@@ -33,6 +33,51 @@ pub const Source = union(enum) {
     }
 };
 pub const Function = enum { transaction, statement, wall };
+pub const StableFunction = enum { transaction, statement };
+
+/// Stable-address execution storage, not a prepared-plan cache. Once copied
+/// into its final owner, scalar results may borrow its immutable typed values
+/// until that owner is released. Wall time deliberately has no cached slot.
+pub const Frame = struct {
+    view: View,
+    values: [2][7]temporal.Value,
+    valid: [2]u7,
+
+    pub fn init(view: View) !Frame {
+        try view.validate();
+        var frame: Frame = .{ .view = view, .values = undefined, .valid = .{ 0, 0 } };
+        for ([_]Instant{ view.transaction, view.statement }, 0..) |instant, index| {
+            for (0..7) |precision| {
+                // A valid finite instant can overflow when rounded at a
+                // coarser precision. Record that error for demand time rather
+                // than failing unrelated expressions during admission.
+                const rounded = instant.withPrecision(@intCast(precision)) catch |err| switch (err) {
+                    error.TemporalOutOfRange => {
+                        frame.values[index][precision] = .{ .timestamp_tz = instant };
+                        continue;
+                    },
+                    else => return err,
+                };
+                frame.values[index][precision] = .{ .timestamp_tz = rounded };
+                frame.valid[index] |= @as(u7, 1) << @intCast(precision);
+            }
+        }
+        return frame;
+    }
+
+    pub fn matches(self: *const Frame, view: View) bool {
+        return self.view.transaction.micros == view.transaction.micros and
+            self.view.statement.micros == view.statement.micros and
+            std.meta.eql(self.view.source, view.source);
+    }
+
+    pub fn value(self: *const Frame, function: StableFunction, precision: u8) !*const temporal.Value {
+        if (precision > 6) return error.InvalidTemporalPrecision;
+        const index: usize = @backingInt(function);
+        if (self.valid[index] & (@as(u7, 1) << @intCast(precision)) == 0) return error.TemporalOutOfRange;
+        return &self.values[index][precision];
+    }
+};
 pub const View = struct {
     source: Source,
     transaction: Instant,
@@ -114,4 +159,45 @@ test "SQL statement clocks use injected std Io realtime without a thread depende
     const view = try View.capture(.{ .io = std.testing.io }, null);
     try std.testing.expectEqual(@as(i8, 0), view.statement.infinity());
     try std.testing.expectEqual(view.statement.micros, view.transaction.micros);
+}
+
+test "SQL statement clock frames retain typed precision values without sampling or allocation" {
+    var fake: Fake = .{ .values = &.{ 20_123_456_789, 19_000_000_000 } };
+    const view = try View.capture(fake.source(), try Instant.init(-500_000));
+    const frame = try Frame.init(view);
+    for ([_]StableFunction{ .transaction, .statement }) |function| {
+        for (0..7) |precision| {
+            const p: u8 = @intCast(precision);
+            const expected = try view.value(if (function == .transaction) .transaction else .statement, p);
+            const borrowed = try frame.value(function, p);
+            try std.testing.expectEqual(expected.micros, borrowed.timestamp_tz.micros);
+            for (0..10_000) |_| try std.testing.expect(borrowed == try frame.value(function, p));
+        }
+    }
+    try std.testing.expect(frame.matches(view));
+    var different = view;
+    different.statement = try Instant.init(view.statement.micros + 1);
+    try std.testing.expect(!frame.matches(different));
+    different = view;
+    different.source = .{ .io = std.testing.io };
+    try std.testing.expect(!frame.matches(different));
+    try std.testing.expectError(error.InvalidTemporalPrecision, frame.value(.transaction, 7));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(?i128, 19_000_000_000), (try view.value(.wall, 6)).unixNanoseconds());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(view.statement.micros, (try frame.value(.statement, 6)).timestamp_tz.micros);
+}
+
+test "SQL statement clock frames defer finite precision overflow without admitting infinity" {
+    var fake: Fake = .{ .values = &.{} };
+    const edge = try Instant.init(temporal.end_timestamp - 1);
+    const view: View = .{ .source = fake.source(), .transaction = edge, .statement = try Instant.init(0) };
+    const frame = try Frame.init(view);
+    try std.testing.expectEqual(edge.micros, (try frame.value(.transaction, 6)).timestamp_tz.micros);
+    for (0..6) |precision| try std.testing.expectError(error.TemporalOutOfRange, frame.value(.transaction, @intCast(precision)));
+    for (0..7) |precision| try std.testing.expectEqual(@as(i64, 0), (try frame.value(.statement, @intCast(precision))).timestamp_tz.micros);
+    var invalid = view;
+    invalid.transaction = try Instant.init(std.math.maxInt(i64));
+    try std.testing.expectError(error.InvalidTransactionClock, Frame.init(invalid));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }

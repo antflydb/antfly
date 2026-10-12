@@ -150,19 +150,27 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
             defer binding_arena.deinit();
             _ = try describe.bind(binding_arena.allocator(), backend, &compiled, &.{});
             try std.testing.expectEqual(@as(usize, 0), fake.calls);
-            const pinned = try backend.pinStatementClock();
+            var pinned = try backend.pinStatementClock();
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             const view = pinned.statement_clock.?;
             try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
             try std.testing.expectEqual(backend.transaction_start.?.micros, view.transaction.micros);
+            const owner_frame = try Clock.Frame.init(view);
+            pinned.clock_values = &owner_frame;
             for (0..1000) |_| {
                 const inherited = try pinned.pinStatementClock();
                 const limits = @import("decision_eval.zig").limitsFor(inherited);
                 try std.testing.expectEqual(view.statement.micros, limits.statement_clock.?.statement.micros);
+                try std.testing.expect(limits.clock_values.? == &owner_frame);
             }
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             const stream = (try Stream.open(a, pinned, &compiled, &.{}, .{ .page_rows = 3, .result_rows = 32 })).?;
             defer stream.close();
+            const stream_frame = stream.context.backend.clock_values.?;
+            try std.testing.expect(stream_frame != &owner_frame);
+            try std.testing.expect(stream_frame == &stream.clock_values.?);
+            const borrowed = try stream_frame.value(.transaction, 6);
+            try @import("scalar.zig").Datum.typedTemporal(borrowed).validateTemporal();
             var seen: usize = 0;
             while (true) {
                 var page = try stream.next(2);
@@ -170,6 +178,9 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
                 seen += page.output.rows.len;
                 try std.testing.expectEqual(view.statement.micros, stream.context.backend.statement_clock.?.statement.micros);
                 try std.testing.expectEqual(view.transaction.micros, stream.context.backend.statement_clock.?.transaction.micros);
+                const limits = @import("decision_eval.zig").limitsFor(stream.context.backend);
+                try std.testing.expect(limits.clock_values.? == stream_frame);
+                try std.testing.expect(borrowed == try limits.clock_values.?.value(.transaction, 6));
                 if (page.exhausted) break;
             }
             try std.testing.expectEqual(@as(usize, 21), seen);
@@ -200,9 +211,18 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
             try std.testing.expectEqual(@as(?i128, -1000), (try view.value(.wall, 6)).unixNanoseconds());
             try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
         }
+        fn fault(a: std.mem.Allocator) !void {
+            // Keep every injected allocation cut reproducible when arena
+            // growth would otherwise depend on host allocator placement.
+            // The normal run above still exercises resize/remap support.
+            var vtable = a.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            try run(.{ .ptr = a.ptr, .vtable = &vtable });
+        }
     };
     try Run.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.fault, .{});
     var fake: Fake = .{ .failed = true };
     var fixture: Fixture = .{};
     var backend = fixture.backend();
@@ -220,6 +240,13 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
     try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
     backend.transaction_start = null;
     backend.statement_clock.?.statement = try Clock.Instant.init(std.math.maxInt(i64));
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.statement_clock = .{ .source = fake.source(), .transaction = try Clock.Instant.init(0), .statement = try Clock.Instant.init(0) };
+    const frame = try Clock.Frame.init(backend.statement_clock.?);
+    backend.clock_values = &frame;
+    backend.statement_clock.?.statement = try Clock.Instant.init(1);
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.statement_clock = null;
     try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
@@ -685,6 +712,9 @@ const ParallelScan = struct {
                 .credit = credit,
                 .stream = .{
                     .budget = .{ .backing = a, .limit = workspace },
+                    // Immutable clock values borrow the parent cursor owner,
+                    // which joins all producer lanes before releasing them.
+                    .clock_values = null,
                     // Context borrows the parent cursor's aggregate regex owner.
                     .regex_execution = .init(a, 0),
                     .arena = undefined,
@@ -811,6 +841,7 @@ const ParallelScan = struct {
 
 pub const Stream = struct {
     budget: Budget,
+    clock_values: ?catalog.Clock.Frame,
     regex_execution: @import("regex_execution.zig"),
     arena: std.heap.ArenaAllocator,
     settings: ?*@import("setting_catalog.zig").View = null,
@@ -875,6 +906,8 @@ pub const Stream = struct {
         errdefer if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         const arena = self.arena.allocator();
         var statement_backend = try backend.pinStatementClock();
+        self.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
+        statement_backend.clock_values = if (self.clock_values) |*frame| frame else null;
         statement_backend.regex_execution = &self.regex_execution;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
         if (backend.setting_capture) |capture| {

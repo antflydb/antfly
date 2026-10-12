@@ -3648,3 +3648,34 @@ capture are activated together. General temporal literals, named-zone/DST
 semantics, arithmetic and SQL JSON formatting also remain open. This delivery
 does not qualify any additional original SQL case: the inventory remains
 479 implemented / 136 rejected / 73 superseded / 898 unresolved.
+
+### Execution-owned typed clock values
+
+Statement and cursor owners now retain an immutable `Clock.Frame` at a stable
+address. Its transaction/statement timestamps provide native timestamptz values
+at precisions 0 through 6 without per-row allocation, parsing, rounding or clock
+sampling. Wall time deliberately has no cached slot. Finite rounding overflow
+is recorded per precision and fails only when that precision is demanded;
+unrelated expressions remain admissible. Infinite owner timestamps are rejected.
+
+Runtime results and ordinary cursors own their frames; derived adapters and
+parallel scan lanes borrow the enclosing execution's frame. Parallel workers
+join before their parent releases that owner. Scalar limits carry the borrowed
+typed-value address, never a pointer into a temporary evaluator or cached plan.
+Inherited frames must match both pinned timestamps and the exact clock source;
+a stale or detached frame cannot silently acquire a new statement cut.
+
+The full SQL Debug gate passes all 21 steps: 734 main-owner and 226 additional
+owner tests pass, with three existing main-owner skips and no failures/leaks.
+Six focused clock tests pass in Debug and ReleaseFast. The linked public API
+gate passes all 80 steps and three selected HTTP/pgwire regressions. Precision,
+repeated pointer identity across cursor pages, stale-source/cut rejection,
+declined-stream fallback and derived reads are covered. The fault sweep retains
+every injected allocation cut using a deterministic no-resize/remap wrapper;
+the normal run separately retains the production allocator behavior. Six oracle
+tool tests and exact regeneration of 174 PostgreSQL contracts pass.
+
+This activates owned scalar clock storage, not the public SQL functions.
+Parser/binder time expressions, exact public result activation, volatility,
+protocol receive-time cuts and session-timezone semantics remain unfinished.
+No original SQL disposition changes: 898 remain unresolved.

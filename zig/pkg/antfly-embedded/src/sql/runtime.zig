@@ -67,7 +67,7 @@ pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig") };
+    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), clock_values: ?catalog.Clock.Frame };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -92,6 +92,7 @@ pub const Result = struct {
 
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
+        state.clock_values = null;
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
         state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -132,12 +133,19 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
         statement_backend.settings_view = &pinned_settings.?;
     }
     const state = try alloc.create(Result.State);
+    errdefer alloc.destroy(state);
+    state.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
     state.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
     var result = Result{ .state = state, .output = undefined };
-    errdefer result.deinit();
+    errdefer {
+        state.regex_execution.deinit();
+        state.arena.deinit();
+        std.debug.assert(state.budget.live == 0);
+    }
+    statement_backend.clock_values = if (state.clock_values) |*frame| frame else null;
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
