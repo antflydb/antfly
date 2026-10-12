@@ -98,6 +98,16 @@ func (code ErrorCode) Description() string {
 	return "unknown Antfly error code"
 }
 
+// NativeError owns the diagnostic captured from one failed native call.
+// errors.Is(err, ErrorCode) continues to classify the stable code.
+type NativeError struct {
+	Code   ErrorCode
+	Detail string
+}
+
+func (e *NativeError) Error() string { return e.Code.Error() + ": " + e.Detail }
+func (e *NativeError) Unwrap() error { return e.Code }
+
 // InferenceAPIError is the JSON error body an Antfly inference call returns
 // on failure: {"error": "...", "message": "..."}. Code is a stable string
 // such as "MODEL_NOT_FOUND"; either field may be empty when the body was not

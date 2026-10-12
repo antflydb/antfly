@@ -537,6 +537,45 @@ fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *
     return .{ .options = options, .document = document, .process_options = process_options, .engine_options = engine_options, .device_options = device_options };
 }
 
+// Fit complete prompts before narrowing qualification candidates. Reducing a
+// source-word window is lossless: overlap and global rebasing are replanned,
+// and no model executes until every resulting window has been admitted.
+fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !PreparedDocument {
+    var options = supplied;
+    const policy = @import("../models/gliner_boundary_qualification.zig");
+    var composed = policy.hasQualifiedTypedDecisionIdentity(options.identity);
+    if (item.compiled.schema.classifications.len != 0) composed = true;
+    for (item.compiled.schema.entities) |entity| if (entity.description != null) {
+        composed = true;
+    };
+    for (item.compiled.schema.relations) |relation| if (relation.description != null) {
+        composed = true;
+    };
+    if (!composed) return prepareDocument(backend, allocator, config, item, options);
+    options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, 1024);
+    options.processor.max_batch_tokens = @max(options.processor.max_batch_tokens, options.processor.max_sequence_tokens);
+    options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, 1024);
+    while (true) {
+        var planned = try prepareDocument(backend, allocator, config, item, options);
+        errdefer planned.document.deinit();
+        var fits = true;
+        for (planned.document.windows) |window| {
+            var prepared = processor.prepare(allocator, tokenizer, &.{.{ .text = try planned.document.windowText(window.index), .schema = &item.compiled }}, planned.process_options) catch |err| {
+                if (err != error.BoundarySequenceLimitExceeded) return err;
+                fits = false;
+                break;
+            };
+            prepared.deinit();
+        }
+        if (fits) return planned;
+        planned.document.deinit();
+        const overlap = item.options.long_document.overlap_words;
+        const width = @min(options.limits.plan.max_window_body_words, item.options.long_document.window_words);
+        if (width <= overlap + 2) return error.BoundarySequenceLimitExceeded;
+        options.limits.plan.max_window_body_words = overlap + @max((width - overlap) / 2, 1);
+    }
+}
+
 fn admitWindows(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, planned: *const PreparedDocument, receiver: anytype) !GeometryUsage {
     const options = planned.options;
     const document = planned.document;
@@ -582,7 +621,7 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
     if (backend != .native and backend != .wasm and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = supplied;
     quiet.observer = null;
-    var planned = try prepareDocument(backend, allocator, config, item, quiet);
+    var planned = try prepareTokenizedDocument(backend, allocator, config, tokenizer, item, quiet);
     defer planned.document.deinit();
     const used = try admitWindows(backend, allocator, config, tokenizer, item, &planned, receiver);
     try check(quiet);
@@ -637,7 +676,7 @@ fn encodeGroup(
 }
 
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: ?*qualification.Gate) !Result {
-    var planned = try prepareDocument(cb.kind(), allocator, config, item, supplied);
+    var planned = try prepareTokenizedDocument(cb.kind(), allocator, config, tokenizer, item, supplied);
     defer planned.document.deinit();
     const options = planned.options;
     const document = planned.document;

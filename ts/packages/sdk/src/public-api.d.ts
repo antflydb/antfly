@@ -17535,6 +17535,8 @@ export interface components {
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Optional result key. Defaults to the metric name. */
             name?: string;
             /** @description Graph index that owns the published metric. */
@@ -17563,6 +17565,8 @@ export interface components {
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Graph index that owns the published metric. */
             index: string;
             /** @description Graph metric name to blend into the search hit score. */
@@ -17923,6 +17927,11 @@ export interface components {
             edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
             /** @default 100 */
             limit?: number;
+            /**
+             * @description Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+             * @default true
+             */
+            deduplicate_nodes?: boolean;
             /** @default false */
             include_paths?: boolean;
             /**
@@ -19284,6 +19293,15 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            /**
+             * @description Pull-time qualified request profiles for this exact artifact,
+             *     including backend, supported features and min/max geometry.
+             *     Runtime admission revalidates artifact identity and resource limits.
+             *     Omitted for artifacts without a qualification receipt.
+             */
+            qualified_limits?: {
+                [key: string]: unknown;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */

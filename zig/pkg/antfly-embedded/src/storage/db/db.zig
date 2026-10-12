@@ -8746,6 +8746,17 @@ pub const DB = struct {
     /// right after a DB is opened, since managed DBs open lazily and cannot
     /// thread the source through `OpenOptions`. No-op when this DB has no
     /// resolution runtime (e.g. read-only / status opens).
+    /// The embedder must outlive all resolution work. Call under the owner fence
+    /// when replacing a managed enrichment runtime.
+    pub fn setResolutionEmbedder(self: *DB, embedder: ?embedder_mod.DenseEmbedder) void {
+        if (self.resolution_runtime) |runtime| {
+            while (!runtime.catch_up_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer runtime.catch_up_mutex.unlock();
+            runtime.embedder = embedder;
+        }
+        self.resolution_embedder = embedder;
+    }
+
     pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
         self.resolution_candidate_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
@@ -29546,7 +29557,7 @@ pub const DB = struct {
     }
 
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
-        if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
+        if (!self.core.hasGeneratedEnrichmentTargets() and self.core.index_manager.enrichments.items.len == 0) return .{};
         const resources = self.core.batchExecutionResources();
         const checkpoint = try enrichment_state.loadProjectionCheckpoint(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
         const applied = checkpoint.applied_sequence;
@@ -29561,6 +29572,7 @@ pub const DB = struct {
             .projection_checkpoint_generation = checkpoint.generation,
             .projection_checkpoint_config_hash = checkpoint.config_hash,
             .checkpoint_replay_tail_sequence_count = target -| checkpoint.applied_sequence,
+            .last_error_code = status.last_error_code,
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
@@ -39063,7 +39075,7 @@ pub const DB = struct {
                 rerank.seed_nodes,
                 rerank.damping,
                 node_ids,
-                .{ .cancellation = req.cancellation orelse .none },
+                .{ .cancellation = req.cancellation orelse .none, .direction = @fromBackingInt(@intCast(@backingInt(rerank.direction))) },
             );
         } else try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
             .require_published = true,
@@ -39150,7 +39162,7 @@ pub const DB = struct {
                 named.query.seed_nodes,
                 named.query.damping,
                 named.query.top_k,
-                .{ .cancellation = cancellation orelse .none },
+                .{ .cancellation = cancellation orelse .none, .direction = @fromBackingInt(@intCast(@backingInt(named.query.direction))) },
             );
         } else try entry.index.graphMetricTopKSnapshotAlloc(
             named.query.metric_name,

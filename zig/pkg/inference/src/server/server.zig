@@ -9577,6 +9577,7 @@ pub const Node = struct {
         decision: ?@import("antfly_decisions").Request,
     ) ![]u8 {
         var options = span_v2_executor.Options{
+            .modern_span_extraction = true,
             .control = control,
             .observer = observer,
             .decide_request = decision,
@@ -9596,10 +9597,15 @@ pub const Node = struct {
         const loaded = handle.get();
         const backend = loaded.session.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
-        const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
-            try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(loaded.session))
+        const qualified_identity: ?gliner_decide_qualification.Identity = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
+            try session_factory.getGlinerDecisionIdentity(loaded.session)
         else
             null;
+        const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (qualified_identity) |identity| try gliner_decide_qualification.require(identity) else null;
+        if (qualified_identity) |identity| {
+            options.modern_span_extraction = gliner_decide_qualification.supportsSpanExtraction(identity);
+            try span_v2_executor.preflight(request, options);
+        }
         const qualified_backend: gliner_decide_qualification.Backend = switch (backend) {
             .native => .native,
             .metal => .metal,
@@ -9608,23 +9614,28 @@ pub const Node = struct {
         };
         // Reject an unmeasured backend or request cardinality before parsing
         // model inputs. Sequence geometry is checked again after exact planning.
-        if (qualified_variant) |variant|
-            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, 1, 1);
+        if (qualified_identity) |identity|
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, 1, 1);
         const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
         const config: span_v2_executor.EncoderConfig = switch (session_config) {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
         if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
-        const max_sequence = span_v2_executor.sequenceTokenCeiling(config, options.processor.max_sequence_tokens, backend == .cuda);
+        // The executor's generic DeBERTa default is 512. An exact qualified
+        // identity supplies its own measured ceiling, including FP32 1B's
+        // 1024-token budget; Q8 retains its separate 198-token contract.
+        const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
+        const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
         options.processor.max_batch_tokens = max_sequence;
-        options.max_prompt_tokens = @min(options.max_prompt_tokens, max_sequence);
+        options.max_prompt_tokens = if (qualified_variant == .decide_1b) max_sequence else @min(options.max_prompt_tokens, max_sequence);
         if (qualified_variant == .decide_1b) {
-            options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, 198);
-            options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, 198);
-            options.max_prompt_tokens = @min(options.max_prompt_tokens, 198);
-            options.max_sequences_per_item = 1;
+            const limits = (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?;
+            options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, limits.sequence_tokens);
+            options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, limits.sequence_tokens);
+            options.max_prompt_tokens = @min(options.max_prompt_tokens, limits.sequence_tokens);
+            options.max_sequences_per_item = limits.prepared_sequences;
         }
 
         const texts = try scratch.alloc([]const u8, request.items.len);
@@ -9648,8 +9659,8 @@ pub const Node = struct {
         const longest = span_v2_executor.maxPlannedSequenceTokens(&request_plan);
         var prepared_sequences: usize = 0;
         for (request_plan.items) |item| prepared_sequences += item.batches.len;
-        if (qualified_variant) |variant|
-            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, prepared_sequences, longest);
+        if (qualified_identity) |identity|
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, prepared_sequences, longest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
@@ -20450,6 +20461,7 @@ pub const Node = struct {
                     chat_template_failed,
                     listing.compatibility_level,
                 );
+                try appendQualifiedLimits(&body, a, &listing.manifest);
                 if (isOpenAiListTask(task)) {
                     const enabled = listing.compatibility_level.len > 0 and
                         (!std.mem.eql(u8, listing.compatibility_level, "unknown") or self.config.allow_unknown_models) and
@@ -20506,6 +20518,7 @@ pub const Node = struct {
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                 );
+                try appendQualifiedLimits(&body, a, &model.manifest);
                 if (isOpenAiListTask(task)) {
                     const enabled = loaded_compatibility.level == .compatible or
                         (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
@@ -23073,6 +23086,17 @@ fn manifestMatchesModelListingTask(
         manifest.capabilities,
         manifestSupportsZeroShotClassification(manifest),
     );
+}
+
+fn appendQualifiedLimits(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.qualified_limits_json.len == 0) return;
+    std.debug.assert(buf.items.len > 0 and buf.items[buf.items.len - 1] == '}');
+    const empty = buf.items.len >= 2 and buf.items[buf.items.len - 2] == '{';
+    buf.items.len -= 1;
+    if (!empty) try buf.append(allocator, ',');
+    try buf.appendSlice(allocator, "\"qualified_limits\":");
+    try buf.appendSlice(allocator, manifest.qualified_limits_json);
+    try buf.append(allocator, '}');
 }
 
 fn appendModelInfo(

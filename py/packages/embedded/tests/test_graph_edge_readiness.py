@@ -196,3 +196,39 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
 
 if __name__ == "__main__":
     _run_wait_workload(sys.argv[1], sys.argv[2])
+
+
+def test_public_traversal_retains_each_seed_path(aflite_path) -> None:
+    with antfly_embedded.create_hosted(aflite_path) as db:
+        db.add_index({"name": "knowledge", "type": "graph", "edge_types": [{"name": "about"}]})
+        db.batch_json(
+            {
+                "inserts": {"claim:a": {"search_text": "embedder"}},
+                "graph_writes": [
+                    {"index_name": "knowledge", "source": "claim:a", "target": seed, "edge_type": "about"}
+                    for seed in ["concept:a", "concept:b"]
+                ],
+                "sync_level": "full_index",
+            }
+        )
+        response = db.search(
+            {
+                "full_text_search": {"match_all": {}},
+                "graph_queries": {
+                    "q": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "start": {"keys": ["concept:a", "concept:b"]},
+                            "direction": "in",
+                            "edge_types": ["about"],
+                            "max_depth": 1,
+                            "include_paths": True,
+                            "deduplicate_nodes": False,
+                        },
+                    }
+                },
+            }
+        )
+        nodes = response["responses"][0]["graph_results"]["q"]["nodes"]
+        assert [node["key"] for node in nodes] == ["claim:a", "claim:a"]
+        assert {node["path"][0]["key"] for node in nodes} == {"concept:a", "concept:b"}

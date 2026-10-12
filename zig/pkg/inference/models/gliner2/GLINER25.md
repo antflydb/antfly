@@ -522,3 +522,32 @@ A mismatched digest, an unreviewed backend, a feature outside the row, or
 geometry outside the measured bounds must continue to fail closed with
 `error.UnsupportedGlinerBoundaryRuntime` -- that is what the qualification
 module's own tests in `models/gliner_boundary_qualification.zig` enforce.
+
+### Embedded knowledge graph extraction and bounded windows
+
+The exact pinned FP32 `GLiNER2.5-Decide-1B` artifact now qualifies native and
+Metal entity/relation extraction using its ModernBERT encoder, marker span
+representations, learned GRU count slots and span scoring heads. Its qualified
+complete prompt ceiling is 1024 tokens, with one item per invocation. This
+supersedes the earlier 198-token FP32 limit; the converted Q8 decision artifact
+retains its separate 198-token qualification and does not advertise extraction.
+Configure decision enrichments with `batch_size: 1`. Model execution still
+requires memory admission, including resident weights and bounded head scratch.
+
+The pinned base and multi-Decide FP32 boundary artifacts also qualify bounded
+word windows with descriptions and classification, including prompts smaller
+than the former 103-token floor. Each complete schema/body prompt is tokenized
+before execution and must fit 1024 tokens. Window bodies shrink to fit schema
+cost; oversized schemas fail before inference. Requests remain bounded by 64
+windows, 1 MiB of text, 131072 words and runtime token/output limits. These are
+composed per-window and merger ceilings, not a claim of model attention across
+an entire document. Classification aggregates owned-word-weighted raw logits;
+mentions and relations preserve global offsets and overlap semantics.
+
+Independent pinned upstream captures and reproducible scripts live under
+`src/extractors/testdata/knowledge_graph` and `scripts/gliner25`. Tests compare
+encoded inputs, learned head intermediates, valid span scores and final outputs
+on native and Metal. Unsupported structures/attributes, joint decoding and
+relation endpoint constraints remain rejected. Pull metadata publishes
+`qualified_limits` for verified artifacts; refresh older pulls to record it.
+See [Lite knowledge graph usage](../../../../LITE_KNOWLEDGE_GRAPH.md).

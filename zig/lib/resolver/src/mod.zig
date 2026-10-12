@@ -394,6 +394,28 @@ pub const Resolver = struct {
     ) !ResolvedEntity {
         const local_id = try a.dupe(u8, entity.local_id);
 
+        // An exact minted-key redirect is an explicit administrator alias,
+        // independent of probabilistic scoring. Never infer this from a fuzzy
+        // candidate, or link a dangling redirect to an unavailable survivor.
+        const minted_key = try renderKey(a, self.key_template, entity);
+        for (candidates) |candidate| {
+            if (!std.mem.eql(u8, candidate.doc_ref.table, self.table) or
+                !std.mem.eql(u8, candidate.doc_ref.key, minted_key)) continue;
+            if (self.type_must_match and !std.mem.eql(u8, candidate.label, entity.label)) continue;
+            if (recordTextField(candidate.record, "merged_into") == null) continue;
+            const survivor = candidate.resolved_doc_ref orelse continue;
+            const record = candidate.resolved_record orelse continue;
+            return .{
+                .local_id = local_id,
+                .doc_ref = .{ .table = try a.dupe(u8, survivor.table), .key = try a.dupe(u8, survivor.key) },
+                .confidence = 1,
+                .decision = .match,
+                .label = try a.dupe(u8, entity.label),
+                .canonical_name = try a.dupe(u8, recordTextField(record, "canonical_name") orelse entity.text),
+                .surface_form = try a.dupe(u8, entity.text),
+            };
+        }
+
         if (self.scorer) |*scorer| {
             if (candidates.len > 0) {
                 var mention_fields = [_]matcher.Field{
@@ -529,6 +551,7 @@ fn renderKey(a: std.mem.Allocator, template: []const u8, entity: ExtractedEntity
             i += 1;
         }
     }
+    if (out.items.len == 0) return error.EmptyEntityKey;
     return out.toOwnedSlice(a);
 }
 
@@ -584,8 +607,14 @@ fn applyHelper(
         try out.appendSlice(a, std.mem.trim(u8, value, " \t\r\n"));
         return;
     }
+    if (std.mem.eql(u8, helper, "uslug")) {
+        try @import("unicode_slug.zig").append(a, out, value);
+        return;
+    }
     if (std.mem.eql(u8, helper, "slug")) {
+        const start = out.items.len;
         try appendSlug(a, out, value);
+        if (out.items.len == start) return error.EmptyEntityKey;
         return;
     }
     if (std.mem.eql(u8, helper, "hash")) {
@@ -1222,7 +1251,7 @@ pub const ResolutionStage = struct {
         const a = scratch.allocator();
 
         const lists = try a.alloc([]const Candidate, parsed.entities.len);
-        if (if (self.resolver.scorer != null) provider else null) |p| {
+        if (provider) |p| {
             try p.candidatesForBatch(a, parsed.entities, lists);
         } else {
             for (lists) |*l| l.* = &.{};
@@ -2212,7 +2241,7 @@ test "resolution durable doc ref binding round trips without changing its logica
     try testing.expectEqualStrings("table:original", replay.entities[0].doc_ref.storage_table.?);
 }
 
-test "deterministic resolution skips candidate and embedding IO but retains destination binding" {
+test "deterministic resolution consults aliases without embedding IO and retains destination binding" {
     const alloc = testing.allocator;
     const Ports = struct {
         reads: usize = 0,
@@ -2221,7 +2250,7 @@ test "deterministic resolution skips candidate and embedding IO but retains dest
         fn candidates(ptr: *anyopaque, _: std.mem.Allocator, _: ExtractedEntity, _: *std.ArrayListUnmanaged(Candidate)) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.reads += 1;
-            return error.TestUnexpectedRead;
+            return;
         }
         fn embed(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?[]const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2248,10 +2277,74 @@ test "deterministic resolution skips candidate and embedding IO but retains dest
     };
     const result = (try stage.computeAlloc(alloc, store.store(), .{ .ptr = &ports, .vtable = &.{ .candidates_for = Ports.candidates } }, "extraction")).?;
     defer alloc.free(result);
-    try testing.expectEqual(@as(usize, 0), ports.reads);
+    try testing.expectEqual(@as(usize, 1), ports.reads);
     try testing.expectEqual(@as(usize, 0), ports.embeddings);
     try testing.expectEqual(@as(usize, 1), ports.bindings);
     var parsed = try parseResolution(alloc, result);
     defer parsed.deinit();
     try testing.expectEqualStrings("table:original", parsed.entities[0].doc_ref.storage_table.?);
+}
+
+test "resolution exact minted key aliases require no scorer" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1",
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    // The blocked candidate is a merged-away duplicate pointing at the survivor.
+    var candidate = MergedCandidate{
+        .doc_ref = .{ .table = "entities", .key = "ada_lovelace" },
+        .label = "person",
+        .name = "Ada Lovelace",
+        .merged_into = "person/ada_lovelace",
+        .survivor_name = "Augusta Ada King",
+    };
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:doc1"));
+
+    const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
+    defer testing.allocator.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    // Resolved to the survivor, not the merged-away duplicate.
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("Augusta Ada King", ent.get("canonical_name").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
+}
+
+test "uslug normalizes Unicode identities without changing legacy ASCII keys" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "Qwen3", "qwen3" }, .{ "qwen3", "qwen3" },
+        .{ "Ｑｗｅｎ３", "qwen3" },
+        .{ "Straße", "strasse" },
+        .{ "Σίσυφος", "σίσυφοσ" },
+        .{ "東京 大学", "東京_大学" },
+        .{ "CAFÉ", "café" },
+        .{ "Cafe\u{301}", "café" },
+        .{ "한글", "한글" },
+        .{ "ﬃ ①", "ffi_1" },
+    };
+    for (cases) |case| {
+        const key = try renderKey(a, "entity/{{ uslug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = case[0] });
+        defer a.free(key);
+        const expected = try std.fmt.allocPrint(a, "entity/{s}", .{case[1]});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+    const legacy = try renderKey(a, "entity/{{ slug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "Epstein's island" });
+    defer a.free(legacy);
+    try std.testing.expectEqualStrings("entity/epstein_island", legacy);
+    for ([_][]const u8{ "entity/{{ slug _entity.text }}", "entity/{{ uslug _entity.text }}" }) |template|
+        try std.testing.expectError(error.EmptyEntityKey, renderKey(a, template, .{ .local_id = "e0", .label = "concept", .text = "!!!" }));
+    try std.testing.expectError(error.EmptyEntityKey, renderKey(a, "entity/{{ slug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "東京" }));
+    try std.testing.expectError(error.InvalidUtf8, renderKey(a, "{{ uslug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "\xff" }));
 }

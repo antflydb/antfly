@@ -54,6 +54,8 @@ func sqlError(body []byte, err error) error {
 }
 
 func (db *DB) CreateTableJSON(name string, schema []byte) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -67,6 +69,8 @@ func (db *DB) CreateTableJSON(name string, schema []byte) error {
 	return check(C.antfly_db_create_table_json((*C.antfly_db)(handle), n, s))
 }
 func (db *DB) DropTable(name string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -91,6 +95,8 @@ type SQLSession struct {
 }
 
 func (db *DB) NewSQLSession() (*SQLSession, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -104,6 +110,8 @@ func (db *DB) NewSQLSession() (*SQLSession, error) {
 	return &SQLSession{db: db, ID: uint64(id)}, nil
 }
 func (s *SQLSession) Close() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := s.db.acquire()
 	if err != nil {
 		return err
@@ -133,6 +141,8 @@ type SQLCursor struct {
 }
 
 func (db *DB) OpenSQLCursorJSON(request []byte) (*SQLCursor, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -151,6 +161,8 @@ func (db *DB) OpenSQLCursorJSON(request []byte) (*SQLCursor, error) {
 	return &SQLCursor{db: db, ID: uint64(id)}, nil
 }
 func (c *SQLCursor) FetchJSON(rows uint32) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := c.db.acquire()
 	if err != nil {
 		return nil, err
@@ -163,6 +175,8 @@ func (c *SQLCursor) FetchJSON(rows uint32) ([]byte, error) {
 	return body, sqlError(body, check(code))
 }
 func (c *SQLCursor) Close() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := c.db.acquire()
 	if err != nil {
 		return err
@@ -176,6 +190,8 @@ func (c *SQLCursor) Close() error {
 // schema, index, enrichment, and search methods operate on that table.
 // Close the table before DropTable. Database Close invalidates table handles.
 func (db *DB) OpenTable(name string) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err

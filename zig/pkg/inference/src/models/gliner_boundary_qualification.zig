@@ -239,7 +239,7 @@ pub const Entry = struct {
 //
 // See zig/pkg/inference/models/gliner2/GLINER25.md for the full record,
 // evidence pointers, and how to re-qualify a wider or different artifact.
-const fastino_gliner25_base_v1 = bundle.Identity{
+pub const fastino_gliner25_base_v1 = bundle.Identity{
     .backbone = .base,
     .precision = .fp32,
     .weight = .{ .size_bytes = 774366564, .sha256 = "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a".* },
@@ -541,7 +541,7 @@ const fastino_gliner25_multi_v1 = bundle.Identity{
         .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
     },
 };
-const fastino_gliner25_multi_decide = bundle.Identity{
+pub const fastino_gliner25_multi_decide = bundle.Identity{
     .backbone = .multi,
     .precision = .fp32,
     .weight = .{ .size_bytes = 1149461028, .sha256 = "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e".* },
@@ -664,6 +664,31 @@ fn multilingualEntries() [family_profiles.len * 4 + 2]Entry {
     return entries;
 }
 
+// Bounded composition: encoder/head parity is measured per complete mixed
+// prompt through 1024 tokens. Document bounds are independent planner/merge
+// resource ceilings, enforced before forwards; they do not raise context size.
+// Evidence: gliner_window_parity_test and scripts/gliner25/capture_window_extraction.py.
+const composed_window_features = Features.initMany(&.{
+    .entities,        .relations,     .schema_descriptions,        .classification_single,
+    .word_whitespace, .overlap_flat,  .offset_utf8,                .offset_codepoints,
+    .decoder_auto,    .long_document, .record_identity_occurrence, .confidence,
+    .spans,
+});
+const composed_window_lengths = LengthContract{
+    .request_items = .{ .min = 1, .max = 1 },
+    .document_bytes = .{ .min = 1, .max = 1024 * 1024 },
+    .document_words = .{ .min = 1, .max = 131072 },
+    .window_count = .{ .min = 1, .max = 64 },
+    .window_words = .{ .min = 1, .max = 1024 },
+    .padded_sequence_tokens = .{ .min = 1, .max = 1024 },
+};
+const composed_window_entries = [_]Entry{
+    .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_multi_decide, .backend = .native, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_multi_decide, .backend = .metal, .features = composed_window_features, .lengths = composed_window_lengths },
+};
+
 const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
@@ -674,7 +699,7 @@ const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries());
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries);
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -687,6 +712,10 @@ comptime {
 
 /// Coarse closed gate only. True would still require an exact live-session
 /// lookup; it must never authorize a listing that has no consumed identity.
+pub fn publishedProfiles() []const Entry {
+    return production_entries;
+}
+
 pub fn hasPublishedProfiles() bool {
     return production_entries.len != 0;
 }
@@ -919,12 +948,9 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     mismatched.precision = .q8_0;
     try std.testing.expect(!hasQualifiedIdentity(mismatched));
 
-    // Requiring only .long_document is satisfied by the long-document row
-    // alone (its feature set is a superset), so this reaches geometry: the
-    // single-window row's narrower padded_sequence_tokens minimum (14) falls
-    // under the long-document row's reviewed minimum (103) -- a genuine
-    // bounded-length rejection, named accordingly, not a feature mismatch.
-    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
+    // Composed windows also admit tiny prompts below the legacy 103-token
+    // floor, including this single-window geometry.
+    try require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths);
 
     // Out-of-range geometry, unlike every identity/backend mismatch above, is
     // a bounded-length rejection: identity, backend, and features all matched
@@ -965,7 +991,8 @@ test "GLiNER multilingual production qualification binds exact artifacts and ind
         changed.weight.sha256[0] = '0';
         try std.testing.expect(!hasQualifiedIdentity(changed));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
-        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
+        if (!equalIdentity(identity, fastino_gliner25_multi_decide))
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.classification_multi)));
     }
     try std.testing.expect(hasQualifiedTypedDecisionIdentity(fastino_gliner25_multi_decide));

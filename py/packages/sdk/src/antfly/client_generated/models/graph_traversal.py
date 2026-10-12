@@ -60,6 +60,9 @@ class GraphTraversal:
                 Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
                 stored edges and does not constrain the aggregate path objective.
             limit (int | Unset):  Default: 100.
+            deduplicate_nodes (bool | Unset): Return each node once across all starts. Set false with include_paths to
+                return each reaching path, including its start node. Depth, result, and work limits still bound path
+                enumeration. Default: True.
             include_paths (bool | Unset):  Default: False.
             include_documents (bool | Unset): Include each result node's stored document when it exists at the pinned
                 snapshot. A dangling graph identity omits document. When false, document is always omitted. Default: False.
@@ -92,6 +95,7 @@ class GraphTraversal:
     max_depth: int | Unset = 1
     edge_weight: GraphEdgeWeightRange | Unset = UNSET
     limit: int | Unset = 100
+    deduplicate_nodes: bool | Unset = True
     include_paths: bool | Unset = False
     include_documents: bool | Unset = False
     fields: list[str] | Unset = UNSET
@@ -164,6 +168,8 @@ class GraphTraversal:
             edge_weight = self.edge_weight.to_dict()
 
         limit = self.limit
+
+        deduplicate_nodes = self.deduplicate_nodes
 
         include_paths = self.include_paths
 
@@ -250,6 +256,8 @@ class GraphTraversal:
             field_dict["edge_weight"] = edge_weight
         if limit is not UNSET:
             field_dict["limit"] = limit
+        if deduplicate_nodes is not UNSET:
+            field_dict["deduplicate_nodes"] = deduplicate_nodes
         if include_paths is not UNSET:
             field_dict["include_paths"] = include_paths
         if include_documents is not UNSET:
@@ -349,6 +357,8 @@ class GraphTraversal:
             edge_weight = GraphEdgeWeightRange.from_dict(_edge_weight)
 
         limit = d.pop("limit", UNSET)
+
+        deduplicate_nodes = d.pop("deduplicate_nodes", UNSET)
 
         include_paths = d.pop("include_paths", UNSET)
 
@@ -535,6 +545,7 @@ class GraphTraversal:
             max_depth=max_depth,
             edge_weight=edge_weight,
             limit=limit,
+            deduplicate_nodes=deduplicate_nodes,
             include_paths=include_paths,
             include_documents=include_documents,
             fields=fields,

@@ -2303,6 +2303,8 @@ pub const GraphMetricFreshness = enum {
     fresh,
 };
 
+pub const GraphMetricDirection = enum { out, in, both };
+
 pub const GraphMetricQuery = struct {
     index_name: []const u8,
     metric_name: []const u8,
@@ -2316,6 +2318,7 @@ pub const GraphMetricQuery = struct {
     /// Damping override for personalized reads. Null keeps the metric's
     /// configured damping. Only valid together with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2337,6 +2340,7 @@ pub const GraphMetricRerank = struct {
     seed_nodes: []const []const u8 = &.{},
     /// Damping override for personalized blends. Only valid with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;
@@ -2936,8 +2940,10 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
     metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
     metric_value_names: [][]u8 = &.{},
+    metric_owners: []graph_query_mod.GraphMetricOwner = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2978,9 +2984,12 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |columns| columns.deinit(alloc);
         if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
         for (self.metric_value_names) |name| alloc.free(name);
         if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.metric_owners) |*owner| owner.deinit(alloc);
+        alloc.free(self.metric_owners);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -3228,6 +3237,7 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,
     has_lease: bool = false,

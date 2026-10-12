@@ -363,42 +363,44 @@ pub fn closeAll(handle: *h.Handle) void {
     handle.sql_sessions.deinit(handle.alloc);
 }
 pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.ErrorCode {
+    h.capi.clearLastError();
     out.* = 0;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return .invalid_argument;
-    if (handle.sql_sessions.count() >= 64) return .busy;
-    const session = handle.alloc.create(Session) catch return .internal;
+    if (handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL sessions require a root database handle");
+    if (handle.sql_sessions.count() >= 64) return h.capi.recordError(.busy, @src().fn_name ++ ": SQL session limit (64) exceeded");
+    const session = handle.alloc.create(Session) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     session.* = .{ .handle = handle, .budget = .{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes }, .arena = undefined };
     session.arena = std.heap.ArenaAllocator.init(session.budget.allocator());
     const id = handle.next_sql_session_id;
     handle.next_sql_session_id = std.math.add(u64, id, 1) catch {
         handle.alloc.destroy(session);
-        return .internal;
+        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     };
     handle.sql_sessions.putNoClobber(handle.alloc, id, session) catch {
         session.arena.deinit();
         handle.alloc.destroy(session);
-        return .internal;
+        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     };
     out.* = id;
     return .ok;
 }
 pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
-    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return .invalid_argument;
+    h.capi.clearLastError();
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const guard = api.enterHandlePinned(ptr, .exclusive) orelse");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return .invalid_argument;
-    const entry = handle.sql_sessions.fetchRemove(id) orelse return .invalid_argument;
+    if (handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL sessions require a root database handle");
+    const entry = handle.sql_sessions.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const entry = handle.sql_sessions.fetchRemove(id) orelse");
     @import("sql_cursor.zig").closeSession(handle, id);
     entry.value.arena.deinit();
     handle.alloc.destroy(entry.value);
