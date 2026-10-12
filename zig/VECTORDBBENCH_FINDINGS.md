@@ -333,7 +333,6 @@ Most are resolved into `ResourceManager` fields in `resource_manager.zig`.
 | `ANTFLY_EXPERIMENT_QUANTIZED_ROUTING` | Convert native exact centroid blocks to RaBitQ for routing | off | experiment (recall loss) |
 | `ANTFLY_EXPERIMENT_CENTERED_ROUTING` | With quantized routing, quantize centroid residuals about the block mean | off | experiment |
 | `ANTFLY_EXPERIMENT_SUBGROUPS_4` / `_8` / `_16` | Persist a balanced subgroup layout of that size in new posting builds (choose one) | off | experiment |
-| `ANTFLY_EXPERIMENT_SUBGROUP_ROUTING` | Per-leaf subgroup representative routing (ignored when global routing is on) | off | experiment (rejected quota policy) |
 | `ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING` | Rank all frontier subgroup representatives together and scan a prefix covering ≥75% of rows | off | experiment |
 | `ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING` | Lazily built, generation-owned int8 representative hints for global routing | off | experiment |
 | `ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS` | Conservative source-space balls on subgroup layouts; prune only on strict bound comparison | off | experiment |
