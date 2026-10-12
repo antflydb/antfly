@@ -1,0 +1,428 @@
+{
+  "status": "pass",
+  "backend": "metal",
+  "binary_sha256": "20abcb96ef2fe67f587fa0cabf285c84bb479835a1a5e32017fdba513a76b069",
+  "tool_sha256": "9643e060fe7599d3badc543f206df07fe011e200ef83b309dbca306def9078a0",
+  "corpus_sha256": "289386832facf05fdb0a6331cadaadaa956145e1c3606ebe10d5229c1e183eee",
+  "oracle_sha256": "f9390a200d51b8d2f27e317516e32935641f455d006fe5f3e451beb06a3fd4e1",
+  "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+  "cases": {
+    "vfr-reference": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999987647,
+        "max_abs": 1.7881393432617188e-07,
+        "actual_norm": 0.9999999935755337
+      }
+    },
+    "vfr-timestamps": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999973188,
+        "max_abs": 3.166496753692627e-07,
+        "actual_norm": 1.000000015139245
+      }
+    },
+    "paff-reference": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999984701,
+        "max_abs": 1.9883736968040466e-07,
+        "actual_norm": 1.0000000262604578
+      }
+    },
+    "paff-timestamps": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999991704,
+        "max_abs": 1.7881393432617188e-07,
+        "actual_norm": 1.0000000221268985
+      }
+    },
+    "vp9-timestamps": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999989747,
+        "max_abs": 1.9604340195655823e-07,
+        "actual_norm": 0.9999999473788276
+      }
+    },
+    "av1-timestamps": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999981801,
+        "max_abs": 2.3096799850463867e-07,
+        "actual_norm": 1.0000000142461245
+      }
+    },
+    "sintel-window-0": {
+      "standalone_pytorch": {
+        "cosine": 0.999999999998094,
+        "max_abs": 2.5797635316848755e-07,
+        "actual_norm": 1.0000000370049982
+      }
+    },
+    "sintel-window-20": {
+      "standalone_pytorch": {
+        "cosine": 0.9999999999946637,
+        "max_abs": 3.8463622331619263e-07,
+        "actual_norm": 0.9999999956773443
+      }
+    }
+  },
+  "limits": "Request-scoped projection reuse; timings are diagnostic, without a performance gate. Cache ownership/counters are qualified by native unit tests.",
+  "baseline_binary_sha256": "7dd7d539cf55e7bec21399664b73b41101993c87f2878d9036c6cdfbb405499c",
+  "uncached_batch_completed_seconds": 25.653985,
+  "baseline_model_identity": "7c034a322f810a719cc3183d82c71e902f9a5588722cdf585dc6065849d43b78",
+  "baseline_server_memory": {
+    "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+    "samples": 235,
+    "peak_bytes": 2121220096,
+    "first_bytes": 6537216,
+    "last_bytes": 1250541568,
+    "errors": []
+  },
+  "batch_completed_seconds": 14.673828542000003,
+  "ordered_batch": [
+    {
+      "index": 0,
+      "case": "vfr-first",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999412658069
+      }
+    },
+    {
+      "index": 1,
+      "case": "vfr-reference",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999935755337
+      },
+      "standalone": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999935755337
+      },
+      "pytorch": {
+        "cosine": 0.9999999999987647,
+        "max_abs": 1.7881393432617188e-07,
+        "actual_norm": 0.9999999935755337
+      }
+    },
+    {
+      "index": 2,
+      "case": "vfr-timestamps",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 1.000000015139245
+      },
+      "standalone": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 1.000000015139245
+      },
+      "pytorch": {
+        "cosine": 0.9999999999973188,
+        "max_abs": 3.166496753692627e-07,
+        "actual_norm": 1.000000015139245
+      }
+    },
+    {
+      "index": 3,
+      "case": "vfr-reference",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999935755337
+      },
+      "standalone": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999935755337
+      },
+      "pytorch": {
+        "cosine": 0.9999999999987647,
+        "max_abs": 1.7881393432617188e-07,
+        "actual_norm": 0.9999999935755337
+      }
+    },
+    {
+      "index": 4,
+      "case": "paff-first",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999946973805
+      }
+    },
+    {
+      "index": 5,
+      "case": "paff-reference",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000262604578
+      },
+      "standalone": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000262604578
+      },
+      "pytorch": {
+        "cosine": 0.9999999999984701,
+        "max_abs": 1.9883736968040466e-07,
+        "actual_norm": 1.0000000262604578
+      }
+    },
+    {
+      "index": 6,
+      "case": "paff-timestamps",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000221268985
+      },
+      "standalone": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000221268985
+      },
+      "pytorch": {
+        "cosine": 0.9999999999991704,
+        "max_abs": 1.7881393432617188e-07,
+        "actual_norm": 1.0000000221268985
+      }
+    },
+    {
+      "index": 7,
+      "case": "paff-reference",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000262604578
+      },
+      "standalone": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000262604578
+      },
+      "pytorch": {
+        "cosine": 0.9999999999984701,
+        "max_abs": 1.9883736968040466e-07,
+        "actual_norm": 1.0000000262604578
+      }
+    },
+    {
+      "index": 8,
+      "case": "vp9-first",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000046892765
+      }
+    },
+    {
+      "index": 9,
+      "case": "vp9-timestamps",
+      "uncached": {
+        "cosine": 0.9999999999999999,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999473788276
+      },
+      "standalone": {
+        "cosine": 0.9999999999999999,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999473788276
+      },
+      "pytorch": {
+        "cosine": 0.9999999999989747,
+        "max_abs": 1.9604340195655823e-07,
+        "actual_norm": 0.9999999473788276
+      }
+    },
+    {
+      "index": 10,
+      "case": "vp9-timestamps",
+      "uncached": {
+        "cosine": 0.9999999999999999,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999473788276
+      },
+      "standalone": {
+        "cosine": 0.9999999999999999,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999473788276
+      },
+      "pytorch": {
+        "cosine": 0.9999999999989747,
+        "max_abs": 1.9604340195655823e-07,
+        "actual_norm": 0.9999999473788276
+      }
+    },
+    {
+      "index": 11,
+      "case": "av1-first",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999891381642
+      }
+    },
+    {
+      "index": 12,
+      "case": "av1-timestamps",
+      "uncached": {
+        "cosine": 0.9999999999999998,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000142461245
+      },
+      "standalone": {
+        "cosine": 0.9999999999999998,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000142461245
+      },
+      "pytorch": {
+        "cosine": 0.9999999999981801,
+        "max_abs": 2.3096799850463867e-07,
+        "actual_norm": 1.0000000142461245
+      }
+    },
+    {
+      "index": 13,
+      "case": "av1-timestamps",
+      "uncached": {
+        "cosine": 0.9999999999999998,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000142461245
+      },
+      "standalone": {
+        "cosine": 0.9999999999999998,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000142461245
+      },
+      "pytorch": {
+        "cosine": 0.9999999999981801,
+        "max_abs": 2.3096799850463867e-07,
+        "actual_norm": 1.0000000142461245
+      }
+    },
+    {
+      "index": 14,
+      "case": "sintel-window-0",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000370049982
+      },
+      "standalone": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000370049982
+      },
+      "pytorch": {
+        "cosine": 0.999999999998094,
+        "max_abs": 2.5797635316848755e-07,
+        "actual_norm": 1.0000000370049982
+      }
+    },
+    {
+      "index": 15,
+      "case": "sintel-overlap",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000082933174
+      }
+    },
+    {
+      "index": 16,
+      "case": "sintel-window-20",
+      "uncached": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999956773443
+      },
+      "standalone": {
+        "cosine": 1.0,
+        "max_abs": 0.0,
+        "actual_norm": 0.9999999956773443
+      },
+      "pytorch": {
+        "cosine": 0.9999999999946637,
+        "max_abs": 3.8463622331619263e-07,
+        "actual_norm": 0.9999999956773443
+      }
+    },
+    {
+      "index": 17,
+      "case": "sintel-window-0",
+      "uncached": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000370049982
+      },
+      "standalone": {
+        "cosine": 1.0000000000000002,
+        "max_abs": 0.0,
+        "actual_norm": 1.0000000370049982
+      },
+      "pytorch": {
+        "cosine": 0.999999999998094,
+        "max_abs": 2.5797635316848755e-07,
+        "actual_norm": 1.0000000370049982
+      }
+    }
+  ],
+  "multipart": [
+    {
+      "cosine": 1.0,
+      "max_abs": 0.0,
+      "actual_norm": 1.000000006095366
+    },
+    {
+      "cosine": 1.0,
+      "max_abs": 0.0,
+      "actual_norm": 1.0000000546366246
+    }
+  ],
+  "retrieval": {
+    "max_score_error": 1.7988970824056594e-07,
+    "rankings": {
+      "queries": {
+        "query-pattern": {
+          "max_score_error": 1.5041693446349313e-07,
+          "exact_ranking": true,
+          "top_k_overlap": {
+            "1": 1.0,
+            "3": 1.0,
+            "5": 1.0
+          },
+          "non_tied_inversions": []
+        },
+        "query-scene": {
+          "max_score_error": 1.7988970824056594e-07,
+          "exact_ranking": true,
+          "top_k_overlap": {
+            "1": 1.0,
+            "3": 1.0,
+            "5": 1.0
+          },
+          "non_tied_inversions": []
+        }
+      },
+      "pass": true
+    }
+  },
+  "independent_request": {
+    "cosine": 1.0,
+    "max_abs": 0.0,
+    "actual_norm": 1.000000015139245
+  },
+  "model_identity": "7c034a322f810a719cc3183d82c71e902f9a5588722cdf585dc6065849d43b78",
+  "server_memory": {
+    "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+    "samples": 300,
+    "peak_bytes": 2296102912,
+    "first_bytes": 1556480,
+    "last_bytes": 1414496256,
+    "errors": []
+  }
+}

@@ -49,6 +49,7 @@ fn partBytes(part: Part) []const u8 {
 }
 pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
 pub const Options = struct { task_type: []const u8 = "RETRIEVAL_DOCUMENT", dimensions: usize = 768 };
+pub const FrameCache = @import("embedding_gemma2_video.zig").FrameCache;
 pub const Result = struct { vector: []f32, input_tokens: usize };
 
 const CT = @import("../ops/ops.zig").CT;
@@ -65,14 +66,21 @@ pub fn workspaceBackingAllocator(backend: @import("../backends/backends.zig").Ba
 }
 
 pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+    return embedCached(out, session, tokenizer, group, options, lock, control, null);
+}
+pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
+    if (cache) |owner| {
+        if (owner.session.ptr != session.ptr or owner.session.vtable != session.vtable) return error.InvalidVideoCacheSession;
+        owner.control = control orelse .{};
+    }
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
-    const result = embedScoped(bounded.allocator(), session, tokenizer, group, options, lock, control) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    const result = embedScoped(bounded.allocator(), session, tokenizer, group, options, lock, control, cache) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
     defer bounded.allocator().free(result.vector);
     return .{ .vector = try out.dupe(f32, result.vector), .input_tokens = result.input_tokens };
 }
 
-fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroup(group, options);
     var input_bytes: usize = 0;
@@ -129,7 +137,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                 inline .video, .sampled_video => |payload| {
                     const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.start(a, io, context.device, bytes, effective, sampling, &video_budget);
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startCached(a, io, context.device, bytes, effective, sampling, &video_budget, cache);
                     break;
                 },
                 else => {},
@@ -141,7 +149,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const prepared = try prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched);
+    const prepared = try prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched, cache);
     defer prepared.deinit(a);
     const count = prepared.ids.len;
     const mask = prepared.mask;
@@ -189,9 +197,9 @@ const PreparedGroup = struct {
 };
 
 fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control) !PreparedGroup {
-    return prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, null, null);
+    return prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, null, null, null);
 }
-fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control, video_budget: ?*media_admission.Pool, prefetched: ?*@import("embedding_gemma2_video.zig").Prefetch) !PreparedGroup {
+fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control, video_budget: ?*media_admission.Pool, prefetched: ?*@import("embedding_gemma2_video.zig").Prefetch, cache: ?*FrameCache) !PreparedGroup {
     const image_scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer image_scope.deinit();
     const prefix = try encoder.taskPrefix(options.task_type);
@@ -229,7 +237,7 @@ fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.z
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encode(cb);
-                } else try @import("embedding_gemma2_video.zig").encodeWithBudget(a, cb, bytes, effective, sampling, video_budget);
+                } else try @import("embedding_gemma2_video.zig").encodeCached(a, cb, bytes, effective, sampling, video_budget, cache);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {

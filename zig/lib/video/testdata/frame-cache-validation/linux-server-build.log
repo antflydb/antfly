@@ -1,0 +1,19 @@
+Build Summary: 14/14 steps succeeded
+bench-server success
++- install antfly-inference-bench-server success
+   +- compile exe antfly-inference-bench-server safe aarch64-linux-musl success 9m MaxRSS:4G
+      +- WriteFile cached
+      +- compile obj antfly-build-info safe aarch64-linux-musl success 177ms MaxRSS:99M
+      |  +- options cached
+      +- compile obj antfly-build-info safe aarch64-linux-musl (+1 more reused dependencies)
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+      |  +- compile exe patch_sentencepiece_proto safe native cached 73ms MaxRSS:31M
+      |  |  +- WriteFile macos-sdk-libc.txt cached
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached
+      |  |  +- compile exe protoc-zig safe native cached 73ms MaxRSS:31M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options cached
+

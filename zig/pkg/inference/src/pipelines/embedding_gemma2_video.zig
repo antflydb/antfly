@@ -23,6 +23,8 @@ const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const build_options = @import("build_options");
 const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
+pub const FrameCache = @import("embedding_gemma2_video_cache.zig").Cache;
+const CacheTicket = @import("embedding_gemma2_video_cache.zig").Ticket;
 pub const Encoded = struct {
     embeddings: []f32,
     tensor: ?CT = null,
@@ -308,7 +310,7 @@ fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: 
 /// The caller retains input, allocator, pool, Io and (for Metal) a process guard
 /// until deinit has closed, joined and drained this owner.
 pub const Prefetch = struct {
-    const Job = union(enum) { header: []const usize, native: NativeProjectionJob, metal: ProjectionJob };
+    const Job = union(enum) { header: []const usize, native: NativeProjectionJob, metal: ProjectionJob, cached: struct { slot: usize, ticket: CacheTicket } };
     a: std.mem.Allocator,
     io: std.Io,
     bytes: []const u8,
@@ -316,6 +318,8 @@ pub const Prefetch = struct {
     sampling: Sampling,
     pool: ?*media.admission.Pool,
     device: ?*anyopaque,
+    cache: ?*FrameCache = null,
+    clip_hash: [32]u8 = @splat(0),
     preparer: ?video.preparation.Metal = null,
     storage: [2]Job = undefined,
     queue: std.Io.Queue(Job) = undefined,
@@ -326,10 +330,14 @@ pub const Prefetch = struct {
     published: std.atomic.Value(usize) = .init(0),
 
     pub fn start(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
+        return startCached(a, io, device, bytes, control, sampling, pool, null);
+    }
+    pub fn startCached(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .control = control, .sampling = sampling, .pool = pool };
+        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .control = control, .sampling = sampling, .pool = pool, .cache = cache };
+        if (cache != null and bytes.len <= 64 * 1024 * 1024) std.crypto.hash.sha2.Sha256.hash(bytes, &self.clip_hash, .{});
         self.queue = .init(&self.storage);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
@@ -361,6 +369,7 @@ pub const Prefetch = struct {
             .header => {},
             .native => |value| self.a.free(value.patches),
             .metal => |*value| value.prepared.deinit(),
+            .cached => |value| self.cache.?.restore(value.ticket),
         }
     }
     pub fn deinit(self: *Prefetch) void {
@@ -419,9 +428,27 @@ pub const Prefetch = struct {
         }
         var capture = Capture{ .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self };
         try self.put(.{ .header = selected });
+        var misses: [32]usize = undefined;
+        var miss_slots: [32]usize = undefined;
+        var missing: usize = 0;
+        for (selected, 0..) |id, slot| {
+            if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
+            if (self.cache) |cache| if (cache.take(.{ .clip = self.clip_hash, .picture = id })) |ticket| {
+                self.put(.{ .cached = .{ .slot = slot, .ticket = ticket } }) catch |err| {
+                    cache.restore(ticket);
+                    return err;
+                };
+                continue;
+            };
+            misses[missing] = id;
+            miss_slots[missing] = slot;
+            missing += 1;
+        }
+        if (missing == 0) return;
+        capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, selected, &capture, Capture.publishWebm);
-        } else try decodeSelection(a, &reader, selected, configurations, &capture);
+            try video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, misses[0..missing], &capture, Capture.publishWebm);
+        } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
     /// Only the consumer runs model operations, while the producer continues
@@ -453,7 +480,7 @@ pub const Prefetch = struct {
         };
         if (resident) |tensors| @memset(tensors, null);
         const adapter = self.control.imageWorkControl();
-        var capture = Capture{ .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native };
+        var capture = Capture{ .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash };
         defer capture.discardNativePending();
         var jobs: [2]Job = undefined;
         while (true) {
@@ -463,7 +490,7 @@ pub const Prefetch = struct {
                 self.discard(job);
             };
             try self.control.check();
-            if (jobs[0] == .metal) {
+            if (jobs[0] == .metal and (count == 1 or jobs[1] == .metal)) {
                 var gpu: [2]ProjectionJob = undefined;
                 for (jobs[0..count], 0..) |job, i| {
                     if (job != .metal) return error.InvalidTensorShape;
@@ -475,10 +502,16 @@ pub const Prefetch = struct {
                     frame_tokens[slot] = frame_tokens[job.slot];
                 };
             } else {
-                for (jobs[0..count]) |job| {
-                    if (job != .native) return error.InvalidTensorShape;
-                    const value = job.native;
-                    try capture.project(value.slot, value.patches, value.options);
+                for (jobs[0..count], 0..) |job, i| {
+                    switch (job) {
+                        .native => |value| try capture.project(value.slot, value.patches, value.options),
+                        .metal => |value| {
+                            owned[i] = false;
+                            try capture.projectGpuNow(value.slot, value.prepared, value.options);
+                        },
+                        .cached => |value| try capture.loadCached(value.slot, value.ticket),
+                        .header => return error.InvalidTensorShape,
+                    }
                 }
             }
         }
@@ -486,6 +519,7 @@ pub const Prefetch = struct {
         if (self.failure) |err| return err;
         self.releasePreparer();
         try capture.flushNativePending();
+        try capture.finishDuplicates();
         if (resident) |tensors| {
             // Each unique packet owns exactly one projection. Presentation duplicates
             // refer to that projection and are appended in sampling order.
@@ -522,6 +556,9 @@ pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes
     return encodeWithBudget(a, cb, bytes, control, sampling, null);
 }
 pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !Encoded {
+    return encodeCached(a, cb, bytes, control, sampling, pool, null);
+}
+pub fn encodeCached(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -569,7 +606,9 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
         a.free(tensors);
     };
     if (resident) |tensors| @memset(tensors, null);
-    var capture = Capture{ .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var clip_hash: [32]u8 = @splat(0);
+    if (cache != null) std.crypto.hash.sha2.Sha256.hash(bytes, &clip_hash, .{});
+    var capture = Capture{ .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -584,10 +623,25 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
         scheduler.queue.close(capture.io.?);
         thread.join();
     };
-    const decoded = if (webm)
-        video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, selected, &capture, Capture.publishWebm)
+    var misses: [32]usize = undefined;
+    var miss_slots: [32]usize = undefined;
+    var missing: usize = 0;
+    for (selected, 0..) |id, slot| {
+        if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
+        if (cache) |shared| if (shared.take(.{ .clip = clip_hash, .picture = id })) |ticket| {
+            defer shared.restore(ticket);
+            try capture.loadCached(slot, ticket);
+            continue;
+        };
+        misses[missing] = id;
+        miss_slots[missing] = slot;
+        missing += 1;
+    }
+    capture.decode_slots = miss_slots[0..missing];
+    const decoded = if (missing == 0) {} else if (webm)
+        video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, misses[0..missing], &capture, Capture.publishWebm)
     else
-        decodeSelection(a, &reader, selected, configurations, &capture);
+        decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
     if (decode_error != null) scheduler.aborted.store(true, .release);
     if (projection_thread) |thread| {
@@ -598,6 +652,7 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     }
     if (decode_error) |err| return err;
     try capture.flushNativePending();
+    try capture.finishDuplicates();
     if (resident) |tensors| {
         // Each unique packet owns exactly one projection. Presentation duplicates
         // refer to that projection and are appended in sampling order.
@@ -628,7 +683,8 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
 fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
     const control = reader.input.control;
     if (reader.track.codec == .mjpeg) {
-        for (selected, 0..) |index, slot| {
+        for (selected) |index| {
+            const slot = std.mem.indexOfScalar(usize, capture.selected, index) orelse return error.InvalidPacketIndex;
             try control.check();
             if (capture.copyDuplicate(slot)) continue;
             var frame = try video.mjpeg.decodeFrame(a, reader, index, .{});
@@ -654,7 +710,7 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
         defer batch.deinit();
     } else {
         // Decode references once for the whole selection, never once per frame.
-        if (configurations) |session| _ = try session.decodeSelected(selected, capture, Capture.publish) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publish);
+        if (configurations) |session| _ = try session.decodeSelected(selected, capture, Capture.publishDecoded) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publishDecoded);
     }
 }
 
@@ -705,6 +761,9 @@ const NativeProjectionJob = struct { slot: usize, patches: []f32, options: video
 const Capture = struct {
     a: std.mem.Allocator,
     cb: *const ComputeBackend,
+    cache: ?*FrameCache = null,
+    clip_hash: [32]u8 = @splat(0),
+    decode_slots: ?[]const usize = null,
     track: media.mp4.Track,
     webm_track: ?media.webm.Track = null,
     pool: ?*media.admission.Pool = null,
@@ -721,6 +780,33 @@ const Capture = struct {
     native_batching: bool = false,
     native_pending: ?NativeProjectionJob = null,
     claimed: [32]bool = @splat(false),
+    fn loadCached(self: *Capture, slot: usize, ticket: CacheTicket) !void {
+        try self.control.check();
+        const tokens = ticket.entry.tokens;
+        if (self.resident) |tensors| tensors[slot] = try self.cache.?.import(self.cb, ticket) else {
+            switch (ticket.entry.value) {
+                .cpu => |values| @memcpy(self.output[slot * 140 * 512 ..][0..values.len], values),
+                .device => return error.UnsupportedVideoBackend,
+            }
+        }
+        for (self.selected, 0..) |id, duplicate| if (id == self.selected[slot]) {
+            if (self.resident == null and duplicate != slot) @memcpy(self.output[duplicate * 140 * 512 ..][0 .. tokens * 512], self.output[slot * 140 * 512 ..][0 .. tokens * 512]);
+            self.frame_tokens[duplicate] = tokens;
+            self.claimed[duplicate] = true;
+        };
+    }
+    fn storeDevice(self: *Capture, slot: usize, tensor: CT, tokens: usize) void {
+        if (self.cache) |cache| cache.storeDevice(.{ .clip = self.clip_hash, .picture = self.selected[slot] }, tensor, tokens);
+    }
+    fn finishDuplicates(self: *Capture) !void {
+        for (self.selected, 0..) |id, slot| {
+            const first = std.mem.indexOfScalar(usize, self.selected, id).?;
+            const tokens = self.frame_tokens[first];
+            if (tokens == 0 or tokens > 140) return error.InvalidTensorShape;
+            if (self.resident == null and slot != first) @memcpy(self.output[slot * 140 * 512 ..][0 .. tokens * 512], self.output[first * 140 * 512 ..][0 .. tokens * 512]);
+            self.frame_tokens[slot] = tokens;
+        }
+    }
     fn copyDuplicate(self: *Capture, slot: usize) bool {
         const first = std.mem.indexOfScalar(usize, self.selected, self.selected[slot]).?;
         if (self.prefetch != null or self.scheduler != null or self.native_batching) return self.claimed[first];
@@ -795,6 +881,7 @@ const Capture = struct {
             const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
             tensors[slot] = encoded.tensor;
             self.frame_tokens[slot] = encoded.tokens;
+            self.storeDevice(slot, encoded.tensor, encoded.tokens);
             return;
         }
         const encoded = try projector.encodeEmbeddingGemma2VideoPatches(self.cb, self.a, patches, options.width, options.height);
@@ -803,6 +890,7 @@ const Capture = struct {
     }
     fn save(self: *Capture, slot: usize, encoded: anytype) !void {
         if (encoded.tokens == 0 or encoded.tokens > 140 or encoded.embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
+        if (self.cache) |cache| cache.storeCpu(.{ .clip = self.clip_hash, .picture = self.selected[slot] }, encoded.embeddings, encoded.tokens);
         @memcpy(self.output[slot * 140 * 512 ..][0..encoded.embeddings.len], encoded.embeddings);
         self.frame_tokens[slot] = encoded.tokens;
     }
@@ -876,6 +964,7 @@ const Capture = struct {
             for (jobs, 0..) |job, i| {
                 tensors[job.slot] = outputs[i];
                 self.frame_tokens[job.slot] = per_frame;
+                self.storeDevice(job.slot, outputs[i], per_frame);
             }
         } else return error.UnsupportedVideoBackend;
     }
@@ -895,6 +984,7 @@ const Capture = struct {
             if (self.resident) |tensors| {
                 tensors[slot] = encoded.tensor;
                 self.frame_tokens[slot] = encoded.tokens;
+                self.storeDevice(slot, encoded.tensor, encoded.tokens);
             } else {
                 defer self.cb.free(encoded.tensor);
                 const embeddings = try self.cb.toFloat32(encoded.tensor, self.a);
@@ -945,6 +1035,10 @@ const Capture = struct {
             if (self.resident == null) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
             self.frame_tokens[slot] = self.frame_tokens[first];
         };
+    }
+    fn publishDecoded(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+        const self: *Capture = @ptrCast(@alignCast(raw));
+        return publish(raw, if (self.decode_slots) |slots| slots[slot] else slot, frame);
     }
     fn publish(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
@@ -1309,7 +1403,7 @@ test "embeddinggemma2 video TS producer preserves prepared MP4 patches and drain
                         std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(job.patches), &hash, .{});
                         try hashes.append(a, hash);
                     },
-                    .metal => return error.TestUnexpectedResult,
+                    .metal, .cached => return error.TestUnexpectedResult,
                 }
             }
             producer.join();
@@ -1326,5 +1420,91 @@ test "embeddinggemma2 video TS producer preserves prepared MP4 patches and drain
             try std.testing.expect(original.len > 0);
             try std.testing.expectEqualSlices([32]u8, original, normalized);
         }
+    }
+}
+
+test "embeddinggemma2 video cache producer skips fully cached decode and preparation for every container" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    const session = @import("../backends/session.zig").Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = undefined } };
+    inline for (.{ "mjpeg.mov", "vp8.webm", "vp9.webm", "av1.webm", "closed.ts", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        const sampling = Sampling{ .timestamps = .{ .max_frames = 3 } };
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = bytes } };
+        const selected = if (isWebm(bytes)) blk: {
+            var reader = try media.webm.Reader.init(a, &source, .{});
+            defer reader.deinit();
+            var index = try video.webm_pictures.index(a, &reader, .{});
+            defer index.deinit();
+            break :blk try selectWebm(a, index, sampling, .{});
+        } else blk: {
+            var input = try PacketInput.init(a, &source, bytes);
+            defer input.deinit();
+            break :blk try selectWithSampling(a, &input.reader, sampling);
+        };
+        defer a.free(selected);
+        var cache = FrameCache{ .allocator = a, .session = session };
+        defer cache.deinit();
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        const values: [512]f32 = @splat(0.125);
+        for (selected) |id| cache.storeCpu(.{ .clip = hash, .picture = id }, &values, 1);
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        const producer = try Prefetch.startCached(a, std.testing.io, null, bytes, .{}, sampling, &pool, &cache);
+        var live = true;
+        defer if (live) producer.deinit();
+        var hits: usize = 0;
+        var jobs: [1]Prefetch.Job = undefined;
+        while (true) {
+            _ = producer.queue.getUncancelable(std.testing.io, &jobs, 1) catch break;
+            defer producer.discard(&jobs[0]);
+            switch (jobs[0]) {
+                .header => |ids| try std.testing.expectEqualSlices(usize, selected, ids),
+                .cached => |job| {
+                    hits += 1;
+                    try std.testing.expectEqualSlices(f32, &values, job.ticket.entry.value.cpu);
+                },
+                .native, .metal => return error.TestUnexpectedResult,
+            }
+        }
+        producer.join();
+        if (producer.failure) |err| return err;
+        producer.deinit();
+        live = false;
+        try std.testing.expectEqual(cache.stats.stored, hits);
+        try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+        const ticket = cache.take(.{ .clip = hash, .picture = selected[0] }).?;
+        cache.restore(ticket);
+    }
+}
+test "embeddinggemma2 video cache abandoned producer restores borrowed entries under backpressure" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    const session = @import("../backends/session.zig").Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = undefined } };
+    const bytes = @embedFile("../testdata/video/mjpeg.mov");
+    var cache = FrameCache{ .allocator = a, .session = session };
+    defer cache.deinit();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    const values: [512]f32 = @splat(0.125);
+    var source = media.source.Source{ .allocator = a, .identity = "cached-abort", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const selected = try select(a, &reader);
+    defer a.free(selected);
+    for (selected) |id| cache.storeCpu(.{ .clip = hash, .picture = id }, &values, 1);
+    const producer = try Prefetch.startCached(a, std.testing.io, null, bytes, .{}, .reference, null, &cache);
+    var live = true;
+    defer if (live) producer.deinit();
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (producer.published.load(.acquire) < 2) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    producer.deinit();
+    live = false;
+    for (selected) |id| {
+        const ticket = cache.take(.{ .clip = hash, .picture = id }).?;
+        cache.restore(ticket);
     }
 }

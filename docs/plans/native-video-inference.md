@@ -1190,3 +1190,35 @@ and the pinned Sintel trailer. Measurements and their limits are retained in
 `zig/lib/video/testdata/reference-storage-validation`. Remaining cross-group
 model reuse, broader codec/fuzz coverage, actual Linux follow-up and streaming
 qualification stay in the full active non-CUDA objective.
+
+### Cross-group frame projection reuse
+
+Grouped requests now retain exact frame projections across repeated and
+overlapping sampling windows, including multiple video parts inside one group.
+The cache is bound to one loaded session and keyed by immutable clip content
+and sampled picture identity. Native CPU arrays and retained Metal device
+tensors survive temporary backend teardown; device reuse adds no host readback.
+The model lock is released between groups, and existing preparation/model
+overlap remains active for missing frames. Metadata and necessary dependency
+replay remain part of strict input validation.
+
+Capacity is bounded to 128 entries and 64 MiB of retained payload/buffer spans,
+with shared per-entry admission held across execution permits. Whole-buffer
+charges account for retained views. Producer tickets prevent eviction while
+queued and return ownership during cancellation and failure. Device cleanup
+keeps its process protection guard until the retained buffers are released.
+
+The pretrained qualification compares ordered repeated/mixed-hit groups and
+multiple video parts against the pinned uncached binary and PyTorch oracle,
+including VFR, PAFF, VP9, AV1 and long Sintel windows. Receipts live under
+`zig/lib/video/testdata/frame-cache-validation`. Actual Linux ARM64 now passes
+174 decoder tests (27 skips) and 31 model/cache tests (three skips), closing the
+previous progressive H.264 runtime follow-up. Broader sustained scheduling,
+cache tuning, real-world codec/display coverage and streaming integration stay
+in the full active non-CUDA objective.
+
+The final pretrained grouped/multipart preservation run passes on native CPU,
+Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
+match their pinned uncached binaries exactly; reference rankings/top-1/3/5
+overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
+receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.

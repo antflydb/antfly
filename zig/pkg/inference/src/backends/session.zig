@@ -875,6 +875,16 @@ pub const Session = struct {
         };
     }
 
+    /// Owned media cache allocations can outlive a single execution permit.
+    /// Charge them independently until eviction, including full device buffers
+    /// retained by views rather than only their logical tensor payload.
+    pub fn admitRetainedMedia(self: Session, host_bytes: usize, device_bytes: usize) !RunPermit {
+        return .{ .session = self, .lease = if (self.run_admission) |admission|
+            try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes })
+        else
+            null };
+    }
+
     pub fn admitResidentInputs(self: Session, inputs: []const ResidentInput) !RunPermit {
         return .{
             .session = self,

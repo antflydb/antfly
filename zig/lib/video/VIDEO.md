@@ -1725,3 +1725,40 @@ SHA-256 of the prepared CPU patch arrays. Hashing and job cleanup are included
 in the completed timing. `install-video-benchmark` installs this executable.
 The pinned trailer comparison and qualification gates are recorded in
 [testdata/reference-storage-validation](testdata/reference-storage-validation/README.md).
+
+### Request-local projected-frame reuse
+
+The EmbeddingGemma 2 pipeline now reuses complete frame projections across
+overlapping video parts and groups in one request. Entries are keyed by the
+SHA-256 of the exact clip bytes and the model sampler's picture identity, and
+bound to one loaded model session. CPU entries own F32 arrays; Metal entries
+retain dense F32 device tensors across compute-wrapper teardown. The sampler
+still opens and validates container/header metadata. Missing interframes still
+replay required dependencies; cached targets skip preparation and projection,
+and a fully cached selection skips reconstruction.
+
+The cache holds up to 128 entries and 64 MiB of retained payload/allocation
+spans. Each entry keeps a separate shared admission lease until eviction or
+request cleanup. Device views charge the full underlying buffer span, so a
+small view cannot hide a larger retained allocation. Cache capacity, allocation
+or admission denial falls back to uncached execution. These bounds cover
+retained payloads; fixed cache metadata and process RSS are separate.
+
+Producers move entries into bounded queue tickets without manipulating Metal
+buffer reference counts. Borrowed entries cannot be evicted; consumers import
+them into the current backend and return the tickets. Queue closure and failed
+consumers return outstanding tickets before cache cleanup. A process protection
+guard remains active through cached-device cleanup. Both grouped HTTP and
+direct grouped inference own the cache inside their model handle lifetime,
+while releasing the model execution lock between groups.
+
+Sampling order, duplicate frames, frame markers, task prefixes and final
+normalization retain their existing contracts. Qualification receipts are in
+`testdata/frame-cache-validation`; wider sustained scheduling, streaming-window
+reuse and codec/display qualification remain in the active non-CUDA goal.
+
+The final pretrained grouped/multipart preservation run passes on native CPU,
+Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
+match their pinned uncached binaries exactly; reference rankings/top-1/3/5
+overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
+receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.

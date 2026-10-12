@@ -957,3 +957,33 @@ progressive payload traffic, rather than reducing memory reservation based
 on an unproven aliasing assumption. Qualification and the pinned trailer
 copying/shared comparison are recorded in
 [the reference-storage receipt](../video/testdata/reference-storage-validation/README.md).
+
+### Request-scoped model projection cache
+
+Grouped video inference owns a bounded projection cache for its request. Exact
+clip-byte hashes and sampled picture identities distinguish entries; one model
+session owns their lifetime. Native CPU entries own their arrays, while Metal
+entries retain device buffers independently of temporary compute wrappers.
+Container/header validation still runs, and uncached interframes still replay
+required coded dependencies. A fully cached selection bypasses decoding/preparation.
+
+Every retained entry holds an independent shared memory lease. Device views
+charge their full buffer span. Queue tickets preserve ownership under
+backpressure, cancellation and eviction; the model consumer performs device
+imports and retains/releases, and cleanup joins producers before releasing
+entries. The cache does not extend the model lock across groups or introduce a
+new runtime dependency. Model handle ownership and process protection remain
+active through device cache cleanup.
+
+Fresh Linux ARM64 runs now also close the earlier reference-storage runtime
+follow-up: 174 decoder tests pass with 27 platform skips, and 31 model/cache
+tests pass with three skips. The current follow-up receipts are in
+`../video/testdata/frame-cache-validation`. These results qualify their recorded
+source and binary scope; broader conformance and sustained load remain separate
+requirements of the full active goal.
+
+The final pretrained grouped/multipart preservation run passes on native CPU,
+Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
+match their pinned uncached binaries exactly; reference rankings/top-1/3/5
+overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
+receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.

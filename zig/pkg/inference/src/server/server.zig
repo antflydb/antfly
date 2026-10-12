@@ -19950,6 +19950,8 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
+        defer frame_cache.deinit();
         try loaded.verifyEmbeddingIdentity();
         const vectors = try out.alloc([]f32, groups.len);
         var count: usize = 0;
@@ -19958,7 +19960,7 @@ pub const Node = struct {
             out.free(vectors);
         }
         for (groups, vectors) |group, *vector| {
-            const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control);
+            const result = try grouped.embedCached(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control, &frame_cache);
             vector.* = result.vector;
             count += 1;
         }
@@ -20008,11 +20010,13 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
+        var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
+        defer frame_cache.deinit();
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         try loaded.verifyEmbeddingIdentity();
         for (groups, 0..) |maybe_group, index| {
             const group = maybe_group orelse continue;
-            const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
+            const result = grouped.embedCached(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control, &frame_cache) catch |err| {
                 if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
                 try errors.append(a, embedItemFailure(index, err, "embedding"));
                 continue;
