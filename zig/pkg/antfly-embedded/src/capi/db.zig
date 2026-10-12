@@ -353,10 +353,15 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
     if (resolvers != .array) return;
     for (resolvers.array.items) |item| {
         if (item != .object) continue;
-        const cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
+        var cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
+        // Config replay may include catalog metadata read back by a caller.
+        // Curation is owned by the merge API and cannot be replaced inline.
+        cfg.value.merges = &.{};
+        cfg.value.merge_generation = 0;
+        cfg.value.merge_state_version = 0;
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
@@ -6879,13 +6884,18 @@ pub export fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolv
         var parsed = std.json.parseFromSlice(Mention, handle.alloc, mention_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver mention JSON");
         defer parsed.deinit();
         const resolver_lib = @import("antfly_resolver");
-        var resolver = resolver_lib.Resolver.initFromParts(handle.alloc, cfg.table, cfg.key_template, .{ .labels = cfg.labels }, cfg.type_must_match, "") catch |err| return capi.mapError(err);
+        const routing = @import("../storage/db/resolution_runtime.zig");
+        const excluded = routing.siblingClaimedLabelsAlloc(handle.alloc, configs, &cfg) catch |err| return capi.mapError(err);
+        defer routing.freeSiblingClaimedLabels(handle.alloc, excluded);
+        var resolver = resolver_lib.Resolver.initFromParts(handle.alloc, cfg.table, cfg.key_template, .{ .labels = cfg.labels, .exclude_labels = excluded }, cfg.type_must_match, "") catch |err| return capi.mapError(err);
         defer resolver.deinit();
         if (!resolver.consumesLabel(parsed.value.label)) return capi.mapErrorContext(error.InvalidArgument, "mention label is not consumed by this resolver");
         const minted = resolver.renderKeyAlloc(handle.alloc, .{ .text = parsed.value.text, .label = parsed.value.label, .local_id = parsed.value.local_id }) catch |err| return capi.mapErrorContext(err, "rendering resolver key");
         defer handle.alloc.free(minted);
-        const key = resolver_lib.canonicalAliasKey(cfg.aliases, minted) catch |err| return capi.mapError(err);
-        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.config_generation }) catch |err| return capi.mapError(err);
+        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer handle.alloc.free(effective_aliases);
+        const key = resolver_lib.canonicalAliasKey(effective_aliases, minted) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration() }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -6970,17 +6980,20 @@ pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolv
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
         defer aliases.deinit(handle.alloc);
-        for (cfg.aliases) |alias| {
+        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer handle.alloc.free(effective_aliases);
+        for (effective_aliases) |alias| {
             if (std.mem.eql(u8, alias.key, parsed.value.key)) {
                 if (std.mem.eql(u8, alias.target, parsed.value.target)) return .ok;
                 return capi.mapErrorContext(error.InvalidArgument, "key already redirects; merge its canonical target instead");
             }
-            aliases.append(handle.alloc, alias) catch |err| return capi.mapError(err);
         }
+        aliases.appendSlice(handle.alloc, cfg.merges) catch |err| return capi.mapError(err);
         aliases.append(handle.alloc, .{ .key = parsed.value.key, .target = parsed.value.target }) catch |err| return capi.mapError(err);
         var next = cfg;
-        next.aliases = aliases.items;
-        next.config_generation = std.math.add(u64, cfg.config_generation, 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
+        next.merges = aliases.items;
+        next.merge_state_version = 1;
+        next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
         _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
         return .ok;
     }

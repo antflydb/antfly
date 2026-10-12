@@ -284,7 +284,7 @@ fn processResolutionArtifactWithCatalog(
         var current = false;
         for (resolvers) |cfg| {
             if (std.mem.eql(u8, cfg.resolution_artifact, key.artifact_name) and
-                cfg.config_generation == parsed.config_generation)
+                cfg.effectiveGeneration() == parsed.config_generation)
             {
                 // Resolve-only catalogs retain graph identities without creating
                 // entity documents. Previously admitted sink work is recovered above.

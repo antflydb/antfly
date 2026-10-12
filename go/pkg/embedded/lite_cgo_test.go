@@ -2697,12 +2697,6 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 	if err := entities.AddIndexJSON([]byte(`{"name":"names","type":"embeddings","dims":1024,"field":"canonical_name","metric":"cosine","embedder":{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF"}}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := entities.BatchJSON([]byte(`{"inserts":{"concept/canonical":{"entity_type":"concept","canonical_name":"The approval reviewer"}},"sync_level":"write"}`)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.RunUntilIdleStatus(); err != nil {
-		t.Fatal(err)
-	}
 	scorer := `{"comparisons":[{"name":"embedding","left":"name_embedding","right":"name_embedding","levels":[{"when":"cosine > 0.5","weight":8.0},{"else":true,"weight":-6.0}]}],"combine":{"bias":-3.0},"decision":{"match":0.9}}`
 	config := map[string]any{"name": "knowledge", "type": "graph",
 		"source":     map[string]any{"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
@@ -2715,6 +2709,17 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 		t.Fatal(err)
 	}
 	if err := db.AddIndexJSON(raw); err != nil {
+		t.Fatal(err)
+	}
+	// Seed the ANN candidate through extraction promotion, never a direct
+	// entity-table write. A root drain must make its generated vector visible.
+	if _, err := db.BatchJSON([]byte(`{"inserts":{"claim:seed":{"kg":{"entities":[{"id":"e0","label":"concept","text":"The approval reviewer"}]} }},"sync_level":"write"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entities.LookupJSON("concept/the_approval_reviewer"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.BatchJSON([]byte(`{"inserts":{"claim:reviewer":{"kg":{"entities":[{"id":"e0","label":"concept","text":"Approval reviewer"}]} }},"sync_level":"write"}`)); err != nil {
@@ -2740,7 +2745,7 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(key) != "concept/canonical" {
+	if string(key) != "concept/the_approval_reviewer" {
 		t.Fatalf("generated embeddings failed to merge the mention: %s", key)
 	}
 	query, err := db.ResolveQueryJSON("concepts", []byte(`{"extraction":{"entities":[{"id":"q0","label":"concept","text":"Approval reviewer"}]}}`))
@@ -2761,7 +2766,7 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 	if err := json.Unmarshal(query, &result); err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Resolution.Entities) != 1 || result.Resolution.Entities[0].DocRef.Key != "concept/canonical" || result.Resolution.Entities[0].DocRef.Table != "entities" || result.Resolution.Entities[0].Decision != "match" {
+	if len(result.Resolution.Entities) != 1 || result.Resolution.Entities[0].DocRef.Key != "concept/the_approval_reviewer" || result.Resolution.Entities[0].DocRef.Table != "entities" || result.Resolution.Entities[0].Decision != "match" {
 		t.Fatalf("query embedding/ANN resolution = %s", query)
 	}
 }

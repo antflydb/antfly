@@ -90,6 +90,10 @@ pub const ResolverConfig = struct {
     key_template: []const u8,
     /// Explicit key redirects, usable without entity promotion.
     aliases: []const resolver_lib.KeyAlias = &.{},
+    /// API-created redirects are durable identity state, never inline config.
+    merges: []const resolver_lib.KeyAlias = &.{},
+    merge_generation: u64 = 0,
+    merge_state_version: u32 = 0,
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
     /// Mention labels this resolver consumes. Empty means all labels
@@ -155,10 +159,47 @@ pub const ResolverConfig = struct {
                 if (a.len != b.len) return false;
                 for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
             } else if (field_type == []const resolver_lib.KeyAlias) {
-                if (!aliasesEqual(self.aliases, other.aliases)) return false;
+                if (!aliasesEqual(@field(self, reflected_name), @field(other, reflected_name))) return false;
             } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
         }
         return true;
+    }
+
+    pub fn effectiveGeneration(self: ResolverConfig) u64 {
+        return @max(self.config_generation, self.merge_generation);
+    }
+
+    /// Borrowed strings, owned array. Durable curation wins over inline aliases.
+    pub fn effectiveAliasesAlloc(self: ResolverConfig, alloc: Allocator) ![]const resolver_lib.KeyAlias {
+        var result: std.ArrayList(resolver_lib.KeyAlias) = .empty;
+        errdefer result.deinit(alloc);
+        for (self.aliases) |alias| {
+            var redirected = false;
+            for (self.merges) |merge| if (std.mem.eql(u8, alias.key, merge.key)) {
+                redirected = true;
+                break;
+            };
+            if (!redirected) try result.append(alloc, alias);
+        }
+        try result.appendSlice(alloc, self.merges);
+        return try result.toOwnedSlice(alloc);
+    }
+
+    /// Default catalogs retain their pre-extension wire shape. Required merge
+    /// metadata stays versioned; old strict readers reject it rather than
+    /// silently forgetting curated identity state on a downgrade.
+    pub fn jsonStringify(self: ResolverConfig, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "merges")) {
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else false;
+                if (!omit) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+        }
+        try writer.endObject();
     }
 
     /// Whether this resolver consumes mentions with the given label. An empty
@@ -175,7 +216,7 @@ pub const ResolverConfig = struct {
         return true;
     }
 
-    fn cloneAliases(alloc: Allocator, aliases: []const resolver_lib.KeyAlias) ![]const resolver_lib.KeyAlias {
+    pub fn cloneAliases(alloc: Allocator, aliases: []const resolver_lib.KeyAlias) ![]const resolver_lib.KeyAlias {
         const out = try alloc.alloc(resolver_lib.KeyAlias, aliases.len);
         var initialized: usize = 0;
         errdefer {
@@ -203,6 +244,9 @@ pub const ResolverConfig = struct {
             .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
             .key_template = try alloc.dupe(u8, cfg.key_template),
             .aliases = try cloneAliases(alloc, cfg.aliases),
+            .merges = try cloneAliases(alloc, cfg.merges),
+            .merge_generation = cfg.merge_generation,
+            .merge_state_version = cfg.merge_state_version,
             .promote = cfg.promote,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
@@ -232,6 +276,11 @@ pub const ResolverConfig = struct {
             alloc.free(alias.target);
         }
         alloc.free(self.aliases);
+        for (self.merges) |alias| {
+            alloc.free(alias.key);
+            alloc.free(alias.target);
+        }
+        alloc.free(self.merges);
         for (self.labels) |l| alloc.free(@constCast(l));
         if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
@@ -249,6 +298,11 @@ pub const ResolverConfig = struct {
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
         try resolver_lib.validateAliases(self.aliases);
+        try resolver_lib.validateAliases(self.merges);
+        if (self.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
+        const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(effective);
+        try resolver_lib.validateAliases(effective);
         if (self.name.len == 0 or
             self.table.len == 0 or
             self.source_artifact.len == 0 or
@@ -305,6 +359,7 @@ pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
     const parsed = try std.json.parseFromSlice([]ResolverConfig, alloc, data, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
 
@@ -315,10 +370,41 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
         alloc.free(out);
     }
     for (parsed.value, 0..) |cfg, i| {
+        if (cfg.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
         out[i] = try ResolverConfig.clone(alloc, cfg);
         initialized += 1;
     }
     return out;
+}
+
+pub const merge_catalog_key = "\x00\x00__metadata__:resolver_merges_v1";
+const MergeState = struct { name: []const u8, aliases: []const resolver_lib.KeyAlias };
+
+pub fn serializeMergeState(alloc: Allocator, configs: []const ResolverConfig) ![]u8 {
+    var states: std.ArrayList(MergeState) = .empty;
+    defer states.deinit(alloc);
+    for (configs) |cfg| if (cfg.merges.len > 0) {
+        try states.append(alloc, .{ .name = cfg.name, .aliases = cfg.merges });
+    };
+    return try std.json.Stringify.valueAlloc(alloc, states.items, .{});
+}
+
+pub fn applyMergeState(alloc: Allocator, configs: []ResolverConfig, data: []const u8) !void {
+    var parsed = try std.json.parseFromSlice([]MergeState, alloc, data, .{});
+    defer parsed.deinit();
+    for (parsed.value) |state| {
+        var found = false;
+        for (configs) |*cfg| {
+            if (!std.mem.eql(u8, cfg.name, state.name)) continue;
+            if (cfg.merges.len > 0 or cfg.merge_state_version != 1 or cfg.merge_generation == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
+            cfg.merges = try ResolverConfig.cloneAliases(alloc, state.aliases);
+            try cfg.validate();
+            found = true;
+            break;
+        }
+        if (!found) return error.InvalidResolverMergeState;
+    }
+    for (configs) |cfg| if ((cfg.merge_generation > 0 or cfg.merge_state_version > 0) and cfg.merges.len == 0) return error.MissingResolverMergeState;
 }
 
 test "resolver catalog round trip" {
@@ -560,4 +646,36 @@ test "resolver config validates required references and candidate mode" {
     ann_with_index.candidate_search = "ann";
     ann_with_index.candidate_ann_index = "entity_name_embedding";
     try ann_with_index.validate();
+}
+
+test "capi resolver catalog preserves legacy defaults and versions durable merge state" {
+    const alloc = std.testing.allocator;
+    var cfg = ResolverConfig{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .config_generation = 1 };
+    const legacy = try serializeCatalog(alloc, &.{cfg});
+    defer alloc.free(legacy);
+    for ([_][]const u8{ "aliases", "promote", "merges", "merge_generation", "merge_state_version" }) |field| try std.testing.expect(std.mem.indexOf(u8, legacy, field) == null);
+    cfg.merges = &.{.{ .key = "a", .target = "b" }};
+    cfg.merge_generation = 2;
+    cfg.merge_state_version = 1;
+    const catalog = try serializeCatalog(alloc, &.{cfg});
+    defer alloc.free(catalog);
+    const sidecar = try serializeMergeState(alloc, &.{cfg});
+    defer alloc.free(sidecar);
+    const restored = try deserializeCatalog(alloc, catalog);
+    defer {
+        for (restored) |*entry| entry.deinit(alloc);
+        alloc.free(restored);
+    }
+    try std.testing.expectError(error.MissingResolverMergeState, applyMergeState(alloc, restored, "[]"));
+    try applyMergeState(alloc, restored, sidecar);
+    try std.testing.expectEqualStrings("b", restored[0].merges[0].target);
+    try std.testing.expectEqual(@as(u64, 2), restored[0].effectiveGeneration());
+    const future = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"future_optional_note\":true}]";
+    const forward = try deserializeCatalog(alloc, future);
+    defer {
+        for (forward) |*entry| entry.deinit(alloc);
+        alloc.free(forward);
+    }
+    const unsupported = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"merge_state_version\":2}]";
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, deserializeCatalog(alloc, unsupported));
 }

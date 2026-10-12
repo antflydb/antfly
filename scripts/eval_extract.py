@@ -116,7 +116,12 @@ def evaluate(inference, config: dict, corpus: list[dict]) -> dict:
     started = time.perf_counter()
     for row in corpus:
         request = {**config, "inputs": [{"id": row["id"], "content": row["text"]}]}
-        output = inference.extract(request)
+        try:
+            output = inference.extract(request)
+        except Exception as exc:
+            raise RuntimeError(
+                f"extraction failed for document {row['id']!r}: {exc}"
+            ) from exc
         data = output["data"]
         if (
             len(data) != 1
@@ -180,7 +185,14 @@ def main() -> None:
     ) as inference:
         report["installed_models"] = inference.list_models()
         for path in args.config:
-            result = evaluate(inference, json.loads(path.read_text()), corpus)
+            try:
+                result = evaluate(inference, json.loads(path.read_text()), corpus)
+            except Exception as exc:
+                report["failure"] = {"config_path": str(path), "error": str(exc)}
+                args.output.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+                )
+                raise
             report["runs"].append(
                 {
                     "config_path": str(path),

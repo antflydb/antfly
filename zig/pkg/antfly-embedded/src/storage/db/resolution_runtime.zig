@@ -128,7 +128,7 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_k
 /// sibling configs); free it with `gpa`. Labeled resolvers need no exclusions
 /// (admission keeps sibling label sets disjoint), so this returns empty for
 /// them without allocating.
-fn siblingClaimedLabelsAlloc(
+pub fn siblingClaimedLabelsAlloc(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
@@ -146,7 +146,7 @@ fn siblingClaimedLabelsAlloc(
     return try claimed.toOwnedSlice(gpa);
 }
 
-fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
+pub fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
     if (labels.len > 0) gpa.free(labels);
 }
 
@@ -225,13 +225,15 @@ pub fn resolveExtraction(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    resolver.aliases = cfg.aliases;
+    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
+    defer gpa.free(effective_aliases);
+    resolver.aliases = effective_aliases;
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
     parsed.entities = resolver.filterEntitiesByLabel(parsed.entities);
 
-    var resolution = try resolver.resolve(gpa, cfg.config_generation, parsed.entities, candidates);
+    var resolution = try resolver.resolve(gpa, cfg.effectiveGeneration(), parsed.entities, candidates);
     defer resolution.deinit();
 
     const bytes = try resolution.toJson(gpa);
@@ -405,7 +407,9 @@ pub fn processChangedExtractionWithConfig(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    resolver.aliases = cfg.aliases;
+    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
+    defer gpa.free(effective_aliases);
+    resolver.aliases = effective_aliases;
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -485,7 +489,7 @@ pub fn processChangedExtractionWithConfig(
 
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
-        .config_generation = cfg.config_generation,
+        .config_generation = cfg.effectiveGeneration(),
         .embedder = stage_embedder,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,

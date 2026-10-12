@@ -225,32 +225,31 @@ def test_public_traversal_retains_each_seed_path(aflite_path) -> None:
 def test_query_resolution_uses_durable_aliases_without_promotion(aflite_path) -> None:
     options = antfly_embedded.OpenOptions(profile=antfly_embedded.Profile.NATIVE)
     with antfly_embedded.create_with_options(aflite_path, options) as db:
-        db.add_index(
-            {
-                "name": "knowledge",
-                "type": "graph",
-                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
-                "artifact": {
-                    "name": "kg",
-                    "kind": "asset",
-                    "source": {"type": "field", "value": "kg"},
-                    "content_type": "application/json",
-                },
-                "edge_types": [{"name": "mentions"}],
-                "resolvers": [
-                    {
-                        "name": "concepts",
-                        "table": "default",
-                        "promote": False,
-                        "source_artifact": "kg",
-                        "resolution_artifact": "resolved",
-                        "key_template": "concept/{{ uslug _entity.text }}",
-                        "aliases": [{"key": "concept/qwen3", "target": "concept/qwen"}],
-                        "config_generation": 1,
-                    }
-                ],
-            }
-        )
+        config = {
+            "name": "knowledge",
+            "type": "graph",
+            "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+            "artifact": {
+                "name": "kg",
+                "kind": "asset",
+                "source": {"type": "field", "value": "kg"},
+                "content_type": "application/json",
+            },
+            "edge_types": [{"name": "mentions"}],
+            "resolvers": [
+                {
+                    "name": "concepts",
+                    "table": "default",
+                    "promote": False,
+                    "source_artifact": "kg",
+                    "resolution_artifact": "resolved",
+                    "key_template": "concept/{{ uslug _entity.text }}",
+                    "aliases": [{"key": "concept/qwen3", "target": "concept/qwen"}],
+                    "config_generation": 1,
+                }
+            ],
+        }
+        db.add_index(config)
         request = {"extraction": {"entities": [{"id": "q0", "label": "concept", "text": "QWEN3"}]}}
         result = db.resolve_query("concepts", request)
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen"
@@ -263,6 +262,13 @@ def test_query_resolution_uses_durable_aliases_without_promotion(aflite_path) ->
             db.resolve_query("concepts", {"text": "Qwen3"})
         db.merge_resolver_keys("concepts", "concept/qwen", "concept/qwen_embedding")
         db.run_until_idle()
+        db.delete_index("knowledge")
+        db.add_index(config)
+        db.run_until_idle()
+        assert (
+            db.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["key"]
+            == "concept/qwen_embedding"
+        )
     with antfly_embedded.open_readonly(aflite_path) as db:
         result = db.resolve_query("concepts", request)
         assert result["resolution"]["config_generation"] == 2

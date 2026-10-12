@@ -853,3 +853,46 @@ resolver is rejected rather than inventing chunk context. The text form requires
 an extractor producer; copy-only or missing source assets fail with a diagnostic.
 For callers that only need template/alias rendering, `render_resolver_key` stays
 available and avoids extraction, embeddings and candidate search.
+
+### Durable merges, config replay and compatibility
+
+API-created key merges live in `resolver_merges_v1` metadata, separately from
+inline `aliases`. The resolver catalog records their version and generation;
+merge state, generation, and backfill cursors commit in one transaction. Normal
+inline config upserts preserve merge state even when callers omit all aliases.
+Callers can keep reapplying declarative index configs on open without reading
+curated merges first. Durable merges take precedence over an inline redirect of
+the same source. Removing a resolver deliberately removes its associated merge
+state; merely replacing its configuration does not. Splits copy both catalogs.
+Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
+rather than silently resolving keys differently. Both mention and relation
+edges are reconciled on the root drain, including removal of old endpoints.
+
+Default resolver catalogs omit new default fields (`aliases:[]`, `promote:true`,
+and zero merge metadata), retaining the previous wire shape. The current reader
+tolerates unknown optional fields and rejects unsupported `merge_state_version`
+values explicitly. **Downgrading a database using aliases, disabled promotion,
+or durable merges to a library predating those features is unsupported.** Such
+old strict readers reject the feature metadata; this is intentional protection
+against silently losing identity rules. Keep a pre-upgrade backup for rollback,
+or export primary application documents and rebuild a separate older database.
+Do not delete merge metadata or strip feature fields to force an old open.
+Files written by interim PR builds are not a supported downgrade format.
+
+The normal native regression now ingests an extraction, promotes its first
+entity, computes its embedding through the enrichment runtime, drains the root,
+and matches a different mention through ANN. It uses a deterministic embedding
+provider so the ordering contract runs in ordinary CI. The opt-in Qwen test
+exercises the same promotion/drain/second-mention path with real embeddings and
+also checks ad-hoc ANN query resolution. Neither test writes a candidate entity
+or its vector by hand.
+
+The required pinned CPU extraction CI test sets
+`ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1`: missing runtime/model support is an error,
+not a skip. CI then runs `scripts/eval_extract.py` through its real-model gate on
+`regression.jsonl`, compares plain/described schemas, checks minimum precision
+and recall and non-empty correct spans for each label, and uploads the complete
+report even on failure. This 23-document curated regression set includes six
+negative documents, repeated names, accented/Arabic/Indic text, and a document
+long enough to require windowing. It remains a regression set, not a claim of
+production-domain accuracy; domain-specific labelled evaluation is still needed.

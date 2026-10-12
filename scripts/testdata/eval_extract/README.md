@@ -34,3 +34,23 @@ The first config includes cold model loading while the second reuses the
 loaded model, so their elapsed times are not a throughput comparison. Use a
 held-out labelled corpus and separately controlled warm-up for deployment
 choices. The command's report retains complete outputs and effective configs.
+
+The larger `regression.jsonl` set has 23 manually labelled documents (six
+negatives), with repeated mentions, accented/Arabic/Indic names and a long-window
+case. `scripts/ci/run_lite_extraction_eval.py` runs both configs through the real
+public inference API, requires precision/recall >= 0.5 and correct spans for both
+labels, and preserves the full report as a CI artifact. CI uses the SHA-pinned
+FP32 model prepared by `prepare_lite_graph_model.py`; an unavailable runtime
+fails this required gate. The broad 0.5 floors detect unusable extraction without
+pretending this small curated set is a representative benchmark. Do not tune a
+production threshold using these examples alone.
+
+A local run on 2026-10-12 with the same pinned FP32 bundle produced identical
+exact-span counts on CPU (`native`) and Metal, including the multi-window case:
+
+| Config | TP | FP | FN | precision | recall | F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain | 38 | 30 | 1 | 0.559 | 0.974 | 0.710 |
+| descriptions | 38 | 3 | 1 | 0.927 | 0.974 | 0.950 |
+
+These are regression results on a curated corpus, not held-out benchmark scores.
