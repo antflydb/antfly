@@ -868,4 +868,48 @@ non-CUDA qualification requirements stay active.
 
 ### Header-only WebM planning continuation
 
-Header-only displayed-picture indexing is implemented for VP8/VP9/AV1, with an explicit full-reconstruction oracle and index comparison benchmark. This removes reconstruction from the default model preflight/planning indexes while retaining reconstruction for selected replay. Focused tests compare metadata against decoded output across VP9 profiles and AV1 depth/chroma/grain/scalable policies. The full macOS gate passes 168 tests with two platform skips; actual Linux ARM64 passes 145 with 25 skips. All 4,623 unique larger-corpus picture records and sampled IDs match full reconstruction on both platforms. The metadata campaign passes 101,937 runs with correctly Smith-serialized seeds; separate acceptance gates prove 13 decoder and five metadata seeds reach valid output. Metal preserves all eight pretrained vectors and three exact rankings/top-k sets, but four of five concurrent load requests receive retryable admission denials under shared-host pressure. Current CPU pretrained parity also preserves all eight vectors and three exact rankings/top-k sets, with five successful concurrent load requests. Metal rejects three zeroed-first-packet cases and preserves clean-retry vectors; broader corruption recovery remains active. Current Linux pretrained qualification remains in progress. `zig/lib/video/testdata/header-index-validation` records the gates and diagnostic timing limits; the broader non-CUDA scope above remains active.
+Header-only displayed-picture indexing is implemented for VP8/VP9/AV1, with an explicit full-reconstruction oracle and index comparison benchmark. This removes reconstruction from the default model preflight/planning indexes while retaining reconstruction for selected replay. Focused tests compare metadata against decoded output across VP9 profiles and AV1 depth/chroma/grain/scalable policies. The full macOS gate passes 168 tests with two platform skips; actual Linux ARM64 passes 145 with 25 skips. All 4,623 unique larger-corpus picture records and sampled IDs match full reconstruction on both platforms. The metadata campaign passes 101,937 runs with correctly Smith-serialized seeds; separate acceptance gates prove 13 decoder and five metadata seeds reach valid output. Metal preserves all eight pretrained vectors and three exact rankings/top-k sets, but four of five concurrent load requests receive retryable admission denials under shared-host pressure. Current CPU pretrained parity also preserves all eight vectors and three exact rankings/top-k sets, with five successful concurrent load requests. Metal rejects three zeroed-first-packet cases and preserves clean-retry vectors; broader corruption recovery remains active. The header-only checkpoint also passes actual Linux ARM64 pretrained parity: eight vectors, three exact rankings/top-k sets, disconnect retry and five concurrent requests. `zig/lib/video/testdata/header-index-validation` records the gates and diagnostic timing limits; the broader non-CUDA scope above remains active.
+
+
+### Codec-verified selective WebM replay
+
+Logical indexes retain bounded restart records separately from displayed-picture
+metadata. VP8/VP9 points require parsed key pictures at the start of a packet;
+AV1 additionally records the latest sequence OBU span. Replay initializes codec
+private data, reads only the required prior sequence span, and starts at the
+verified key packet with the original logical output ordinal. Container sync
+hints do not authorize a restart. Reader identity and AV1 operating-point/layer
+policy must match the index. Selected replay retains entropy/pixel validation.
+
+Model producers and synchronous encoding use indexed replay. Restart metadata
+is included in shared admission and releases with the index. A synthetic
+regression compares all three codecs against packet-zero replay, including AV1
+without codec-private data or repeated sequence headers, false sync hints, duplicate
+samples, policy mismatch and allocation-failure cleanup. The `replay_compare`
+benchmark hashes 32 selected outputs in the final quarter of each real clip and
+checks their ordinals, timestamps, geometry/depth/chroma and bytes. All six corpus comparisons pass on macOS and actual Linux ARM64. Full gates
+pass 174 macOS tests (two skips), 150 Linux tests (26 skips) and 24 model tests.
+Nineteen expanded-format replay fixtures, bootstrap allocation failures and
+101,920 metadata fuzz runs pass. Six new late-window vectors plus ten existing
+sampling vectors preserve pinned PyTorch results, exact rankings/top-k and
+load/retry checks on CPU, Metal and actual Linux ARM64. Source-bound receipts
+and diagnostic timing limits are in `zig/lib/video/testdata/replay-validation`. Broader non-CUDA scope remains active.
+
+
+### RGB24 row quantization and recipe v5
+
+Late 854-pixel-wide windows exposed a preprocessing parity gap shared by CPU
+and Metal, despite matching native sample bytes and replay ordinals. Independent
+RGB24 extraction identified scalar luma-domain Q16 quantization for rows outside
+the 16-pixel vector alignment. The preparation API now includes `q16_luma`,
+implemented with bounded integer arithmetic on CPU and Metal. Model presentation
+uses Q13 component rounding for aligned rows and Q16 for nonaligned rows; high
+depth/HDR paths retain their separately declared conversion policies. This adds
+no runtime conversion-library dependency. Independent 26-pixel-wide fixtures
+cover BT.601/709/2020 and both ranges; actual Metal staging also matches CPU.
+
+The embedding identity is `embeddinggemma2-f32-mean-v5-logical-timestamps-rgb24`,
+so cached vectors cannot silently retain the older output policy. Pinned late
+window references remain unchanged and now pass on CPU, Metal and Linux ARM64,
+as do the ten existing sampling vectors and current resource/lifetime gates. Integer reference details are recorded by the fixture generator and
+[FFmpeg's RGB24 reference arithmetic](https://github.com/FFmpeg/FFmpeg/blob/n9.0.2/libswscale/yuv2rgb.c).

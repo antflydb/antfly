@@ -35,6 +35,16 @@ float3 tone_rgb(float3 encoded, constant Params &p, device const float *eotf) {
     float3 srgb = select(1.055f * pow(linear, float3(1.0f / 2.4f)) - 0.055f, 12.92f * linear, linear <= 0.0031308f);
     return clamp(floor(srgb * 255.0f + 0.5f), 0.0f, 255.0f);
 }
+float3 rgb_q16(int y, int2 uv_delta, constant Params &p) {
+    int4 c = p.bt709 == 1 ? (p.full ? int4(103206, -12275, -30678, 121608) : int4(100902, -12001, -29993, 118894))
+           : p.bt709 == 2 ? (p.full ? int4(96638, -10783, -37443, 123299) : int4(94482, -10543, -36607, 120547))
+                          : (p.full ? int4(91881, -22552, -46800, 116129) : int4(89830, -22049, -45756, 113537));
+    int2 uv = uv_delta + 128;
+    int4 displacement = (int4(uv.y, uv.x, uv.y, uv.x) * c >> 16) - (c >> 9);
+    int3 indexes = y + int3(displacement.x, displacement.y + displacement.z, displacement.w);
+    int3 value = p.full ? indexes : ((indexes + 326) * 76309 - 400 * 65536 + 32768) >> 16;
+    return float3(clamp(value, 0, 255));
+}
 float3 rgb_q13(int y, int2 uv, constant Params &p) {
     int4 c = p.bt709 ? (p.full ? int4(12901, -1534, -3835, 15201) : int4(14686, -1747, -4366, 17305))
                     : (p.full ? int4(11485, -2819, -5850, 14516) : int4(13075, -3209, -6660, 16525));
@@ -54,7 +64,8 @@ float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read>
     float stored_scale = float(1u << p.sample_shift);
     float y = floor(round(yplane.read(xy).r * storage_max) / stored_scale) / scale;
     float2 uv = floor(round(uvplane.read(xy / 2).rg * storage_max) / stored_scale) / scale - 128.0f;
-    if (p.rounding && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
+    if (p.rounding == 2 && p.depth == 8 && p.tone == 0) return rgb_q16(int(y), int2(uv), p);
+    if (p.rounding == 1 && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }
     else if (p.depth != 8) { float factor = 255.0f * scale / float((1u << p.depth) - 1u); y *= factor; uv *= factor; }
     float3 value = p.bt709 == 1 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)
@@ -121,7 +132,8 @@ float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::
     float y = float(yplane.read(xy).r >> p.sample_shift) / scale;
     float2 uv = float2(0.0f);
     if (p.chroma != 0) uv = float2(uvplane.read(xy / uint2(p.chroma == 3 ? 1 : 2, p.chroma == 1 ? 2 : 1)).rg >> p.sample_shift) / scale - 128.0f;
-    if (p.rounding && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
+    if (p.rounding == 2 && p.depth == 8 && p.tone == 0) return rgb_q16(int(y), int2(uv), p);
+    if (p.rounding == 1 && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }
     else if (p.depth != 8) { float factor = 255.0f * scale / float((1u << p.depth) - 1u); y *= factor; uv *= factor; }
     float3 value = p.bt709 == 1 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)

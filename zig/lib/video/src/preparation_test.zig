@@ -325,3 +325,31 @@ test "HDR Metal cache admission and submitted output survive preparer teardown" 
     defer a.free(expected);
     for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.000001);
 }
+
+test "video Metal Q16 integer host preparation matches portable RGB across supported SDR matrices and ranges" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try prep.Metal.init(device);
+    defer metal.deinit();
+    var y: [26 * 16]u8 = undefined;
+    var uv: [26 * 8]u8 = undefined;
+    for (&y, 0..) |*value, i| value.* = @intCast((i * 37 + 11) % 256);
+    for (&uv, 0..) |*value, i| value.* = @intCast((i * 61 + 7) % 256);
+    for ([_]prep.Matrix{ .bt601, .bt709 }) |matrix| for ([_]bool{ false, true }) |full| {
+        const host = prep.HostSurface{ .width = 26, .height = 16, .format = if (full) .nv12_full else .nv12_video, .planes = .{
+            .{ .bytes = &y, .width = 26, .height = 16, .stride = 26 },
+            .{ .bytes = &uv, .width = 13, .height = 8, .stride = 26 },
+        } };
+        const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .rgb_rounding = .q16_luma, .torchvision = true };
+        const expected = try prep.referenceHost(a, host, options, .{});
+        defer a.free(expected);
+        var result = try metal.submitHost(a, host, options, .{});
+        defer result.deinit();
+        try result.wait(std.testing.io, .{});
+        const actual = try result.readback(a);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    };
+}

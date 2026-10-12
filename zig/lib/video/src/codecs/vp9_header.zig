@@ -17,7 +17,7 @@
 const std = @import("std");
 pub const Geometry = struct { width: u32, height: u32 };
 pub const References = [8]?Geometry;
-pub const Picture = struct { geometry: Geometry, visible: bool, show_existing: bool = false };
+pub const Picture = struct { geometry: Geometry, visible: bool, show_existing: bool = false, key: bool = false };
 pub const Parts = struct { packets: [8][]const u8 = undefined, len: usize = 0 };
 const Bits = struct {
     bytes: []const u8,
@@ -147,7 +147,7 @@ pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !P
     for (0..8) |i| {
         if (refresh & (@as(u32, 1) << @intCast(i)) != 0) references[i] = geometry;
     }
-    return .{ .geometry = geometry, .visible = show };
+    return .{ .geometry = geometry, .visible = show, .key = !inter };
 }
 pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) !void {
     _ = try inspect(bytes, references, max_pixels);

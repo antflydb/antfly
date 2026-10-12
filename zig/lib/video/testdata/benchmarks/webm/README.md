@@ -89,3 +89,11 @@ and geometry, plus sampled IDs, against full reconstruction on each iteration.
 outside that interval. `container_ns` records initial container parsing. In
 comparison mode RSS includes reconstruction and is not a header-only memory
 measurement. These modes perform no model inference or GPU preparation.
+
+
+`replay_compare 2` selects 32 logical pictures from the final quarter, then
+compares packet-zero and codec-key replay. Both paths hash selected native
+samples and compare ordinals, PTS/duration, geometry, depth/chroma and colour
+metadata. Timings include selected hashing and completed decode, and exclude
+model projection/preparation. Packet counts and sequence bootstrap bytes are
+reported separately; shared-host timing does not establish capacity.

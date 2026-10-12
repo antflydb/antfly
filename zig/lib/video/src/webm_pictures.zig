@@ -25,14 +25,21 @@ const frames = @import("codecs/frame.zig");
 const vp8 = @import("vp8.zig");
 const sampling = @import("sampling.zig");
 pub const Picture = struct { pts: i64, duration: ?u64, width: u32, height: u32 };
-pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers };
+pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
+pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0 };
+pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null };
 pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []Picture,
+    restarts: []Restart = &.{},
+    reader: ?*const media.webm.Reader = null,
+    operating_point: u5 = 0,
+    all_layers: bool = true,
     reservation: media.admission.Token = .{},
     duration_seconds: ?f64 = null,
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.pictures);
+        self.allocator.free(self.restarts);
         self.reservation.deinit();
         self.* = undefined;
     }
@@ -73,6 +80,16 @@ const Collect = struct {
     allocator: std.mem.Allocator,
     pictures: std.ArrayList(Picture) = .empty,
     limit: usize,
+    restarts: std.ArrayList(Restart) = .empty,
+    restart_limit: usize = 8192,
+    fn restart(self: *Collect, value: Restart) !void {
+        if (self.restarts.items.len >= self.restart_limit) return error.ResourceLimitExceeded;
+        if (self.restarts.items.len == self.restarts.capacity) {
+            const growth = self.restarts.capacity +| (self.restarts.capacity / 2 +| 8);
+            try self.restarts.ensureTotalCapacityPrecise(self.allocator, @min(self.restart_limit, growth));
+        }
+        self.restarts.appendAssumeCapacity(value);
+    }
     fn accept(raw: *anyopaque, _: usize, frame: *const codecs.Frame) !void {
         const self: *Collect = @ptrCast(@alignCast(raw));
         try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height });
@@ -90,18 +107,23 @@ const Collect = struct {
 };
 pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options) !Index {
     const picture_budget = std.math.mul(usize, @max(options.max_pictures, 8), 2 * @sizeOf(Picture)) catch return error.ResourceLimitExceeded;
-    const metadata_bytes = std.math.add(usize, picture_budget, @sizeOf(@import("codecs/av1_headers.zig").Session)) catch return error.ResourceLimitExceeded;
+    const restart_budget = std.math.mul(usize, @max(options.max_packets, 8), 2 * @sizeOf(Restart)) catch return error.ResourceLimitExceeded;
+    const array_budget = std.math.add(usize, picture_budget, restart_budget) catch return error.ResourceLimitExceeded;
+    const metadata_bytes = std.math.add(usize, array_budget, @sizeOf(@import("codecs/av1_headers.zig").Session)) catch return error.ResourceLimitExceeded;
     var reservation = if (options.decoder.admission_pool) |pool| try pool.acquire(.{ .host_bytes = metadata_bytes }) else media.admission.Token{};
     errdefer reservation.deinit();
-    var collector = Collect{ .allocator = a, .limit = options.max_pictures };
+    var collector = Collect{ .allocator = a, .limit = options.max_pictures, .restart_limit = options.max_packets };
+    defer collector.restarts.deinit(a);
     defer collector.pictures.deinit(a);
     if (options.strategy == .headers) {
         try indexHeaders(reader, options, &collector);
     } else try walk(a, reader, options, null, &collector, Collect.accept);
     const pictures = try collector.pictures.toOwnedSlice(a);
     errdefer a.free(pictures);
-    try reservation.resize(.{ .host_bytes = pictures.len * @sizeOf(Picture) });
-    return .{ .allocator = a, .pictures = pictures, .reservation = reservation, .duration_seconds = reader.duration_seconds };
+    const restarts = try collector.restarts.toOwnedSlice(a);
+    errdefer a.free(restarts);
+    try reservation.resize(.{ .host_bytes = pictures.len * @sizeOf(Picture) + restarts.len * @sizeOf(Restart) });
+    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .reservation = reservation, .duration_seconds = reader.duration_seconds };
 }
 /// Header indexing validates visible-picture geometry/reference metadata. Pixel
 /// reconstruction and entropy validity remain the selected replay's responsibility.
@@ -132,7 +154,9 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             if (config.len > 4) try session.walk(config[4..], &dummy, Reject.picture);
         }
     }
+    var sequence: @FieldType(Restart, "sequence") = null;
     for (reader.packets, 0..) |packet, packet_id| {
+        const logical_before = collector.pictures.items.len;
         try options.decoder.control.check();
         try reader.input.control.check();
         if (packet.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
@@ -152,18 +176,25 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
                 const height = std.mem.readInt(u16, bytes[8..10], .little);
                 if (width >> 14 != 0 or height >> 14 != 0) return error.UnsupportedVideoProfile;
                 vp8_geometry = .{ .width = width, .height = height };
+                try collector.restart(.{ .packet = packet_id, .logical = logical_before });
                 if (width != reader.track.width or height != reader.track.height) return error.UnsupportedDynamicGeometry;
             }
             const g = vp8_geometry orelse return error.InvalidVideoData;
             if (g.width == 0 or g.height == 0 or @as(u64, g.width) * g.height > options.decoder.max_pixels) return error.ResourceLimitExceeded;
             if (tag & 16 != 0 and !packet.invisible) try appendHeader(collector, packet, g);
         } else if (av1) |session| {
+            const sequence_before = sequence;
             var publish = Av1Publish{ .collector = collector, .packet = packet };
             try session.walk(lease.bytes, &publish, Av1Publish.accept);
+            if (session.packet_sequence) |span| sequence = .{ .packet = packet_id, .offset = span.offset, .size = span.size };
+            if (session.packet_restart_key) {
+                try collector.restart(.{ .packet = packet_id, .logical = logical_before, .sequence = if (session.packet_restart_needs_sequence) sequence_before else null });
+            }
         } else {
             const parts = try @import("codecs/vp9_header.zig").split(lease.bytes);
-            for (parts.packets[0..parts.len]) |part| {
+            for (parts.packets[0..parts.len], 0..) |part, part_id| {
                 const picture = try @import("codecs/vp9_header.zig").inspect(part, &references, options.decoder.max_pixels);
+                if (part_id == 0 and picture.key) try collector.restart(.{ .packet = packet_id, .logical = logical_before });
                 if (picture.visible and !packet.invisible) try appendHeader(collector, packet, picture.geometry);
             }
         }
@@ -178,18 +209,45 @@ fn appendHeader(collector: *Collect, packet: media.webm.Packet, geometry: @impor
 /// The callback borrows the frame until it returns. Repeated selections publish
 /// once; the model reuses that projection in each requested presentation slot.
 pub fn walk(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
+    return walkFrom(a, reader, options, .{}, selected, context, accept);
+}
+/// Restarts only at parsed codec key pictures, retaining logical output IDs.
+/// AV1 reloads the most recent sequence OBU before replaying the key packet.
+pub fn walkIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, indexed: Index, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
+    if (indexed.reader != reader) return error.InvalidVideoIndex;
+    if (reader.track.codec == .av1 and (indexed.operating_point != options.decoder.av1_operating_point or indexed.all_layers != options.decoder.av1_all_layers)) return error.InvalidDecodeOptions;
+    var restart: Restart = .{};
+    if (selected) |ids| {
+        if (ids.len == 0) return;
+        var first = ids[0];
+        for (ids) |id| {
+            if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
+            first = @min(first, id);
+        }
+        for (indexed.restarts) |point| {
+            if (point.logical > first) break;
+            restart = point;
+        }
+    }
+    return walkFrom(a, reader, options, restart, selected, context, accept);
+}
+fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, restart: Restart, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
     if (selected) |ids| if (ids.len == 0) return;
     var last: usize = 0;
     if (selected) |ids| for (ids) |id| {
         last = @max(last, id);
     };
-    var logical: usize = 0;
+    if (restart.packet > reader.packets.len or restart.logical > options.max_pictures) return error.InvalidPacketIndex;
+    if (options.replay_stats) |stats| stats.* = .{ .first_packet = restart.packet };
+    var logical: usize = restart.logical;
     if (reader.track.codec == .vp8) {
         const session = try vp8.Session.init(a, reader, .{ .max_packet_bytes = options.decoder.max_packet_bytes, .max_pixels = options.decoder.max_pixels, .max_decode_bytes = options.decoder.max_decode_bytes, .admission_pool = options.decoder.admission_pool });
         defer session.deinit();
+        session.next_index = restart.packet;
         while (session.next_index < reader.packets.len) {
             try options.decoder.control.check();
+            if (options.replay_stats) |stats| stats.packets_decoded += 1;
             var decoded = (try session.next()) orelse continue;
             defer decoded.deinit();
             if (logical >= options.max_pictures) return error.ResourceLimitExceeded;
@@ -207,7 +265,22 @@ pub fn walk(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
     } else {
         const session = try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, options.decoder);
         defer session.destroy();
-        for (reader.packets, 0..) |packet, packet_id| {
+        try session.initializeWebm(reader);
+        if (restart.sequence) |span| {
+            if (span.packet >= reader.packets.len) return error.InvalidPacketIndex;
+            const packet = reader.packets[span.packet];
+            if (span.offset > packet.size or span.size > packet.size - span.offset) return error.InvalidVideoData;
+            if (span.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
+            const offset = std.math.add(u64, packet.offset, span.offset) catch return error.InvalidVideoData;
+            var lease = try reader.input.read(offset, span.size);
+            defer lease.deinit();
+            if (options.replay_stats) |stats| stats.bootstrap_bytes += span.size;
+            var initialization = try session.decodeWebmBytes(reader, lease.bytes, 0, null);
+            defer initialization.deinit();
+            if (initialization.frames.len != 0) return error.InvalidVideoData;
+        }
+        for (reader.packets[restart.packet..], restart.packet..) |packet, packet_id| {
+            if (options.replay_stats) |stats| stats.packets_decoded += 1;
             var batch = try session.decodeWebmPacket(reader, packet_id);
             defer batch.deinit();
             // Container-invisible packets still update codec references.
@@ -329,7 +402,7 @@ test "WebM header metadata admission outlives indexing and allocation failures r
             defer reader.deinit();
             var headers = try index(a, &reader, .{ .decoder = .{ .admission_pool = &pool } });
             defer headers.deinit();
-            try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture)), pool.snapshot().host_bytes);
+            try std.testing.expectEqual(@as(u64, headers.pictures.len * @sizeOf(Picture) + headers.restarts.len * @sizeOf(Restart)), pool.snapshot().host_bytes);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
@@ -344,4 +417,166 @@ test "WebM metadata indexing rejects overflowing and denied shared budgets" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
     try std.testing.expectError(error.SharedAdmissionExceeded, index(a, &reader, .{ .decoder = .{ .admission_pool = &pool } }));
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+test "WebM indexed replay ignores sync hints and bootstraps AV1 sequence headers" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        count: usize = 0,
+        digest: [32]u8 = undefined,
+        pts: i64 = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 3), id);
+            std.crypto.hash.sha2.Sha256.hash(frame.bytes, &self.digest, .{});
+            self.pts = frame.pts_ns;
+            self.count += 1;
+        }
+        fn geometry(_: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {}
+    };
+    inline for (.{ "../testdata/vp8-inter.webm", "../testdata/vpx-av1/vp9.webm", "../testdata/vpx-av1/av1.webm" }) |path| {
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile(path) }, .identity = path };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        const key = reader.packets[0];
+        var sequence_end: usize = 0;
+        if (reader.track.codec == .av1) {
+            var lease = try reader.readPacket(0);
+            defer lease.deinit();
+            const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_pixels = 1024 * 1024 });
+            defer headers.deinit();
+            var dummy: u8 = 0;
+            try headers.walk(lease.bytes, &dummy, Capture.geometry);
+            const span = headers.packet_sequence orelse return error.TestUnexpectedResult;
+            sequence_end = span.offset + span.size;
+            reader.track.codec_private = &.{};
+            try std.testing.expect(sequence_end < lease.bytes.len);
+        }
+        const packets = try a.alloc(media.webm.Packet, 4);
+        for (packets, 0..) |*packet, i| {
+            packet.* = key;
+            packet.sync = false;
+            packet.pts = @intCast(i * 1_000_000_000);
+            if (i != 0 and sequence_end != 0) {
+                packet.offset += sequence_end;
+                packet.size -= sequence_end;
+            }
+        }
+        a.free(reader.packets);
+        reader.packets = packets;
+        var indexed = try index(a, &reader, .{});
+        defer indexed.deinit();
+        try std.testing.expectEqual(@as(usize, 4), indexed.restarts.len);
+        var expected = Capture{};
+        var actual = Capture{};
+        var baseline_stats = ReplayStats{};
+        var seek_stats = ReplayStats{};
+        try walk(a, &reader, .{ .replay_stats = &baseline_stats }, &.{ 3, 3 }, &expected, Capture.accept);
+        try walkIndexed(a, &reader, .{ .replay_stats = &seek_stats }, indexed, &.{ 3, 3 }, &actual, Capture.accept);
+        try std.testing.expectEqual(@as(usize, 1), actual.count);
+        try std.testing.expectEqual(expected.count, actual.count);
+        try std.testing.expectEqualSlices(u8, &expected.digest, &actual.digest);
+        try std.testing.expectEqual(expected.pts, actual.pts);
+        try std.testing.expectEqual(@as(usize, 4), baseline_stats.packets_decoded);
+        try std.testing.expectEqual(@as(usize, 1), seek_stats.packets_decoded);
+        try std.testing.expectEqual(@as(usize, 3), seek_stats.first_packet);
+        if (reader.track.codec == .av1) {
+            try std.testing.expect(seek_stats.bootstrap_bytes > 0);
+            try std.testing.expectError(error.InvalidDecodeOptions, walkIndexed(a, &reader, .{ .decoder = .{ .av1_all_layers = false } }, indexed, &.{3}, &actual, Capture.accept));
+        }
+        try std.testing.expectError(error.InvalidPacketIndex, walkIndexed(a, &reader, .{}, indexed, &.{4}, &actual, Capture.accept));
+    }
+}
+
+test "WebM indexed replay allocation failures reclaim index bootstrap and decoder owners" {
+    const Campaign = struct {
+        fn accept(_: *anyopaque, _: usize, _: *const codecs.Frame) !void {}
+        fn geometry(_: *anyopaque, _: @import("codecs/vp9_header.zig").Geometry) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/vpx-av1/av1.webm") }, .identity = "restart-allocation", .admission_pool = &pool };
+            var reader = try media.webm.Reader.init(a, &source, .{});
+            defer reader.deinit();
+            const key = reader.packets[0];
+            const sequence_end = blk: {
+                var lease = try reader.readPacket(0);
+                defer lease.deinit();
+                const headers = try @import("codecs/av1_headers.zig").Session.create(a, .{ .max_pixels = 1024 * 1024 });
+                defer headers.deinit();
+                var unused: u8 = 0;
+                try headers.walk(lease.bytes, &unused, geometry);
+                const span = headers.packet_sequence orelse return error.TestUnexpectedResult;
+                break :blk span.offset + span.size;
+            };
+            reader.track.codec_private = &.{};
+            const packets = try a.alloc(media.webm.Packet, 4);
+            for (packets, 0..) |*packet, i| {
+                packet.* = key;
+                packet.pts = @intCast(i * 1_000_000_000);
+                if (i != 0) {
+                    packet.offset += sequence_end;
+                    packet.size -= sequence_end;
+                }
+            }
+            a.free(reader.packets);
+            reader.packets = packets;
+            const options = Options{ .decoder = .{ .admission_pool = &pool, .max_decode_bytes = 16 * 1024 * 1024 } };
+            var indexed = try index(a, &reader, options);
+            defer indexed.deinit();
+            var dummy: u8 = 0;
+            try walkIndexed(a, &reader, options, indexed, &.{3}, &dummy, accept);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "WebM indexed replay preserves expanded VP9 AV1 depth chroma grain and layers" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        target: usize,
+        digest: [32]u8 = undefined,
+        count: usize = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.target, id);
+            std.crypto.hash.sha2.Sha256.hash(frame.bytes, &self.digest, .{});
+            self.count += 1;
+        }
+    };
+    inline for (.{ "vpx-av1/vp9.ivf", "vpx-av1/vp9-yuv420p10le.ivf", "vpx-av1/vp9-yuv420p12le.ivf", "vpx-av1/vp9-yuv422p.ivf", "vpx-av1/vp9-yuv422p12le.ivf", "vpx-av1/vp9-yuv444p.ivf", "vpx-av1/vp9-yuv444p10le.ivf", "vpx-av1/av1.ivf", "vpx-av1/av1-grain.ivf", "vpx-av1/av1-odd.ivf", "av1-extended/av1-c0-12.ivf", "av1-extended/av1-c1-12.ivf", "av1-extended/av1-c2-8.ivf", "av1-extended/av1-c2-10.ivf", "av1-extended/av1-c2-12.ivf", "av1-extended/av1-c3-8.ivf", "av1-extended/av1-c3-10.ivf", "av1-extended/av1-c3-12.ivf", "av1-extended/av1-svc.ivf" }) |path| {
+        const bytes = @embedFile("../testdata/" ++ path);
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/vpx-av1/av1.webm") }, .identity = path };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        const packets = try a.alloc(media.webm.Packet, 4);
+        const original = reader.packets[0];
+        for (packets, 0..) |*packet, i| {
+            packet.* = original;
+            packet.offset = 44;
+            packet.size = std.mem.readInt(u32, bytes[32..36], .little);
+            packet.pts = @intCast(i * 1_000_000_000);
+            packet.invisible = false;
+        }
+        a.free(reader.packets);
+        reader.packets = packets;
+        source.storage = .{ .borrowed = bytes };
+        reader.track.codec = if (std.mem.startsWith(u8, path, "vpx-av1/vp9")) .vp9 else .av1;
+        reader.track.width = std.mem.readInt(u16, bytes[12..14], .little);
+        reader.track.height = std.mem.readInt(u16, bytes[14..16], .little);
+        reader.track.codec_private = &.{};
+        var indexed = try index(a, &reader, .{});
+        defer indexed.deinit();
+        try std.testing.expectEqual(@as(usize, 4), indexed.restarts.len);
+        const selected = [_]usize{indexed.pictures.len - 1};
+        var baseline = Capture{ .target = selected[0] };
+        var replay = Capture{ .target = selected[0] };
+        var stats = ReplayStats{};
+        try walk(a, &reader, .{}, &selected, &baseline, Capture.accept);
+        try walkIndexed(a, &reader, .{ .replay_stats = &stats }, indexed, &selected, &replay, Capture.accept);
+        try std.testing.expectEqual(@as(usize, 1), replay.count);
+        try std.testing.expectEqual(baseline.count, replay.count);
+        try std.testing.expectEqualSlices(u8, &baseline.digest, &replay.digest);
+        try std.testing.expectEqual(@as(usize, 1), stats.packets_decoded);
+    }
 }

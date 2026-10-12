@@ -38,7 +38,7 @@ extern fn av_prepared_destroy(*anyopaque) void;
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
 pub const ToneMapping = @import("tone.zig").Policy;
-pub const RgbRounding = enum(u32) { nearest, q13_components };
+pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma };
 pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
     width: u32,
@@ -47,8 +47,9 @@ pub const Options = struct {
     matrix: Matrix,
     rotation: Rotation = .none,
     tone_mapping: ToneMapping = .none,
-    /// Q13 separately floors Y/U/V products, then rounds the RGB sum.
-    /// This pins the 8-bit reference policy independently of host SIMD dispatch.
+    /// Explicit integer RGB profiles: Q13 floors component products; Q16
+    /// quantizes chroma in the luma domain before expansion. Model policy
+    /// selects by reference row alignment, independently of host dispatch.
     rgb_rounding: RgbRounding = .nearest,
     /// Rescale to [0,1], then center for HF vision patch linear inputs if requested.
     centered: bool = true,
@@ -111,6 +112,7 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
     var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv, bit_depth) >> format.sampleShift()))) / scale - 128;
     var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv + bytes, bit_depth) >> format.sampleShift()))) / scale - 128;
+    if (rounding == .q16_luma and bit_depth == 8 and tone_mapping == .none) return rgbQ16(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
     if (rounding == .q13_components and bit_depth == 8 and tone_mapping == .none) return rgbQ13(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
     if (!format.fullRange()) {
         luma = (luma - 16) * (255.0 / 219.0);
@@ -160,6 +162,31 @@ fn rgbHdr(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matr
         .bt601 => .{ luma + 1.402 * v, luma - 0.344136 * u - 0.714136 * v, luma + 1.772 * u },
     };
     return @import("tone.zig").render64(values, matrix == .bt2020_ncl, policy);
+}
+// Q16 luma-domain quantization for the scalar RGB24 reference profile.
+// Chroma displacements are quantized before luma expansion. Evaluate the
+// integer equations directly; no external conversion library or lookup cache.
+fn rgbQ16(y: i32, u_delta: i32, v_delta: i32, full: bool, matrix: Matrix) [3]u8 {
+    const coefficients: [4]i32 = switch (matrix) {
+        .bt601 => if (full) .{ 91881, -22552, -46800, 116129 } else .{ 89830, -22049, -45756, 113537 },
+        .bt709 => if (full) .{ 103206, -12275, -30678, 121608 } else .{ 100902, -12001, -29993, 118894 },
+        .bt2020_ncl => if (full) .{ 96638, -10783, -37443, 123299 } else .{ 94482, -10543, -36607, 120547 },
+    };
+    const u = u_delta + 128;
+    const v = v_delta + 128;
+    const offsets = [4]i32{
+        ((v * coefficients[0]) >> 16) - (coefficients[0] >> 9),
+        ((u * coefficients[1]) >> 16) - (coefficients[1] >> 9),
+        ((v * coefficients[2]) >> 16) - (coefficients[2] >> 9),
+        ((u * coefficients[3]) >> 16) - (coefficients[3] >> 9),
+    };
+    const indexes = [3]i32{ y + offsets[0], y + offsets[1] + offsets[2], y + offsets[3] };
+    var output: [3]u8 = undefined;
+    for (indexes, &output) |index, *value| {
+        const expanded = if (full) index else ((index + 326) * 76309 - 400 * 65536 + 32768) >> 16;
+        value.* = @intCast(std.math.clamp(expanded, 0, 255));
+    }
+    return output;
 }
 // Coefficients are independently quantized from the BT.601/BT.709 matrix
 // and range expansion. Signed shifts deliberately floor each component.
@@ -547,4 +574,25 @@ test "video Q13 RGB conversion matches independent reference across matrices ran
             };
         }
     }
+}
+
+test "video Q16 luma-domain RGB matches independent nonaligned RGB24 reference" {
+    var y: [26 * 16]u8 = undefined;
+    var uv: [26 * 8]u8 = undefined;
+    for (&y, 0..) |*value, i| value.* = @intCast((i * 37 + 11) % 256);
+    for (&uv, 0..) |*value, i| value.* = @intCast((i * 61 + 7) % 256);
+    const planes = [2]apple.Plane{
+        .{ .bytes = &y, .width = 26, .height = 16, .stride = 26 },
+        .{ .bytes = &uv, .width = 13, .height = 8, .stride = 26 },
+    };
+    const expected = @embedFile("../testdata/rgb-q16-reference.bin");
+    var offset: usize = 0;
+    for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]apple.Format{ .nv12_video, .nv12_full }) |format| {
+        for (0..16) |row| for (0..26) |col| {
+            const actual = rgb(planes, col, row, format, matrix, 8, 1, .q16_luma, .none);
+            try std.testing.expectEqualSlices(u8, expected[offset..][0..3], &actual);
+            offset += 3;
+        };
+    };
+    try std.testing.expectEqual(expected.len, offset);
 }

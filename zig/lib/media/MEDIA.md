@@ -652,3 +652,28 @@ qualification, replay/index costs and the full non-CUDA goal remain active.
 ### WebM planning boundary
 
 The model-facing video layer can derive logical displayed-picture timelines from VP8/VP9/AV1 headers rather than repeatedly reconstructing the clip during admission and sampling. Container packet PTS/duration remain attached to each displayed output, including multiple visible pictures from one packet. Header validation is a planning boundary; selected replay validates compressed entropy and pixels. Packet reads retain source controls and byte limits, while metadata capacity is admitted separately.
+
+
+### Codec-verified selective WebM replay
+
+Logical indexes retain bounded restart records separately from displayed-picture
+metadata. VP8/VP9 points require parsed key pictures at the start of a packet;
+AV1 additionally records the latest sequence OBU span. Replay initializes codec
+private data, reads only the required prior sequence span, and starts at the
+verified key packet with the original logical output ordinal. Container sync
+hints do not authorize a restart. Reader identity and AV1 operating-point/layer
+policy must match the index. Selected replay retains entropy/pixel validation.
+
+Model producers and synchronous encoding use indexed replay. Restart metadata
+is included in shared admission and releases with the index. A synthetic
+regression compares all three codecs against packet-zero replay, including AV1
+without codec-private data or repeated sequence headers, false sync hints, duplicate
+samples, policy mismatch and allocation-failure cleanup. The `replay_compare`
+benchmark hashes 32 selected outputs in the final quarter of each real clip and
+checks their ordinals, timestamps, geometry/depth/chroma and bytes. All six corpus comparisons pass on macOS and actual Linux ARM64. Full gates
+pass 174 macOS tests (two skips), 150 Linux tests (26 skips) and 24 model tests.
+Nineteen expanded-format replay fixtures, bootstrap allocation failures and
+101,920 metadata fuzz runs pass. Six new late-window vectors plus ten existing
+sampling vectors preserve pinned PyTorch results, exact rankings/top-k and
+load/retry checks on CPU, Metal and actual Linux ARM64. Source-bound receipts
+and diagnostic timing limits are in `zig/lib/video/testdata/replay-validation`. Broader non-CUDA scope remains active.

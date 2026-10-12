@@ -38,6 +38,10 @@ pub const Session = struct {
     pending: bool = false,
     next_tile: usize = 0,
     failed: bool = false,
+    packet_sequence: ?SequenceSpan = null,
+    packet_restart_key: bool = false,
+    packet_restart_needs_sequence: bool = false,
+    pub const SequenceSpan = struct { offset: usize, size: usize };
     pub fn create(a: std.mem.Allocator, options: Options) !*Session {
         try options.control.check();
         const self = try a.create(Session);
@@ -62,8 +66,13 @@ pub const Session = struct {
         const scope = runtime.Scope.enter(&self.owner);
         defer scope.deinit();
         errdefer self.failed = true;
+        self.packet_sequence = null;
+        self.packet_restart_key = false;
+        self.packet_restart_needs_sequence = false;
+        var first_frame = !self.pending;
         var position: usize = 0;
         while (position < bytes.len) {
+            const obu_start = position;
             try self.options.control.check();
             const tag = bytes[position];
             position += 1;
@@ -88,7 +97,10 @@ pub const Session = struct {
                 if (idc & (@as(u32, 1) << temporal) == 0 or idc & (@as(u32, 1) << (@as(u5, spatial) + 8)) == 0) continue;
             }
             switch (kind) {
-                1 => try self.sequenceHeader(payload),
+                1 => {
+                    try self.sequenceHeader(payload);
+                    self.packet_sequence = .{ .offset = obu_start, .size = position - obu_start };
+                },
                 2 => {
                     if (payload.len != 0 or self.pending) return error.InvalidVideoData;
                 },
@@ -100,6 +112,11 @@ pub const Session = struct {
                     var bits = initBits(payload);
                     if (grammar.parse_frame_hdr(&self.context, &bits) < 0 or bits.@"error" != 0) return error.InvalidVideoData;
                     try self.owner.result();
+                    if (first_frame) {
+                        self.packet_restart_needs_sequence = self.packet_sequence == null;
+                        self.packet_restart_key = self.current.show_existing_frame == 0 and self.current.frame_type == grammar.DAV1D_FRAME_TYPE_KEY and self.current.refresh_frame_flags == 255;
+                    }
+                    first_frame = false;
                     if (kind == 3 and grammar.check_trailing_bits(&bits, 1) < 0) return error.InvalidVideoData;
                     if (self.current.show_existing_frame != 0) {
                         if (kind == 6) return error.InvalidVideoData;

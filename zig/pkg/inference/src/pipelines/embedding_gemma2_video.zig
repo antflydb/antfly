@@ -126,7 +126,7 @@ fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h
     const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
     // Apply SAR through target aspect; a single separable resample avoids an
     // intermediate stretched raster and its additional RGB8 rounding.
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = .q13_components };
+    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
@@ -354,7 +354,7 @@ pub const Prefetch = struct {
         var capture = Capture{ .a = a, .cb = undefined, .track = track, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self };
         try self.put(.{ .header = selected });
         if (webm) {
-            try video.webm_pictures.walk(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, selected, &capture, Capture.publishWebm);
+            try video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, selected, &capture, Capture.publishWebm);
         } else try decodeSelection(a, &reader, selected, configurations, &capture);
     }
 
@@ -513,7 +513,7 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
         thread.join();
     };
     const decoded = if (webm)
-        video.webm_pictures.walk(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, selected, &capture, Capture.publishWebm)
+        video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, selected, &capture, Capture.publishWebm)
     else
         decodeSelection(a, &reader, selected, configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;

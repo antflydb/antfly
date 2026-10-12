@@ -217,13 +217,31 @@ pub const Session = struct {
         try frames.append(copy.*);
         bytes.* += copy.bytes.len;
     }
-    pub fn decodeWebmPacket(self: *Session, reader: *media.webm.Reader, index: usize) !Batch {
+    /// Loads configuration OBUs before a seek-specific sequence header. No
+    /// coded pictures may be produced by codec-private initialization.
+    pub fn initializeWebm(self: *Session, reader: *media.webm.Reader) !void {
         try reader.input.control.check();
+        if (self.failed) return error.InvalidDecoderSession;
         if (self.codec == .av1 and self.options.av1_framing != .low_overhead) return error.InvalidDecodeOptions;
-        if (index >= reader.packets.len) return error.InvalidPacketIndex;
         if ((self.codec == .av1 and reader.track.codec != .av1) or (self.codec == .vp9 and reader.track.codec != .vp9)) return error.UnsupportedVideoCodec;
-        const packet = reader.packets[index];
-        if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+        if (!self.webm_initialized and self.codec == .av1 and reader.track.codec_private.len != 0) {
+            const config = reader.track.codec_private;
+            if (config.len < 4 or config[0] != 0x81) return error.InvalidVideoData;
+            if (config.len > 4) {
+                var initialization = try self.decodeWebmBytes(reader, config[4..], 0, null);
+                defer initialization.deinit();
+                if (initialization.frames.len != 0) {
+                    self.invalidate();
+                    return error.InvalidVideoData;
+                }
+            }
+        }
+        self.webm_initialized = true;
+    }
+    /// Borrows bytes only during this call and joins source/decoder controls.
+    /// Used for bounded sequence bootstrap as well as ordinary packet replay.
+    pub fn decodeWebmBytes(self: *Session, reader: *media.webm.Reader, bytes: []const u8, pts: i64, duration: ?u64) !Batch {
+        try reader.input.control.check();
         const Pair = struct {
             first: media.source.Control,
             second: media.source.Control,
@@ -237,27 +255,24 @@ pub const Session = struct {
         const original = self.owner.control;
         self.owner.control = .{ .context = &controls, .check_fn = Pair.check };
         defer self.owner.control = original;
-        if (!self.webm_initialized and self.codec == .av1 and reader.track.codec_private.len != 0) {
-            const config = reader.track.codec_private;
-            if (config.len < 4 or config[0] != 0x81) return error.InvalidVideoData;
-            if (config.len > 4) {
-                var initialization = try self.decode(config[4..], 0, null);
-                defer initialization.deinit();
-                if (initialization.frames.len != 0) {
-                    self.invalidate();
-                    return error.InvalidVideoData;
-                }
-            }
-        }
-        self.webm_initialized = true;
-        var lease = try reader.readPacket(index);
-        defer lease.deinit();
-        var batch = try self.decode(lease.bytes, packet.pts, packet.duration_ns);
+        var batch = try self.decode(bytes, pts, duration);
         errdefer {
             batch.deinit();
             self.invalidate();
         }
         try reader.input.control.check();
         return batch;
+    }
+    pub fn decodeWebmPacket(self: *Session, reader: *media.webm.Reader, index: usize) !Batch {
+        try reader.input.control.check();
+        if (self.codec == .av1 and self.options.av1_framing != .low_overhead) return error.InvalidDecodeOptions;
+        if (index >= reader.packets.len) return error.InvalidPacketIndex;
+        if ((self.codec == .av1 and reader.track.codec != .av1) or (self.codec == .vp9 and reader.track.codec != .vp9)) return error.UnsupportedVideoCodec;
+        const packet = reader.packets[index];
+        if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+        try self.initializeWebm(reader);
+        var lease = try reader.readPacket(index);
+        defer lease.deinit();
+        return self.decodeWebmBytes(reader, lease.bytes, packet.pts, packet.duration_ns);
     }
 };

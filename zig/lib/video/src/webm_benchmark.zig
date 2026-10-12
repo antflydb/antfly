@@ -20,7 +20,7 @@ const video = @import("mod.zig");
 extern fn av_benchmark_device_create() ?*anyopaque;
 extern fn av_benchmark_device_destroy(*anyopaque) void;
 extern fn av_benchmark_peak_rss() u64;
-const Mode = enum { decode, cpu, metal, hash, dump, index, index_reconstruct, index_compare };
+const Mode = enum { decode, cpu, metal, hash, dump, index, index_reconstruct, index_compare, replay_compare };
 const Context = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -148,6 +148,10 @@ pub fn main(init: std.process.Init) !void {
         try benchmarkIndex(a, init.io, &writer.interface, &reader, &pool, mode, iterations, index_ns);
         return;
     }
+    if (mode == .replay_compare) {
+        try benchmarkReplay(a, init.io, &writer.interface, &reader, &pool, iterations);
+        return;
+    }
     var device: ?*anyopaque = null;
     var metal: ?video.preparation.Metal = null;
     const setup_start = now(init.io);
@@ -215,7 +219,48 @@ fn benchmarkIndex(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader:
             defer a.free(oracle_selected);
             if (!std.mem.eql(usize, selected, oracle_selected)) return error.IndexSamplingMismatch;
         }
-        try out.print("{{\"kind\":\"index\",\"codec\":\"{s}\",\"mode\":\"{s}\",\"iteration\":{d},\"container_ns\":{d},\"completed_ns\":{d},\"reconstruction_ns\":{d},\"visible_pictures\":{d},\"selected_pictures\":{d},\"retained_metadata_bytes\":{d},\"process_peak_rss_bytes\":{d},\"parity_checked\":{s}}}\n", .{ @tagName(reader.track.codec), @tagName(mode), iteration, container_ns, completed_ns, oracle_ns, index.pictures.len, selected.len, index.pictures.len * @sizeOf(video.webm_pictures.Picture), av_benchmark_peak_rss(), if (mode == .index_compare) "true" else "false" });
+        try out.print("{{\"kind\":\"index\",\"codec\":\"{s}\",\"mode\":\"{s}\",\"iteration\":{d},\"container_ns\":{d},\"completed_ns\":{d},\"reconstruction_ns\":{d},\"visible_pictures\":{d},\"selected_pictures\":{d},\"retained_metadata_bytes\":{d},\"process_peak_rss_bytes\":{d},\"parity_checked\":{s}}}\n", .{ @tagName(reader.track.codec), @tagName(mode), iteration, container_ns, completed_ns, oracle_ns, index.pictures.len, selected.len, index.pictures.len * @sizeOf(video.webm_pictures.Picture) + index.restarts.len * @sizeOf(video.webm_pictures.Restart), av_benchmark_peak_rss(), if (mode == .index_compare) "true" else "false" });
+        try out.flush();
+    }
+}
+
+fn benchmarkReplay(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader: *media.webm.Reader, pool: *media.admission.Pool, iterations: usize) !void {
+    const Record = struct { id: usize, pts: i64, duration: ?u64, width: u32, height: u32, depth: u8, chroma: u8, color: @FieldType(video.codecs.Frame, "color"), digest: [32]u8 };
+    const Capture = struct {
+        records: [32]Record = undefined,
+        count: usize = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const video.codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count == self.records.len) return error.ResourceLimitExceeded;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(frame.bytes, &digest, .{});
+            self.records[self.count] = .{ .id = id, .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height, .depth = frame.bit_depth, .chroma = frame.chroma_format, .color = frame.color, .digest = digest };
+            self.count += 1;
+        }
+    };
+    var index = try video.webm_pictures.index(a, reader, .{ .decoder = .{ .admission_pool = pool } });
+    defer index.deinit();
+    if (index.pictures.len < 4) return error.EmptyVideo;
+    const first = index.pictures.len * 3 / 4;
+    const count = @min(32, index.pictures.len - first);
+    var selections: [32]usize = undefined;
+    for (selections[0..count], 0..) |*id, i| id.* = first + i * (index.pictures.len - first - 1) / @max(count - 1, 1);
+    for (0..iterations) |iteration| {
+        var baseline = Capture{};
+        var replay = Capture{};
+        var full_stats = video.webm_pictures.ReplayStats{};
+        var seek_stats = video.webm_pictures.ReplayStats{};
+        var options = video.webm_pictures.Options{ .decoder = .{ .admission_pool = pool }, .replay_stats = &full_stats };
+        const full_start = now(io);
+        try video.webm_pictures.walk(a, reader, options, selections[0..count], &baseline, Capture.accept);
+        const full_ns = now(io) - full_start;
+        options.replay_stats = &seek_stats;
+        const seek_start = now(io);
+        try video.webm_pictures.walkIndexed(a, reader, options, index, selections[0..count], &replay, Capture.accept);
+        const seek_ns = now(io) - seek_start;
+        if (baseline.count != count or replay.count != count) return error.ReplayParityMismatch;
+        for (baseline.records[0..count], replay.records[0..count]) |expected, actual| if (!std.meta.eql(expected, actual)) return error.ReplayParityMismatch;
+        try out.print("{{\"kind\":\"replay\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"first_selected\":{d},\"selected_count\":{d},\"full_ns\":{d},\"seek_ns\":{d},\"full_packets\":{d},\"seek_packets\":{d},\"first_packet\":{d},\"bootstrap_bytes\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, first, count, full_ns, seek_ns, full_stats.packets_decoded, seek_stats.packets_decoded, seek_stats.first_packet, seek_stats.bootstrap_bytes });
         try out.flush();
     }
 }

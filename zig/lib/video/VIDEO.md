@@ -1361,3 +1361,47 @@ scope remain active.
 ### Header-only WebM logical-picture indexing
 
 Model planning now indexes VP8/VP9/AV1 displayed-picture headers without reconstructing pixel planes. Hidden pictures still update reference geometry; VP9 superframes and AV1 operating-point filtering preserve displayed output ordinals. AV1 uses the owned frame-header grammar with header-only reference slots and validates tile-group framing. Entropy and pixel correctness remain replay responsibilities. An explicit `strategy = .reconstruct` index provides the qualification oracle. Metadata allocations use shared admission and bounded capacity; the returned index retains its reservation until deinitialization. All 4,623 larger-corpus picture records and sampled IDs match reconstruction on macOS and actual Linux ARM64. The metadata fuzz campaign passes 101,937 runs, and seed acceptance checks exercise Smith serialization before parsing. Shared-host timings are diagnostic. Current CPU pretrained parity passes all eight vectors and three exact rankings/top-k sets; Linux pretrained and corruption/retry follow-ups remain in progress; this change does not establish general codec conformance. Receipts are in `testdata/header-index-validation`.
+
+
+### Codec-verified selective WebM replay
+
+Logical indexes retain bounded restart records separately from displayed-picture
+metadata. VP8/VP9 points require parsed key pictures at the start of a packet;
+AV1 additionally records the latest sequence OBU span. Replay initializes codec
+private data, reads only the required prior sequence span, and starts at the
+verified key packet with the original logical output ordinal. Container sync
+hints do not authorize a restart. Reader identity and AV1 operating-point/layer
+policy must match the index. Selected replay retains entropy/pixel validation.
+
+Model producers and synchronous encoding use indexed replay. Restart metadata
+is included in shared admission and releases with the index. A synthetic
+regression compares all three codecs against packet-zero replay, including AV1
+without codec-private data or repeated sequence headers, false sync hints, duplicate
+samples, policy mismatch and allocation-failure cleanup. The `replay_compare`
+benchmark hashes 32 selected outputs in the final quarter of each real clip and
+checks their ordinals, timestamps, geometry/depth/chroma and bytes. All six corpus comparisons pass on macOS and actual Linux ARM64. Full gates
+pass 174 macOS tests (two skips), 150 Linux tests (26 skips) and 24 model tests.
+Nineteen expanded-format replay fixtures, bootstrap allocation failures and
+101,920 metadata fuzz runs pass. Six new late-window vectors plus ten existing
+sampling vectors preserve pinned PyTorch results, exact rankings/top-k and
+load/retry checks on CPU, Metal and actual Linux ARM64. Source-bound receipts
+and diagnostic timing limits are in `zig/lib/video/testdata/replay-validation`. Broader non-CUDA scope remains active.
+
+
+### RGB24 row quantization and recipe v5
+
+Late 854-pixel-wide windows exposed a preprocessing parity gap shared by CPU
+and Metal, despite matching native sample bytes and replay ordinals. Independent
+RGB24 extraction identified scalar luma-domain Q16 quantization for rows outside
+the 16-pixel vector alignment. The preparation API now includes `q16_luma`,
+implemented with bounded integer arithmetic on CPU and Metal. Model presentation
+uses Q13 component rounding for aligned rows and Q16 for nonaligned rows; high
+depth/HDR paths retain their separately declared conversion policies. This adds
+no runtime conversion-library dependency. Independent 26-pixel-wide fixtures
+cover BT.601/709/2020 and both ranges; actual Metal staging also matches CPU.
+
+The embedding identity is `embeddinggemma2-f32-mean-v5-logical-timestamps-rgb24`,
+so cached vectors cannot silently retain the older output policy. Pinned late
+window references remain unchanged and now pass on CPU, Metal and Linux ARM64,
+as do the ten existing sampling vectors and current resource/lifetime gates. Integer reference details are recorded by the fixture generator and
+[FFmpeg's RGB24 reference arithmetic](https://github.com/FFmpeg/FFmpeg/blob/n9.0.2/libswscale/yuv2rgb.c).
