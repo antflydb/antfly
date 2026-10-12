@@ -954,6 +954,16 @@ pub const GraphQueryEngine = struct {
         if (gq.metrics.len != 0 or gq.order_by.len != 0 or gq.where_metric.len != 0) {
             try self.applyMetricDependenciesColumnar(graph_index, gq, defer_result_limit, &result);
         }
+        if (gq.query_type == .traverse or gq.query_type == .neighbors) {
+            for (result.nodes) |*node| if (node.path != null and node.table != null and node.path_tables == null) {
+                const bytes = try std.math.add(usize, try std.math.mul(usize, node.path.?.len, @sizeOf(?[]const u8)), if (node.table) |table| table.len else 0);
+                if (self.work_budget) |budget| try budget.retainStateBytes(bytes);
+                node.path_tables = pathTablesFromTerminalAlloc(self.alloc, node.path.?.len, node.table) catch |err| {
+                    if (self.work_budget) |budget| budget.releaseStateBytes(bytes);
+                    return err;
+                };
+            };
+        }
         return result;
     }
 
@@ -974,8 +984,10 @@ pub const GraphQueryEngine = struct {
 
     /// Borrowed column view. Selection maps and storage remain valid until
     /// the owning workspace's next select/deinit.
+    const ScorePages = @import("metric_pages.zig").ScorePages;
     pub const MetricColumn = struct {
-        pub const Source = union(enum) { nullable: []?f64, decoded: []f64 };
+        pub const Paged = struct { owner: *ScorePages, column: usize };
+        pub const Source = union(enum) { nullable: []?f64, decoded: []f64, paged: Paged };
         source: Source,
         rows: ?[]const usize = null,
         len: usize,
@@ -984,6 +996,10 @@ pub const GraphQueryEngine = struct {
             return switch (self.source) {
                 .nullable => |values| values[index],
                 .decoded => |values| if (std.math.isNan(values[index])) null else values[index],
+                .paged => |page| blk: {
+                    const value = page.owner.at(page.column, index);
+                    break :blk if (std.math.isNan(value)) null else value;
+                },
             };
         }
     };
@@ -1012,6 +1028,35 @@ pub const GraphQueryEngine = struct {
             if (cmp) |less| return less;
         }
         return if (context.row_ordinals) |rows| rows[left] < rows[right] else left < right;
+    }
+
+    // Resolve the shared page directory and column offsets once before sorting.
+    // The heap owns unmapped rows, so comparisons need neither a source-tag
+    // dispatch nor a row-map lookup for every score.
+    const PagedMetricSortContext = struct {
+        orders: []const GraphMetricOrder,
+        offsets: []const usize,
+        pages: []const []f64,
+        row_shift: std.math.Log2Int(usize),
+        row_mask: usize,
+        row_ordinals: []const usize,
+    };
+
+    fn pagedMetricCandidateLessThan(context: PagedMetricSortContext, left: usize, right: usize) bool {
+        const left_page = context.pages[left >> context.row_shift];
+        const right_page = context.pages[right >> context.row_shift];
+        const left_row = left & context.row_mask;
+        const right_row = right & context.row_mask;
+        for (context.orders, context.offsets) |order, offset| {
+            const l = left_page[offset + left_row];
+            const r = right_page[offset + right_row];
+            if (compareOptionalMetricScore(
+                if (std.math.isNan(l)) null else l,
+                if (std.math.isNan(r)) null else r,
+                order,
+            )) |less| return less;
+        }
+        return context.row_ordinals[left] < context.row_ordinals[right];
     }
 
     fn siftWorstMetricCandidateUp(context: MetricColumnSortContext, heap: []usize, start: usize) void {
@@ -1428,7 +1473,7 @@ pub const GraphQueryEngine = struct {
             scratch,
             metric_value_names,
             columns[0..plan.projections.len],
-            workspace.rows,
+            try workspace.explicitRows(),
             &result.nodes,
         );
         if (result.metric_values_slab.len > 0) self.alloc.free(result.metric_values_slab);
@@ -1515,6 +1560,7 @@ pub const GraphQueryEngine = struct {
         count: usize = 0,
         limit: usize,
         permuted: bool = false,
+        paged_owner: ?*ScorePages = null,
         fn allocate(a: Allocator, capacity: usize, limit: usize, column_count: usize, ordered: bool) !@This() {
             const slots = try a.alloc(usize, if (ordered) capacity else 0);
             errdefer a.free(slots);
@@ -1529,37 +1575,64 @@ pub const GraphQueryEngine = struct {
             }
             return self;
         }
-        fn init(a: Allocator, capacity: usize, limit: usize, names: []const []const u8, orders: []const GraphMetricOrder, permuted: bool) !@This() {
-            var self = try allocate(a, capacity, limit, names.len, permuted);
+        fn init(a: Allocator, capacity: usize, limit: usize, names: []const []const u8, orders: []const GraphMetricOrder, permuted: bool, paged: bool, projected: []const []const u8) !@This() {
+            var self = try allocate(a, capacity, limit, 0, !paged and permuted);
             errdefer self.deinit();
             self.orders = orders;
             self.permuted = permuted;
+            var page_columns: usize = 0;
+            if (paged) for (names) |name| {
+                page_columns += @intFromBool(metricColumnNameIndex(projected, name) != null);
+            };
+            // A single contiguous owner already has cheap scalar growth.
+            if (page_columns > 1) self.paged_owner = try ScorePages.create(a, page_columns);
+            var page_index: usize = 0;
+            for (names) |name| {
+                const is_paged = self.paged_owner != null and metricColumnNameIndex(projected, name) != null;
+                self.columns[self.column_count] = .{ .source = if (is_paged) .{ .paged = .{ .owner = self.paged_owner.?, .column = page_index } } else .{ .decoded = try a.alloc(f64, capacity) }, .len = capacity };
+                self.column_count += 1;
+                if (is_paged) page_index += 1;
+            }
             for (orders, self.order_indexes[0..orders.len]) |order, *index| index.* = metricColumnNameIndex(names, order.name) orelse return error.InvalidQueryRequest;
             return self;
         }
         fn deinit(self: *@This()) void {
             self.alloc.free(self.slots);
             self.alloc.free(self.rows);
-            for (self.columns[0..self.column_count]) |column| self.alloc.free(column.source.decoded);
+            for (self.columns[0..self.column_count]) |column| switch (column.source) {
+                .decoded => |values| self.alloc.free(values),
+                .paged => {},
+                .nullable => unreachable,
+            };
+            if (self.paged_owner) |owner| owner.destroy();
         }
         fn grow(self: *@This()) !void {
             const capacity = if (self.rows.len >= self.limit - self.rows.len) self.limit else self.rows.len * 2;
-            // Grow owners separately: no complete second score slab is live.
-            // On failure this private accumulator remains deinitializable; the
-            // caller returns without exposing any partially grown storage.
             for (self.columns[0..self.column_count]) |*column| {
-                column.source.decoded = try self.alloc.realloc(column.source.decoded, capacity);
+                switch (column.source) {
+                    .decoded => |values| column.source = .{ .decoded = try self.alloc.realloc(values, capacity) },
+                    .paged => {},
+                    .nullable => unreachable,
+                }
                 column.len = capacity;
             }
             self.rows = try self.alloc.realloc(self.rows, capacity);
-            if (self.permuted) self.slots = try self.alloc.realloc(self.slots, capacity);
+            // Append-only collection needs the permutation only at final sort.
+            if (self.slots.len != 0) self.slots = try self.alloc.realloc(self.slots, capacity);
         }
-        fn append(self: *@This(), ordinal: usize, columns: []const []f64, row: usize) !void {
+        fn append(self: *@This(), ordinal: usize, columns: []const []f64, row: usize, direct: bool) !void {
             if (self.count == self.rows.len) try self.grow();
+            if (self.paged_owner) |owner| try owner.ensureRows(self.count + 1);
             self.rows[self.count] = ordinal;
-            for (columns, self.columns[0..self.column_count]) |column, target| target.source.decoded[self.count] = column[row];
-            if (self.permuted) self.slots[self.count] = self.count;
+            for (columns, self.columns[0..self.column_count]) |column, target| switch (target.source) {
+                .decoded => |values| values[self.count] = column[row],
+                .paged => |page| {
+                    if (!direct or column.ptr + row != page.owner.window(page.column, self.count, 1).ptr) page.owner.set(page.column, self.count, column[row]);
+                },
+                .nullable => unreachable,
+            };
             self.count += 1;
+            if (self.paged_owner) |owner| owner.count = self.count;
         }
         fn context(self: *const @This()) MetricColumnSortContext {
             return .{ .orders = self.orders, .metric_indexes = self.order_indexes[0..self.orders.len], .views = self.columns[0..self.column_count], .row_ordinals = self.rows };
@@ -1588,15 +1661,82 @@ pub const GraphQueryEngine = struct {
                 siftWorstMetricCandidateUp(self.context(), self.slots[0..self.count], self.count - 1);
             } else siftWorstMetricCandidateDown(self.context(), self.slots, 0);
         }
-        fn finish(self: *@This()) void {
-            if (self.permuted) std.mem.sort(usize, self.slots[0..self.count], self.context(), metricColumnCandidateLessThan);
+        fn canBeatKnownPrefix(self: *const @This(), ordinal: usize, columns: []const MetricColumn, row: usize, known: []const usize) bool {
+            const worst = self.slots[0];
+            for (known, 0..) |index, i| {
+                if (compareOptionalMetricScore(columns[index].at(row), self.columns[self.order_indexes[i]].at(worst), self.orders[i])) |better| return better;
+            }
+            return known.len != self.orders.len or ordinal < self.rows[worst];
+        }
+        fn finish(self: *@This()) !void {
+            if (self.permuted) {
+                if (self.slots.len == 0) {
+                    self.slots = try self.alloc.alloc(usize, self.count);
+                    for (self.slots, 0..) |*slot, i| slot.* = i;
+                }
+                if (self.paged_owner) |owner| {
+                    var offsets: [graph_metric_dependency_limit]usize = undefined;
+                    var all_paged = true;
+                    for (self.order_indexes[0..self.orders.len], 0..) |index, i| {
+                        switch (self.columns[index].source) {
+                            .paged => |page| {
+                                std.debug.assert(page.owner == owner);
+                                offsets[i] = page.column * owner.row_capacity;
+                            },
+                            else => {
+                                all_paged = false;
+                                break;
+                            },
+                        }
+                    }
+                    if (all_paged) {
+                        const sort_context: PagedMetricSortContext = .{
+                            .orders = self.orders,
+                            .offsets = offsets[0..self.orders.len],
+                            .pages = owner.pages.items,
+                            .row_shift = owner.row_shift,
+                            .row_mask = owner.row_capacity - 1,
+                            .row_ordinals = self.rows,
+                        };
+                        std.mem.sort(usize, self.slots[0..self.count], sort_context, pagedMetricCandidateLessThan);
+                        return;
+                    }
+                }
+                std.mem.sort(usize, self.slots[0..self.count], self.context(), metricColumnCandidateLessThan);
+            }
+        }
+        fn takeRows(self: *@This()) []usize {
+            if (self.permuted) {
+                // The heap slots form a permutation of 0..count. Temporarily
+                // mark cycles in its spare high bit, preserving the score map.
+                const mark = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+                for (0..self.count) |start| {
+                    if (self.slots[start] & mark != 0) continue;
+                    const saved = self.rows[start];
+                    var target = start;
+                    while (true) {
+                        const source = self.slots[target];
+                        self.slots[target] |= mark;
+                        if (source == start) {
+                            self.rows[target] = saved;
+                            break;
+                        }
+                        self.rows[target] = self.rows[source];
+                        target = source;
+                    }
+                }
+                for (self.slots[0..self.count]) |*slot| slot.* &= ~mark;
+            }
+            const rows = self.rows;
+            self.rows = &.{};
+            return rows;
         }
     };
 
     /// A stable source-row selection and only the columns needed by future
     /// stages. The reader is snapshot-owned; this executor never opens storage.
     pub const MetricStageWorkspace = struct {
-        const ColumnGroup = struct { references: usize = 0, mapping: ?[]usize = null };
+        const ColumnGroup = struct { references: usize = 0, mapping: ?[]usize = null, paged: ?*ScorePages = null };
         const Slot = struct {
             source: MetricColumn.Source,
             group: u8,
@@ -1604,12 +1744,15 @@ pub const GraphQueryEngine = struct {
                 switch (self.source) {
                     .nullable => |values| a.free(values),
                     .decoded => |values| a.free(values),
+                    .paged => {},
                 }
                 const group = &groups[self.group];
                 group.references -= 1;
                 if (group.references == 0) {
                     if (group.mapping) |mapping| a.free(mapping);
                     group.mapping = null;
+                    if (group.paged) |owner| owner.destroy();
+                    group.paged = null;
                 }
             }
             fn column(self: @This(), count: usize, groups: *const [graph_metric_dependency_limit]ColumnGroup) MetricColumn {
@@ -1618,23 +1761,39 @@ pub const GraphQueryEngine = struct {
         };
         alloc: Allocator,
         plan: MetricReadPlan,
-        rows: []usize,
+        rows: []usize = &.{},
+        row_storage: []usize = &.{},
+        identity_count: ?usize = null,
         columns: [graph_metric_dependency_limit]?Slot = @splat(null),
         groups: [graph_metric_dependency_limit]ColumnGroup = @splat(.{}),
         pub fn init(alloc: Allocator, plan: MetricReadPlan, node_count: usize) !@This() {
-            const rows = try alloc.alloc(usize, node_count);
-            for (rows, 0..) |*row, i| row.* = i;
-            return .{ .alloc = alloc, .plan = plan, .rows = rows };
+            return .{ .alloc = alloc, .plan = plan, .identity_count = node_count };
+        }
+        pub fn rowCount(self: *const @This()) usize {
+            return self.identity_count orelse self.rows.len;
+        }
+        pub fn rowAt(self: *const @This(), i: usize) usize {
+            return if (self.identity_count != null) i else self.rows[i];
+        }
+        fn explicitRows(self: *@This()) ![]usize {
+            if (self.identity_count) |count| {
+                const rows = try self.alloc.alloc(usize, count);
+                for (rows, 0..) |*row, i| row.* = i;
+                self.rows = rows;
+                self.row_storage = rows;
+                self.identity_count = null;
+            }
+            return self.rows;
         }
         pub fn deinit(self: *@This()) void {
             for (self.columns) |column| if (column) |slot| slot.deinit(self.alloc, &self.groups);
-            self.alloc.free(self.rows);
+            self.alloc.free(self.row_storage);
         }
         fn index(self: *const @This(), name: []const u8) usize {
             return metricColumnNameIndex(self.plan.dependencies.slice(), name).?;
         }
         pub fn columnsFor(self: *const @This(), names: []const []const u8, out: []MetricColumn) void {
-            for (names, out) |name, *column| column.* = self.columns[self.index(name)].?.column(self.rows.len, &self.groups);
+            for (names, out) |name, *column| column.* = self.columns[self.index(name)].?.column(self.rowCount(), &self.groups);
         }
         pub fn ensure(self: *@This(), reader: anytype, names: []const []const u8, nodes: []const GraphResultNode) !void {
             var missing: MetricReadPlan.Names = .{};
@@ -1643,11 +1802,12 @@ pub const GraphQueryEngine = struct {
             };
             if (missing.len == 0) return;
             var local_count: usize = 0;
-            for (self.rows) |row| local_count += @intFromBool(nodes[row].table == null);
+            for (0..self.rowCount()) |i| local_count += @intFromBool(nodes[self.rowAt(i)].table == null);
             const keys = try self.alloc.alloc([]const u8, local_count);
             defer self.alloc.free(keys);
             var local_index: usize = 0;
-            for (self.rows) |row| if (nodes[row].table == null) {
+            for (0..self.rowCount()) |i| if (nodes[self.rowAt(i)].table == null) {
+                const row = self.rowAt(i);
                 keys[local_index] = nodes[row].key;
                 local_index += 1;
             };
@@ -1658,7 +1818,7 @@ pub const GraphQueryEngine = struct {
             var initialized: usize = 0;
             errdefer for (columns[0..initialized]) |column| self.alloc.free(column);
             for (columns[0..missing.len]) |*column| {
-                column.* = try self.alloc.alloc(Score, self.rows.len);
+                column.* = try self.alloc.alloc(Score, self.rowCount());
                 local_columns[initialized] = column.*[0..local_count];
                 initialized += 1;
             }
@@ -1691,12 +1851,12 @@ pub const GraphQueryEngine = struct {
             }
             // Expand backwards in-place: qualified identities must not alias a
             // local document with the same key. No second score slab is needed.
-            if (local_count != self.rows.len) for (columns[0..missing.len]) |column| {
+            if (local_count != self.rowCount()) for (columns[0..missing.len]) |column| {
                 var source = local_count;
-                var target = self.rows.len;
+                var target = self.rowCount();
                 while (target != 0) {
                     target -= 1;
-                    if (nodes[self.rows[target]].table == null) {
+                    if (nodes[self.rowAt(target)].table == null) {
                         source -= 1;
                         column[target] = column[source];
                     } else column[target] = if (decoded) std.math.nan(f64) else null;
@@ -1725,13 +1885,13 @@ pub const GraphQueryEngine = struct {
             // Sorting consumes the existing identity row buffer, with original
             // node ordinals carried by the heap. Selected/reordered workspaces
             // retain the staged path; rollback restores identity on any failure.
-            if (self.rows.len != nodes.len) return false;
-            for (self.rows, 0..) |row, ordinal| if (row != ordinal) return false;
-            const capacity = if (limited) @min(self.rows.len, @as(usize, @intCast(query.params.max_results))) else self.rows.len;
-            const batch_rows = 4096 / names.len;
+            if (self.rowCount() != nodes.len) return false;
+            if (self.identity_count == null) for (self.rows, 0..) |row, ordinal| if (row != ordinal) return false;
+            const capacity = if (limited) @min(self.rowCount(), @as(usize, @intCast(query.params.max_results))) else self.rowCount();
+            const batch_rows = @as(usize, 1) << std.math.log2_int(usize, 4096 / names.len);
             // Small/dense pages already fit the ordinary warmed plan. Fusion
             // is useful when scores can be discarded instead of retained.
-            if (self.rows.len <= batch_rows or (limited and self.plan.orders.len != 0 and capacity > self.rows.len / 4)) return false;
+            if (self.rowCount() <= batch_rows or (limited and self.plan.orders.len != 0 and capacity > self.rowCount() / 4)) return false;
             const streamed = comptime std.meta.hasMethod(@TypeOf(reader), "openDecodedColumnStream");
             var stream = if (streamed) try reader.openDecodedColumnStream(self.alloc) else {};
             defer if (streamed) stream.deinit();
@@ -1749,7 +1909,7 @@ pub const GraphQueryEngine = struct {
             };
             const key_order = KeyOrder{ .nodes = nodes };
             var ascending = true;
-            for (self.rows[1..], self.rows[0 .. self.rows.len - 1]) |current, previous| if (KeyOrder.less(key_order, current, previous)) {
+            if (!limited or query.order_by.len != 0) for (1..self.rowCount()) |i| if (KeyOrder.less(key_order, self.rowAt(i), self.rowAt(i - 1))) {
                 ascending = false;
                 break;
             };
@@ -1761,7 +1921,7 @@ pub const GraphQueryEngine = struct {
             for (names.slice()) |name| if (metricColumnNameIndex(self.plan.projections.slice(), name) != null) {
                 retained_names.append(name);
             };
-            var heap = try MetricCandidateHeap.init(self.alloc, @min(capacity, batch_rows), capacity, retained_names.slice(), query.order_by, permuted);
+            var heap = try MetricCandidateHeap.init(self.alloc, @min(capacity, batch_rows), capacity, retained_names.slice(), query.order_by, permuted, !limited, self.plan.projections.slice());
             defer heap.deinit();
             const scores = try self.alloc.alloc(f64, batch_rows * names.len);
             defer self.alloc.free(scores);
@@ -1777,25 +1937,56 @@ pub const GraphQueryEngine = struct {
             for (self.plan.orders.slice()) |name| if (metricColumnNameIndex(self.plan.filters.slice(), name) == null) {
                 order_names.append(name);
             };
+            var known_order_indexes: [graph_metric_order_limit]usize = undefined;
+            var known_order_count: usize = 0;
+            for (query.order_by) |order| {
+                if (metricColumnNameIndex(self.plan.filters.slice(), order.name) == null) break;
+                known_order_indexes[known_order_count] = metricColumnNameIndex(names.slice(), order.name).?;
+                known_order_count += 1;
+            }
+            const was_implicit = self.identity_count != null;
+            const original_count = self.rowCount();
             var committed = false;
             defer if (!committed) {
-                for (self.rows, 0..) |*row, ordinal| row.* = ordinal;
+                if (was_implicit) {
+                    self.alloc.free(self.row_storage);
+                    self.row_storage = &.{};
+                    self.rows = &.{};
+                    self.identity_count = original_count;
+                } else for (self.rows, 0..) |*row, ordinal| row.* = ordinal;
             };
             // Limited filter-only results are a logical prefix. Unlimited
             // reads retain global key locality and restore surviving ordinals.
-            if (permuted and !ascending) sortMetricReadRows(self.rows, nodes);
+            if (permuted and !ascending) sortMetricReadRows(try self.explicitRows(), nodes);
             var offset: usize = 0;
-            while (offset < self.rows.len) {
-                const count = @min(batch_rows, self.rows.len - offset);
+            while (offset < self.rowCount()) {
+                const count = @min(batch_rows, self.rowCount() - offset);
+                var direct = false;
+                if (!limited) {
+                    if (heap.paged_owner) |owner| {
+                        direct = count <= owner.row_capacity - (heap.count & (owner.row_capacity - 1));
+                        if (direct) try owner.ensureRows(heap.count + count);
+                    } else direct = heap.count + count <= heap.rows.len;
+                }
                 var columns: [graph_metric_dependency_limit][]f64 = undefined;
                 var views: [graph_metric_dependency_limit]MetricColumn = undefined;
                 for (columns[0..names.len], views[0..names.len], 0..) |*column, *view, i| {
                     column.* = scores[i * batch_rows ..][0..count];
+                    if (direct) if (metricColumnNameIndex(retained_names.slice(), names.slice()[i])) |retained_index| {
+                        switch (heap.columns[retained_index].source) {
+                            .paged => |page| column.* = page.owner.window(page.column, heap.count, count),
+                            .decoded => |values| if (heap.count + count <= values.len and heap.count + count <= heap.rows.len) {
+                                column.* = values[heap.count..][0..count];
+                            },
+                            .nullable => unreachable,
+                        }
+                    };
                     @memset(column.*, std.math.nan(f64));
                     view.* = .{ .source = .{ .decoded = column.* }, .len = count };
                 }
                 var local_count: usize = 0;
-                for (self.rows[offset..][0..count], 0..) |source, row| if (nodes[source].table == null) {
+                for (0..count) |row| if (nodes[self.rowAt(offset + row)].table == null) {
+                    const source = self.rowAt(offset + row);
                     keys[local_count] = nodes[source].key;
                     positions[local_count] = row;
                     local_count += 1;
@@ -1811,7 +2002,7 @@ pub const GraphQueryEngine = struct {
                         var local = local_count;
                         while (row != 0) {
                             row -= 1;
-                            if (nodes[self.rows[offset + row]].table == null) {
+                            if (nodes[self.rowAt(offset + row)].table == null) {
                                 local -= 1;
                                 column[row] = column[local];
                             } else column[row] = std.math.nan(f64);
@@ -1822,9 +2013,10 @@ pub const GraphQueryEngine = struct {
                 local_count = 0;
                 for (0..count) |row| {
                     if (!metricCandidatePassesFilters(row, query.where_metric, filter_indexes[0..query.where_metric.len], views[0..names.len])) continue;
+                    if (limited and order_names.len != 0 and known_order_count != 0 and heap.count == heap.limit and !heap.canBeatKnownPrefix(self.rowAt(offset + row), views[0..names.len], row, known_order_indexes[0..known_order_count])) continue;
                     survivors[survivor_count] = row;
                     survivor_count += 1;
-                    const node = nodes[self.rows[offset + row]];
+                    const node = nodes[self.rowAt(offset + row)];
                     if (node.table == null) {
                         keys[local_count] = node.key;
                         positions[local_count] = row;
@@ -1843,7 +2035,7 @@ pub const GraphQueryEngine = struct {
                         }
                         // Compact reads may overwrite unrelated positions. Only
                         // surviving qualified rows are consumed, always as null.
-                        for (survivors[0..survivor_count]) |row| if (nodes[self.rows[offset + row]].table != null) {
+                        for (survivors[0..survivor_count]) |row| if (nodes[self.rowAt(offset + row)].table != null) {
                             column[row] = std.math.nan(f64);
                         };
                     }
@@ -1851,20 +2043,19 @@ pub const GraphQueryEngine = struct {
                 var retained_columns: [graph_metric_dependency_limit][]f64 = undefined;
                 for (retained_names.slice(), retained_columns[0..retained_names.len]) |name, *column| column.* = columns[metricColumnNameIndex(names.slice(), name).?];
                 if (limited and query.order_by.len != 0) {
-                    for (survivors[0..survivor_count]) |row| try heap.offer(self.rows[offset + row], retained_columns[0..retained_names.len], row);
+                    for (survivors[0..survivor_count]) |row| try heap.offer(self.rowAt(offset + row), retained_columns[0..retained_names.len], row);
                 } else {
                     for (survivors[0..survivor_count]) |row| {
                         if (heap.count == capacity) break;
-                        try heap.append(self.rows[offset + row], retained_columns[0..retained_names.len], row);
+                        try heap.append(self.rowAt(offset + row), retained_columns[0..retained_names.len], row, direct);
                     }
                 }
                 if (query.order_by.len == 0 and heap.count == capacity) break;
                 offset += count;
             }
-            heap.finish();
-            const rows = try self.alloc.alloc(usize, heap.count);
-            errdefer self.alloc.free(rows);
-            for (rows, 0..) |*row, i| row.* = heap.rows[if (permuted) heap.slots[i] else i];
+            try heap.finish();
+            const row_storage = if (heap.count == 0) @as([]usize, &.{}) else heap.takeRows();
+            const rows = row_storage[0..heap.count];
             var retained: [graph_metric_dependency_limit]?Slot = @splat(null);
             var retained_count: usize = 0;
             // Transfer selected score storage and its shared heap permutation.
@@ -1872,17 +2063,27 @@ pub const GraphQueryEngine = struct {
             for (retained_names.slice(), 0..) |name, i| {
                 if (metricColumnNameIndex(self.plan.projections.slice(), name) == null) continue;
                 if (heap.count == 0) {
-                    self.alloc.free(heap.columns[i].source.decoded);
+                    switch (heap.columns[i].source) {
+                        .decoded => |values| self.alloc.free(values),
+                        .paged => {},
+                        .nullable => unreachable,
+                    }
                     heap.columns[i].source = .{ .decoded = &.{} };
                 }
                 retained[self.index(name)] = .{ .source = heap.columns[i].source, .group = 0 };
                 heap.columns[i].source = .{ .decoded = &.{} };
                 retained_count += 1;
             }
-            self.alloc.free(self.rows);
+            self.alloc.free(self.row_storage);
             self.rows = rows;
+            self.row_storage = row_storage;
+            self.identity_count = null;
             self.columns = retained;
             self.groups[0] = .{ .references = retained_count };
+            if (retained_count != 0 and heap.count != 0) {
+                self.groups[0].paged = heap.paged_owner;
+                heap.paged_owner = null;
+            }
             if (retained_count != 0 and heap.count != 0 and permuted) {
                 self.groups[0].mapping = heap.slots;
                 heap.slots = &.{};
@@ -1900,6 +2101,7 @@ pub const GraphQueryEngine = struct {
                     if (compacted[i]) |source| switch (source) {
                         .nullable => |values| self.alloc.free(values),
                         .decoded => |values| self.alloc.free(values),
+                        .paged => {},
                     };
                     compacted[i] = null;
                 }
@@ -1907,14 +2109,14 @@ pub const GraphQueryEngine = struct {
             for (self.columns, 0..) |maybe, i| {
                 const slot = maybe orelse continue;
                 if (!keep[i] or slot.group != group) continue;
-                const column = slot.column(self.rows.len, &self.groups);
+                const column = slot.column(self.rowCount(), &self.groups);
                 compacted[i] = switch (slot.source) {
                     .nullable => blk: {
                         const values = self.alloc.alloc(?f64, selected.len) catch return false;
                         for (selected, values) |parent, *value| value.* = column.at(parent);
                         break :blk .{ .nullable = values };
                     },
-                    .decoded => blk: {
+                    .decoded, .paged => blk: {
                         const values = self.alloc.alloc(f64, selected.len) catch return false;
                         for (selected, values) |parent, *value| value.* = column.at(parent) orelse std.math.nan(f64);
                         break :blk .{ .decoded = values };
@@ -1928,11 +2130,11 @@ pub const GraphQueryEngine = struct {
         pub fn select(self: *@This(), query: GraphQuery, apply_limit: bool, names: []const []const u8, future: []const []const u8, later: []const []const u8) !void {
             var columns: [graph_metric_dependency_limit]MetricColumn = undefined;
             self.columnsFor(names, columns[0..names.len]);
-            const selected = try selectMetricCandidateIndexesAlloc(self.alloc, names, columns[0..names.len], query, apply_limit, self.rows.len);
+            const selected = try selectMetricCandidateIndexesAlloc(self.alloc, names, columns[0..names.len], query, apply_limit, self.rowCount());
             defer self.alloc.free(selected);
             const rows = try self.alloc.alloc(usize, selected.len);
             errdefer self.alloc.free(rows);
-            for (selected, rows) |parent, *row| row.* = self.rows[parent];
+            for (selected, rows) |parent, *row| row.* = self.rowAt(parent);
             var keep: [graph_metric_dependency_limit]bool = @splat(false);
             var groups: [graph_metric_dependency_limit]u8 = undefined;
             var mappings: [graph_metric_dependency_limit][]usize = undefined;
@@ -1941,6 +2143,7 @@ pub const GraphQueryEngine = struct {
             errdefer for (compacted) |maybe| if (maybe) |source| switch (source) {
                 .nullable => |values| self.alloc.free(values),
                 .decoded => |values| self.alloc.free(values),
+                .paged => {},
             };
             errdefer for (mappings[0..count]) |mapping| self.alloc.free(mapping);
             for (self.plan.dependencies.slice(), 0..) |name, i| keep[i] = metricColumnNameIndex(future, name) != null or metricColumnNameIndex(later, name) != null;
@@ -1957,10 +2160,11 @@ pub const GraphQueryEngine = struct {
                 const source_len = switch (slot.source) {
                     .nullable => |values| values.len,
                     .decoded => |values| values.len,
+                    .paged => |page| page.owner.count,
                 };
                 const item_size: usize = switch (slot.source) {
                     .nullable => @sizeOf(?f64),
-                    .decoded => @sizeOf(f64),
+                    .decoded, .paged => @sizeOf(f64),
                 };
                 const sparse = selected.len == 0 or (selected.len <= source_len / 4 and (source_len - selected.len) * item_size >= 16 * 1024);
                 sparse_groups[slot.group] = sparse;
@@ -1986,6 +2190,7 @@ pub const GraphQueryEngine = struct {
                 switch (slot.source) {
                     .nullable => |values| self.alloc.free(values),
                     .decoded => |values| self.alloc.free(values),
+                    .paged => {},
                 }
                 slot.source = source;
                 if (!reset[slot.group]) {
@@ -2003,8 +2208,14 @@ pub const GraphQueryEngine = struct {
                 if (maybe.*) |slot| slot.deinit(self.alloc, &self.groups);
                 maybe.* = null;
             };
-            self.alloc.free(self.rows);
+            for (groups[0..count]) |group| if (sparse_groups[group]) {
+                if (self.groups[group].paged) |owner| owner.destroy();
+                self.groups[group].paged = null;
+            };
+            self.alloc.free(self.row_storage);
             self.rows = rows;
+            self.row_storage = rows;
+            self.identity_count = null;
         }
     };
 
@@ -2078,8 +2289,8 @@ pub const GraphQueryEngine = struct {
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
-            for (trav_results) |tr| {
-                var result_node = try traversalResultNodeAlloc(self.alloc, tr, self.work_budget);
+            for (trav_results) |*tr| {
+                var result_node = try takeTraversalResultNode(tr, self.work_budget);
                 errdefer result_node.deinit(self.alloc);
                 try all_results.append(self.alloc, result_node);
 
@@ -2527,48 +2738,25 @@ pub fn collectUniqueNodesFromMatches(
     return owned;
 }
 
-fn traversalResultNodeAlloc(
-    alloc: Allocator,
-    result: traversal_mod.TraversalResult,
-    work_budget: ?*work_budget_mod.WorkBudget,
-) !GraphResultNode {
+/// Move owned traversal payloads instead of cloning every metric candidate.
+/// Budget credit moves with the payload; no double reservation is required.
+fn takeTraversalResultNode(result: *traversal_mod.TraversalResult, work_budget: ?*work_budget_mod.WorkBudget) !GraphResultNode {
+    const bytes = if (work_budget != null) try traversalGraphResultNodeOwnedBytes(result.*) else 0;
+    const same_budget = work_budget != null and work_budget == result.retained_budget;
     if (work_budget) |budget| {
-        const retained_bytes = traversalGraphResultNodeOwnedBytes(result) catch
-            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
-        try budget.retainStateBytes(retained_bytes);
+        const previous = if (same_budget) result.retained_state_bytes else 0;
+        try budget.retainStateBytes(bytes -| previous);
+        if (previous > bytes) budget.releaseStateBytes(previous - bytes);
     }
-    const key = try alloc.dupe(u8, result.key);
-    errdefer alloc.free(key);
-    const table = if (result.target_table) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (table) |value| alloc.free(value);
-    const path = if (result.path) |value| try clonePathNodesAlloc(alloc, value) else null;
-    errdefer if (path) |value| freePathNodeItems(alloc, value, value.len);
-    const path_tables = if (path) |value|
-        try pathTablesFromTerminalAlloc(alloc, value.len, result.target_table)
-    else
-        null;
-    errdefer if (path_tables) |tables| freePathTables(alloc, tables);
-
-    const path_edges = if (result.path_edges) |edges| blk: {
-        const owned = try alloc.alloc(PathEdgeInfo, edges.len);
-        var count: usize = 0;
-        errdefer freePathEdgeItems(alloc, owned, count);
-        for (edges, 0..) |edge, i| {
-            owned[i] = try pathEdgeInfoFromPathEdge(alloc, edge);
-            count += 1;
-        }
-        break :blk owned;
-    } else null;
-    errdefer if (path_edges) |edges| freePathEdgeItems(alloc, edges, edges.len);
-    return .{
-        .key = key,
-        .table = table,
-        .depth = result.depth,
-        .distance = result.distance,
-        .path = path,
-        .path_tables = path_tables,
-        .path_edges = path_edges,
-    };
+    if (!same_budget) if (result.retained_budget) |budget| budget.releaseStateBytes(result.retained_state_bytes);
+    const node = GraphResultNode{ .key = result.key, .table = result.target_table, .depth = result.depth, .distance = result.distance, .path = result.path, .path_edges = result.path_edges };
+    result.key = &.{};
+    result.target_table = null;
+    result.path = null;
+    result.path_edges = null;
+    result.retained_budget = null;
+    result.retained_state_bytes = 0;
+    return node;
 }
 
 fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !usize {
@@ -2577,8 +2765,6 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
     if (result.path) |items| {
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf([]const u8)));
         for (items) |item| total = try std.math.add(usize, total, item.len);
-        total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
-        if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
     }
     if (result.path_edges) |edges| for (edges) |edge| {
         total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
@@ -4751,7 +4937,7 @@ test "graph metric staged reads only load display columns for selected rows" {
             try std.testing.expectEqual(@as(usize, 8), reader.keys);
             try std.testing.expectEqualSlices(usize, &.{ 5, 4 }, work.rows);
             for (work.columns[0..2]) |slot| {
-                const column = slot.?.column(work.rows.len, &work.groups);
+                const column = slot.?.column(work.rowCount(), &work.groups);
                 try std.testing.expectEqual(@as(?f64, 5), column.at(0));
                 try std.testing.expectEqual(@as(?f64, 4), column.at(1));
             }
@@ -5055,7 +5241,7 @@ test "graph metric order and filter apply max results after metric processing" {
         .query_type = .neighbors,
         .index_name = "test",
         .start_nodes = .{ .keys = start_keys },
-        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 1 },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 1, .include_paths = true },
         .order_by = &metric_orders,
         .where_metric = &metric_filters,
     }, start_keys);
@@ -5063,6 +5249,9 @@ test "graph metric order and filter apply max results after metric processing" {
 
     try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
     try std.testing.expectEqualStrings("C", result.nodes[0].key);
+    try std.testing.expect(isCanonicalResultNode(result.nodes[0]));
+    try std.testing.expectEqual(@as(usize, 2), result.nodes[0].path.?.len);
+    try std.testing.expect(result.nodes[0].path_tables == null);
 }
 
 test "shortest path metric filtering evaluates the complete bounded candidate set" {
@@ -5719,7 +5908,7 @@ test "graph metric fused selection matches staged missing qualified duplicate an
                 for (names, columns) |name, column| for (keys, column) |key, *value| {
                     const n = try std.fmt.parseInt(usize, key, 10);
                     if (self.fail and n == 4096) return error.InvalidGraphMetricScore;
-                    value.* = if (n % 11 == 0) std.math.nan(f64) else @floatFromInt(n % (if (name[0] == 'f') @as(usize, 97) else if (name[0] == 'o') @as(usize, 31) else @as(usize, 19)));
+                    value.* = if ((name[0] != 'f' and n % 11 == 0) or (name[0] == 'f' and n % 17 == 0)) std.math.nan(f64) else @floatFromInt(n % (if (name[0] == 'f') @as(usize, 97) else if (name[0] == 'o') @as(usize, 31) else @as(usize, 19)));
                 };
             }
         };
@@ -5734,8 +5923,8 @@ test "graph metric fused selection matches staged missing qualified duplicate an
             const filters = [_]GraphMetricFilter{.{ .name = "f", .op = .gte, .value = 20 }};
             const apply_limit = mode < 6;
             const unlimited = mode >= 4;
-            const orders = [_]GraphMetricOrder{ .{ .name = if (mode == 1) "f" else "o", .direction = if (mode == 3) .asc else .desc, .nulls = if (mode == 3) .first else .last }, .{ .name = "f", .direction = .asc } };
-            const query = GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = if (mode == 4 or mode == 5) 0 else 9 }, .metrics = &.{ .{ .name = "f" }, .{ .name = "o" }, .{ .name = "p" } }, .where_metric = if (mode == 3) &.{} else &filters, .order_by = if (mode == 2 or mode == 4 or mode == 6) &.{} else orders[0..if (mode == 0) 2 else 1] };
+            const orders = [_]GraphMetricOrder{ .{ .name = if (mode == 1) "f" else if (mode == 10) "unused" else "o", .direction = if (mode == 3 or mode == 8) .asc else .desc, .nulls = if (mode == 3 or mode >= 8) .first else .last }, .{ .name = if (mode == 10) "o" else if (mode == 11) "unused" else "f", .direction = .asc } };
+            const query = GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = if (mode == 4 or mode == 5) 0 else 9 }, .metrics = &.{ .{ .name = "f" }, .{ .name = "o" }, .{ .name = "p" } }, .where_metric = if (mode == 3) &.{} else &filters, .order_by = if (mode == 2 or mode == 4 or mode == 6) &.{} else orders[0..if (mode == 0 or mode >= 8) 2 else 1] };
             const plan = try MetricReadPlan.init(query);
             var staged = try GraphQueryEngine.MetricStageWorkspace.init(a, plan, nodes.len);
             defer staged.deinit();
@@ -5770,7 +5959,7 @@ test "graph metric fused selection matches staged missing qualified duplicate an
             for (left, right) |x, y| for (0..fused.rows.len) |row| try std.testing.expectEqual(x.at(row), y.at(row));
         }
     };
-    for (0..8) |mode| try Runner.run(std.testing.allocator, mode);
+    for (0..12) |mode| try Runner.run(std.testing.allocator, mode);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{@as(usize, 0)});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{@as(usize, 5)});
     // A failure after successful batches must leave the workspace untouched.
@@ -5785,8 +5974,8 @@ test "graph metric fused selection matches staged missing qualified duplicate an
     defer work.deinit();
     var reader = Runner.Reader{ .fail = true };
     try std.testing.expectError(error.InvalidGraphMetricScore, work.selectReading(&reader, query, true, nodes));
-    try std.testing.expectEqual(nodes.len, work.rows.len);
-    for (work.rows, 0..) |row, ordinal| try std.testing.expectEqual(ordinal, row);
+    try std.testing.expectEqual(nodes.len, work.rowCount());
+    for (0..work.rowCount()) |i| try std.testing.expectEqual(i, work.rowAt(i));
     for (work.columns) |column| try std.testing.expect(column == null);
 }
 
@@ -5810,13 +5999,13 @@ test "graph metric sparse compaction commits atomically and releases empty selec
             var reader = Reader{};
             try work.ensure(&reader, plan.projections.slice(), nodes);
             work.select(query, true, plan.projections.slice(), plan.projections.slice(), &.{}) catch |err| {
-                try std.testing.expectEqual(nodes.len, work.rows.len);
+                try std.testing.expectEqual(nodes.len, work.rowCount());
                 try std.testing.expectEqual(nodes.len, work.columns[0].?.source.decoded.len);
                 return err;
             };
             try std.testing.expectEqualSlices(usize, &.{ 4096, 4095, 4094 }, work.rows);
             for (work.columns[0..2]) |slot| {
-                const column = slot.?.column(work.rows.len, &work.groups);
+                const column = slot.?.column(work.rowCount(), &work.groups);
                 for (0..3) |row| try std.testing.expectEqual(@as(?f64, @floatFromInt(4096 - row)), column.at(row));
             }
             var empty = query;
@@ -5858,7 +6047,7 @@ test "graph metric fused eligibility preserves unlimited personalized and legacy
     };
     var legacy = Legacy{};
     try std.testing.expect(!try work.selectReading(&legacy, query, true, nodes));
-    try std.testing.expectEqual(nodes.len, work.rows.len);
+    try std.testing.expectEqual(nodes.len, work.rowCount());
     for (work.columns) |column| try std.testing.expect(column == null);
 }
 
@@ -5944,12 +6133,54 @@ test "graph metric fused heap grows only with matches and rolls back failed grow
         work.deinit();
         try std.testing.expectEqual(@as(usize, 0), counter.live);
     }
-    var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 400 * 1024 };
+    var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 250 * 1024 };
     var work = try GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), plan, nodes.len);
     var reader = Reader{ .mode = 2 };
     try std.testing.expectError(error.OutOfMemory, work.selectReading(&reader, query, true, nodes));
-    for (work.rows, 0..) |row, i| try std.testing.expectEqual(i, row);
+    for (0..work.rowCount()) |i| try std.testing.expectEqual(i, work.rowAt(i));
     for (work.columns) |column| try std.testing.expect(column == null);
     work.deinit();
     try std.testing.expectEqual(@as(usize, 0), counter.live);
+}
+
+test "graph metric traversal payload transfer is atomic and preserves owner pointers" {
+    const a = std.testing.allocator;
+    const key = try a.dupe(u8, "b");
+    const table = try a.dupe(u8, "entities");
+    const path = try clonePathNodesAlloc(a, &.{ "a", "b" });
+    const edges = try a.alloc(paths_mod.PathEdge, 1);
+    edges[0] = try paths_mod.clonePathEdge(a, .{ .source = "a", .target = "b", .edge_type = "e", .edge_id = "id", .owner_document = "owner", .metadata = "metadata", .weight = 1 });
+    var source = traversal_mod.TraversalResult{ .key = key, .target_table = table, .path = path, .path_edges = edges, .depth = 1, .distance = 1, .total_weight = 1 };
+    const bytes = try traversalGraphResultNodeOwnedBytes(source);
+    var budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = bytes - 16 });
+    try budget.retainStateBytes(bytes - 16);
+    source.retained_budget = &budget;
+    source.retained_state_bytes = bytes - 16;
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, takeTraversalResultNode(&source, &budget));
+    try std.testing.expectEqual(key.ptr, source.key.ptr);
+    try std.testing.expect(source.retained_budget == &budget);
+    budget.max_retained_state_bytes = bytes;
+    var node = try takeTraversalResultNode(&source, &budget);
+    defer node.deinit(a);
+    try std.testing.expectEqual(bytes, budget.retained_state_bytes);
+    try std.testing.expectEqual(key.ptr, node.key.ptr);
+    try std.testing.expectEqual(table.ptr, node.table.?.ptr);
+    try std.testing.expectEqual(path.ptr, node.path.?.ptr);
+    try std.testing.expectEqual(edges.ptr, node.path_edges.?.ptr);
+    try std.testing.expect(node.path_tables == null);
+    traversal_mod.freeResults(a, &.{source});
+    try std.testing.expectEqual(bytes, budget.retained_state_bytes);
+    node.path_tables = try pathTablesFromTerminalAlloc(a, node.path.?.len, node.table);
+    try std.testing.expect(isCanonicalResultNode(node));
+}
+
+test "graph metric identity workspace reserves no candidate row storage" {
+    var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = std.testing.allocator, .limit = 0 };
+    const query = GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} } };
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), try MetricReadPlan.init(query), 100000);
+    defer work.deinit();
+    try std.testing.expectEqual(@as(usize, 100000), work.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), work.rows.len);
+    try std.testing.expectEqual(@as(usize, 99999), work.rowAt(99999));
+    try std.testing.expectEqual(@as(usize, 0), counter.alloc_attempts);
 }
