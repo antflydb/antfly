@@ -21,8 +21,8 @@ Read `docs/architecture.mdx` for the Raft, storage, and index design, and `specs
 ## Commands
 
 ```bash
-make build              # antfarm frontend + Zig antfly binary (copied to ./antfly; run ./antfly standalone)
-make generate           # After OpenAPI changes (Zig modules, joined openapi.yaml, Go/TS/Python/Rust SDKs, antfarm)
+make build              # Zig antfly binary, copied to ./antfly (run ./antfly standalone)
+make generate           # After OpenAPI or antfarm changes (Zig modules, joined openapi.yaml, Go/TS/Python/Rust SDKs, antfarm build)
 make gc                 # Garbage-collect build caches across all worktrees
 ```
 

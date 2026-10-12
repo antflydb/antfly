@@ -30,7 +30,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build              Build the Zig antfly binary"
-	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
+	@echo "  build-antfarm      Rebuild the antfarm frontend into zig/pkg/antfly/antfarm (also run by generate)"
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
 	@echo "  fmt                Format Zig, Go, Python, TypeScript, and Rust sources"
@@ -88,7 +88,9 @@ build-antfarm-main:
 	rm -rf zig/pkg/antfly/antfarm/*
 	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
 
-build: build-antfarm
+# Uses the committed antfarm build in zig/pkg/antfly/antfarm; `make generate`
+# (or `make build-antfarm`) refreshes it, and repository-check verifies it.
+build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 

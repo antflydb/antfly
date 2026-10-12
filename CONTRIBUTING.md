@@ -54,7 +54,7 @@ Run `make help` for the full list. Key targets:
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
+| `make build` | Build the `antfly` binary with the committed Antfarm assets |
 | `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
 | `make fmt` | Format Zig, Go, Python, TypeScript, and Rust sources |
 | `make fmt-check` | Verify repository formatting without changing files |
@@ -63,7 +63,7 @@ Run `make help` for the full list. Key targets:
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
 | `make zig-test` | Run the Zig test aggregate |
-| `make build-antfarm` | Build the Antfarm dashboard |
+| `make build-antfarm` | Rebuild the Antfarm dashboard into `zig/pkg/antfly/antfarm` (also run by `make generate`); needed after changing `ts/apps/antfarm` or its dependencies |
 | `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
@@ -122,7 +122,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 ## Dependency Hygiene
 
-`make build` and `make generate` may auto-run `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
+`make generate` auto-runs `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
 
 If you want the same check locally before pushing, install the repository hooks once:
 
