@@ -316,15 +316,25 @@ fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.
         .datetime => .u64_val,
         else => return error.InvalidRelationalExpressionInput,
     };
-    return .{ .ordinal = ordinal, .path = column.path, .value_type = value_type, .is_numeric = column.column_type == .numeric, .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null, .is_null = value == .null, .value = switch (value) {
-        .null => .{ .bytes_val = "" },
-        .string, .blob, .numeric => |bytes| .{ .bytes_val = bytes },
-        .integer => |integer| .{ .i64_val = integer },
-        .number => |number| .{ .f64_val = number },
-        .boolean => |boolean| .{ .bool_val = boolean },
-        .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
-        .sql_array => |array| .{ .bytes_val = array.bytes },
-    } };
+    return .{
+        .ordinal = ordinal,
+        .path = column.path,
+        .value_type = value_type,
+        .is_numeric = column.column_type == .numeric,
+        .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+        .is_null = value == .null,
+        .value = switch (value) {
+            .null => .{ .bytes_val = "" },
+            .string, .blob, .numeric => |bytes| .{ .bytes_val = bytes },
+            .integer => |integer| .{ .i64_val = integer },
+            .number => |number| .{ .f64_val = number },
+            .boolean => |boolean| .{ .bool_val = boolean },
+            .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
+            .sql_array => |array| .{ .bytes_val = array.bytes },
+            // JSON output requires its explicit SQL NULL provenance boundary.
+            .json => return error.InvalidRelationalExpressionInput,
+        },
+    };
 }
 
 test "relational index system array rewrite operands retain canonical bytes and reject element reinterpretation" {

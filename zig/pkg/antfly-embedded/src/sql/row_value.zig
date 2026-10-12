@@ -18,6 +18,127 @@
 //! JSON is an ingress/output representation, never a source of SQL identity.
 const std = @import("std");
 const layout = @import("../common/sql_array_layout.zig");
+const json_order = @import("json_order.zig");
+const Context = @import("numeric_value.zig").Context;
+
+/// A present typed JSON value, including JSON null. SQL NULL is represented by
+/// Value.null, never by this payload. Trees borrow a pinned ingress/schema/row
+/// owner; neither strings nor exact numeric tokens acquire SQL scalar identity.
+pub const Json = struct {
+    value: std.json.Value,
+
+    pub fn extract(self: Json, key: []const u8, work: *json_order.Budget) !?Json {
+        return if (try @import("json_path.zig").extract(self.value, key, work)) |value| .{ .value = value } else null;
+    }
+
+    /// Materialize an independently owned tree in a caller-owned region.
+    /// Partial allocations belong to that region on failure. Unlike decoding,
+    /// no input token or container may remain attached to the pinned source.
+    pub fn cloneLeaky(self: Json, alloc: std.mem.Allocator, work: *json_order.Budget) !Json {
+        return .{ .value = try cloneNode(self.value, alloc, work, 0) };
+    }
+
+    fn cloneNode(value: std.json.Value, alloc: std.mem.Allocator, work: *json_order.Budget, depth: usize) anyerror!std.json.Value {
+        try work.consume(1);
+        if (depth > 64) return if (work.shared) |context| context.limit() else error.SqlProgramLimitExceeded;
+        return switch (value) {
+            inline .string, .number_string => |bytes, tag| blk: {
+                try work.consume(bytes.len);
+                break :blk @unionInit(std.json.Value, @tagName(tag), try alloc.dupe(u8, bytes));
+            },
+            .array => |items| blk: {
+                var output = std.json.Array.init(alloc);
+                try output.ensureTotalCapacity(items.items.len);
+                for (items.items) |item| output.appendAssumeCapacity(try cloneNode(item, alloc, work, depth + 1));
+                break :blk .{ .array = output };
+            },
+            .object => |items| blk: {
+                var output: std.json.ObjectMap = .empty;
+                try output.ensureTotalCapacity(alloc, @intCast(items.count()));
+                for (items.keys(), items.values()) |key, item| {
+                    try work.consume(key.len);
+                    try output.put(alloc, try alloc.dupe(u8, key), try cloneNode(item, alloc, work, depth + 1));
+                }
+                break :blk .{ .object = output };
+            },
+            else => value,
+        };
+    }
+};
+
+/// Lazy decoded JSON cache for exactly one pinned physical row. Initialize at
+/// its final address: the arena points at memory, and all consumers must finish
+/// before resetRow/deinit or advancing the source row. No schema-width vector,
+/// stringify/parse round trip, or per-expression source decoding is required.
+pub const JsonRow = struct {
+    memory: @import("memory_budget.zig"),
+    arena: std.heap.ArenaAllocator,
+    context: *Context,
+    entries: std.AutoHashMapUnmanaged(u32, Entry),
+    decodes: usize,
+
+    const Entry = struct { bytes: []const u8, json: *const Json };
+
+    /// Backing must reclaim freed arena buffers. Request/transaction arenas
+    /// use initRegion so row resets cannot refund retained parent capacity.
+    pub fn init(self: *JsonRow, backing: std.mem.Allocator, limit: usize, context: *Context) void {
+        self.* = .{
+            .memory = .{ .backing = backing, .limit = limit },
+            .arena = undefined,
+            .context = context,
+            .entries = .empty,
+            .decodes = 0,
+        };
+        self.arena = .init(self.memory.allocator());
+    }
+
+    pub fn initRegion(self: *JsonRow, backing: std.mem.Allocator, limit: usize, context: *Context) void {
+        self.init(backing, limit, context);
+        self.memory.monotonic = true;
+    }
+
+    pub fn deinit(self: *JsonRow) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Invalidate every borrowed result before advancing the physical source.
+    /// Retained capacity stays charged; row changes never reset CPU admission,
+    /// sticky cancellation, or the maximum live decode-memory boundary.
+    pub fn resetRow(self: *JsonRow) !void {
+        try self.context.charge(0);
+        if (!self.arena.reset(.retain_capacity)) return self.failure(error.OutOfMemory);
+        self.entries = .empty;
+        self.decodes = 0;
+    }
+
+    /// Source bytes must belong to an authenticated, canonical physical JSON
+    /// cell and remain immutable until row retirement. This bounded decoder
+    /// does not replace physical validation or infer schema/NULL authority.
+    pub fn decodePinned(self: *JsonRow, ordinal: u32, bytes: []const u8) !*const Json {
+        try self.context.charge(1);
+        if (self.entries.get(ordinal)) |entry| {
+            // An ordinal alone is not source authority. Changing a source
+            // buffer without a row reset must not return a previous row's tree.
+            if (entry.bytes.ptr != bytes.ptr or entry.bytes.len != bytes.len) return error.InvalidSqlProgram;
+            return entry.json;
+        }
+        if (bytes.len > self.context.max_input_bytes) return self.context.limit();
+        var work: json_order.Budget = .{ .shared = self.context };
+        const value = json_order.parsePinnedTextLeaky(self.arena.allocator(), bytes, &work) catch |err| return self.failure(err);
+        json_order.validateTextDomain(value, &work, 0) catch |err| return self.failure(err);
+        const json = self.arena.allocator().create(Json) catch |err| return self.failure(err);
+        json.* = .{ .value = value };
+        self.entries.put(self.arena.allocator(), ordinal, .{ .bytes = bytes, .json = json }) catch |err| return self.failure(err);
+        self.decodes += 1;
+        return json;
+    }
+
+    fn failure(self: *JsonRow, err: anyerror) anyerror {
+        if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) return self.context.limit();
+        return err;
+    }
+};
 
 pub const Array = struct {
     element_type: layout.Kind,
@@ -40,6 +161,9 @@ pub const Value = union(enum) {
     number: f64,
     numeric: []const u8,
     sql_array: Array,
+    /// A sparse owner allocates a JSON root only when actually referenced.
+    /// Keep DOM container metadata out of every ordinary logical value slot.
+    json: *const Json,
 
     /// Explicit transport-neutral scalar adaptation; never parse a value or
     /// infer its SQL type. The source supplies the exact scalar tag/payload.
@@ -53,7 +177,7 @@ pub const Value = union(enum) {
     /// Adding an expression value must not silently widen persistent indexes.
     pub fn scalar(self: Value, comptime Scalar: type) !Scalar {
         return switch (self) {
-            .sql_array => error.UnsupportedRelationalValueType,
+            .sql_array, .json => error.UnsupportedRelationalValueType,
             inline else => |payload, tag| @unionInit(Scalar, @tagName(tag), payload),
         };
     }
@@ -85,4 +209,230 @@ test "SQL row values preserve exact scalar operands across explicit key projecti
     const array: Value = .{ .sql_array = .{ .element_type = .int64, .bytes = &bytes } };
     try std.testing.expectEqual(@as(u32, 0), (try array.sql_array.view()).count);
     try std.testing.expectError(error.UnsupportedRelationalValueType, array.scalar(Scalar));
+    const json: Value = .{ .json = &.{ .value = .null } };
+    try std.testing.expect(json != .null);
+    try std.testing.expectEqual(std.json.Value.null, json.json.value);
+    try std.testing.expectError(error.UnsupportedRelationalValueType, json.scalar(Scalar));
+    const BeforeJson = union(enum) {
+        null,
+        string: []const u8,
+        blob: []const u8,
+        boolean: bool,
+        datetime: i128,
+        integer: i64,
+        number: f64,
+        numeric: []const u8,
+        sql_array: Array,
+    };
+    try std.testing.expectEqual(@sizeOf(BeforeJson), @sizeOf(Value));
+}
+
+test "SQL row values JSON cache decodes once borrows exact tokens and resets source identity" {
+    const a = std.testing.allocator;
+    var context: Context = .{ .alloc = a };
+    var row: JsonRow = undefined;
+    row.init(a, 1024 * 1024, &context);
+    defer row.deinit();
+    const source = "{\"source\":\"escaped\\ntext\",\"n\":9007199254740993.2500,\"nil\":null}";
+    const operand = try row.decodePinned(std.math.maxInt(u32), source);
+    var work: json_order.Budget = .{ .shared = &context };
+    const number = (try operand.extract("n", &work)).?;
+    try std.testing.expectEqualStrings("9007199254740993.2500", number.value.number_string);
+    const offset = std.mem.indexOf(u8, source, number.value.number_string).?;
+    try std.testing.expectEqual(@intFromPtr(source.ptr + offset), @intFromPtr(number.value.number_string.ptr));
+    try std.testing.expectEqualStrings("escaped\ntext", (try operand.extract("source", &work)).?.value.string);
+    try std.testing.expectEqual(std.json.Value.null, (try operand.extract("nil", &work)).?.value);
+    try std.testing.expect((try operand.extract("missing", &work)) == null);
+    const live = row.memory.live;
+    row.memory.limit = live; // Cache hits cannot obtain additional memory.
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const cached = try row.decodePinned(std.math.maxInt(u32), source);
+        try std.testing.expectEqual(operand.value.object.values().ptr, cached.value.object.values().ptr);
+    }
+    std.debug.print("JSON row cache: reads=10000 decodes=1 cached_allocated_bytes=0 retained_bytes={} elapsed_ns={}\n", .{ live, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+    try std.testing.expectEqual(@as(usize, 1), row.decodes);
+    try std.testing.expectEqual(live, row.memory.live);
+    try std.testing.expectEqual(@as(usize, 1), row.entries.count());
+    try std.testing.expectError(error.InvalidSqlProgram, row.decodePinned(std.math.maxInt(u32), "{\"source\":\"next\"}"));
+    const before = context.remaining;
+    try row.resetRow();
+    try std.testing.expectEqual(before, context.remaining);
+    const next = try row.decodePinned(std.math.maxInt(u32), "{\"source\":\"next\"}");
+    try std.testing.expectEqualStrings("next", (try next.extract("source", &work)).?.value.string);
+    try std.testing.expectEqual(@as(usize, 1), row.decodes);
+}
+
+test "SQL row values JSON cache unwinds every allocation cut and bounds live row memory" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var context: Context = .{ .alloc = backing };
+            var row: JsonRow = undefined;
+            row.init(backing, 1024 * 1024, &context);
+            defer row.deinit();
+            const source = "{\"\\u0078\":[1,null,true,{},[\"a\\tb\"]]}";
+            for (0..4) |_| {
+                const operand = try row.decodePinned(7, source);
+                try std.testing.expect(operand.value.object.contains("x"));
+                _ = try row.decodePinned(7, source);
+                try std.testing.expectEqual(@as(usize, 1), row.decodes);
+                try row.resetRow();
+            }
+        }
+    };
+    try Run.run(a);
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Run.run, .{});
+    var context: Context = .{ .alloc = a };
+    var limited: JsonRow = undefined;
+    limited.init(a, 0, &context);
+    defer limited.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.decodePinned(1, "[1]"));
+    limited.memory.limit = 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.decodePinned(1, "[1]"));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.resetRow());
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var region_context: Context = .{ .alloc = region.allocator() };
+    var region_row: JsonRow = undefined;
+    region_row.initRegion(region.allocator(), 1024 * 1024, &region_context);
+    defer region_row.deinit();
+    _ = try region_row.decodePinned(1, "[1,2,3]");
+    const spent = region_row.memory.footprint();
+    try region_row.resetRow();
+    try std.testing.expect(region_row.memory.monotonic);
+    try std.testing.expect(region_row.memory.footprint() >= spent);
+    _ = try region_row.decodePinned(1, "[4]");
+    try std.testing.expect(region_row.memory.footprint() >= spent);
+}
+
+test "SQL row values JSON cache retains cancellation and rejects malformed source before publication" {
+    const a = std.testing.allocator;
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const wide: [1024]u8 = @splat('x');
+    var source_buffer: [1100]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buffer, "{{\"source\":\"{s}\",\"array\":[1,null,true]}}", .{&wide});
+    var observed: Control = .{};
+    var context: Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &observed };
+    var baseline: JsonRow = undefined;
+    baseline.init(a, 1024 * 1024, &context);
+    defer baseline.deinit();
+    _ = try baseline.decodePinned(1, source);
+    for (1..observed.polls + 1) |cut| {
+        var control: Control = .{ .fail_at = cut };
+        var canceled: Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &control };
+        var row: JsonRow = undefined;
+        row.init(a, 1024 * 1024, &canceled);
+        defer row.deinit();
+        try std.testing.expectError(error.QueryCanceled, row.decodePinned(1, source));
+        try std.testing.expectError(error.QueryCanceled, row.decodePinned(1, source));
+        try std.testing.expectError(error.QueryCanceled, row.resetRow());
+        try std.testing.expectEqual(@as(usize, 0), row.entries.count());
+    }
+    for ([_][]const u8{ "{", "[1,]", "{\"x\":1,\"x\":2}", "\"\\u0000\"", "\"bad\\xescape\"" }) |invalid| {
+        var fresh: Context = .{ .alloc = a };
+        var row: JsonRow = undefined;
+        row.init(a, 1024 * 1024, &fresh);
+        defer row.deinit();
+        _ = row.decodePinned(1, invalid) catch |err| {
+            try std.testing.expect(err == error.SqlInvalidTextRepresentation or err == error.SqlTypeMismatch);
+            try std.testing.expectEqual(@as(usize, 0), row.entries.count());
+            continue;
+        };
+        return error.TestExpectedError;
+    }
+    var fresh: Context = .{ .alloc = a, .max_input_bytes = 1 };
+    var row: JsonRow = undefined;
+    row.init(a, 1024 * 1024, &fresh);
+    defer row.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, row.decodePinned(1, "null"));
+    fresh.max_input_bytes = 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, row.decodePinned(1, "null"));
+    var nested: [131]u8 = undefined;
+    @memset(nested[0..65], '[');
+    nested[65] = '0';
+    @memset(nested[66..], ']');
+    var depth_context: Context = .{ .alloc = a };
+    var depth_row: JsonRow = undefined;
+    depth_row.init(a, 1024 * 1024, &depth_context);
+    defer depth_row.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, depth_row.decodePinned(0, &nested));
+    try std.testing.expectEqual(@as(usize, 0), depth_row.entries.count());
+    try std.testing.expectError(error.SqlProgramLimitExceeded, depth_row.decodePinned(0, "null"));
+}
+
+test "SQL row values JSON clone owns every token after its source is retired and unwinds faults" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var output = std.heap.ArenaAllocator.init(backing);
+            defer output.deinit();
+            var context: Context = .{ .alloc = backing };
+            var work: json_order.Budget = .{ .shared = &context };
+            const cloned = blk: {
+                var row: JsonRow = undefined;
+                row.init(backing, 1024 * 1024, &context);
+                defer row.deinit();
+                const source = try backing.dupe(u8, "{\"s\":\"escaped\\ntext\",\"n\":9007199254740993.2500,\"a\":[null,{\"x\":\"plain\"}]}");
+                defer backing.free(source);
+                const input = try row.decodePinned(0, source);
+                const result = try input.cloneLeaky(output.allocator(), &work);
+                try std.testing.expect(input.value.object.values().ptr != result.value.object.values().ptr);
+                try std.testing.expect(input.value.object.get("n").?.number_string.ptr != result.value.object.get("n").?.number_string.ptr);
+                break :blk result;
+            };
+            try std.testing.expectEqualStrings("9007199254740993.2500", (try cloned.extract("n", &work)).?.value.number_string);
+            try std.testing.expectEqualStrings("escaped\ntext", (try cloned.extract("s", &work)).?.value.string);
+            const items = (try cloned.extract("a", &work)).?.value.array;
+            try std.testing.expectEqual(output.allocator().ptr, items.allocator.ptr);
+            try std.testing.expectEqual(std.json.Value.null, items.items[0]);
+            try std.testing.expectEqualStrings("plain", items.items[1].object.get("x").?.string);
+        }
+    };
+    try Run.run(a);
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Run.run, .{});
+}
+
+test "SQL row values JSON clone cancels every observed cut without retaining partial output" {
+    const a = std.testing.allocator;
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const wide: [1024]u8 = @splat('x');
+    var values = std.json.Array.init(a);
+    defer values.deinit();
+    try values.append(.{ .string = &wide });
+    const input: Json = .{ .value = .{ .array = values } };
+    var observed: Control = .{};
+    var baseline_context: Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &observed };
+    var baseline_work: json_order.Budget = .{ .shared = &baseline_context };
+    var baseline_region = std.heap.ArenaAllocator.init(a);
+    defer baseline_region.deinit();
+    _ = try input.cloneLeaky(baseline_region.allocator(), &baseline_work);
+    try std.testing.expect(observed.polls >= 2);
+    for (1..observed.polls + 1) |cut| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        var control: Control = .{ .fail_at = cut };
+        var context: Context = .{ .alloc = region.allocator(), .checkpoint = Control.check, .ptr = &control };
+        var work: json_order.Budget = .{ .shared = &context };
+        try std.testing.expectError(error.QueryCanceled, input.cloneLeaky(region.allocator(), &work));
+        try std.testing.expectError(error.QueryCanceled, input.cloneLeaky(region.allocator(), &work));
+    }
 }

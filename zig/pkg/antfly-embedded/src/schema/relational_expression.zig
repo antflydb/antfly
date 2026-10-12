@@ -1849,6 +1849,10 @@ fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.C
         .number => |value| std.math.order(value, b.number),
         .datetime => |value| std.math.order(value, b.datetime),
         .sql_array => |array| @import("../sql/array_comparison.zig").order(try array.view(), try b.sql_array.view(), context, max_allocated_bytes),
+        .json => |json| blk: {
+            var work: @import("../sql/json_order.zig").Budget = .{ .shared = context };
+            break :blk try @import("../sql/json_order.zig").compare(json.value, b.json.value, &work, 0);
+        },
     };
 }
 
@@ -2035,6 +2039,9 @@ const Compiler = struct {
                         self.hash.update(&bytes);
                     },
                     .sql_array => |array| self.frame(array.bytes),
+                    // JSON literal/public compilation is deliberately guarded
+                    // until its capability and NULL transport are activated.
+                    .json => return error.InvalidRelationalExpressionType,
                 }
             },
             .column => {
@@ -3713,7 +3720,7 @@ fn valuesEqual(a: Value, b: Value) !bool {
         .null => true,
         .string => |bytes| std.mem.eql(u8, bytes, b.string),
         .blob => |bytes| std.mem.eql(u8, bytes, b.blob),
-        .numeric, .sql_array => try valueOrder(a, b, false) == .eq,
+        .numeric, .sql_array, .json => try valueOrder(a, b, false) == .eq,
         .integer => |value| value == b.integer,
         .number => |value| value == b.number,
         .boolean => |value| value == b.boolean,
@@ -3834,6 +3841,7 @@ test "relational declarations constant folding owns output and shares sticky adm
 
 fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     return switch (value) {
+        .json => |json| cloneJsonOutput(execution, json.*),
         .numeric => |bytes| numericJsonOutput(execution, bytes),
         .sql_array => |array| arrayJsonOutputLeaky(execution, array),
         .string => |bytes| blk: {
@@ -3856,6 +3864,16 @@ fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     };
 }
 
+fn cloneJsonOutput(execution: *Execution, json: @import("../sql/row_value.zig").Json) !std.json.Value {
+    var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+    defer execution.bytes.* -|= memory.footprint();
+    var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+    var output = (json.cloneLeaky(memory.allocator(), &work) catch |err| return if (err == error.OutOfMemory and memory.isExhausted()) execution.limit() else executionFailure(err)).value;
+    // Never retain the temporary admission allocator in managed JSON arrays.
+    @import("../sql/json_order.zig").rehomeArrayAllocators(&output, execution.alloc, &work, 0) catch |err| return executionFailure(err);
+    return output;
+}
+
 fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
     return switch (value) {
         .null => .null,
@@ -3874,7 +3892,52 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
             var execution = Execution.init(alloc, &allowance);
             break :blk arrayJsonOutputLeaky(&execution, array);
         },
+        .json => |json| blk: {
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &allowance);
+            break :blk cloneJsonOutput(&execution, json.*);
+        },
     };
+}
+
+test "relational index system typed JSON values compare exactly and materialize owned bounded output" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const alloc = region.allocator();
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(alloc, &bytes);
+    const output = blk: {
+        var source: @import("../sql/row_value.zig").JsonRow = undefined;
+        source.init(a, max_allocated_bytes, &execution.numeric);
+        defer source.deinit();
+        const left: Value = .{ .json = try source.decodePinned(0, "{\"n\":9007199254740993.2500,\"a\":[null,\"escaped\\ntext\"]}") };
+        const right: Value = .{ .json = try source.decodePinned(1, "{\"a\":[null,\"escaped\\ntext\"],\"n\":9007199254740993.25}") };
+        try std.testing.expectEqual(std.math.Order.eq, try valueOrderWithContext(left, right, false, &execution.numeric));
+        try std.testing.expect(try valuesEqual(left, right));
+        try std.testing.expect(!try valuesEqual(.null, .{ .json = &.{ .value = .null } }));
+        break :blk try boundedValueToJson(&execution, left);
+    };
+    try std.testing.expectEqualStrings("9007199254740993.2500", output.object.get("n").?.number_string);
+    const array = output.object.get("a").?.array;
+    try std.testing.expectEqual(alloc.ptr, array.allocator.ptr);
+    try std.testing.expectEqual(alloc.vtable, array.allocator.vtable);
+    try std.testing.expectEqualStrings("escaped\ntext", array.items[1].string);
+    try std.testing.expect(bytes < max_allocated_bytes);
+    var limited_bytes: usize = 0;
+    var limited = Execution.init(alloc, &limited_bytes);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, boundedValueToJson(&limited, .{ .json = &.{ .value = output } }));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, limited.charge(0));
+    var cpu_bytes: usize = max_allocated_bytes;
+    var cpu = Execution.init(alloc, &cpu_bytes);
+    cpu.numeric.remaining = 1; // Clone succeeds; allocator rehoming exhausts work.
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, boundedValueToJson(&cpu, .{ .json = &.{ .value = .null } }));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, cpu.charge(0));
+    // A tagged VM operand must not accidentally activate public JSON programs
+    // before schema capability and physical SQL NULL provenance are wired.
+    const definition = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"column\",\"column\":\"doc\"}", .{});
+    defer definition.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "doc", .path = "doc", .column_type = .json }} }, definition.value, .json));
 }
 
 fn entries(value: std.json.Value) ![]const std.json.Value {

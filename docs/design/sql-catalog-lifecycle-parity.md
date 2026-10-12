@@ -4117,3 +4117,43 @@ type OIDs, SQL NULL provenance and selected-argument failures. Formatting,
 source-catalog freshness, original inventory integrity and the 2,051-file Apache
 boundary passed. There is no public contract change requiring generation and
 no durable JSON activation or additional original-case credit in this checkpoint.
+
+### Typed JSON operand and row owner foundation
+
+Logical operands now have a distinct JSON tag whose present JSON null is not
+SQL NULL. The tag points at an immutable decoded root; an invariant test keeps
+the ordinary Value slot the same size as before JSON support. Ordered scalar
+key projection rejects JSON explicitly, independently of expression comparison.
+Shared structural comparison preserves exact numeric tokens and ignores object
+insertion order without converting through floating point.
+
+JsonRow lazily decodes only referenced authenticated physical JSON cells into a
+bounded stable-address owner. A sparse ordinal hash map shares each decoded
+tree across programs without a schema-width allocation or linear cache lookup.
+Cached values borrow immutable source tokens where possible; escaped strings
+and containers belong to the row owner. Source-pointer/extent checks reject an
+ordinal reused with a different source before an explicit row reset. Reset
+invalidates all borrowed values but preserves work, cancellation and memory
+admission. Heap-backed owners charge live capacity; initRegion also charges
+freed buffers retained by a parent arena, so reset cannot refund inaccessible
+capacity. Syntax, text domain, depth, input bytes and allocation admission run
+before publishing a cached root. Admission/cancellation failures stay sticky.
+
+Owned output clones every token/container into the request region under shared
+work and actual-capacity admission. Managed JSON arrays are rehomed away from
+temporary admission allocators. Allocation-failure sweeps cover decode/reset and
+clone ownership; cancellation sweeps cover every observed decode/clone poll.
+Repeated-read evidence requires one decode and no additional memory for 10,000
+reads, with a sparse maximum-u32 ordinal rather than a schema-width vector.
+
+This is not public durable JSON activation. JSON column/literal compilation
+and physical JSON rewrite output remain guarded. Activation still requires the
+new capability/public operations, SQL lowering and immutable literal identity,
+the shared owner across defaults/generated/CHECK/index bindings, and restart/
+restore qualification against PostgreSQL. Existing mutation json_null_fields,
+AROW SQL-null projections and prepareTypedDocumentValueWithPlan already preserve
+root JSON-null provenance; generated/default JSON results must join that same
+channel instead of inventing an envelope or flattening JSON null into SQL NULL.
+The mapper currently filters submitted generated-field null metadata, so the
+derived expression owner must return authoritative replacement provenance.
+Original sql-0671 and all 898 unresolved original dispositions remain open.
