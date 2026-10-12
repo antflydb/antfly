@@ -129,7 +129,7 @@ pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicEx
 pub fn validatePublicQuerySortTupleContract(alloc: std.mem.Allocator, body: []const u8) !void {
     if (std.mem.indexOf(u8, body, "\"order_by\"") == null) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |object| object,
@@ -957,7 +957,7 @@ pub fn parseAlgebraicTensorAccessPathEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorAccessPathEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorAccessPathEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorAccessPathEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorAccessPathEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1073,7 +1073,7 @@ pub fn parseAlgebraicTensorExprEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorExprEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorExprEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorExprEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorExprEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1131,7 +1131,7 @@ pub fn parseAlgebraicTensorProgramEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorProgramEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorProgramEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorProgramEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorProgramEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1289,7 +1289,7 @@ pub fn parseAlgebraicVectorWorkerRequestEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicVectorWorkerRequestEnvelope {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidQueryRequest;
@@ -1498,11 +1498,11 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         @constCast((&[_][]const u8{})[0..]);
     errdefer freeOwnedStringSlice(alloc, hierarchy_unit_fields);
     if (filter_query_json.len > 0) {
-        var parsed_filter = std.json.parseFromSlice(std.json.Value, alloc, filter_query_json, .{}) catch return error.InvalidQueryRequest;
+        var parsed_filter = std.json.parseFromSlice(std.json.Value, alloc, filter_query_json, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
         parsed_filter.deinit();
     }
     if (exclusion_query_json.len > 0) {
-        var parsed_exclusion = std.json.parseFromSlice(std.json.Value, alloc, exclusion_query_json, .{}) catch return error.InvalidQueryRequest;
+        var parsed_exclusion = std.json.parseFromSlice(std.json.Value, alloc, exclusion_query_json, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
         parsed_exclusion.deinit();
     }
     const require_algebraic_filter_resolution = try parseOptionalBoolJson(value.object.get("require_algebraic_filter_resolution"), false);
@@ -2062,7 +2062,7 @@ pub fn parseNativeDocIdConstraintEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedNativeDocIdConstraintEnvelope {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return parseNativeDocIdConstraintEnvelopeValueAlloc(alloc, parsed.value);
 }
@@ -2432,7 +2432,7 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const value = parsed.value.object.get("timeout_ms") orelse return null;
@@ -2615,7 +2615,7 @@ fn validateRawGraphWhereAlloc(
 }
 
 fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
@@ -2878,7 +2878,7 @@ pub fn validateStoragePublicQueryRequest(alloc: std.mem.Allocator, body: []const
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch |err| {
-        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     };
     try validatePublicQueryEnvelopeValueAlloc(arena.allocator(), root);
     if (root.object.get("evaluate")) |stage| {
@@ -9531,7 +9531,7 @@ fn parseGraphMetricQueriesAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) ![]const db_mod.types.NamedGraphMetricQuery {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     if (parsed.value.object.get("_graph_metric_queries")) |internal_queries| {
@@ -9738,7 +9738,7 @@ fn parseGraphMetricRerankPersonalizationAlloc(
     freshness: db_mod.types.GraphMetricFreshness,
 ) !ParsedGraphMetricPersonalization {
     if (body.len == 0) return .{};
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const rerank_value = parsed.value.object.get("graph_metric_rerank") orelse return .{};
@@ -9887,7 +9887,7 @@ fn parseLegacyPatternSteps(
         graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
         const edge_types = try cloneFields(alloc, requested_edge_types);
         errdefer freeOwnedStringSlice(alloc, edge_types);
-        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
+        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
         errdefer edge_filter.deinit(alloc);
         steps[i] = .{
             .alias = try alloc.dupe(u8, step.alias orelse ""),
@@ -9948,7 +9948,7 @@ fn parseLegacyGraphQueryParams(
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     return .{
         .edge_types = edge_types,
@@ -9987,7 +9987,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -10062,7 +10062,7 @@ fn parseGraphPathQuery(
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -10282,7 +10282,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         graph_query_mod.validateEdgeTypes(requested_types) catch return error.InvalidQueryRequest;
         const types = try cloneFields(alloc, requested_types);
         errdefer freeOwnedStringSlice(alloc, types);
-        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
         errdefer edge_filter.deinit(alloc);
         edges[i] = .{
             .from = from,
@@ -11088,7 +11088,7 @@ fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod
 }
 
 fn queryBodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return parsed.value.object.get("with") != null;
@@ -11778,7 +11778,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     deadline_ns: ?u64,
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     try ensureQueryDeadline(deadline_ns);
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -11921,7 +11921,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return parsed.value.object.get("identity_read_generation") != null or
@@ -11929,14 +11929,14 @@ fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body:
 }
 
 fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasForbiddenPublicQueryField(parsed.value.object);
 }
 
 fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasInternalShardField(parsed.value.object);
@@ -11957,7 +11957,7 @@ fn queryBodyForGeneratedContractAlloc(
 ) !?[]u8 {
     if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout and !options.strip_graph_metric) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
 
@@ -12024,7 +12024,7 @@ fn objectHasNonNullField(object: std.json.ObjectMap, name: []const u8) bool {
 }
 
 fn queryBodyHasPublicHierarchyControls(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasNonNullField(parsed.value.object, "hierarchy");
@@ -12037,7 +12037,7 @@ fn applyPublicHierarchyControls(
 ) !void {
     if (!(try queryBodyHasPublicHierarchyControls(alloc, body))) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const hierarchy = parsed.value.object.get("hierarchy") orelse return;
@@ -12356,7 +12356,7 @@ fn parsePublicDocFilterBindingsAlloc(
 
     var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
     try deadline.check();
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     try deadline.check();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12651,7 +12651,7 @@ fn parseInternalFilterQueryJsonAlloc(
     body: []const u8,
     req: *db_mod.types.SearchRequest,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     if (parsed.value.object.get("_filter_query_json") == null and
@@ -12698,7 +12698,7 @@ fn mergeInternalFilterJsonAlloc(
 
 fn parseInternalFilterJsonStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .string) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     parsed.deinit();
     return try alloc.dupe(u8, value.string);
 }

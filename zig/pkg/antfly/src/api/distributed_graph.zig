@@ -1960,6 +1960,7 @@ const QueryState = struct {
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
     seen_retained_bytes: usize = 0,
     metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
+    metric_scores_pending: bool = false,
     metric_allocator: graph_work_budget.RetainedAllocator = undefined,
 
     fn initMetrics(self: *QueryState, a: std.mem.Allocator, reads: []const graph_query_mod.GraphMetricRead) !void {
@@ -2002,7 +2003,9 @@ const QueryState = struct {
         if (owner.rows >= std.math.maxInt(u32)) return error.InvalidQueryRequest;
         const row = owner.rows;
         owner.pages.?.ensureRows(row + 1) catch |err| return self.metricFailure(err);
-        for (owner.names, 0..) |name, column| owner.pages.?.set(column, row, graphNodeMetricScore(source, name) orelse std.math.nan(f64));
+        if (!self.metric_scores_pending) for (owner.names, 0..) |name, column| {
+            owner.pages.?.set(column, row, graphNodeMetricScore(source, name) orelse std.math.nan(f64));
+        };
         owner.rows += 1;
         owner.pages.?.count = owner.rows;
         target.metric_columns = owner;
@@ -3489,10 +3492,26 @@ fn canonicalGraphStepAlloc(
     return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
 }
 
-// Edge scans and discovery stay serial. Only admitted returned rows enter this
-// buffer; frontier/path state never depends on their scores. Borrow keys from
-// QueryState (stable allocations), and address results by index across growth.
+// Keep discovery serial while a bounded window groups independent score reads.
+// Keys and physical table names borrow stable QueryState/admission allocations;
+// result indexes survive list growth and sorting this private window.
 const CanonicalMetricBatch = struct {
+    const Entry = struct { table: []const u8, group: u64, index: usize };
+    const Route = struct {
+        table: []const u8,
+        admission_key: []const u8,
+        groups: []u64,
+        fn contains(self: @This(), id: u64) bool {
+            var lo: usize = 0;
+            var hi = self.groups.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.groups[mid] == id) return true;
+                if (self.groups[mid] < id) lo = mid + 1 else hi = mid;
+            }
+            return false;
+        }
+    };
     alloc: std.mem.Allocator,
     worker: Worker,
     admission: *GraphNodeAdmissionContext,
@@ -3504,90 +3523,140 @@ const CanonicalMetricBatch = struct {
     status_seen: *std.AutoHashMapUnmanaged(u64, void),
     row_limit: usize = 256,
     table: ?[]const u8 = null,
-    nodes: []graph_query_mod.GraphResultNode = &.{},
-    groups: []u64 = &.{},
-    indexes: []usize = &.{},
+    entries: []Entry = &.{},
+    keys: [][]u8 = &.{},
     count: usize = 0,
-    dirty: bool = false,
     lease: graph_work_budget.RetainedLease = .{},
+    routing: ?graph_work_budget.RetainedAllocator = null,
+    routes: std.StringHashMapUnmanaged(Route) = .empty,
+    pending_tables: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *@This()) void {
-        self.alloc.free(self.nodes);
-        self.alloc.free(self.groups);
-        self.alloc.free(self.indexes);
-        self.lease.deinit();
+    fn routingAllocator(self: *@This()) std.mem.Allocator {
+        if (self.routing == null) self.routing = .{ .backing = self.alloc, .budget = self.work_budget };
+        return self.routing.?.allocator();
     }
-
+    fn failure(self: *@This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.routing != null and self.routing.?.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.entries);
+        self.alloc.free(self.keys);
+        self.lease.deinit();
+        if (self.routing) |*routing| {
+            const a = routing.allocator();
+            var it = self.routes.valueIterator();
+            while (it.next()) |route| a.free(route.groups);
+            self.routes.deinit(a);
+            self.pending_tables.deinit(a);
+            std.debug.assert(routing.live_bytes == 0);
+        }
+    }
     fn prepareTable(self: *@This(), table: []const u8) !void {
         if (self.reads.len == 0) return;
-        if (self.table) |previous| {
-            if (std.mem.eql(u8, previous, table)) return;
-            try self.flush();
-        }
-        self.table = table;
-        self.dirty = true;
+        self.prepareRoute(table) catch |err| return self.failure(err);
     }
-
+    fn prepareRoute(self: *@This(), table: []const u8) !void {
+        var state = try self.admission.ensureTable(table);
+        const physical = state.table_name;
+        const key = state.logical_name orelse physical;
+        if (!self.routes.contains(key)) {
+            // Metadata-only tables also have a bounded pending window.
+            if (self.pending_tables.items.len == 32) {
+                try self.flush();
+                state = try self.admission.ensureTable(table);
+            }
+            const a = self.routingAllocator();
+            try self.routes.ensureUnusedCapacity(a, 1);
+            try self.pending_tables.ensureUnusedCapacity(a, 1);
+            const allowed = state.allowed and try self.admission.graphIndexAvailable(state, self.index_name);
+            const groups = if (allowed) try table_catalog.resolveGroupsForSpanPinnedUntil(a, self.admission.catalog, physical, "", "", state.topology_epoch, self.worker.routingDeadline(self.admission.catalog)) else try a.alloc(u64, 0);
+            // Epochs are pinned in every hydrate request. A stale route causes
+            // the normal whole-query topology retry, rather than partial output.
+            std.mem.sort(u64, groups, {}, std.sort.asc(u64));
+            self.routes.putAssumeCapacity(key, .{ .table = physical, .admission_key = key, .groups = groups });
+            self.pending_tables.appendAssumeCapacity(key);
+        }
+        self.table = key;
+    }
+    fn reserve(self: *@This()) !void {
+        if (self.entries.len != 0) return;
+        const capacity = @max(@as(usize, 1), @min(self.row_limit, 4096 / self.reads.len));
+        var lease = try graph_work_budget.RetainedLease.init(self.work_budget, capacity * (@sizeOf(Entry) + @sizeOf([]u8)));
+        errdefer lease.deinit();
+        const entries = try self.alloc.alloc(Entry, capacity);
+        errdefer self.alloc.free(entries);
+        const keys = try self.alloc.alloc([]u8, capacity);
+        self.entries = entries;
+        self.keys = keys;
+        self.lease = lease;
+    }
     fn append(self: *@This(), index: usize, group: u64) !void {
         if (self.reads.len == 0) return;
-        if (self.nodes.len == 0) {
-            // Bound both score cells and node descriptors, independently of
-            // frontier size. Allocate lazily so metadata-only rounds stay small.
-            const capacity = @max(@as(usize, 1), @min(self.row_limit, 4096 / self.reads.len));
-            const bytes = capacity * (@sizeOf(graph_query_mod.GraphResultNode) + @sizeOf(u64) + @sizeOf(usize));
-            var lease = try graph_work_budget.RetainedLease.init(self.work_budget, bytes);
-            errdefer lease.deinit();
-            const nodes = try self.alloc.alloc(graph_query_mod.GraphResultNode, capacity);
-            errdefer self.alloc.free(nodes);
-            const groups = try self.alloc.alloc(u64, capacity);
-            errdefer self.alloc.free(groups);
-            const indexes = try self.alloc.alloc(usize, capacity);
-            self.nodes = nodes;
-            self.groups = groups;
-            self.indexes = indexes;
-            self.lease = lease;
-        }
-        var node = self.state.nodes.items[index];
-        node.metrics = &.{};
-        node.metric_columns = null;
-        self.nodes[self.count] = node;
-        self.groups[self.count] = group;
-        self.indexes[self.count] = index;
+        try self.reserve();
+        self.entries[self.count] = .{ .table = self.table orelse return error.InvalidQueryRequest, .group = group, .index = index };
         self.count += 1;
-        self.dirty = true;
-        if (self.count == self.nodes.len) try self.flush();
+        if (self.count == self.entries.len) try self.flush();
     }
-
+    fn less(_: void, left: Entry, right: Entry) bool {
+        const order = std.mem.order(u8, left.table, right.table);
+        return if (order == .eq) left.group < right.group else order == .lt;
+    }
     fn flush(self: *@This()) !void {
-        const table = self.table orelse return;
-        if (!self.dirty) return;
-        var step = CanonicalGraphStep{
-            .edges = &.{},
-            .nodes = self.nodes,
-            .path_edges = &.{},
-            .group_ids = self.groups,
-            .node_count = self.count,
-            .array_lease = .{},
-            .table_scratch = graph_traversal_mod.MetadataScratch.init(self.alloc, self.work_budget),
-        };
-        // Descriptors borrow result ownership: release only hydration storage.
-        defer {
-            if (step.metric_columns) |owner| owner.deinit(self.alloc);
-            step.metrics_lease.deinit();
-            step.table_scratch.deinit();
+        self.flushWindow() catch |err| return self.failure(err);
+    }
+    fn flushWindow(self: *@This()) !void {
+        std.mem.sort(Entry, self.entries[0..self.count], {}, less);
+        var start: usize = 0;
+        while (start < self.count) {
+            const first = self.entries[start];
+            var end = start + 1;
+            while (end < self.count and self.entries[end].group == first.group and std.mem.eql(u8, self.entries[end].table, first.table)) end += 1;
+            const route = self.routes.get(first.table) orelse return error.InvalidQueryRequest;
+            if (!route.contains(first.group)) return error.TopologyChanged;
+            try self.hydrate(route, first.group, self.entries[start..end]);
+            start = end;
         }
-        // Empty flushes still collect required group metadata. A denied or
-        // deduplicated candidate must not suppress freshness validation.
-        try attachCanonicalGraphStepMetrics(self.alloc, self.worker, self.admission, table, self.index_name, self.reads, self.consistency, self.work_budget, &self.state.metric_status, self.status_seen, &step);
-        if (step.metric_columns) |source| {
-            const target = self.state.metric_columns orelse return error.InvalidRemoteResponse;
-            for (self.indexes[0..self.count], 0..) |index, row| {
-                const node = self.state.nodes.items[index];
-                for (0..self.reads.len) |column| target.pages.?.set(column, node.metric_row, source.scores[column * self.count + row]);
-            }
+        // Score responses carry metadata for touched groups. Collect only the
+        // remaining groups, including tables with no admitted/returned nodes.
+        for (self.pending_tables.items) |table| {
+            const route = self.routes.get(table).?;
+            for (route.groups) |group| if (!self.status_seen.contains(group)) try self.hydrate(route, group, &.{});
         }
         self.count = 0;
-        self.dirty = false;
+        self.pending_tables.clearRetainingCapacity();
+    }
+    fn hydrate(self: *@This(), route: Route, group: u64, entries: []const Entry) !void {
+        const state = try self.admission.ensureTable(route.admission_key);
+        var bytes = try std.math.mul(usize, try std.math.mul(usize, entries.len, self.reads.len), @sizeOf(?f64));
+        for (entries, self.keys[0..entries.len]) |entry, *key| {
+            key.* = @constCast(self.state.nodes.items[entry.index].key);
+            bytes = try std.math.add(usize, bytes, key.len);
+        }
+        var lease = try graph_work_budget.RetainedLease.init(self.work_budget, bytes);
+        defer lease.deinit();
+        // The synchronous worker borrows this request. Only the reusable key
+        // descriptors are owned here; dictionary, policies and keys are stable.
+        const request = GraphHydrateRequest{
+            .keys = self.keys[0..entries.len],
+            .metric_index_name = self.index_name,
+            .metric_index_identity = state.graph_index_identity,
+            .metric_reads = @constCast(self.reads),
+            .include_hits = false,
+            .topology_epoch = state.topology_epoch,
+            .identity_read_generation = try state.generationForGroup(group),
+        };
+        var response = try self.worker.executeGraphHydrate(self.alloc, group, route.table, request, self.consistency);
+        defer response.deinit(self.alloc);
+        if (response.metric_scores.len != entries.len * self.reads.len or response.metric_status.len != self.reads.len) return error.InvalidGraphHydrateResponse;
+        try mergeGraphMetricStatuses(self.alloc, &self.state.metric_status, response.metric_status);
+        try self.status_seen.put(self.alloc, group, {});
+        if (entries.len != 0) {
+            const target = self.state.metric_columns orelse return error.InvalidRemoteResponse;
+            for (entries, 0..) |entry, row| {
+                const node = self.state.nodes.items[entry.index];
+                for (0..self.reads.len) |column| target.pages.?.set(column, node.metric_row, response.metric_scores[column * entries.len + row] orelse std.math.nan(f64));
+            }
+        }
     }
 };
 
@@ -4571,6 +4640,7 @@ fn executeDistributedTraverse(
             }
         }
         if (canonical_round) {
+            state.metric_scores_pending = true;
             const reader = DistributedEdgeReader{
                 .catalog = catalog,
                 .worker = worker,
@@ -4632,7 +4702,8 @@ fn executeDistributedTraverse(
                         var merged_owned = true;
                         errdefer if (merged_owned) merged.deinit(alloc);
                         if (max_depth == 0 or merged.depth < max_depth) {
-                            try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged, path_state_id));
+                            try next_frontier.ensureUnusedCapacity(alloc, 1);
+                            next_frontier.appendAssumeCapacity(try frontierFromState(alloc, &state, merged, path_state_id));
                             try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                         }
                         if (return_node) {
@@ -4654,8 +4725,7 @@ fn executeDistributedTraverse(
                 if (state.nodes.items.len >= collection_limit) break;
             }
             try metric_batch.flush();
-            // Frontier-owned table strings are retired below; scratch survives
-            // for reuse at the next depth.
+            state.metric_scores_pending = false;
             metric_batch.table = null;
             worker.reachLifecycle(.{
                 .phase = .expand_round_completed,
@@ -4663,8 +4733,9 @@ fn executeDistributedTraverse(
                 .depth = completed_depth +| 1,
                 .result_count = state.nodes.items.len,
             });
+            const ready_frontier = try next_frontier.toOwnedSlice(alloc);
             freeFrontier(alloc, frontier);
-            frontier = try next_frontier.toOwnedSlice(alloc);
+            frontier = ready_frontier;
             continue;
         }
 
@@ -4775,7 +4846,8 @@ fn executeDistributedTraverse(
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                             if (merged_node.depth < max_depth) {
-                                try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try next_frontier.ensureUnusedCapacity(alloc, 1);
+                                next_frontier.appendAssumeCapacity(try frontierFromState(alloc, &state, merged_node, path_state_id));
                                 try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
@@ -4883,7 +4955,8 @@ fn executeDistributedTraverse(
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                             if (merged_node.depth < max_depth) {
-                                try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try next_frontier.ensureUnusedCapacity(alloc, 1);
+                                next_frontier.appendAssumeCapacity(try frontierFromState(alloc, &state, merged_node, path_state_id));
                                 try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
@@ -4978,7 +5051,8 @@ fn executeDistributedTraverse(
                         errdefer if (merged_node_owned) merged_node.deinit(alloc);
 
                         if (merged_node.depth < max_depth) {
-                            try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                            try next_frontier.ensureUnusedCapacity(alloc, 1);
+                            next_frontier.appendAssumeCapacity(try frontierFromState(alloc, &state, merged_node, path_state_id));
                             try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                         }
                         if (return_node) {
@@ -5010,8 +5084,9 @@ fn executeDistributedTraverse(
             .result_count = state.nodes.items.len,
         });
 
+        const ready_frontier = try next_frontier.toOwnedSlice(alloc);
         freeFrontier(alloc, frontier);
-        frontier = try next_frontier.toOwnedSlice(alloc);
+        frontier = ready_frontier;
     }
 
     try validateDistributedGraphMetricCandidateCount(state.nodes.items.len, defer_result_limit);
@@ -7777,7 +7852,8 @@ fn hydrateHitsForKeys(
                 var res = try worker.executeGraphHydrate(alloc, entry.key_ptr.*, table_name, req, consistency);
                 defer res.deinit(alloc);
                 for (res.hits) |hit| {
-                    try out.append(alloc, try hit.clone(alloc));
+                    try out.ensureUnusedCapacity(alloc, 1);
+                    out.appendAssumeCapacity(try hit.clone(alloc));
                 }
             }
             return try finalizeHydratedHits(alloc, &out, cross_group_hydrate);
@@ -7868,7 +7944,8 @@ fn hydrateHitsForKeys(
         }
         for (slots) |slot| {
             for (slot.result.?.hits) |hit| {
-                try out.append(alloc, try hit.clone(alloc));
+                try out.ensureUnusedCapacity(alloc, 1);
+                out.appendAssumeCapacity(try hit.clone(alloc));
             }
         }
         return try finalizeHydratedHits(alloc, &out, cross_group_hydrate);
@@ -7898,7 +7975,8 @@ fn hydrateHitsForKeys(
         var res = try worker.executeGraphHydrate(alloc, entry.key_ptr.*, table_name, req, consistency);
         defer res.deinit(alloc);
         for (res.hits) |hit| {
-            try out.append(alloc, try hit.clone(alloc));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try hit.clone(alloc));
         }
     }
 
@@ -10438,7 +10516,7 @@ fn graphTensorProgramJsonValueAlloc(
     defer view.deinit(alloc);
     const encoded = try query_contract.encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, view.program);
     defer alloc.free(encoded);
-    return std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch return error.InvalidQueryRequest;
+    return std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
 }
 
 const parseGraphTensorProgramJsonValueAlloc = @import("antfly_local_sources").api_local_graph.parseGraphTensorProgramJsonValueAlloc;
@@ -10916,7 +10994,8 @@ fn appendGraphMetricExecutionRead(
         existing.freshness = stricterGraphMetricFreshness(existing.freshness, freshness);
         return;
     }
-    try out.append(alloc, .{
+    try out.ensureUnusedCapacity(alloc, 1);
+    out.appendAssumeCapacity(.{
         .name = try alloc.dupe(u8, name),
         .freshness = freshness,
     });
@@ -11058,55 +11137,7 @@ pub const parseGraphExpandRequest = @import("antfly_local_sources").api_local_gr
 
 pub const encodeGraphExpandResponse = @import("antfly_local_sources").api_local_graph.encodeGraphExpandResponse;
 
-pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !GraphExpandResponse {
-    var parsed = try std.json.parseFromSlice(GraphExpandResponseJson, alloc, body, .{});
-    defer parsed.deinit();
-
-    const expansions = try alloc.alloc(GraphExpansion, parsed.value.expansions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
-        alloc.free(expansions);
-    }
-    for (parsed.value.expansions, 0..) |expansion, i| {
-        var owned_nodes = try @import("antfly_local_sources").api_local_graph.cloneGraphNodesWithMetrics(alloc, expansion.nodes);
-        errdefer owned_nodes.deinit(alloc);
-
-        const hits = if (expansion.hits.len > 0)
-            try cloneSearchHits(alloc, expansion.hits)
-        else
-            @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-        errdefer if (hits.len > 0) {
-            for (hits) |*hit| hit.deinit(alloc);
-            alloc.free(hits);
-        };
-
-        const frontier_key = try alloc.dupe(u8, expansion.frontier_key);
-        errdefer alloc.free(frontier_key);
-        const name = try alloc.dupe(u8, expansion.name);
-        errdefer alloc.free(name);
-        expansions[i] = .{
-            .frontier_id = expansion.frontier_id,
-            .frontier_key = frontier_key,
-            .graph_result = .{
-                .name = name,
-                .nodes = owned_nodes.nodes,
-                .metric_columns = owned_nodes.metrics.columns,
-                .metric_values_slab = owned_nodes.metrics.values,
-                .metric_value_names = owned_nodes.metrics.names,
-                .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
-                .hits = hits,
-                .total_hits = expansion.total,
-                .metric_status = try cloneGraphMetricStatuses(alloc, expansion.metric_status),
-            },
-        };
-        initialized += 1;
-    }
-
-    // Older workers did not report physical scans. Their local expansion is
-    // bounded by the default per-shard ceiling, so charge that whole ceiling.
-    return .{ .expansions = expansions, .scanned_rows = parsed.value.scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges) };
-}
+pub const parseGraphExpandResponse = @import("antfly_local_sources").api_graph_expand_decode.parse;
 
 pub const cloneGraphSearchResult = @import("antfly_local_sources").api_local_graph.cloneGraphSearchResult;
 
@@ -12255,7 +12286,9 @@ fn mergeGraphMetricStatus(
         try mergeGraphMetricStatusInto(alloc, status, source);
         return;
     }
-    try statuses.append(alloc, try cloneGraphMetricStatus(alloc, source));
+    // Reserve before cloning so list growth cannot lose an owned status.
+    try statuses.ensureUnusedCapacity(alloc, 1);
+    statuses.appendAssumeCapacity(try cloneGraphMetricStatus(alloc, source));
 }
 
 fn validateDistributedGraphMetricStatusCompatible(
@@ -16491,7 +16524,7 @@ test "distributed graph metric post processing applies max results after filter 
     for (nodes) |*node| node.* = .{ .key = "n", .depth = 0, .distance = 0, .metric_columns = &owner };
     const wire = try std.json.Stringify.valueAlloc(a, GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "root", .name = "g", .total = n, .nodes = nodes }}, .scanned_rows = n }, .{});
     defer a.free(wire);
-    var counter = std.testing.FailingAllocator.init(a, .{});
+    var counter = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = a };
     var parsed = try parseGraphExpandResponse(counter.allocator(), wire);
     try std.testing.expectEqual(@as(?f64, 3.5), parsed.expansions[0].graph_result.nodes[n - 1].metricAt(0).score);
     const result = parsed.expansions[0].graph_result;
@@ -16501,15 +16534,28 @@ test "distributed graph metric post processing applies max results after filter 
         metric_bytes += node.metrics.len * @sizeOf(graph_query_mod.GraphMetricValue);
         for (node.metrics) |value| metric_bytes += value.name.len;
     }
-    std.debug.print("FRESH_REMOTE_DECODE nodes={d} columns=4 allocations={d} retained_bytes={d} metric_bytes={d} dense_score_bytes={d}\n", .{ n, counter.allocations, counter.allocated_bytes - counter.freed_bytes, metric_bytes, n * 4 * @sizeOf(f64) });
+    std.debug.print("FRESH_REMOTE_DECODE nodes={d} columns=4 allocations={d} retained_bytes={d} metric_bytes={d} dense_score_bytes={d}\n", .{ n, counter.alloc_calls, counter.live, metric_bytes, n * 4 * @sizeOf(f64) });
+    std.debug.print("STREAM_DECODE_PEAK peak={d} retained={d} temporary_excess={d}\n", .{ counter.peak, counter.live, counter.peak - counter.live });
+    try std.testing.expect(counter.peak < 4 * 1024 * 1024);
     parsed.deinit(counter.allocator());
-    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    var elapsed: [2][7]u64 = undefined;
+    for (0..7) |round| for (0..2) |offset| {
+        const mode = (round + offset) % 2;
+        const started = platform_time.monotonicNs();
+        var output = if (mode == 0) try parseGraphExpandResponseBeforeStreaming(a, wire) else try parseGraphExpandResponse(a, wire);
+        try std.testing.expectEqual(@as(?f64, 3.5), output.expansions[0].graph_result.nodes[n - 1].metricAt(0).score);
+        output.deinit(a);
+        elapsed[mode][round] = platform_time.monotonicNs() - started;
+    };
+    for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("STREAM_DECODE_CPU nodes={d} before_median_ns={d} after_median_ns={d}\n", .{ n, elapsed[0][3], elapsed[1][3] });
 }
 
 test "distributed graph metric post processing applies max results after filter and order bounded canonical hydration" {
     const alloc = std.testing.allocator;
     const FakeCatalog = struct {
-        const tables = [_]metadata_table_manager.TableRecord{.{
+        const tables = [_]metadata_table_manager.TableRecord{ .{
             .table_id = 7,
             .name = "docs",
             .description = "docs table",
@@ -16518,10 +16564,11 @@ test "distributed graph metric post processing applies max results after filter 
             .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"source\":{\"artifact\":\"facts\",\"nodes\":{\"source\":\"{{ _item.source }}\"},\"edge\":{\"edge_id\":\"{{ _doc.key }}\"}}}}",
             .replication_sources_json = "[]",
             .placement_role = "data",
-        }};
+        }, .{ .table_id = 8, .name = "other", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}" } };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "doc:m" },
             .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "doc:m", .end_key = null },
+            .{ .group_id = 33, .table_id = 8, .range_id = 33, .start_key = "", .end_key = null },
         };
 
         fn iface() table_catalog.CatalogSource {
@@ -16584,11 +16631,11 @@ test "distributed graph metric post processing applies max results after filter 
             state.largest_cells = @max(state.largest_cells, request.keys.len * request.metric_reads.len);
             try std.testing.expect(request.keys.len <= 256);
             try std.testing.expect(request.keys.len * request.metric_reads.len <= 4096);
-            try std.testing.expectEqual(@as(?u64, 12345), request.identity_read_generation);
+            try std.testing.expectEqual(if (group == 33) @as(?u64, null) else @as(?u64, 12345), request.identity_read_generation);
             const scores = try a.alloc(?f64, request.keys.len * request.metric_reads.len);
             errdefer a.free(scores);
             for (request.keys, 0..) |key, row| {
-                try std.testing.expectEqual(@as(u64, 22), group);
+                try std.testing.expect(group == 22 or group == 33);
                 scores[row] = if (std.mem.eql(u8, key, "nonreturn")) -1 else @floatFromInt(try std.fmt.parseInt(usize, key[5..], 10));
             }
             const statuses = try a.alloc(db_mod.types.GraphMetricStatus, request.metric_reads.len);
@@ -16705,6 +16752,69 @@ test "distributed graph metric post processing applies max results after filter 
         try std.testing.expectEqualStrings(targets[row], node.path.?[1]);
         try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
     }
+    test_state = .{ .graph = &graph };
+    var alternate = QueryState{ .name = try alloc.dupe(u8, "alternate") };
+    defer alternate.deinit(alloc);
+    try alternate.initMetrics(alloc, query.query.metrics);
+    for (targets) |key| {
+        var node = try initGraphResultNode(alloc, key, null, 1, 1, null, null, null);
+        try alternate.attachMetrics(.{ .key = key, .depth = 1, .distance = 1 }, &node);
+        try alternate.nodes.append(alloc, node);
+    }
+    var alternate_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var alternate_seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer alternate_seen.deinit(alloc);
+    var alternate_batch = CanonicalMetricBatch{ .alloc = alloc, .worker = FakeWorker.iface(&test_state), .admission = &admission, .state = &alternate, .index_name = "graph_idx", .reads = query.query.metrics, .consistency = .read_index, .work_budget = &alternate_budget, .status_seen = &alternate_seen };
+    defer alternate_batch.deinit();
+    for (0..n) |i| {
+        try alternate_batch.prepareTable(if (i % 2 == 0) "docs" else "other");
+        try alternate_batch.append(i, if (i % 2 == 0) 22 else 33);
+    }
+    try alternate_batch.flush();
+    try std.testing.expectEqual(@as(usize, 4), test_state.score_calls);
+    std.debug.print("BOUNDED_ALTERNATE_TABLE nodes={d} score_calls={d} status_calls={d}\n", .{ n, test_state.score_calls, test_state.status_calls });
+    try alternate_batch.append(0, 999);
+    try std.testing.expectError(error.TopologyChanged, alternate_batch.flush());
+    var denied_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    denied_budget.max_retained_state_bytes = 1;
+    {
+        var denied = CanonicalMetricBatch{ .alloc = alloc, .worker = FakeWorker.iface(&test_state), .admission = &admission, .state = &alternate, .index_name = "graph_idx", .reads = query.query.metrics, .consistency = .read_index, .work_budget = &denied_budget, .status_seen = &alternate_seen };
+        defer denied.deinit();
+        try std.testing.expectError(error.GraphWorkBudgetExceeded, denied.prepareTable("docs"));
+    }
+    try std.testing.expectEqual(@as(usize, 0), denied_budget.retained_state_bytes);
+    const FailureRunner = struct {
+        fn run(a: std.mem.Allocator, source: *graph_mod.GraphIndex, starts: []const []const u8, ends: []const []const u8) !void {
+            var worker_state = TestState{ .graph = source };
+            const request = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+            const topology = try table_catalog.topologyEpoch(a, FakeCatalog.iface(), "docs");
+            var gate = GraphNodeAdmissionContext.init(a, FakeCatalog.iface(), FakeWorker.iface(&worker_state), "docs", "graph_idx", topology, request, null, &.{}, .{}, .read_index);
+            defer gate.deinit();
+            var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+            const named = db_mod.types.NamedGraphQuery{ .name = "failure", .query = .{
+                .query_type = .traverse,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = starts },
+                .target_nodes = .{ .keys = ends },
+                .metrics = &.{.{ .name = "rank" }},
+                .include_metric_status = true,
+                .params = .{ .max_depth = 2, .max_results = 1000 },
+            } };
+            var output = executeDistributedTraverse(a, FakeCatalog.iface(), FakeWorker.iface(&worker_state), "docs", request, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, named, .read_index, &gate, &work) catch |err| {
+                var marker = std.testing.FailingAllocator.init(a, .{});
+                if (err != error.OutOfMemory and a.vtable == marker.allocator().vtable) {
+                    const failing: *std.testing.FailingAllocator = @ptrCast(@alignCast(a.ptr));
+                    std.debug.print("TRAVERSE_FAILURE ordinal={d} err={s} allocation={f}\n", .{ failing.fail_index, @errorName(err), std.debug.FormatStackTrace{ .stack_trace = failing.getStackTrace() } });
+                }
+                return err;
+            };
+            defer output.deinit(a);
+            try std.testing.expectEqual(@as(usize, 3), output.nodes.len);
+            for (output.nodes, 0..) |node, row| try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
+        }
+    };
+    try FailureRunner.run(alloc, &graph, roots[0..3], targets[0..3]);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, FailureRunner.run, .{ &graph, roots[0..3], targets[0..3] });
 }
 
 test "distributed graph metric post processing applies max results after filter and order decoder ownership failures" {
@@ -16760,16 +16870,17 @@ test "distributed graph metric post processing applies max results after filter 
                     .consistency = .read_index,
                     .work_budget = &budget,
                     .status_seen = undefined,
+                    .table = "g",
                 };
                 defer batch.deinit();
                 if (deny) {
                     try std.testing.expectError(error.GraphWorkBudgetExceeded, batch.append(0, 1));
-                    try std.testing.expectEqual(@as(usize, 0), batch.nodes.len);
+                    try std.testing.expectEqual(@as(usize, 0), batch.entries.len);
                 } else {
                     try batch.append(0, 1);
-                    const storage = batch.nodes.ptr;
+                    const storage = batch.entries.ptr;
                     try batch.append(0, 1);
-                    try std.testing.expectEqual(storage, batch.nodes.ptr);
+                    try std.testing.expectEqual(storage, batch.entries.ptr);
                     try std.testing.expectEqual(@as(usize, 2), batch.count);
                     try std.testing.expect(budget.retained_state_bytes > 0);
                 }
@@ -16780,4 +16891,184 @@ test "distributed graph metric post processing applies max results after filter 
     try Runner.run(std.testing.allocator, false);
     try Runner.run(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{false});
+}
+
+test "distributed graph metric post processing applies max results after filter and order status merge failure cleanup" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var statuses = std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus).empty;
+            defer {
+                for (statuses.items) |*status| status.deinit(a);
+                statuses.deinit(a);
+            }
+            try mergeGraphMetricStatuses(a, &statuses, &.{.{ .name = @constCast("rank"), .build_worker_id = "worker", .last_error = "details" }});
+            try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "distributed graph metric post processing applies max results after filter and order streaming wire compatibility" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, body: []const u8) !void {
+            var expected = try std.json.parseFromSlice(GraphExpandResponseJson, a, body, .{});
+            defer expected.deinit();
+            const wire = try a.dupe(u8, body);
+            var wire_owned = true;
+            defer if (wire_owned) a.free(wire);
+            var decoded = try parseGraphExpandResponse(a, wire);
+            defer decoded.deinit(a);
+            a.free(wire);
+            wire_owned = false;
+            expected.value.scanned_rows = decoded.scanned_rows;
+            for (expected.value.expansions) |expansion| {
+                for (@constCast(expansion.nodes)) |*node| {
+                    node.metrics_owned = false;
+                    for (node.metrics) |*metric| metric.name_owned = false;
+                }
+            }
+            const wanted = try std.json.Stringify.valueAlloc(a, expected.value, .{ .emit_null_optional_fields = false });
+            defer a.free(wanted);
+            const actual = try encodeGraphExpandResponse(a, decoded);
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(wanted, actual);
+        }
+    };
+    const cases = [_][]const u8{
+        "{\"scanned_rows\":null,\"expansions\":[]}",
+        "{\"expansions\":[{\"nodes\":[{\"metrics\":[{\"score\":null,\"name\":\"r\\u0061nk\"}],\"distance\":1,\"depth\":1,\"key\":\"a\\u002fb\",\"path\":[\"s\",\"a/b\"],\"path_tables\":[null,\"t\"],\"provenance\":[\"p\\u002fq\"],\"table\":\"t\"}],\"metric_status\":[{\"name\":\"rank\",\"build_worker_id\":\"w\\u002f1\",\"last_error\":\"detail\"}],\"hits\":[{\"id\":\"a/b\",\"score\":2}],\"total\":1,\"name\":\"g\",\"frontier_key\":\"s\",\"frontier_id\":0}],\"scanned_rows\":3}",
+        "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"s\",\"name\":\"g\",\"total\":3,\"nodes\":[{\"key\":\"a\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":2}]},{\"key\":\"b\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":3}]},{\"key\":\"c\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"degree\",\"score\":null},{\"name\":\"rank\",\"score\":4}]}]}]}",
+    };
+    const inaccurate = [_][]const u8{
+        "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"s\",\"name\":\"g\",\"total\":0,\"nodes\":[{\"key\":\"a\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":3}]},{\"key\":\"b\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":4}]}]}]}",
+        "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"s\",\"name\":\"g\",\"total\":1000000,\"nodes\":[{\"key\":\"a\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":3}]}]}]}",
+    };
+    for (inaccurate) |body| {
+        try Runner.run(std.testing.allocator, body);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{body});
+    }
+    for (cases) |body| {
+        try Runner.run(std.testing.allocator, body);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{body});
+    }
+    const bad = [_][]const u8{
+        "{}",
+        "{\"expansions\":[],\"extra\":0}",
+        "{\"expansions\":[],\"expansions\":[]}",
+        "{\"expansions\":null}",
+        "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"s\",\"name\":\"g\",\"total\":1,\"nodes\":[{\"depth\":1,\"distance\":1}]}]}",
+        "{\"expansions\":[],\"scanned_rows\":-1}",
+        "{\"expansions\":[]} []",
+    };
+    for (bad) |body| {
+        const expected = std.json.parseFromSlice(GraphExpandResponseJson, std.testing.allocator, body, .{}) catch |err| {
+            try std.testing.expectError(err, parseGraphExpandResponse(std.testing.allocator, body));
+            continue;
+        };
+        expected.deinit();
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "distributed graph metric post processing applies max results after filter and order streaming wide legacy" {
+    const a = std.testing.allocator;
+    const c = graph_query_mod.graph_metric_projection_limit + 1;
+    var buffers: [c][8]u8 = undefined;
+    var metrics: [c]graph_query_mod.GraphMetricValue = undefined;
+    for (&buffers, &metrics, 0..) |*buffer, *metric, column| metric.* = .{ .name = try std.fmt.bufPrint(buffer, "m{d}", .{column}), .score = if (column % 2 == 0) @floatFromInt(column) else null, .name_owned = false };
+    const wire = try std.json.Stringify.valueAlloc(a, GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "s", .name = "g", .total = 1, .nodes = &.{.{ .key = "a", .depth = 1, .distance = 1, .metrics = &metrics, .metrics_owned = false }} }} }, .{});
+    defer a.free(wire);
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, input: []const u8) !void {
+            var decoded = try parseGraphExpandResponse(alloc, input);
+            defer decoded.deinit(alloc);
+            const result = decoded.expansions[0].graph_result;
+            try std.testing.expect(result.metric_columns == null);
+            try std.testing.expectEqual(@as(usize, c), result.metric_value_names.len);
+            try std.testing.expectEqual(@as(usize, c), result.nodes[0].metricCount());
+            try std.testing.expectEqual(@as(?f64, null), result.nodes[0].metricAt(1).score);
+        }
+    };
+    try Runner.run(a, wire);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{wire});
+}
+
+// Retained only for the paired decoder measurement fixture.
+fn parseGraphExpandResponseBeforeStreaming(alloc: std.mem.Allocator, body: []const u8) !GraphExpandResponse {
+    var parsed = try std.json.parseFromSlice(GraphExpandResponseJson, alloc, body, .{});
+    defer parsed.deinit();
+
+    const expansions = try alloc.alloc(GraphExpansion, parsed.value.expansions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
+        alloc.free(expansions);
+    }
+    for (parsed.value.expansions, 0..) |expansion, i| {
+        var owned_nodes = try @import("antfly_local_sources").api_local_graph.cloneGraphNodesWithMetrics(alloc, expansion.nodes);
+        errdefer owned_nodes.deinit(alloc);
+
+        const hits = if (expansion.hits.len > 0)
+            try cloneSearchHits(alloc, expansion.hits)
+        else
+            @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+        errdefer if (hits.len > 0) {
+            for (hits) |*hit| hit.deinit(alloc);
+            alloc.free(hits);
+        };
+
+        const frontier_key = try alloc.dupe(u8, expansion.frontier_key);
+        errdefer alloc.free(frontier_key);
+        const name = try alloc.dupe(u8, expansion.name);
+        errdefer alloc.free(name);
+        expansions[i] = .{
+            .frontier_id = expansion.frontier_id,
+            .frontier_key = frontier_key,
+            .graph_result = .{
+                .name = name,
+                .nodes = owned_nodes.nodes,
+                .metric_columns = owned_nodes.metrics.columns,
+                .metric_values_slab = owned_nodes.metrics.values,
+                .metric_value_names = owned_nodes.metrics.names,
+                .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
+                .hits = hits,
+                .total_hits = expansion.total,
+                .metric_status = try cloneGraphMetricStatuses(alloc, expansion.metric_status),
+            },
+        };
+        initialized += 1;
+    }
+
+    // Older workers did not report physical scans. Their local expansion is
+    // bounded by the default per-shard ceiling, so charge that whole ceiling.
+    return .{ .expansions = expansions, .scanned_rows = parsed.value.scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges) };
+}
+
+test "distributed graph metric post processing applies max results after filter and order streaming underestimated growth" {
+    const a = std.testing.allocator;
+    var keys: [9][2]u8 = undefined;
+    var values: [9][2]graph_query_mod.GraphMetricValue = undefined;
+    var nodes: [9]graph_query_mod.GraphResultNode = undefined;
+    for (&keys, &values, &nodes, 0..) |*key, *metrics, *node, row| {
+        metrics.* = .{ .{ .name = "rank", .score = @as(f64, @floatFromInt(row)) + 0.5, .name_owned = false }, .{ .name = "degree", .score = if (row % 2 == 0) @floatFromInt(2 * row) else null, .name_owned = false } };
+        node.* = .{ .key = try std.fmt.bufPrint(key, "n{d}", .{row}), .depth = 1, .distance = 1, .metrics = metrics, .metrics_owned = false };
+    }
+    const wire = try std.json.Stringify.valueAlloc(a, GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "s", .name = "g", .total = 1, .nodes = &nodes }} }, .{});
+    defer a.free(wire);
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, body: []const u8) !void {
+            var decoded = try parseGraphExpandResponse(alloc, body);
+            defer decoded.deinit(alloc);
+            const result = decoded.expansions[0].graph_result;
+            try std.testing.expectEqual(@as(usize, 9), result.metric_columns.?.rows);
+            try std.testing.expectEqual(@as(usize, 18), result.metric_columns.?.scores.len);
+            for (result.nodes, 0..) |node, row| {
+                try std.testing.expectEqual(@as(?f64, @as(f64, @floatFromInt(row)) + 0.5), node.metricAt(0).score);
+                try std.testing.expectEqual(if (row % 2 == 0) @as(?f64, @floatFromInt(2 * row)) else null, node.metricAt(1).score);
+            }
+        }
+    };
+    try Runner.run(a, wire);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{wire});
 }
