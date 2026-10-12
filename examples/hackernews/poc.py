@@ -32,6 +32,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 def wait_for_index(
@@ -194,10 +195,22 @@ def qualify_composed_sources(call, query, selected_source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="Run a Linux binary in a bounded local x86 container",
+    )
+    parser.add_argument("--docker-cpus", type=int, default=4)
+    parser.add_argument("--docker-memory-gib", type=int, default=4)
     parser.add_argument("--project", default="antfly-dev-01")
     parser.add_argument("--bucket", default="colony-import-sources-antfly-dev-01")
     parser.add_argument("--prefix", default="hn-poc/20261007")
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument(
+        "--filesystem-source",
+        type=Path,
+        help="Use a local connection root containing archive/; no cloud credentials",
+    )
     parser.add_argument("--port", type=int, default=8877)
     parser.add_argument("--expected-rows", type=int, default=10000)
     parser.add_argument("--require-filters", action="store_true")
@@ -217,6 +230,15 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
+    parser.add_argument("--query-term", default="database")
+    parser.add_argument(
+        "--no-highlights",
+        action="store_true",
+        help="Match a BM25-only comparison workload",
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="Record query execution diagnostics"
+    )
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument("--qualify-composed-sources", action="store_true")
     parser.add_argument("--store-source", action="store_true")
@@ -231,6 +253,11 @@ def main():
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
+    if args.docker and not args.filesystem_source:
+        parser.error("Docker comparison mode requires --filesystem-source")
+    if args.docker_cpus < 1 or args.docker_memory_gib < 1:
+        parser.error("Docker limits must be positive")
+    args.state = args.state.resolve()
     if not 1 <= args.port < 65535:
         parser.error("query port must leave a valid adjacent health port")
     if not 0 <= args.cursor_pages <= 100:
@@ -248,7 +275,9 @@ def main():
         else ["hn_id", "created_at", "item_type", "author", "points"]
     )
     args.state.mkdir(parents=True, exist_ok=True)
-    if args.bearer_stdin:
+    if args.filesystem_source:
+        token = ""
+    elif args.bearer_stdin:
         token = sys.stdin.readline(65537).strip()
         if not token or len(token) > 65536:
             raise ValueError("Expected a bounded bearer token on stdin")
@@ -262,6 +291,17 @@ def main():
     env = dict(os.environ, HN_GCS_BEARER=token)
 
     def connection(capability, prefix):
+        if args.filesystem_source:
+            root = (
+                args.filesystem_source.resolve()
+                if capability == "lake_read"
+                else args.state.resolve() / "artifacts"
+            )
+            return {
+                "kind": "external_io",
+                "capabilities": [capability],
+                "external_io": {"protocol": "filesystem", "root": str(root)},
+            }
         return {
             "kind": "external_io",
             "capabilities": [capability],
@@ -296,36 +336,70 @@ def main():
         "lake_cache": {"root": str(args.state / "cache"), "max_disk_bytes": 1073741824},
         "lake_indexes": {"query_cursors": {"retention_ms": args.cursor_retention_ms}},
     }
+    if args.filesystem_source:
+        # The native local store publishes through its filesystem artifact store.
+        # The source connection still confines reads to the supplied root.
+        del config["storage"]["artifacts"]
     config_path = args.state / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     base = f"http://127.0.0.1:{args.port}/db/v1"
     process = None
     log = None
+    container = None
 
     def start():
-        nonlocal process, log
+        nonlocal process, log, container
         log = (args.state / "server.log").open("a")
+        command = [
+            str(Path(args.binary).resolve()),
+            "standalone",
+            "--config",
+            str(config_path),
+            "--data-dir",
+            str(args.state / "data"),
+            "--host",
+            "0.0.0.0" if args.docker else "127.0.0.1",
+            "--port",
+            str(args.port),
+            "--health",
+            "true",
+            "--health-port",
+            str(args.port + 1),
+            "--auth",
+            "false",
+            "--models-dir",
+            str(args.state / "empty-models"),
+        ]
+        if args.docker:
+            container = "hn-comparison-" + uuid.uuid4().hex
+            command[0] = "/app/antfly"
+            command = [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                container,
+                "--platform",
+                "linux/amd64",
+                "--cpus",
+                str(args.docker_cpus),
+                "--memory",
+                f"{args.docker_memory_gib}g",
+                "-p",
+                f"127.0.0.1:{args.port}:{args.port}",
+                "-p",
+                f"127.0.0.1:{args.port + 1}:{args.port + 1}",
+                "--mount",
+                f"type=bind,src={Path(args.binary).resolve()},dst=/app/antfly,readonly",
+                "--mount",
+                f"type=bind,src={args.state},dst={args.state}",
+                "--mount",
+                f"type=bind,src={args.filesystem_source.resolve()},dst={args.filesystem_source.resolve()},readonly",
+                "alpine:3.22",
+                *command,
+            ]
         process = subprocess.Popen(
-            [
-                str(Path(args.binary).resolve()),
-                "standalone",
-                "--config",
-                str(config_path),
-                "--data-dir",
-                str(args.state / "data"),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(args.port),
-                "--health",
-                "true",
-                "--health-port",
-                str(args.port + 1),
-                "--auth",
-                "false",
-                "--models-dir",
-                str(args.state / "empty-models"),
-            ],
+            command,
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -344,6 +418,15 @@ def main():
         raise RuntimeError("Antfly startup timed out")
 
     def stop():
+        nonlocal container
+        if container is not None:
+            subprocess.run(
+                ["docker", "rm", "-f", container],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            container = None
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -393,7 +476,7 @@ def main():
     def resource_counters():
         # Linux counters help separate CPU work from remote transfer. Network
         # counters cover non-loopback interfaces, including TLS/DNS overhead.
-        if not Path("/proc/net/dev").exists():
+        if args.docker or not Path("/proc/net/dev").exists():
             return None
         counters = {"network_rx_bytes": 0, "network_tx_bytes": 0}
         for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
@@ -477,7 +560,9 @@ def main():
                             "kind": "external",
                             "table_id": "hn-archive-poc",
                             "format": "parquet",
-                            "uri": f"gs://{args.bucket}/{args.prefix}/archive",
+                            "uri": "file:///archive"
+                            if args.filesystem_source
+                            else f"gs://{args.bucket}/{args.prefix}/archive",
                             "credentials": {"ref": "hn-gcs-source"},
                         },
                     },
@@ -546,35 +631,40 @@ def main():
         )
         phase = "query_correctness_and_latency"
         query = {
-            "full_text_search": {"match": "database", "field": "body"},
+            "full_text_search": {"match": args.query_term, "field": "body"},
             "full_text_index": "body_text",
             "fields": ["hn_id", "title", "item_type", "author", "points", "created_at"],
             "highlight": {"fields": ["body"]},
             "limit": 5,
             "order_by": [{"field": "_score", "desc": True}],
         }
+        if args.no_highlights:
+            del query["highlight"]
+        if args.profile:
+            query["profile"] = True
         first, first_ms = timed_query(query, "cold")
-        if not first["hits"]["hits"]:
+        if not first["hits"]["hits"] and not args.no_highlights:
             query["full_text_search"]["match"] = "AI"
             first, first_ms = timed_query(query, "cold")
         hits = first["hits"]["hits"]
         assert len(hits) >= 2, "Sample must contain at least two matching rows"
-        assert all(hit.get("_highlights", {}).get("body") for hit in hits), (
-            "Missing remote highlights"
-        )
         term = query["full_text_search"]["match"].lower()
-        assert all(
-            any(
-                fragment["text"]
-                .encode("utf-8")[span["start"] : span["end"]]
-                .decode("utf-8")
-                .lower()
-                in (term, term + "s")
-                for fragment in hit["_highlights"]["body"]
-                for span in fragment["spans"]
+        if not args.no_highlights:
+            assert all(hit.get("_highlights", {}).get("body") for hit in hits), (
+                "Missing remote highlights"
             )
-            for hit in hits
-        ), "Highlight spans do not match the search term"
+            assert all(
+                any(
+                    fragment["text"]
+                    .encode("utf-8")[span["start"] : span["end"]]
+                    .decode("utf-8")
+                    .lower()
+                    in (term, term + "s")
+                    for fragment in hit["_highlights"]["body"]
+                    for span in fragment["spans"]
+                )
+                for hit in hits
+            ), "Highlight spans do not match the search term"
         assert all("body" not in hit["_source"] for hit in hits), (
             "Highlight widened source projection"
         )
@@ -822,9 +912,10 @@ def main():
         assert [(h["_id"], h["_score"]) for h in reopened["hits"]["hits"]] == [
             (h["_id"], h["_score"]) for h in hits
         ]
-        assert all(
-            h.get("_highlights", {}).get("body") for h in reopened["hits"]["hits"]
-        )
+        if not args.no_highlights:
+            assert all(
+                h.get("_highlights", {}).get("body") for h in reopened["hits"]["hits"]
+            )
         if deep_request is not None:
             deep_reopened, elapsed = timed_query(deep_request, "cursor_depth_restart")
             assert [
@@ -853,7 +944,7 @@ def main():
         )
         cache_files = [p for p in (args.state / "cache").rglob("*") if p.is_file()]
         report = {
-            "project": args.project,
+            "project": None if args.filesystem_source else args.project,
             "metadata_indexes": metadata_columns,
             "metadata_indexes_queryable": list(metadata_status),
             "cold_cache_cleared_after_publication": args.cold_cache,
@@ -874,8 +965,12 @@ def main():
             "cache_files": len(cache_files),
             "cache_bytes": sum(p.stat().st_size for p in cache_files),
             "store_source": args.store_source,
-            "source": f"gs://{args.bucket}/{args.prefix}/archive",
-            "artifacts": f"gs://{args.bucket}/{artifact_prefix}/indexes",
+            "source": (args.filesystem_source.resolve() / "archive").as_uri()
+            if args.filesystem_source
+            else f"gs://{args.bucket}/{args.prefix}/archive",
+            "artifacts": "native filesystem artifact store"
+            if args.filesystem_source
+            else f"gs://{args.bucket}/{artifact_prefix}/indexes",
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
@@ -904,8 +999,19 @@ def main():
                 "empty_date_filter_before_and_after_restart",
                 "concurrent_search",
             ],
-            "note": "Qualification of the reported row count. The temporary demo bucket has an eight-day deletion lifecycle.",
+            "note": "Local filesystem comparison; OS file caches are not flushed."
+            if args.filesystem_source
+            else "Qualification of the reported row count. The temporary demo bucket has an eight-day deletion lifecycle.",
         }
+        if args.no_highlights:
+            report["verified"].remove("projected_highlights")
+        if args.docker:
+            report["execution_environment"] = {
+                "architecture": "x86_64",
+                "cpus": args.docker_cpus,
+                "memory_gib": args.docker_memory_gib,
+                "runtime": "Docker; host translation may apply",
+            }
         if exact_filter_status == "passed":
             report["verified"].append("exact_filter")
         (args.state / "report.json").write_text(json.dumps(report, indent=2) + "\n")

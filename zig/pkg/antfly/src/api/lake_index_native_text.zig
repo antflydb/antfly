@@ -70,8 +70,11 @@ pub const FileGroup = struct {
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
     summaries: []const ?statistics.Ref = &.{},
+    opening_packs: []const @import("lake_index_text_opening_pack.zig").Pack = &.{},
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
+        if (self.opening_packs.len > 65536) return error.InvalidNativeLakeTextCorpus;
+        for (self.opening_packs) |pack| try pack.validate(domain);
         if (self.summaries.len != 0 and self.summaries.len != self.segments.len) return error.InvalidNativeLakeTextCorpus;
         for (self.summaries) |summary| if (summary) |ref| try ref.validate();
         try state.validate(&.{self.file}, domain);
@@ -354,6 +357,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
                 group.summaries = previous_group.summaries;
+                group.opening_packs = previous_group.opening_packs;
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
                 try summaries.appendSlice(ca, group.summaries);
                 try segments.appendSlice(ca, group.segments);
@@ -361,6 +365,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 continue;
             }
             const first_segment = segments.items.len;
+            var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = ca, .store = store, .cancellation = cancellation };
+            defer opening.deinit();
             var ordinals = physical.Builder.init(a, ca, store, cancellation);
             defer ordinals.deinit();
             var previous_id: ?[96]u8 = null;
@@ -397,14 +403,16 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io, &opening);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io);
+            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io, &opening);
+            try opening.flush();
+            group.opening_packs = opening.refs.items;
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
@@ -470,6 +478,7 @@ fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local
     var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation };
     try validator.pages(root.domain, root.term_statistics);
     for (root.file_groups) |group| {
+        for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
         for (group.summaries) |summary| try validator.pages(root.domain, summary);
         for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
     }
@@ -483,6 +492,7 @@ fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = backend, .cache = null, .context = context, .cancellation = cancellation }, segment);
+        if (directory.metadata_bundle) |bundle| try validator.leaf(bundle);
         for ([_][]const @import("lake_index_seekable_text.zig").Piece{ directory.metadata, directory.blocks }) |pieces| {
             var prior: ?artifacts.ChunkRef = null;
             for (pieces) |piece| {
@@ -536,7 +546,7 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
     defer a.free(encoded);
     return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize, io: ?std.Io) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize, io: ?std.Io, opening: *@import("lake_index_text_opening_pack.zig").Collector) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
@@ -550,7 +560,7 @@ fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectio
         if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
-        const ref = @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
+        const ref = @import("lake_index_seekable_text.zig").publishWithOpeningCollector(a, out, &upload, bytes, cancellation, opening) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
         const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, io) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
         try summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });

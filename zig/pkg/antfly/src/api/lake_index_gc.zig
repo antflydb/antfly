@@ -220,6 +220,7 @@ pub const Collector = struct {
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
+        if (directory.metadata_bundle) |bundle| _ = try self.mark(bundle);
         for (directory.metadata) |piece| _ = try self.mark(piece.retainedArtifact());
         for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
@@ -230,6 +231,7 @@ pub const Collector = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
@@ -282,7 +284,10 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
                     try self.markPages(a, root.domain, root.term_statistics, false);
-                    for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+                    for (root.file_groups) |group| {
+                        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+                        for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+                    }
                     for (root.manifests) |manifest| {
                         if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
                     }

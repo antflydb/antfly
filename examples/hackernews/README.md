@@ -875,3 +875,73 @@ p95 and restart. One first `postgres` request took 2.32 seconds, while its workl
 p95 passed at 292 ms. This qualifies one partition, not the full archive or an
 Antfly Cloud deployment. The same binary also passed both public filesystem native
 recovery profiles. Final PR CI still requires human approval of the final revision.
+
+## Local search comparison before cloud qualification
+
+Use the same unchanged Parquet partition for both engines, prebuild both text
+indexes, and measure after builds finish. Prefer native binaries of the same
+architecture on the same host. CPU translation, background test runs, thread
+limits and OS file-cache state materially affect cold measurements. Antfly's
+`--cold-cache` clears only the benchmark state's serving cache; it does not flush
+the OS cache. DuckDB's first sample starts in a fresh process with an uncontrolled
+OS cache. Subsequent terms follow the first term in that process.
+
+Install the optional pinned DuckDB dependency with `uv sync --group comparison`
+from this directory. Put one partition in `<work>/source/archive/part.parquet`.
+The following commands run from the repository root with the HN Python environment
+active; set `ANTFLY_BINARY` to an optimized native build for this host.
+
+```sh
+python examples/hackernews/search_comparison.py \
+  --source <work>/source/archive/part.parquet \
+  --database <work>/duckdb-fts.duckdb --output <work>/duckdb-fts.json \
+  --expected-rows 142577 --threads 4 --repeats 20 --cycles 2 --build
+
+python examples/hackernews/poc.py --binary "$ANTFLY_BINARY" \
+  --filesystem-source <work>/source --state <work>/antfly \
+  --expected-rows 142577 --store-source --require-filters --cold-cache \
+  --repeats 20 --workload-terms database postgres sqlite AI --no-highlights
+
+python examples/hackernews/search_comparison.py --mode scan \
+  --source <work>/source/archive/part.parquet \
+  --database <work>/unused.duckdb --output <work>/duckdb-scan.json \
+  --expected-rows 142577 --threads 4 --repeats 20 --cycles 2
+```
+
+Replace `<work>` with a real directory before executing. Run Antfly twice against
+the same state for reopening/restart coverage. Use a fresh state to measure a new
+publication layout: unchanged-file reuse preserves older sidecars. Omit
+`--no-highlights` for the public-search workload, and add `--profile` to capture
+execution diagnostics. `--query-term AI` changes the first query to a broader
+workload. Filesystem mode obtains no cloud credentials and publishes locally.
+
+Both ranked tests search `body`, return five hits and project the same metadata
+columns. DuckDB uses its default Porter stemmer and English stopwords; analyzer,
+field-length encoding and corpus semantics can produce different scores and
+orders, so it is a performance baseline, not an exact ranking oracle. DuckDB
+performs no HTTP response or highlighting work. Each engine's repeated ordered
+results are checked for stability. The DuckDB database records the source SHA-256
+and row count and rejects reuse with a different input. Installation, importing
+data and building/checkpointing the index are excluded from query timings.
+
+For matched x86 container runs, build `Dockerfile.search-comparison` with
+`--platform linux/amd64`, mount this script at `/comparison.py`, the Parquet
+partition read-only, and a writable result directory. Give the DuckDB container
+`--cpus 4 --memory 4g`; Antfly's `poc.py --docker` defaults to those limits and
+removes its uniquely named container when finished. Running x86 on ARM remains
+a translated-host diagnostic. The native-host comparison is preferable.
+
+`search_comparison.py --mode remote-scan` accepts an HTTPS Parquet URL and
+`--bearer-stdin`. It uses a temporary in-memory HTTP secret, bounds credentials
+on stdin, and excludes credentials/source URLs from the report. This workload
+performs an **unranked substring scan** and has no text index. Remote experiments
+need their own transfer/job bounds and budget admission; the local comparison
+requires no cloud resources.
+
+New native publications can compress opening navigation and batch small opening
+objects into authenticated cohorts. Original immutable identities remain the
+cache keys; required range reads remain available when memory admission is denied.
+The directory codec, decoded-size limits, per-member proofs and GC/reuse retention
+are described in `docs/plans/lake-ingestion-and-publication.md`. Compare provider
+request and byte counters as well as wall-clock latency. Shared-host timing alone
+is not a production latency guarantee.
