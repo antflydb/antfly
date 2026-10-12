@@ -26562,6 +26562,113 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    /// A bounded cohort of independent KV sequences. Each row uses the same
+    /// prepared quantized kernels as singleton decode, with unique hidden/PLE
+    /// carriers. Layer-major execution shares one frame and reuses hot weights.
+    fn runCoordinatedGemma4Rows(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        inputs: *const DecodeBatchHostInputs,
+    ) !bool {
+        const count = request.items.len;
+        if (count < 2 or count > 4 or request.phase != .full or request.mode != .greedy_argmax or
+            request.contract != .gemma4_gated_ple_shared_kv or request.output_hidden != null or
+            request.input_token_ids != null or request.input_positions != null) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (metal_runtime.hasActiveFrame(runtime)) return false;
+        var cb = self.computeBackend();
+        const shape = [_]i32{ @intCast(count), @intCast(request.hidden_size) };
+        const front = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return false;
+        defer freeOp(ctx, front);
+        const back = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return false;
+        defer freeOp(ctx, back);
+        const ple_width = request.ple_hidden_size * request.layer_count;
+        const ple_shape = [_]i32{ @intCast(count), @intCast(ple_width) };
+        const ple = (try allocUninitF32ShapeOp(ctx, &ple_shape)) orelse return false;
+        defer freeOp(ctx, ple);
+
+        // Keep the singleton embedding/PLE arithmetic and copy each result
+        // before the next row may reuse runtime scratch. No KV writes occur.
+        for (0..count) |row| {
+            try cb.checkExecutionControl();
+            var singleton = request.*;
+            singleton.items = request.items[row..][0..1];
+            singleton.output_token_ids = request.output_token_ids[row..][0..1];
+            const row_inputs = DecodeBatchHostInputs{ .token_ids = inputs.token_ids[row..][0..1], .positions = inputs.positions[row..][0..1] };
+            var initial = (try prepareDecodeBatchInitialTensors(self, &singleton, &row_inputs)) orelse return false;
+            defer initial.deinit();
+            const hidden_ct = try retainedCtFromMetalTensor(self, &initial.hidden);
+            defer freeOp(ctx, hidden_ct);
+            if (!try copyRows2DOp(ctx, front, row, hidden_ct, 0, 1, request.hidden_size)) return false;
+            const ple_mt = if (initial.ple_vectors) |*tensor| tensor else return false;
+            const ple_ct = try retainedCtFromMetalTensor(self, ple_mt);
+            defer freeOp(ctx, ple_ct);
+            if (!try copyRows2DOp(ctx, ple, row, ple_ct, 0, 1, ple_width)) return false;
+        }
+        var active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
+        if (!active_frame) return false;
+        errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+        // Retain automatic barriers across pages: prepared singleton plans
+        // do not describe the scratch dependencies between independent rows.
+        var active_hidden = front;
+        var next_hidden = back;
+        for (request.layers, 0..) |layer, layer_index| {
+            for (request.items, 0..) |item, row| {
+                try cb.checkExecutionControl();
+                var singleton = request.*;
+                singleton.items = request.items[row..][0..1];
+                singleton.output_token_ids = request.output_token_ids[row..][0..1];
+                const hidden_view = try sliceRows2DOp(ctx, active_hidden, row, 1, request.hidden_size);
+                defer freeOp(ctx, hidden_view);
+                const output_carrier = try self.borrowedMetalTensorFromCt(next_hidden);
+                const output_shape = [_]i32{ 1, @intCast(request.hidden_size) };
+                var output_mt = try output_carrier.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &output_shape);
+                defer output_mt.deinit();
+                const ple_row = try sliceRows2DOp(ctx, ple, row, 1, ple_width);
+                defer freeOp(ctx, ple_row);
+                const hidden_mt = try self.borrowedMetalTensorFromCt(hidden_view);
+                const ple_row_mt = try self.borrowedMetalTensorFromCt(ple_row);
+                var ple_layer = (try sliceDecodePleLayerView(&ple_row_mt, 1, layer_index, request.ple_hidden_size, request.layer_count)) orelse return error.NativeBatchedDecodeUnavailable;
+                defer ple_layer.deinit();
+                var attention = item.attention;
+                attention.layer_index = layer.kv_layer_index;
+                attention.skip_kv_write = layer.shares_kv;
+                attention.sliding_window = layer.sliding_window;
+                const result = (try self.runActiveGatedLayerFromAttentionInputDeviceMt(&singleton, &layer, layer_index, hidden_mt, layer.attn_pre_norm_slot, hidden_mt, hidden_view, attention, ple_layer, layer.output_scale_value, output_mt)) orelse return error.NativeBatchedDecodeUnavailable;
+                var output = result.tensor;
+                defer output.deinit();
+                if (!result.output_mt_used) {
+                    const output_ct = try retainedCtFromMetalTensor(self, &output);
+                    defer freeOp(ctx, output_ct);
+                    if (!try copyRows2DOp(ctx, next_hidden, row, output_ct, 0, 1, request.hidden_size)) return error.NativeBatchedDecodeUnavailable;
+                }
+                self.timing_stats.active_decode_layers += 1;
+            }
+            std.mem.swap(CT, &active_hidden, &next_hidden);
+        }
+        try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
+        // Preserve singleton tail arithmetic too. Only scalar token IDs return
+        // to the host; no hidden states or vocabulary logits are exported.
+        for (0..count) |row| {
+            const hidden_view = try sliceRows2DOp(ctx, active_hidden, row, 1, request.hidden_size);
+            defer freeOp(ctx, hidden_view);
+            const token = (try decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx, &.{
+                .norm_slot = request.final_norm_slot,
+                .linear_slot = request.final_lm_head_slot,
+                .input = hidden_view,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .out_dim = request.vocab_size,
+                .suppress_token_ids = request.suppress_token_ids,
+            })) orelse return error.NativeBatchedDecodeUnavailable;
+            if (token >= request.vocab_size) return error.InvalidModelOutput;
+            request.output_token_ids[row] = @intCast(token);
+        }
+        self.timing_stats.active_decode_frame_successes += 1;
+        return true;
+    }
+
     fn runActiveDecoderRuntimeDecode(
         ctx: *anyopaque,
         self: *MetalCompute,
@@ -27461,6 +27568,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         } else {
             self.timing_stats.active_decode_frame_disabled += 1;
+        }
+        if (request.items.len > 1) {
+            if (!active_decode_frame_enabled) return false;
+            return runCoordinatedGemma4Rows(ctx, self, request, &batch_inputs);
         }
         var active_frame = false;
         if (active_decode_frame_enabled and !metal_runtime.hasActiveFrame(runtime)) {

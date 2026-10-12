@@ -8991,7 +8991,7 @@ pub const NativeGenerationPipeline = struct {
             if (cached_first_target_choice) |cached_choice| {
                 if (draft_count == 1 and target_query_len == 1) {
                     const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                    const canonical_result = self.materializeAcceptedTokenKvActiveHiddenForMtp(
+                    const canonical_result = self.materializeMtpCanonicalHidden(
                         token_ids,
                         verify_seq,
                         &target_ctx,
@@ -9000,12 +9000,8 @@ pub const NativeGenerationPipeline = struct {
                         decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                         return err;
                     };
-                    if (canonical_result == null) {
-                        decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
-                        return error.UnsupportedBackend;
-                    }
-                    if (canonical_result) |owned| {
-                        var canonical_hidden = owned;
+                    {
+                        var canonical_hidden = canonical_result;
                         defer canonical_hidden.deinit();
                         mtp_activation.notePendingKvWritten();
 
@@ -10251,6 +10247,20 @@ pub const NativeGenerationPipeline = struct {
         return null;
     }
 
+    /// Active materialization deliberately declines long split-window contexts.
+    /// Preserve the full KV view through the existing one-token hidden path.
+    fn materializeMtpCanonicalHidden(
+        self: *NativeGenerationPipeline,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+    ) !ForwardHiddenDevice {
+        if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
+        if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(token_ids, total_seq_len, decode_context, hidden_source)) |result| return result;
+        return self.forwardMtpTargetHiddenDeviceNoReplay(token_ids[total_seq_len - 1 .. total_seq_len], 1, total_seq_len, decode_context, hidden_source);
+    }
+
     fn materializeAcceptedTokenKvActiveHiddenForMtp(
         self: *NativeGenerationPipeline,
         token_ids: []const i64,
@@ -10793,6 +10803,20 @@ pub const NativeGenerationPipeline = struct {
             all_greedy = all_greedy and work.wants_greedy;
         }
         if (all_greedy) {
+            if (!platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_EAGER", false) and claimed.len <= 4) {
+                var contexts: [4]gpt_arch.DecodeContext = undefined;
+                var native_items: [4]decoder_gated_runtime.GreedyBatchItem = undefined;
+                for (items, 0..) |item, row| {
+                    var decode_runtime = BorrowedDecodeStateRuntime.init(item.state);
+                    contexts[row] = decode_runtime.makeDecodeContext(item.total_sequence_len, 1);
+                    native_items[row] = .{ .token_id = input_ids[row], .seq_len = item.total_sequence_len, .decode_context = &contexts[row] };
+                }
+                if (try decoder_gated_runtime.forwardGreedyTokensBatch(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, native_items[0..claimed.len])) |choices| {
+                    if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) std.log.info("metal_ocr_native_decode_rows={d}", .{claimed.len});
+                    return .{ .logits = null, .greedy_tokens = choices, .max_query_seq_len = 1 };
+                }
+            }
+
             const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, max_query_seq_len, &owned_ctx.context, "gpt.metal_batch_decode");
             defer self.cb.free(hidden);
             const weight = try self.graphWeight("lm_head.weight");
@@ -15748,4 +15772,22 @@ test "prepared embeddings MTP requires the image hidden state and releases rows 
     const input = try preparedEmbeddingsTestRows(&pipeline.cb, a, 3, 4);
     const context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = 3, .total_sequence_len = 3, .query_sequence_len = 3 };
     try std.testing.expectError(error.MultimodalMtpPrefillUnavailable, pipeline.forwardPreparedEmbeddingsLastLogits(input, &.{ 1, 2, 3 }, 3, &context, true));
+}
+
+test "MTP canonical hidden falls back when the active backend route is unavailable" {
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 0, 0, 0, 0, 1, 2, 3, 4 });
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .vocab_size = 2, .num_hidden_layers = 0, .position_encoding = .rope });
+    const context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+    var result = try pipeline.materializeMtpCanonicalHidden(&.{1}, 1, &context, .final);
+    defer result.deinit();
+    const values = try pipeline.cb.toFloat32(result.hidden, a);
+    defer a.free(values);
+    try std.testing.expectEqual(@as(usize, 1), result.rows);
+    try std.testing.expectEqual(@as(usize, 4), values.len);
+    for (values, 1..) |value, index| try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index)) / @sqrt(@as(f32, 7.5) + pipeline.gpt_config.norm_eps), value, 1e-5);
 }

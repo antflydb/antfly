@@ -1739,6 +1739,84 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     return null;
 }
 
+pub const GreedyBatchItem = struct {
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+};
+
+/// Coordinate independent paged Gemma4 sequences with the prepared singleton
+/// arithmetic. Metal owns the layer-major cohort and returns token IDs only.
+pub fn forwardGreedyTokensBatch(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    configured_layers: usize,
+    items: []const GreedyBatchItem,
+) !?[]u32 {
+    if (cb.kind() != .metal or items.len == 0 or items.len > 4 or !cfg.hasPle() or cfg.usesMoe()) return null;
+    for (items) |item| {
+        if (!supportsDirectGemmaRuntime(cfg, configured_layers, item.decode_context) or
+            item.decode_context.attention_mode != .paged_decode or item.decode_context.query_sequence_len != 1) return null;
+    }
+    const choices = try allocator.alloc(u32, items.len);
+    var success = false;
+    defer if (!success) allocator.free(choices);
+    if (items.len == 1) {
+        const token = (try forwardGreedyToken(cb, allocator, cfg, configured_layers, items[0].token_id, items[0].seq_len, items[0].decode_context)) orelse return null;
+        choices[0] = @intCast(token);
+        success = true;
+        return choices;
+    }
+    var maximum_seq: usize = 0;
+    for (items) |item| maximum_seq = @max(maximum_seq, item.seq_len);
+    if (!(try cb.decoderRuntimePrepareOrReuseFamily(allocator, cfg, maximum_seq, configured_layers)).prepared) return null;
+    var layers_buf: [256]contracts.DecoderRuntimeLayerSpec = undefined;
+    if (cfg.num_hidden_layers > layers_buf.len) return null;
+    const layers = try gemma4_runtime.fillLayerSpecsCached(cb, allocator, cfg, configured_layers, &layers_buf, true, items[0].decode_context.gemma4_layer_spec_cache);
+    var decode_items: [4]contracts.DecoderRuntimeDecodeItem = undefined;
+    var token_ids: [4]i64 = undefined;
+    for (items, decode_items[0..items.len]) |item, *decoded| {
+        decoded.* = .{ .token_id = item.token_id, .position = item.seq_len - 1, .seq_len = item.seq_len, .attention = gpt_arch.attentionContextFromDecode(item.decode_context) };
+    }
+    const embedding = try gpt_arch.getEmbeddingWeight(cb, cfg);
+    defer cb.free(embedding);
+    const ple_embedding = gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.embed_tokens_per_layer.weight"),
+        else => return err,
+    };
+    defer cb.free(ple_embedding);
+    const request = contracts.DecoderRuntimeDecodeRequest{
+        .contract = .gemma4_gated_ple_shared_kv,
+        .configured_layer_count = configured_layers,
+        .layer_count = layers.len,
+        .hidden_size = cfg.hidden_size,
+        .vocab_size = cfg.vocab_size,
+        .num_attention_heads = cfg.num_attention_heads,
+        .norm_eps = cfg.norm_eps,
+        .ple_hidden_size = cfg.ple_hidden_size,
+        .token_embedding_scale = cfg.tokenEmbeddingScale(),
+        .global_head_dim = cfg.global_head_dim,
+        .rope_freq_scale = cfg.rope_freq_scale,
+        .rope_consecutive_pairs = cfg.rope_layout == .consecutive_pairs,
+        .activation = decoderActivationKind(cfg),
+        .final_norm_slot = finalNormSlot(configured_layers),
+        .final_lm_head_slot = finalLmHeadSlot(configured_layers),
+        .ple_model_proj_slot = pleModelProjSlot(configured_layers),
+        .ple_proj_norm_slot = pleProjNormSlot(configured_layers),
+        .layers = layers,
+        .items = decode_items[0..items.len],
+        .token_embedding_weight = embedding,
+        .ple_token_embedding_weight = ple_embedding,
+        .suppress_token_ids = cfg.suppressTokenIds(),
+        .output_token_ids = token_ids[0..items.len],
+    };
+    if (!try cb.decoderRuntimeDecodeBatch(&request)) return null;
+    for (choices, token_ids[0..items.len]) |*choice, token| choice.* = @intCast(token);
+    success = true;
+    return choices;
+}
+
 /// Backend-owned sampled decode: run the whole forward through the planned
 /// decode frame (same as greedy), capture the PRE-norm backbone row, and
 /// sample from it via the fused norm+lm-head tail. The frame's argmax token

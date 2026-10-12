@@ -1345,17 +1345,30 @@ pub const GenerationBatchingConfig = struct {
     }
 
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
-        const validated_max_items: usize = if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) @min(@max(platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2, 1), 4) else 2;
+        const validated_max_items: usize = 2;
         return .{
-            .max_step_items = if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) validated_max_items else @min(@max(self.max_step_items, 1), validated_max_items),
+            .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
             .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
-            .max_decode_wait_us = if (self.mode == .on or platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) self.max_decode_wait_us else 0,
+            .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
             .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 2048),
             // Wider active sets currently lose response equivalence even when
             // individual steps are capped to two rows. Preserve the proven
             // direct path until the multi-wave row scheduler is validated.
             .max_active_requests_for_batching = validated_max_items,
         };
+    }
+    fn gemma4MetalOcrPolicyForRows(self: @This(), requested_rows: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.schedulerPolicy();
+        const rows = @min(@max(requested_rows, 1), 4);
+        policy.max_step_items = rows;
+        policy.max_active_requests_for_batching = rows;
+        policy.max_decode_wait_us = self.max_decode_wait_us;
+        policy.allow_mixed_sequence_lengths = true;
+        return policy;
+    }
+
+    fn gemma4MetalOcrPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        return self.gemma4MetalOcrPolicyForRows(platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2);
     }
 };
 
@@ -15061,7 +15074,7 @@ pub const Node = struct {
                 }
                 const coordinated_metal_ocr = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false) and
                     group_indices.items.len >= 2 and backend_kind == .metal and gpt_config.family == .gemma and gpt_config.gemma4_channel_protocol and gpt_config.hasPle() and model.manifest.gguf_projector_path != null and
-                    group_indices.items.len <= self.config.generation_batching.schedulerPolicy().max_active_requests_for_batching.?;
+                    group_indices.items.len <= self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?;
                 const execution_mode = if (coordinated_metal_ocr)
                     BatchExecutionMode.coordinated_shared
                 else if (group_has_media)
@@ -15187,6 +15200,9 @@ pub const Node = struct {
                             continue;
                         };
                     }
+                    // Keep CUDA's homogeneous C2 policy intact. Only this
+                    // qualified Metal cohort admits independent decode positions.
+                    if (execution_mode == .coordinated_shared) coordinator.setPolicy(self.config.generation_batching.gemma4MetalOcrPolicy());
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
                         leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
@@ -34859,6 +34875,11 @@ fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
 }
 
 fn batchGenerationError(err: anyerror) api.GenerateBatchError {
+    switch (err) {
+        error.ImageDecodeFailed, error.ImageTooLarge, error.ImageBatchTooLarge => return Node.generateBatchImageError(err),
+        else => {},
+    }
+
     if (generationRequestFailure(err)) |failure| {
         return .{
             .code = failure.code,
@@ -36352,4 +36373,48 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Metal OCR policy enables ragged rows without widening the CUDA policy" {
+    const config = GenerationBatchingConfig{ .mode = .on, .max_step_items = 8 };
+    const base = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), base.max_step_items);
+    try std.testing.expect(!base.allow_mixed_sequence_lengths);
+    const metal = config.gemma4MetalOcrPolicyForRows(4);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_active_requests_for_batching.?);
+    try std.testing.expect(metal.allow_mixed_sequence_lengths);
+    try std.testing.expectEqual(@as(usize, 1), config.gemma4MetalOcrPolicyForRows(0).max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrPolicyForRows(99).max_step_items);
+}
+
+test "Metal OCR coordinator packs four unequal page positions" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    const config = GenerationBatchingConfig{};
+    coordinator.setPolicy(config.gemma4MetalOcrPolicyForRows(4));
+    var leases: [4]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| coordinator.release(lease);
+    var work: [4]u8 = undefined;
+    for (&leases, 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row, 11 + row, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+}
+
+test "generation batch corrupt images are permanent while allocation failures remain retryable" {
+    const bad_image = batchGenerationError(error.ImageDecodeFailed);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", bad_image.code);
+    try std.testing.expect(!bad_image.retryable);
+    const allocation = batchGenerationError(error.OutOfMemory);
+    try std.testing.expect(allocation.retryable);
 }
