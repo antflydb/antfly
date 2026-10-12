@@ -968,8 +968,13 @@ and titled groups retain compatibility. No CUDA performance gain is claimed.
 The follow-up adds `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1` within the experimental
 OCR lane: QKV, FFN, PLE and vocabulary projections span the active rows, with
 per-page RoPE/attention and frame-local F32/F16 KV suffix writes. The four-row
-corpus run submitted one frame per multi-row step and matched all transcripts,
-but remained slower than serialized generation, so this switch defaults off.
+corpus run submitted one frame per multi-row step. A subsequent patch selects
+parallel RMS normalization for short matrices and groups projections into
+tracked compute scopes. Four-row recognition improved to 40.139s versus
+54.501s for ordinary generation, with identical transcripts in both eight-page
+passes. Two-row repeats changed a diagram transcript. This switch remains
+opt-in pending broader qualification; the normalization rollback is
+`TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE=1`.
 `ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME=1` also qualifies canonical one-token
 hidden/choice recovery past the local-attention window. K=2, including bonus
 acceptance, matched the complete OCR corpus but did not pass the speed gate.

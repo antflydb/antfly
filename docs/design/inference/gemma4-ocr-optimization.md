@@ -2,6 +2,69 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Parallel normalization and matrix scopes
+
+[The next qualification](gemma4-ocr-parallel-qualification.json) measures the
+follow-up on the same eight pages with two complete passes per configuration.
+The matrix path was normalizing each hidden row serially on one GPU thread.
+It now selects the existing parallel row RMS kernel for two-to-four-row
+matrices with widths at least 1,024 when
+`ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1`. This also accelerates short MTP verification
+matrices in that configuration. `TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE=1`
+retains the previous normalization selection.
+
+QKV projections, the shared attention-output/FFN block, PLE and final head now
+use tracked compute scopes inside the existing frame. These reuse compute
+encoders and retain the runtime's dependency barriers. The existing Metal
+counter sampler profiles the frame without intermediate submissions or host
+waits. A separate complete two-page diagnostic sampled a median 12.49 ms per
+two-row step across 404 steps; the previous two-row smoke sampled about
+39.5 ms. Stage sampling was disabled for the timed corpus runs. Some shared
+block work remains attributed to `other`; these are not per-kernel roofline
+measurements.
+
+| Configuration | Median seconds, eight pages | Tokens per pass | Exact control text in both passes |
+| --- | ---: | ---: | --- |
+| Resident ordinary greedy | 54.501 | 4,057 / 4,057 | Yes |
+| Matrix batching, two rows | 42.675 | 4,057 / 4,016 | No: one diagram-page repeat changed |
+| Matrix batching, four rows | 40.139 | 4,057 / 4,057 | Yes |
+| MTP K=2, canonical recovery and bonus | 63.273 | 4,057 / 4,057 | Yes |
+| MTP K=2, deferred recovery, no bonus | 76.087 | 4,057 / 4,057 | Yes |
+
+Four-row batching delivered 1.36 times the throughput of ordinary generation,
+a 26.4% reduction in recognition time, while preserving all transcripts in
+both passes. The previous-version control measured 74.382 seconds for four-row
+batching and 79.470 seconds for bonus MTP, versus 40.139 and 63.273 seconds
+with this patch. In the first measured MTP pass, verification fell from 36.993
+to 20.103 seconds with identical 1,251 calls and 2,502 rows; draft and recovery
+counts were identical too. The previous-version controls include the CPU
+activity described below. The two-row variant still fails the strict parity/repeat gate.
+MTP verification is cheaper, but MTP still loses to ordinary decoding on this
+checkpoint and hardware. Experimental matrix batching and Metal MTP remain
+opt-in; this corpus does not establish broader document/checkpoint coverage.
+
+The recovery audit found that fully accepted drafts already reuse verified
+hidden states. Corrections and bonus tokens still need their own KV written.
+The existing deferred-recovery path folds this work into the next verification
+batch, removing the separate forward but increasing verification work and
+changing the assistant's donor context. Its complete-corpus result was slower
+than canonical recovery with bonus acceptance, so it remains off. In the
+first measured complete pass, canonical/bonus verification processed 2,502 rows
+in 20.103 seconds and materialization took 21.626 seconds. Deferred recovery
+removed materialization but processed 5,469 verification rows in 49.283
+seconds; drafting grew from 12.881 to 17.760 seconds. Warmup phases are excluded. These are enclosing phase
+wall times, not independent GPU kernel timings.
+
+These timings include recognition preparation, prefill/decode and HTTP over
+identical pre-rendered PNGs. PDF rasterization, model startup and image file
+reads are excluded. The machine was not dedicated: unrelated CPU compilation
+appeared during the second deferred-recovery pass and the previous-version
+controls. The ordinary, new matrix and bonus-MTP cases completed before that
+activity appeared. Source/executable pins, flags, quality proxies and phase
+counters are recorded in the qualification JSON. Seven focused checks passed,
+including independent F64 normalization references at the model dimensions
+and frame/KV lifecycle checks.
+
 ## Implemented matrix batching and MTP follow-up
 
 [Eight-page qualification](gemma4-ocr-matrix-qualification.json) records the
