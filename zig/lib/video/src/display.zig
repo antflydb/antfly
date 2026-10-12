@@ -47,6 +47,36 @@ pub fn layout(track: media.mp4.Track, width: u32, height: u32, policy: Policy) !
         .{ .rotation = rotation, .width = @intCast(display_width), .height = height };
 }
 
+pub const WebmLayout = struct { display: Layout, crop: media.webm.Crop };
+/// WebM display dimensions describe the cropped raster. Physical units and
+/// aspect-ratio units provide a ratio, never an inferred physical screen size.
+pub fn webmLayout(track: media.webm.Track, width: u32, height: u32, policy: Policy) !WebmLayout {
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidVideoGeometry;
+    if (policy == .coded_pixels) return .{ .display = .{ .rotation = .none, .width = width, .height = height }, .crop = .{} };
+    const p = track.presentation;
+    const cropped = try preparation.croppedSize(width, height, p.crop);
+    if (p.stereo_mode != 0 or p.projection_type != 0 or p.projection_private.len != 0 or p.yaw != 0 or p.pitch != 0) return error.UnsupportedVideoDisplay;
+    const rotation: preparation.Rotation = if (p.roll == 0) .none else if (p.roll == 90) .clockwise270 else if (p.roll == -90) .clockwise90 else if (@abs(p.roll) == 180) .half_turn else return error.UnsupportedVideoDisplay;
+    if (p.display_unit > 3) return error.UnsupportedVideoDisplay;
+    if (p.display_unit != 0 and (p.display_width == null or p.display_height == null)) return error.UnsupportedVideoDisplay;
+    // Schema defaults refer to Track PixelWidth/Height, not the dimensions of
+    // a later codec picture. Preserve container aspect across resolution changes.
+    const declared = try preparation.croppedSize(track.width, track.height, p.crop);
+    const dw = p.display_width orelse declared[0];
+    const dh = p.display_height orelse declared[1];
+    if (dw == 0 or dh == 0) return error.InvalidVideoGeometry;
+    // Preserve the cropped height and apply the display aspect once, directly
+    // in the model target geometry; no intermediate stretched image is needed.
+    const numerator = @as(u64, cropped[1]) * dw;
+    const display_width = (numerator + dh / 2) / dh;
+    if (display_width == 0 or display_width > 16384) return error.ResourceLimitExceeded;
+    const display: Layout = if (rotation == .clockwise90 or rotation == .clockwise270)
+        .{ .rotation = rotation, .width = cropped[1], .height = @intCast(display_width) }
+    else
+        .{ .rotation = rotation, .width = @intCast(display_width), .height = cropped[1] };
+    return .{ .display = display, .crop = p.crop };
+}
+
 test "display policy distinguishes coded pixels SAR quarter turns and unsupported transforms" {
     const a = std.testing.allocator;
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/mjpeg.mov") }, .identity = "display-fixture" };
@@ -65,4 +95,40 @@ test "display policy distinguishes coded pixels SAR quarter turns and unsupporte
     track.display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 };
     track.pixel_aspect.vertical = 0;
     try std.testing.expectError(error.UnsupportedVideoDisplay, layout(track, 720, 480, .presentation));
+}
+
+test "WebM presentation applies crop then aspect ratio then counterclockwise roll" {
+    var track = media.webm.Track{ .number = 1, .codec = .vp9, .width = 720, .height = 480, .presentation = .{
+        .crop = .{ .left = 8, .right = 8, .top = 4, .bottom = 4 },
+        .display_width = 16,
+        .display_height = 9,
+        .display_unit = 3,
+        .roll = 90,
+    } };
+    const actual = try webmLayout(track, 720, 480, .presentation);
+    try std.testing.expectEqual(Layout{ .rotation = .clockwise270, .width = 472, .height = 839 }, actual.display);
+    try std.testing.expectEqual(track.presentation.crop, actual.crop);
+    try std.testing.expectEqual(Layout{ .rotation = .none, .width = 720, .height = 480 }, (try webmLayout(track, 720, 480, .coded_pixels)).display);
+    track.presentation.roll = -90;
+    try std.testing.expectEqual(preparation.Rotation.clockwise90, (try webmLayout(track, 720, 480, .presentation)).display.rotation);
+    track.presentation.display_unit = 0;
+    track.presentation.display_width = null;
+    track.presentation.display_height = null;
+    try std.testing.expectEqual(Layout{ .rotation = .clockwise90, .width = 472, .height = 704 }, (try webmLayout(track, 720, 480, .presentation)).display);
+    track.presentation.roll = 45;
+    try std.testing.expectError(error.UnsupportedVideoDisplay, webmLayout(track, 720, 480, .presentation));
+    track.presentation.roll = 0;
+    track.presentation.yaw = 90;
+    try std.testing.expectError(error.UnsupportedVideoDisplay, webmLayout(track, 720, 480, .presentation));
+    track.presentation.yaw = 0;
+    track.presentation.display_unit = 4;
+    try std.testing.expectError(error.UnsupportedVideoDisplay, webmLayout(track, 720, 480, .presentation));
+    track.presentation.display_unit = 3;
+    try std.testing.expectError(error.UnsupportedVideoDisplay, webmLayout(track, 720, 480, .presentation));
+}
+
+test "WebM implicit display aspect follows track dimensions across codec geometry changes" {
+    const track = media.webm.Track{ .number = 1, .codec = .av1, .width = 720, .height = 480 };
+    try std.testing.expectEqual(Layout{ .rotation = .none, .width = 300, .height = 200 }, (try webmLayout(track, 360, 200, .presentation)).display);
+    try std.testing.expectEqual(Layout{ .rotation = .none, .width = 360, .height = 200 }, (try webmLayout(track, 360, 200, .coded_pixels)).display);
 }

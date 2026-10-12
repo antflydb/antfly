@@ -27,6 +27,38 @@ pub const Limits = struct {
     max_packet_bytes: usize = 16 * 1024 * 1024,
     max_dimension: u64 = 16_384,
 };
+/// Container declarations are preserved independently of codec output. Defaults
+/// and element IDs follow the Matroska EBML schema; rendering belongs to video.
+pub const Crop = struct { left: u32 = 0, top: u32 = 0, right: u32 = 0, bottom: u32 = 0 };
+pub const Presentation = struct {
+    crop: Crop = .{},
+    display_width: ?u32 = null,
+    display_height: ?u32 = null,
+    display_unit: u8 = 0,
+    stereo_mode: u8 = 0,
+    projection_type: u8 = 0,
+    projection_private: []const u8 = &.{},
+    yaw: f64 = 0,
+    pitch: f64 = 0,
+    roll: f64 = 0,
+};
+pub const Colour = struct {
+    matrix: u16 = 2,
+    transfer: u16 = 2,
+    primaries: u16 = 2,
+    range: u8 = 0,
+    bits_per_channel: u8 = 0,
+    subsampling_h: ?u8 = null,
+    subsampling_v: ?u8 = null,
+    cb_subsampling_h: ?u8 = null,
+    cb_subsampling_v: ?u8 = null,
+    siting_h: u8 = 0,
+    siting_v: u8 = 0,
+    max_cll: ?u64 = null,
+    max_fall: ?u64 = null,
+    /// Borrowed bounded EBML payload; the reader owns its metadata lease.
+    mastering: []const u8 = &.{},
+};
 pub const Track = struct {
     number: u64,
     codec: Codec,
@@ -34,6 +66,8 @@ pub const Track = struct {
     height: u32,
     codec_private: []const u8 = &.{},
     default_duration_ns: ?u64 = null,
+    presentation: Presentation = .{},
+    colour: Colour = .{},
 };
 pub const Packet = struct {
     cluster_offset: u64,
@@ -357,7 +391,10 @@ fn parseTracks(bytes: []const u8, limits: Limits, control: source.Control) !Trac
         var width: u64 = 0;
         var height: u64 = 0;
         var duration: ?u64 = null;
+        var presentation = Presentation{};
+        var colour = Colour{};
         var encoded = false;
+        var video_seen = false;
         var nested: usize = 0;
         while (nested < fields.len) {
             try control.check();
@@ -377,18 +414,9 @@ fn parseTracks(bytes: []const u8, limits: Limits, control: source.Control) !Trac
                     if (try ebml.readFloat(value) != 1) return error.UnsupportedTimeline;
                 },
                 0xe0 => {
-                    var geometry: usize = 0;
-                    while (geometry < value.len) {
-                        try control.check();
-                        elements += 1;
-                        if (elements > limits.max_elements) return error.ResourceLimitExceeded;
-                        const dimension = try ebml.readElementHeader(value, geometry);
-                        geometry = dimension.data_end orelse return error.MalformedMedia;
-                        const data = try ebml.elementPayload(value, dimension);
-                        if (dimension.id == 0xb0) width = try ebml.readUint(data);
-                        if (dimension.id == 0xba) height = try ebml.readUint(data);
-                        if (dimension.id == 0x9a and try ebml.readUint(data) != 0 and try ebml.readUint(data) != 2) return error.UnsupportedInterlacedVideo;
-                    }
+                    if (video_seen) return error.MalformedMedia;
+                    video_seen = true;
+                    try parseVideo(value, limits, control, &elements, &width, &height, &presentation, &colour);
                 },
                 else => {},
             }
@@ -398,9 +426,107 @@ fn parseTracks(bytes: []const u8, limits: Limits, control: source.Control) !Trac
         if (encoded) return error.UnsupportedEncryptedMedia;
         if (number == 0 or width == 0 or height == 0 or width > limits.max_dimension or height > limits.max_dimension) return error.ResourceLimitExceeded;
         if (duration != null and duration.? == 0) return error.UnsupportedTimeline;
-        return .{ .number = number, .codec = codec, .width = std.math.cast(u32, width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u32, height) orelse return error.ResourceLimitExceeded, .codec_private = private, .default_duration_ns = duration };
+        return .{ .number = number, .codec = codec, .width = std.math.cast(u32, width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u32, height) orelse return error.ResourceLimitExceeded, .codec_private = private, .default_duration_ns = duration, .presentation = presentation, .colour = colour };
     }
     return error.UnsupportedVideoCodec;
+}
+/// Fixed-depth metadata traversal shares the track's element and cancellation
+/// budgets. Known singleton fields reject duplicates instead of last-value wins.
+const Fields = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+    seen: u64 = 0,
+    elements: *usize,
+    limits: Limits,
+    control: source.Control,
+    fn next(self: *Fields, comptime ids: []const u32) !?struct { id: u32, data: []const u8 } {
+        if (self.cursor == self.bytes.len) return null;
+        try self.control.check();
+        if (self.elements.* >= self.limits.max_elements) return error.ResourceLimitExceeded;
+        self.elements.* += 1;
+        const field = try ebml.readElementHeader(self.bytes, self.cursor);
+        self.cursor = field.data_end orelse return error.MalformedMedia;
+        inline for (ids, 0..) |id, bit| if (field.id == id) {
+            const mask = @as(u64, 1) << bit;
+            if (self.seen & mask != 0) return error.MalformedMedia;
+            self.seen |= mask;
+        };
+        return .{ .id = field.id, .data = try ebml.elementPayload(self.bytes, field) };
+    }
+};
+fn unsigned(comptime T: type, data: []const u8) !T {
+    return std.math.cast(T, try ebml.readUint(data)) orelse error.ResourceLimitExceeded;
+}
+fn parseVideo(bytes: []const u8, limits: Limits, control: source.Control, elements: *usize, width: *u64, height: *u64, presentation: *Presentation, colour: *Colour) !void {
+    var fields = Fields{ .bytes = bytes, .elements = elements, .limits = limits, .control = control };
+    while (try fields.next(&.{ 0xb0, 0xba, 0x9a, 0x54aa, 0x54bb, 0x54cc, 0x54dd, 0x54b0, 0x54ba, 0x54b2, 0x53b8, 0x55b0, 0x7670 })) |field| {
+        switch (field.id) {
+            0xb0 => width.* = try ebml.readUint(field.data),
+            0xba => height.* = try ebml.readUint(field.data),
+            0x9a => {
+                const value = try ebml.readUint(field.data);
+                if (value != 0 and value != 2) return error.UnsupportedInterlacedVideo;
+            },
+            0x54aa => presentation.crop.bottom = try unsigned(u32, field.data),
+            0x54bb => presentation.crop.top = try unsigned(u32, field.data),
+            0x54cc => presentation.crop.left = try unsigned(u32, field.data),
+            0x54dd => presentation.crop.right = try unsigned(u32, field.data),
+            0x54b0 => {
+                presentation.display_width = try unsigned(u32, field.data);
+                if (presentation.display_width.? == 0) return error.MalformedMedia;
+            },
+            0x54ba => {
+                presentation.display_height = try unsigned(u32, field.data);
+                if (presentation.display_height.? == 0) return error.MalformedMedia;
+            },
+            0x54b2 => presentation.display_unit = try unsigned(u8, field.data),
+            0x53b8 => presentation.stereo_mode = try unsigned(u8, field.data),
+            0x55b0 => try parseColour(field.data, limits, control, elements, colour),
+            0x7670 => {
+                var projection = Fields{ .bytes = field.data, .elements = elements, .limits = limits, .control = control };
+                while (try projection.next(&.{ 0x7671, 0x7672, 0x7673, 0x7674, 0x7675 })) |pose| switch (pose.id) {
+                    0x7671 => presentation.projection_type = try unsigned(u8, pose.data),
+                    0x7672 => presentation.projection_private = pose.data,
+                    0x7673 => presentation.yaw = try ebml.readFloat(pose.data),
+                    0x7674 => presentation.pitch = try ebml.readFloat(pose.data),
+                    0x7675 => presentation.roll = try ebml.readFloat(pose.data),
+                    else => {},
+                };
+                if (!std.math.isFinite(presentation.yaw) or !std.math.isFinite(presentation.pitch) or !std.math.isFinite(presentation.roll) or @abs(presentation.yaw) > 180 or @abs(presentation.pitch) > 90 or @abs(presentation.roll) > 180) return error.MalformedMedia;
+            },
+            else => {},
+        }
+    }
+    if (@as(u64, presentation.crop.left) + presentation.crop.right >= width.* or @as(u64, presentation.crop.top) + presentation.crop.bottom >= height.*) return error.MalformedMedia;
+}
+fn parseColour(bytes: []const u8, limits: Limits, control: source.Control, elements: *usize, colour: *Colour) !void {
+    var fields = Fields{ .bytes = bytes, .elements = elements, .limits = limits, .control = control };
+    while (try fields.next(&.{ 0x55b1, 0x55b2, 0x55b3, 0x55b4, 0x55b5, 0x55b6, 0x55b7, 0x55b8, 0x55b9, 0x55ba, 0x55bb, 0x55bc, 0x55bd, 0x55d0 })) |field| switch (field.id) {
+        0x55b1 => colour.matrix = try unsigned(u16, field.data),
+        0x55b2 => colour.bits_per_channel = try unsigned(u8, field.data),
+        0x55b3 => colour.subsampling_h = try unsigned(u8, field.data),
+        0x55b4 => colour.subsampling_v = try unsigned(u8, field.data),
+        0x55b5 => colour.cb_subsampling_h = try unsigned(u8, field.data),
+        0x55b6 => colour.cb_subsampling_v = try unsigned(u8, field.data),
+        0x55b7 => colour.siting_h = try unsigned(u8, field.data),
+        0x55b8 => colour.siting_v = try unsigned(u8, field.data),
+        0x55b9 => colour.range = try unsigned(u8, field.data),
+        0x55ba => colour.transfer = try unsigned(u16, field.data),
+        0x55bb => colour.primaries = try unsigned(u16, field.data),
+        0x55bc => colour.max_cll = try ebml.readUint(field.data),
+        0x55bd => colour.max_fall = try ebml.readUint(field.data),
+        0x55d0 => {
+            colour.mastering = field.data;
+            var mastering = Fields{ .bytes = field.data, .elements = elements, .limits = limits, .control = control };
+            while (try mastering.next(&.{ 0x55d1, 0x55d2, 0x55d3, 0x55d4, 0x55d5, 0x55d6, 0x55d7, 0x55d8, 0x55d9, 0x55da })) |value| {
+                if (value.id < 0x55d1 or value.id > 0x55da) continue;
+                const number = try ebml.readFloat(value.data);
+                if (!std.math.isFinite(number) or number < 0 or (value.id <= 0x55d8 and number > 1)) return error.MalformedMedia;
+            }
+        },
+        else => {},
+    };
+    if (colour.range > 3 or colour.siting_h > 2 or colour.siting_v > 2) return error.MalformedMedia;
 }
 fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayList(Packet), track: Track, element: Element, time: u64, scale: u64, duration: ?u64, group_sync: bool, cluster_offset: u64) !void {
     if (element.unknown or element.end - element.payload < 4) return error.MalformedMedia;
@@ -433,4 +559,36 @@ test "webm rejects timestamp multiplication overflow without trapping" {
     defer packets.deinit(std.testing.allocator);
     try std.testing.expectError(error.TimestampOverflow, appendBlock(std.testing.allocator, &scan, &packets, .{ .number = 1, .codec = .vp9, .width = 16, .height = 16 }, .{ .id = 0xa3, .payload = 0, .end = 5, .unknown = false }, std.math.maxInt(u64), std.math.maxInt(i64), null, true, 0));
     try std.testing.expectEqual(@as(usize, 0), input.retained_bytes);
+}
+
+test "webm track retains bounded display crop projection and Colour declarations" {
+    const bytes = "\xae\xe8\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\xd9\xb0\x81\x1a\xba\x81\x10\x54\xcc\x81\x01\x54\xdd\x81\x03\x54\xbb\x81\x01\x54\xaa\x81\x02\x54\xb0\x81\x10\x54\xba\x81\x09\x54\xb2\x81\x03\x76\x70\x8b\x76\x75\x88\x40\x56\x80\x00\x00\x00\x00\x00\x55\xb0\xa6\x55\xb1\x81\x01\x55\xb2\x81\x0a\x55\xb9\x81\x02\x55\xba\x81\x10\x55\xbb\x81\x09\x55\xb3\x81\x01\x55\xb4\x81\x01\x55\xbc\x82\x03\xe8\x55\xbd\x82\x01\x90";
+    const parsed = try parseTracks(bytes, .{}, .{});
+    try std.testing.expectEqual(Crop{ .left = 1, .right = 3, .top = 1, .bottom = 2 }, parsed.presentation.crop);
+    try std.testing.expectEqual(@as(?u32, 16), parsed.presentation.display_width);
+    try std.testing.expectEqual(@as(?u32, 9), parsed.presentation.display_height);
+    try std.testing.expectEqual(@as(u8, 3), parsed.presentation.display_unit);
+    try std.testing.expectEqual(@as(f64, 90), parsed.presentation.roll);
+    try std.testing.expectEqual(@as(u16, 1), parsed.colour.matrix);
+    try std.testing.expectEqual(@as(u16, 16), parsed.colour.transfer);
+    try std.testing.expectEqual(@as(u16, 9), parsed.colour.primaries);
+    try std.testing.expectEqual(@as(u8, 2), parsed.colour.range);
+    try std.testing.expectEqual(@as(u8, 10), parsed.colour.bits_per_channel);
+    try std.testing.expectEqual(@as(?u8, 1), parsed.colour.subsampling_h);
+    try std.testing.expectEqual(@as(?u64, 1000), parsed.colour.max_cll);
+    try std.testing.expectEqual(@as(?u64, 400), parsed.colour.max_fall);
+    try std.testing.expectError(error.ResourceLimitExceeded, parseTracks(bytes, .{ .max_elements = 8 }, .{}));
+    const defaults = try parseTracks("\xae\x95\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x86\xb0\x81\x1a\xba\x81\x10", .{}, .{});
+    try std.testing.expectEqual(Presentation{}, defaults.presentation);
+    try std.testing.expectEqual(Colour{}, defaults.colour);
+}
+test "webm display and Colour reject duplicate singleton fields malformed crop and nonfinite pose" {
+    inline for (.{
+        "\xae\x98\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x89\xb0\x81\x1a\xba\x81\x10\xb0\x81\x1a",
+        "\xae\x99\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x8a\xb0\x81\x1a\xba\x81\x10\x54\xcc\x81\x1a",
+        "\xae\x99\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x8a\xb0\x81\x1a\xba\x81\x10\x54\xb0\x81\x00",
+        "\xae\xa0\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x91\xb0\x81\x1a\xba\x81\x10\x55\xb0\x88\x55\xb1\x81\x01\x55\xb1\x81\x06",
+        "\xae\x9c\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x8d\xb0\x81\x1a\xba\x81\x10\x55\xb0\x84\x55\xb9\x81\x04",
+        "\xae\xa3\xd7\x81\x01\x83\x81\x01\x86\x85\x56\x5f\x56\x50\x39\xe0\x94\xb0\x81\x1a\xba\x81\x10\x76\x70\x8b\x76\x75\x88\x7f\xf8\x00\x00\x00\x00\x00\x00",
+    }) |bytes| try std.testing.expectError(error.MalformedMedia, parseTracks(bytes, .{}, .{}));
 }

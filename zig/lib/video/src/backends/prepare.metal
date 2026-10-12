@@ -15,7 +15,15 @@
 
 #include <metal_stdlib>
 using namespace metal;
-struct Params { uint sw, sh, tw, th, rotation, bt709, full, centered, depth, chroma, rounding, sample_shift, tone; };
+struct Params { uint sw, sh, tw, th, rotation, bt709, full, centered, depth, chroma, rounding, sample_shift, tone, crop_left, crop_top, crop_right, crop_bottom; };
+uint2 source_point(uint2 point, constant Params &p) {
+    uint cw = p.sw - p.crop_left - p.crop_right, ch = p.sh - p.crop_top - p.crop_bottom;
+    uint2 xy = point;
+    if (p.rotation == 1) xy = uint2(point.y, ch - 1 - point.x);
+    else if (p.rotation == 2) xy = uint2(cw - 1 - point.x, ch - 1 - point.y);
+    else if (p.rotation == 3) xy = uint2(cw - 1 - point.y, point.x);
+    return xy + uint2(p.crop_left, p.crop_top);
+}
 float3 tone_rgb(float3 encoded, constant Params &p, device const float *eotf) {
     float3 v = clamp(encoded / 255.0f, 0.0f, 1.0f), linear;
     float3 position = v * 16384.0f;
@@ -55,10 +63,7 @@ float3 rgb_q13(int y, int2 uv, constant Params &p) {
     return float3(clamp((value + 1) >> 1, 0, 255));
 }
 float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
-    uint2 xy = point;
-    if (p.rotation == 1) xy = uint2(point.y, p.sh - 1 - point.x);
-    else if (p.rotation == 2) xy = uint2(p.sw - 1 - point.x, p.sh - 1 - point.y);
-    else if (p.rotation == 3) xy = uint2(p.sw - 1 - point.y, point.x);
+    uint2 xy = source_point(point, p);
     float scale = float(1u << (p.depth - 8));
     float storage_max = p.depth == 8 ? 255.0f : 65535.0f;
     float stored_scale = float(1u << p.sample_shift);
@@ -76,7 +81,7 @@ float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read>
 }
 kernel void horizontal(texture2d<float, access::read> yplane [[texture(0)]], texture2d<float, access::read> uvplane [[texture(1)]],
     device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
-    uint dh = (p.rotation & 1) ? p.sw : p.sh;
+    uint dh = (p.rotation & 1) ? p.sw - p.crop_left - p.crop_right : p.sh - p.crop_top - p.crop_bottom;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
@@ -91,15 +96,12 @@ kernel void horizontal_rgba(device const uchar *rgba [[buffer(4)]],
     device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]],
     device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
-    uint dh = (p.rotation & 1) ? p.sw : p.sh;
+    uint dh = (p.rotation & 1) ? p.sw - p.crop_left - p.crop_right : p.sh - p.crop_top - p.crop_bottom;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
     for (uint i = 0; i < count; ++i) {
-        uint2 xy = uint2(start + i, gid.y);
-        if (p.rotation == 1) xy = uint2(xy.y, p.sh - 1 - xy.x);
-        else if (p.rotation == 2) xy = uint2(p.sw - 1 - xy.x, p.sh - 1 - xy.y);
-        else if (p.rotation == 3) xy = uint2(p.sw - 1 - xy.y, xy.x);
+        uint2 xy = source_point(uint2(start + i, gid.y), p);
         uint pos = (xy.y * p.sw + xy.x) * 4;
         sum += int3(rgba[pos], rgba[pos + 1], rgba[pos + 2]) * weights[offset + i];
     }
@@ -124,10 +126,7 @@ kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *o
 }
 
 float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
-    uint2 xy = point;
-    if (p.rotation == 1) xy = uint2(point.y, p.sh - 1 - point.x);
-    else if (p.rotation == 2) xy = uint2(p.sw - 1 - point.x, p.sh - 1 - point.y);
-    else if (p.rotation == 3) xy = uint2(p.sw - 1 - point.y, point.x);
+    uint2 xy = source_point(point, p);
     float scale = float(1u << (p.depth - 8));
     float y = float(yplane.read(xy).r >> p.sample_shift) / scale;
     float2 uv = float2(0.0f);
@@ -144,7 +143,7 @@ float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::
 }
 kernel void horizontal_native(texture2d<uint, access::read> yplane [[texture(0)]], texture2d<uint, access::read> uvplane [[texture(1)]],
     device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
-    uint dh = (p.rotation & 1) ? p.sw : p.sh;
+    uint dh = (p.rotation & 1) ? p.sw - p.crop_left - p.crop_right : p.sh - p.crop_top - p.crop_bottom;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);

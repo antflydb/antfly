@@ -677,3 +677,24 @@ Nineteen expanded-format replay fixtures, bootstrap allocation failures and
 sampling vectors preserve pinned PyTorch results, exact rankings/top-k and
 load/retry checks on CPU, Metal and actual Linux ARM64. Source-bound receipts
 and diagnostic timing limits are in `zig/lib/video/testdata/replay-validation`. Broader non-CUDA scope remains active.
+
+## WebM presentation and Colour metadata
+
+The bounded track reader retains crop edges, display dimensions/units, stereo,
+projection type/private data/pose, and Colour declarations. Known singleton
+fields reject duplicates; nested metadata shares the element and cancellation
+budgets. Mastering data remains borrowed from the reader's metadata lease;
+finite chromaticity/luminance values are validated. These fields follow the
+[Matroska EBML schema](https://raw.githubusercontent.com/ietf-wg-cellar/matroska-specification/master/ebml_matroska.xml).
+
+Model consumers apply crop before rotation and resize, use display dimensions
+as an aspect ratio, and reconcile container matrix/transfer/primaries with
+codec declarations. Depth/chroma/range mismatches fail. VP8 container Range is
+authoritative because its clamping bit specifies reconstruction clamping,
+rather than full/limited-range conversion; see
+[RFC 6386 section 9.2](https://www.rfc-editor.org/rfc/rfc6386.html#section-9.2).
+The video consumer declares supported rendering policies separately: rectangular
+quarter turns and SDR/PQ/HLG policies, with explicit failures for stereo,
+spherical projections, nonorthogonal poses and explicit chroma siting that
+requires another reconstruction filter. Media retains declarations without
+performing pixel conversion.

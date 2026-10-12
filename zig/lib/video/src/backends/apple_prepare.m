@@ -159,7 +159,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             y = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 0);
             uv = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 1);
         }
-        size_t height = (params[4] & 1) ? params[0] : params[1];
+        size_t height = (params[4] & 1) ? params[0] - params[13] - params[15] : params[1] - params[14] - params[16];
         id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
         result.output = [p.device newBufferWithLength:(size_t)params[2] * params[3] * 3 * sizeof(float) options:MTLResourceStorageModeShared];
         result.command = [p.queue commandBuffer];
@@ -169,12 +169,12 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         [encoder setComputePipelineState:nativeY ? p.horizontalNative : (rgba ? p.horizontalRGBA : p.horizontal)];
         if (rgba) [encoder setBuffer:result.rgba offset:0 atIndex:4];
         else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; [encoder setBuffer:params[12] ? toneLUT : c.xw offset:0 atIndex:5]; }
-        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:52 atIndex:1];
+        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:68 atIndex:1];
         [encoder setBuffer:c.xb offset:0 atIndex:2]; [encoder setBuffer:c.xw offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
-        [encoder setBytes:params length:52 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
+        [encoder setBytes:params length:68 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }

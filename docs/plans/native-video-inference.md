@@ -934,3 +934,38 @@ cancellation after a caller guard and return null before dereference. Both
 frame-view helpers are now pure, with a discovered boundary regression that
 fails on the previous implementation. Final source-bound receipts are in
 `zig/lib/video/testdata/simd-validation`; broader non-CUDA work remains active.
+
+### WebM presentation and Colour through inference
+
+Track metadata now retains crop/display dimensions, projection pose and Colour.
+The model applies crop in coded coordinates before quarter turns and resizing,
+without a cropped staging allocation on Metal. Implicit display aspect follows
+Track PixelWidth/Height even when a later codec picture changes resolution.
+Explicit display dimensions/physical units provide an aspect ratio rather than
+an inferred screen size. Primaries/transfer/matrix declarations are reconciled;
+depth, chroma and range mismatches fail. VP8 container declarations supply its
+RGB conversion matrix and range, while VP9/AV1 explicit codec signals must agree.
+
+The embedding recipe is now `embeddinggemma2-f32-mean-v6-webm-presentation`;
+previously ignored metadata can change input patches and embeddings, so v5 and
+v6 identities must stay distinct. The independent oracle uses unmodified codec
+payloads, explicit RGB conversion, crop/roll processing, pinned HF target geometry
+and pinned pretrained PyTorch. This extends the reference processor explicitly;
+it does not assume upstream applies WebM display metadata automatically.
+Synthetic metadata-only fixtures retain identical compressed Cluster hashes.
+Native/Metal preparation, RGBA staging and P010 imports have crop tests; defaults
+across coded geometry changes have a separate portable regression. Unsupported
+stereo/spherical projections, nonorthogonal pose, derived Range and explicit
+chroma siting remain explicit rendering-policy failures. Broader real-world
+HDR/display, scheduling, sustained performance, codec and live ingestion work
+remain within the active non-CUDA objective.
+
+Final presentation gates pass 77 container tests on macOS and Linux ARM64,
+180 video tests on macOS (2 skipped), 155 on Linux ARM64 (27 skipped), and
+25 model policy tests. All three pretrained cases preserve prompt-token counts
+on native CPU, Metal and Linux ARM64. Maximum vector error is below 2.8e-7 on
+macOS and 2.9e-6 on Linux ARM64; every cosine exceeds 0.9999999997. These are
+synthetic SDR policy oracles, not universal real-world/HDR qualification.
+Source/binary/report receipts are in
+`zig/lib/video/testdata/presentation-validation`. Broader non-CUDA work remains
+active.

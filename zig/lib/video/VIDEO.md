@@ -1426,3 +1426,45 @@ cancellation after a caller guard and return null before dereference. Both
 frame-view helpers are now pure, with a discovered boundary regression that
 fails on the previous implementation. Final source-bound receipts are in
 `zig/lib/video/testdata/simd-validation`; broader non-CUDA work remains active.
+
+## WebM presentation through model preparation
+
+WebM track presentation and Colour metadata now reaches model preparation.
+Crop is applied in coded pixel coordinates before rotation/resampling, so odd
+crop boundaries preserve the original chroma sample phase. CPU and Metal use
+the same cropped extent. Metal stages/imports the original planes and applies
+crop in the shader; it does not allocate an intermediate cropped raster.
+Resize coefficients are cached by cropped geometry and preparation policy,
+with crop origin remaining a command parameter. RGBA and P010/CoreVideo paths
+use the same ordering and bounds.
+
+Display dimensions supply the target aspect ratio in one resample. Rectangular
+projection roll is counterclockwise; positive 90 degrees maps to the existing
+clockwise-270 renderer. Unsupported stereo/projection/pose and chroma-siting
+policies fail explicitly. Container Colour declarations are combined with
+codec signals; incompatible matrix, transfer, primaries, depth, chroma and
+range declarations fail. VP8's container declarations can supply its RGB
+conversion matrix and full/limited range. The fixed HDR renderer still uses
+its declared exposure policy rather than deriving exposure from mastering data.
+
+The embedding recipe advances to
+`embeddinggemma2-f32-mean-v6-webm-presentation`, since previously ignored metadata
+can change an embedding. Independent RGB24 crop fixtures exercise odd/even
+boundaries and all quarter turns. Metal tests additionally exercise RGBA staging,
+coefficient reuse and P010 imports. The presentation fixture generator preserves
+compressed Cluster payload hashes while changing only container declarations;
+`tools/embeddinggemma2/video_webm_presentation_qualification.py` supplies a pinned
+PyTorch oracle with explicit presentation processing, rather than assuming the
+upstream loader applies container display metadata automatically. Qualification
+receipts are recorded separately from the earlier v5 receipts. Broader real-world
+HDR/display qualification and the full non-CUDA goal remain active.
+
+Final presentation gates pass 77 container tests on macOS and Linux ARM64,
+180 video tests on macOS (2 skipped), 155 on Linux ARM64 (27 skipped), and
+25 model policy tests. All three pretrained cases preserve prompt-token counts
+on native CPU, Metal and Linux ARM64. Maximum vector error is below 2.8e-7 on
+macOS and 2.9e-6 on Linux ARM64; every cosine exceeds 0.9999999997. These are
+synthetic SDR policy oracles, not universal real-world/HDR qualification.
+Source/binary/report receipts are in
+`zig/lib/video/testdata/presentation-validation`. Broader non-CUDA work remains
+active.

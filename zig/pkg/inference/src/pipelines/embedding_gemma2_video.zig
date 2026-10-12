@@ -89,7 +89,9 @@ fn policy(track: media.mp4.Track, width: u32, height: u32) !video.preparation.Op
     return policySignal(track, width, height, .{});
 }
 fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h264.Color) !video.preparation.Options {
-    const display = try video.display.layout(track, width, height, .presentation);
+    return policyLayout(track, try video.display.layout(track, width, height, .presentation), width, signal);
+}
+fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u32, signal: video.h264.Color) !video.preparation.Options {
     var transfer: u16 = signal.transfer orelse 2;
     var declared_matrix: u16 = signal.matrix orelse 6;
     var primaries: u16 = signal.primaries orelse 2;
@@ -153,6 +155,43 @@ fn webmTrack(track: media.webm.Track) !media.mp4.Track {
     return .{ .codec = .avc, .id = 1, .timescale = 1_000_000_000, .width = std.math.cast(u16, track.width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u16, track.height) orelse return error.ResourceLimitExceeded, .avcc = &.{}, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
 }
 
+fn webmPolicy(track: media.webm.Track, width: u32, height: u32, signal: video.h264.Color) !video.preparation.Options {
+    const layout = try video.display.webmLayout(track, width, height, .presentation);
+    var common = try webmTrack(track);
+    const c = track.colour;
+    var declaration: [10]u8 = undefined;
+    @memcpy(declaration[0..4], "nclc");
+    std.mem.writeInt(u16, declaration[4..6], c.primaries, .big);
+    std.mem.writeInt(u16, declaration[6..8], c.transfer, .big);
+    std.mem.writeInt(u16, declaration[8..10], c.matrix, .big);
+    common.color_info = &declaration;
+    var options = try policyLayout(common, layout.display, width, signal);
+    options.crop = layout.crop;
+    return options;
+}
+fn webmHost(track: media.webm.Track, frame: *const video.codecs.Frame) !video.preparation.HostSurface {
+    const c = track.colour;
+    if (c.bits_per_channel != 0 and c.bits_per_channel != frame.bit_depth) return error.UnsupportedVideoColor;
+    const horizontal: u8 = if (frame.chroma_format == 3) 0 else 1;
+    const vertical: u8 = if (frame.chroma_format == 1) 1 else 0;
+    if (c.subsampling_h) |v| if (frame.chroma_format == 0 or v != horizontal) return error.UnsupportedVideoColor;
+    if (c.subsampling_v) |v| if (frame.chroma_format == 0 or v != vertical) return error.UnsupportedVideoColor;
+    if (c.cb_subsampling_h) |v| if (v != 0) return error.UnsupportedVideoColor;
+    if (c.cb_subsampling_v) |v| if (v != 0) return error.UnsupportedVideoColor;
+    // Current RGB conversion replicates coded chroma samples. Explicit siting
+    // requires a separate reconstruction filter rather than an ignored tag.
+    if (c.siting_h != 0 or c.siting_v != 0) return error.UnsupportedVideoColor;
+    var host = frame.host();
+    if (c.range == 3) return error.UnsupportedVideoColor;
+    if (c.range != 0) {
+        const full = c.range == 2;
+        // VP8 has no full/limited-range signal; container Range is authoritative.
+        if (track.codec != .vp8 and full != frame.color.full_range) return error.UnsupportedVideoColor;
+        host.format = if (full) .nv12_full else .nv12_video;
+    }
+    return host;
+}
+
 /// Conservative decoded-pixel charge used before admitted HTTP model execution.
 pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     return inspectPixelsWithSampling(bytes, control, .reference);
@@ -207,7 +246,7 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
         var plan = Plan{ .commands = preparationSlots(selected) };
         for (selected) |id| {
             const picture = index.pictures[id];
-            try plan.picture(picture.width, picture.height, try policy(try webmTrack(reader.track), picture.width, picture.height));
+            try plan.picture(picture.width, picture.height, try webmPolicy(reader.track, picture.width, picture.height, .{}));
         }
         return plan;
     }
@@ -351,7 +390,7 @@ pub const Prefetch = struct {
             self.preparer = try video.preparation.Metal.init(device);
             if (pool) |shared| try self.preparer.?.admit(shared, 16 * 1024 * 1024);
         }
-        var capture = Capture{ .a = a, .cb = undefined, .track = track, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self };
+        var capture = Capture{ .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self };
         try self.put(.{ .header = selected });
         if (webm) {
             try video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, selected, &capture, Capture.publishWebm);
@@ -497,7 +536,7 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
         a.free(tensors);
     };
     if (resident) |tensors| @memset(tensors, null);
-    var capture = Capture{ .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var capture = Capture{ .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -634,6 +673,7 @@ const Capture = struct {
     a: std.mem.Allocator,
     cb: *const ComputeBackend,
     track: media.mp4.Track,
+    webm_track: ?media.webm.Track = null,
     pool: ?*media.admission.Pool = null,
     control: media.source.Control,
     output: []f32,
@@ -838,19 +878,21 @@ const Capture = struct {
         const self: *Capture = @ptrCast(@alignCast(raw));
         const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
         if (self.copyDuplicate(slot)) return;
+        const track = self.webm_track orelse return error.InvalidSamplingMetadata;
+        const host = try webmHost(track, frame);
         const color = frame.color;
         const signal = video.h264.Color{
             .primaries = if (color.primaries == 2) null else color.primaries,
             .transfer = if (color.transfer == 2) null else color.transfer,
-            .matrix = if (color.matrix == 2) null else color.matrix,
+            .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
         };
-        var options = try policySignal(self.track, frame.width, frame.height, signal);
+        var options = try webmPolicy(track, frame.width, frame.height, signal);
         options.admission_pool = self.pool;
         if (self.metal) |metal| {
-            const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
+            const prepared = try metal.submitHost(self.a, host, options, self.control);
             return self.projectGpu(slot, prepared, options);
         }
-        const patches = try video.preparation.referenceHost(self.a, frame.host(), options, self.control);
+        const patches = try video.preparation.referenceHost(self.a, host, options, self.control);
         defer self.a.free(patches);
         try self.project(slot, patches, options);
     }
@@ -1159,4 +1201,29 @@ test "embeddinggemma2 video cancellation before consumer entry joins and drains 
     live = false;
     try std.testing.expectEqual(@as(usize, 0), bounded.live);
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
+
+test "embeddinggemma2 video WebM presentation and container colour reach model preparation" {
+    var track = media.webm.Track{ .number = 1, .codec = .vp9, .width = 26, .height = 16, .presentation = .{ .crop = .{ .left = 1, .top = 1, .right = 3, .bottom = 2 }, .display_width = 16, .display_height = 9, .display_unit = 3, .roll = 90 }, .colour = .{ .matrix = 1, .primaries = 1, .transfer = 1, .range = 1, .bits_per_channel = 8 } };
+    const options = try webmPolicy(track, 26, 16, .{ .matrix = 1 });
+    try std.testing.expectEqual(video.preparation.Rotation.clockwise270, options.rotation);
+    try std.testing.expectEqual(track.presentation.crop, options.crop);
+    try std.testing.expectEqual(video.preparation.Matrix.bt709, options.matrix);
+    const g = projector.embeddingGemma2VideoGeometry(13, 23);
+    try std.testing.expectEqual(g.width, options.width);
+    try std.testing.expectEqual(g.height, options.height);
+    try std.testing.expectError(error.UnsupportedVideoColor, webmPolicy(track, 26, 16, .{ .matrix = 6 }));
+    track.colour = .{ .matrix = 9, .primaries = 9, .transfer = 16 };
+    try std.testing.expectEqual(video.preparation.ToneMapping.pq_reinhard_100, (try webmPolicy(track, 26, 16, .{})).tone_mapping);
+    var frame = video.codecs.Frame{ .allocator = std.testing.allocator, .bytes = undefined, .width = 26, .height = 16, .bit_depth = 8, .chroma_format = 1, .color = .{}, .pts_ns = 0, .duration_ns = null, .decode_high_water = 0 };
+    var pixels: [26 * 16 * 3 / 2]u8 = @splat(128);
+    frame.bytes = &pixels;
+    track.colour = .{ .range = 2 };
+    try std.testing.expectError(error.UnsupportedVideoColor, webmHost(track, &frame));
+    track.codec = .vp8;
+    try std.testing.expect((try webmHost(track, &frame)).format.fullRange());
+    track.colour.bits_per_channel = 10;
+    try std.testing.expectError(error.UnsupportedVideoColor, webmHost(track, &frame));
+    track.colour = .{ .subsampling_h = 0 };
+    try std.testing.expectError(error.UnsupportedVideoColor, webmHost(track, &frame));
 }

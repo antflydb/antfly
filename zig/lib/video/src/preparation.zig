@@ -46,6 +46,8 @@ pub const Options = struct {
     /// Required explicit SDR color matrix; range comes from the NV12 surface.
     matrix: Matrix,
     rotation: Rotation = .none,
+    /// Remove coded pixels before rotation/resampling; chroma uses coded coordinates.
+    crop: media.webm.Crop = .{},
     tone_mapping: ToneMapping = .none,
     /// Explicit integer RGB profiles: Q13 floors component products; Q16
     /// quantizes chroma in the luma domain before expansion. Model policy
@@ -72,6 +74,12 @@ pub const Geometry = struct {
         return self.patches * 768;
     }
 };
+pub fn croppedSize(width: u32, height: u32, crop: media.webm.Crop) ![2]u32 {
+    const horizontal = @as(u64, crop.left) + crop.right;
+    const vertical = @as(u64, crop.top) + crop.bottom;
+    if (horizontal >= width or vertical >= height) return error.InvalidVideoGeometry;
+    return .{ width - @as(u32, @intCast(horizontal)), height - @as(u32, @intCast(vertical)) };
+}
 pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Geometry {
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
@@ -82,7 +90,8 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     const source_pixels = try std.math.mul(usize, source_width, source_height_u32);
     const patches = pixels / 256;
     if (patches / 9 > options.max_soft_tokens or source_pixels > options.max_source_pixels) return error.ResourceLimitExceeded;
-    const source_height = if (options.rotation == .clockwise90 or options.rotation == .clockwise270) source_width else source_height_u32;
+    const cropped = try croppedSize(source_width, source_height_u32, options.crop);
+    const source_height = if (options.rotation == .clockwise90 or options.rotation == .clockwise270) cropped[0] else cropped[1];
     const horizontal_bytes = try std.math.mul(usize, try std.math.mul(usize, options.width, source_height), 3);
     const output_bytes = try std.math.mul(usize, pixels, 3 * @sizeOf(f32));
     const rgb_bytes = try std.math.mul(usize, source_pixels, 3);
@@ -256,19 +265,21 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     try control.check();
     const g = try geometry(host.width, host.height, options);
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-    const width = if (rotated) host.height else host.width;
-    const height = if (rotated) host.width else host.height;
+    const cropped = try croppedSize(host.width, host.height, options.crop);
+    const width = if (rotated) cropped[1] else cropped[0];
+    const height = if (rotated) cropped[0] else cropped[1];
     try host.validate();
     const bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
     defer allocator.free(bytes);
     for (0..height) |y| {
         try control.check();
         var x: usize = 0;
-        if (simd and options.rotation == .none and host.bit_depth == 8 and options.tone_mapping == .none and options.rgb_rounding != .nearest) {
-            while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x, y, options);
+        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and options.rgb_rounding != .nearest) {
+            while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x + options.crop.left, y + options.crop.top, options);
         }
         while (x < width) : (x += 1) {
-            const point = sourcePoint(x, y, host.width, host.height, options.rotation);
+            const local = sourcePoint(x, y, cropped[0], cropped[1], options.rotation);
+            const point = [2]usize{ local[0] + options.crop.left, local[1] + options.crop.top };
             @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding, options.tone_mapping));
         }
     }
@@ -345,14 +356,16 @@ pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_wid
     if (options.tone_mapping != .none) return error.UnsupportedVideoColor;
     if (bytes.len != @as(usize, source_width) * source_height * 4) return error.InvalidVideoGeometry;
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-    const width = if (rotated) source_height else source_width;
-    const height = if (rotated) source_width else source_height;
+    const cropped = try croppedSize(source_width, source_height, options.crop);
+    const width = if (rotated) cropped[1] else cropped[0];
+    const height = if (rotated) cropped[0] else cropped[1];
     const rgb_bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
     defer allocator.free(rgb_bytes);
     for (0..height) |y| {
         try control.check();
         for (0..width) |x| {
-            const point = sourcePoint(x, y, source_width, source_height, options.rotation);
+            const local = sourcePoint(x, y, cropped[0], cropped[1], options.rotation);
+            const point = [2]usize{ local[0] + options.crop.left, local[1] + options.crop.top };
             const offset = (point[1] * source_width + point[0]) * 4;
             @memcpy(rgb_bytes[(y * width + x) * 3 ..][0..3], bytes[offset..][0..3]);
         }
@@ -469,7 +482,8 @@ pub const Metal = struct {
         if (color_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
         const color_upload: usize = if (requested != 0 and mask & requested == 0) 16385 * 4 else 0;
         const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-        const key: [5]u32 = .{ if (rotated) height else width, if (rotated) width else height, g.width, g.height, @intFromBool(options.torchvision) };
+        const cropped = try croppedSize(width, height, options.crop);
+        const key: [5]u32 = .{ if (rotated) cropped[1] else cropped[0], if (rotated) cropped[0] else cropped[1], g.width, g.height, @intFromBool(options.torchvision) };
         if (self.coefficients != null and std.mem.eql(u32, &key, &self.coefficient_key)) {
             if (self.coefficient_build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
             if (self.coefficient_bytes > self.coefficient_limit - color_bytes) return error.ResourceLimitExceeded;
@@ -500,7 +514,7 @@ pub const Metal = struct {
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping) };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -528,7 +542,7 @@ pub const Metal = struct {
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping) };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -545,7 +559,7 @@ pub const Metal = struct {
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping) };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
@@ -565,7 +579,7 @@ pub const Metal = struct {
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0 };
+        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
@@ -705,4 +719,38 @@ test "video portable integer RGB SIMD matches scalar across tails strides chroma
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, expected, actual);
     };
+}
+
+test "video cropped preparation preserves coded chroma coordinates before quarter turns" {
+    var y: [26 * 16]u8 = undefined;
+    var uv: [26 * 8]u8 = undefined;
+    for (&y, 0..) |*v, i| v.* = @intCast((i * 37 + 11) % 256);
+    for (&uv, 0..) |*v, i| v.* = @intCast((i * 61 + 7) % 256);
+    const fixture = @embedFile("../testdata/rgb-q16-reference.bin");
+    const host = HostSurface{ .width = 26, .height = 16, .format = .nv12_video, .planes = .{
+        .{ .bytes = &y, .width = 26, .height = 16, .stride = 26 }, .{ .bytes = &uv, .width = 13, .height = 8, .stride = 26 },
+    } };
+    for ([_]u32{ 1, 2 }) |left| {
+        const crop = media.webm.Crop{ .left = left, .right = 3, .top = 1, .bottom = 2 };
+        const cw = 26 - left - 3;
+        var cropped_rgba: [26 * 16 * 4]u8 = undefined;
+        for (0..13) |row| for (0..cw) |col| {
+            const src = ((row + 1) * 26 + col + left) * 3;
+            const dst = (row * cw + col) * 4;
+            @memcpy(cropped_rgba[dst..][0..3], fixture[src..][0..3]);
+            cropped_rgba[dst + 3] = 255;
+        };
+        for (std.enums.values(Rotation)) |rotation| {
+            const options = Options{ .width = 96, .height = 48, .matrix = .bt601, .rgb_rounding = .q16_luma, .torchvision = true, .crop = crop, .rotation = rotation };
+            var oracle_options = options;
+            oracle_options.crop = .{};
+            const expected = try referenceRgba(std.testing.allocator, cropped_rgba[0 .. cw * 13 * 4], cw, 13, oracle_options, .{});
+            defer std.testing.allocator.free(expected);
+            const actual = try referenceHost(std.testing.allocator, host, options, .{});
+            defer std.testing.allocator.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+    }
+    try std.testing.expectError(error.InvalidVideoGeometry, geometry(26, 16, .{ .width = 96, .height = 48, .matrix = .bt601, .crop = .{ .left = 26 } }));
+    try std.testing.expectError(error.InvalidVideoGeometry, croppedSize(26, 16, .{ .left = std.math.maxInt(u32), .right = std.math.maxInt(u32) }));
 }
