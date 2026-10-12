@@ -19,10 +19,19 @@
 # caches. Neither Zig nor Cargo evicts build output on its own, so caches grow
 # until something deletes them.
 #
-# Zig caches (.zig-cache, zig-out*, stray ~/.cache/antfly-* dirs) and Rust
-# target/ dirs are removed when idle for GC_MAX_AGE_DAYS or larger than
-# GC_MAX_GB. Anything written in the last GC_ACTIVE_MINUTES is assumed to
-# belong to a running build and is skipped.
+# What it cleans:
+#   Zig    .zig-cache, zig-out*, zig-local in every checkout; Zig-shaped cache
+#          dirs under ~/.cache and $TMPDIR; o/ h/ z/ tmp/ in the global cache
+#          (fetched packages in p/ are kept)
+#   Rust   rs/target (after `cargo sweep` when installed)
+#   Go     go clean -cache
+#   Python uv cache prune
+#   Node   pnpm store prune, npm cache verify
+#
+# Zig and Rust dirs are removed when idle for GC_MAX_AGE_DAYS (default 3) or
+# larger than GC_MAX_GB (default 20). Anything written in the last
+# GC_ACTIVE_MINUTES (default 30) is assumed to belong to a running build and
+# is skipped.
 #
 # Usage: scripts/cache_gc.sh            (or: make gc)
 #        DRY_RUN=1 scripts/cache_gc.sh  (or: make gc DRY_RUN=1)
