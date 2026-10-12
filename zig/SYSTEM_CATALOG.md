@@ -51,6 +51,64 @@ Creating a database also creates its `public` namespace. Empty databases and
 namespaces can be dropped. The compatibility database and its public namespace
 are protected. Rename requires authority on both the old and new names.
 
+## Namespace relation ownership
+
+Tables, access indexes and constraint-owned indexes share one
+namespace-qualified relation name space (`system_catalog/relation_names.zig`).
+CHECK and FK constraint names do not reserve relations. Keys are
+length-delimited UTF-8, so quoted names are unambiguous. Each entry holds one
+active owner and at most one reserved successor (including a restore successor
+with a different physical table ID); a pending-only name has no active owner
+and is never a lookup result. Claims bind table identity, exact schema
+epoch/digest, publication identity and phase. Records (`AFRE01`, live manifest
+`AFRL01`, reconciliation jobs `AFRC04`) are strict versioned formats with no
+fallback decoders.
+
+- Ownership is derived from the authoritative schema and namespace binding
+  (`TableCut`), never from client input. A transaction-scoped publication
+  retains each table's original before cut and coalesces updates into its final
+  after cut, detecting cross-table collisions before registry writes and
+  permitting atomic name swaps without publishing intermediate names.
+  Validation point-reads each affected name; it never scans unrelated tables,
+  and replaying a stale cut is rejected even if the same table ID and name exist.
+- Native writers (table/binding commands, FK generation, hidden FK-bearing
+  CREATE and restore producers) compose exact predecessor/successor cuts in the
+  same metadata transaction as physical metadata. Authenticated replay, Raft
+  snapshots and checkpoints verify complete before/after cuts and live-manifest
+  counts/hashes against authoritative table, FK and restore sources; a matching
+  fingerprint is never self-authenticating. Missing, forged or injected claims
+  fail closed without publishing rows, receipts or notifications.
+- Building the active root is an isolated, durable reconciliation job over a
+  transactional source clock (advanced only by name/schema-relevant changes),
+  in bounded pages of 64 tables, 8,192 claims and 4 MiB. Replicas prepare pages
+  from their own pinned authority outside the apply lock and revalidate under
+  it. Ready is not a serving state: publication uses a v32 command carrying the
+  ready cut, exact predecessor and membership-bound activation, and each
+  receiver prepares its own source/candidate proof before atomically swapping
+  root/manifest and adopting writers. Replaced generations are collected by
+  bounded GC that cannot delete a published root.
+- Leader coordinators schedule adoption, pages, proofs, publication and GC on
+  a per-service `std.Io` lane at a 250 ms cadence with at most one bounded
+  intent per slice; tracking adoption remains explicit, and ambiguous admission
+  re-observes durable state.
+- Bulk catalog resolution accepts at most 256 combined lookups in one immutable
+  transaction pinned to one published live root; missing or unpublished roots
+  cannot attest absence. Name-sensitive replacements use a guarded wire tag
+  (decoder capability 33) that rechecks the exact active owner, logical table
+  and incarnation in the replacing transaction.
+- Index DDL has its own relation kind: CREATE retains its owning table; DROP
+  resolves names and definitions from one immutable relation cut, authorizes the
+  logical owning table first and carries the exact owner into native guarded
+  CAS. Constraint-backed indexes must be removed through their constraint.
+
+Open work: automatic capability-fenced writer adoption and bootstrap, public
+unqualified SQL index resolution, atomic multi-owner DROP, online
+`CONCURRENTLY` builds, CASCADE dependency retirement, REINDEX integration and
+multi-peer coordinator failover coverage. The registry must not become a second
+independently committed catalog, and a table scan must not replace point
+resolution. The implementation log is in
+[docs/design/relational/history/namespace-relation-ownership-log.md](../docs/design/relational/history/namespace-relation-ownership-log.md).
+
 ## Binding and execution
 
 HTTP and A2A retrieval use the same query binding boundary. Background entity

@@ -69,6 +69,16 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 | Inference | [inference/gliner2/cuda-qualification-2026-07.md](inference/history/gliner2/cuda-qualification-2026-07.md) | [gliner2/CUDA.md](../../zig/pkg/inference/models/gliner2/CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
 | Audio | [audio/benchmark-baseline-2026-04.md](audio/history/benchmark-baseline-2026-04.md) | [AUDIO.md](../../zig/lib/audio/AUDIO.md) | 2026-04-14 single-run codec benchmark baseline |
 | Compilation | [compilation/experiment-ledger-2026-08-to-10.md](compilation/history/experiment-ledger-2026-08-to-10.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Former COMPILATION_EXPERIMENTS.md: phase-by-phase compilation-unit experiments, rejected probes, and runner measurements through 2026-10-11 |
+| SQL | [sql/reconciliation-and-adjudication-2026-10.md](sql/history/reconciliation-and-adjudication-2026-10.md) | [extraction.md](sql/extraction.md) | Capability reconciliation queue counts and the exact-source adjudication batch |
+| SQL | [sql/lake-integration-log.md](sql/history/lake-integration-log.md) | [extraction.md](sql/extraction.md), [REMOTE_TABLE_SERVING.md](../../zig/REMOTE_TABLE_SERVING.md) | External lake SQL, lake index publication and cold-cache evidence |
+| SQL | [sql/pre-merge-activation-2026-09.md](sql/history/pre-merge-activation-2026-09.md) | [extraction.md](sql/extraction.md) | Pre-merge FK/TRUNCATE/retirement activation runs and test totals |
+| SQL | [sql/integration-status-log.md](sql/history/integration-status-log.md) | [extraction.md](sql/extraction.md) | Integration status, sessions, MERGE, TRUNCATE and online-merge narrative with per-case evidence |
+| SQL | [sql/validation-checkpoints.md](sql/history/validation-checkpoints.md) | [extraction.md](sql/extraction.md) | Local validation checkpoints, initial slice and initial measurements |
+| SQL | [sql/typed-values-log-2026-10.md](sql/history/typed-values-log-2026-10.md) | [extraction.md](sql/extraction.md) | Typed rows, arrays, precise types and exact NUMERIC increments with validation receipts |
+| SQL | [sql/regex-implementation-log.md](sql/history/regex-implementation-log.md) | [regex-parity.md](sql/regex-parity.md) | Removed C-engine backend foundation, scalar activation and qualification progress |
+| SQL | [sql/parity-inventory-batches.md](sql/history/parity-inventory-batches.md) | [parity-inventory.md](sql/parity-inventory.md) | Campaign batch narratives and per-case evidence prose |
+| Ordered artifacts | [ordered-artifacts/activation-gate-log.md](ordered-artifacts/history/activation-gate-log.md) | [ordered-artifacts.md](ordered-artifacts.md) | Asynchronous-artifact protocol implementation log behind the activation gate |
+| System catalog | [relational/namespace-relation-ownership-log.md](relational/history/namespace-relation-ownership-log.md) | [SYSTEM_CATALOG.md](../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership) | Relation-name publication, reconciliation and coordinator log |
 
 
 ## Additional records
