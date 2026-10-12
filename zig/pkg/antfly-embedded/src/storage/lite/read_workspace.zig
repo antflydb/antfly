@@ -111,6 +111,18 @@ pub const Workspace = struct {
         self.result_backing = null;
     }
 
+    pub fn resetScoreBatch(self: *Workspace) void {
+        self.score_plan_borrowed = false;
+        self.native_state.detach();
+        if (self.allocation_failed) {
+            self.discardRetainedStorage();
+            self.allocation_failed = false;
+        } else {
+            self.resetScratch(&self.batch);
+            self.resetScratch(&self.graph);
+        }
+    }
+
     pub fn resetBatch(self: *Workspace) void {
         self.resetScratch(&self.batch);
     }

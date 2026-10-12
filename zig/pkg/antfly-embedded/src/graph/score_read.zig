@@ -439,6 +439,14 @@ const FloatPlanOutput = struct {
         write(ctx, key, score);
     }
     fn decoded(ctx: *anyopaque, values: []const f64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.plan.dense_columns and self.plan.row_order_identity) {
+            for (self.plan.column_sorted[0..self.plan.column_count], 0..) |column, ordinal| {
+                const col = if (self.plan.column_order_identity) column else self.plan.column_remap[column];
+                @memcpy(self.columns[col], values[ordinal * self.plan.nodes.len ..][0..self.plan.nodes.len]);
+            }
+            return;
+        }
         for (values, 0..) |value, key| write(ctx, key, if (std.math.isNan(value)) null else value);
     }
     fn completeSink(self: *@This()) @import("../storage/backend_types.zig").CompleteScoreSink {
@@ -449,12 +457,39 @@ const FloatPlanOutput = struct {
     }
 };
 
-fn populateColumns(
+/// Move-only stream bound to one erased transaction and allocator lifetime.
+/// Unknown identities keep ordinary scope ownership instead of retaining it.
+pub const FloatColumnStream = struct {
+    allocator: std.mem.Allocator,
+    txn: *@import("../storage/backend_erased.zig").ReadTxn,
+    txn_identity: u64,
+    scope: ?@import("../storage/backend_erased.zig").ReadScope = null,
+    pub fn init(a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn) @This() {
+        return .{ .allocator = a, .txn = txn, .txn_identity = txn.identity };
+    }
+    pub fn populate(self: *@This(), prefixes: []const ?[]const u8, nodes: []const []const u8, columns: []const []f64) !Stats {
+        if (self.txn_identity != self.txn.identity) return error.InvalidBatch;
+        try @import("../storage/prepared_score_request.zig").validateScoreColumns(nodes.len, prefixes.len, columns);
+        if (self.txn_identity == 0) return populateFloatColumns(self.allocator, self.txn, prefixes, nodes, columns);
+        return populateColumnsUsingScope(self.allocator, self.txn, prefixes, nodes, columns, &self.scope);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.scope) |*scope| scope.close();
+        self.* = undefined;
+    }
+};
+
+fn populateColumns(a: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8, columns: anytype) !Stats {
+    return populateColumnsUsingScope(a, txn, prefixes, nodes, columns, null);
+}
+
+fn populateColumnsUsingScope(
     caller_alloc: std.mem.Allocator,
     txn: anytype,
     prefixes: []const ?[]const u8,
     nodes: []const []const u8,
     columns: anytype,
+    reused: anytype,
 ) !Stats {
     std.debug.assert(prefixes.len == columns.len);
     for (columns) |column| {
@@ -475,12 +510,27 @@ fn populateColumns(
     const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(caller_alloc))).error_union.payload else void;
     // Probe-only wrappers expose the method but cannot open a pinned scope.
     // Keep their existing batched view, and propagate allocation/storage errors.
-    var scope: ?Scope = if (scoped) txn.openReadScope(caller_alloc) catch |err|
+    var scope: ?Scope = if (comptime @TypeOf(reused) != @TypeOf(null))
+        reused.* orelse (txn.openReadScope(caller_alloc) catch |err| (if (err == error.ReadOnly or err == error.Unsupported) null else return err))
+    else if (scoped) txn.openReadScope(caller_alloc) catch |err|
         (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
-    defer if (scoped) {
+    defer if (comptime @TypeOf(reused) != @TypeOf(null)) {
+        if (scope) |*active| active.resetScoreBatch() catch {
+            active.close();
+            scope = null;
+        };
+        reused.* = scope;
+    } else if (scoped) {
         if (scope) |*active| active.close();
     };
-    if (comptime scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
+    if (comptime @TypeOf(reused) != @TypeOf(null)) {
+        if (scope) |*active| active.beginScoreBatch() catch |err| {
+            if (err != error.Unsupported) return err;
+        };
+    }
+    // Streaming batches are one-shot shapes: reuse native working scratch,
+    // rather than constructing/promoting a full optional plan for every batch.
+    if (comptime @TypeOf(reused) == @TypeOf(null) and scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
         if (scope) |*active| {
             const supported = if (comptime @hasDecl(Scope, "supportsScoreVisitor")) active.supportsScoreVisitor() else true;
             if (supported) if (active.preparedScorePlan()) |plan| {
@@ -568,7 +618,12 @@ fn populateColumns(
             return order == .lt or (order == .eq and a < b);
         }
     };
-    std.mem.sort(usize, rows, RowOrder{ .nodes = nodes }, RowOrder.less);
+    var ascending = true;
+    for (nodes[1..], nodes[0 .. nodes.len - 1]) |current, previous| if (std.mem.order(u8, current, previous) == .lt) {
+        ascending = false;
+        break;
+    };
+    if (!ascending) std.mem.sort(usize, rows, RowOrder{ .nodes = nodes }, RowOrder.less);
     var unique_count: usize = 1;
     for (rows[1..], rows[0 .. rows.len - 1]) |row, prior| {
         if (!std.mem.eql(u8, nodes[row], nodes[prior])) unique_count += 1;

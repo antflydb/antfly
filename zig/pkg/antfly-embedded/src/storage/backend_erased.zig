@@ -240,6 +240,8 @@ pub const ReadScope = struct {
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
+        begin_score_batch: ?*const fn (*anyopaque) anyerror!void = null,
+        reset_score_batch: ?*const fn (*anyopaque) anyerror!void = null,
         get_many_sorted_into: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8) anyerror!void = null,
         visit_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, backend_types.ScoreSink) anyerror!void = null,
         working_allocator: ?*const fn (*anyopaque) Allocator = null,
@@ -346,6 +348,19 @@ pub const ReadScope = struct {
         try reset_scope(self.ptr);
     }
 
+    /// Opt into working-arena reuse only for bounded, transient score batches.
+    pub fn beginScoreBatch(self: *@This()) !void {
+        const begin_batch = self.vtable.begin_score_batch orelse return error.Unsupported;
+        try begin_batch(self.ptr);
+    }
+
+    /// Invalidates result and prepared-plan borrows, retaining bounded scratch.
+    /// Unsupported scopes must be closed between batches instead.
+    pub fn resetScoreBatch(self: *@This()) !void {
+        const reset_batch = self.vtable.reset_score_batch orelse return error.Unsupported;
+        try reset_batch(self.ptr);
+    }
+
     pub fn close(self: *@This()) void {
         self.vtable.close(self.allocator, self.ptr);
         self.* = undefined;
@@ -413,6 +428,15 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             return self.handle.reset();
         }
 
+        fn beginScoreBatch(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.beginScoreBatch();
+        }
+        fn resetScoreBatch(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.resetScoreBatch();
+        }
+
         fn close(a: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const parent_owner = self.parent;
@@ -439,7 +463,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
