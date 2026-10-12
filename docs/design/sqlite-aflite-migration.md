@@ -44,6 +44,10 @@ working directory. See the executable examples in
 - `tables`: source name, deterministic source query, target table, ordered
   column mappings, and a nonempty verification key. Each target appears once.
   List parents before children when target foreign keys require that order.
+- `write_mode`: `insert` (default) requires an empty mapped target table;
+  `upsert` applies only mapped columns through the declared key and preserves
+  omitted columns and unrelated existing rows in a schema seed. Omitted
+  non-null columns still need insertion defaults before conflict handling.
 - `columns`: target `name`, source projection `from`, `type`, optional
   `nullable` (default true), and optional `transform` (default `identity`).
 - `key`: mapped target columns forming a non-null, unique source key. Integer,
@@ -54,6 +58,8 @@ working directory. See the executable examples in
   single row that cannot fit fails. These are encoded row/request bounds,
   not a process-wide memory quota. JSON parsing and SQLite query execution
   have their own allocation costs.
+- `verification_rows`: 1–1,000, default 100. Verification groups source keys
+  independently of write batches, with the same retained-byte bound.
 
 Identifiers are restricted to ASCII letters, digits, and underscores, with a
 letter or underscore first. Source aliases allow mapping broader original
@@ -98,11 +104,11 @@ schema and choose which logical rows to select.
 5. Copy bounded batches with parameterized multi-row INSERT statements.
    Every submitted statement is an atomic target mutation. Incomplete and
    unknown mutation outcomes fail without publishing or retrying.
-6. Compare target counts and every mapped cell by source key. This is exact
-   value verification, stronger than count-only verification, with bounded
-   retained rows. JSON object member order is ignored. Verification currently
-   issues one target point query per source row; this favors correctness over
-   maximum throughput.
+6. Compare target counts and every mapped cell by source key in bounded key
+   groups. Match responses by typed keys independently of response ordering,
+   rejecting missing/duplicate keys. JSON object member order is ignored.
+   Insert mode verifies the entire target row count; upsert mode verifies all
+   selected keys while allowing unrelated destination rows.
 7. Close the database, run Antfly's file integrity check, restrict the file to
    mode 0600, and fsync it. Atomically hard-link it to the destination path,
    refusing a racing creator, then fsync the destination directory. This
@@ -116,6 +122,12 @@ schema and choose which logical rows to select.
 bind target columns and types. It does not copy rows or publish the destination.
 It does not prove all target row constraints will accept the data; those checks
 are enforced during actual INSERT and verified before publication.
+
+`verify --plan seed-plan.json` requires a schema seed, takes an isolated stable
+snapshot and validates its mapped values without copying rows or publishing a
+destination. Write batches are additionally bounded by SQL parameter and AST
+preparation budgets. SQL error reporting includes SQLSTATE/schema column
+identifiers without printing row values or diagnostic text.
 
 Read transactions provide one stable cut per source database, not a common cut
 across multiple files. Long reads can retain WAL pages or delay writers on
@@ -144,9 +156,12 @@ metadata deliberately; rebuild derived projections deliberately. Fork/revert
 lineage flattening, protocol item conversion, trigger replacements, revision
 counters, and memory-file discovery remain Codex responsibilities.
 
-The included Codex section example demonstrates a narrow table mapping only;
-it is not a complete Codex migration. Existing SQLite migration bookkeeping
-must not be copied into `codex_schema_migrations` as if Antfly migrations had run.
+The [complete Codex profile](codex-sqlite-migration.md) exports the authoritative
+target DDL, covers every runtime table, captures source snapshots and emits a
+metadata overlay after history replay. It records the importer's current
+timestamp-preservation limitation as an application acceptance gate. Existing
+SQLite migration bookkeeping must not be copied into `codex_schema_migrations`
+as if Antfly migrations had run.
 
 ## Subsequent work
 

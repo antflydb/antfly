@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-11",
+  "schema": {
+    "codex_commit": "02ea85af6527b80c56d55e3e68f1016787704bca",
+    "schema_sha256": "1aaf7138747636935b3cdd6001e5bc96339fdc47c6fe9a064ffb85e0e99b2697",
+    "migrations": [
+      {
+        "version": 1,
+        "name": "codex state tables"
+      },
+      {
+        "version": 20,
+        "name": "agent message board tables"
+      },
+      {
+        "version": 21,
+        "name": "agent message board channel descriptions"
+      },
+      {
+        "version": 22,
+        "name": "thread read receipts"
+      }
+    ]
+  },
+  "table_mappings": 31,
+  "source_thread_rows": 1590,
+  "source_projected_items": 857528,
+  "goals": 48,
+  "header_mode_mismatches": 0,
+  "missing_rollout_paths": 0,
+  "full_real_source_preflight": "passed",
+  "actual_relational_copy": "27 tables excluding history projection tables; all mapped rows/values verified",
+  "history_samples": {
+    "legacy": {
+      "raw_items": 10
+    },
+    "paginated": {
+      "raw_items": 16,
+      "projected_items": 3,
+      "source_projected_items": 3,
+      "created_at_mismatches": 0
+    }
+  },
+  "metadata_overlay": "1590 rows verified; first two sample extra/next_ordinal fields retained",
+  "logs": "SQLite count reported database disk image is malformed; retained unchanged",
+  "full_history_cutover": "not run; stopped-application capture and timestamp-preserving replay/acceptance required",
+  "substantive_metadata_overlay": "1590 rows verified; imported extra and next_ordinal retained for nonempty legacy and paginated samples"
+}

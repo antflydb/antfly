@@ -28,6 +28,7 @@ Run a plan:
 ```sh
 zig-out/bin/antfly-migrate migrate --plan migration.json --dry-run
 zig-out/bin/antfly-migrate migrate --plan migration.json
+zig-out/bin/antfly-migrate verify --plan seed-plan.json
 ```
 
 For the standalone build the installed executable is in the package's own
@@ -40,9 +41,16 @@ Real-library acceptance tests:
 
 ```sh
 ANTFLY_MIGRATE_BIN=/absolute/path/to/antfly-migrate \
+  ANTFLY_MIGRATE_LIB=/absolute/path/to/libantfly-directory \
   python3 -m unittest discover -s pkg/antfly-migrate/tests -v
 ```
 
 See [the design and plan contract](../../../docs/design/sqlite-aflite-migration.md)
 for snapshot consistency, conversions, verification, publication, and the
 boundary between generic relational migration and Codex history reconstruction.
+
+The [Codex profile](profiles/codex/README.md) generates full schema-pinned
+relational and metadata-overlay plans from real Codex captures. Upsert mode
+preserves unmapped fields in an existing seed; read-only `verify` validates
+that seed without publishing a file. Use a recent main libantfly build for
+large Codex records; older ABI 3 libraries have smaller SQL budgets.

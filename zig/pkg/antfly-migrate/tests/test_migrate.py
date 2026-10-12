@@ -20,6 +20,7 @@ ANTFLY_MIGRATE_BIN=/absolute/path/antfly-migrate python3 -m unittest discover \
 """
 
 import copy
+import ctypes
 import hashlib
 import json
 import os
@@ -317,6 +318,152 @@ class MigrationTests(unittest.TestCase):
                 )
         self.assertTrue((self.root / "output.aflite").is_file())
         self.assertEqual(list(self.root.glob("*.migrate-*")), [])
+
+    def read_aflite(self, path, statement):
+        class Buffer(ctypes.Structure):
+            _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+        directory = Path(os.environ["ANTFLY_MIGRATE_LIB"])
+        lib = ctypes.CDLL(
+            str(
+                directory
+                / ("libantfly.dylib" if sys.platform == "darwin" else "libantfly.so")
+            )
+        )
+        lib.antfly_lite_open_readonly.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.antfly_db_close.argtypes = [ctypes.c_void_p]
+        lib.antfly_db_sql_json.argtypes = [
+            ctypes.c_void_p,
+            Buffer,
+            ctypes.POINTER(Buffer),
+        ]
+        lib.antfly_buffer_free.argtypes = [ctypes.POINTER(Buffer)]
+        handle = ctypes.c_void_p()
+        self.assertEqual(
+            lib.antfly_lite_open_readonly(str(path).encode(), ctypes.byref(handle)), 0
+        )
+        out = Buffer()
+        try:
+            request = json.dumps({"statement": statement}).encode()
+            memory = ctypes.create_string_buffer(request)
+            code = lib.antfly_db_sql_json(
+                handle,
+                Buffer(ctypes.cast(memory, ctypes.c_void_p), len(request)),
+                ctypes.byref(out),
+            )
+            self.assertEqual(code, 0)
+            return json.loads(ctypes.string_at(out.ptr, out.len))
+        finally:
+            lib.antfly_buffer_free(ctypes.byref(out))
+            lib.antfly_db_close(handle)
+
+    def test_upsert_preserves_unmapped_columns_extra_rows_and_seed(self):
+        seed_plan = copy.deepcopy(self.plan)
+        seed_plan["destination"] = "seed.aflite"
+        seed_plan["schema"]["statements"][0] = (
+            seed_plan["schema"]["statements"][0]
+            .replace(
+                "enabled BOOLEAN NOT NULL", "enabled BOOLEAN NOT NULL DEFAULT false"
+            )
+            .replace("opaque TEXT NOT NULL", "opaque TEXT NOT NULL DEFAULT ''")
+            .replace(
+                "score DOUBLE PRECISION NOT NULL",
+                "score DOUBLE PRECISION NOT NULL DEFAULT 0",
+            )
+            .removesuffix(")")
+            + ", next_ordinal BIGINT NOT NULL DEFAULT 73)"
+        )
+        result = self.run_plan(seed_plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seed = self.root / "seed.aflite"
+        before = hashlib.sha256(seed.read_bytes()).digest()
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE items SET name='captured metadata' WHERE id=2")
+            db.execute("DELETE FROM items WHERE id=3")
+        self.plan["schema"] = {"seed": "seed.aflite"}
+        table = self.plan["tables"][0]
+        table["write_mode"] = "upsert"
+        table["columns"] = table["columns"][:2]
+        result = self.run_plan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.read_aflite(
+            self.root / "output.aflite",
+            "SELECT name,next_ordinal,opaque FROM items WHERE id=2",
+        )["rows"]
+        self.assertEqual(rows, [["captured metadata", "73", "AP8C"]])
+        count = self.read_aflite(
+            self.root / "output.aflite", "SELECT count(*) FROM items"
+        )["rows"][0][0]
+        self.assertEqual(int(count), 23)
+        self.assertEqual(before, hashlib.sha256(seed.read_bytes()).digest())
+
+    def test_wide_tables_split_at_the_sql_parameter_limit(self):
+        with sqlite3.connect(self.root / "wide.sqlite") as db:
+            columns = ["id INTEGER PRIMARY KEY"] + [
+                f"c{i} INTEGER NOT NULL" for i in range(40)
+            ]
+            db.execute("CREATE TABLE wide(" + ",".join(columns) + ")")
+            db.executemany(
+                "INSERT INTO wide VALUES(" + ",".join("?" for _ in range(41)) + ")",
+                [tuple([i] * 41) for i in range(50)],
+            )
+        plan = {
+            "version": 1,
+            "sources": [{"name": "source", "path": "wide.sqlite"}],
+            "destination": "output.aflite",
+            "schema": {
+                "statements": [
+                    "CREATE TABLE wide(id BIGINT PRIMARY KEY,"
+                    + ",".join(f"c{i} BIGINT NOT NULL" for i in range(40))
+                    + ")"
+                ]
+            },
+            "tables": [
+                {
+                    "source": "source",
+                    "query": "SELECT * FROM wide",
+                    "target": "wide",
+                    "key": ["id"],
+                    "columns": [
+                        {"name": name, "from": name, "type": "integer"}
+                        for name in ["id"] + [f"c{i}" for i in range(40)]
+                    ],
+                }
+            ],
+            "batch_rows": 100,
+        }
+        result = self.run_plan(plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verify wide: 50 rows", result.stderr)
+
+    def test_verify_only_detects_changed_values_without_publishing(self):
+        result = self.run_plan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seed = self.root / "output.aflite"
+        before = hashlib.sha256(seed.read_bytes()).digest()
+        plan = copy.deepcopy(self.plan)
+        plan["schema"] = {"seed": "output.aflite"}
+        plan["destination"] = "never-published.aflite"
+        path = self.root / "verify.json"
+        path.write_text(json.dumps(plan))
+        args = [str(self.binary), "verify", "--plan", str(path)]
+        result = subprocess.run(
+            args, check=False, capture_output=True, text=True, timeout=120
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "never-published.aflite").exists())
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE items SET name='a changed value' WHERE id=2")
+        result = subprocess.run(
+            args, check=False, capture_output=True, text=True, timeout=120
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TargetValueMismatch", result.stderr)
+        self.assertFalse((self.root / "never-published.aflite").exists())
+        self.assertEqual(before, hashlib.sha256(seed.read_bytes()).digest())
 
 
 if __name__ == "__main__":

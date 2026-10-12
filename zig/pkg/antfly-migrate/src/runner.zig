@@ -101,6 +101,28 @@ fn insert(sink: aflite.Sink, a: std.mem.Allocator, table: p.Table, rows: []const
         }
         try sql.writer.writeAll(")");
     }
+    if (table.write_mode == .upsert) {
+        try sql.writer.writeAll(" ON CONFLICT (");
+        for (table.key, 0..) |key, i| {
+            if (i != 0) try sql.writer.writeAll(",");
+            try sql.writer.print("\"{s}\"", .{key});
+        }
+        try sql.writer.writeAll(") DO UPDATE SET ");
+        var assignments: usize = 0;
+        for (table.columns) |col| {
+            var is_key = false;
+            for (table.key) |key| if (std.mem.eql(u8, key, col.name)) {
+                is_key = true;
+            };
+            if (is_key) continue;
+            if (assignments != 0) try sql.writer.writeAll(",");
+            try sql.writer.print("\"{s}\" = EXCLUDED.\"{s}\"", .{ col.name, col.name });
+            assignments += 1;
+        }
+        // Key-only tables use a no-op assignment while retaining one affected
+        // row per source key, avoiding different DO NOTHING count semantics.
+        if (assignments == 0) try sql.writer.print("\"{s}\" = EXCLUDED.\"{s}\"", .{ table.key[0], table.key[0] });
+    }
     // Includes parameter escaping and statement overhead in the hard limit.
     const request = try std.json.Stringify.valueAlloc(a, .{ .statement = sql.written(), .parameters = params.items }, .{});
     if (request.len > max_bytes) {
@@ -124,7 +146,8 @@ fn copy(a: std.mem.Allocator, scratch: std.mem.Allocator, source: sqlite.Source,
         const alloc = batch.allocator();
         var rows: std.ArrayList([]Cell) = .empty;
         var bytes: usize = 0;
-        while (rows.items.len < plan.batch_rows and bytes < plan.batch_bytes / 2) {
+        const row_limit = @min(plan.batch_rows, @min(aflite.max_parameters, aflite.max_batch_cells) / table.columns.len);
+        while (rows.items.len < row_limit and bytes < plan.batch_bytes / 2) {
             if (!try sqlite.next(stmt)) {
                 done = true;
                 break;
@@ -142,46 +165,96 @@ fn countRows(a: std.mem.Allocator, sink: aflite.Sink, table: p.Table) !u64 {
     return @intCast(try aflite.integer(result.object.get("rows").?.array.items[0].array.items[0]));
 }
 
+fn keyIndex(table: p.Table, name: []const u8) usize {
+    for (table.columns, 0..) |col, i| if (std.mem.eql(u8, col.name, name)) return i;
+    unreachable;
+}
+
+fn rowKey(a: std.mem.Allocator, table: p.Table, row: []const Cell) ![]const u8 {
+    const values = try a.alloc(Value, table.key.len);
+    for (table.key, values) |key, *value| value.* = row[keyIndex(table, key)].value;
+    return std.json.Stringify.valueAlloc(a, values, .{});
+}
+
+fn predicates(writer: *std.Io.Writer, a: std.mem.Allocator, table: p.Table, rows: []const []Cell, params: *std.ArrayList(Value)) anyerror!void {
+    if (rows.len > 1) {
+        const middle = rows.len / 2;
+        try writer.writeAll("(");
+        try predicates(writer, a, table, rows[0..middle], params);
+        try writer.writeAll(" OR ");
+        try predicates(writer, a, table, rows[middle..], params);
+        try writer.writeAll(")");
+        return;
+    }
+    for (table.key, 0..) |key, i| {
+        if (i != 0) try writer.writeAll(" AND ");
+        try params.append(a, rows[0][keyIndex(table, key)].value);
+        try writer.print("\"{s}\" = ${d}", .{ key, params.items.len });
+    }
+}
+
 fn verify(a: std.mem.Allocator, scratch: std.mem.Allocator, source: sqlite.Source, sink: aflite.Sink, table: p.Table, plan: p.Plan, expected_count: u64) !void {
-    if (try countRows(a, sink, table) != expected_count) return error.TargetCountMismatch;
+    const target_count = try countRows(a, sink, table);
+    if (if (table.write_mode == .insert) target_count != expected_count else target_count < expected_count) return error.TargetCountMismatch;
     const stmt = try source.prepare(a, try query(a, table));
     defer _ = c.sqlite3_finalize(stmt);
     var count: u64 = 0;
-    while (try sqlite.next(stmt)) {
+    var done = false;
+    while (!done) {
         var arena = std.heap.ArenaAllocator.init(scratch);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const row = try readRow(alloc, stmt, table, plan.batch_bytes);
+        var rows: std.ArrayList([]Cell) = .empty;
+        var expected: std.StringHashMap([]Cell) = .init(alloc);
+        var bytes: usize = 0;
+        const row_limit = @min(plan.verification_rows, aflite.max_batch_cells / table.key.len);
+        while (rows.items.len < row_limit and bytes < plan.batch_bytes / 2) {
+            if (!try sqlite.next(stmt)) {
+                done = true;
+                break;
+            }
+            const row = try readRow(alloc, stmt, table, plan.batch_bytes);
+            bytes += (try std.json.Stringify.valueAlloc(alloc, row, .{})).len;
+            try rows.append(alloc, row);
+            try expected.put(try rowKey(alloc, table, row), row);
+        }
+        if (rows.items.len == 0) break;
         var sql: std.Io.Writer.Allocating = .init(alloc);
         try sql.writer.print("SELECT {s} FROM \"{s}\" WHERE ", .{ try columns(alloc, table), table.target });
         var params: std.ArrayList(Value) = .empty;
-        for (table.key, 0..) |key, ki| for (table.columns, row) |col, value| if (std.mem.eql(u8, key, col.name)) {
-            if (ki != 0) try sql.writer.writeAll(" AND ");
-            try params.append(alloc, value.value);
-            try sql.writer.print("\"{s}\" = ${d}", .{ key, params.items.len });
-        };
-        const result = try sink.sql(alloc, sql.written(), params.items);
+        try predicates(&sql.writer, alloc, table, rows.items, &params);
+        // Fetch one more than expected to detect unexpected duplicate keys.
+        const result = try sink.sqlLimit(alloc, sql.written(), params.items, rows.items.len + 1);
         const actual_rows = result.object.get("rows").?.array.items;
-        if (actual_rows.len != 1 or actual_rows[0].array.items.len != row.len) return error.TargetKeyMismatch;
+        if (actual_rows.len != rows.items.len) return error.TargetKeyMismatch;
         const null_rows = result.object.get("sql_nulls") orelse return error.MissingNullInformation;
-        for (table.columns, row, actual_rows[0].array.items, 0..) |col, expected, actual, i| {
-            const is_null = if (null_rows == .null) actual == .null else null_rows.array.items[0].array.items[i].bool;
-            if (is_null != expected.sql_null or !aflite.equal(expected.value, try aflite.decode(alloc, col.type, actual, is_null))) return error.TargetValueMismatch;
+        for (actual_rows, 0..) |actual_row, ri| {
+            if (actual_row.array.items.len != table.columns.len) return error.TargetColumnsMismatch;
+            const decoded = try alloc.alloc(Cell, table.columns.len);
+            for (table.columns, actual_row.array.items, decoded, 0..) |col, actual, *cell, ci| {
+                const is_null = if (null_rows == .null) actual == .null else null_rows.array.items[ri].array.items[ci].bool;
+                cell.* = .{ .value = try aflite.decode(alloc, col.type, actual, is_null), .sql_null = is_null };
+            }
+            const matched = expected.fetchRemove(try rowKey(alloc, table, decoded)) orelse return error.TargetKeyMismatch;
+            for (matched.value, decoded) |e, actual| if (e.sql_null != actual.sql_null or !aflite.equal(e.value, actual.value)) return error.TargetValueMismatch;
         }
-        count += 1;
+        if (expected.count() != 0) return error.TargetKeyMismatch;
+        count += rows.items.len;
+        if (count % 100 == 0) std.debug.print("verified {s}: {d}/{d} rows\n", .{ table.target, count, expected_count });
     }
     if (count != expected_count) return error.SourceCountChanged;
 }
 
-pub fn run(init: std.process.Init, plan: p.Plan, base: []const u8, dry_run: bool) !void {
+pub fn run(init: std.process.Init, plan: p.Plan, base: []const u8, dry_run: bool, verify_only: bool) !void {
     try plan.validate();
+    if (verify_only and plan.schema.seed == null) return error.VerifyRequiresSeed;
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const destination = try std.fs.path.resolve(a, &.{ base, plan.destination });
     // Refuse any existing directory entry, including dangling symlinks.
     const dest_z = try a.dupeSentinel(u8, destination, 0);
-    if (c.faccessat(c.AT_FDCWD, dest_z, c.F_OK, c.AT_SYMLINK_NOFOLLOW) == 0) return error.DestinationExists;
+    if (!verify_only and c.faccessat(c.AT_FDCWD, dest_z, c.F_OK, c.AT_SYMLINK_NOFOLLOW) == 0) return error.DestinationExists;
     const sources = try a.alloc(sqlite.Source, plan.sources.len);
     var opened: usize = 0;
     defer for (sources[0..opened]) |source| source.close();
@@ -219,22 +292,26 @@ pub fn run(init: std.process.Init, plan: p.Plan, base: []const u8, dry_run: bool
                 };
                 if (!std.mem.eql(u8, expected, target.object.get("type").?.string)) return error.TargetTypeMismatch;
             }
-            if (try countRows(a, sink, table) != 0) return error.TargetMustBeEmpty;
+            if (!verify_only and table.write_mode == .insert and try countRows(a, sink, table) != 0) return error.TargetMustBeEmpty;
         }
         if (dry_run) {
             std.debug.print("dry-run passed: source conversions, keys, and target columns validated; destination not published\n", .{});
             return;
         }
-        for (plan.tables) |table| {
+        if (!verify_only) for (plan.tables) |table| {
             std.debug.print("copy {s}\n", .{table.target});
             try copy(a, init.gpa, sourceFor(plan, sources, table.source), sink, table, plan);
-        }
+        };
         for (plan.tables, counts) |table, count| {
             std.debug.print("verify {s}: {d} rows\n", .{ table.target, count });
             try verify(a, init.gpa, sourceFor(plan, sources, table.source), sink, table, plan, count);
         }
     }
     try aflite.checkFile(a, stage);
+    if (verify_only) {
+        std.debug.print("verification passed; seed and destination unchanged\n", .{});
+        return;
+    }
     const stage_z = try a.dupeSentinel(u8, stage, 0);
     const fd = c.open(stage_z, c.O_RDONLY);
     if (fd < 0) return error.StageOpenFailed;

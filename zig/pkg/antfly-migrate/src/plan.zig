@@ -29,6 +29,7 @@ pub const Table = struct {
     target: []const u8,
     key: []const []const u8,
     columns: []const Column,
+    write_mode: enum { insert, upsert } = .insert,
 };
 pub const Plan = struct {
     version: u32,
@@ -37,6 +38,7 @@ pub const Plan = struct {
     schema: struct { seed: ?[]const u8 = null, statements: []const []const u8 = &.{} },
     tables: []const Table,
     batch_rows: usize = 100,
+    verification_rows: usize = 100,
     batch_bytes: usize = 1024 * 1024,
 
     pub fn validate(self: Plan) !void {
@@ -44,6 +46,7 @@ pub const Plan = struct {
         if (self.sources.len == 0 or self.tables.len == 0) return error.EmptyPlan;
         if (!std.mem.endsWith(u8, self.destination, ".aflite")) return error.InvalidDestination;
         if (self.batch_rows == 0 or self.batch_rows > 1000 or self.batch_bytes < 1024 or self.batch_bytes > 8 * 1024 * 1024) return error.InvalidBatchLimit;
+        if (self.verification_rows == 0 or self.verification_rows > 1000) return error.InvalidVerificationLimit;
         if ((self.schema.seed != null) == (self.schema.statements.len != 0)) return error.ChooseSeedOrStatements;
         for (self.sources, 0..) |s, i| {
             if (s.name.len == 0 or s.path.len == 0) return error.InvalidSource;

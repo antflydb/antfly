@@ -16,6 +16,11 @@
 const std = @import("std");
 const c = @import("ffi.zig").c;
 pub const Value = std.json.Value;
+// Conservative public SQL compiler bound. Each mapped cell binds once.
+pub const max_parameters = 1024;
+// Leave headroom for AST nodes from JSON casts and upsert assignments on ABI
+// 3 libraries with smaller compiler budgets. This also bounds preparation work.
+pub const max_batch_cells = 256;
 
 pub const Sink = struct {
     db: ?*c.antfly_db,
@@ -38,7 +43,11 @@ pub const Sink = struct {
     }
 
     pub fn sql(self: Sink, a: std.mem.Allocator, statement: []const u8, parameters: []const Value) !Value {
-        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .parameters = parameters, .limit = 2 }, .{});
+        return self.sqlLimit(a, statement, parameters, 2);
+    }
+
+    pub fn sqlLimit(self: Sink, a: std.mem.Allocator, statement: []const u8, parameters: []const Value, limit: usize) !Value {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .parameters = parameters, .limit = limit }, .{});
         var out: c.antfly_buffer = .{ .ptr = null, .len = 0 };
         defer c.antfly_buffer_free(&out);
         try check(c.antfly_db_sql_json(self.db, .{ .ptr = request.ptr, .len = request.len }, &out), out);
@@ -52,8 +61,21 @@ pub const Sink = struct {
 
 pub fn check(code: c.antfly_error_code, out: c.antfly_buffer) !void {
     if (code == c.ANTFLY_OK) return;
-    // SQL errors can contain source values. Print the stable code only.
-    _ = out;
+    // Keep row values and diagnostic text private, but include SQLSTATE and
+    // a schema identifier so real migration failures are actionable.
+    if (out.ptr != null and out.len != 0) {
+        if (std.json.parseFromSlice(Value, std.heap.page_allocator, out.ptr[0..out.len], .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) if (parsed.value.object.get("error")) |diagnostic| {
+                if (diagnostic == .object) {
+                    if (diagnostic.object.get("code")) |state| if (state == .string and state.string.len == 5) std.debug.print("SQLSTATE {s}\n", .{state.string});
+                    if (diagnostic.object.get("column_name")) |column| if (column == .string) {
+                        if (@import("plan.zig").identifier(column.string)) |_| std.debug.print("column {s}\n", .{column.string}) else |_| {}
+                    };
+                }
+            };
+        } else |_| {}
+    }
     std.debug.print("Antfly operation failed: {s}\n", .{c.antfly_error_code_name(code)});
     if (code == c.ANTFLY_OUTCOME_UNKNOWN) return error.AntflyOutcomeUnknown;
     return error.AntflyOperationFailed;

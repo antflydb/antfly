@@ -51,5 +51,11 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     acceptance.addFileArg(b.path(b.fmt("{s}/tests/test_migrate.py", .{package_path})));
     acceptance.addArtifactArg(executable);
     acceptance.addArg("-v");
+    acceptance.setEnvironmentVariable("ANTFLY_MIGRATE_LIB", library);
     b.step("migrate-e2e", "Run real SQLite and aflite migration acceptance tests").dependOn(&acceptance.step);
+    const profile_tests = b.addSystemCommand(&.{"python3"});
+    profile_tests.addFileArg(b.path(b.fmt("{s}/tests/test_codex_profile.py", .{package_path})));
+    profile_tests.addArtifactArg(executable);
+    profile_tests.addArg("-v");
+    b.top_level_steps.get("migrate-e2e").?.step.dependOn(&profile_tests.step);
 }

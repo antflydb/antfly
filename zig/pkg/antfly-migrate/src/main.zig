@@ -31,10 +31,11 @@ fn execute(init: std.process.Init) !void {
     _ = args.next();
     const command = args.next() orelse "--help";
     if (std.mem.eql(u8, command, "--help")) {
-        std.debug.print("Usage: antfly-migrate migrate --plan plan.json [--dry-run]\nPaths in the plan are relative to the plan file. Existing destinations are never replaced.\n", .{});
+        std.debug.print("Usage: antfly-migrate migrate --plan plan.json [--dry-run]\n       antfly-migrate verify --plan seed-plan.json\nPaths in the plan are relative to the plan file. Existing destinations are never replaced.\n", .{});
         return;
     }
-    if (!std.mem.eql(u8, command, "migrate")) return error.UnknownCommand;
+    const verify_only = std.mem.eql(u8, command, "verify");
+    if (!verify_only and !std.mem.eql(u8, command, "migrate")) return error.UnknownCommand;
     var path: ?[]const u8 = null;
     var dry_run = false;
     while (args.next()) |arg| {
@@ -51,7 +52,8 @@ fn execute(init: std.process.Init) !void {
     defer init.gpa.free(bytes);
     const parsed = try std.json.parseFromSlice(plan.Plan, init.gpa, bytes, .{});
     defer parsed.deinit();
-    try runner.run(init, parsed.value, std.fs.path.dirname(plan_path) orelse ".", dry_run);
+    if (verify_only and dry_run) return error.InvalidArguments;
+    try runner.run(init, parsed.value, std.fs.path.dirname(plan_path) orelse ".", dry_run, verify_only);
 }
 
 test {
