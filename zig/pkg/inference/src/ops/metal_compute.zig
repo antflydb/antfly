@@ -26576,6 +26576,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.input_token_ids != null or request.input_positions != null) return false;
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         if (metal_runtime.hasActiveFrame(runtime)) return false;
+        const profile = getenvBool("ANTFLY_GEMMA4_OCR_PROFILE");
+        const before = if (profile) metal_runtime.runtimeMemorySnapshot(runtime) else undefined;
         var cb = self.computeBackend();
         var active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
         if (!active_frame) return false;
@@ -26651,20 +26653,51 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     else
                         try v_view.retainedCopy();
                 }
-                const q_ct = try retainedCtFromMetalTensor(self, &q_rope);
-                defer freeOp(ctx, q_ct);
-                // Shared-KV layers do not consume K/V. Provide bounded unused
-                // placeholders with the expected shape, never unrelated Q rows.
-                const kv_shape = [_]i32{ 1, @intCast(kv_dim) };
-                const k_ct = if (k_rope) |*tensor| try retainedCtFromMetalTensor(self, tensor) else (try allocUninitF32ShapeOp(ctx, &kv_shape)) orelse return error.NativeBatchedDecodeUnavailable;
-                defer freeOp(ctx, k_ct);
-                const v_ct = if (v_norm) |*tensor| try retainedCtFromMetalTensor(self, tensor) else k_ct;
-                defer if (v_ct != k_ct) freeOp(ctx, v_ct);
                 var attention = item.attention;
                 attention.layer_index = layer.kv_layer_index;
                 attention.skip_kv_write = layer.shares_kv;
                 attention.sliding_window = layer.sliding_window;
-                const result = try gqaPagedAttentionOp(ctx, q_ct, k_ct, v_ct, null, attention, 1, request.num_attention_heads, layer.kv_heads, layer.head_dim);
+                const paged = (try pagedKvLayerFromDeviceHookWithPendingSuffix(attention, layer.kv_heads, layer.head_dim, if (layer.shares_kv) 0 else 1)) orelse return error.NativeBatchedDecodeUnavailable;
+                if (!sameMetalRuntime(@ptrCast(runtime), paged.runtime)) return error.NativeBatchedDecodeUnavailable;
+                var offsets = (try self.pagedKvBlockTokenOffsets(attention, paged.page_size_tokens, paged.ring_page_count)) orelse return error.NativeBatchedDecodeUnavailable;
+                defer offsets.deinit(self.allocator);
+                if (!layer.shares_kv) {
+                    if (!try metal_runtime.decoderRuntimeSeedPagedSuffixOnFrame(self.provider_impl, .{
+                        .slot = paged.slot,
+                        .format = paged.format,
+                        .k = k_rope.?,
+                        .v = v_norm.?,
+                        .total_tokens = attention.kv_sequence_len,
+                        .suffix_tokens = @as(usize, 1),
+                        .num_kv_heads = layer.kv_heads,
+                        .head_dim = layer.head_dim,
+                        .key_row_bytes = paged.key_row_bytes,
+                        .base_key_row_bytes = paged.base_key_row_bytes,
+                        .v_row_stride = paged.v_row_stride,
+                        .kv_position_offset = attention.kv_position_offset,
+                        .block_token_offsets = offsets.values(),
+                        .page_size = @as(usize, paged.page_size_tokens),
+                    })) return error.NativeBatchedDecodeUnavailable;
+                }
+                var result_mt = (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(self.provider_impl, .{
+                    .q = q_rope,
+                    .slot = paged.slot,
+                    .format = paged.format,
+                    .block_token_offsets = offsets.values(),
+                    .page_size = @as(usize, paged.page_size_tokens),
+                    .kv_tokens = attention.kv_sequence_len,
+                    .num_heads = request.num_attention_heads,
+                    .num_kv_heads = layer.kv_heads,
+                    .head_dim = layer.head_dim,
+                    .key_row_bytes = paged.key_row_bytes,
+                    .base_key_row_bytes = paged.base_key_row_bytes,
+                    .query_position_offset = attention.total_sequence_len - 1,
+                    .kv_position_offset = attention.kv_position_offset,
+                    .sliding_window = attention.sliding_window,
+                })) orelse return error.NativeBatchedDecodeUnavailable;
+                defer result_mt.deinit();
+                try commitPagedKvLayerDeviceWrite(attention);
+                const result = try retainedCtFromMetalTensor(self, &result_mt);
                 defer freeOp(ctx, result);
                 if (!try copyRows2DOp(ctx, attn_ct, row, result, 0, 1, q_dim)) return error.NativeBatchedDecodeUnavailable;
                 const ple_offset = (row * request.layer_count + layer_index) * request.ple_hidden_size;
@@ -26732,6 +26765,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.allocator.free(choices);
         active_frame = false;
         for (choices, request.output_token_ids) |token, *output| output.* = @intCast(token);
+        if (profile) {
+            const after = metal_runtime.runtimeMemorySnapshot(runtime);
+            std.log.info("metal_ocr_matrix_frame: rows={d} submits={d} wait_ns={d} gpu_ns={d}", .{
+                rows,                                             after.frame_submit_count - before.frame_submit_count,
+                after.frame_wait_nanos - before.frame_wait_nanos, after.frame_gpu_nanos - before.frame_gpu_nanos,
+            });
+        }
         self.timing_stats.active_decode_frame_successes += 1;
         return true;
     }

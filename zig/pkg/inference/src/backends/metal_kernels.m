@@ -8834,6 +8834,29 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "kernel void termite_apply_linear_bf16_multi_row_shared_reduce(device const float *input [[buffer(0)]], device const ushort *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint o [[threadgroup_position_in_grid]]) {\n"
            "    if (o >= p.out_dim || p.rows == 0u || p.rows > 64u) return;\n"
+           "    if (p.rows <= 4u) {\n"
+           "        float init = lane == 0u ? bias[o] : 0.0f;\n"
+           "        float a0 = init, a1 = init, a2 = init, a3 = init;\n"
+           "        uint w_base = o * p.in_dim;\n"
+           "        for (uint i = lane; i < p.in_dim; i += 32u) {\n"
+           "            float w = termite_bf16_to_f32(weight[w_base + i]);\n"
+           "            a0 += input[i] * w;\n"
+           "            if (p.rows > 1u) a1 += input[p.in_dim + i] * w;\n"
+           "            if (p.rows > 2u) a2 += input[2u * p.in_dim + i] * w;\n"
+           "            if (p.rows > 3u) a3 += input[3u * p.in_dim + i] * w;\n"
+           "        }\n"
+           "        partials[lane] = a0;\n"
+           "        if (p.rows > 1u) partials[32u + lane] = a1;\n"
+           "        if (p.rows > 2u) partials[64u + lane] = a2;\n"
+           "        if (p.rows > 3u) partials[96u + lane] = a3;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint stride = 16u; stride > 0u; stride >>= 1u) {\n"
+           "            if (lane < stride) for (uint r = 0u; r < p.rows; ++r) partials[r * 32u + lane] += partials[r * 32u + lane + stride];\n"
+           "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        }\n"
+           "        if (lane == 0u) for (uint r = 0u; r < p.rows; ++r) output[r * p.out_dim + o] = partials[r * 32u];\n"
+           "        return;\n"
+           "    }\n"
            "    for (uint r = 0u; r < p.rows; ++r) partials[r * 32u + lane] = lane == 0u ? bias[o] : 0.0f;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    uint w_base = o * p.in_dim;\n"
@@ -67097,4 +67120,46 @@ int termite_metal_host_vm_counters(uint64_t *out) {
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&stats, &count) != KERN_SUCCESS) return -1;
     out[0] = stats.pageouts; out[1] = stats.swapins; out[2] = stats.swapouts;
     return 0;
+}
+
+// Seed a reserved paged suffix on the caller's existing frame. Capacity is
+// established before taking the encoder: growing a span can transition it.
+int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
+    termite_metal_decode_runtime *runtime, size_t slot, uint32_t format,
+    void *k_handle, size_t k_offset, void *v_handle, size_t v_offset,
+    size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads,
+    size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes,
+    size_t v_row_stride, size_t kv_position_offset,
+    const uint32_t *block_table, size_t block_count, size_t page_size
+) {
+    if (runtime == NULL || runtime->active_frame_cb == nil || k_handle == NULL || v_handle == NULL ||
+        block_table == NULL || block_count == 0 || page_size == 0 || slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -1;
+    if (format != 2u && format != 3u) return -2;
+    if (total_tokens == 0 || suffix_tokens == 0 || suffix_tokens > total_tokens ||
+        num_kv_heads == 0 || head_dim == 0 || key_row_bytes == 0 || v_row_stride == 0) return -3;
+    size_t capacity_tokens = 0;
+    for (size_t i = 0; i < block_count; ++i) {
+        if ((size_t)block_table[i] > SIZE_MAX - page_size) return -4;
+        const size_t end = (size_t)block_table[i] + page_size;
+        if (end > capacity_tokens) capacity_tokens = end;
+    }
+    const size_t value_bytes = format == 3u ? sizeof(uint16_t) : sizeof(float);
+    if (capacity_tokens > SIZE_MAX / key_row_bytes || v_row_stride > SIZE_MAX / value_bytes ||
+        capacity_tokens > SIZE_MAX / (v_row_stride * value_bytes)) return -4;
+    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot,
+            capacity_tokens * key_row_bytes, capacity_tokens * v_row_stride * value_bytes) != 0) return -5;
+    if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
+            TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, TERMITE_METAL_COMPUTE_REGION_ATTENTION) != 0) return -6;
+    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    const int rc = format == 2u
+        ? termite_metal_encode_paged_f32_kv_seed_on_encoder(runtime, encoder, slot,
+            (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
+            total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, v_row_stride,
+            kv_position_offset, block_table, block_count, page_size, -7)
+        : termite_metal_encode_paged_quantized_kv_seed_on_encoder(runtime, encoder, slot, format,
+            (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
+            total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes,
+            v_row_stride, kv_position_offset, block_table, block_count, page_size, -7);
+    const int end_rc = termite_metal_decode_runtime_end_planned_compute_scope(runtime);
+    return rc != 0 ? rc : end_rc;
 }

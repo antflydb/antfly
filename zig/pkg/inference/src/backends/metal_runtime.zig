@@ -3629,6 +3629,37 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
 /// leave completion to that frame's eventual submit/wait. Callers must keep
 /// every consumer on the same frame; the ordinary wrapper above retains its
 /// synchronous completion contract.
+pub extern fn termite_metal_decode_runtime_seed_paged_suffix_on_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    total_tokens: usize,
+    suffix_tokens: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    v_row_stride: usize,
+    kv_position_offset: usize,
+    block_table: [*]const u32,
+    block_count: usize,
+    page_size: usize,
+) c_int;
+
+pub fn decoderRuntimeSeedPagedSuffixOnFrame(self: anytype, request: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!hasActiveFrame(runtime) or !request.k.isDevice() or !request.v.isDevice()) return false;
+    if (request.suffix_tokens == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return false;
+    const width = std.math.mul(usize, request.num_kv_heads, request.head_dim) catch return false;
+    const count = std.math.mul(usize, request.suffix_tokens, width) catch return false;
+    if (request.k.elemCount() != count or request.v.elemCount() != count) return false;
+    return termite_metal_decode_runtime_seed_paged_suffix_on_frame(runtime, request.slot, request.format, request.k.deviceHandle(), request.k.deviceByteOffset(), request.v.deviceHandle(), request.v.deviceByteOffset(), request.total_tokens, request.suffix_tokens, request.num_kv_heads, request.head_dim, request.key_row_bytes, request.base_key_row_bytes, request.v_row_stride, request.kv_position_offset, request.block_token_offsets.ptr, request.block_token_offsets.len, request.page_size) == 0;
+}
+
 pub fn decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_has_active_frame(runtime) == 0) return null;
@@ -28862,6 +28893,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         return result;
     }
 
+    const multirow_q4 = if (@hasField(@TypeOf(request), "multirow_q4")) request.multirow_q4 else getenvFlagEnabled("ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN");
     const none = std.math.maxInt(usize);
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
     var output = MetalTensor.deviceAllocate(
@@ -28915,7 +28947,15 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
             output_handle,
             output.deviceByteOffset(),
         )
-    else if (request.rows > 1) rc_blk: {
+    else if (request.rows > 1 and request.rows <= 8 and (all_q4_0 or q4_0_q6_k) and
+        multirow_q4)
+    q4_batch: {
+        const apply: *const @TypeOf(termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_device) = if (all_q4_0)
+            &termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_device
+        else
+            &termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q6_k_down_slots_device;
+        break :q4_batch apply(runtime, input_handle, input.deviceByteOffset(), residual_handle, residual.deviceByteOffset(), request.rows, request.hidden_size, request.intermediate_size, @backingInt(request.activation), request.gate_linear_slot, request.up_linear_slot, request.post_gate_rms_norm_slot orelse none, request.post_down_rms_norm_slot orelse none, request.eps, request.down_linear_slot, output_handle, output.deviceByteOffset());
+    } else if (request.rows > 1) rc_blk: {
         var row: usize = 0;
         while (row < request.rows) : (row += 1) {
             const offset = row * row_bytes;
@@ -37018,6 +37058,15 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
 }
 
 test "metal native q4_0 gated ffn device path matches decomposed" {
+    try testQ4GatedFfnRows(1);
+}
+
+test "metal native q4_0 multirow gated ffn matches decomposed" {
+    try testQ4GatedFfnRows(2);
+    try testQ4GatedFfnRows(4);
+}
+
+fn testQ4GatedFfnRows(comptime rows: usize) !void {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -37026,7 +37075,6 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const rows: usize = 1;
     const hidden_size: usize = 64;
     const intermediate_size: usize = 64;
     const block_values: usize = 32;
@@ -37210,6 +37258,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
         .up_linear_slot = 61,
         .down_linear_slot = 62,
         .rows = rows,
+        .multirow_q4 = rows > 1,
         .hidden_size = hidden_size,
         .intermediate_size = intermediate_size,
         .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
@@ -37219,26 +37268,28 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    const pair_activation_used =
-        after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
-        after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output;
-    if (pair_activation_used) {
-        // M4 defaults to the token-qualified pair+activation route even though
-        // the older split-reduce rollback remains enabled in isolation.
-        try std.testing.expectEqual(before_direct.q4_0_pair_reduce, after_direct.q4_0_pair_reduce);
-    } else if (q4_0SplitGateUpReduceEnabled()) {
-        try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
-        try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
-    } else {
-        try std.testing.expect(
-            after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
-                after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce,
-        );
-    }
-    if (q4_0LinearRmsAddF16ProjectEnabled()) {
-        try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input_f16_output > before_direct.q4_0_linear_reduce_f16_input_f16_output);
-    } else {
-        try std.testing.expect(after_direct.q4_0_linear_reduce > before_direct.q4_0_linear_reduce);
+    if (rows == 1) {
+        const pair_activation_used =
+            after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
+            after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output;
+        if (pair_activation_used) {
+            // M4 defaults to the token-qualified pair+activation route even though
+            // the older split-reduce rollback remains enabled in isolation.
+            try std.testing.expectEqual(before_direct.q4_0_pair_reduce, after_direct.q4_0_pair_reduce);
+        } else if (q4_0SplitGateUpReduceEnabled()) {
+            try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
+            try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
+        } else {
+            try std.testing.expect(
+                after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
+                    after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce,
+            );
+        }
+        if (q4_0LinearRmsAddF16ProjectEnabled()) {
+            try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input_f16_output > before_direct.q4_0_linear_reduce_f16_input_f16_output);
+        } else {
+            try std.testing.expect(after_direct.q4_0_linear_reduce > before_direct.q4_0_linear_reduce);
+        }
     }
 
     var expected_mut = expected_tensor;
@@ -46335,9 +46386,8 @@ test "metal native decoder runtime bf16 matrix projections preserve tails offset
     // aligned 64/128/128 case enters full-tile vector staging; 65/132/133 mixes
     // vector interiors with scalar tails; guard=65 forces offset260 fallback.
     for ([_]Case{
-        .{ .rows = 1 },                      .{ .rows = 31 },                     .{ .rows = 32 },                                  .{ .rows = 63 },  .{ .rows = 64 },
-        .{ .rows = 65 },                     .{ .rows = 127 },                    .{ .rows = 128 },                                 .{ .rows = 129 }, .{ .rows = 511 },
-        .{ .rows = 64, .k = 128, .n = 128 }, .{ .rows = 65, .k = 132, .n = 133 }, .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
+        .{ .rows = 1 },  .{ .rows = 2 },   .{ .rows = 3 },   .{ .rows = 4 },   .{ .rows = 31 },  .{ .rows = 32 },                     .{ .rows = 63 },                     .{ .rows = 64 },
+        .{ .rows = 65 }, .{ .rows = 127 }, .{ .rows = 128 }, .{ .rows = 129 }, .{ .rows = 511 }, .{ .rows = 64, .k = 128, .n = 128 }, .{ .rows = 65, .k = 132, .n = 133 }, .{ .rows = 64, .k = 128, .n = 128, .guard = 65 },
     }) |case| {
         const rows = case.rows;
         const k = case.k;
@@ -48235,4 +48285,78 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "metal paged suffix seed stays on frame across page growth" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const heads: usize = 1;
+    const dim: usize = 32;
+    const prefix: usize = 64;
+    const zero_keys = @as([prefix * dim]f32, @splat(0));
+    const prefix_values = @as([prefix * dim]f32, @splat(3));
+    var k_prefix = try testDeviceTensorFromSlice(runtime, &zero_keys, &.{ prefix, dim });
+    defer k_prefix.deinit();
+    var v_prefix = try testDeviceTensorFromSlice(runtime, &prefix_values, &.{ prefix, dim });
+    defer v_prefix.deinit();
+    var q = try testDeviceTensorFromSlice(runtime, &@as([dim]f32, @splat(0)), &.{ 1, dim });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &@as([dim]f32, @splat(0)), &.{ 1, dim });
+    defer k.deinit();
+    var raw_v = try testDeviceTensorFromSlice(runtime, &@as([dim]f32, @splat(3.5)), &.{ 1, dim });
+    defer raw_v.deinit();
+    const blocks = [_]u32{ 0, 32, 64 };
+    for ([_]u32{ 2, 3 }) |format| {
+        const key_bytes = dim * (if (format == 3) @as(usize, 2) else @as(usize, 4));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(runtime, 0));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(runtime, 0, format, k_prefix.deviceHandle(), k_prefix.deviceByteOffset(), v_prefix.deviceHandle(), v_prefix.deviceByteOffset(), prefix, prefix, heads, dim, key_bytes, key_bytes, dim, 0, &blocks, 2, 32));
+        const before = runtimeMemorySnapshot(runtime);
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        // The seed must wait for this GPU producer through command ordering,
+        // without a host readback or an intermediate submit/wait.
+        var v = (try decoderRuntimeApplyScale(&provider, raw_v, 2)) orelse return error.UnexpectedNull;
+        defer v.deinit();
+        try std.testing.expect(try decoderRuntimeSeedPagedSuffixOnFrame(&provider, .{
+            .slot = @as(usize, 0),
+            .format = format,
+            .k = k,
+            .v = v,
+            .total_tokens = prefix + 1,
+            .suffix_tokens = @as(usize, 1),
+            .num_kv_heads = heads,
+            .head_dim = dim,
+            .key_row_bytes = key_bytes,
+            .base_key_row_bytes = key_bytes,
+            .v_row_stride = dim,
+            .kv_position_offset = @as(usize, 0),
+            .block_token_offsets = blocks[0..],
+            .page_size = @as(usize, 32),
+        }));
+        var output = (try decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(&provider, .{
+            .q = q,
+            .slot = @as(usize, 0),
+            .format = format,
+            .block_token_offsets = blocks[0..],
+            .page_size = @as(usize, 32),
+            .kv_tokens = prefix + 1,
+            .num_heads = heads,
+            .num_kv_heads = heads,
+            .head_dim = dim,
+            .key_row_bytes = key_bytes,
+            .base_key_row_bytes = key_bytes,
+            .query_position_offset = prefix,
+            .kv_position_offset = @as(usize, 0),
+            .sliding_window = @as(usize, 0),
+        })) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        try std.testing.expectEqual(before.frame_submit_count + 1, runtimeMemorySnapshot(runtime).frame_submit_count);
+        const values = try output.toHostSlice();
+        for (values) |value| try std.testing.expectApproxEqAbs((@as(f32, @floatFromInt(prefix)) * 3.0 + 7.0) / @as(f32, @floatFromInt(prefix + 1)), value, 2e-4);
+    }
 }
