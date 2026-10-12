@@ -1,0 +1,38 @@
+1/37 inference_internal.test.embeddinggemma2 video module declarations...OK
+2/37 pipelines.embedding_gemma2.test.embeddinggemma2 video rows preserve image audio and frame ordering...OK
+3/37 pipelines.embedding_gemma2.test_0...OK
+4/37 pipelines.embedding_gemma2.test.embeddinggemma2 video live window validates sampling before entering a model session...OK
+5/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video sampling maps presentation order and uniform long clips...OK
+6/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video repeated samples reuse projection and validate color declarations...OK
+7/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 model VFR qualification preserves pinned average FPS indices and compressed pixels...OK
+8/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video HDR rendering requires consistent gamut and transfer...OK
+9/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM inspection uses decoded visible picture sampling...OK
+10/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video logical field partition selection and timestamp windows...OK
+11/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video admission rejects all container paths before model execution...OK
+12/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight bounds temporary owners and plans geometry instead of maximum slots...OK
+13/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight allocation failures release metadata decoder and admission owners...OK
+14/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer prepares before model gate and drains an abandoned full queue...OK
+15/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer failure preserves error and releases partial owners...OK
+16/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer allocation failure drains metadata and prepared patches...OK
+17/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cancellation before consumer entry joins and drains producer...OK
+18/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM presentation and container colour reach model preparation...OK
+19/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video native TS sampling and preflight preserve MP4 pictures...OK
+20/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video TS producer preserves prepared MP4 patches and drains owners...OK
+21/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache producer skips fully cached decode and preparation for every container...OK
+22/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache abandoned producer restores borrowed entries under backpressure...OK
+23/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 video borrowed packet preparation matches container and leaves caller read state untouched...OK
+24/37 pipelines.embedding_gemma2_video.test.embeddinggemma2 Metal video borrowed reader preparation matches container on completed device work...SKIP
+25/37 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache borrows survive eviction pressure and preserve exact ownership...OK
+26/37 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache shared admission denies additional request owners...OK
+27/37 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache allocation denial returns the retained lease...OK
+28/37 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 Metal video cache survives compute wrappers without intermediate downloads...SKIP
+29/37 runtime.root.test_0...OK
+30/37 runtime.kv.root.test_0...OK
+31/37 gguf.root.test_0...OK
+32/37 ops.metal_compute.test.embeddinggemma2 Metal video buffer survives producer destruction and enters resident linear...SKIP
+33/37 ops.metal_compute.test.embeddinggemma2 Metal video producer prepares while compute lease is held and drains on abandonment...SKIP
+34/37 backends.backends.test_0...OK
+35/37 runtime.moe.root.test_0...OK
+36/37 runtime.scheduler.root.test_0...OK
+37/37 runtime.tier.root.test_0...OK
+33 passed; 4 skipped; 0 failed.

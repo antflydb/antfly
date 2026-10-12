@@ -1018,3 +1018,20 @@ outside this qualification. No runtime codec or transport dependency was added.
 
 Source, binary, fixture and report identities are recorded in
 [testdata/hls/partial-validation](testdata/hls/partial-validation/README.md).
+
+### Published units as model packet windows
+
+`antfly_video.live_windows.join` copies a finite set of published HLS/DASH units
+into owned packet storage. It preserves encoded samples, display/configuration
+metadata, media/source clocks and epoch identity, and rejects overlapping decode
+clocks or mixed configuration/DASH periods. Snapshot, staging and packet-index
+allocations use shared admission; input segments can be released after joining.
+The resulting reader needs no MP4 serialization.
+
+EmbeddingGemma 2 accepts that borrowed reader through `SampledVideo.reader` and
+`embedLiveWindow`. The caller must supply codec preroll and reorder context and
+establish a presentation-complete interval. Neither PART nor EXTINF duration
+proves that future reordered pictures have arrived. Automatic watermark/window
+scheduling, live transport-to-model orchestration and pretrained stream-window
+parity remain follow-up work in the active objective. Qualification is recorded
+in `../video/testdata/live/validation`.

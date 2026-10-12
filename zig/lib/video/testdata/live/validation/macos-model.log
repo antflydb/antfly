@@ -1,0 +1,21 @@
+Build Summary: 15/15 steps succeeded; 37/37 tests passed
+install-video-model-tests success
++- install test success
+   +- compile test debug native success 53s MaxRSS:2G
+      +- WriteFile macos-sdk-libc.txt cached
+      +- run exe jit-source-identity (metal_identity.zig) cached
+      |  +- compile exe jit-source-identity safe native cached 46ms MaxRSS:31M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- WriteFile video_prepare_shader.h cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+         +- compile exe patch_sentencepiece_proto safe native cached 45ms MaxRSS:31M
+         |  +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) cached
+         |  +- compile exe protoc-zig safe native cached 46ms MaxRSS:31M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+test-video-model success
++- run test 37 pass (37 total) 26s MaxRSS:127M
+   +- compile test debug native (+6 more reused dependencies)

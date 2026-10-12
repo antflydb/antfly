@@ -1780,3 +1780,26 @@ remain in the active non-CUDA objective. See the media
 VP9 and AV1 remain checked-in, Antfly-maintained Zig ports with no runtime
 libvpx/dav1d/FFmpeg dependency; ownership and update rules are documented in
 [src/codecs/PORTING.md](src/codecs/PORTING.md).
+
+### Owned live packet windows and model reader input
+
+[live_windows.zig](src/live_windows.zig) joins finite published HLS/DASH units in
+decode order, preserving supplied preroll and future reorder context. It owns
+sample bytes, configuration/colour metadata and packet indexes independently of
+input segments. Mixed epochs/configurations/DASH periods and duplicate decode
+clocks fail before model input. Staging, snapshots and indexes share admission;
+allocation-failure and retained-output tests cover cleanup and ownership.
+
+The model pipeline accepts borrowed immutable packet readers for preflight,
+synchronous encoding and asynchronous preparation. Independent source counters,
+controls and preparation leases leave caller read state untouched. Reader input
+uses timestamp/logical-picture sampling and the existing CPU/Metal scheduling,
+admission and cancellation paths. Projection caching is disabled for these
+borrowed readers: a packet identity is not an immutable complete-clip cache key.
+The caller retains source, packets and metadata until synchronous completion or
+`Prefetch.deinit`; `embedLiveWindow` manages its joined owner across execution.
+
+A caller supplies a presentation-complete window, including codec preroll and
+reordered-output dependencies, and separates configuration epochs. Automatic
+watermarks, live reload-to-window scheduling and pretrained streamed-window
+parity are still required. See [the window qualification receipt](testdata/live/validation/README.md).

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const live_windows = @import("live_windows.zig");
 pub const transport_avc = @import("transport_avc.zig");
 pub const h264_pictures = @import("h264_pictures.zig");
 pub const webm_pictures = @import("webm_pictures.zig");
@@ -35,6 +36,7 @@ pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
 pub const sampling = @import("sampling.zig");
 test {
+    _ = live_windows;
     _ = transport_avc;
     _ = codecs;
     _ = @import("codecs/test.zig");

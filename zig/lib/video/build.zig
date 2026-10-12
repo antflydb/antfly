@@ -21,6 +21,13 @@ pub fn build(b: *std.Build) void {
     _ = support.addModule(b, b.path("."), target, optimize);
     support.addBenchmarks(b, b.path("."), target, optimize);
     support.addTests(b, b.path("."), target, optimize);
+    const live_root = b.createModule(.{ .root_source_file = b.path("live_window_test_root.zig"), .target = target, .optimize = optimize });
+    live_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
+    const live_tests = b.addTest(.{ .root_module = live_root, .filters = &.{"live packet window"} });
+    const run_live_tests = b.addRunArtifact(live_tests);
+    run_live_tests.has_side_effects = true;
+    b.step("test-live-windows", "Qualify owned HLS/DASH packet windows and shared admission").dependOn(&run_live_tests.step);
+    b.step("install-live-window-tests", "Install live window ownership tests for another host").dependOn(&b.addInstallArtifact(live_tests, .{ .dest_sub_path = "window-tests" }).step);
     const transport_fuzz_root = b.createModule(.{ .root_source_file = b.path("transport_fuzz_root.zig"), .target = target, .optimize = optimize });
     transport_fuzz_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
     transport_fuzz_root.addImport("antfly_image", b.modules.get("antfly_video").?.import_table.get("antfly_image").?);

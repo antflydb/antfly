@@ -23,7 +23,7 @@ const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const media_admission = @import("antfly_media").admission;
 const scoring = @import("antfly_decisions").scoring;
-pub const SampledVideo = struct { bytes: []const u8, sampling: @import("embedding_gemma2_video.zig").Sampling };
+pub const SampledVideo = struct { bytes: []const u8 = &.{}, reader: ?*const @import("antfly_media").mp4.Reader = null, sampling: @import("embedding_gemma2_video.zig").Sampling };
 pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 /// Final response materialization; normalization already completed on device.
@@ -43,7 +43,10 @@ fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
         .raster => |raster| raster.bytes,
-        .sampled_video => |value| value.bytes,
+        .sampled_video => |value| if (value.reader) |reader| switch (reader.input.storage) {
+            .borrowed => |bytes| bytes,
+            .range => &.{},
+        } else value.bytes,
         inline else => |bytes| bytes,
     };
 }
@@ -63,6 +66,21 @@ pub fn workspaceBackingAllocator(backend: @import("../backends/backends.zig").Ba
         if (backend == .native) return std.heap.c_allocator;
     }
     return std.heap.smp_allocator;
+}
+
+/// Embed a finite, presentation-complete HLS/DASH packet window. The caller
+/// provides preroll/reorder context and ends windows at configuration epochs.
+/// Model lock, admission, cancellation and CPU/Metal scheduling match embed().
+pub fn embedLiveWindow(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, segments: []const @import("antfly_media").live_mp4.Segment, sampling: @import("antfly_video").sampling.TimestampPolicy, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, pool: ?*@import("antfly_media").admission.Pool) !Result {
+    try sampling.validate();
+    const effective = control orelse Control{};
+    const adapter = effective.imageWorkControl();
+    var window_permit = try session.admitHostPreprocess(192 * 1024 * 1024);
+    defer window_permit.deinit();
+    var window = try @import("antfly_video").live_windows.join(out, "live-model-window", segments, .{ .stream = .{ .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } } });
+    defer window.deinit();
+    const parts = [_]Part{ .{ .sampled_video = .{ .reader = &window.reader, .sampling = .{ .timestamps = sampling } } }, .{ .text = caption orelse "" } };
+    return embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control);
 }
 
 pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
@@ -109,7 +127,8 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
             inline .video, .sampled_video => |payload| {
                 const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                 const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                const plan = try @import("embedding_gemma2_video.zig").inspectPlan(a, bytes, effective, sampling, &host_budget, session.backend() == .metal);
+                const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
+                const plan = if (packet_reader) |reader| try @import("embedding_gemma2_video.zig").inspectReaderPlan(a, reader, effective, sampling, &host_budget, session.backend() == .metal) else try @import("embedding_gemma2_video.zig").inspectPlan(a, bytes, effective, sampling, &host_budget, session.backend() == .metal);
                 device_bytes = @max(device_bytes, try plan.deviceBytes());
                 command_slots = @max(command_slots, plan.commands);
             },
@@ -137,7 +156,8 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                 inline .video, .sampled_video => |payload| {
                     const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startCached(a, io, context.device, bytes, effective, sampling, &video_budget, cache);
+                    const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
+                    prefetched = if (packet_reader) |reader| try @import("embedding_gemma2_video.zig").Prefetch.startReader(a, io, context.device, reader, effective, sampling, &video_budget) else try @import("embedding_gemma2_video.zig").Prefetch.startCached(a, io, context.device, bytes, effective, sampling, &video_budget, cache);
                     break;
                 },
                 else => {},
@@ -237,7 +257,7 @@ fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.z
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encode(cb);
-                } else try @import("embedding_gemma2_video.zig").encodeCached(a, cb, bytes, effective, sampling, video_budget, cache);
+                } else if (if (@TypeOf(payload) == SampledVideo) payload.reader else null) |reader| try @import("embedding_gemma2_video.zig").encodeReader(a, cb, reader, effective, sampling, video_budget) else try @import("embedding_gemma2_video.zig").encodeCached(a, cb, bytes, effective, sampling, video_budget, cache);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {
@@ -576,7 +596,13 @@ pub fn validateGroup(group: Group, options: Options) !void {
     var raster_bytes: usize = 0;
     for (group.content) |part| {
         const value = partBytes(part);
-        if (part == .sampled_video and part.sampled_video.sampling == .timestamps) try part.sampled_video.sampling.timestamps.validate();
+        if (part == .sampled_video) {
+            if (part.sampled_video.sampling == .timestamps) try part.sampled_video.sampling.timestamps.validate();
+            if (part.sampled_video.reader) |reader| {
+                if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;
+                _ = try @import("embedding_gemma2_video.zig").packetBytes(reader);
+            }
+        }
         if (part == .raster) {
             try part.raster.validate();
             try @import("image.zig").DecodeLimits.inference_default.validate(part.raster.width, part.raster.height);
@@ -786,4 +812,10 @@ test "embeddinggemma2 Metal device composition preserves ordered tokens without 
     const actual = try cb.toFloat32(result, a);
     defer a.free(actual);
     for (actual, expected) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+}
+
+test "embeddinggemma2 video live window validates sampling before entering a model session" {
+    const session: Session = undefined;
+    const tokenizer: Tokenizer = undefined;
+    try std.testing.expectError(error.InvalidSamplingPolicy, embedLiveWindow(std.testing.allocator, session, tokenizer, &.{}, .{ .step_ns = 0 }, null, .{}, null, null, null));
 }

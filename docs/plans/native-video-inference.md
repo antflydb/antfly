@@ -1240,3 +1240,21 @@ TS partials, CBC byte-range chaining, delta playlists, rendition coordination
 and model-level live window orchestration still require implementation and
 qualification. The full non-CUDA objective remains active. Codec source ports
 are owned and maintained in-tree; no runtime codec-library dependency is allowed.
+
+### Direct model inference over published packet windows
+
+The typed native model API now accepts borrowed packet readers and exposes
+`embedLiveWindow` for finite published HLS/DASH units. Joining copies encoded
+samples and metadata into an independently owned reader without MP4 remuxing.
+Original segments may then be released. Mixed configuration epochs/DASH periods
+and overlapping decode clocks are rejected. Shared admission covers staging and
+retained storage; model preflight and execution continue through existing CPU/
+Metal permits, cancellation, bounded queues and logical timestamp selection.
+
+The qualification receipt is `zig/lib/video/testdata/live/validation`. Current
+scope proves reader preparation/ownership and model entry, rather than pretrained
+streamed retrieval parity. Caller-supplied presentation watermarks and preroll
+remain necessary. Automatic transport reload-to-window scheduling, decoder-order
+watermark derivation, cross-window retention/eviction and pretrained streamed
+CPU/Metal/Linux comparisons are the next implementation/qualification gaps.
+The full non-CUDA objective remains active.
