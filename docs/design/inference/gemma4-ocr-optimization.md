@@ -2,6 +2,108 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Why the expected speedups have not appeared
+
+The current result qualifies these implementations, not the potential of GPU
+batching or speculative decoding. There are three different limits:
+
+- Resident image preparation addresses only a small part of OCR time. In the
+  paired resident run, decode took 43.416 seconds versus 6.335 seconds for image
+  preparation. Even eliminating preparation entirely would save roughly 12%
+  of the measured total; reducing its transfers cannot make decode faster.
+- Coordinated page decode is still **one-row arithmetic inside a shared
+  frame**. `runCoordinatedGemma4Rows` loops layers, then pages, invoking
+  `runActiveGatedLayerFromAttentionInputDeviceMt` separately for every row.
+  Embedding/PLE initialization runs separately before the frame; final
+  RMS normalization and the vocabulary head also run separately for each
+  page after it. This adds copies, dispatches and synchronization without
+  explicitly sharing weight loads/dequantization across input rows. Local
+  cache reuse is possible, but a multi-row matrix kernel is needed to obtain
+  the expected bandwidth benefit. Increasing scheduler occupancy alone
+  cannot resolve this limitation.
+- MTP saves target rounds only if drafting, batch verification and KV/hidden
+  recovery together cost less than the ordinary target steps they replace.
+  The measured K=2 run accepted 839 tokens in 543 rounds: about 1.55 tokens
+  per round, not two. That includes correction tokens; the draft-match rate
+  alone does not describe speed. Metal bonus acceptance defaults off. With
+  K=1 and no bonus, each round emits at most one token, so drafting cannot
+  amortize the number of target steps at all.
+  Corrections can require another target forward, and past the 512-token
+  sliding window the active hidden-materialization guard selects the
+  existing hidden-only route. Ordinary greedy generation retains its
+  optimized singleton path throughout these pages.
+
+The MTP phase counters are now available in logs with
+`ANTFLY_GEMMA4_MTP_PROFILE=1`. `mtp_phase_profile` reports drafting,
+verification, materialization and activation-copy wall times and counts;
+`mtp_draft_profile` breaks down assistant stages. Leave
+`ANTFLY_GEMMA4_MTP_PROFILE_SYNC` disabled for performance comparisons: the
+logging reads existing counters and does not add GPU synchronization.
+These are host-observed phase times, not a Metal kernel trace, and nested
+draft-stage times must not be added to their enclosing draft total.
+
+### Follow-up controlled experiments
+
+[Phase timings and transcript checks](gemma4-ocr-bottlenecks.json) pin the
+diagnostic source revision and executable SHA-256. These tests use the first
+two Attention pages, fresh servers, one page warmup, and two measured passes
+per configuration on one frozen executable. The diagnostic build completed
+before these comparisons; only one benchmark server used the GPU at a time.
+Small differences between consecutively run cases remain subject to drift.
+
+| Configuration | Median seconds, two pages | Completion tokens/pass | Exact control text |
+| --- | ---: | ---: | --- |
+| Resident ordinary greedy | 11.211 | 841 | Yes |
+| MTP K=2, existing defaults | 22.609 | 841 | No |
+| MTP K=2, enable Q6_K two-row head switch | 22.751 | 841 | No |
+| MTP K=2, accept bonus tokens | 21.182 | 796 | No |
+| MTP K=2, defer materialization and reuse target activation | 24.459 | 841 | Yes |
+| Deferred MTP K=2 plus two-row head switch | 24.737 | 841 | Yes |
+
+Ordinary decode took 9.134 and 9.226 seconds. The first default MTP pass spent
+4.844 seconds drafting, 9.103 verifying and 6.511 materializing corrections,
+plus 0.035 copying activations. It made 345 separate correction
+materializations. All 841 draft steps were resident, with no host draft steps
+or target-embedding cross-backend copies. GPU residency in the draft is
+already present; the extra target work and assistant computation dominate.
+
+`TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE=1` permits an existing two-row shared-weight
+Q6_K head kernel on eligible routes/shapes. Enabling the switch did not produce
+an end-to-end gain; this test does not assert that every head operation selected
+that kernel. Its source dispatch requires the switch; the prepared multi-row head helper's
+comment now states that requirement explicitly.
+
+`ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1` reduced target rounds, but required 150 bonus
+materializations in addition to 256 correction materializations. Recovery took
+7.706 seconds, and output shortened and changed. It therefore fails both the
+ordinary-runtime comparison and exact-transcript qualification.
+
+Together, `ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1` and
+`ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION=1` removed the separate
+materialization phase and matched all four measured pilot transcripts. They
+also increased verification from 596 to 1,219 target rows per pass and from
+298 to 448 calls. Verification alone took 16.986 seconds, with 5.352 seconds
+drafting. The transcript match is useful qualification evidence on these two
+pages, but does not establish correctness on the full corpus or a speedup.
+Enabling the two-row head switch on that deferred path also retained the
+pilot transcripts and gave no timing improvement.
+
+The [speculative decoding paper](https://arxiv.org/abs/2211.17192) and
+[llama.cpp documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
+describe verification that amortizes a target forward across multiple tokens.
+Our current failure to amortize enough work is an implementation/qualification
+problem; it does not establish that this approach cannot help Gemma4 OCR.
+
+The next implementation priority is a true multi-row prepared decoder:
+batch the QKV and feed-forward linear operations and vocabulary head, retain
+per-page paged attention and KV identities, and read all token choices after
+one owned frame. Qualify two rows before increasing the active set. For MTP,
+first restore agreement with ordinary greedy generation at the first divergent
+token, then improve verifier and correction-materialization cost. Keep the
+existing sliding-window guard until a safe optimized hidden-state route is
+qualified across that boundary. Neither output shortening nor a changed
+transcript counts as an exact-control speedup.
+
 This follows the [OCR comparison](gemma4-ocr-comparison.md), using the same
 Gemma4 E2B Q4_0 checkpoint, Q8_0 image projector and eight PDF pages. It addresses
 four separate questions: runtime efficiency, independent-page decode batching,

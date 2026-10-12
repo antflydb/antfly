@@ -6895,10 +6895,11 @@ pub fn forwardPreparedLmHeadArgmaxRows(
     const trace_started_at = if (trace) monotonicNowNs() else 0;
     const choices = try allocator.alloc(u32, rows);
     errdefer allocator.free(choices);
-    // Preferred at rows 2-8: ONE multi-row apply — the q6_k head rides the
-    // r2-reduce kernel (pairs of rows share a single pass over the ~550MB
-    // weight stream) instead of re-reading the head once per row. Falls back
-    // to the per-row loop below on any unsupported condition.
+    // Prefer ONE multi-row apply. Eligible Q6_K heads at rows 2-8 can use
+    // r2-reduce when TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE is enabled; pairs
+    // then share a pass over the weight stream. This helper alone does not
+    // guarantee that kernel selection. Fall back to per-row applies below
+    // when the backend does not support this route.
     if (rows >= 2) multi_row: {
         const logits = (try cb.decoderRuntimeApplyLinear(&.{
             .slot = lm_head_slot,
