@@ -1171,4 +1171,4 @@ wire-contract mismatch, unconditional graph hydration, split-action lane
 double-release, and host-clock leakage—
 demonstrate that extending VOPR across
 remaining orchestration boundaries is likely to pay off. See
-[Defects Found](#defects-found) for the complete inventory.
+[Defects Found](defects-found.md#defects-found) for the complete inventory.
