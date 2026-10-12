@@ -2255,7 +2255,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
             }
             if (!used_trusted_identity_path) {
-                try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+                try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
                     self.alloc,
                     self.core.store,
                     self.core.identity_namespace,

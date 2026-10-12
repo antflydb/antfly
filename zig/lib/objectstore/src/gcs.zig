@@ -131,6 +131,7 @@ pub const TransportResponse = struct {
     generation: ?[]u8 = null,
     content_type: ?[]u8 = null,
     location: ?[]u8 = null,
+    server_date: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
         alloc.free(self.body);
@@ -138,6 +139,7 @@ pub const TransportResponse = struct {
         if (self.generation) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
+        if (self.server_date) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -227,6 +229,7 @@ const HttpxTransport = struct {
         );
         errdefer result.deinit(alloc);
         if (response.headers.get("x-goog-generation")) |generation| result.generation = try alloc.dupe(u8, generation);
+        if (response.headers.get("Date")) |value| result.server_date = try alloc.dupe(u8, value);
         return result;
     }
 };
@@ -922,6 +925,10 @@ pub const JsonApiClient = struct {
     }
 
     const vtable: client_mod.Client.VTable = .{
+        // Bucket/Object Retention protects generations, not live names.
+        // Artifact references must pin generations before this provider can
+        // supply immutable-name closure evidence (including after toggling
+        // bucket versioning). Keep complete audits authoritative meanwhile.
         .deinit = erasedDeinit,
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
@@ -1426,6 +1433,7 @@ fn parseListResponse(alloc: Allocator, body: []const u8) !types.ListResult {
             name: []const u8,
             etag: ?[]const u8 = null,
             size: ?[]const u8 = null,
+            retentionExpirationTime: ?[]const u8 = null,
         } = null,
         prefixes: ?[]const []const u8 = null,
         nextPageToken: ?[]const u8 = null,
@@ -1451,6 +1459,7 @@ fn parseListResponse(alloc: Allocator, body: []const u8) !types.ListResult {
             .etag = etag,
             .size = size,
             .last_modified_unix_ms = null,
+            .retention_until_ms = if (item.retentionExpirationTime) |value| @import("retention_time.zig").rfc3339(value) else null,
         };
         entries_initialized += 1;
     }
@@ -2228,4 +2237,24 @@ fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8
         }
     }
     return error.MissingHeader;
+}
+
+test "gcs version retention never certifies live artifact names" {
+    const a = std.testing.allocator;
+    const State = struct {
+        fn request(_: ?*anyopaque, _: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            // Declining this capability must not depend on today's bucket
+            // configuration: versioning can change after a certificate is made.
+            return error.UnexpectedRetentionRequest;
+        }
+    };
+    var config = try jsonApiConfigAlloc(a, "bucket");
+    defer config.deinit(a);
+    const cfg = config.json_api.?;
+    config.json_api = null;
+    var provider = JsonApiClient.initWithRequestFn(a, cfg, null, State.request);
+    defer provider.deinit();
+    var client = provider.client();
+    try std.testing.expect((try client.immutablePrefixUntil("bucket", "graph/a/", null)) == null);
+    try std.testing.expect(!try client.validateImmutableUntil("bucket", std.math.maxInt(u64), null));
 }

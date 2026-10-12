@@ -1854,6 +1854,10 @@ pub const SearchRequest = struct {
     remote_snapshot: ?[]const u8 = null,
     /// Borrowed, trusted coordinator control; never accepted from public JSON.
     native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    /// Trusted lower bound from already retained publication-wide winners.
+    /// Strict score pruning only: equal scores retain their global tie chance.
+    /// Never populated from public JSON or forwarded to count-only execution.
+    minimum_competitive_score: ?f32 = null,
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2082,6 +2086,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
+    "minimum_competitive_score",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {

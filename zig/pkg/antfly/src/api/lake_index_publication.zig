@@ -314,6 +314,12 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     defer a.free(directory.artifact_id);
     defer a.free(directory.checksum);
     try context.ensureActive();
+    // All uploads in this attempt are complete before its namespace evidence
+    // is sealed. Certificates are advisory; failure retains the full audit.
+    scoped.sealClosures(cancellation) catch {
+        try context.ensureActive();
+        try cancellation.check();
+    };
     const completed = try clock.now_ms(clock.ptr);
     const publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
     const latest = if (lease) |owner| try owner.snapshot(owner.ptr, a) else table;

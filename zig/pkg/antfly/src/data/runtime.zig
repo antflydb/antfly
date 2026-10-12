@@ -2587,6 +2587,9 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
         try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
+        inline for (.{ "attempts", "failures", "pages", "nanoseconds" }) |field| {
+            try health_metrics.appendPromMetric(writer, "antfly_lake_navigation_warming_" ++ field ++ "_total", "counter", "Bounded lake navigation warming " ++ field, @field(api_request_stats.lake_navigation_warming, field));
+        }
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);

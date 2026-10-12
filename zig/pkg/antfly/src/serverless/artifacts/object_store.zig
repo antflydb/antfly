@@ -54,6 +54,7 @@ pub const ObjectStore = struct {
     owns_client: bool = true,
     read_only: bool = false,
     local_inventory: ?@import("fs_store.zig").FsStore = null,
+    remote_retention: @import("remote_retained_closure.zig") = .{},
     bucket: []u8,
     prefix: []u8,
     verified_mu: std.atomic.Mutex = .unlocked,
@@ -224,6 +225,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        self.remote_retention.deinit(self.alloc);
         if (self.local_inventory) |*inventory| inventory.deinit();
         lockAtomic(&self.verified_mu);
         var verified_it = self.verified_objects.iterator();
@@ -455,12 +457,14 @@ pub const ObjectStore = struct {
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var meta = client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer meta.deinit(self.client.allocator);
+        defer meta.deinit(alloc);
         try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),
@@ -569,9 +573,11 @@ pub const ObjectStore = struct {
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
         if (self.read_only) return error.ArtifactStoreReadOnly;
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
+        if (self.local_inventory) |*fs| try @import("retained_closure.zig").forget(fs, artifact_id);
         lockAtomic(&self.verified_mu);
         defer self.verified_mu.unlock();
         if (self.verified_objects.fetchRemove(artifact_id)) |removed| {
@@ -688,7 +694,41 @@ pub const ObjectStore = struct {
         }
     }
 
+    fn retentionWitness(raw: *anyopaque, scope: artifact_store.UploadScope, token: CancellationToken) !?artifact_store.RetentionWitness {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").witness(fs, scope, token);
+        return @import("remote_retained_closure.zig").witness(self, scope, token);
+    }
+    fn retainedClosure(raw: *anyopaque, id: []const u8, token: CancellationToken) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").retained(fs, id, token);
+        return @import("remote_retained_closure.zig").retained(self, id, token);
+    }
+    fn rememberClosure(raw: *anyopaque, id: []const u8, witnesses: []const artifact_store.RetentionWitness, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").remember(fs, id, witnesses, token);
+        try @import("remote_retained_closure.zig").remember(self, id, witnesses, token);
+    }
+    fn inheritClosure(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: artifact_store.UploadScope, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return fs.retention.inherit(fs, id, previous, scope, token);
+        try self.remote_retention.inherit(self, id, previous, scope, token);
+    }
+    fn sealClosures(raw: *anyopaque, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return fs.retention.seal(fs, token);
+        try self.remote_retention.seal(self, token);
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .retention_witness = retentionWitness,
+        .retained_closure = retainedClosure,
+        .remember_closure = rememberClosure,
+        .inherit_closure = inheritClosure,
+        .seal_closures = sealClosures,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
@@ -1247,4 +1287,64 @@ test "external lake complete artifact reads avoid metadata probes and reject tam
     try std.testing.expectEqual(@as(usize, 0), empty_body.len);
     try store.delete(empty.artifact_id);
     try std.testing.expectError(error.FileNotFound, store.getVerifiedAllocWithCancellation(empty.artifact_id, 0, empty.checksum, .none));
+}
+
+test "external lake remote retained closure certificates survive reopen inherit and expire closed" {
+    const a = std.testing.allocator;
+    const Provider = struct {
+        var expired = false;
+        var probes: usize = 0;
+        fn witness(_: *anyopaque, _: []const u8, _: []const u8, token: ?objectstore.CancellationToken) !?u64 {
+            if (token) |value| try value.check();
+            probes += 1;
+            return if (expired) null else 2000;
+        }
+        fn valid(_: *anyopaque, _: []const u8, until: u64, token: ?objectstore.CancellationToken) !bool {
+            if (token) |value| try value.check();
+            return !expired and until == 2000;
+        }
+    };
+    Provider.expired = false;
+    Provider.probes = 0;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var vtable = client.vtable.*;
+    vtable.immutable_prefix_until = Provider.witness;
+    vtable.validate_immutable_until = Provider.valid;
+    client.vtable = &vtable;
+    var backend = try ObjectStore.initWithClient(a, client, "retained", "tenant");
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    store.upload_scope = .{ .domain = @splat(8), .attempt = @splat(2) };
+    var root = try store.put("initial root");
+    defer root.deinit(a);
+    try store.inheritClosure(root.artifact_id, null, .none);
+    try store.sealClosures(.none);
+    try std.testing.expect(try store.retainedClosure(root.artifact_id, .none));
+    const captured = Provider.probes;
+    var reopened = try ObjectStore.initWithClient(a, client, "retained", "tenant");
+    defer reopened.deinit();
+    var fresh = reopened.artifactStore();
+    try std.testing.expect(try fresh.retainedClosure(root.artifact_id, .none));
+    try std.testing.expectEqual(captured, Provider.probes); // No prefix re-enumeration.
+    fresh.upload_scope = .{ .domain = @splat(8), .attempt = @splat(3) };
+    var next = try fresh.put("next root");
+    defer next.deinit(a);
+    try fresh.inheritClosure(next.artifact_id, root.artifact_id, .none);
+    try fresh.sealClosures(.none);
+    try std.testing.expect(try fresh.retainedClosure(next.artifact_id, .none));
+    // Certificate identity cannot migrate into another backend prefix.
+    var other = try ObjectStore.initWithClient(a, client, "retained", "other");
+    defer other.deinit();
+    var other_store = other.artifactStore();
+    try std.testing.expect(!try other_store.retainedClosure(next.artifact_id, .none));
+    Provider.expired = true;
+    try std.testing.expect(!try fresh.retainedClosure(root.artifact_id, .none));
+    try std.testing.expect(!try fresh.retainedClosure(next.artifact_id, .none));
+    // Ordinary object stores expose no retention proof regardless of caches.
+    var mutable = try ObjectStore.initWithClient(a, memory.client(), "retained", "tenant");
+    defer mutable.deinit();
+    var mutable_store = mutable.artifactStore();
+    try std.testing.expect(!try mutable_store.retainedClosure(root.artifact_id, .none));
 }
