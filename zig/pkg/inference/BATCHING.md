@@ -283,6 +283,26 @@ descriptors, not JSON arrays. A typed invocation rejects an absent numeric resul
 rather than falling back to JSON under a numeric-only memory allowance. These
 contracts apply independently of model family and do not change public APIs.
 
+Worker route capabilities constrain rendering before materialization. The
+worker advertises a 64 MiB complete request envelope
+(`attachment_envelope_max_bytes`, applied even with zero attachments) and a
+separate 1 MiB attachment-metadata ceiling (`attachment_metadata_max_bytes`).
+Metadata is measured from the actual serialized JSON, including escaping, not
+from UTF-8 length divided by an expansion factor; text-only requests keep the
+original logical JSON ceiling. Only raw PDF planning derives a tightly packed
+RGBA pixel ceiling from the payload limit; encoded images keep the model's
+pixel allowance, and raw accounting includes stride padding. Embedding windows
+check both ceilings with framing arithmetic shared with the envelope encoder,
+split mixed text/image windows without shrinking valid text-only batches, and
+reject an indivisible oversized item before provider dispatch.
+
+Private provider errors are diagnosed by their owning runtime before the first
+ABI or worker-RPC hop normalizes them to `InferenceProviderFailure`. Linked and
+isolated inference share one bounded operation/error/model diagnostic policy;
+the receiving bridge does not re-log normalized errors or expose
+backend-specific error names in its wire ABI, and logs never include request
+bodies or media bytes.
+
 This is shared fused-batching infrastructure, not a claim that every artifact
 and provider now executes natively batched. GPU generation's shared graph,
 stream, scratch and request-budget state still needs backend-specific isolation;
@@ -428,5 +448,7 @@ the outer request admission covers the complete serial batch. This is a
 correctness path, not a claim of batched Qwen projector or decoder execution.
 
 Native Florence batching is throughput-oriented. A request batch is chunked by `ANTFLY_INFERENCE_READ_BATCH_SIZE` (default 8, clamped to 1..64), preprocessed into `[batch, 3, H, W]`, then run through the Florence encoder once for the chunk. CUDA and Metal use the incremental decoder KV cache in batch mode when available: self-attention keys/values are appended per row, cross-attention keys/values are precomputed for the whole encoder batch, and the LM head is applied over `[batch, hidden]` at each generated position. Metal exposes the generic eager backend hooks needed by the preallocated KV slab path (`allocUninitF32Shape`, `copyRows2D`, and device-backed row concat/slice) and has a batched device `attention_f32` entry that dispatches all `batch * q_len * heads` rows in one Metal command. The reader pipeline does not need a Florence-specific Metal API. Rows that emit EOS stop contributing new text tokens while the rest of the batch continues. If the batched KV path is unsupported by a backend shape or operator, native Florence falls back to the full batched decoder path; non-native and unsupported reader families keep the serial fallback behind the same `LoadedReader.readBatch` contract.
+
+Resident Florence OCR separates cross-attention cache backing ownership from active tensor shape. In-place EOS compaction moves surviving rows without resizing the backing allocation; the decoder then publishes exact active-prefix views and attends through them. Backing buffers outlive every view (CUDA row views are non-retaining; Metal keeps retained device views), repeated compaction replaces only view descriptors, and teardown releases views before backing storage.
 
 The current `/read` HTTP response remains all-or-error at the envelope level, matching the existing API behavior. The future generic batch wrapper above should add per-item errors for bad image bytes, media fetch failures, and per-row inference failures without changing the `/read` response schema.

@@ -109,6 +109,45 @@ does not own threads, tasks, shutdown, or budgets. New code should keep this
 distinction explicit; when ambiguity is possible, use “node BackendRuntime” for
 the executor owner and “inference backend runtime descriptor” for the value.
 
+### Lane profile and maintenance scheduler
+
+`BackendRuntimeLaneLimits` (`lib/runtime/src/threaded_io_limits.zig`) is one
+value-semantic profile under the 256-thread aggregate ceiling, not a set of
+independent maxima. Defaults: durable background 48, API 16, request forward
+32, Raft inbound 32, Raft outbound 32, inference 48, control 8, PDF rendering 4
+(dedicated threads, queue 8), and 32 dedicated service-worker slots
+(`worker_capacity`, for Raft senders, listeners, observers, and other service
+owners). The defaults sum to 252. Callers may redistribute capacity while
+keeping fixed lanes nonzero; validation rejects an overcommitted profile before
+allocating executors. Worker reservations are lazy and isolated, capacity
+returns only after executor teardown, and unused sibling capacity is never
+borrowed. A zero `worker_capacity` disables dedicated worker admission.
+
+`BackendRuntime` lazily owns one maintenance scheduler on the durable lane.
+TTL, transaction recovery, text merging, sparse compaction, enrichment,
+resolution/promotion, derived-index replay, artifact repair, and quarantine
+retry register callbacks instead of parking a thread per shard or index. A
+callback runs a pass, then parks or returns a retry delay; notifications
+coalesce and survive a running pass. Runnable scans rotate fairly, and
+completed callbacks are joined before dispatch. Maintenance is admitted at most
+half the durable lane (further limited by CPU parallelism), with separate
+reserved shares for maintenance, producers, derived publication, and
+propagation so producers cannot starve their derived dependencies.
+Activation requires at least eight durable workers (the coordinator and
+durable-job reaper share the lane) and fails explicitly otherwise; a capacity
+error is never converted into a larger thread ceiling. Registration handles are
+lifetime leases: stop detaches queued work and joins active callbacks before
+the owner is freed, and shutdown closes registration and drains handles before
+destroying the coordinator. Lane statistics expose registrations, active/class
+counts, peaks, dispatches, and dispatch retries.
+
+`ModelManager` load single-flight separates a flight's join eligibility from
+its reference lifetime. A retry after a completed failed flight detaches the
+old flight; existing waiters still receive the original result, and cleanup of
+the old flight cannot remove a new flight registered under the same key. A
+failed load is not an implicit negative cache. This applies to ordinary models
+and composite assets.
+
 ## Invariants
 
 1. Every serving `Node` declares `local` or `external_required` ownership before
