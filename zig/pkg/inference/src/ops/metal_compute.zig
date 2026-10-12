@@ -1162,6 +1162,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
+    matrix_stage_profiled: bool = false,
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
     boundary_scope_buffers: std.ArrayListUnmanaged(MetalTensor) = .empty,
     boundary_workspace: ?@import("gliner_boundary_resident.zig").Workspace.Borrow = null,
@@ -26562,6 +26563,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn traceGemma4MatrixStage(runtime: *metal_runtime.RawMetalDecodeRuntime, enabled: bool, name: []const u8, layer: usize, previous: *metal_runtime.RawRuntimeMemoryStats) !void {
+        if (!enabled) return;
+        // Diagnostic only: flush this stage to measure its GPU contribution.
+        // Normal qualification runs leave this flag off and retain one frame.
+        try metal_runtime.flushActiveFrame(runtime);
+        const current = metal_runtime.runtimeMemorySnapshot(runtime);
+        std.log.info("metal_ocr_matrix_stage: name={s} layer={d} gpu_ns={d} wait_ns={d}", .{
+            name,                                                 layer, current.frame_gpu_nanos - previous.frame_gpu_nanos,
+            current.frame_wait_nanos - previous.frame_wait_nanos,
+        });
+        previous.* = current;
+    }
+
     /// Quantized matrix operations span the cohort; only attention and RoPE
     /// retain per-page positions and KV identities. One frame owns all work.
     fn runGemma4MultirowDecode(
@@ -26578,12 +26592,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.hasActiveFrame(runtime)) return false;
         const profile = getenvBool("ANTFLY_GEMMA4_OCR_PROFILE");
         const before = if (profile) metal_runtime.runtimeMemorySnapshot(runtime) else undefined;
+        const trace_stages = getenvBool("ANTFLY_GEMMA4_METAL_PROFILE_STAGES") and !self.matrix_stage_profiled;
+        if (trace_stages) self.matrix_stage_profiled = true;
+        var stage_previous = if (trace_stages) metal_runtime.runtimeMemorySnapshot(runtime) else undefined;
         var cb = self.computeBackend();
         var active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
         if (!active_frame) return false;
         errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
         var initial = (try prepareDecodeBatchInitialTensors(self, request, inputs)) orelse return error.NativeBatchedDecodeUnavailable;
         defer initial.deinit();
+        try traceGemma4MatrixStage(runtime, trace_stages, "initial", 0, &stage_previous);
         var hidden = try initial.hidden.retainedCopy();
         defer hidden.deinit();
         const ple = if (initial.ple_vectors) |tensor| tensor else return error.NativeBatchedDecodeUnavailable;
@@ -26627,6 +26645,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .out_dim = kv_dim,
                 })) orelse return error.NativeBatchedDecodeUnavailable;
             }
+            try traceGemma4MatrixStage(runtime, trace_stages, "qkv", layer_index, &stage_previous);
             const attn_shape = [_]i32{ @intCast(rows), @intCast(q_dim) };
             const attn_ct = (try allocUninitF32ShapeOp(ctx, &attn_shape)) orelse return error.NativeBatchedDecodeUnavailable;
             defer freeOp(ctx, attn_ct);
@@ -26708,6 +26727,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer freeOp(ctx, ple_row_ct);
                 if (!try copyRows2DOp(ctx, ple_layer_ct, row, ple_row_ct, 0, 1, request.ple_hidden_size)) return error.NativeBatchedDecodeUnavailable;
             }
+            try traceGemma4MatrixStage(runtime, trace_stages, "attention", layer_index, &stage_previous);
             const residual_ct = try retainedCtFromMetalTensor(self, &hidden);
             defer freeOp(ctx, residual_ct);
             const block_request = ops.RunGatedDecoderBlockRequest{
@@ -26739,8 +26759,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
             const attn_mt = try self.borrowedMetalTensorFromCt(attn_ct);
             const block = (try self.finishGatedDecoderBlockFromAttentionOutputMt(&block_request, layer_index, attn_mt, hidden, null)) orelse return error.NativeBatchedDecodeUnavailable;
+            try traceGemma4MatrixStage(runtime, trace_stages, "ffn", layer_index, &stage_previous);
             // finishGatedLayerTailMt consumes the block on both success/error.
             const next_hidden = (try self.finishGatedLayerTailMt(&block_request, layer_index, block, ple_layer_mt)) orelse return error.NativeBatchedDecodeUnavailable;
+            try traceGemma4MatrixStage(runtime, trace_stages, "ple", layer_index, &stage_previous);
             hidden.deinit();
             hidden = next_hidden;
             self.timing_stats.active_decode_layers += rows;
@@ -26761,6 +26783,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .out_dim = request.vocab_size,
         })) orelse return error.NativeBatchedDecodeUnavailable;
         defer freeOp(ctx, logits);
+        try traceGemma4MatrixStage(runtime, trace_stages, "head", 0, &stage_previous);
         const choices = (try decoderRuntimeArgmaxRowsSuppressOp(ctx, logits, 0, rows, request.vocab_size, request.suppress_token_ids, self.allocator)) orelse return error.NativeBatchedDecodeUnavailable;
         defer self.allocator.free(choices);
         active_frame = false;
@@ -27785,7 +27808,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (request.items.len > 1) {
             if (!active_decode_frame_enabled) return false;
-            if (std.c.getenv("ANTFLY_GEMMA4_METAL_OCR_MULTIROW") == null or getenvBool("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"))
+            if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"))
                 return runGemma4MultirowDecode(ctx, self, request, &batch_inputs);
             return runCoordinatedGemma4Rows(ctx, self, request, &batch_inputs);
         }
