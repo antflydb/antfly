@@ -22,7 +22,20 @@ const parquet = @import("lake_parquet_rowgroup.zig");
 const external = @import("../external_source/mod.zig");
 const storage = @import("../../storage/object_storage.zig");
 const A = std.mem.Allocator;
-pub const Column = struct { name: []const u8, kind: []const u8, required: bool, field_id: ?i32 = null, iceberg_type: []const u8 = "" };
+pub const Column = struct {
+    name: []const u8,
+    kind: []const u8,
+    required: bool,
+    field_id: ?i32 = null,
+    iceberg_type: []const u8 = "",
+    /// Declared NUMERIC consumes exact physical integers or decimal lexemes.
+    /// Ordinary number retains its strict floating source contract; rounded
+    /// physical floats cannot silently become exact NUMERIC values.
+    pub fn accepts(self: Column, actual: []const u8) bool {
+        if (std.mem.eql(u8, self.kind, "numeric")) return std.mem.eql(u8, actual, "integer") or std.mem.eql(u8, actual, "string");
+        return std.mem.eql(u8, actual, self.kind);
+    }
+};
 pub const Detected = struct {
     arena: std.heap.ArenaAllocator,
     columns: []const Column,
@@ -179,4 +192,15 @@ test "external lake Iceberg discovery selects pinned schema and preserves requir
     try std.testing.expectError(error.IcebergSnapshotMismatch, icebergSchema(a, bytes, "99"));
     try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, parquetKind(.{ .column_id = @constCast("binary"), .nullable = false, .physical_type = 6 }));
     try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, parquetKind(.{ .column_id = @constCast("nested"), .nullable = false, .physical_type = 2, .nested = true }));
+}
+
+test "external lake typed NUMERIC source contracts admit exact physical inputs only" {
+    const exact: Column = .{ .name = "k", .kind = "numeric", .required = false };
+    try std.testing.expect(exact.accepts("integer"));
+    try std.testing.expect(exact.accepts("string"));
+    try std.testing.expect(!exact.accepts("number"));
+    try std.testing.expect(!exact.accepts("boolean"));
+    const floating: Column = .{ .name = "k", .kind = "number", .required = false };
+    try std.testing.expect(!floating.accepts("integer"));
+    try std.testing.expect(floating.accepts("number"));
 }

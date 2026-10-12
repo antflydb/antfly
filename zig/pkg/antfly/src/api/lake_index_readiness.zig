@@ -33,6 +33,13 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
     if (!eligible and publication.directory == null) return &.{};
+    // A replica attempts bounded navigation warming before reporting an index
+    // queryable. Concurrent checks do not duplicate warm I/O. Failure/timeout
+    // is an optional cache miss and does not weaken the source proof below.
+    @import("lake_index_navigation_warming.zig").warmPublicationWithin(a, server, table, request) catch |err| {
+        if (err == error.NavigationWarmupInProgress) return &.{};
+        try request.ensureActive();
+    };
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
@@ -111,7 +118,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .text_segment and decl.artifact.metadata_version == native_text.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native_text.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
