@@ -10,7 +10,7 @@ Work in a git worktree under `.worktrees/<name>` created from `origin/main`. Kee
 
 Antfly is a distributed key-value store and vector search engine with a Zig server runtime. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/pkg/` (`sdk`, `operator`, `docsaf`, `evalaf`, `genkit`, `memoryaf`, `proxy`, `lite`), and each must be built from within its own directory with `GOWORK=off` (the Makefiles set this). The Antfly and inference servers live under `zig/`.
+The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/pkg/` (`sdk`, `embedded`, `operator`, `proxy`, `docsaf`, `evalaf`, `evalaf/plugins/antfly`, `genkit/antfly`, `genkit/openrouter`, `memoryaf`; see `GO_MODULES` in the Makefile), and each must be built from within its own directory with `GOWORK=off` (the Makefiles set this). The Antfly and inference servers live under `zig/`.
 
 ## Go Version
 
@@ -27,7 +27,7 @@ GOEXPERIMENT=simd go test ./...
 GOEXPERIMENT=simd go test -bench=. -benchmem ./...
 ```
 
-The Makefile defines `GO := GOEXPERIMENT=simd go` for convenience. All `make` targets use this automatically.
+The Makefile defines `GO := GOWORK=off GOEXPERIMENT=simd go` for convenience. All `make` targets use this automatically.
 
 ## Architecture
 
@@ -39,22 +39,24 @@ See `docs/architecture.mdx` for full details.
 - `zig/pkg/antfly/src/metadata/`: Metadata server coordinating cluster operations
 - `zig/pkg/antfly/src/data/`: Storage nodes handling data shards and queries
 - `zig/pkg/antfly/src/raft/`: Raft consensus and transport
-- `zig/pkg/antfly/src/storage/`: Storage engines, indexes, and transactions
+- `zig/pkg/antfly/src/storage/`: Server-side storage integration (enrichment, backups, kernel ownership, shard splits)
+- `zig/pkg/antfly-embedded/src/storage/`: Native storage engine (LSM tree, indexes, transactions), shared with embedded Lite
+- `zig/pkg/antfly-client/`, `zig/pkg/antfly-server-api/`: Client library and server API types
 - `zig/pkg/inference/`: Local inference runtime
 - `docs/`: Hand-written documentation (synced into colony/frontend/apps/www-antfly at build time)
 
 **Data Organization**:
 - **Shards**: Horizontal partitions by key range
 - **Tables**: Multiple shards with configurable replication
-- **Indexes**: `full_text` (BM25), `embeddings` (dense, sparse, and late-interaction vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations). Enrichments (chunking, embeddings, extraction, summaries) are declared inline on the index config; see `specs/openapi/antfly/indexes.yaml`
+- **Indexes**: `full_text` (BM25), `embeddings` (dense, sparse, and late-interaction vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations), `relational` (ordered composite keys over typed rows). Enrichments (chunking, embeddings, extraction, summaries) are declared inline on the index config; see `specs/openapi/antfly/indexes.yaml`
 
 **Storage**: LSM storage + Raft consensus, with separate runtime paths for provisioned, serverless, and embedded Lite deployments.
 
 ## Commands
 
 ```bash
-make build              # All binaries + frontend + codegen
-make generate           # After OpenAPI/proto changes (SDKs, docs, protobufs)
+make build              # antfarm frontend + Zig antfly binary (copied to ./antfly)
+make generate           # After OpenAPI changes (Zig modules, joined openapi.yaml, Go/TS/Python/Rust SDKs, antfarm)
 make gc                 # Garbage-collect build caches across all worktrees
 ```
 
@@ -89,7 +91,7 @@ make build
 
 ## API Development
 
-**Code generation**: OpenAPI specs use oapi-codegen with `cfg.yaml` configs. Look up the `cfg.yaml` next to any `openapi.yaml` or `api.yaml` for generation settings. Key setting: optional fields use `omitzero` instead of pointers (`prefer-skip-optional-pointer-with-omitzero: true`).
+**Code generation**: The Go SDK uses oapi-codegen with `cfg.yaml` configs under `go/pkg/sdk/`; the Zig modules and the TS, Python, and Rust SDKs have their own generators, all driven by `make generate`. Key setting: optional fields use `omitzero` instead of pointers (`prefer-skip-optional-pointer-with-omitzero: true`).
 
 **Adding endpoints**:
 1. Update the relevant spec under `specs/openapi/`
@@ -104,6 +106,11 @@ Release tags:
 
 - `v*` — Zig runtime archives, CLI packages, and container images
 - `go/pkg/operator/v*` — integrated Antfly operator container build
+- `py/antfly/sdk/v*`, `ts/antfly/sdk/v*` — Python and TypeScript SDK packages
+- `ts/antfly/components/v*`, `ts/antfly/design-system/v*`, `ts/antfly/web/v*` — TypeScript UI packages
+
+See `RELEASE.md` for the release pipeline.
+
 ## Secrets Management
 
 Never store credentials in config. Use `${secret:...}` keystore or env vars. See `docs/reference/secrets.md`.
