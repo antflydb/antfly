@@ -853,3 +853,25 @@ storage profiles. Its first regional cold search measured 7.0 seconds and early
 continuation pages roughly 0.8–1.3 seconds, but the control-plane stream reset
 while returning results. These partial observations are not a passing verdict.
 A complete supervised two-cycle run is required before readiness.
+
+The optimized ordinal/lookahead binary at revision `048692502a` completed both
+regional cycles against an unchanged 142,577-row BigQuery Parquet partition. Both
+cycles passed every configured correctness and performance gate with stored-source
+highlights and empty caches before the first search. Cold queries took 6.35–7.82
+seconds, warm p95 was 279–280 ms, restart search was 395–426 ms, and continuation
+cursor p95 was 1.20–1.22 seconds across all 4,110 matching rows. Filter p95 stayed
+below 484 ms; concurrent requests stayed below 527 ms. Historical/current union,
+replacement suppression, saved visibility and mutable composed cursor restart
+checks passed. Initial publication took 449.62 seconds plus 1.64 seconds of
+registration; reopening the same publication took 0.22 seconds.
+
+See `publication-ordinal-qualification-20261012.json` for binary and harness
+provenance, gate thresholds, sample summaries and retained-report hashes. The
+first attempt lost its Kubernetes output stream and supplied only partial evidence;
+the detached supervised replacement supplied the complete passing verdict. The
+owned worker was deleted and derived publication artifacts were retained. Initial
+128-hit cursor pages took 1.97–2.28 seconds; the cursor gate measures continuation
+p95 and restart. One first `postgres` request took 2.32 seconds, while its workload
+p95 passed at 292 ms. This qualifies one partition, not the full archive or an
+Antfly Cloud deployment. The same binary also passed both public filesystem native
+recovery profiles. Final PR CI still requires human approval of the final revision.
