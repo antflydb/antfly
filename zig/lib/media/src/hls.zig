@@ -250,7 +250,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
                 _ = std.math.add(u64, offset, pending.length) catch return error.MalformedHls;
                 range = .{ .offset = offset, .length = pending.length };
             }
-            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse return error.UnsupportedContainer, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption });
+            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption });
             sequence = std.math.add(u64, sequence, 1) catch return error.MalformedHls;
             duration = null;
             pending_range = null;

@@ -1019,3 +1019,32 @@ This phase does not change codec/model execution or the v6 embedding recipe.
 SAMPLE-AES/CBCS, DRM processing, MPEG-TS, low-latency and separate-track ingestion,
 broader real-world codec/model qualification, scheduling and performance remain
 within the active non-CUDA goal.
+
+
+### MPEG-TS AVC/HLS continuation
+
+Native bounded TS demuxing now validates complete PAT/PMT tables, CRCs,
+continuity, PES payloads and 33-bit clocks. The video adapter normalizes Annex B
+AVC into the existing reader/decoder API, retaining native timestamps without
+serializing MP4. No-map HLS uses a codec callback after authenticated resource
+fetch/AES decryption. State/cursors commit only after successful ingestion;
+discontinuities open epochs while held packet leases remain valid. Scratch,
+configuration parsing and normalized storage participate in shared admission.
+
+Independent FFprobe/FFmpeg closed-GOP and B-frame fixtures exercise every
+picture and packet clock, with production localhost HTTP, retry/epoch,
+allocation-failure and bounded fuzz checks. See
+`zig/lib/media/testdata/transport/validation` for final evidence. This delivers
+a portable library/HLS path rather than pretrained TS model parity. External
+TS maps, arbitrary NAL/PES/access-unit splitting and timestamp inference,
+SAR/VFR qualification, other TS codecs and raw/model input routing remain
+open alongside the broader original non-CUDA scope.
+
+Final TS-phase gates pass 115 media tests and seven existing HTTP tests on
+macOS and actual Linux ARM64, plus the separate TS HTTP test on each. Video
+gates pass 184 macOS tests (two skipped) and 159 Linux ARM64 tests (27 skipped).
+The final bounded TS fuzz campaign adds 101,456 runs to the previous 102,382
+(cumulative 203,838); positive serialized seeds decode both fixture transports.
+All generated fixtures and the manifest regenerate byte for byte. The media
+allocation-failure helper forces resize fallbacks after actual Linux exposed
+heap-placement-dependent counts; production allocation behavior is unchanged.

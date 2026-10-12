@@ -770,3 +770,47 @@ failure. Production HTTP tests authenticate keys and ranged media while keeping
 old packet leases valid. OpenSSL is a qualification tool, never a runtime
 codec/crypto dependency. SAMPLE-AES/CBCS, DRM processing, MPEG-TS and low-latency
 HLS remain implementation work.
+
+
+## Native MPEG-TS AVC extraction and HLS adapter
+
+`transport_stream.demux` extracts owned Annex B AVC PES payloads and their
+90 kHz PTS/DTS from bounded 188-byte MPEG-2 transport packets. It validates
+PAT/PMT CRCs and complete numbered table sections, selects one AVC program,
+checks payload continuity (including exact duplicates and counter rollover),
+and unwraps 33-bit timestamps. Unsupported encryption, missing tables/clocks,
+truncated sections/PES and continuity gaps fail before publication. Audio and
+unselected streams are ignored. Input state is copied; only `next_state` from a
+successful result should be committed. Shared admission covers extraction
+scratch and retained output, with cancellation and allocation-failure cleanup.
+
+An HLS media playlist without `EXT-X-MAP` uses the optional
+`hls_live.Options.transport_stream` factory supplied by `lib/video`. This keeps
+container/HTTP/AES code independent of pixel decoding. The factory runs after
+native authenticated fetching and AES-128 decryption. Factory failure preserves
+the playlist cursor. The returned `live_mp4.Segment.origin` is
+`normalized_transport`: its backing contains codec configuration and indexed
+packet bytes, **not a serialized MP4 file**. Consume its `.reader` packet API.
+
+The current AVC adapter requires PES-aligned access units and complete Annex B
+NAL units within each PES. Multiple explicitly delimited pictures in one PES
+fail with `AmbiguousTransportPictureTiming`; they do not receive invented
+per-picture timestamps. Every segment requires complete PAT/PMT tables. External
+TS initialization maps, arbitrary PES/access-unit splitting, audio assembly,
+other TS video codecs and low-latency partial resources remain work. These
+restrictions are explicit and do not establish general MPEG-TS conformance.
+
+Independent FFprobe fixtures cover closed-GOP and reordered B-frame clocks and
+payloads. Production HTTP tests additionally exercise authenticated no-map HLS
+through native AVC decoding. `test-media-transport-fuzz --fuzz=100000` uses two
+serialized, positively accepted TS seeds and bounded shared-admission cleanup.
+Qualification receipts are in `testdata/transport/validation`.
+
+Final TS-phase gates pass 115 media tests and seven existing HTTP tests on
+macOS and actual Linux ARM64, plus the separate TS HTTP test on each. Video
+gates pass 184 macOS tests (two skipped) and 159 Linux ARM64 tests (27 skipped).
+The final bounded TS fuzz campaign adds 101,456 runs to the previous 102,382
+(cumulative 203,838); positive serialized seeds decode both fixture transports.
+All generated fixtures and the manifest regenerate byte for byte. The media
+allocation-failure helper forces resize fallbacks after actual Linux exposed
+heap-placement-dependent counts; production allocation behavior is unchanged.

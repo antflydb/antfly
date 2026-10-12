@@ -19,5 +19,5 @@
     .version = "0.0.1",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{ .objectstore = .{ .path = "../objectstore" } },
-    .paths = .{ "build.zig", "build.zig.zon", "build_support.zig", "media_test_root.zig", "objectstore_test_root.zig", "MEDIA.md", "src", "testdata", "scripts" },
+    .paths = .{ "build.zig", "build.zig.zon", "build_support.zig", "media_test_root.zig", "transport_fuzz_root.zig", "objectstore_test_root.zig", "MEDIA.md", "src", "testdata", "scripts" },
 }

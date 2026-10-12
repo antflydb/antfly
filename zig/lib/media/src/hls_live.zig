@@ -19,7 +19,11 @@ const hls = @import("hls.zig");
 const network = @import("http_stream.zig");
 const live = @import("live_mp4.zig");
 const dash_cursor = @import("dash_cursor.zig");
-pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{} };
+pub const TransportFactory = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, []const u8, []const u8, hls.Segment, live.Options, @import("source.zig").Control, ?*@import("admission.zig").Pool) anyerror!live.Segment,
+};
+pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
@@ -252,6 +256,15 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 for (playlist.segments) |segment| if (segment.sequence == sequence) break :blk segment;
                 return null;
             };
+            if (item.initialization.uri.len == 0) {
+                if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
+                const factory = self.options.transport_stream orelse return error.UnsupportedContainer;
+                var resource = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
+                defer resource.deinit();
+                const result = try factory.accept(factory.context, self.mediaUrl(), resource.bytes, item, self.options.ingest, self.transport.control, self.transport.pool);
+                self.commitCursor(item);
+                return result;
+            }
             // Failed snapshot allocation/validation retains pending input. Retry
             // that commit before any fetch; never append the same object twice.
             if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) {

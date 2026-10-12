@@ -31,6 +31,9 @@ pub const Options = struct {
 pub const Segment = struct {
     backing: *stream.Snapshot,
     reader: mp4.Reader,
+    /// Normalized TS snapshots contain codec config plus length-prefixed packets,
+    /// not a serialized MP4 file. Consumers use reader rather than backing bytes.
+    origin: enum { fmp4, normalized_transport } = .fmp4,
     ordinal: usize,
     /// Decoder/timestamp state must be reset when this changes.
     epoch: usize,

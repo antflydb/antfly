@@ -1518,3 +1518,57 @@ This phase does not change codec/model execution or the v6 embedding recipe.
 SAMPLE-AES/CBCS, DRM processing, MPEG-TS, low-latency and separate-track ingestion,
 broader real-world codec/model qualification, scheduling and performance remain
 within the active non-CUDA goal.
+
+
+## Native MPEG-TS AVC and HLS decoding
+
+`transport_avc.Reader` converts the media demuxer's Annex B PES payloads into
+length-prefixed AVC packets and an owned `media.mp4.Reader` view. It builds AVC
+configuration from in-band SPS/PPS or a supplied continuation configuration,
+retains PES timestamps in the 90 kHz domain, and feeds the existing native
+H.264 logical-picture/configuration decoder. It does not serialize or remux an
+MP4 file. The backing snapshot must outlive the reader; `Reader.deinit` releases
+both in order. Normalization admission is derived from actual payload size,
+including scratch/snapshot overlap, rather than the maximum stream allowance.
+
+For HLS, keep one request-local adapter at a stable address:
+
+```zig
+var codec = video.transport_avc.Hls{ .allocator = allocator };
+defer codec.deinit();
+var reader = try media.hls_live.Reader(Http).init(
+    allocator, &transport, playlist_url,
+    .{ .transport_stream = codec.factory() },
+);
+defer reader.deinit();
+```
+
+The adapter commits continuity, configuration and ordinals only after successful
+normalization. HLS discontinuities reset TS state and open a bounded epoch;
+configuration changes without a discontinuity fail. Held segment readers remain
+valid across reloads and epochs. Demuxing, normalization, configuration, leases
+and retained packet arrays use the supplied shared pool. HTTP/AES behavior
+remains in media. This path is portable and adds no runtime codec dependency.
+
+Qualification compares every decoded NV12 picture in closed-GOP and B-frame
+fixtures against independent FFmpeg hashes, including presentation timestamps.
+Retry, discontinuity, held leases, allocation-failure cleanup and production
+HTTP authentication are exercised. See the source/binary-bound receipts in
+`../media/testdata/transport/validation`.
+
+PES/access-unit alignment, one complete NAL sequence per PES and per-segment
+PAT/PMT are current restrictions. Durations use adjacent DTS deltas; an isolated
+packet needs an explicit duration (HLS can supply EXTINF). Broader VFR terminal
+policy, TS SAR/display qualification, external TS maps, NALs spanning PES and
+multiple access units per PES remain open. Raw TS/model-input integration and
+pretrained TS/HLS parity are not established by this decoder-library change.
+The full non-CUDA goal remains active.
+
+Final TS-phase gates pass 115 media tests and seven existing HTTP tests on
+macOS and actual Linux ARM64, plus the separate TS HTTP test on each. Video
+gates pass 184 macOS tests (two skipped) and 159 Linux ARM64 tests (27 skipped).
+The final bounded TS fuzz campaign adds 101,456 runs to the previous 102,382
+(cumulative 203,838); positive serialized seeds decode both fixture transports.
+All generated fixtures and the manifest regenerate byte for byte. The media
+allocation-failure helper forces resize fallbacks after actual Linux exposed
+heap-placement-dependent counts; production allocation behavior is unchanged.

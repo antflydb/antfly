@@ -46,5 +46,8 @@ pub fn build(b: *std.Build) void {
     b.step("test-media-hls-aes-declaration-fuzz", "Fuzz HLS AES declarations with an independent report").dependOn(&b.addRunArtifact(declaration_fuzz).step);
     const cipher_fuzz = b.addTest(.{ .root_module = aes_fuzz_root, .filters = &.{ "HLS AES fuzz CBC", "HLS AES fuzz cipher seed" }, .use_llvm = true });
     b.step("test-media-hls-aes-cipher-fuzz", "Fuzz AES ciphertext with an independent report").dependOn(&b.addRunArtifact(cipher_fuzz).step);
+    const transport_fuzz_root = b.createModule(.{ .root_source_file = b.path("transport_fuzz_root.zig"), .target = target, .optimize = optimize });
+    const transport_fuzz = b.addTest(.{ .root_module = transport_fuzz_root, .filters = &.{"transport fuzz"}, .use_llvm = true });
+    b.step("test-media-transport-fuzz", "Fuzz bounded native TS extraction with positive AVC seeds").dependOn(&b.addRunArtifact(transport_fuzz).step);
     support.addTests(b, b.path("."), target, optimize);
 }

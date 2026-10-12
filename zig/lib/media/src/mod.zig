@@ -28,6 +28,7 @@ pub const hls_live = @import("hls_live.zig");
 pub const hls = @import("hls.zig");
 pub const hls_master = @import("hls_master.zig");
 pub const stream = @import("stream.zig");
+pub const transport_stream = @import("transport_stream.zig");
 pub const source = @import("source.zig");
 pub const timeline = @import("timeline.zig");
 pub const webm = @import("webm.zig");
@@ -37,6 +38,7 @@ test {
     _ = ebml;
     _ = source;
     _ = stream;
+    _ = transport_stream;
     _ = live_mp4;
     _ = hls;
     _ = hls_master;

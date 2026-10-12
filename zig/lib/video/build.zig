@@ -21,4 +21,14 @@ pub fn build(b: *std.Build) void {
     _ = support.addModule(b, b.path("."), target, optimize);
     support.addBenchmarks(b, b.path("."), target, optimize);
     support.addTests(b, b.path("."), target, optimize);
+    const http = b.dependency("httpx", .{ .target = target, .optimize = optimize });
+    const integration = b.createModule(.{ .root_source_file = b.path("transport_http_test_root.zig"), .target = target, .optimize = optimize });
+    integration.addImport("httpx", http.module("httpx"));
+    integration.addImport("antfly_video", b.modules.get("antfly_video").?);
+    integration.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
+    const tests = b.addTest(.{ .root_module = integration });
+    const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
+    b.step("test-transport-http", "Qualify authenticated TS HLS packet/decoder integration").dependOn(&run.step);
+    b.step("install-transport-http-tests", "Install TS HTTP qualification for another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "transport-http-tests" }).step);
 }

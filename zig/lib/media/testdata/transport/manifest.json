@@ -1,0 +1,70 @@
+{
+  "generator_sha256": "48f63d8c3960602c7a9ed415e35bb0e727e28acd12f42f8ba7e68b2633873e0f",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "cases": {
+    "closed": {
+      "source": "zig/lib/video/testdata/schedule-closed.mp4",
+      "source_sha256": "3b5a5e12bf9831002e1f45d3d0b2ed8676632a884b526c098f15bcd18cb06efc",
+      "transport_sha256": "00f54b524dc404758c1b0044fd6d3c86af9874be7836025f79764f28977bb185",
+      "pes_sha256": "8f8c7259ffee95c343492744f745906a2474afda384cc2e3f9587fb82102679c",
+      "oracle_sha256": "60bb59f480aa2043e4239c2c90bd845f2bb24fddf5e2586a6640d0c434f9ae20",
+      "command": [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/lib/video/testdata/schedule-closed.mp4",
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-mpegts_flags",
+        "resend_headers",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-f",
+        "mpegts",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/lib/media/testdata/transport/closed.ts"
+      ]
+    },
+    "bframes": {
+      "source": "zig/lib/video/testdata/decode-bframes.mp4",
+      "source_sha256": "58de44f592e3df42aca292965394a3213b1bc7047e1269d5262652fb32a2dc18",
+      "transport_sha256": "bdc83e969c31c267bc019d4730d47ee8cc196504e89496861a46b28982f1e941",
+      "pes_sha256": "6b322d8792e95dfc358caaf25557e253ec1dd96f8594e8cd34da7674cdf25b83",
+      "oracle_sha256": "c118acb109171555e84f07faf372c363244d535e9e00edf35dbdb2460747078e",
+      "command": [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/lib/video/testdata/decode-bframes.mp4",
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-mpegts_flags",
+        "resend_headers",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-f",
+        "mpegts",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/lib/media/testdata/transport/bframes.ts"
+      ]
+    }
+  }
+}
