@@ -48360,3 +48360,45 @@ test "metal paged suffix seed stays on frame across page growth" {
         for (values) |value| try std.testing.expectApproxEqAbs((@as(f32, @floatFromInt(prefix)) * 3.0 + 7.0) / @as(f32, @floatFromInt(prefix + 1)), value, 2e-4);
     }
 }
+
+test "metal native Gemma4 matrix RMS rows match independent F64 in one frame" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    for ([_]usize{ 2, 3, 4 }) |rows| {
+        for ([_]usize{ 1023, 1024, 1536, 6144 }) |dim| {
+            const values = try std.testing.allocator.alloc(f32, rows * dim);
+            defer std.testing.allocator.free(values);
+            const weights = try std.testing.allocator.alloc(f32, dim);
+            defer std.testing.allocator.free(weights);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 109))) * (if (i / dim == 0) @as(f32, 0.0001) else @as(f32, 100));
+            @memset(values[(rows - 1) * dim ..], 0);
+            for (weights, 0..) |*weight, i| weight.* = 0.7 + @as(f32, @floatFromInt(i % 17)) * 0.031;
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_rms_norm(runtime, 0, weights.ptr, dim));
+            var input = try testDeviceTensorFromSlice(runtime, values, &.{ @intCast(rows), @intCast(dim) });
+            defer input.deinit();
+            var output = try MetalTensor.deviceAllocate(runtime, values.len * @sizeOf(f32), .private, &.{ @intCast(rows), @intCast(dim) });
+            defer output.deinit();
+            const before = frameCommandBufferCount(runtime);
+            try beginPreparedFrame(runtime);
+            errdefer cancelFrame(runtime) catch {};
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_rms_norm_rows_device(runtime, 0, input.deviceHandle(), input.deviceByteOffset(), rows, dim, 1e-6, output.deviceHandle(), output.deviceByteOffset()));
+            try std.testing.expectEqual(before, frameCommandBufferCount(runtime));
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            try std.testing.expectEqual(before + 1, frameCommandBufferCount(runtime));
+            const actual = try output.toHostSlice();
+            for (0..rows) |row| {
+                var sumsq: f64 = 0;
+                for (values[row * dim ..][0..dim]) |value| sumsq += @as(f64, value) * value;
+                const inv = 1 / @sqrt(sumsq / @as(f64, @floatFromInt(dim)) + @as(f64, @as(f32, 1e-6)));
+                for (0..dim) |col| {
+                    const expected: f32 = @floatCast(@as(f64, values[row * dim + col]) * inv * weights[col]);
+                    try std.testing.expectApproxEqAbs(expected, actual[row * dim + col], 2e-5);
+                }
+            }
+        }
+    }
+}
