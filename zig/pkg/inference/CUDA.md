@@ -7,7 +7,7 @@ inference's portability model:
 
 - A normal Antfly inference build does not require the CUDA toolkit.
 - A normal Antfly inference container does not ship CUDA runtime libraries, cuBLAS,
-  cuDNN, TensorRT, ONNX Runtime, or XLA.
+  cuDNN, TensorRT, or XLA.
 - The native CUDA path uses only the NVIDIA driver ABI at runtime:
   `libcuda.so.1`, loaded dynamically.
 - XLA/PJRT remains an optional compiled-graph path for dense/static graph
@@ -487,9 +487,9 @@ python scripts/gliner25/prepare_decide_quant_capture.py \
   --cases "$MODEL/benchmark-cases.json" --validation "$MODEL/validation.json" \
   --output /tmp/gliner-decide-q8-cases.json
 zig build bench-gliner-decide-quant-build test-gliner-decide-quant \
-  -Dcuda=true -Dmetal=false -Donnx=false -Doptimize=fast -j1
+  -Dcuda=true -Dmetal=false -Doptimize=fast -j1
 zig build test -Dtest-filter='GLiNER Decide CUDA' \
-  -Dcuda=true -Dmetal=false -Donnx=false -Doptimize=fast -j1
+  -Dcuda=true -Dmetal=false -Doptimize=fast -j1
 ANTFLY_CUDA_DISPATCH_STATS=1 \
   zig-out/bin/antfly-inference-gliner-decide-quant-bench \
   --model-dir "$MODEL" --capture /tmp/gliner-decide-q8-cases.json \

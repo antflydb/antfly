@@ -2,8 +2,8 @@
 
 antfly-inference-zig is Antfly's Zig ML inference runtime: embeddings,
 reranking, extraction/classification, chunking, rewriting, reading (OCR/VLM),
-transcription, and generation across native CPU, Metal, CUDA, and ONNX Runtime
-backends, plus LoRA/PEFT training. This file tracks open work only; how things
+transcription, and generation across native CPU, Metal, and CUDA backends (ONNX
+models run on Antfly's own ONNX implementation), plus LoRA/PEFT training. This file tracks open work only; how things
 work today lives in the design docs linked below.
 
 The HTTP surface is generated from
