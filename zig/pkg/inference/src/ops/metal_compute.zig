@@ -13183,7 +13183,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         seq_len: usize,
         num_heads: usize,
         head_dim: usize,
-        qwen3vl_vision_flash: bool,
+        vision_policy: enum { generic, qwen3vl, gemma4 },
     ) anyerror!?CT {
         if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return null;
         const q_buf = toBuf(q_ct);
@@ -13247,7 +13247,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .num_heads = num_heads,
             .head_dim = head_dim,
             .bias_mode = bias_mode,
-            .qwen3vl_vision_flash = qwen3vl_vision_flash,
+            .qwen3vl_vision_flash = vision_policy == .qwen3vl,
+            .gemma4_vision_flash = vision_policy == .gemma4,
         })) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -13385,7 +13386,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, if (mask.len == 0) null else mask, attn_bias_ct, batch, seq_len, num_heads, head_dim, false)) |output| return output;
+        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, if (mask.len == 0) null else mask, attn_bias_ct, batch, seq_len, num_heads, head_dim, .generic)) |output| return output;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
     }
 
@@ -13448,6 +13449,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    fn scaledDotProductAttentionGemma4VisionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim, .gemma4)) |output| return output;
+        return self.hostFallbackSdpa(q_ct, k_ct, v_ct, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
     fn scaledDotProductAttentionQwen3VlVisionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -13459,7 +13475,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim, true)) |output| return output;
+        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim, .qwen3vl)) |output| return output;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
@@ -13475,7 +13491,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        return self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim, false);
+        return self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim, .generic);
     }
 
     fn disentangledRelativeAttentionBackwardOp(
@@ -31454,6 +31470,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.segmentAttentionGrouped = segmentAttentionGroupedOp;
         vt.maskedMeanRows = maskedMeanRowsOp;
         vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
+        vt.scaledDotProductAttentionGemma4Vision = scaledDotProductAttentionGemma4VisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
         vt.maskedBceWithLogitsBackward = maskedBceWithLogitsBackwardOp;

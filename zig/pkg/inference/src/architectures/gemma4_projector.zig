@@ -368,6 +368,18 @@ pub fn encodeEmbeddingGemma2Raster(cb: *const ComputeBackend, allocator: std.mem
     return encodeSingleImageView(cb, allocator, &weights, embeddingGemma2ImageConfig(), view);
 }
 
+/// Header-only grouping identity. Both spatial axes matter for position/RoPE;
+/// equal token counts alone must not merge differently shaped images.
+pub fn embeddingGemma2ImageGeometry(width: u32, height: u32) !Geometry {
+    try image.DecodeLimits.inference_default.validate(width, height);
+    if (width == 0 or height == 0) return error.InvalidImageBatch;
+    return targetGeometry(embeddingGemma2ImageConfig(), width, height);
+}
+
+pub fn embeddingGemma2GeometryKey(geometry: Geometry) u64 {
+    return (@as(u64, @intCast(geometry.grid_x)) << 32) | @as(u64, @intCast(geometry.grid_y));
+}
+
 /// One image marker pair plus the tokenizer's BOS/EOS tokens.
 pub fn embeddingGemma2RasterSequenceLength(raster: antfly_image.BorrowedRasterAttachment) !usize {
     try raster.validate();
@@ -1408,6 +1420,25 @@ fn imageScratchBytes(cfg: Config, patches: usize) !usize {
     const attention = std.math.mul(usize, std.math.mul(usize, patches, patches) catch return error.InvalidImageBatch, cfg.head_count) catch return error.InvalidImageBatch;
     const activations_count = std.math.mul(usize, patches, (std.math.add(usize, std.math.mul(usize, cfg.vision_hidden, 12) catch return error.InvalidImageBatch, std.math.mul(usize, cfg.intermediate_size, 3) catch return error.InvalidImageBatch) catch return error.InvalidImageBatch)) catch return error.InvalidImageBatch;
     return std.math.mul(usize, std.math.add(usize, attention, activations_count) catch return error.InvalidImageBatch, 4) catch return error.InvalidImageBatch;
+}
+
+/// Conservative per-image estimate available before decoding for broker admission.
+pub fn embeddingGemma2ImageScratch(width: u32, height: u32, limit: usize) !usize {
+    const geometry = try embeddingGemma2ImageGeometry(width, height);
+    const scratch = try imageScratchBytes(embeddingGemma2ImageConfig(), geometry.grid_x * geometry.grid_y);
+    if (scratch > limit) return error.ImageBatchBudgetExceeded;
+    return scratch;
+}
+
+pub fn embeddingGemma2PreparedScratch(images: []const PreparedImage, limit: usize) !usize {
+    var sum: usize = 0;
+    for (images) |item| {
+        try validatePreparedImage(embeddingGemma2ImageConfig(), item);
+        const scratch = try imageScratchBytes(embeddingGemma2ImageConfig(), item.geometry.grid_x * item.geometry.grid_y);
+        if (scratch > limit) return error.ImageBatchBudgetExceeded;
+        sum = std.math.add(usize, sum, scratch) catch return error.InvalidImageBatch;
+    }
+    return @min(sum, limit);
 }
 
 pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRasterAttachment, limit: usize) !usize {
@@ -3257,6 +3288,33 @@ fn encoderBlock(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: 
     return encoderBlockBatch(cb, allocator, store, cfg, input, geometry, layer, 1);
 }
 
+/// Diagnostic pass only: flush at phase boundaries and report synchronized
+/// command-buffer GPU time separately from CPU wall and transfer observations.
+const VisionProfile = struct {
+    enabled: bool,
+    layer: usize,
+    gpu_ns: u128,
+    clock_ns: u64,
+    downloads: u64,
+
+    fn init(cb: *const ComputeBackend, layer: usize) VisionProfile {
+        const enabled = platform.env.getenvBool("ANTFLY_GEMMA4_VISION_PROFILE");
+        const stats = if (enabled) cb.debugTimingSnapshot().provider else @import("../ops/ops.zig").NativeQuantTimingStats{};
+        return .{ .enabled = enabled, .layer = layer, .gpu_ns = stats.decoder_runtime_frame_gpu_nanos, .clock_ns = if (enabled) platform.time.monotonicNs() else 0, .downloads = stats.metal_tensor_host_mirror_download_bytes };
+    }
+
+    fn phase(self: *VisionProfile, cb: *const ComputeBackend, label: []const u8) !void {
+        if (!self.enabled) return;
+        if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) try cb.decoderRuntimeFlushActiveFrame();
+        const stats = cb.debugTimingSnapshot().provider;
+        const clock = platform.time.monotonicNs();
+        std.debug.print("gemma4-vision-profile layer={d} phase={s} wall_ns={d} gpu_ns={d} download_bytes={d}\n", .{ self.layer, label, clock -| self.clock_ns, stats.decoder_runtime_frame_gpu_nanos -| self.gpu_ns, stats.metal_tensor_host_mirror_download_bytes -| self.downloads });
+        self.gpu_ns = stats.decoder_runtime_frame_gpu_nanos;
+        self.clock_ns = clock;
+        self.downloads = stats.metal_tensor_host_mirror_download_bytes;
+    }
+};
+
 fn encoderBlockBatch(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3270,12 +3328,21 @@ fn encoderBlockBatch(
     const total = batch * geometry.grid_x * geometry.grid_y;
     var buf: [128]u8 = undefined;
 
+    // One owned command frame per vision layer amortizes dispatch/wait costs.
+    // Existing active-frame owners retain their boundary. Runtime frame leases
+    // keep freed producer buffers alive until completion or cancellation.
+    var frame = false;
+    if (cb.kind() == .metal and !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and !cb.decoderRuntimeHasActiveFrame()) frame = try cb.decoderRuntimeBeginFrame();
+    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var profile = VisionProfile.init(cb, layer);
+
     const ln1 = try store.weightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
     defer cb.free(ln1);
     const normed1 = try cb.rmsNorm(input, ln1, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed1);
 
-    const attn = try selfAttentionBatch(cb, allocator, store, cfg, normed1, geometry, layer, &buf, batch);
+    try profile.phase(cb, "attention_pre_norm");
+    const attn = try selfAttentionBatch(cb, allocator, store, cfg, normed1, geometry, layer, &buf, batch, &profile);
     defer cb.free(attn);
     const attn_post = try store.weightCt(try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
     defer cb.free(attn_post);
@@ -3289,14 +3356,22 @@ fn encoderBlockBatch(
     const normed2 = try cb.rmsNorm(res1, ln2, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed2);
 
+    try profile.phase(cb, "attention_post_norm_residual");
     const ffn = try feedForward(cb, allocator, store, cfg, normed2, total, layer, &buf);
     defer cb.free(ffn);
+    try profile.phase(cb, "ffn");
     const ffn_post = try store.weightCt(try fmt(&buf, "v.blk.{d}.ffn_post_norm.weight", .{layer}));
     defer cb.free(ffn_post);
     const ffn_normed = try cb.rmsNorm(ffn, ffn_post, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(ffn_normed);
 
     const res2 = try cb.add(res1, ffn_normed);
+    errdefer cb.free(res2);
+    try profile.phase(cb, "ffn_post_norm_residual");
+    if (frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame = false;
+    }
     cb.free(res1);
     return res2;
 }
@@ -3311,6 +3386,7 @@ fn selfAttentionBatch(
     layer: usize,
     buf: *[128]u8,
     batch: usize,
+    profile: *VisionProfile,
 ) !CT {
     const sequence = geometry.grid_x * geometry.grid_y;
     const total = batch * sequence;
@@ -3326,6 +3402,7 @@ fn selfAttentionBatch(
         q = normed;
     }
 
+    try profile.phase(cb, "q_projection_norm_rope");
     var k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     defer cb.free(k);
     {
@@ -3336,6 +3413,7 @@ fn selfAttentionBatch(
         k = normed;
     }
 
+    try profile.phase(cb, "k_projection_norm_rope");
     var v = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     defer cb.free(v);
     {
@@ -3344,11 +3422,12 @@ fn selfAttentionBatch(
         v = normed;
     }
 
-    const mask = try allocator.alloc(i64, total);
-    defer allocator.free(mask);
-    @memset(mask, 1);
-    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, batch, sequence, cfg.head_count, head_dim);
+    try profile.phase(cb, "v_projection_norm");
+    // Cohorts have equal grids and no padded patch rows. An all-valid mask
+    // unnecessarily prevents Metal's model-scoped Flash dispatch.
+    const attn = try cb.scaledDotProductAttentionGemma4Vision(q, k, v, batch, sequence, cfg.head_count, head_dim);
     defer cb.free(attn);
+    try profile.phase(cb, "attention");
 
     return linearNoBiasMaybeClipped(cb, allocator, store, attn, try fmt(buf, "v.blk.{d}.attn_out", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
 }

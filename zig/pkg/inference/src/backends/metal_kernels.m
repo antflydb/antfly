@@ -46937,7 +46937,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->sdpa_f32_pipeline == nil) return -2;
-    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u || qwen3vl_vision_flash > 1u || nomic_mode > 1u) return -3;
+    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u || qwen3vl_vision_flash > 2u || nomic_mode > 1u) return -3;
     if (bias_mode != 0u && bias_handle == NULL) return -4;
     if (has_mask != 0u && mask_handle == NULL) return -5;
     if (batch > UINT32_MAX || seq_len > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX) return -6;
@@ -47014,7 +47014,9 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             runtime->sdpa_f32_vision_hd64_flash_q32_pipeline != nil &&
             runtime->sdpa_f32_vision_hd64_flash_q32_pipeline.threadExecutionWidth == 32u &&
             runtime->sdpa_f32_vision_hd64_flash_q32_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
-            (qwen3vl_vision_flash != 0u || termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_VISION_SDPA_HD64_FLASH_Q32"))) &&
+            ((qwen3vl_vision_flash == 1u ||
+              (qwen3vl_vision_flash == 2u && !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_GEMMA4_VISION_FLASH")))) ||
+             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_VISION_SDPA_HD64_FLASH_Q32"))) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_VISION_SDPA_HD64_FLASH_Q32"));
         const BOOL use_nomic_q8 = nomic_mode != 0u && bias_mode == 0u && layout == 1u &&
             (seq_len == 128u || (seq_len == 16u && batch >= 4u)) && head_dim == 64u &&
@@ -47041,7 +47043,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             ? runtime->sdpa_f32_nomic_q8_pipeline
             : (use_tg ? runtime->sdpa_f32_tg_pipeline : runtime->sdpa_f32_pipeline)))))));
         if (use_florence_window_hd32) runtime->florence_window_sdpa_dispatches += 1;
-        if (use_vision_hd64_flash_q32 && qwen3vl_vision_flash != 0u) runtime->qwen3vl_vision_flash_q32_dispatches += 1;
+        if (use_vision_hd64_flash_q32 && qwen3vl_vision_flash == 1u) runtime->qwen3vl_vision_flash_q32_dispatches += 1;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -14;

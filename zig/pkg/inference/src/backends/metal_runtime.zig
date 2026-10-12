@@ -7393,7 +7393,8 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     const bias_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "bias")) request.bias else null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
-    const qwen3vl_vision_flash: u32 = if (@hasField(@TypeOf(request), "qwen3vl_vision_flash") and request.qwen3vl_vision_flash) 1 else 0;
+    // Stable C ABI policy value: 0 generic, 1 Qwen3 VL, 2 Gemma4.
+    const qwen3vl_vision_flash: u32 = if (@hasField(@TypeOf(request), "gemma4_vision_flash") and request.gemma4_vision_flash) 2 else if (@hasField(@TypeOf(request), "qwen3vl_vision_flash") and request.qwen3vl_vision_flash) 1 else 0;
     if (bias_mode > 3) return null;
     if (bias_mode != 0 and (bias_tensor == null or !bias_tensor.?.isDevice())) return null;
     if (mask_tensor) |mask| {
@@ -43539,6 +43540,79 @@ test "metal native decoder runtime qwen3vl vision flash is scoped and matches ge
     const specialized_values = try specialized.toHostSlice();
     const after = runtimeMemorySnapshot(runtime);
     try std.testing.expectEqual(before.qwen3vl_vision_flash_q32_dispatches + 1, after.qwen3vl_vision_flash_q32_dispatches);
+    try std.testing.expectEqual(generic_values.len, specialized_values.len);
+    for (generic_values, specialized_values) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
+    }
+}
+
+test "metal gemma4 vision Flash preserves distinct batched rows" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const batch: usize = 2;
+    const seq_len: usize = 300;
+    const num_heads: usize = 2;
+    const head_dim: usize = 64;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    var q_data: [total]f32 = undefined;
+    var k_data: [total]f32 = undefined;
+    var v_data: [total]f32 = undefined;
+    for (&q_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 5 + 1) % 37)) - 18;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.015625;
+    }
+    for (&k_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 7 + 3) % 41)) - 20;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.0125;
+    }
+    for (&v_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 11 + 5) % 43)) - 21;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.01;
+    }
+
+    const shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    var q = try testDeviceTensorFromSlice(runtime, &q_data, &shape);
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_data, &shape);
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_data, &shape);
+    defer v.deinit();
+
+    var generic = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    })) orelse return error.UnexpectedNull;
+    defer generic.deinit();
+    const generic_values = try generic.toHostSlice();
+
+    const before = runtimeMemorySnapshot(runtime);
+    var specialized = (try decoderRuntimeSdpaF32Device(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .gemma4_vision_flash = true,
+    })) orelse return error.UnexpectedNull;
+    defer specialized.deinit();
+    const specialized_values = try specialized.toHostSlice();
+    const after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before.qwen3vl_vision_flash_q32_dispatches, after.qwen3vl_vision_flash_q32_dispatches);
     try std.testing.expectEqual(generic_values.len, specialized_values.len);
     for (generic_values, specialized_values) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
