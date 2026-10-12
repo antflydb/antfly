@@ -1,7 +1,10 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **478 implemented / 136 rejected / 73 superseded /
-899 unresolved**. Nine further cross-table INSERT/CTE, multi-row DO NOTHING and
+Current audited dispositions: **479 implemented / 136 rejected / 73 superseded /
+898 unresolved**. The unchanged original MD5 read now has independent PostgreSQL
+and mounted native HTTP evidence with nonempty, duplicate-preserving results.
+Its isolated profile retains case, NULL and UTF-8 witnesses without changing the
+existing 91-read golden. Nine further cross-table INSERT/CTE, multi-row DO NOTHING and
 qualified RETURNING contracts now have unchanged-source mounted native and
 PostgreSQL evidence. Every case verifies complete table postimages and genuine
 logical primary-key enforcement, rather than just affected counts or parsing.
@@ -46,7 +49,7 @@ Thirty-seven minimized witnesses now join the native and WASM regression gates;
 ten new scalar contracts verify the same corrected selection rules through
 SQL binding/execution. Full contract/upstream inventory, PostgreSQL 19, broader
 SQL/collation and durable-expression qualification remain open. These component
-improvements do not change the 899 unresolved original-case dispositions.
+improvements do not change the 898 unresolved original-case dispositions.
 
 SQL now uses the native Zig `antfly_regex.captures` interface in `lib/regex`.
 The vendored C engine and bridge have been removed. The existing byte/FST
@@ -100,6 +103,30 @@ five-row tie selection. Only these six originals gained disposition credit;
 their source SQL, parameters and profile rows are unchanged. Clock functions
 such as `now()` require a dedicated clock contract and cannot become sampled
 values in deterministic goldens.
+
+### Bounded text fingerprints and prefix comparisons
+
+The shared scalar VM implements PostgreSQL's text `md5` overload using native
+Zig, producing lowercase hexadecimal text with one 32-byte output allocation.
+It rejects typed non-text inputs and wrong arities with `42883`, preserves
+SQL NULL, admits output space before hashing and charges borrowed input bytes
+in cancellation-aware chunks. Prefix comparison uses no scratch allocation and
+charges only the candidate prefix rather than scanning the unrelated tail.
+
+The independent PostgreSQL oracle verifies 126 text/JSON contracts. Native tests
+cover exact output-space admission, work exhaustion, cancellation, all allocation
+failure points and fourfold subject growth under linear work and constant output
+space. These are resource-bound checks, not a latency benchmark. Mounted public
+SQL verifies scalar values, output types, NULL masks and diagnostics. The separate
+`digest_read` campaign qualifies only sql-0257; its `ACTIVE` input is backed by
+the pinned mega-branch `lower_dml.zig` MD5 regression. This does not certify the
+bytea overload, durable MD5 indexes or broader index activation.
+
+Discovery of ten unchanged JSON-tagged array-parameter reads on PostgreSQL 18.6
+returned `cannot cast type jsonb to text[]`. Their inputs and unresolved statuses
+are retained. Likewise `ends_with` is not an available PostgreSQL 18 function;
+no new SQL extension or completion credit was introduced for that historical
+source shape.
 
 ### Durable ARRAY constructor architecture
 
@@ -539,8 +566,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 478 implemented, 136 rejected and 73 superseded
-cases, with 899 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 479 implemented, 136 rejected and 73 superseded
+cases, with 898 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL

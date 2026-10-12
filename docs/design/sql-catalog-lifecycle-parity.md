@@ -3439,3 +3439,25 @@ additional evidence for a narrower validated rollout. Required stages are:
 
 None of these remaining stages earns original SQL-case completion by design
 intent alone. The 899 unresolved originals and public activation gates remain.
+
+### Native text fingerprint qualification
+
+The next independent SQL cohort adds the shared native text MD5 kernel and
+bounded prefix comparison; it does not change the approval-blocked native
+report-generation rollout above. The original sql-0257 SQL and parameter remain
+unchanged. Its separate `digest_read` profile uses the original mega-branch
+MD5 regression's uppercase `ACTIVE` witness, retaining duplicates, lowercase
+nonmatches, an explicitly nullable column and unrelated UTF-8 data. The existing
+91-read profile/golden is unchanged.
+
+Validation: the final Debug public API gate passed both the original digest and
+existing read tests (80/80 build steps, zero skipped/failed/leaked tests). Three
+focused native scalar tests passed strict semantics, quota/cancellation,
+constant-space linear-work scaling and allocation-fault sweeps. Independent
+PostgreSQL 18.6 checks passed the exact digest campaign, all 91 existing reads,
+126 scalar contracts and 118 oracle-generator tests. The Apache boundary audit
+and 20 inventory-verifier tests passed. This is not PostgreSQL 19 qualification,
+bytea-overload activation or a latency benchmark.
+
+The audited original inventory is now 479 implemented / 136 rejected /
+73 superseded / 898 unresolved. No other source cases received credit.

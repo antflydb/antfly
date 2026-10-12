@@ -221,7 +221,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, md5 };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -1988,7 +1988,7 @@ fn arity(function: Function, count: usize) !void {
         .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
-        .cardinality, .array_ndims, .jsonb_array_length, .initcap => count == 1,
+        .cardinality, .array_ndims, .jsonb_array_length, .initcap, .md5 => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
@@ -2006,7 +2006,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (arrayCompatibleFunction(function) or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2197,6 +2197,15 @@ const Binder = struct {
                         if (actual.kind != null and actual.kind != desired and !unknown) return error.SqlUndefinedFunction;
                     }
                     break :blk .{ .kind = if (function == .jsonb_extract_path) .json else .string, .element_type = if (function == .jsonb_extract_path) .jsonb else .text, .nullable = true };
+                }
+                if (function == .starts_with or function == .md5) {
+                    var nullable = false;
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != .string) return error.SqlUndefinedFunction;
+                        nullable = nullable or actual.nullable;
+                    }
+                    break :blk .{ .kind = if (function == .md5) .string else .boolean, .element_type = if (function == .md5) .text else .boolean, .nullable = nullable };
                 }
                 if (function == .jsonb_array_length or function == .initcap) {
                     const arg = call.args[0];
@@ -2727,7 +2736,7 @@ const Binder = struct {
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                         .concat_ws => if (i == 0) .string else null,
                         .jsonb_typeof, .jsonb_array_length => .json,
-                        .initcap => .string,
+                        .initcap, .md5 => .string,
                         .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
                         .split_part => if (i == 2) .integer else .string,
                         .overlay => if (i < 2) .string else .integer,
@@ -4471,7 +4480,40 @@ const Evaluator = struct {
                 if (function == .lower) _ = std.ascii.lowerString(output, output) else _ = std.ascii.upperString(output, output);
                 break :blk .{ .string = output };
             },
-            .starts_with => if (values[1] == .string) .{ .bool = std.mem.startsWith(u8, text_value, values[1].string) } else error.SqlTypeMismatch,
+            .starts_with => blk: {
+                if (values[1] != .string) return error.SqlTypeMismatch;
+                const affix = values[1].string;
+                if (affix.len > text_value.len) break :blk .{ .bool = false };
+                var offset: usize = 0;
+                while (offset < affix.len) {
+                    const end = offset + @min(256, affix.len - offset);
+                    try self.workOwner().charge(end - offset);
+                    if (!std.mem.eql(u8, text_value[offset..end], affix[offset..end])) break :blk .{ .bool = false };
+                    offset = end;
+                }
+                break :blk .{ .bool = true };
+            },
+            .md5 => blk: {
+                // SQL's compatibility fingerprint, not a security primitive.
+                // Hash borrowed UTF-8 bytes; retain only the fixed-size result.
+                try self.charge(32);
+                var digest = std.crypto.hash.Md5.init(.{});
+                var offset: usize = 0;
+                while (offset < text_value.len) {
+                    const end = offset + @min(256, text_value.len - offset);
+                    try self.workOwner().charge(end - offset);
+                    digest.update(text_value[offset..end]);
+                    offset = end;
+                }
+                const bytes = digest.finalResult();
+                const output = try self.alloc.alloc(u8, 32);
+                const hex = "0123456789abcdef";
+                for (bytes, 0..) |byte, i| {
+                    output[i * 2] = hex[byte >> 4];
+                    output[i * 2 + 1] = hex[byte & 15];
+                }
+                break :blk .{ .string = output };
+            },
             .trim, .ltrim, .rtrim => blk: {
                 const trim_chars = if (args.len == 1) " " else if (values[1] == .string) values[1].string else return error.SqlTypeMismatch;
                 var characters: std.AutoHashMapUnmanaged(u21, void) = .empty;
@@ -4926,6 +4968,7 @@ fn checkScalarKernelReference(bytes: []const u8) !void {
         };
         try std.testing.expect(case.@"error" == null);
         try std.testing.expectEqual(switch (case.oid.?) {
+            16 => arrays.ElementType.boolean,
             23 => arrays.ElementType.int32,
             25 => .text,
             3802 => .jsonb,
@@ -5013,6 +5056,76 @@ test "SQL initcap uses one bounded output allocation with cancellation and OOM c
             const value = try bound.evaluate(alloc, &.{}, &.{.{ .string = "héLLO😀wORLD" }}, .{});
             defer alloc.free(value.value.string);
             try std.testing.expectEqualStrings("HéLlo😀World", value.value.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "SQL affix and digest kernels bound work allocations and cancellation" {
+    const a = std.testing.allocator;
+    const input: [4096]u8 = @splat('a');
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for ([_][]const u8{"starts_with(s,$1)"}) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+        defer program.deinit();
+        // No scratch/output allocation, even for a long equal affix.
+        const result = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = &input }}, .{ .steps = 8192 });
+        try std.testing.expect(result.value.bool);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = &input }}, .{ .steps = 128 }));
+        // A tiny prefix must not scan or charge the unrelated large tail.
+        const short = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{.{ .string = "a" }}, .{ .steps = 16 });
+        try std.testing.expect(short.value.bool);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "md5(s)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    var memory: [32]u8 = undefined;
+    var exact = std.heap.FixedBufferAllocator.init(&memory);
+    const result = try program.evaluate(exact.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{});
+    try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", result.value.string);
+    try std.testing.expectError(error.OutOfMemory, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = &input })}, &.{}, .{ .steps = 128 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = "abc" })}, &.{}, .{ .output_bytes = 31 }));
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    try std.testing.expectError(error.QueryCanceled, program.evaluate(a, &.{Datum.json(.{ .string = &input })}, &.{}, .{ .checkpoint = Control.check, .checkpoint_context = &control }));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
+}
+
+test "SQL digest scaling retains constant output space and cleans allocation failures" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "md5(s)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    const input: [16384]u8 = @splat('a');
+    for ([_]usize{ 4096, 16384 }) |length| {
+        var memory: [32]u8 = undefined;
+        var exact = std.heap.FixedBufferAllocator.init(&memory);
+        // Fourfold subject growth admits exactly linear hashing work and no
+        // larger scratch/output allocation. This is not a latency benchmark.
+        const result = try program.evaluate(exact.allocator(), &.{Datum.json(.{ .string = input[0..length] })}, &.{}, .{ .steps = length + 128 });
+        try std.testing.expectEqual(@as(usize, 32), result.value.string.len);
+    }
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var expression = try @import("compiler.zig").compileScalar(alloc, "md5($1)", .{});
+            defer expression.deinit();
+            var bound = try bind(alloc, expression.expression, &.{}, &.{}, .{});
+            defer bound.deinit();
+            const result = try bound.evaluate(alloc, &.{}, &.{.{ .string = "héllo😀" }}, .{});
+            defer alloc.free(result.value.string);
+            try std.testing.expectEqualStrings("9c837c88949d76509749939beea9e092", result.value.string);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Harness.run, .{});

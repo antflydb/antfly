@@ -1293,6 +1293,7 @@ def main():
         "campaign",
         choices=[
             "read",
+            "digest_read",
             "typed_array_read",
             "aggregate_read",
             "set_read",
@@ -1356,6 +1357,7 @@ def main():
     with postgres() as db:
         if args.campaign in {
             "read",
+            "digest_read",
             "typed_array_read",
             "aggregate_read",
             "set_read",
