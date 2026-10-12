@@ -385,8 +385,8 @@ file's own title and a one-line description taken from its first paragraph.
   package-scoped and special-purpose test tiers.
 - [VOPR.md](VOPR.md) — VOPR: Deterministic Autonomous Testing for Antfly: the
   common VOPR engine and deterministic `std.Io` runtime integration.
-- [FLAKES.md](FLAKES.md) — Zig runtime flakes: recorded flake evidence,
-  reproduction conditions, and regression status.
+- [FLAKES.md](FLAKES.md) — Zig runtime flakes: table of flakes seen, where,
+  and whether they are open or closed (details in git history and PRs).
 - [BENCHMARKS.md](BENCHMARKS.md) — Benchmarks and build tools: commands for
   building and running benchmarks and tools from `zig/`.
 
