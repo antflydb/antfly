@@ -55,7 +55,7 @@ Run `make help` for the full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make build` | Build the `antfly` binary with the committed Antfarm assets |
-| `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
+| `make generate` | Join the public `openapi.yaml` and regenerate OpenAPI types, Go/TS/Python/Rust SDKs, and the embedded Antfarm dashboard |
 | `make fmt` | Format Zig, Go, Python, TypeScript, and Rust sources |
 | `make fmt-check` | Verify repository formatting without changing files |
 | `make repository-check` | Run formatting, SDK, memoryaf, and release-tooling checks serially |
@@ -63,7 +63,6 @@ Run `make help` for the full list. Key targets:
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
 | `make zig-test` | Run the Zig test aggregate |
-| `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
 | `make license-check` | Verify first-party license headers are present |

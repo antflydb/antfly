@@ -30,7 +30,6 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build              Build the Zig antfly binary"
-	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
 	@echo "  fmt                Format Zig, Go, Python, TypeScript, and Rust sources"
 	@echo "  fmt-check          Check Zig, Go, Python, TypeScript, and Rust formatting"
@@ -74,7 +73,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks release-scripting-test
+.PHONY: build generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check zig-checksums-check
 
 # Uses the committed antfarm build in zig/pkg/antfly/antfarm; `make generate`
@@ -83,14 +82,14 @@ build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
-build-docs:
-	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
-	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
-
 release-scripting-test:
 	scripts/release/test.sh
 
-generate: graph-identifier-generate build-docs tidy zig-source-catalog-generate
+generate: graph-identifier-generate
+	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
+	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
+	$(MAKE) tidy
+	$(MAKE) zig-source-catalog-generate
 	$(MAKE) zig-openapi-generate
 	@for mod in $(GO_MODULES); do \
 		echo "==> Generating in $$mod"; \
