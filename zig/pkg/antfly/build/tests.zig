@@ -3681,7 +3681,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster production managed index publication recovery exact replay"},
+        .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_managed_index_vopr_tests = b.addRunArtifact(production_cluster_managed_index_vopr_tests);
