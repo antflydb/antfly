@@ -975,6 +975,12 @@ tracked compute scopes. Four-row recognition improved to 40.139s versus
 passes. Two-row repeats changed a diagram transcript. This switch remains
 opt-in pending broader qualification; the normalization rollback is
 `TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE=1`.
+A later campaign changed a diagram transcript even with the new specialization
+option disabled, so the earlier pass does not establish repeatable exact text
+parity. `TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED=1` adds opt-in exact
+column-count Q4_0 kernels for two and three F32 rows; other rows retain their
+existing kernels. Six focused checks pass with this option on and off. Shared
+machine timing drift prevents an additional end-to-end speed claim.
 `ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME=1` also qualifies canonical one-token
 hidden/choice recovery past the local-attention window. K=2, including bonus
 acceptance, matched the complete OCR corpus but did not pass the speed gate.

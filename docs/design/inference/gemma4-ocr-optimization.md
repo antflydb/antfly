@@ -2,6 +2,86 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Upstream research and short-row specialization
+
+[The follow-up qualification](gemma4-ocr-q4-specialization.json) pins the new
+runtime, source research and measurements. The research checkout is llama.cpp
+`8bb3cf0d216a5ae48360179f2931daf284be4d01`. Its small-batch dispatch uses an
+exact three-column tile. The proposed
+[upstream multi-column kernels](https://github.com/ggml-org/llama.cpp/pull/29110)
+share activation slices and weight blocks, specialize the column count, and
+report gains on larger models. Our existing kernels already share weights;
+the useful differences are register-sized accumulators and removing the padded
+fourth column for three-row batches.
+
+`TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED=1` selects new two-/three-row
+Q4_0 kernels for F32 input/output. They retain the existing accumulation order,
+unroll fixed-size loops and use two SIMD groups for three rows, four for two.
+The prior kernels remain the fallback when disabled or unavailable, and for
+other row counts/formats. Existing small-batch/wide disable switches also
+prevent this path. Borrowed FFN runtimes copy the new pipeline handles.
+The four-row specialization was slower in the isolated probes and is excluded.
+On the actual backend, eight alternating off/on runs with 16 resident weight
+slots measured 33.43 versus 29.01 microseconds per operation for the two-row
+1,536-by-6,144 FFN projection (13.2% less GPU time). Every enabled sample was
+faster than every control sample, and output hashes matched. Three-row results
+had overlapping/drifting timing ranges and are not performance-qualified.
+Runtime teardown releases both new and prior wide-batch pipeline handles.
+
+The existing operator benchmark now accepts `--planned-linear-scope`, grouping
+independent linear operations into the decoder's tracked encoder scope. Use
+`--weight-slots 16` to rotate resident weights and avoid relying solely on a hot
+single matrix. Compare the same binary with the specialization switch at 0/1:
+
+```sh
+zig build inference-metal-bench -Doptimize=ReleaseFast -- \
+  --mode linear --rows 3 --in 6144 --out 1536 \
+  --warmup 4 --iters 15 --ops-per-frame 64 --weight-slots 16 \
+  --planned-linear-scope
+```
+
+A separate prototype adapted the narrow 64-output-by-8-row matrix tile discussed
+in [upstream issue 25250](https://github.com/ggml-org/llama.cpp/issues/25250).
+At 1,536-by-6,144 with rotating weights it took about 44 microseconds per op,
+versus 22/36/36 for the existing two-/three-/four-row kernels. FP16 input
+narrowing also changed the outputs. This prototype is excluded from serving;
+the larger-model proposal does not establish a gain at E2B's shapes.
+
+The assistant protocol audit agrees with pinned upstream
+[speculative decoding](https://github.com/ggml-org/llama.cpp/blob/8bb3cf0d216a5ae48360179f2931daf284be4d01/common/speculative.cpp)
+and [Gemma4 hidden-state output](https://github.com/ggml-org/llama.cpp/blob/8bb3cf0d216a5ae48360179f2931daf284be4d01/src/models/gemma4.cpp):
+fixed positions within a draft round, shared target KV, and post-final-norm
+target hidden states.
+The GGUF's tied `token_embd.weight` is Q8_0, while Antfly's prepared vocabulary
+head is BF16. That representation difference must be accounted for in future
+head comparisons; a Q6_K switch cannot optimize this head. Preserving the
+original quantized head is a research lead, not an implemented or measured win.
+
+The latest complete corpus campaign exposes a broader parity limit: four-row
+controls with specialization **disabled** also changed the diagram-page
+transcript (4,016 versus 4,057 total tokens). Enabling specialization matched
+one pass and changed the other. The earlier 40.139-second campaign remains a
+record of that run, but does not establish repeatable transcript parity under
+broader scheduling conditions. Both the matrix lane and this new kernel option
+remain opt-in. The mismatch's numerical/scheduling cause is not yet isolated.
+
+Full-corpus MTP output matched the ordinary control in both variants. Timing
+swung substantially with unrelated compilation on the shared machine, including
+roughly 17 to 48 seconds for identical two-page pilot work. These timings cannot
+establish an additional end-to-end speedup. Kernel-level results, all measured
+work/quality gates and the synthetic llama.cpp reference are recorded in JSON.
+The installed llama.cpp reference (0.5.0, build 11146, `7fe450e19`) used the
+same target GGUF with 310 synthetic prompt tokens and 128 generated positions
+per sequence, at batches 1/2/3/4. Two runs observed 103–118, 178–204, 208–213,
+and 215–235 generated tokens/second respectively. This excludes multimodal
+preparation, HTTP, sampling and transcription accuracy, and uses shorter
+contexts than much of the OCR corpus. It demonstrates small-batch decoder
+scaling on this hardware; it cannot rank complete OCR pipelines.
+
+Six focused checks pass with specialization enabled and again disabled,
+including F64 linear references over rows 2/3/4/5, widths 32/512/1536, offset
+inputs, a 257-column tail and zero rows; the FFN comparison now includes row 3.
+
 ## Parallel normalization and matrix scopes
 
 [The next qualification](gemma4-ocr-parallel-qualification.json) measures the
