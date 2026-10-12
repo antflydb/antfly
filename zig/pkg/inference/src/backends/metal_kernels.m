@@ -17070,6 +17070,16 @@ static void termite_metal_decode_runtime_clear_quant_linear_descriptor(termite_m
 int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime *runtime, size_t slot) {
     if (runtime == NULL) return -1;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -2;
+    // A cached ICB must not retain evicted/released prepared weights after
+    // their slot is cleared. Mapped aliases may share the same Metal buffer.
+    TermiteMetalMtpHeadWorkspace *mtp_head = runtime->mtp_head_workspace;
+    if (mtp_head != nil && (
+        runtime->linear_weight_buffers[slot] == mtp_head->lm_weight ||
+        runtime->linear_weight_buffers[slot] == mtp_head->centroid_weight ||
+        runtime->quant_linear_weight_buffers[slot] == mtp_head->lm_weight ||
+        runtime->quant_linear_weight_buffers[slot] == mtp_head->centroid_weight))
+        runtime->mtp_head_workspace = nil;
+
 
     runtime->linear_weight_buffers[slot] = nil;
     runtime->linear_bias_buffers[slot] = nil;
@@ -67216,4 +67226,5 @@ int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
     return rc != 0 ? rc : end_rc;
 }
 
+// Packed SIMD cluster ranking and candidate scoring.
 #include "metal_mtp_head_impl.h"

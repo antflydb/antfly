@@ -27,24 +27,23 @@ static const char *termite_mtp_head_source =
     "    if (type == 3) return float(((device const half *)w)[i]);\n"
     "    return ((device const float *)w)[i];\n"
     "}\n"
-    "kernel void mtp_centroids(device const float *x [[buffer(0)]], device const uchar *w [[buffer(1)]], device float *scores [[buffer(2)]], constant MtpHeadParams &p [[buffer(3)]], uint row [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+    "kernel void mtp_centroids(device const float *x [[buffer(0)]], device const uchar *w [[buffer(1)]], device float *scores [[buffer(2)]], constant MtpHeadParams &p [[buffer(3)]], uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+    "    uint row = tg * 8 + sg; if (row >= p.clusters) return;\n"
     "    float sum = 0; for (uint c = lane; c < p.hidden; c += 32) sum += x[c] * mtp_weight(w, row, c, p.hidden, p.centroid_type);\n"
     "    sum = simd_sum(sum); if (lane == 0) scores[row] = sum;\n"
     "}\n"
-    "kernel void mtp_clusters(device const float *scores [[buffer(0)]], device uint *ids [[buffer(1)]], constant MtpHeadParams &p [[buffer(2)]], uint tid [[thread_position_in_grid]]) {\n"
-    "    if (tid != 0) return;\n"
-    "    float top_scores[128]; uint top_ids[128];\n"
-    "    for (uint k = 0; k < p.topk; ++k) { top_scores[k] = -INFINITY; top_ids[k] = 0; }\n"
-    "    for (uint c = 0; c < p.clusters; ++c) {\n"
-    "        float score = scores[c]; if (!(score > top_scores[p.topk - 1])) continue;\n"
-    "        uint at = 0; while (at < p.topk && !(score > top_scores[at])) ++at;\n"
-    "        if (at == p.topk) continue;\n"
-    "        for (uint k = p.topk - 1; k > at; --k) { top_scores[k] = top_scores[k - 1]; top_ids[k] = top_ids[k - 1]; }\n"
-    "        top_scores[at] = score; top_ids[at] = c;\n"
+    "kernel void mtp_clusters(device const float *scores [[buffer(0)]], device uint *ids [[buffer(1)]], constant MtpHeadParams &p [[buffer(2)]], uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+    "    uint row = tg * 8 + sg; if (row >= p.clusters) return;\n"
+    "    float own = scores[row]; if (isnan(own)) own = -INFINITY;\n"
+    "    uint rank = 0;\n"
+    "    for (uint c = lane; c < p.clusters; c += 32) {\n"
+    "        float other = scores[c]; if (isnan(other)) other = -INFINITY;\n"
+    "        rank += uint(other > own || (other == own && c < row));\n"
     "    }\n"
-    "    for (uint k = 0; k < p.topk; ++k) ids[k] = top_ids[k];\n"
+    "    rank = simd_sum(rank); if (lane == 0 && rank < p.topk) ids[rank] = row;\n"
     "}\n"
-    "kernel void mtp_candidates(device const float *x [[buffer(0)]], device const uchar *w [[buffer(1)]], device const float *ordering [[buffer(2)]], device const uint *ids [[buffer(3)]], device float *scores [[buffer(4)]], device uint *tokens [[buffer(5)]], constant MtpHeadParams &p [[buffer(6)]], uint row [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+    "kernel void mtp_candidates(device const float *x [[buffer(0)]], device const uchar *w [[buffer(1)]], device const float *ordering [[buffer(2)]], device const uint *ids [[buffer(3)]], device float *scores [[buffer(4)]], device uint *tokens [[buffer(5)]], constant MtpHeadParams &p [[buffer(6)]], uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {\n"
+    "    uint row = tg * 8 + sg; if (row >= p.topk * (p.vocab / p.clusters)) return;\n"
     "    uint size = p.vocab / p.clusters, pos = ids[row / size] * size + row % size;\n"
     "    float mapped = ordering[pos]; bool valid = isfinite(mapped) && mapped >= 0 && mapped < float(p.vocab) && floor(mapped) == mapped;\n"
     "    uint token = valid ? uint(mapped) : 0; float sum = 0;\n"
@@ -112,7 +111,7 @@ int termite_metal_decode_runtime_mtp_cluster_head(
             id<MTLLibrary> library = [runtime->device newLibraryWithSource:[NSString stringWithUTF8String:termite_mtp_head_source] options:options error:&error];
             if (!library) { fprintf(stderr, "mtp_cluster_head_compile: %s\n", error.localizedDescription.UTF8String); return -6; }
             NSString *names[4] = {@"mtp_centroids", @"mtp_clusters", @"mtp_candidates", @"mtp_select"};
-            for (unsigned i = 0; i < 4; ++i) { w->pipelines[i] = termite_mtp_head_pipeline(runtime->device, library, names[i]); if (!w->pipelines[i]) return -6; }
+            for (unsigned i = 0; i < 4; ++i) { w->pipelines[i] = termite_mtp_head_pipeline(runtime->device, library, names[i]); if (!w->pipelines[i] || w->pipelines[i].maxTotalThreadsPerThreadgroup < (i < 3 ? 256 : 1)) return -6; }
             size_t candidates = topk * (vocab / clusters);
             w->input = [runtime->device newBufferWithLength:hidden * 4 options:MTLResourceStorageModePrivate];
             w->centroids = [runtime->device newBufferWithLength:clusters * 4 options:MTLResourceStorageModePrivate];
@@ -137,7 +136,7 @@ int termite_metal_decode_runtime_mtp_cluster_head(
             {w->input, w->lm_weight, w->ordering, w->cluster_ids, w->scores, w->tokens, w->params},
             {w->scores, w->tokens, w->result, w->params}
         };
-        NSUInteger counts[4] = {4, 3, 7, 4}, grids[4] = {clusters, 1, topk * (vocab / clusters), 1}, threads[4] = {32, 1, 32, 1};
+        NSUInteger counts[4] = {4, 3, 7, 4}, grids[4] = {(clusters + 7) / 8, (clusters + 7) / 8, (topk * (vocab / clusters) + 7) / 8, 1}, threads[4] = {256, 256, 256, 1};
         BOOL replay = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY"));
         if (replay && w->commands == nil) {
             MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
@@ -220,6 +219,8 @@ int termite_metal_decode_runtime_mtp_cluster_head_test(termite_metal_decode_runt
         uint32_t token = UINT32_MAX;
         if (termite_metal_decode_runtime_mtp_cluster_head(r, 0, 1, (__bridge void *)input, 16, (__bridge void *)order, 16, 64, 32, 3, 2, &token) != -2) return -4;
         if (termite_metal_decode_runtime_mtp_cluster_head(r, 0, 1, (__bridge void *)input, 16, (__bridge void *)order, 16, 64, 32, 4, 5, &token) != -2) return -4;
+        if (r->mtp_head_workspace == nil) return -5;
+        if (termite_metal_decode_runtime_clear_linear_slot(r, 0) != 0 || r->mtp_head_workspace != nil) return -5;
         return 0;
     }
 }
