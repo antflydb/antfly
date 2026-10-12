@@ -28424,6 +28424,11 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->q4_0_small_batch_r2_pipeline = nil;
     runtime->q4_0_small_batch_r4_pipeline = nil;
     runtime->q4_0_small_batch_r8_pipeline = nil;
+    runtime->q4_0_small_batch_r2_specialized_pipeline = nil;
+    runtime->q4_0_small_batch_r3_specialized_pipeline = nil;
+    runtime->q4_0_small_batch_r2_wide_pipeline = nil;
+    runtime->q4_0_small_batch_r4_wide_pipeline = nil;
+    runtime->q4_0_small_batch_r8_wide_pipeline = nil;
     runtime->q4_0_reduce_small_pipeline = nil;
     runtime->q4_0_reduce_sumsq_pipeline = nil;
     runtime->q4_0_reduce_f16_input_pipeline = nil;
