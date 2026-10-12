@@ -31,4 +31,3 @@ test-video-model success
       +- WriteFile tokenizer.json (reused)
       +- WriteFile video_prepare_shader.h (reused)
       +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
-

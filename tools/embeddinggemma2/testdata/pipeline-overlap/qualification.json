@@ -92,10 +92,10 @@
     "linux-arm64-original.json": "9721297820069aaa3170e934abd4380dc093414e00a5b8c2f2e37d2ac01187ad",
     "linux-arm64-webm.json": "24799403ecefc328a7fc13cd13484729dfba7acb91800183b5e55bac79bc573b",
     "linux-arm64-sampling.json": "4d677e0a91c62eaa6c3203f41ea4f4b521914f46f3585d97fe732a32a7fae77a",
-    "model-build-tests.log": "ab14b22d19e03bcbc9391fb2f782000700fa2bb7e4e9772c25c3f7f87b1875e1",
-    "video-tests.log": "b82ac796e02739af8861801f006dfabe7b37d4598e32f4d1d1526ac2652c14fb",
-    "cache-lifetime-tests.log": "cae9d8c7e6bdef048773969815a9f9fd2ab601703e425defb062a485d868f162",
-    "linux-arm64-build.log": "7120bf046cfcfa15ccae58ca4226315b7ea0a4a604c3a2f7f0dbe945e214851b"
+    "model-build-tests.log": "16b29b0bdea7203bc40e853e1e29093bc33682139cdf8c38879045ea55a9e0e7",
+    "video-tests.log": "81f00e4d923cea9b4ece8cf5da366adc5882e94c110b22b85aca9636247a1bc5",
+    "cache-lifetime-tests.log": "d92eaab7a55447e6a633f71795d21f49c0bae452e07305b096ef688d6c896bcf",
+    "linux-arm64-build.log": "eb926776f7bac3135229d37ef43f4842e66830d0dbdc78df61243562ca12ea80"
   },
   "remaining": [
     "Isolated throughput/latency and measured scheduling/reservation tuning",
@@ -104,5 +104,6 @@
     "Linux x86_64 runtime",
     "Broader live/HLS and extended DASH coverage",
     "Other requirements in the full non-CUDA goal"
-  ]
+  ],
+  "log_normalization": "Trailing blank lines removed from saved build/test logs; test results unchanged."
 }
