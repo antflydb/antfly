@@ -567,7 +567,9 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer cleanup()
-		if loc.First == 1 && loc.Size <= corpusMaxBytes {
+		// A range covering every page is the original file: serve it unchanged at
+		// any size. The consumer (Antfly) enforces its own configurable limit.
+		if loc.First == 1 {
 			pages, parseErr := corpusPDFPages(source, loc.Size)
 			if parseErr == nil && pages == loc.Last {
 				http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, source)
@@ -582,11 +584,6 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer func() { output.Close(); os.Remove(output.Name()) }()
 		if e = api.Trim(source, output, []string{fmt.Sprintf("%d-%d", loc.First, loc.Last)}, nil); e != nil {
 			http.Error(w, "PDF page extraction failed", 422)
-			return
-		}
-		info, e := output.Stat()
-		if e != nil || info.Size() > corpusMaxBytes {
-			http.Error(w, "PDF range exceeds 128 MiB; reduce --pages-per-record", 413)
 			return
 		}
 		http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, output)
