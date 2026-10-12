@@ -281,13 +281,11 @@ file's own title and a one-line description taken from its first paragraph.
   mutable AKNN index without prematurely replacing the current HBC
   implementation.
 - [VECTOR_STORE.md](VECTOR_STORE.md) — Separate Vector Store: Intended Design:
-  an experimental separate vector store with reference-based source payload
-  handling.
-- [VECTOR_STORE_REVIEW.md](VECTOR_STORE_REVIEW.md) — Vector store correctness
-  and design review — 2026-09-08: dated investigation log for vector-store
-  memory/recovery correctness work.
+  table-owned source-embedding store with reference-based payloads; the
+  creation default for fresh local single-shard standalone tables.
 - [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md) — VectorDBBench
-  Findings: the working evidence log for 50K/1M VectorDBBench investigation.
+  Findings: benchmark contract, confirmed rules, current reference numbers,
+  and the dense experiment-flag inventory.
 - [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md) — Dense Indexing
   Lifecycle: core implementation complete, with remaining rollout-gate
   qualification runs tracked in the file.
