@@ -3882,6 +3882,7 @@ const Evaluator = struct {
                     },
                     .jsonb_extract_path_text, .jsonb_extract_path => {
                         var value = try self.runDatum(call.args[0], depth + 1);
+                        var path_work = self.workBudget();
                         for (call.args[1..]) |arg| {
                             // Strict calls evaluate every argument, even after
                             // SQL NULL or a missing intermediate component.
@@ -3892,29 +3893,9 @@ const Evaluator = struct {
                             }
                             if (key.array != null or key.value != .string) return error.SqlTypeMismatch;
                             if (value.sql_null) continue;
-                            try self.workOwner().charge(key.value.string.len);
-                            value.value = switch (value.value) {
-                                .object => |object| object.get(key.value.string) orelse {
-                                    value = .{};
-                                    continue;
-                                },
-                                .array => |array| element: {
-                                    const ordinal = @import("json_path.zig").ordinal(key.value.string) catch {
-                                        value = .{};
-                                        continue;
-                                    };
-                                    const count: i64 = @intCast(array.items.len);
-                                    const position = if (ordinal < 0) count + ordinal else ordinal;
-                                    if (position < 0 or position >= count) {
-                                        value = .{};
-                                        continue;
-                                    }
-                                    break :element array.items[@intCast(position)];
-                                },
-                                else => {
-                                    value = .{};
-                                    continue;
-                                },
+                            value.value = try @import("json_path.zig").extract(value.value, key.value.string, &path_work) orelse {
+                                value = .{};
+                                continue;
                             };
                         }
                         if (value.sql_null) break :blk .{};

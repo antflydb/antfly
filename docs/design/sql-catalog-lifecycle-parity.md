@@ -4083,3 +4083,37 @@ was corrected by disabling backing-allocator resize, retaining every allocation
 cut; unmatched focused-test selectors were corrected before qualification.
 Fresh origin/main was already incorporated. This is local qualification, not
 remote CI or complete original-case parity; 898 originals remain unresolved.
+
+### Shared JSON path read boundary
+
+JSON path reads now use one allocation-free structural kernel over an already
+decoded, pinned operand. Its optional result represents a missing path, while
+a present JSON null remains a tagged JSON value. Object lookup, PostgreSQL
+int32 array ordinals, negative offsets and exact borrowed numeric tokens form
+the common boundary for query execution and upcoming durable activation. Query
+calls still evaluate later selected arguments after SQL NULL or a missing component;
+work and sticky cancellation remain attached to the enclosing invocation.
+The kernel has no allocator and repeated reads preserve payload addresses.
+
+Durable activation remains open. The next boundary is a real JSON operand in
+row_value.Value, excluded from ordered scalar keys, with SQL NULL outside the
+JSON payload. Parsed ingress should borrow its request-owned subtree; AROW
+should decode only referenced JSON columns into a row-scoped prepared-values
+owner, once across all defaults/generated/CHECK/index programs. The owner must
+not cache by ordinal in an invocation that spans multiple rows. Set.readValues
+already supplies a schema dependency mask and a shared values array; cold
+restore should use that same boundary. Tuple/index bindings currently execute
+plans separately and also need the shared prepared-row owner. Compilation,
+canonical literal identity, JSON result equality, generated restore verification,
+public grammar/client regeneration and reader capability fencing must all land
+before admitting durable JSON functions or claiming original sql-0671 parity.
+
+Shared-path qualification: full final-source SQL Debug passed 766 main-owner
+and 226 linked tests, with three existing skips and no failures/leaks (21/21
+steps). Both new kernel tests executed, including 10,000 borrowed reads and
+every observed cancellation cut. An isolated live PostgreSQL 18 runtime
+independently reproduced all 36 existing JSON path contracts, including result
+type OIDs, SQL NULL provenance and selected-argument failures. Formatting,
+source-catalog freshness, original inventory integrity and the 2,051-file Apache
+boundary passed. There is no public contract change requiring generation and
+no durable JSON activation or additional original-case credit in this checkpoint.
