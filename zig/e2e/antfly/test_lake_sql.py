@@ -4340,14 +4340,17 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                 "body": {"type": "string", "x-antfly-field": {"type": "text"}},
             }}}}, "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount"}], "include_columns": ["body"]}], "base_source": {
                 "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
-            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}}})
+            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}, "stored_text": {"type": "full_text", "field": "body", "store_source": True}}})
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
             assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
             sortable = call("GET", "/tables/paged_text/indexes/all_text")
             assert sortable["status"]["readiness"]["state"] != "failed", str(sortable) + server.debug_logs()
-            if resource["status"]["readiness"]["queryable"] and sortable["status"]["readiness"]["queryable"]:
+            stored = call("GET", "/tables/paged_text/indexes/stored_text")
+            assert stored["config"]["store_source"] is True, stored
+            assert stored["status"]["readiness"]["state"] != "failed", str(stored) + server.debug_logs()
+            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored)):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
@@ -4372,6 +4375,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             assert counted["hits"]["hits"] == []
             shapes = [
                 {"highlight": {"fields": ["body"]}},
+                {"full_text_index": "stored_text", "highlight": {"fields": ["body"]}},
                 {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
                 {"exclusion_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
                 {"filter_query": {"range": {"path": "/amount", "gte": 50}},

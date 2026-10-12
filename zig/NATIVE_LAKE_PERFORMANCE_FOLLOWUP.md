@@ -2661,9 +2661,19 @@ preserves exact NUMERIC and signed timestamps, null order and implicit public-ID
 ties. Backward pages retain the closest preceding winners and restore canonical
 output order. Compatible ordered-row index plans retain the existing global
 winning-prefix seek. Other sorted requests use native doc values within each
-window, rather than repeating a global ordered-index scan per window. Highlight planning retains
-only schema/analysis metadata and hydrates highlight dependencies after final
-ranking, including fields excluded from the public projection.
+window, rather than repeating a global ordered-index scan per window. Early
+highlight planning reads only authenticated configuration/schema metadata; it
+never opens the corpus merely to find highlight dependencies. Highlight fields
+excluded from the public projection hydrate after final ranking. When the index
+retains authenticated source, each final winner carries a compact segment-local
+coordinate rather than a reader pin. Delivery reopens one immutable segment at a
+time under the publication lease, checks the public document identity, and reuses
+one input region for hidden source while retaining only returned snippets.
+Discarded and offset-skipped candidates retain no highlight coordinates. The
+shared public request/response field contract now admits the documented boolean
+`store_source` option. Create-table and create-index normalization preserve true
+and false, omit SDK optional nulls, and reject non-boolean values; index responses
+retain the setting rather than silently dropping it.
 
 The winner heap forwards a trusted score cutoff to later windows. Native range,
 segment and posting bounds can prune before payload admission even before a local
@@ -2759,21 +2769,33 @@ pending.
 
 ### Current refinement qualification
 
-The branch includes `origin/main` through `0f7fec50c5`; the final merge was clean.
-Zig 0.17.0 Debug native qualification passed 105/105 combined production CLI,
-lake integration, public lake API, and bounded ranking build steps without
-allocator leaks. Lake integration roots passed 153 shared and 226 API tests;
-public lake API roots passed 153 shared and 208 API tests; bounded ranking roots
-passed 41 shared and 28 API tests, with one benchmark skipped. These are 809 test
-executions across the separate roots, including repeated shared contracts.
-All ten focused schema-cache tests and both focused object-store regressions
-also pass. After the final documentation/comment-only main merge, the production
-CLI rebuilt successfully in 48/48 steps using the worktree's default cache.
+The branch includes `origin/main` through `d1182ab89d`; the merge was clean.
+Zig 0.17.0 Debug CLI, lake integration, bounded ranking and both native boundary
+checks passed 102/102 combined build steps after that merge: 153 shared and 226
+API integration tests, plus 41 shared and 28 API bounded-ranking tests, with one
+benchmark skipped and no allocator leaks. Final native lake integration passed
+50/50 build steps and all 382 tests (153 shared, 229 API), without leaks. Final
+public option/compatibility normalization qualification passed 85/85 combined
+production CLI and focused API
+build steps, with all 43 table-contract regressions passing without leaks. Those
+checks include both create-table paths, create-index boolean normalization,
+exact large schema literals, private identity rejection, and every allocation
+failure during compatibility normalization. Existing assertions now account for
+current durable identities rather than requiring identity-free catalog entries.
 
-All 20 selected real Parquet/Iceberg E2Es pass against that final CLI. The expanded
+Earlier refinement qualification also passed the public lake API roots (153
+shared and 208 API tests), all ten focused schema-cache regressions, and both
+focused object-store regressions. Repeated shared roots are separate test
+executions, not distinct cases. The metadata-only highlight regression leaves
+the corpus cache uninitialized, proving dependency planning does not acquire
+readers. A final-winner regression verifies discarded and offset-skipped hits
+retain no stored-highlight coordinates.
+
+All 20 selected real Parquet/Iceberg E2Es pass against that final CLI (278 seconds). The expanded
 67-file fixture compares metadata includes/exclusions, field sorts, ordered-index
-prefix seeks, forward/backward cursors, hidden highlight dependencies, exact
-counts, scores and hydration with full admission, both before and after restart.
+prefix seeks, forward/backward cursors, hidden highlight dependencies, native
+stored-source highlighting, exact counts, scores and hydration with full admission,
+both before and after restart.
 The wide 129-column Parquet fixture now forces a long source URI and verifies
 single-table COUNT, join COUNT and 128 SUM reducers. Other selected E2Es cover
 large dynamic joins, exact NUMERIC covering/materialized paths, conservative
