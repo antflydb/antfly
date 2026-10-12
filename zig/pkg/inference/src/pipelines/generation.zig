@@ -10289,7 +10289,8 @@ pub const NativeGenerationPipeline = struct {
         if (!gemma4MtpActiveMaterializeEnabled()) return null;
         if (hidden_source != .final) return null;
         if (self.cb.kind() != .metal) return null;
-        if (!gemma4MtpActiveMaterializeSupported(self.cb.kind(), self.gpt_config, total_seq_len)) return null;
+        if (!gemma4MtpActiveMaterializeSupported(self.cb.kind(), self.gpt_config, total_seq_len) and
+            !getenvBool("ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME")) return null;
         if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
         var result = (try decoder_gated_runtime.forwardGreedyTokenAndFinalHidden(
             &self.cb,

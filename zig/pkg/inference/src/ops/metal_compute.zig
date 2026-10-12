@@ -26562,6 +26562,180 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    /// Quantized matrix operations span the cohort; only attention and RoPE
+    /// retain per-page positions and KV identities. One frame owns all work.
+    fn runGemma4MultirowDecode(
+        ctx: *anyopaque,
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        inputs: *const DecodeBatchHostInputs,
+    ) !bool {
+        const rows = request.items.len;
+        if (rows < 2 or rows > 4 or request.phase != .full or request.mode != .greedy_argmax or
+            request.contract != .gemma4_gated_ple_shared_kv or request.output_hidden != null or
+            request.input_token_ids != null or request.input_positions != null) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (metal_runtime.hasActiveFrame(runtime)) return false;
+        var cb = self.computeBackend();
+        var active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
+        if (!active_frame) return false;
+        errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+        var initial = (try prepareDecodeBatchInitialTensors(self, request, inputs)) orelse return error.NativeBatchedDecodeUnavailable;
+        defer initial.deinit();
+        var hidden = try initial.hidden.retainedCopy();
+        defer hidden.deinit();
+        const ple = if (initial.ple_vectors) |tensor| tensor else return error.NativeBatchedDecodeUnavailable;
+        const ple_shape = [_]i32{ @intCast(rows), @intCast(request.ple_hidden_size) };
+        const ple_layer_ct = (try allocUninitF32ShapeOp(ctx, &ple_shape)) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, ple_layer_ct);
+        const ple_layer_mt = try self.borrowedMetalTensorFromCt(ple_layer_ct);
+        for (request.layers, 0..) |layer, layer_index| {
+            try cb.checkExecutionControl();
+            const q_dim = request.num_attention_heads * layer.head_dim;
+            const kv_dim = layer.kv_heads * layer.head_dim;
+            var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .slot = layer.attn_pre_norm_slot,
+                .input = hidden,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+            }, &self.timing_stats)) orelse return error.NativeBatchedDecodeUnavailable;
+            defer normed.deinit();
+            var q = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = layer.q_linear_slot,
+                .input = normed,
+                .in_dim = request.hidden_size,
+                .out_dim = q_dim,
+            })) orelse return error.NativeBatchedDecodeUnavailable;
+            defer q.deinit();
+            var k: ?MetalTensor = null;
+            defer if (k) |*tensor| tensor.deinit();
+            var v: ?MetalTensor = null;
+            defer if (v) |*tensor| tensor.deinit();
+            if (!layer.shares_kv) {
+                k = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = layer.k_linear_slot,
+                    .input = normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = kv_dim,
+                })) orelse return error.NativeBatchedDecodeUnavailable;
+                v = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = layer.v_linear_slot,
+                    .input = normed,
+                    .in_dim = request.hidden_size,
+                    .out_dim = kv_dim,
+                })) orelse return error.NativeBatchedDecodeUnavailable;
+            }
+            const attn_shape = [_]i32{ @intCast(rows), @intCast(q_dim) };
+            const attn_ct = (try allocUninitF32ShapeOp(ctx, &attn_shape)) orelse return error.NativeBatchedDecodeUnavailable;
+            defer freeOp(ctx, attn_ct);
+            for (request.items, 0..) |item, row| {
+                const q_shape = [_]i32{ 1, @intCast(q_dim) };
+                var q_view = try q.retainedView(row * q_dim * @sizeOf(f32), q_dim * @sizeOf(f32), &q_shape);
+                defer q_view.deinit();
+                const q_scale: f32 = @sqrt(@as(f32, @floatFromInt(layer.head_dim)));
+                var q_rope = (try self.applyDecodeHeadNormRopeDeviceMt(q_view, layer.q_head_norm_slot orelse return error.NativeBatchedDecodeUnavailable, request.num_attention_heads, layer.head_dim, layer.rope_active_dim, item.attention.total_sequence_len - 1, layer.rope_theta, request.rope_freq_scale, request.rope_consecutive_pairs, q_scale)) orelse return error.NativeBatchedDecodeUnavailable;
+                defer q_rope.deinit();
+                var k_rope: ?MetalTensor = null;
+                defer if (k_rope) |*tensor| tensor.deinit();
+                var v_norm: ?MetalTensor = null;
+                defer if (v_norm) |*tensor| tensor.deinit();
+                if (!layer.shares_kv) {
+                    const kv_shape = [_]i32{ 1, @intCast(kv_dim) };
+                    var k_view = try k.?.retainedView(row * kv_dim * @sizeOf(f32), kv_dim * @sizeOf(f32), &kv_shape);
+                    defer k_view.deinit();
+                    var v_view = try v.?.retainedView(row * kv_dim * @sizeOf(f32), kv_dim * @sizeOf(f32), &kv_shape);
+                    defer v_view.deinit();
+                    k_rope = (try self.applyDecodeHeadNormRopeDeviceMt(k_view, layer.k_head_norm_slot orelse return error.NativeBatchedDecodeUnavailable, layer.kv_heads, layer.head_dim, layer.rope_active_dim, item.attention.total_sequence_len - 1, layer.rope_theta, request.rope_freq_scale, request.rope_consecutive_pairs, 1.0)) orelse return error.NativeBatchedDecodeUnavailable;
+                    v_norm = if (request.global_head_dim != 0)
+                        (try self.applyDecodeValueNormDeviceMt(v_view, layer.kv_heads, layer.head_dim, kv_dim, request.norm_eps)) orelse return error.NativeBatchedDecodeUnavailable
+                    else
+                        try v_view.retainedCopy();
+                }
+                const q_ct = try retainedCtFromMetalTensor(self, &q_rope);
+                defer freeOp(ctx, q_ct);
+                // Shared-KV layers do not consume K/V. Provide bounded unused
+                // placeholders with the expected shape, never unrelated Q rows.
+                const kv_shape = [_]i32{ 1, @intCast(kv_dim) };
+                const k_ct = if (k_rope) |*tensor| try retainedCtFromMetalTensor(self, tensor) else (try allocUninitF32ShapeOp(ctx, &kv_shape)) orelse return error.NativeBatchedDecodeUnavailable;
+                defer freeOp(ctx, k_ct);
+                const v_ct = if (v_norm) |*tensor| try retainedCtFromMetalTensor(self, tensor) else k_ct;
+                defer if (v_ct != k_ct) freeOp(ctx, v_ct);
+                var attention = item.attention;
+                attention.layer_index = layer.kv_layer_index;
+                attention.skip_kv_write = layer.shares_kv;
+                attention.sliding_window = layer.sliding_window;
+                const result = try gqaPagedAttentionOp(ctx, q_ct, k_ct, v_ct, null, attention, 1, request.num_attention_heads, layer.kv_heads, layer.head_dim);
+                defer freeOp(ctx, result);
+                if (!try copyRows2DOp(ctx, attn_ct, row, result, 0, 1, q_dim)) return error.NativeBatchedDecodeUnavailable;
+                const ple_offset = (row * request.layer_count + layer_index) * request.ple_hidden_size;
+                const ple_row_shape = [_]i32{ 1, @intCast(request.ple_hidden_size) };
+                var ple_view = try ple.retainedView(ple_offset * @sizeOf(f32), request.ple_hidden_size * @sizeOf(f32), &ple_row_shape);
+                defer ple_view.deinit();
+                const ple_row_ct = try retainedCtFromMetalTensor(self, &ple_view);
+                defer freeOp(ctx, ple_row_ct);
+                if (!try copyRows2DOp(ctx, ple_layer_ct, row, ple_row_ct, 0, 1, request.ple_hidden_size)) return error.NativeBatchedDecodeUnavailable;
+            }
+            const residual_ct = try retainedCtFromMetalTensor(self, &hidden);
+            defer freeOp(ctx, residual_ct);
+            const block_request = ops.RunGatedDecoderBlockRequest{
+                .q = null,
+                .k = null,
+                .v = null,
+                .residual = residual_ct,
+                .attention = request.items[0].attention,
+                .num_heads = request.num_attention_heads,
+                .num_kv_heads = layer.kv_heads,
+                .head_dim = layer.head_dim,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
+                .hidden_size = request.hidden_size,
+                .eps = request.norm_eps,
+                .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
+                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .intermediate_size = layer.intermediate_size,
+                .activation = request.activation,
+                .ple = null,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+                .output_scale_value = layer.output_scale_value,
+            };
+            const attn_mt = try self.borrowedMetalTensorFromCt(attn_ct);
+            const block = (try self.finishGatedDecoderBlockFromAttentionOutputMt(&block_request, layer_index, attn_mt, hidden, null)) orelse return error.NativeBatchedDecodeUnavailable;
+            // finishGatedLayerTailMt consumes the block on both success/error.
+            const next_hidden = (try self.finishGatedLayerTailMt(&block_request, layer_index, block, ple_layer_mt)) orelse return error.NativeBatchedDecodeUnavailable;
+            hidden.deinit();
+            hidden = next_hidden;
+            self.timing_stats.active_decode_layers += rows;
+        }
+        const hidden_ct = try retainedCtFromMetalTensor(self, &hidden);
+        defer freeOp(ctx, hidden_ct);
+        const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = request.final_norm_slot,
+            .input = hidden_ct,
+            .hidden_size = request.hidden_size,
+            .eps = request.norm_eps,
+        })) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, final_hidden);
+        const logits = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            .slot = request.final_lm_head_slot,
+            .input = final_hidden,
+            .in_dim = request.hidden_size,
+            .out_dim = request.vocab_size,
+        })) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, logits);
+        const choices = (try decoderRuntimeArgmaxRowsSuppressOp(ctx, logits, 0, rows, request.vocab_size, request.suppress_token_ids, self.allocator)) orelse return error.NativeBatchedDecodeUnavailable;
+        defer self.allocator.free(choices);
+        active_frame = false;
+        for (choices, request.output_token_ids) |token, *output| output.* = @intCast(token);
+        self.timing_stats.active_decode_frame_successes += 1;
+        return true;
+    }
+
     /// A bounded cohort of independent KV sequences. Each row uses the same
     /// prepared quantized kernels as singleton decode, with unique hidden/PLE
     /// carriers. Layer-major execution shares one frame and reuses hot weights.
@@ -27571,6 +27745,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (request.items.len > 1) {
             if (!active_decode_frame_enabled) return false;
+            if (std.c.getenv("ANTFLY_GEMMA4_METAL_OCR_MULTIROW") == null or getenvBool("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"))
+                return runGemma4MultirowDecode(ctx, self, request, &batch_inputs);
             return runCoordinatedGemma4Rows(ctx, self, request, &batch_inputs);
         }
         var active_frame = false;
