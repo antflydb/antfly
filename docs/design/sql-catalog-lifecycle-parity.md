@@ -2965,3 +2965,56 @@ replacement without relabeling an already-owned result. Synthetic sequencing
 also verifies that changing the current root does not change a returned root.
 All runs have zero skips, failures or leaks. Root provenance is not a signature
 or enrollment check; all activation and original-case boundaries above remain.
+
+### Authenticated metadata receipt submission and exact ACK observation
+
+Checkpoint `3fa1d2e707` exposes the existing transactional signed-receipt ACK
+through the internal system-catalog dispatcher. Submission and status require
+an explicit service credential plus a body-bound read grant; neither operation
+accepts an authority Boolean in its body. ACK submission is classified as a
+mutation, while exact status is a read and carries the normal metadata identity
+headers. The client checks that status belongs to the signing cluster.
+
+Before proposing, submission validates the signature, coordinated decoder
+capability, fresh readiness under the catalog mutation gate and the complete
+transactional receipt preflight. Committed apply independently repeats current
+root enrollment, reporter, placement, namespace, source observation and revision
+checks in the head/owner CAS transaction. A preflight is never a lease. Waiting
+for apply happens outside the mutation gate; timeout, lost authority or an
+unproved postimage remains an explicit unknown outcome.
+
+The bounded status response contains only the fixed head and selected owner.
+It neither loads the immutable plan/manifest nor scans the other owners. It
+verifies the exact stored receipt digest, not merely a changed revision, a phase
+or a count. An original-revision request can therefore resolve its committed
+receipt after a lost reply without replaying the mutation. Foreign attempts,
+incompatible owner identity and conflicting receipt hashes fail closed. This
+point observation remains recoverable after metadata is closed and reopened.
+
+The mutation client gives the transport outcome header precedence over its
+body: a conflict-looking body under an unknown outcome cannot become a
+definitely-not-proposed failure or trigger a retry. Known receipt rejections
+retain their exact HTTP and callback status identities; new callback detail
+codes are appended without renumbering existing wire outcomes.
+
+The frozen-source Debug `antfly-relational-index-ack-test` gate passed all 59
+build steps and 30 component executions: 26 publication/metadata components and
+four focused HTTP/dispatcher tests. These exercise native and Raft receipt
+positions, current-root rejection, status before commit, original-revision
+lost-reply resolution, reopen, body-bound authentication, callback errors,
+mutation-gate release and unknown-outcome handling. The direct callback status
+ABI gate passed all 26 tests. An earlier broad metadata-service run passed 137
+existing tests, but that target did not select the new HTTP tests; the focused
+ACK target above is the qualification for those tests. Inventory integrity,
+formatting, diff, control-catalog freshness and the Apache boundary pass.
+The same frozen checkpoint passed all 59 optimized ReleaseFast build steps
+and 30 component executions, with zero skips, failures or leaks. Fresh
+independent PostgreSQL lifecycle qualification passed all 16 oracle tests.
+
+This is the metadata progress connection, not automatic native owner signing,
+worker scheduling or full index activation. The public producer remains
+disabled. Full build/validation/install/release, hash-owner cohort coordination,
+coordinated cancellation/epoch retirement, restore/adoption and distributed
+fault qualification still require implementation and evidence. No original
+SQL case receives credit from this component gate; totals remain
+478 implemented / 136 rejected / 73 superseded / 899 unresolved.
