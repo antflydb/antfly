@@ -50,17 +50,19 @@ pub const PreparedResults = struct {
     handle: *State,
     const State = struct {
         allocator: std.mem.Allocator,
-        request_identity: usize,
-        txn_identity: usize,
+        request_identity: u64,
+        txn_identity: u64,
         values: []f64,
         namespace: []u8,
         ready: bool = false,
         disabled: bool = false,
         references: usize = 1,
         leases: usize = 0,
+        routing: ?@import("../storage/prepared_score_request.zig").ScoreRouting = null,
     };
 
     pub fn init(a: std.mem.Allocator, request: *const PreparedChunks, txn: *const @import("../storage/backend_erased.zig").ReadTxn) !@This() {
+        if (txn.identity == 0) return error.Unsupported;
         const namespace = txn.decodedResultsNamespace() orelse return error.Unsupported;
         var count: usize = 0;
         if (request.combinedRequest()) |combined| count = combined.readKeys().len else {
@@ -71,7 +73,7 @@ pub const PreparedResults = struct {
         errdefer a.destroy(state);
         const values = try a.alloc(f64, count);
         errdefer a.free(values);
-        state.* = .{ .allocator = a, .request_identity = @intFromPtr(request.handle), .txn_identity = @intFromPtr(txn.ptr), .values = values, .namespace = try a.dupe(u8, namespace) };
+        state.* = .{ .allocator = a, .request_identity = request.handle.identity, .txn_identity = txn.identity, .values = values, .namespace = try a.dupe(u8, namespace) };
         return .{ .handle = state };
     }
 
@@ -85,6 +87,7 @@ pub const PreparedResults = struct {
         state.references -= 1;
         if (state.references != 0) return;
         const a = state.allocator;
+        if (state.routing) |*routing| routing.deinit();
         a.free(state.values);
         a.free(state.namespace);
         a.destroy(state);
@@ -98,6 +101,8 @@ pub const PreparedResults = struct {
     }
 
     fn freeDisabled(state: *State) void {
+        if (state.routing) |*routing| routing.deinit();
+        state.routing = null;
         state.allocator.free(state.values);
         state.allocator.free(state.namespace);
         state.namespace = &.{};
@@ -109,7 +114,6 @@ pub const PreparedResults = struct {
     /// access and lease operations are exclusive, like existing prepared reads.
     pub const View = struct {
         state: *State,
-        request: PreparedChunks,
         pub const DenseColumn = struct {
             values: []const f64,
             pub fn len(self: @This()) usize {
@@ -123,15 +127,14 @@ pub const PreparedResults = struct {
         /// Contiguous logical-row view for sorted unique inputs. Arbitrary
         /// permutations and duplicate fanout use visit() without inverse maps.
         pub fn denseColumn(self: *const @This(), column: usize) ?DenseColumn {
-            const range = self.request.denseColumnRange(column) orelse return null;
+            const range = self.state.routing.?.denseColumnRange(column) orelse return null;
             return .{ .values = self.state.values[range.first..][0..range.count] };
         }
         pub fn visit(self: *const @This(), visitor: PreparedChunks.ScoreVisitor) void {
-            self.request.visitDecoded(self.state.values, visitor);
+            self.state.routing.?.visitDecoded(self.state.values, visitor);
         }
         pub fn deinit(self: *@This()) void {
             const state = self.state;
-            self.request.deinit();
             state.leases -= 1;
             if (state.leases == 0 and state.disabled) freeDisabled(state);
             release(state);
@@ -144,7 +147,7 @@ pub const PreparedResults = struct {
     /// or invalidated caches retain the ordinary bounded readColumns path.
     pub fn readView(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks) !ViewRead {
         const state = self.handle;
-        if (state.txn_identity != @intFromPtr(txn.ptr) or state.request_identity != @intFromPtr(request.handle)) return error.InvalidBatch;
+        if (state.txn_identity != txn.identity or state.request_identity != request.handle.identity) return error.InvalidBatch;
         if (state.disabled) return error.Unsupported;
         const namespace = txn.decodedResultsNamespace() orelse {
             state.ready = false;
@@ -169,15 +172,16 @@ pub const PreparedResults = struct {
             }
             state.ready = true;
         }
+        if (state.routing == null) state.routing = try @import("../storage/prepared_score_request.zig").ScoreRouting.init(state.allocator, request);
         state.references += 1;
         state.leases += 1;
-        return .{ .view = .{ .state = state, .request = request.retain() }, .stats = stats };
+        return .{ .view = .{ .state = state }, .stats = stats };
     }
 
     pub fn populate(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks, columns: []const []?f64) !Stats {
         try request.validateColumns(columns);
         const state = self.handle;
-        if (state.txn_identity != @intFromPtr(txn.ptr) or state.request_identity != @intFromPtr(request.handle)) return error.InvalidBatch;
+        if (state.txn_identity != txn.identity or state.request_identity != request.handle.identity) return error.InvalidBatch;
         if (state.disabled) return populateChunks(a, txn, request, columns);
         const namespace = txn.decodedResultsNamespace();
         if (namespace) |bytes| if (!std.mem.eql(u8, bytes, state.namespace)) {
@@ -292,8 +296,7 @@ pub fn prepareRequestForReuse(alloc: std.mem.Allocator, txn: anytype, prefixes: 
 pub fn populatePrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, columns: []const []?f64) !Stats {
     const plan = request.plan();
     if (!plan.valid) return error.InvalidBatch;
-    if (columns.len != plan.prefixes.len) return error.InvalidBatch;
-    for (columns) |column| if (column.len != plan.nodes.len) return error.InvalidBatch;
+    try @import("../storage/prepared_score_request.zig").validateScoreColumns(plan.nodes.len, plan.prefixes.len, columns);
     errdefer for (columns) |column| @memset(column, null);
     if (plan.read_keys.len == 0) {
         for (columns) |column| @memset(column, null);
@@ -403,18 +406,61 @@ fn decodePreparedScore(bytes: []const u8) !f64 {
     return score;
 }
 
-pub fn populate(
+pub fn populate(caller_alloc: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8, columns: []const []?f64) !Stats {
+    try @import("../storage/prepared_score_request.zig").validateScoreColumns(nodes.len, prefixes.len, columns);
+    return populateColumns(caller_alloc, txn, prefixes, nodes, columns);
+}
+
+/// One-shot decoded columns use the same bounded resolver and authentication as
+/// ordinary reads, with eight bytes per logical score and no large key owner.
+pub fn populateFloatColumns(a: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8, columns: []const []f64) !Stats {
+    try @import("../storage/prepared_score_request.zig").validateScoreColumns(nodes.len, prefixes.len, columns);
+    return populateColumns(a, txn, prefixes, nodes, columns);
+}
+fn clearColumn(column: anytype) void {
+    @memset(column, if (comptime @TypeOf(column) == []?f64) null else std.math.nan(f64));
+}
+fn setColumnScore(column: anytype, row: usize, score: ?f64) void {
+    column[row] = if (comptime @TypeOf(column) == []?f64) score else score orelse std.math.nan(f64);
+}
+const FloatPlanOutput = struct {
+    plan: *const @import("../storage/prepared_score_plan.zig").PreparedScorePlan,
+    columns: []const []f64,
+    fn write(ctx: *anyopaque, key: usize, score: ?f64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const first = if (key == 0) 0 else self.plan.ends[key - 1];
+        for (self.plan.targets[first..self.plan.ends[key]]) |target| {
+            const col = if (self.plan.column_order_identity) target.column else self.plan.column_remap[target.column];
+            const row = if (self.plan.row_order_identity) target.row else self.plan.row_remap[target.row];
+            setColumnScore(self.columns[col], row, score);
+        }
+    }
+    fn present(ctx: *anyopaque, key: usize, score: f64) void {
+        write(ctx, key, score);
+    }
+    fn decoded(ctx: *anyopaque, values: []const f64) void {
+        for (values, 0..) |value, key| write(ctx, key, if (std.math.isNan(value)) null else value);
+    }
+    fn completeSink(self: *@This()) @import("../storage/backend_types.zig").CompleteScoreSink {
+        return .{ .context = self, .write = write, .write_decoded = decoded };
+    }
+    fn sink(self: *@This()) @import("../storage/backend_types.zig").ScoreSink {
+        return .{ .context = self, .write = present };
+    }
+};
+
+fn populateColumns(
     caller_alloc: std.mem.Allocator,
     txn: anytype,
     prefixes: []const ?[]const u8,
     nodes: []const []const u8,
-    columns: []const []?f64,
+    columns: anytype,
 ) !Stats {
     std.debug.assert(prefixes.len == columns.len);
     for (columns) |column| {
         std.debug.assert(column.len == nodes.len);
     }
-    errdefer for (columns) |column| @memset(column, null);
+    errdefer for (columns) |column| clearColumn(column);
     if (nodes.len == 0) return .{};
     var has_prefix = false;
     for (prefixes) |prefix| if (prefix != null) {
@@ -422,7 +468,7 @@ pub fn populate(
         break;
     };
     if (!has_prefix) {
-        for (columns) |column| @memset(column, null);
+        for (columns) |column| clearColumn(column);
         return .{};
     }
     const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
@@ -440,17 +486,20 @@ pub fn populate(
             if (supported) if (active.preparedScorePlan()) |plan| {
                 const prepared = plan.prepare(active.preparedScoreAllocator(), prefixes, nodes) catch false;
                 if (prepared) prepared_read: {
-                    var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+                    var output = if (comptime @TypeOf(columns) == []const []?f64)
+                        @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns }
+                    else
+                        FloatPlanOutput{ .plan = plan, .columns = columns };
                     const complete = if (comptime @hasDecl(Scope, "visitPreparedScores"))
                         (if (comptime @hasDecl(Scope, "supportsPreparedScores")) active.supportsPreparedScores() else true)
                     else
                         false;
                     if (complete) {
                         for (columns, prefixes) |column, prefix| if (prefix == null) {
-                            @memset(column, null);
+                            clearColumn(column);
                         };
                     } else {
-                        for (columns) |column| @memset(column, null);
+                        for (columns) |column| clearColumn(column);
                     }
                     const read = if (comptime @hasDecl(Scope, "visitPreparedScores"))
                         (if (complete) active.visitPreparedScores(plan, output.completeSink()) else active.visitManySortedScores(plan.read_keys, output.sink()))
@@ -466,7 +515,7 @@ pub fn populate(
                             active.close();
                             scope = null;
                             scope = try txn.openReadScope(caller_alloc);
-                            for (columns) |column| @memset(column, null);
+                            for (columns) |column| clearColumn(column);
                             break :prepared_read;
                         },
                         else => return err,
@@ -481,7 +530,7 @@ pub fn populate(
             };
         }
     }
-    for (columns) |column| @memset(column, null);
+    for (columns) |column| clearColumn(column);
     const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
     defer alloc.free(physical);
@@ -582,14 +631,14 @@ pub fn populate(
         }
         if (visitor_direct and use_visitor) {
             const Output = struct {
-                columns: []const []?f64,
+                columns: @TypeOf(columns),
                 owners: []const usize,
                 unique: []const usize,
                 offset: usize,
                 fn write(ctx: *anyopaque, index: usize, score: f64) void {
                     const out: *@This() = @ptrCast(@alignCast(ctx));
                     const flat = out.offset + index;
-                    out.columns[out.owners[flat / out.unique.len]][out.unique[flat % out.unique.len]] = score;
+                    setColumnScore(out.columns[out.owners[flat / out.unique.len]], out.unique[flat % out.unique.len], score);
                 }
             };
             var output = Output{ .columns = columns, .owners = owners[0..owner_count], .unique = unique, .offset = offset };
@@ -598,7 +647,7 @@ pub fn populate(
             try scope.?.getManySortedScores(read_keys[0..len], decoded_scores[0..len]);
             for (decoded_scores[0..len], 0..) |score, i| {
                 const flat = offset + i;
-                columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+                setColumnScore(columns[owners[flat / unique_count]], unique[flat % unique_count], score);
             }
         } else {
             @memset(read_values[0..len], null);
@@ -616,7 +665,7 @@ pub fn populate(
                 const score: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .little));
                 if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
                 const flat = offset + i;
-                columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+                setColumnScore(columns[owners[flat / unique_count]], unique[flat % unique_count], score);
             }
         }
         if (scoped and @hasDecl(Scope, "reset")) {
@@ -642,7 +691,7 @@ pub fn populate(
     var owner = physical[0];
     for (physical[1..physical_count]) |column| {
         if (std.mem.eql(u8, prefixes[owner].?, prefixes[column].?)) {
-            @memcpy(columns[column], columns[owner]);
+            if (columns[column].ptr != columns[owner].ptr) @memcpy(columns[column], columns[owner]);
         } else owner = column;
     }
     return stats;

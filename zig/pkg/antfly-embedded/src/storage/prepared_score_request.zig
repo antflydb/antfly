@@ -233,6 +233,31 @@ pub const PreparedScoreRequest = struct {
 /// limits; native workspace retention is unchanged. Total ownership is charged
 /// to the caller allocator. Global duplicate fanout is compiled once, including
 /// duplicates crossing chunk boundaries; no input bytes are compared on reads.
+var next_request_owner_identity = std.atomic.Value(u64).init(1);
+fn newRequestOwnerIdentity() u64 {
+    const id = next_request_owner_identity.fetchAdd(1, .monotonic);
+    if (id == 0 or id == std.math.maxInt(u64)) @panic("score request owner identity exhausted");
+    return id;
+}
+
+/// Output aliasing is allowed only for identical spans. Partial overlap cannot
+/// represent independent logical rows; reject it before any delivery or clear.
+pub fn validateScoreColumns(rows: usize, count: usize, columns: anytype) !void {
+    if (columns.len != count) return error.InvalidBatch;
+    for (columns) |column| if (column.len != rows) return error.InvalidBatch;
+    if (columns.len <= 1 or rows == 0) return;
+    for (columns, 0..) |column, i| {
+        const start = @intFromPtr(column.ptr);
+        const end = std.math.add(usize, start, try std.math.mul(usize, rows, @sizeOf(@TypeOf(column[0])))) catch return error.InvalidBatch;
+        for (columns[0..i]) |prior| {
+            const other = @intFromPtr(prior.ptr);
+            if (other == start or rows == 0) continue;
+            const other_end = std.math.add(usize, other, try std.math.mul(usize, rows, @sizeOf(@TypeOf(column[0])))) catch return error.InvalidBatch;
+            if (start < other_end and other < end) return error.InvalidBatch;
+        }
+    }
+}
+
 pub const PreparedScoreChunks = struct {
     handle: *const State,
     const State = struct {
@@ -240,12 +265,14 @@ pub const PreparedScoreChunks = struct {
         rows: usize,
         row_order_identity: bool,
         column_owners: []const usize,
+        column_next: []const usize = &.{},
         row_heads: []const usize,
         duplicate_next: []const usize,
         chunks: []const Chunk,
         combined: ?PreparedScoreRequest = null,
         unique_rows: usize = 0,
         references: usize = 1,
+        identity: u64,
     };
     const absent = std.math.maxInt(usize);
     pub const Chunk = struct {
@@ -255,6 +282,7 @@ pub const PreparedScoreChunks = struct {
     };
 
     pub fn init(a: std.mem.Allocator, prefixes: []const ?[]const u8, nodes: []const []const u8) !@This() {
+        const identity = newRequestOwnerIdentity();
         const state = try a.create(State);
         errdefer a.destroy(state);
         // Preserve the decoded cache and full fanout when the entire request
@@ -268,7 +296,7 @@ pub const PreparedScoreChunks = struct {
             else => return err,
         } else null;
         if (combined) |request| {
-            state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = true, .column_owners = &.{}, .row_heads = &.{}, .duplicate_next = &.{}, .chunks = &.{}, .combined = request };
+            state.* = .{ .allocator = a, .identity = identity, .rows = nodes.len, .row_order_identity = true, .column_owners = &.{}, .row_heads = &.{}, .duplicate_next = &.{}, .chunks = &.{}, .combined = request };
             return .{ .handle = state };
         }
         const owners = try a.alloc(usize, prefixes.len);
@@ -286,8 +314,20 @@ pub const PreparedScoreChunks = struct {
             }
             owners[column] = entry.value_ptr.*;
         };
+        const column_next = try a.alloc(usize, owners.len);
+        errdefer a.free(column_next);
+        @memset(column_next, absent);
+        var reverse = owners.len;
+        while (reverse != 0) {
+            reverse -= 1;
+            const owner = owners[reverse];
+            if (owner != absent and owner != reverse) {
+                column_next[reverse] = column_next[owner];
+                column_next[owner] = reverse;
+            }
+        }
         if (nodes.len == 0 or columns.items.len == 0) {
-            state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = true, .column_owners = owners, .row_heads = &.{}, .duplicate_next = &.{}, .chunks = &.{} };
+            state.* = .{ .allocator = a, .identity = identity, .rows = nodes.len, .row_order_identity = true, .column_owners = owners, .column_next = column_next, .row_heads = &.{}, .duplicate_next = &.{}, .chunks = &.{} };
             return .{ .handle = state };
         }
         // Prove sorted uniqueness before allocating sort/fanout scratch.
@@ -381,7 +421,7 @@ pub const PreparedScoreChunks = struct {
         // target budget yet deduplicate to one canonical batch. It can reuse
         // decoded scores just like a combined full plan.
         if (chunks.items.len == 1) @constCast(chunks.items[0].request.handle).payload.canonical.retain_decoded = true;
-        state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .row_heads = order, .duplicate_next = next, .chunks = try chunks.toOwnedSlice(a), .unique_rows = unique_count };
+        state.* = .{ .allocator = a, .identity = identity, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .column_next = column_next, .row_heads = order, .duplicate_next = next, .chunks = try chunks.toOwnedSlice(a), .unique_rows = unique_count };
         return .{ .handle = state };
     }
 
@@ -399,6 +439,7 @@ pub const PreparedScoreChunks = struct {
         const a = state.allocator;
         a.free(state.chunks);
         a.free(state.column_owners);
+        a.free(state.column_next);
         a.free(state.row_heads);
         a.free(state.duplicate_next);
         a.destroy(state);
@@ -440,8 +481,7 @@ pub const PreparedScoreChunks = struct {
     }
     pub fn validateColumns(self: *const @This(), columns: []const []?f64) !void {
         const count = if (self.combinedRequest()) |request| request.plan().prefixes.len else self.handle.column_owners.len;
-        if (columns.len != count) return error.InvalidBatch;
-        for (columns) |column| if (column.len != self.handle.rows) return error.InvalidBatch;
+        try validateScoreColumns(self.handle.rows, count, columns);
     }
 
     pub const Output = struct {
@@ -564,7 +604,11 @@ pub const PreparedScoreChunks = struct {
         var row = if (self.handle.row_order_identity) canonical_row else self.handle.row_heads[canonical_row];
         while (row != absent) {
             // Duplicate columns share the canonical value, never a copied slab.
-            for (self.handle.column_owners, 0..) |owner, col| if (owner == column) visitor.write(visitor.context, col, row, value);
+            var col = column;
+            while (col != absent) {
+                visitor.write(visitor.context, col, row, value);
+                col = self.handle.column_next[col];
+            }
             row = if (self.handle.row_order_identity or self.handle.duplicate_next.len == 0) absent else self.handle.duplicate_next[row];
         }
     }
@@ -579,6 +623,107 @@ pub const PreparedScoreChunks = struct {
         for (self.handle.column_owners, 0..) |owner, column| {
             if (owner != absent and owner != column and columns[column].ptr != columns[owner].ptr) @memcpy(columns[column], columns[owner]);
         }
+    }
+};
+
+/// Independently owned score-to-logical-row routing, containing no key bytes,
+/// storage handles, or borrowed descriptors. Constructed once per view cache.
+pub const ScoreRouting = struct {
+    const absent = std.math.maxInt(usize);
+    pub const Column = struct { first: usize = absent, indices: []usize = &.{} };
+    allocator: std.mem.Allocator,
+    rows: usize,
+    columns: []Column,
+    row_map: []usize = &.{},
+
+    pub fn init(a: std.mem.Allocator, request: *const PreparedScoreChunks) !@This() {
+        const count = if (request.combinedRequest()) |r| r.plan().prefixes.len else request.handle.column_owners.len;
+        var self = @This(){ .allocator = a, .rows = request.handle.rows, .columns = try a.alloc(Column, count) };
+        @memset(self.columns, .{});
+        errdefer self.deinit();
+        if (request.combinedRequest()) |r| {
+            const plan = r.plan();
+            if (plan.dense_columns and plan.row_order_identity) {
+                for (plan.column_sorted[0..plan.column_count], 0..) |column, ordinal| {
+                    self.columns[if (plan.column_order_identity) column else plan.column_remap[column]].first = ordinal * self.rows;
+                }
+            } else {
+                for (plan.prefixes, 0..) |prefix, col| if (prefix != null) {
+                    self.columns[if (plan.column_order_identity) col else plan.column_remap[col]].indices = try a.alloc(usize, self.rows);
+                };
+                var first: usize = 0;
+                for (plan.ends, 0..) |end, key| {
+                    for (plan.targets[first..end]) |target| {
+                        const col = if (plan.column_order_identity) target.column else plan.column_remap[target.column];
+                        const row = if (plan.row_order_identity) target.row else plan.row_remap[target.row];
+                        self.columns[col].indices[row] = key;
+                    }
+                    first = end;
+                }
+            }
+            return self;
+        }
+        if (!request.handle.row_order_identity) {
+            self.row_map = try a.alloc(usize, self.rows);
+            for (request.handle.row_heads[0..request.handle.unique_rows], 0..) |head, unique| {
+                var row = head;
+                while (row != absent) {
+                    self.row_map[row] = unique;
+                    row = if (request.handle.duplicate_next.len == 0) absent else request.handle.duplicate_next[row];
+                }
+            }
+        }
+        var offset: usize = 0;
+        for (request.chunkPlans()) |chunk| {
+            const keys = chunk.request.readKeys().len;
+            if (chunk.request.hasRoutes()) {
+                for (0..keys) |key| for (chunk.request.routes(key)) |target| {
+                    const col = &self.columns[target.column];
+                    if (col.indices.len == 0) col.indices = try a.alloc(usize, request.handle.unique_rows);
+                    col.indices[target.row] = offset + key;
+                };
+            } else if (self.columns[chunk.column].first == absent) {
+                self.columns[chunk.column].first = offset;
+            }
+            offset += keys;
+        }
+        // Alias descriptors borrow the owner's index slice; only owners free it.
+        for (request.handle.column_owners, 0..) |owner, col| if (owner != absent and owner != col) {
+            self.columns[col] = self.columns[owner];
+        };
+        return self;
+    }
+    pub fn deinit(self: *@This()) void {
+        for (self.columns, 0..) |column, i| {
+            if (column.indices.len == 0) continue;
+            var shared = false;
+            for (self.columns[0..i]) |prior| if (prior.indices.ptr == column.indices.ptr) {
+                shared = true;
+                break;
+            };
+            if (!shared) self.allocator.free(column.indices);
+        }
+        self.allocator.free(self.row_map);
+        self.allocator.free(self.columns);
+        self.* = undefined;
+    }
+    pub fn scoreIndex(self: *const @This(), col: usize, row: usize) ?usize {
+        const column = self.columns[col];
+        const canonical = if (self.row_map.len == 0) row else self.row_map[row];
+        if (column.indices.len != 0) return column.indices[canonical];
+        return if (column.first == absent) null else column.first + canonical;
+    }
+    pub fn denseColumnRange(self: *const @This(), col: usize) ?struct { first: usize, count: usize } {
+        if (col >= self.columns.len or self.row_map.len != 0) return null;
+        const column = self.columns[col];
+        if (column.first == absent or column.indices.len != 0) return null;
+        return .{ .first = column.first, .count = self.rows };
+    }
+    pub fn visitDecoded(self: *const @This(), scores: []const f64, visitor: PreparedScoreChunks.ScoreVisitor) void {
+        for (self.columns, 0..) |_, col| for (0..self.rows) |row| {
+            const value = if (self.scoreIndex(col, row)) |index| scores[index] else std.math.nan(f64);
+            visitor.write(visitor.context, col, row, if (std.math.isNan(value)) null else value);
+        };
     }
 };
 
@@ -788,4 +933,20 @@ fn permutationAllocationFailureCase(a: std.mem.Allocator) !void {
 
 test "prepared score unique permutations omit duplicate chains and release allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, permutationAllocationFailureCase, .{});
+}
+
+fn routingFailureCase(a: std.mem.Allocator, request: *const PreparedScoreChunks) !void {
+    var routing = try ScoreRouting.init(a, request);
+    defer routing.deinit();
+    try std.testing.expectEqual(request.handle.rows, routing.rows);
+}
+test "prepared score detached routing releases allocation failures" {
+    const a = std.testing.allocator;
+    var small = try PreparedScoreChunks.init(a, &.{ "p/", null, "q/", "p/" }, &.{ "b", "a", "b" });
+    defer small.deinit();
+    try std.testing.checkAllAllocationFailures(a, routingFailureCase, .{&small});
+    const nodes: [5000][]const u8 = @splat("a");
+    var large = try PreparedScoreChunks.init(a, &.{ "p/", null, "q/", "p/" }, &nodes);
+    defer large.deinit();
+    try std.testing.checkAllAllocationFailures(a, routingFailureCase, .{&large});
 }

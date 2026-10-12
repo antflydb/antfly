@@ -20139,6 +20139,23 @@ pub const GraphIndex = struct {
             return read.view;
         }
 
+        /// Independently owned, logical-order decoded columns for one-shot
+        /// stage reads. Caller owns the arrays; native working retention stays
+        /// bounded and no query-wide encoded key owner is constructed.
+        pub fn readDecodedColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64) !void {
+            var buffer: [32]?[]const u8 = undefined;
+            const selected = if (names.len <= buffer.len) buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > buffer.len) alloc.free(selected);
+            for (names, selected) |name, *prefix| {
+                prefix.* = for (self.statuses, self.prefixes) |status, value| {
+                    if (std.mem.eql(u8, status.name, name)) break value;
+                } else return error.InvalidQueryRequest;
+            }
+            const read = try score_read.populateFloatColumns(alloc, &self.txn, selected, nodes, columns);
+            self.reads.keys += read.keys;
+            self.reads.batches += read.batches;
+        }
+
         /// Opt in only when the caller knows this session will repeat reads.
         /// Ordinary staged and short-lived sessions keep the warmed mutable plan.
         pub fn enablePreparedReuse(self: *@This()) void {

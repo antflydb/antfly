@@ -465,13 +465,21 @@ pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
     return readScopeFrom(alloc, Scope{ .cursor = cursor, .scratch = @import("../segment_source.zig").Scratch.init(alloc, 256 * 1024) });
 }
 
+var next_read_transaction_identity = std.atomic.Value(u64).init(1);
+fn newReadTransactionIdentity() u64 {
+    const id = next_read_transaction_identity.fetchAdd(1, .monotonic);
+    if (id == 0 or id == std.math.maxInt(u64)) @panic("read transaction identity exhausted");
+    return id;
+}
+
 pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
+    identity: u64 = 0,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        decoded_results_namespace: ?*const fn (*anyopaque) []const u8 = null,
+        decoded_results_namespace: ?*const fn (*anyopaque) ?[]const u8 = null,
         can_reuse_decoded_results: ?*const fn (*anyopaque) bool = null,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
@@ -1441,7 +1449,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn decodedResultsNamespace(ptr: *anyopaque) []const u8 {
+        fn decodedResultsNamespace(ptr: *anyopaque) ?[]const u8 {
             return unbox(ptr).handle.decodedResultsNamespace();
         }
 
@@ -1507,6 +1515,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
+        .identity = newReadTransactionIdentity(),
         .vtable = &.{
             .decoded_results_namespace = if (@hasDecl(Handle, "decodedResultsNamespace")) vt.decodedResultsNamespace else null,
             .can_reuse_decoded_results = if (@hasDecl(Handle, "canReuseDecodedResults")) vt.canReuseDecodedResults else null,
