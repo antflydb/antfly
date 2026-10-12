@@ -691,7 +691,7 @@ split-storage `antfly` and `capi` topology.
 
 For a genuine cold comparison, add different empty paths on both sides. Keep
 them inside the worktree (under the ignored `.zig-cache/`), never in `/tmp` or
-`~/.cache` (see the build-cache rules in `AGENTS.md`), and delete them when the
+`~/.cache` (see the [build-cache rules](../AGENTS.md#build-caches)), and delete them when the
 comparison is recorded:
 
 ```sh
