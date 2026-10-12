@@ -504,7 +504,7 @@ pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
     return readScopeFrom(alloc, Scope{ .cursor = cursor, .scratch = @import("../segment_source.zig").Scratch.init(alloc, 256 * 1024) });
 }
 
-var next_read_transaction_identity = std.atomic.Value(u64).init(1);
+var next_read_transaction_identity = platform.atomic.Value(u64).init(1);
 fn newReadTransactionIdentity() u64 {
     const id = next_read_transaction_identity.fetchAdd(1, .monotonic);
     if (id == 0 or id == std.math.maxInt(u64)) @panic("read transaction identity exhausted");
