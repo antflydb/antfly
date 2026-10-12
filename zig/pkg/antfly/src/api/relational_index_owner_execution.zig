@@ -61,12 +61,14 @@ pub const Result = union(enum) {
         }
     },
     applied: std.json.Parsed(native.Outcome),
+    controlled: struct { root_generation: u64, outcome: std.json.Parsed(native.Outcome) },
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
             .acknowledged => {},
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
+            .controlled => |value| value.outcome.deinit(),
         }
         self.* = undefined;
     }
@@ -77,6 +79,17 @@ pub const Result = union(enum) {
             .acknowledged => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
+            .controlled => |value| value.outcome.value,
+        };
+    }
+
+    /// Admission alone has no publication receipt. Never reconstruct a root
+    /// for signing from current routing after this result's lease was released.
+    pub fn rootGeneration(self: *const Result) ?u64 {
+        return switch (self.*) {
+            .recovered => |value| value.root_generation,
+            .controlled => |value| value.root_generation,
+            .acknowledged, .applied => null,
         };
     }
 };
@@ -387,7 +400,8 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const command = try permission.value.nativeControl(hot_request, binding);
         // The source rechecks activity immediately before compiled dispatch,
         // and returns committed pending outcomes even if cancellation follows.
-        return .{ .applied = try source.applyNativeIndexOwnerControl(alloc, request.group_id, table_name, command, context) };
+        const controlled = try source.applyNativeIndexOwnerControlAtRoot(alloc, request.group_id, table_name, command, context);
+        return .{ .controlled = .{ .root_generation = controlled.root_generation, .outcome = controlled.outcome } };
     }
     if (request.operation != .fence) return error.GenerationAdmissionPending;
     // Fetch large immutable inputs only for a genuinely absent admission. This
@@ -591,15 +605,15 @@ const TestDriver = struct {
         return parsed(native.ClaimCleanupMaintenanceOutcome, alloc, .{ .advanced = true, .claims_retired = true });
     }
 
-    pub fn applyNativeIndexOwnerControl(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.Command, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
+    pub fn applyNativeIndexOwnerControlAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.Command, _: operation.RequestContext) !@FieldType(Result, "controlled") {
         self.controls += 1;
         if (self.fail_control) return error.ReceiverControlFailed;
         try std.testing.expect(command.inputs_b64 == null);
-        return parsed(native.Outcome, alloc, .{
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.Outcome, alloc, .{
             .binding = command.binding,
             .position = .{ .namespace = command.binding.fence.namespace, .sequence = 2 },
             .duplicate = false,
-        });
+        }) };
     }
 };
 
@@ -861,6 +875,7 @@ test "relational index publication native receiver stages one effect recovers pe
         defer result.deinit();
         try std.testing.expect(result == .applied);
         try std.testing.expect(result.outcome().?.receipt == null);
+        try std.testing.expect(result.rootGeneration() == null);
         try std.testing.expectEqual(@as(usize, 1), driver.permission_reads);
         try std.testing.expectEqual(@as(usize, 1), driver.admission_reads);
         try std.testing.expectEqual(@as(usize, 1), driver.admissions);
@@ -869,6 +884,11 @@ test "relational index publication native receiver stages one effect recovers pe
     {
         var result = try step(alloc, &driver, &driver, plan.before.name, request, .{});
         defer result.deinit();
+        try std.testing.expect(result == .controlled);
+        try std.testing.expectEqual(@as(?u64, 9), result.rootGeneration());
+        driver.root_generation = 10;
+        try std.testing.expectEqual(@as(?u64, 9), result.rootGeneration());
+        driver.root_generation = 9;
         try std.testing.expectEqual(@as(usize, 1), driver.controls);
         try std.testing.expectEqual(@as(usize, 1), driver.admission_reads);
         try std.testing.expectEqual(@as(usize, 1), driver.admissions);

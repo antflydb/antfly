@@ -88,6 +88,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerControlAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaims(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaimsAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
@@ -3915,6 +3916,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
+    /// Keep the applying lease's root with its owned committed outcome. A
+    /// subsequent status lookup may already refer to a replacement root.
+    pub const RootedNativeIndexOwnerControl = RootedNativeControl(false);
+
+    fn RootedNativeControl(comptime canceling: bool) type {
+        return struct {
+            root_generation: u64,
+            outcome: std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome),
+
+            pub fn deinit(self: *@This()) void {
+                self.outcome.deinit();
+                self.* = undefined;
+            }
+        };
+    }
+
+    pub fn applyNativeIndexOwnerControlAtRoot(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+    ) !RootedNativeIndexOwnerControl {
+        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, false);
+    }
+
     pub fn applyNativeIndexOwnerControl(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -3923,7 +3951,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         command: native_index_control.Command,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(native_index_control.Outcome) {
-        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, false);
+        return (try self.applyNativeIndexOwnerControlAtRoot(alloc, group_id, table_name, command, context)).outcome;
     }
 
     pub fn applyCanceledNativeIndexOwnerControl(
@@ -3934,7 +3962,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         command: native_index_control.Command,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(native_index_control.CleanupOutcome) {
-        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, true);
+        return (try self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, true)).outcome;
     }
 
     fn applyNativeIndexOwnerControlImpl(
@@ -3945,7 +3973,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         command: native_index_control.Command,
         context: request_operation.RequestContext,
         comptime canceling: bool,
-    ) !std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome) {
+    ) !RootedNativeControl(canceling) {
         try context.ensureActive();
         try command.validate();
         const operation: abi.NativeIndexOwnerOperation = switch (command.effect) {
@@ -3967,7 +3995,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().nativeIndexOwnerControlJson(table_name, operation, encoded);
         defer response.deinit();
-        return std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        const parsed = try std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
     }
 
     pub fn applyFkGenerationNative(

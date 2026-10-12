@@ -212,10 +212,13 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var admitted = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
         defer admitted.deinit();
         try std.testing.expect(admitted == .applied);
+        try std.testing.expect(admitted.rootGeneration() == null);
         try std.testing.expect(admitted.outcome().?.receipt == null);
         try std.testing.expect(!admitted.outcome().?.replication_pending);
         var fenced = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
         defer fenced.deinit();
+        try std.testing.expect(fenced == .controlled);
+        try std.testing.expectEqual(root_generation, fenced.rootGeneration().?);
         const fence_receipt = fenced.outcome().?.receipt.?;
         try std.testing.expectEqual(.fenced, fence_receipt.action);
         try std.testing.expect(fence_receipt.position == .native);
@@ -233,6 +236,8 @@ test "native index owner adapter executes fresh permission stages and recovers r
         reserve_request.operation = .reserve;
         var reserved = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
         defer reserved.deinit();
+        try std.testing.expect(reserved == .controlled);
+        try std.testing.expectEqual(root_generation, reserved.rootGeneration().?);
         reserved_receipt = reserved.outcome().?.receipt.?;
         try std.testing.expectEqual(.reserved, reserved_receipt.action);
         try std.testing.expect(reserved_receipt.position.native.sequence > fence_receipt.position.native.sequence);
