@@ -2342,6 +2342,72 @@ test "relational index system partial membership discharges uncovered predicates
     std.debug.print("partial-index uncovered membership predicate rows=128 primary_probes=0 residual_fallback_probes=128\n", .{});
 }
 
+test "relational index system SQL immutable index constant membership survives LSM reopen and portable restore" {
+    for ([_]bool{ true, false }) |constant| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("constant-index-membership");
+        defer directory.cleanup();
+        var target = try @import("../../common/test_directory.zig").TestDirectory.init("constant-index-restored");
+        defer target.cleanup();
+        var archive: std.ArrayList(u8) = .empty;
+        defer archive.deinit(alloc);
+        const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+        {
+            var seed = try db_mod.DB.open(alloc, directory.path(), options);
+            defer seed.close();
+            const definition = try std.json.Stringify.valueAlloc(alloc, .{
+                .version = 1,
+                .storage_mode = "relational",
+                .default_type = "row",
+                .relational_indexes = &.{.{ .name = "tenant_id", .keys = &.{.{ .column = "id" }}, .include_columns = &.{"payload"}, .where = &.{.{ .constant = constant }} }},
+                .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = .{ .id = .{ .type = "integer" }, .payload = .{ .type = "keyword" } }, .additionalProperties = false } } },
+            }, .{});
+            defer alloc.free(definition);
+            try seed.setSchemaJson(alloc, definition);
+            try seed.batch(.{ .writes = &.{
+                .{ .key = "r1", .value = "{\"id\":1,\"payload\":\"one\"}" },
+                .{ .key = "r2", .value = "{\"id\":2,\"payload\":\"two\"}" },
+                .{ .key = "r3", .value = "{\"id\":3,\"payload\":\"three\"}" },
+            } });
+            _ = try ready(&seed);
+            try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+        }
+        var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+        defer reopened.close();
+        var restored = try db_mod.DB.open(alloc, target.path(), options);
+        defer restored.close();
+        try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+        for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+            _ = try ready(db);
+            const progress = try db.relationalIndexBuildStatus("tenant_id");
+            const prefix = try records.forwardPrefix(.{ .generation = progress.generation, .slot = progress.slot });
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var item = try cursor.seekAtOrAfter(&prefix);
+            var count: usize = 0;
+            while (item) |entry| : (item = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, &prefix)) break;
+                _ = try records.forwardOwnership(entry.key);
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, if (constant) 3 else 0), count);
+            if (!constant) try std.testing.expectError(error.PartialIndexPredicateNotImplied, db.beginRelationalRows(alloc, .{ .index = "tenant_id" }));
+            var reader = try db.beginRelationalRows(alloc, .{
+                .index = "tenant_id",
+                .fields = &.{ "id", "payload" },
+                .conditions = if (constant) &.{} else &.{ .{ .column = "id", .op = .gt, .value = .{ .integer = 0 } }, .{ .column = "id", .op = .lte, .value = .{ .integer = 0 } } },
+            });
+            defer reader.deinit();
+            var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+            defer page.deinit();
+            try std.testing.expect(!page.more);
+            try std.testing.expectEqual(@as(usize, if (constant) 3 else 0), page.rows.len);
+            try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        }
+    }
+}
+
 fn partialCount(db: *db_mod.DB) !usize {
     var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" }, .conditions = &.{.{ .column = "tenant", .op = .gt, .value = .{ .integer = 0 } }} });
     defer reader.deinit();

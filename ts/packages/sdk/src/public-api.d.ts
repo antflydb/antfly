@@ -14180,14 +14180,21 @@ export interface components {
         };
         /** @enum {string} */
         RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
-        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        /**
+         * @description A typed partial-index conjunct. Specify either a constant truth value,
+         *     or a column and comparison operation, never both. Only TRUE is indexed;
+         *     FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents
+         *     an empty index without inventing a column dependency.
+         */
         RelationalIndexPredicate: {
-            column: string;
-            op: components["schemas"]["RelationalComparisonOp"];
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
             /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
             value?: unknown;
             /** @description String comparison collation with the same semantics as ordered keys. */
             collation?: string;
+            /** @description Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26. */
+            constant?: boolean;
         };
         /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
         RelationalIndexConfig: {

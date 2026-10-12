@@ -56,7 +56,7 @@ pub fn configForDefinition(alloc: std.mem.Allocator, definition: wire.Relational
     const conditions: ?[]const wire.RelationalIndexPredicate = if (definition.where) |where| blk: {
         const copies = try owned.dupe(wire.RelationalIndexPredicate, where);
         for (copies) |*condition| if (condition.value) |value| {
-            condition.value = try columns.canonicalValue(owned, condition.column, value);
+            condition.value = try columns.canonicalValue(owned, condition.column orelse return error.InvalidSchemaUpdateRequest, value);
         };
         break :blk copies;
     } else null;

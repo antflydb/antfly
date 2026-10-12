@@ -148,6 +148,7 @@ pub const Catalog = struct {
             if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 24 and schema.requires_array_expressions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };
@@ -179,6 +180,19 @@ test "relational index system catalog fences exact NUMERIC programs with integra
     const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = true };
     var catalog: Catalog = .{ .schema_format_version = 20, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    catalog.schema_format_version = schema_mod.storage_format_version;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL immutable index catalog fences constant predicate readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_constant_index_predicates = true };
+    var catalog: Catalog = .{ .schema_format_version = 25, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_constant_index_predicates = false;
+    try catalog.validateForSchema(table);
+    table.requires_constant_index_predicates = true;
     catalog.schema_format_version = schema_mod.storage_format_version;
     try catalog.validateForSchema(table);
     const restored = try Catalog.decode(&catalog.encode());

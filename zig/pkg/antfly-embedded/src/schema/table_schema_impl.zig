@@ -24,6 +24,28 @@ pub const StorageMode = @import("antfly_schema_openapi").TableStorageMode;
 const relational_wire = @import("antfly_schema_openapi");
 const relational_native = @import("../storage/relational_index.zig");
 
+fn validateIndexPredicate(condition: relational_wire.RelationalIndexPredicate) !void {
+    if (condition.constant != null) {
+        if (condition.column != null or condition.op != null or condition.value != null or condition.collation != null)
+            return error.InvalidSchemaUpdateRequest;
+    } else {
+        const column = condition.column orelse return error.InvalidSchemaUpdateRequest;
+        if (column.len == 0 or condition.op == null) return error.InvalidSchemaUpdateRequest;
+        if (condition.collation) |collation| if (collation.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.RelationalIndexPredicate) !relational_native.UniquePredicate {
+    try validateIndexPredicate(condition);
+    return .{
+        .constant = condition.constant,
+        .field = condition.column orelse "",
+        .op = TableSchema.nativeEnum(relational_native.RelationalCheckOp, condition.op orelse .eq),
+        .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+        .collation = condition.collation,
+    };
+}
+
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
@@ -78,12 +100,7 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{
                 .name = declaration.name,
                 .columns = declaration.columns orelse &.{},
@@ -143,12 +160,7 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{ .name = declaration.name, .keys = keys, .include_columns = declaration.include_columns orelse &.{}, .where = where, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
         }
         return definitions;
@@ -2670,6 +2682,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             for (includes) |column| if (column.len == 0 or (try columns.getOrPut(alloc, column)).found_existing) return error.InvalidSchemaUpdateRequest;
             const conditions: []const relational_wire.RelationalIndexPredicate = index.where orelse &.{};
             if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
         }
     }
     if (root.get("checks")) |checks| {
@@ -2743,6 +2756,9 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
         for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
         const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns orelse &.{} else item.child_columns;
         if (T == relational_wire.RelationalUniqueConstraint) {
+            const conditions = item.where orelse &.{};
+            if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
             if (item.timing == .deferred and !(item.deferrable orelse false)) return error.InvalidSchemaUpdateRequest;
             if ((item.columns != null) == (item.keys != null)) return error.InvalidSchemaUpdateRequest;
             if (item.keys) |keys| {
@@ -2948,7 +2964,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         for (indexes.value) |index| {
             for (index.keys) |key| if (key.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
             for (index.include_columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
-            for (index.where orelse &.{}) |condition| if (findDocumentProperty(document_schema.properties, condition.column) == null) return error.InvalidSchemaUpdateRequest;
+            for (index.where orelse &.{}) |condition| if (condition.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
         }
     }
     if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {

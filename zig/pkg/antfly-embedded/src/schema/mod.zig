@@ -798,6 +798,16 @@ fn typedNumericWire(expression: anytype, depth: usize, predicate: bool) bool {
     return false;
 }
 
+fn requiresConstantIndexPredicates(schema: ParsedTableSchema) bool {
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.where orelse &.{}) |condition| if (condition.constant != null) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+        for (constraint.where orelse &.{}) |condition| if (condition.constant != null) return true;
+    };
+    return false;
+}
+
 fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
     if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
         if (typedNumericWire(expression, 0, predicate)) return true;
@@ -1215,6 +1225,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
+        .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1244,6 +1255,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
+        .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

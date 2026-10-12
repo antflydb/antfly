@@ -44,6 +44,38 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalPartialIndexConstantRoundTrip(t *testing.T) {
+	for _, value := range []bool{false, true} {
+		predicate := RelationalIndexPredicate{Constant: &value}
+		encoded, err := json.Marshal(predicate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]interface{}
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if len(fields) != 1 || fields["constant"] != value {
+			t.Fatalf("constant membership lost or acquired comparison fields: %s", encoded)
+		}
+		var restored RelationalIndexPredicate
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored.Constant == nil || *restored.Constant != value {
+			t.Fatalf("constant membership lost on decode: %s", encoded)
+		}
+	}
+	ordinary := RelationalIndexPredicate{Column: "n", Op: oapi.RelationalComparisonOpGt, Value: 0}
+	encoded, err := json.Marshal(ordinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "constant") {
+		t.Fatalf("ordinary comparison acquired constant membership: %s", encoded)
+	}
+}
+
 func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
 	for _, origin := range []RelationalUniqueConstraintOrigin{RelationalUniqueConstraintOriginConstraint, RelationalUniqueConstraintOriginIndex} {
 		rule := RelationalUniqueConstraint{Name: "email_key", Columns: []string{"email"}, Origin: origin}

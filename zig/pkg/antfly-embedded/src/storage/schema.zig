@@ -292,6 +292,9 @@ pub const TableSchema = struct {
     /// Constructor bytecode is newer than array comparisons and identity casts.
     /// Fence readers even when its array result is consumed by a scalar CHECK.
     requires_array_constructors: bool = false,
+    /// Constant partial-index membership is a new public/native predicate
+    /// variant. Readers must understand it even without typed expressions.
+    requires_constant_index_predicates: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -314,7 +317,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 25;
+pub const storage_format_version: u32 = 26;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -344,7 +347,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -418,6 +421,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_numeric_modifiers = false;
     projection_schema.requires_array_expressions = false;
     projection_schema.requires_array_constructors = false;
+    projection_schema.requires_constant_index_predicates = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -463,6 +467,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedVersion;
     if (format_version < 24 and schema.requires_array_expressions) return error.UnsupportedVersion;
     if (format_version < 25 and schema.requires_array_constructors) return error.UnsupportedVersion;
+    if (format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedVersion;
     if (format_version < 20) for (schema.relational_columns) |column| {
         if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
     };
@@ -613,6 +618,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 23) try buf.append(alloc, @intFromBool(schema.requires_numeric_modifiers));
     if (format_version >= 24) try buf.append(alloc, @intFromBool(schema.requires_array_expressions));
     if (format_version >= 25) try buf.append(alloc, @intFromBool(schema.requires_array_constructors));
+    if (format_version >= 26) try buf.append(alloc, @intFromBool(schema.requires_constant_index_predicates));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1027,6 +1033,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_numeric_modifiers = if (fmt_version >= 23) data[pos + 4] == 1 else false,
         .requires_array_expressions = if (fmt_version >= 24) data[pos + 5] == 1 else false,
         .requires_array_constructors = if (fmt_version >= 25) data[pos + 6] == 1 else false,
+        .requires_constant_index_predicates = if (fmt_version >= 26) data[pos + 7] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1278,10 +1285,12 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 23) try cursor.readBool();
     if (format_version >= 24) try cursor.readBool();
     if (format_version >= 25) try cursor.readBool();
+    if (format_version >= 26) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_constant_index_predicates and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_array_constructors and !schema.requires_array_expressions) return error.InvalidSchema;
     if (schema.requires_array_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema))
         return error.InvalidSchema;
@@ -3034,6 +3043,42 @@ test "relational index system exact NUMERIC programs fence readers without NUMER
     defer a.free(malformed);
     malformed[malformed.len - 1] = 2;
     try std.testing.expectError(error.InvalidSchema, deserializeSchema(a, malformed));
+}
+
+test "relational index system SQL immutable index constant membership fences old schema readers" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_constant_index_predicates = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 25));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_constant_index_predicates);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    const typed_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(typed_projection);
+    current.requires_constant_index_predicates = false;
+    const ordinary_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary_projection);
+    try std.testing.expectEqualSlices(u8, typed_projection, ordinary_projection);
+    const ordinary = try serializeSchemaFormat(a, current, 25);
+    defer a.free(ordinary);
+    const old = try deserializeSchema(a, ordinary);
+    defer freeSchema(a, old);
+    try std.testing.expect(!old.requires_constant_index_predicates);
+    current.requires_constant_index_predicates = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
 }
 
 test "relational index system array constructors independently fence old readers and survive immutable schemas" {

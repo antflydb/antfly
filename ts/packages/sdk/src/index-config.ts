@@ -87,19 +87,21 @@ export function validateCreateIndexRequestRelationships(
 
 // Exhaustive generated-type keys make new public operators a deliberate SDK
 // validation change, without maintaining another application-local enum.
-const relationalOperators: Record<NonNullable<RelationalIndexConfig["where"]>[number]["op"], true> =
-  {
-    eq: true,
-    ne: true,
-    gt: true,
-    gte: true,
-    lt: true,
-    lte: true,
-    is_null: true,
-    is_not_null: true,
-    is_distinct: true,
-    is_not_distinct: true,
-  };
+const relationalOperators: Record<
+  NonNullable<NonNullable<RelationalIndexConfig["where"]>[number]["op"]>,
+  true
+> = {
+  eq: true,
+  ne: true,
+  gt: true,
+  gte: true,
+  lt: true,
+  lte: true,
+  is_null: true,
+  is_not_null: true,
+  is_distinct: true,
+  is_not_distinct: true,
+};
 const relationalOperatorNames = new Set(Object.keys(relationalOperators));
 
 function validateRelationalIndexConfig(config: Record<string, unknown>): void {
@@ -165,7 +167,16 @@ function validateRelationalIndexConfig(config: Record<string, unknown>): void {
     config.where.forEach((condition, index) => {
       const path = `where[${index}]`;
       if (!isRecord(condition)) throw new TypeError(`${path} must be an object`);
-      validateOnlyKeys(condition, ["column", "op", "value", "collation"], path);
+      validateOnlyKeys(condition, ["constant", "column", "op", "value", "collation"], path);
+      if (condition.constant !== undefined) {
+        if (typeof condition.constant !== "boolean")
+          throw new TypeError(`${path}.constant must be a boolean`);
+        if (["column", "op", "value", "collation"].some((key) => condition[key] != null))
+          throw new TypeError(
+            `${path} must select constant membership or a column comparison, not both`
+          );
+        return;
+      }
       validateRequiredString(condition.column, `${path}.column`);
       if (typeof condition.op !== "string" || !relationalOperatorNames.has(condition.op))
         throw new TypeError(`${path}.op must be a supported relational comparison`);

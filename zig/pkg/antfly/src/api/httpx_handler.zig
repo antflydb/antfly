@@ -13852,6 +13852,83 @@ test "httpx SQL generated immutable planning preserves PostgreSQL rejection diag
     try std.testing.expectEqual(@as(usize, 0), source.captures);
 }
 
+test "httpx SQL immutable index planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        base_sql: []const u8,
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_index_planning_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-index-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var base = try local.sql_compiler.compile(alloc, fixture.value.base_sql, .{});
+    defer base.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, base.statement.create_table);
+    defer alloc.free(schema);
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "index_probe", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("index_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    const Catalog = struct {
+        fn run(raw: *anyopaque, a: std.mem.Allocator, control: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *Source = @ptrCast(@alignCast(raw));
+            if (call != .resolve_many or call.resolve_many.relations.len == 0)
+                return Source.systemCatalog(raw, a, control, call);
+            try control.ensureActive();
+            // Test-only immutable relation cut, not production publication
+            // authority. Mutation callbacks remain deliberately unavailable.
+            const domain = local.system_catalog_domain;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const relations = try arena.allocator().alloc(?domain.ResolvedRelation, call.resolve_many.relations.len);
+            @memset(relations, null);
+            const table = self.records[0];
+            var parsed_schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed_schema.deinit(a);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
+            for (call.resolve_many.relations, relations) |target, *resolved| {
+                if (!std.mem.eql(u8, target.database, "default") or !std.mem.eql(u8, target.namespace, "public") or !std.mem.eql(u8, target.name, table.name)) continue;
+                var value = domain.ResolvedTable.fromTable(table);
+                value.query_definition = domain.QueryDefinition.fromTable(table);
+                resolved.* = .{ .table = value, .logical_table = table.name, .owner = .{ .table_id = table.table_id, .schema_version = parsed_schema.version, .schema_digest = digest, .kind = .table } };
+            }
+            return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 7, .tables = &.{}, .relations = relations, .relation_epoch = .{ .revision = 7, .incarnation = @splat(7) } }, .{});
+        }
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Catalog.run, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("index rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
 test "httpx SQL transaction timestamp results retain typed values through public streaming" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");

@@ -137,6 +137,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlAssignmentTypeMismatch => .{ .code = "42804", .message = "The expression type cannot be assigned to this column.", .hint = "Use a compatible value or an explicit cast to the column type." },
         error.SqlInvalidGenerationExpression => .{ .code = "42P17", .message = "A generated column cannot reference itself or another generated column.", .hint = "Use base columns in the generation expression." },
         error.SqlMutableGenerationExpression => .{ .code = "42P17", .message = "A generation expression must be immutable.", .hint = "Use immutable operations on base columns; transaction/session values cannot define stored generated values." },
+        error.SqlMutableIndexExpression => .{ .code = "42P17", .message = "Functions in an index expression must be immutable.", .hint = "Use immutable operations; transaction/session values cannot define stored index keys." },
+        error.SqlMutableIndexPredicate => .{ .code = "42P17", .message = "Functions in an index predicate must be immutable.", .hint = "Use immutable operations; transaction/session values cannot define index membership." },
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
         error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL argument or JSON path element is null.", .hint = "Supply non-null values for required arguments and path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },

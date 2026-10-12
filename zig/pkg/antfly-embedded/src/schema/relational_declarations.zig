@@ -161,7 +161,7 @@ pub fn uniqueFields(alloc: std.mem.Allocator, runtime: native.TableSchema, layou
             } else try fields.append(alloc, runtime.relational_columns[key.ordinal].name);
         }
     }
-    for (unique.where) |condition| try fields.append(alloc, condition.field);
+    for (unique.where) |condition| if (condition.constant == null) try fields.append(alloc, condition.field);
     return fields.toOwnedSlice(alloc);
 }
 

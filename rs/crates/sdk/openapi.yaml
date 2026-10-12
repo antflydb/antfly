@@ -28468,10 +28468,14 @@ components:
     RelationalIndexPredicate:
       type: object
       additionalProperties: false
-      required:
-        - column
-        - op
-      description: A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+      description: >
+        A typed partial-index conjunct. Specify either a constant truth value,
+
+        or a column and comparison operation, never both. Only TRUE is indexed;
+
+        FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents
+
+        an empty index without inventing a column dependency.
       properties:
         column:
           type: string
@@ -28484,6 +28488,11 @@ components:
         collation:
           type: string
           description: String comparison collation with the same semantics as ordered keys.
+        constant:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Constant membership truth. SQL UNKNOWN is normalized to false for index membership.
+            Requires reader capability version 26.
     RelationalIndexConfig:
       type: object
       required:

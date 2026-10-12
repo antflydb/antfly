@@ -859,10 +859,34 @@ pub const UniqueExpression = struct {
 pub const UniquePredicateOp = RelationalCheckOp;
 
 pub const UniquePredicate = struct {
-    field: []const u8,
-    op: UniquePredicateOp,
+    /// Exactly one of constant membership or a nonempty field comparison.
+    constant: ?bool = null,
+    field: []const u8 = "",
+    op: UniquePredicateOp = .eq,
     value_json: ?[]const u8 = null,
     collation: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        if (self.constant) |value| {
+            if (self.field.len != 0 or self.op != .eq or self.value_json != null or self.collation != null)
+                return error.WriteFailed; // std.json's custom writer error set; fail closed.
+            try writer.objectField("constant");
+            try writer.write(value);
+        } else {
+            // Retain the exact existing native spelling, including nulls:
+            // unrelated definitions must not acquire new durable digests.
+            try writer.objectField("field");
+            try writer.write(self.field);
+            try writer.objectField("op");
+            try writer.write(self.op);
+            try writer.objectField("value_json");
+            try writer.write(self.value_json);
+            try writer.objectField("collation");
+            try writer.write(self.collation);
+        }
+        try writer.endObject();
+    }
 };
 
 pub const RelationalPeriod = struct {

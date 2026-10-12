@@ -1315,21 +1315,24 @@ pub const RelationalIndexOwnerKind = enum {
     }
 };
 
-/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+/// A typed partial-index conjunct. Specify either a constant truth value, or a column and comparison operation, never both. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents an empty index without inventing a column dependency.
 pub const RelationalIndexPredicate = struct {
-    column: []const u8,
-    op: RelationalComparisonOp,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
     value: ?std.json.Value = null,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
+    /// Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
+    constant: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "column", "column", false },
-        .{ "op", "op", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
         .{ "value", "value", true },
         .{ "collation", "collation", true },
+        .{ "constant", "constant", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1342,16 +1345,24 @@ pub const RelationalIndexPredicate = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("column");
-        try jw.write(self.column);
-        try jw.objectField("op");
-        try jw.write(self.op);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
         if (self.value) |value| {
             try jw.objectField("value");
             try jw.write(value);
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.constant) |value| {
+            try jw.objectField("constant");
             try jw.write(value);
         }
         try jw.endObject();

@@ -3802,3 +3802,54 @@ predicate admission. An isolated 16-case PostgreSQL probe confirms dead mutable
 calls are pruned, reachable mutable calls reject with 42P17, and demanded
 constant errors retain their ordering. That exploratory probe is not a checked-in
 index fixture or original-case qualification.
+
+### Immutable ordered-index admission and constant membership
+
+Expression keys and partial-index predicates now use the same bounded,
+demand-aware immutable planner as stored generated expressions. Binding precedes
+pruning; reachable stable/volatile operations reject with PostgreSQL 42P17 in
+the appropriate index context, while unreachable branches do not prevent valid
+definitions. The existing request cancellation/preparation limits also cover
+these index programs. CHECK and ordinary DEFAULT evaluation retain their
+different volatility/error-timing contracts.
+
+Partial membership has an explicit constant form, rather than a fabricated
+column comparison: TRUE imposes no restriction; FALSE and SQL UNKNOWN select no
+rows. The shared native plan binds every remaining ordinary conjunct before
+absorption and refuses an empty index for a query unless that query is provably
+contradictory. Constant-false write preparation and historical projection skip
+key, covering and row-decoding work. The 1,024-row work-count regression requires
+zero key/payload bytes and zero scratch capacity, not a timing-based speedup.
+Constant-true fingerprints remain identical to full-index comparison semantics;
+ordinary native predicate serialization retains its exact previous spelling so
+existing durable definition digests do not change.
+
+The generated OpenAPI predicate model follows the existing index-key pattern:
+optional variant fields, with authoritative server validation rejecting mixed
+or incomplete variants. Go uses an explicitly optional boolean pointer so
+`constant: false` is not silently omitted. Python and TypeScript retain the same
+public model; TypeScript's index validator handles both forms and rejects mixed
+variants. A requirements-only `oneOf` was tested and removed because current
+generators erased the Python model and emitted unsuitable Go serialization.
+
+The independent PostgreSQL 18 fixture contains 20 DDL contracts (14 admitted,
+six rejected), including logical membership and expression-key results over
+NULL, empty-string and ordinary input rows. No native implementation generates
+these expected values. The native typed-row oracle test belongs to the physical
+index owner, not the lightweight SQL owner: importing the full document mapper
+into the latter introduces unrelated vector-module dependencies. Public HTTP
+tests independently check all six rejection SQLSTATEs before read capture.
+
+This is not full general partial-predicate support, native worker activation,
+distributed index lifecycle certification, or credit for unresolved originals.
+General non-conjunctive predicate implication remains guarded; original-case
+accounting stays 479 implemented / 136 rejected / 73 superseded / 898 unresolved.
+
+Constant predicate variants require ASCH/reader capability 26, independently of
+physical column types or typed expression programs. Derivation checks both
+ordered indexes and unique constraints; immutable schema cloning, strict binary
+decoding and transactional catalog validation retain the fence. Serialization
+refuses a downgrade to capability 25, and text-index projection fingerprints
+exclude this unrelated feature. Decoder tests cover every truncation and a
+malformed capability boolean without allocating. This is a decoder capability,
+not authorization to activate production index workers or namespace turnover.

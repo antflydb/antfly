@@ -423,14 +423,14 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             for (index.keys) |key| {
                 const nulls: []const u8 = if (key.nulls_first orelse key.descending) "first" else "last";
                 if (key.expression) |expression| {
-                    const lowered = try @import("schema_expression.zig").lowerTyped(alloc, schema.*, expression, null);
+                    const lowered = try @import("schema_expression.zig").lowerIndexKey(alloc, schema.*, expression, limits);
                     try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.element_type == .numeric) "numeric" else if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 } else try keys.append(alloc, try value(alloc, .{ .column = key.field, .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 try columns.append(alloc, key.field);
             }
             // Explicit unique-owner provenance, not the display description,
             // links this index to its rule. Both publish in one schema CAS.
-            const predicates = if (index.predicate) |predicate| try @import("schema_expression.zig").lowerIndexPredicate(alloc, schema.*, predicate) else &.{};
+            const predicates = if (index.predicate) |predicate| try @import("schema_expression.zig").lowerIndexPredicateWithLimits(alloc, schema.*, predicate, limits) else &.{};
             try indexes.append(try value(alloc, .{ .name = index.name, .keys = keys.items, .include_columns = index.include_columns, .where = predicates, .description = if (index.unique) "SQL UNIQUE INDEX" else "SQL INDEX" }));
             if (index.unique) {
                 const constraints = try list(schema, alloc, "unique_constraints");
