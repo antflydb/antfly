@@ -86,6 +86,7 @@ test {
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_text_statistics.zig");
+    _ = @import("api/lake_index_seekable_text.zig");
 }
 
 test {

@@ -86,6 +86,62 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     const ref = try writer.putWithCancellation(bytes, cancellation);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
+fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
+    // Opaque/legacy fixtures keep their existing all-block representation.
+    if (bytes.len < 56 or !std.mem.eql(u8, bytes[bytes.len - 4 ..], "AFSM")) return &.{};
+    var reader = try local.segment.RangeSegmentReader.init(a, .{ .contiguous = bytes }, .{});
+    defer reader.deinit();
+    var ranges: std.ArrayList(Range) = .empty;
+    try ranges.append(a, .{ .offset = @intCast(reader.stored_offset), .len = @intCast(@min(21, reader.stored_metadata_length)) });
+    if (reader.num_blocks != 0) try ranges.append(a, .{
+        .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24),
+        .len = @as(usize, reader.num_blocks) * 8,
+    });
+    const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, bytes[bytes.len - 24 ..][0..8], .big);
+    try ranges.append(a, .{ .offset = @intCast(tail), .len = bytes.len - @as(usize, @intCast(tail)) });
+    for (reader.fields) |field| for (field.sections) |section| {
+        if (section.section_type != .inverted_text or section.length == 0) continue;
+        const view = (try reader.sectionView(field.name, .inverted_text)).?;
+        const inverted = try local.section_inverted.RangeInvertedIndexReader.init(a, view, pack_bytes);
+        for (try inverted.initialMetadataViews()) |metadata| if (metadata) |range| {
+            try ranges.append(a, .{ .offset = @intCast(range.offset), .len = @intCast(range.length) });
+        };
+    };
+    std.mem.sort(Range, ranges.items, {}, struct {
+        fn less(_: void, lhs: Range, rhs: Range) bool {
+            return lhs.offset < rhs.offset;
+        }
+    }.less);
+    var merged: std.ArrayList(Range) = .empty;
+    for (ranges.items) |requested| {
+        // Native v5 integrity checks authenticate complete 64 KiB pages.
+        // Bundle those same pages so tiny metadata reads do not fetch adjacent
+        // original-pack ranges solely to establish the native CRC proof.
+        const page_start = requested.offset / block_bytes * block_bytes;
+        const page_end = @min(bytes.len, std.mem.alignForward(usize, requested.offset + requested.len, block_bytes));
+        const range: Range = if (reader.paged_source != null) .{ .offset = page_start, .len = page_end - page_start } else requested;
+        if (merged.items.len != 0) {
+            const last = &merged.items[merged.items.len - 1];
+            if (range.offset <= last.offset + last.len) {
+                last.len = @max(last.offset + last.len, range.offset + range.len) - last.offset;
+                continue;
+            }
+        }
+        try merged.append(a, range);
+    }
+    var length: usize = 0;
+    for (merged.items) |range| length = try std.math.add(usize, length, range.len);
+    // Oversized optional navigation stays in authenticated native blocks.
+    return if (length <= pack_bytes and length < bytes.len / 2) merged.items else &.{};
+}
+fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []const u8) !Piece {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const checksum = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    const scope = (try stores.uploadScopeFromArtifactId(pack.artifact_id)) orelse return error.InvalidArtifactUploadScope;
+    const id = try scope.artifactId(checksum);
+    return .{ .offset = offset, .ref = .{ .artifact_id = try a.dupe(u8, &id), .checksum = checksum, .byte_len = bytes.len }, .pack = pack, .pack_offset = pack_offset };
+}
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -93,25 +149,38 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, ca
     // Upload large immutable packs, with independently authenticated bounded
     // range units. Broad reads coalesce adjacent units into one pack range GET,
     // while sparse queries never download an entire pack to authenticate it.
+    const ranges = try initialMetadata(ca, bytes);
+    var metadata: std.ArrayList(Piece) = .empty;
+    if (ranges.len != 0) {
+        var bundle: std.ArrayList(u8) = .empty;
+        for (ranges) |range| try bundle.appendSlice(ca, bytes[range.offset..][0..range.len]);
+        const pack = try upload(ca, store, bundle.items, cancellation);
+        var offset: usize = 0;
+        for (ranges) |range| {
+            try metadata.append(ca, try packedPiece(ca, pack, range.offset, offset, bundle.items[offset..][0..range.len]));
+            offset += range.len;
+        }
+    }
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
+    var metadata_position: usize = 0;
     while (position < bytes.len) {
         const pack_end = @min(position + pack_bytes, bytes.len);
         const pack = try upload(ca, store, bytes[position..pack_end], cancellation);
         var offset = position;
         while (offset < pack_end) {
-            const end = @min(offset + block_bytes, pack_end);
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes[offset..end], &digest, .{});
-            const checksum = try ca.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-            const scope = (try stores.uploadScopeFromArtifactId(pack.artifact_id)) orelse return error.InvalidArtifactUploadScope;
-            const id = try scope.artifactId(checksum);
-            try blocks.append(ca, .{ .offset = offset, .ref = .{ .artifact_id = try ca.dupe(u8, &id), .checksum = checksum, .byte_len = end - offset }, .pack = pack, .pack_offset = offset - position });
+            while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
+            if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
+                offset = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
+                continue;
+            }
+            const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else bytes.len);
+            try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
             offset = end;
         }
         position = pack_end;
     }
-    const directory: Directory = .{ .bytes = bytes.len, .metadata = &.{}, .blocks = blocks.items, .terms = &.{} };
+    const directory: Directory = .{ .bytes = bytes.len, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();
     const encoded = try std.json.Stringify.valueAlloc(ca, directory, .{});
     if (encoded.len > 4 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
@@ -432,6 +501,9 @@ const Owner = struct {
     directory: Directory,
     fallback: ?Read,
     query_scoped: bool = false,
+    metadata_pack: ?Ref = null,
+    metadata_bundle: []u8 = &.{},
+    metadata_resident_bytes: std.atomic.Value(usize) = .init(0),
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     // Diagnostics track touched payload blocks without retaining payloads.
     loaded: []bool,
@@ -439,6 +511,7 @@ const Owner = struct {
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const a = self.a;
+        a.free(self.metadata_bundle);
         self.arena.deinit();
         a.destroy(self);
     }
@@ -447,7 +520,11 @@ const Owner = struct {
         if (self.query_scoped) self.fallback = null;
     }
     fn source(self: *@This()) local.index.SegmentSource {
-        return .{ .ranges = .{ .ptr = self, .length = self.directory.bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal, .resource_manager = self.resource_manager } };
+        return .{ .ranges = .{ .ptr = self, .length = self.directory.bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager } };
+    }
+    fn retainedBytes(raw: *anyopaque) usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.metadata_resident_bytes.load(.acquire);
     }
     fn readInitial(raw: *anyopaque, offset: u64, out: []u8) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -534,6 +611,13 @@ const Owner = struct {
                 const metadata = containing(self.owner.directory.metadata, @intCast(offset));
                 const block = if (metadata == null) containing(self.owner.directory.blocks, @intCast(offset)) else null;
                 const piece = if (metadata) |i| self.owner.directory.metadata[i] else if (block) |i| self.owner.directory.blocks[i] else return;
+                if (metadata != null and self.owner.metadata_pack != null) {
+                    // Required reads use the physical owner's admitted bundle;
+                    // per-unit speculative GETs would duplicate navigation I/O.
+                    offset = piece.offset + piece.ref.byte_len;
+                    continue;
+                }
+
                 var pieces: []const Piece = if (metadata) |i| self.owner.directory.metadata[i..][0..1] else self.owner.directory.blocks[block.?..][0..1];
                 if (block) |i| if (piece.pack) |pack| {
                     var end = i + 1;
@@ -670,6 +754,32 @@ const Owner = struct {
         }
         try capability.check();
     }
+    fn metadataBytes(self: *@This(), capability: Read) !?[]const u8 {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        try capability.check();
+        if (self.metadata_bundle.len == 0) {
+            const pack = self.metadata_pack.?;
+            const bytes = artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache) catch |err| switch (err) {
+                // Navigation residency is optional; continue through bounded
+                // verified range leases when this physical owner is full.
+                error.OutOfMemory => return null,
+                else => return err,
+            };
+            errdefer self.a.free(bytes);
+            for (self.directory.metadata) |piece| {
+                const start: usize = @intCast(piece.pack_offset);
+                _ = try ServingCache.VerifiedBytes.authenticate(bytes[start..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
+            }
+            try capability.check();
+            // The publication allocator accounts this bounded immutable
+            // navigation until the last physical owner releases it. Neither
+            // the opening credentials nor cancellation capability survive.
+            self.metadata_bundle = bytes;
+            self.metadata_resident_bytes.store(bytes.len, .release);
+        }
+        return self.metadata_bundle;
+    }
     fn readSerial(self: *@This(), capability: Read, start: u64, out: []u8) anyerror!void {
         try capability.check();
         if (start > self.directory.bytes or out.len > self.directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
@@ -682,6 +792,15 @@ const Owner = struct {
             const metadata = containing(self.directory.metadata, offset);
             const block = if (metadata == null) containing(self.directory.blocks, offset) else null;
             const piece = if (metadata) |index| self.directory.metadata[index] else if (block) |index| self.directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
+            if (metadata != null and self.metadata_pack != null) if (try self.metadataBytes(capability)) |bytes| {
+                const within = offset - piece.offset;
+                const take = @min(out.len - done, @as(usize, @intCast(piece.ref.byte_len)) - within);
+                try capability.check();
+                @memcpy(out[done..][0..take], bytes[@as(usize, @intCast(piece.pack_offset)) + within ..][0..take]);
+                offset += take;
+                done += take;
+                continue;
+            };
             if (group == null or offset >= group.?.logical_end) {
                 if (group) |*value| value.deinit();
                 group = null;
@@ -709,6 +828,10 @@ const Owner = struct {
                 self.loaded[index] = true;
                 self.mutex.unlock();
             }
+            if (metadata != null) {
+                if (group) |*value| value.deinit();
+                group = null;
+            }
             offset += take;
             done += take;
         }
@@ -734,6 +857,14 @@ pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager };
     errdefer Owner.release(owner);
     owner.directory = try loadDirectory(owner.arena.allocator(), read, ref);
+    if (owner.directory.metadata.len != 0) if (owner.directory.metadata[0].pack) |pack| {
+        var expected_offset: u64 = 0;
+        const compatible = for (owner.directory.metadata) |piece| {
+            if (piece.pack == null or !std.mem.eql(u8, piece.pack.?.artifact_id, pack.artifact_id) or piece.pack_offset != expected_offset) break false;
+            expected_offset += piece.ref.byte_len;
+        } else expected_offset == pack.byte_len;
+        if (compatible) owner.metadata_pack = pack;
+    };
     owner.loaded = try owner.arena.allocator().alloc(bool, owner.directory.blocks.len);
     @memset(owner.loaded, false);
     return .fromNative(owner.source());
@@ -1502,4 +1633,76 @@ test "external lake required pack reads overlap and return every scheduler reser
     try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+}
+
+test "external lake seekable metadata opens all field navigation with two authenticated reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const documents = try ca.alloc(local.storage_db_document_mapper.MapperDoc, 4000);
+    for (documents, 0..) |*document, i| {
+        document.* = .{ .key = try std.fmt.allocPrint(ca, "document-{d}", .{i}), .value = try std.fmt.allocPrint(ca, "{{\"body\":\"alpha term{d} shared needle {s}\"}}", .{ i, "payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload payload " }) };
+    }
+    const bytes = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, documents, .{}, null)).?;
+    defer a.free(bytes);
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-metadata-bundle");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(19), 1, std.testing.io);
+    const ref = try publish(ca, ca, &store, bytes, .none);
+    var cache = ServingCache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(2), .context = .{ .io = std.testing.io } };
+    const data = try load(a, .{ .store = store, .cache = cached, .context = .{}, .cancellation = .none }, ref);
+    const owner: *Owner = @ptrCast(@alignCast(data.native.ranges.ptr));
+    try std.testing.expect(owner.directory.metadata.len > 1);
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, data);
+    const opened = cache.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), opened.provider_reads);
+    try std.testing.expectEqual(ref.byte_len + owner.directory.metadata[0].pack.?.byte_len, opened.provider_bytes);
+    try std.testing.expectEqual(owner.directory.metadata[0].pack.?.byte_len, data.native.retainedBytes());
+    for (owner.loaded) |loaded| try std.testing.expect(!loaded);
+    var eager = try local.index.IndexWriter.init(a);
+    defer eager.deinit();
+    try eager.addSegmentWithId(1, bytes);
+    const expected = try eager.snapshot().search(a, "body", &.{"needle"}, 10);
+    defer a.free(expected.hits);
+    const actual = try writer.snapshot().search(a, "body", &.{"needle"}, 10);
+    defer a.free(actual.hits);
+    try std.testing.expectEqual(expected.total_count, actual.total_count);
+    for (expected.hits, actual.hits) |lhs, rhs| {
+        try std.testing.expectEqual(lhs.doc_id, rhs.doc_id);
+        try std.testing.expectEqual(lhs.score, rhs.score);
+    }
+    // Native byte offsets, including metadata/payload boundaries, remain exact.
+    const roundtrip = try a.alloc(u8, bytes.len);
+    defer a.free(roundtrip);
+    try data.native.readInto(0, roundtrip);
+    try std.testing.expectEqualSlices(u8, bytes, roundtrip);
+    // A valid bundle cannot authorize a substituted logical range identity.
+    const wrong = try ca.dupe(Piece, owner.directory.metadata);
+    const checksum = "1111111111111111111111111111111111111111111111111111111111111111";
+    const scoped_id = try store.upload_scope.?.artifactId(checksum);
+    wrong[0].ref = .{ .artifact_id = &scoped_id, .checksum = checksum, .byte_len = wrong[0].ref.byte_len };
+    var altered = owner.directory;
+    altered.metadata = wrong;
+    const altered_ref = try upload(ca, &store, try std.json.Stringify.valueAlloc(ca, altered, .{}), .none);
+    var bad = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, altered_ref);
+    defer bad.deinit(a);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, bad.initReader(a));
+
+    var pressured = try load(a, .{ .store = store, .cache = cached, .context = .{}, .cancellation = .none }, ref);
+    defer pressured.deinit(a);
+    const pressured_owner: *Owner = @ptrCast(@alignCast(pressured.native.ranges.ptr));
+    var denied_alloc = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    pressured_owner.a = denied_alloc.allocator();
+    var header: [21]u8 = undefined;
+    try pressured.native.readInto(0, &header);
+    try std.testing.expectEqualSlices(u8, bytes[0..header.len], &header);
+    try std.testing.expectEqual(@as(usize, 0), pressured.native.retainedBytes());
 }

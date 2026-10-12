@@ -231,6 +231,8 @@ def main():
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
+    if not 1 <= args.port < 65535:
+        parser.error("query port must leave a valid adjacent health port")
     if not 0 <= args.cursor_pages <= 100:
         parser.error("cursor pages must be between zero and 100")
     if args.repeats < 1 or args.concurrency < 1:
@@ -316,7 +318,9 @@ def main():
                 "--port",
                 str(args.port),
                 "--health",
-                "false",
+                "true",
+                "--health-port",
+                str(args.port + 1),
                 "--auth",
                 "false",
                 "--models-dir",
@@ -335,7 +339,7 @@ def main():
             try:
                 call("GET", "/tables")
                 return
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
                 time.sleep(0.5)
         raise RuntimeError("Antfly startup timed out")
 
@@ -404,20 +408,49 @@ def main():
         )
         return counters
 
+    def lake_metrics():
+        # Health exposition refreshes every five seconds. Sample serial phases
+        # after a full refresh interval, outside their measured query latency.
+        time.sleep(6)
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{args.port + 1}/metrics", timeout=15
+        ) as response:
+            text = response.read().decode()
+        return {
+            fields[0]: int(fields[1])
+            for line in text.splitlines()
+            if line.startswith("antfly_lake_")
+            and len(fields := line.split()) == 2
+            and "{" not in fields[0]
+        }
+
     def timed_query(query, phase="search"):
+        serial_profile = phase in {"cold", "cursor_initial", "cursor_depth_restart"}
+        metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
         result = call("POST", "/tables/hn_archive_poc/query", query)
         elapsed = round((time.monotonic() - started) * 1000, 2)
         after = resource_counters()
-        if before is not None:
+        metrics_after = lake_metrics() if serial_profile else None
+        if before is not None or metrics_after is not None:
             io_profiles.append(
                 {
                     "phase": phase,
                     "elapsed_ms": elapsed,
                     "took_ms": result.get("took"),
                     "filter": query.get("filter_query"),
-                    **{key: round(after[key] - before[key], 2) for key in before},
+                    "lake_metrics_delta": (
+                        {
+                            key: value - metrics_before.get(key, 0)
+                            for key, value in metrics_after.items()
+                            if key.endswith("_total")
+                        }
+                        if metrics_after is not None
+                        else None
+                    ),
+                    "lake_metrics_scope": "process; nested phases may overlap",
+                    **{key: round(after[key] - before[key], 2) for key in before or {}},
                 }
             )
         return result, elapsed

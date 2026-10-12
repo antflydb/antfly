@@ -765,3 +765,42 @@ current replacement, saved-source visibility, and replay of a captured composed
 cursor after current rows change and the daemon restarts. These are separate
 correctness requirements; a successful single-table search cannot substitute
 for them. The current rows are synthetic qualification data, not a live HN feed.
+
+The stored-source and larger bulk-page run at engine revision `9663fe3bdc`
+completed two same-region cycles on the unchanged 142,577-row partition. Initial
+publication took 424.38 seconds; reopening the same publication took 0.2 seconds.
+Exact SQL counts, indexed/residual filter agreement, concurrent searches,
+historical/current replacement semantics, and restart/cursor correctness passed.
+Restart searches took 703–712 ms. Cold highlighted queries still took 15.9–18.0
+seconds, and early deep cursor pages exceeded the 2-second p95 gate. This is a
+**failed** one-file performance qualification; see
+`publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
+objects were removed with generation conditions; source data was preserved.
+
+The harness exposes health metrics only on the daemon's loopback host at the
+query port plus one. For selected serial phases it waits for the existing
+five-second metrics refresh before and after each measured query, outside the
+reported latency, and records process-level phase/cache-counter deltas. Nested
+phase durations can overlap; background traffic and concurrent queries prevent
+these counters from being a per-query provider trace.
+
+The final optimized Linux binary also passed both native storage profiles through
+the public HTTP recovery tests. An incomplete local cut directory now validates
+as a cache miss and opens the same authenticated remote generation; loss of
+remote authority still fails closed. Malformed manifests, missing sealed files,
+and active-reader admission are covered by engine units. Exact validation layers
+and binary provenance are in `native-recovery-qualification-20261012.json`.
+
+New seekable text publications can bundle their opening metadata pages into one
+authenticated object per segment. The bundle stays below 1 MiB and below half of
+the original segment size; oversized or small segments keep the existing range
+layout. The physical owner charges retained bundle bytes to its publication
+allocator and reports them to residency accounting. Under memory pressure, reads
+fall back to verified range leases. Segment-native offsets, page CRC checks,
+scoring, legacy directories and cursor identities stay unchanged. This adds a
+bounded duplicate of opening pages to object storage in exchange for fewer cold
+GETs. Existing publications remain readable; rebuilding produces bundled layout.
+The native regression opens all declared field navigation with exactly two
+provider reads (directory and bundle), checks exact scores and the full byte
+round-trip, rejects a substituted range identity, and tests residency denial.
+Regional performance of this change must still pass the qualification gates.
