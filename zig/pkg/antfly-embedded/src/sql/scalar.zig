@@ -1111,7 +1111,7 @@ test "SQL multidimensional constructors flatten typed cells and bound dynamic wo
             try std.testing.expect(array.elements[3].sql_null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var constant = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[1,2],[3,4]])", .{});
     defer constant.deinit();
     var dynamic = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[$1,2],[$2,4]])", .{});
