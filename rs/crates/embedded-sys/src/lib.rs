@@ -251,7 +251,7 @@ impl Default for antfly_buffer {
 /// One options struct for every storage kind. `storage_kind` (an
 /// `ANTFLY_STORAGE_KIND_*` value) picks a `.aflite` file or a normal
 /// directory; the inference budget fields, `busy_timeout_ms`, and
-/// `reserved[8]` layout must mirror the header exactly -- `tests/abi_sizes.rs`
+/// The reserved tail and models_dir layout must mirror the header exactly -- `tests/abi_sizes.rs`
 /// checks `size_of::<antfly_open_options>()` against
 /// `antfly_open_options_size()`.
 #[repr(C)]
@@ -283,7 +283,8 @@ pub struct antfly_open_options {
     /// Milliseconds to keep retrying while another writer holds the writer
     /// lock (`ANTFLY_BUSY`), like `sqlite3_busy_timeout`. 0 fails immediately.
     pub busy_timeout_ms: u64,
-    pub reserved: [u64; 8],
+    pub reserved: [u64; 6],
+    pub models_dir: antfly_slice,
 }
 
 #[repr(C)]
@@ -449,6 +450,8 @@ impl Default for antfly_scan_hash_result {
 unsafe extern "C" {
     pub fn antfly_abi_version() -> u32;
     pub fn antfly_open_options_size() -> u32;
+    pub fn antfly_last_error_detail() -> *const c_char;
+    pub fn antfly_last_error_code() -> antfly_error_code;
     pub fn antfly_error_code_name(code: antfly_error_code) -> *const c_char;
     pub fn antfly_error_code_description(code: antfly_error_code) -> *const c_char;
     pub fn antfly_open_options_init(options: *mut antfly_open_options) -> antfly_error_code;

@@ -46,15 +46,16 @@ class QueryDiagnosticTest(unittest.TestCase):
 
     def test_subgroup_layout_is_fixed_not_a_query_treatment(self):
         flags = common_treatment_flags(
-            ["control", "subgroup_routing"], ["aggregate", "subgroups_4"]
+            ["control", "global_subgroup_routing"], ["aggregate", "subgroups_4"]
         )
         self.assertIn("ANTFLY_EXPERIMENT_SUBGROUPS_4", flags)
-        self.assertNotIn("ANTFLY_EXPERIMENT_SUBGROUP_ROUTING", flags)
+        self.assertNotIn("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING", flags)
         with self.assertRaises(ValueError):
             common_treatment_flags(["control", "subgroups_4"], [])
         with self.assertRaises(ValueError):
             common_treatment_flags(
-                ["control", "subgroup_routing"], ["subgroups_4", "subgroups_16"]
+                ["control", "global_subgroup_routing"],
+                ["subgroups_4", "subgroups_16"],
             )
 
     def test_combined_routing_arm_adds_only_routing_to_admission(self):

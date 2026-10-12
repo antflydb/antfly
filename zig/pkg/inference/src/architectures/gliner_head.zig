@@ -604,7 +604,7 @@ fn spanMarkerForwardCt(
     return spanMarkerForwardFromWordCt(cb, allocator, word_ct, start_indices, end_indices, batch, num_words, num_spans, H, profile);
 }
 
-fn spanMarkerForwardFromWordCt(
+pub fn spanMarkerForwardFromWordCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     word_ct: CT, // [batch * num_words, H]
@@ -938,6 +938,19 @@ fn countLstmV1ForwardFromCt(
     num_labels: usize,
     H: usize,
 ) !CT {
+    return countLstmV1AtStep(cb, allocator, label_ct, num_labels, H, 0);
+}
+
+/// Count-aware marker projection at one instance slot. Each slot carries the
+/// GRU state of all preceding learned count positions, as upstream CountLSTM.
+pub fn countLstmV1AtStep(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    label_ct: CT,
+    num_labels: usize,
+    H: usize,
+    step: usize,
+) !CT {
     if (num_labels == 0) {
         const empty_shape = [_]i32{ 0, @intCast(H) };
         return cb.fromFloat32Shape(&.{}, &empty_shape);
@@ -950,13 +963,17 @@ fn countLstmV1ForwardFromCt(
     defer cb.free(pos_w);
     const pos_data = try cb.toFloat32(pos_w, allocator);
     defer allocator.free(pos_data);
-    if (pos_data.len < H) return error.UnexpectedInputShape;
+    if (H == 0 or step >= pos_data.len / H) return error.UnexpectedInputShape;
     const pos_broadcast = try allocator.alloc(f32, num_labels * H);
     defer allocator.free(pos_broadcast);
-    for (0..num_labels) |i| @memcpy(pos_broadcast[i * H ..][0..H], pos_data[0..H]);
-
-    const gru_out = try gruStep(cb, allocator, label_embs, pos_broadcast, num_labels, H);
+    var gru_out = try allocator.dupe(f32, label_embs);
     defer allocator.free(gru_out);
+    for (0..step + 1) |position| {
+        for (0..num_labels) |i| @memcpy(pos_broadcast[i * H ..][0..H], pos_data[position * H ..][0..H]);
+        const next = try gruStep(cb, allocator, gru_out, pos_broadcast, num_labels, H);
+        allocator.free(gru_out);
+        gru_out = next;
+    }
 
     const cat = try allocator.alloc(f32, num_labels * 2 * H);
     defer allocator.free(cat);

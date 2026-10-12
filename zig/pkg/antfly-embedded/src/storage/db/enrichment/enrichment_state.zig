@@ -44,6 +44,7 @@ pub fn projectionStatusName(status: ProjectionStatus) []const u8 {
 }
 
 pub const RuntimeStatus = struct {
+    last_error_code: @import("../types.zig").RuntimeErrorName = .{},
     target_sequence: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -309,7 +310,16 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
         }
     else
         null;
-    return decodeRuntimeStatus(raw, retry_count_raw);
+    var status = try decodeRuntimeStatus(raw, retry_count_raw);
+    const detail_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
+    defer alloc.free(detail_key);
+    const detail = txn.get(detail_key) catch |err| switch (err) {
+        error.NotFound => return status,
+        else => return err,
+    };
+    if (detail.len >= 8 and detail.len <= 264 and std.mem.readInt(u64, detail[0..8], .little) == std.hash.Wyhash.hash(0x454e525354415455, raw))
+        status.last_error_code = @import("../types.zig").RuntimeErrorName.init(detail[8..]);
+    return status;
 }
 
 fn decodeRuntimeStatus(raw: []const u8, retry_count_raw: ?[]const u8) !RuntimeStatus {
@@ -392,6 +402,13 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);
+    const detail_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":error" });
+    defer std.heap.page_allocator.free(detail_key);
+    var detail: [264]u8 = undefined;
+    std.mem.writeInt(u64, detail[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
+    const code = status.last_error_code.slice();
+    @memcpy(detail[8..][0..code.len], code);
+    try txn.put(detail_key, detail[0 .. 8 + code.len]);
     try txn.commit();
 }
 
@@ -570,6 +587,7 @@ test "enrichment runtime status persists source target sequence" {
 
     try saveRuntimeStatus(runtime, "generated", .{
         .target_sequence = 7,
+        .last_error_code = @import("../types.zig").RuntimeErrorName.init("GlinerBoundaryPaddedSequenceLimitExceeded"),
         .error_count = 1,
         .retryable_error_count = 2,
         .fatal_error_count = 3,
@@ -584,6 +602,7 @@ test "enrichment runtime status persists source target sequence" {
     });
     const loaded = try loadRuntimeStatus(std.testing.allocator, runtime, "generated");
     try std.testing.expectEqual(@as(u64, 7), loaded.target_sequence);
+    try std.testing.expectEqualStrings("GlinerBoundaryPaddedSequenceLimitExceeded", loaded.last_error_code.slice());
     try std.testing.expectEqual(@as(u64, 1), loaded.error_count);
     try std.testing.expectEqual(@as(u64, 2), loaded.retryable_error_count);
     try std.testing.expectEqual(@as(u64, 3), loaded.fatal_error_count);

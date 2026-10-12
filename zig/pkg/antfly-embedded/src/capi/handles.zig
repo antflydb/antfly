@@ -94,6 +94,7 @@ pub const Handle = struct {
     // which keeps today's behavior unchanged.
     lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     lite_inference_io: ?*std.Io.Threaded = null,
+    lite_inference_models_dir: ?[]u8 = null,
     // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
     // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
     // this caller intent across its own reconfigure passes -- see its doc
@@ -166,6 +167,10 @@ pub fn stopLiteEmbeddedInference(handle: *Handle) void {
         lifetime.quiesce();
         inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
         handle.lite_inference_lifetime = null;
+    }
+    if (handle.lite_inference_models_dir) |directory| {
+        handle.alloc.free(directory);
+        handle.lite_inference_models_dir = null;
     }
     if (handle.lite_inference_io) |io_impl| {
         io_impl.deinit();

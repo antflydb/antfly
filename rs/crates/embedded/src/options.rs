@@ -139,6 +139,8 @@ pub struct OpenOptions {
     pub scratch_budget_mb: u32,
     pub process_memory_budget_mb: u32,
     pub busy_timeout: Option<Duration>,
+    /// Model directory for database enrichments; None uses the default.
+    pub models_dir: Option<std::path::PathBuf>,
 }
 
 impl OpenOptions {
@@ -146,6 +148,11 @@ impl OpenOptions {
     /// cleanup, automatic inference budgets).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn models_dir(mut self, directory: impl AsRef<std::path::Path>) -> Self {
+        self.models_dir = Some(directory.as_ref().to_path_buf());
+        self
     }
 
     pub fn storage(mut self, storage: Storage) -> Self {
