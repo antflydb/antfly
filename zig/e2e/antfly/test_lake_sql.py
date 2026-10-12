@@ -3978,3 +3978,146 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp_path):
+    """An unrepresentable optional key must never turn refresh into an incomplete index."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+
+    def put(name, body):
+        path = tmp_path / name
+        pq.write_table(pa.table({"body": [body], "amount": [1]}), path, compression="snappy")
+        payload = path.read_bytes()
+        (objects / name).write_bytes(
+            b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode() + payload
+        )
+
+    put("a.parquet", "x" * 262120 + " retainedneedle")
+    put("b.parquet", "initial")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+    )
+    failed = True
+    try:
+        def call(method, path, body=None):
+            response = requests.request(
+                method, server.api_url + path, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=90,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json() if response.content else None
+            return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
+
+        def ready():
+            deadline = time.monotonic() + 90
+            while True:
+                resources = call("GET", "/tables/directory/indexes")
+                assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
+                if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+                    return
+                assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+                time.sleep(0.1)
+
+        def check():
+            ready()
+            value = call("POST", "/tables/directory/query", {
+                "full_text_search": {"match": "retainedneedle", "field": "body"},
+                "full_text_index": "body_text", "fields": ["amount"], "limit": 10,
+            })
+            assert len(value["hits"]["hits"]) == 1, value
+
+        call("POST", "/tables/directory", {
+            "num_shards": 1,
+            "schema": {"storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "directory", "format": "parquet", "uri": root.as_uri(),
+            }},
+            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        })
+        check()
+        for phase, name, body in (
+            (1, "b.parquet", "replacement"),
+            (2, "a.parquet", "retainedneedle"),
+            (3, "b.parquet", "another replacement"),
+        ):
+            put(name, body)
+            call("POST", f"/tables/directory/indexes/wake{phase}", {
+                "type": "algebraic", "derive_from_schema": True,
+                "aggregates": [{"name": "rows", "op": "count"}],
+            })
+            check()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("covering", [False, True])
+def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
+    """Sparse build keys drive index probes, including duplicates, NULLs and large fanout."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "probe.parquet"
+    count, fanout = 8192, 600
+    pq.write_table(pa.table({
+        "k": pa.array([0 if i < fanout else i for i in range(count)], type=pa.int64()),
+        "v": pa.array(range(count), type=pa.int64()),
+    }), path, compression="snappy", use_dictionary=False, row_group_size=1024)
+    payload = path.read_bytes()
+    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+    )
+    failed = True
+    try:
+        def call(method, route, body=None):
+            response = requests.request(method, server.api_url + route, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call("POST", "/tables/join_probe", {
+            "num_shards": 1,
+            "schema": {"storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "join-probe", "format": "parquet", "uri": root.as_uri(),
+            }, "relational_indexes": [{
+                "name": "k_idx", "keys": [{"column": "k"}],
+                "include_columns": ["v"] if covering else [],
+            }]},
+        })
+        deadline = time.monotonic() + 90
+        while True:
+            resources = call("GET", "/tables/join_probe/indexes")
+            assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
+            if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        statement = (
+            f"SELECT p.v, b.k FROM join_probe p JOIN (VALUES (-1),(0),({count - 1}),(0),(NULL)) b(k) "
+            "ON p.k=b.k ORDER BY p.v, b.k"
+        )
+        expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [[str(count - 1), str(count - 1)]]
+        assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        server.pause()
+        if covering:
+            # Preserve object identity/footer while making every physical data
+            # page unreadable. The leased covering index must satisfy the join.
+            footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+            object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+        for cached in list(server.root.rglob("lake-ranges")):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

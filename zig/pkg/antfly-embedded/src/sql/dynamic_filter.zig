@@ -38,6 +38,8 @@ pub const Domain = struct {
     }
 };
 pub const Filter = struct {
+    pub const max_exact_keys = 4096;
+    pub const ExactKey = struct { hash: u64, values: []const Datum, next: ?usize };
     a: A,
     columns: []Column,
     domains: []Domain,
@@ -45,6 +47,11 @@ pub const Filter = struct {
     rows: usize = 0,
     sealed: bool = false,
     failed: bool = false,
+    exact_complete: bool = true,
+    exact_budget: @import("memory_budget.zig"),
+    exact_arena: std.heap.ArenaAllocator = undefined,
+    exact_keys: std.ArrayList(ExactKey) = .empty,
+    exact_buckets: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     pub fn create(a: A, columns: []const Column, bytes: usize) !*Filter {
         const self = try a.create(Filter);
         errdefer a.destroy(self);
@@ -55,10 +62,12 @@ pub const Filter = struct {
         const bits = try a.alloc(u64, @max(16, @min(8192, bytes / 8)));
         @memset(bits, 0);
         for (domains) |*domain| domain.* = .{ .min_owner = .init(a), .max_owner = .init(a) };
-        self.* = .{ .a = a, .columns = keys, .domains = domains, .bits = bits };
+        self.* = .{ .a = a, .columns = keys, .domains = domains, .bits = bits, .exact_budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        self.exact_arena = .init(self.exact_budget.allocator());
         return self;
     }
     pub fn close(self: *Filter) void {
+        self.exact_arena.deinit();
         for (self.domains) |*domain| {
             domain.min_owner.deinit();
             domain.max_owner.deinit();
@@ -82,6 +91,45 @@ pub const Filter = struct {
         self.bits[first.index] |= first.bit;
         self.bits[second.index] |= second.bit;
         self.rows += 1;
+        if (self.exact_complete) self.addExact(hash, values) catch |err| switch (err) {
+            error.OutOfMemory => self.discardExact(),
+            else => return err,
+        };
+    }
+    fn discardExact(self: *Filter) void {
+        self.exact_complete = false;
+        _ = self.exact_arena.reset(.free_all);
+        self.exact_keys = .empty;
+        self.exact_buckets = .empty;
+    }
+    fn addExact(self: *Filter, hash: u64, values: []const Datum) !void {
+        var next = self.exact_buckets.get(hash);
+        while (next) |index| {
+            const key = self.exact_keys.items[index];
+            var equal = true;
+            for (key.values, values) |l, r| if ((try scalar.compareDatums(l, r)) != .eq) {
+                equal = false;
+                break;
+            };
+            if (equal) return;
+            next = key.next;
+        }
+        if (self.exact_keys.items.len == max_exact_keys) {
+            self.discardExact();
+            return;
+        }
+        const a = self.exact_arena.allocator();
+        const owned = try a.alloc(Datum, values.len);
+        for (owned, values) |*out, value| out.* = try @import("operators.zig").cloneDatum(a, value);
+        const index = self.exact_keys.items.len;
+        try self.exact_keys.append(a, .{ .hash = hash, .values = owned, .next = self.exact_buckets.get(hash) });
+        try self.exact_buckets.put(a, hash, index);
+    }
+    /// Complete, deduplicated build tuples. Absence means retain the bounded
+    /// Bloom/domain path; a partial exact set must never restrict a scan.
+    pub fn exactKeys(self: *const Filter) ?[]const ExactKey {
+        if (!self.sealed or self.failed or !self.exact_complete) return null;
+        return self.exact_keys.items;
     }
     pub fn applyBatch(self: *const Filter, a: A, batch: @import("../storage/rowsource/types.zig").ColumnBatch, selected: []bool) !void {
         if (self.failed or !self.sealed or selected.len != batch.rowCount()) return error.InvalidSqlBackendResponse;
@@ -174,4 +222,29 @@ test "SQL batch dynamic masks match scalar membership for dictionaries nulls and
     var selected = [_]bool{ true, true, true, false };
     try filter.applyBatch(a, batch, &selected);
     try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, &selected);
+}
+
+test "SQL dynamic exact keys own values deduplicate semantic tuples and abandon incomplete sets" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{.{ .name = "k", .type = .integer }}, 256);
+    defer filter.close();
+    try filter.add(&.{Datum.json(.{ .integer = 42 })});
+    for (0..1000) |_| try filter.add(&.{Datum.json(.{ .float = 42 })});
+    try filter.add(&.{.{}});
+    filter.sealed = true;
+    try std.testing.expectEqual(@as(usize, 1), filter.exactKeys().?.len);
+    try std.testing.expectEqual(@as(i64, 42), filter.exactKeys().?[0].values[0].value.integer);
+    filter.sealed = false;
+    for (0..Filter.max_exact_keys + 1) |i| try filter.add(&.{Datum.json(.{ .integer = @intCast(i + 100) })});
+    filter.sealed = true;
+    try std.testing.expect(filter.exactKeys() == null);
+    try std.testing.expectEqual(@as(usize, 0), filter.exact_budget.live);
+    for (0..Filter.max_exact_keys + 1) |i| try std.testing.expect(try filter.contains(&.{Datum.json(.{ .integer = @intCast(i + 100) })}));
+    const strings = try Filter.create(a, &.{.{ .name = "s", .type = .string }}, 256);
+    defer strings.close();
+    var borrowed = [_]u8{ 'a', 'b', 'c' };
+    try strings.add(&.{Datum.json(.{ .string = &borrowed })});
+    borrowed[0] = 'x';
+    strings.sealed = true;
+    try std.testing.expectEqualStrings("abc", strings.exactKeys().?[0].values[0].value.string);
 }

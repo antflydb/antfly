@@ -455,12 +455,14 @@ pub const ObjectStore = struct {
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var meta = client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer meta.deinit(self.client.allocator);
+        defer meta.deinit(alloc);
         try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),
@@ -569,9 +571,11 @@ pub const ObjectStore = struct {
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
         if (self.read_only) return error.ArtifactStoreReadOnly;
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
+        if (self.local_inventory) |*fs| try @import("retained_closure.zig").forget(fs, artifact_id);
         lockAtomic(&self.verified_mu);
         defer self.verified_mu.unlock();
         if (self.verified_objects.fetchRemove(artifact_id)) |removed| {
@@ -688,7 +692,35 @@ pub const ObjectStore = struct {
         }
     }
 
+    fn retentionWitness(raw: *anyopaque, scope: artifact_store.UploadScope, token: CancellationToken) !?artifact_store.RetentionWitness {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").witness(fs, scope, token);
+        return null;
+    }
+    fn retainedClosure(raw: *anyopaque, id: []const u8, token: CancellationToken) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").retained(fs, id, token);
+        return false;
+    }
+    fn rememberClosure(raw: *anyopaque, id: []const u8, witnesses: []const artifact_store.RetentionWitness, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (!self.read_only) if (self.local_inventory) |*fs| try @import("retained_closure.zig").remember(fs, id, witnesses, token);
+    }
+    fn inheritClosure(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: artifact_store.UploadScope, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (!self.read_only) if (self.local_inventory) |*fs| try fs.retention.inherit(fs, id, previous, scope, token);
+    }
+    fn sealClosures(raw: *anyopaque, token: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (!self.read_only) if (self.local_inventory) |*fs| try fs.retention.seal(fs, token);
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .retention_witness = retentionWitness,
+        .retained_closure = retainedClosure,
+        .remember_closure = rememberClosure,
+        .inherit_closure = inheritClosure,
+        .seal_closures = sealClosures,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,

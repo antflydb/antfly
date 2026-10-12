@@ -184,6 +184,9 @@ pub const ArtifactMetadata = struct {
     }
 };
 
+/// Backend evidence must change after namespace deletion, replacement or restore.
+pub const RetentionWitness = struct { scope: UploadScope, stamp: [32]u8 };
+
 pub const ArtifactStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -194,6 +197,11 @@ pub const ArtifactStore = struct {
     upload_scope: ?UploadScope = null,
 
     pub const VTable = struct {
+        retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
+        retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
+        remember_closure: ?*const fn (*anyopaque, []const u8, []const RetentionWitness, CancellationToken) anyerror!void = null,
+        inherit_closure: ?*const fn (*anyopaque, []const u8, ?[]const u8, UploadScope, CancellationToken) anyerror!void = null,
+        seal_closures: ?*const fn (*anyopaque, CancellationToken) anyerror!void = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         put_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
@@ -216,6 +224,28 @@ pub const ArtifactStore = struct {
         reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
+
+    pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
+        try scope.validate();
+        try cancellation.check();
+        return if (self.vtable.retention_witness) |call| call(self.ptr, scope, cancellation) else null;
+    }
+    pub fn retainedClosure(self: *ArtifactStore, id: []const u8, cancellation: CancellationToken) !bool {
+        try cancellation.check();
+        return if (self.vtable.retained_closure) |call| call(self.ptr, id, cancellation) else false;
+    }
+    pub fn rememberClosure(self: *ArtifactStore, id: []const u8, witnesses: []const RetentionWitness, cancellation: CancellationToken) !void {
+        try cancellation.check();
+        if (self.vtable.remember_closure) |call| try call(self.ptr, id, witnesses, cancellation);
+    }
+    pub fn inheritClosure(self: *ArtifactStore, id: []const u8, previous: ?[]const u8, cancellation: CancellationToken) !void {
+        try cancellation.check();
+        if (self.vtable.inherit_closure) |call| try call(self.ptr, id, previous, self.upload_scope orelse return error.InvalidArtifactUploadScope, cancellation);
+    }
+    pub fn sealClosures(self: *ArtifactStore, cancellation: CancellationToken) !void {
+        try cancellation.check();
+        if (self.vtable.seal_closures) |call| try call(self.ptr, cancellation);
+    }
 
     pub fn deinit(self: *ArtifactStore) void {
         self.vtable.deinit(self.allocator, self.ptr);

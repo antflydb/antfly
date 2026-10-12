@@ -868,6 +868,46 @@ pub const Cursor = struct {
         }
     }
 
+    /// Advance a forward stream to a key without reading skipped sibling
+    /// leaves. Retain the authenticated ancestor path and never rewind.
+    pub fn seekForward(self: *Cursor, lower: []const u8) !void {
+        try self.store.check(self.store.ptr);
+        if (self.reverse) return error.InvalidGraphPage;
+        if (self.upper) |upper| if (!less(lower, upper)) {
+            self.deinit();
+            return;
+        };
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.end) |end| if (!less(lower, end)) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            };
+            var lo: usize = 0;
+            var hi = frame.page.entries.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (less(frame.page.entries[mid].key, lower)) lo = mid + 1 else hi = mid;
+            }
+            if (frame.page.ref.height == 0) {
+                frame.next = @max(frame.next, lo);
+                return;
+            }
+            const index = @max(frame.next, if (lo < frame.page.entries.len and std.mem.eql(u8, frame.page.entries[lo].key, lower)) lo else lo -| 1);
+            if (index == frame.page.entries.len) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            }
+            const entry = frame.page.entries[index];
+            const end = if (index + 1 < frame.page.entries.len) frame.page.entries[index + 1].key else frame.end;
+            frame.next = index + 1;
+            try self.descend(entry.child.?, lower, entry.key, end);
+            return;
+        }
+    }
+
     pub fn next(self: *Cursor) !?Record {
         try self.store.check(self.store.ptr);
         if (self.reverse) return self.previous();
@@ -1045,6 +1085,18 @@ test "serverless graph page tree rank cursors resume without reading earlier lea
         change.* = .{ .key = name, .value = &value };
     }
     const root = (try apply(a, backing.store(), null, changes)).?;
+    var seeking = try Cursor.init(a, backing.store(), root, "", names[count - 1][0..]);
+    defer seeking.deinit();
+    _ = try seeking.next();
+    const before_seek = backing.reads;
+    try seeking.seekForward(&names[1500]);
+    try std.testing.expectEqualSlices(u8, &names[1500], (try seeking.next()).?.key);
+    try std.testing.expect(backing.reads - before_seek <= root.height + 1);
+    // Lower targets never rewind a forward stream.
+    try seeking.seekForward(&names[10]);
+    try std.testing.expectEqualSlices(u8, &names[1501], (try seeking.next()).?.key);
+    try seeking.seekForward(&names[count - 1]);
+    try std.testing.expect((try seeking.next()) == null);
     for ([_]u64{ 0, 1, 233, 1024, count - 2, count - 1, count, count + 1 }) |rank| {
         const reads = backing.reads;
         var cursor = try Cursor.initAtRank(a, backing.store(), root, rank);

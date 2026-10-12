@@ -670,8 +670,9 @@ pub const Reader = struct {
         }
         try self.frequencyLane(field, terms, output, &budget, 0, lanes);
         if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
-            try task.await(runtime);
+            var owned = task.*;
             slot.* = null;
+            try owned.await(runtime);
         };
         try self.check();
     }
@@ -692,8 +693,9 @@ pub const Reader = struct {
         }
         try self.summaryLane(segment, field, terms, average, config, output, &budget, 0, lanes);
         if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
-            try task.await(runtime);
+            var owned = task.*;
             slot.* = null;
+            try owned.await(runtime);
         };
         try self.check();
     }
@@ -877,6 +879,13 @@ test "external lake text statistics survive cold reads incremental replacement a
     try Reader.summaries(&reopened, a, 0, "body", &.{ "gamma", "common", "absent", "gamma" }, 100, .{}, &serial_summaries);
     try Reader.summaries(&parallel, a, 0, "body", &.{ "gamma", "common", "absent", "gamma" }, 100, .{}, &parallel_summaries);
     try std.testing.expectEqualDeep(serial_summaries, parallel_summaries);
+    // Lane zero succeeds while an admitted background lane rejects its key.
+    // Joining that error must consume the task before deferred cleanup runs.
+    const oversized = try a.alloc(u8, tree.max_key_bytes);
+    defer a.free(oversized);
+    @memset(oversized, 'x');
+    try std.testing.expectError(error.InvalidNativeLakeTextStatistics, Reader.frequencies(&parallel, a, "body", &.{ "gamma", oversized }, parallel_counts[0..2]));
+    try std.testing.expectError(error.InvalidNativeLakeTextStatistics, Reader.summaries(&parallel, a, 0, "body", &.{ "gamma", oversized }, 100, .{}, parallel_summaries[0..2]));
     parallel.read.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, Reader.frequencies(&parallel, a, "body", &.{ "alpha", "beta", "gamma", "common" }, &parallel_counts));
     var unchanged = Builder.init(a, &manager);

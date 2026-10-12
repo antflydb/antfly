@@ -602,15 +602,20 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
         var exact_seed: ?Root = null;
+        var seed_artifact: ?[]const u8 = null;
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if (directory_root.inventory_version == 3 and directory_root.serving_routes == null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
-                try validateReuse(a, store.*, root, provider.context, cancellation);
+                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
             }
-            if (root.seekable and root.statistics_version >= 1 and std.mem.eql(u8, &root.recipe, &recipe) and std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) exact_seed = root;
+            if (root.seekable and root.statistics_version >= 1 and std.mem.eql(u8, &root.recipe, &recipe) and std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) {
+                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+                seed_artifact = declaration.artifact.artifact_id;
+                exact_seed = root;
+            }
         }
         var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
             if (declaration.artifact.kind != .text_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, want.name)) continue;
@@ -620,7 +625,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if (directory_root.inventory_version == 3 and directory_root.serving_routes == null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
-            try validateReuse(a, store.*, root, provider.context, cancellation);
+            try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+            seed_artifact = declaration.artifact.artifact_id;
             break root;
         } else null;
         const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
@@ -787,6 +793,29 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var stats_writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope.?;
         var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
+        // A disabled optional directory has no complete base to update. Paged
+        // seeds hold only changed maintenance groups, so stream unchanged
+        // contributions from the canonical serving directory when bootstrapping.
+        if (paged_seed and !incremental_directory) {
+            const Bootstrap = struct {
+                a: A,
+                pages: *@import("../serverless/graph_segment/page_store.zig").PageStore,
+                plan: *const state.Plan,
+                builder: *term_directory.Builder,
+                provider: *@import("lake_index_row_source.zig").Provider,
+                cancellation: Cancellation,
+                pub fn check(self: *@This()) !void {
+                    try self.provider.context.ensureActive();
+                    try self.cancellation.check();
+                }
+                pub fn record(self: *@This(), entry: anytype) !void {
+                    if (!self.plan.unchanged(entry.file)) return;
+                    try addStatisticsContribution(self.a, self.pages.store(), entry.route.summary, term_directory.identity(entry.route.ref.artifact_id), 1, null, self.builder);
+                }
+            };
+            var bootstrap: Bootstrap = .{ .a = a, .pages = &stats_pages, .plan = &plan, .builder = &directory_builder, .provider = provider, .cancellation = cancellation };
+            try text_directory.walkSegments(a, seed.?, store.*, cancellation, &bootstrap);
+        }
         if (seed) |old| for (old.file_groups) |group| {
             const current = plan.by_id.get(group.file.id);
             if (current != null and !plan.changed[current.?]) continue;
@@ -831,6 +860,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var upload = store.*;
         upload.allocator = ca;
         const uploaded = try upload.putWithCancellation(bytes, cancellation);
+        store.inheritClosure(uploaded.artifact_id, seed_artifact, cancellation) catch {
+            try provider.context.ensureActive();
+            try cancellation.check();
+        };
         const owned = try std.json.Stringify.valueAlloc(ca, Declared{ .name = want.name, .binding = binding, .artifact = .{ .name = want.name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len } }, .{});
         try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
     }
@@ -840,7 +873,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
 // bound memory and avoid downloading the archive; normal serving continues to
 // authenticate posting ranges. Metadata trees are read and authenticated in
 // bounded pages, including descendants not touched by incremental updates.
-fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    var retained_backend = backend;
+    const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;
+    try context.ensureActive();
+    try cancellation.check();
+    if (certified) return;
     const tree = @import("../serverless/graph_segment/page_tree.zig");
     var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing_a };
     const a = locked.allocator();
@@ -854,6 +892,38 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
         cancellation: Cancellation,
         domain: [32]u8,
         remaining_reads: u64 = tree.max_page_bytes,
+        witnesses: std.AutoHashMapUnmanaged(stores.UploadScope, stores.RetentionWitness) = .empty,
+        certifiable: bool = true,
+        fn retain(v: *@This(), scope: stores.UploadScope) !void {
+            if (!v.certifiable or v.witnesses.contains(scope)) return;
+            if (v.witnesses.count() == 4096) {
+                v.certifiable = false;
+                return;
+            }
+            const proof = v.store.retentionWitness(scope, v.cancellation) catch {
+                v.certifiable = false;
+                try v.check();
+                return;
+            };
+            const witness = proof orelse {
+                v.certifiable = false;
+                return;
+            };
+            try v.witnesses.put(v.a, scope, witness);
+        }
+        fn retainArtifact(v: *@This(), id: []const u8) !void {
+            if (try stores.uploadScopeFromArtifactId(id)) |scope| try v.retain(scope) else v.certifiable = false;
+        }
+        fn certify(v: *@This(), id: []const u8) !void {
+            if (!v.certifiable) return;
+            const witnesses = try v.a.alloc(stores.RetentionWitness, v.witnesses.count());
+            defer v.a.free(witnesses);
+            var it = v.witnesses.valueIterator();
+            for (witnesses) |*entry| entry.* = it.next().?.*;
+            v.store.rememberClosure(id, witnesses, v.cancellation) catch {
+                try v.check();
+            };
+        }
         pub fn check(v: *@This()) !void {
             try v.context.ensureActive();
             try v.cancellation.check();
@@ -883,6 +953,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
         }
         fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
             try v.check();
+            try v.retainArtifact(ref.artifact_id);
             const io = v.context.io orelse return auditLeaf(v.a, v.store, ref, v.context, v.cancellation);
             const index = v.cursor;
             v.cursor = (index + 1) % v.pending.len;
@@ -901,8 +972,9 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
                 try auditLeaf(v.a, v.store, retained, v.context, v.cancellation);
             }
         }
-        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+        pub fn skip(v: *@This(), ref: tree.Ref) !bool {
             try v.check();
+            try v.retain(.{ .domain = v.domain, .attempt = ref.attempt });
             v.remaining_reads = tree.max_page_bytes;
             return false;
         }
@@ -913,6 +985,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
             if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
         }
         fn segment(v: *@This(), ref: artifacts.ChunkRef, seekable: bool) !void {
+            try v.retainArtifact(ref.artifact_id);
             if (!seekable) return v.leaf(ref);
             try v.check();
             var scratch = std.heap.ArenaAllocator.init(v.a);
@@ -941,6 +1014,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
             var scratch = std.heap.ArenaAllocator.init(v.a);
             defer scratch.deinit();
             const physical_ref = file.physical orelse return error.InvalidNativeLakeTextCorpus;
+            try v.retainArtifact(physical_ref.artifact_id);
             const physical_group = try loadFileManifest(scratch.allocator(), v.store, physical_ref, v.domain, v.cancellation, null);
             if (!std.mem.eql(u8, physical_group.file.id, file.file.id) or !std.mem.eql(u8, &physical_group.file.digest, &file.file.digest)) return error.InvalidNativeLakeTextCorpus;
             for (physical_group.rows) |block| if (block.bitmap) |bitmap| try v.leaf(bitmap);
@@ -956,17 +1030,21 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
     };
     var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain };
     defer validator.drain(true);
+    defer validator.witnesses.deinit(a);
+    try validator.retainArtifact(root_id);
     try validator.pages(root.term_statistics);
     try validator.pages(root.term_directory.leaves);
     try validator.pages(root.term_directory.branches);
     if (root.inventory_version == 3) {
         try validator.pages(root.directories.files);
+        try validator.pages(root.directories.segments);
         try validator.pages(root.serving_inventory);
         try validator.pages(root.segment_files);
         try validator.pages(root.serving_routes);
         try text_directory.walkSegments(a, root, backend, cancellation, &validator);
         if (root.serving_routes != null) try @import("lake_index_serving_inventory.zig").walkRoutes(a, root, backend, cancellation, &validator);
         for (0..validator.pending.len) |i| try validator.finish(i, false);
+        try validator.certify(root_id);
         return;
     }
     for (root.file_groups) |group| {
@@ -975,6 +1053,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, contex
     }
     for (root.segments) |ref| try validator.segment(ref, root.seekable);
     for (0..validator.pending.len) |i| try validator.finish(i, false);
+    try validator.certify(root_id);
 }
 
 fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {

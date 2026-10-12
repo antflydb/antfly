@@ -1313,6 +1313,7 @@ pub const Adapter = struct {
                         break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);
                     };
                 errdefer cursor.close(cursor.ptr);
+                if (!owner.overlays.contains(request.table.id)) cursor.* = try @import("lake_index_sql_rows.zig").wrapDynamic(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, cursor.*);
                 try self.verify(scratch.allocator(), request.table);
             } else {
                 cursor.* = owner.native.?.cursors[native_index];

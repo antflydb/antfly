@@ -45,6 +45,7 @@ pub const FsStore = struct {
         }
     };
 
+    retention: @import("retained_closure.zig") = .{},
     alloc: Allocator,
     root_dir: []u8,
     inventory_root: []u8,
@@ -92,6 +93,7 @@ pub const FsStore = struct {
     }
 
     pub fn deinit(self: *FsStore) void {
+        self.retention.deinit(self.alloc);
         self.durable_dirs.deinit(self.alloc);
         lockAtomic(&self.verified_mu);
         var it = self.verified_files.keyIterator();
@@ -278,8 +280,8 @@ pub const FsStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
 
         var io_impl = threadedIo();
         defer io_impl.deinit();
@@ -356,9 +358,11 @@ pub const FsStore = struct {
     }
 
     pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
+        if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(self, scope, .none);
         const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
         try deleteFile(path);
+        try @import("retained_closure.zig").forget(self, artifact_id);
         self.forgetVerifiedFile(artifact_id);
     }
 
@@ -654,12 +658,36 @@ pub const FsStore = struct {
             // cannot publish here; a later orphan retries through registration
             // and is backfilled if it races this advisory metadata cleanup.
             try inventory.deleteTree(io, entry.name);
+            try @import("retained_closure.zig").forgetNamespace(self, scope);
             try fs_paths.syncDirPortable(io, std.fs.path.dirname(payload).?);
             try fs_paths.syncDirectoryHandlePortable(io, inventory);
         }
     }
 
+    fn retentionWitness(raw: *anyopaque, scope: artifact_store.UploadScope, token: CancellationToken) !?artifact_store.RetentionWitness {
+        return @import("retained_closure.zig").witness(@ptrCast(@alignCast(raw)), scope, token);
+    }
+    fn retainedClosure(raw: *anyopaque, id: []const u8, token: CancellationToken) !bool {
+        return @import("retained_closure.zig").retained(@ptrCast(@alignCast(raw)), id, token);
+    }
+    fn rememberClosure(raw: *anyopaque, id: []const u8, witnesses: []const artifact_store.RetentionWitness, token: CancellationToken) !void {
+        return @import("retained_closure.zig").remember(@ptrCast(@alignCast(raw)), id, witnesses, token);
+    }
+    fn inheritClosure(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: artifact_store.UploadScope, token: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.retention.inherit(self, id, previous, scope, token);
+    }
+    fn sealClosures(raw: *anyopaque, token: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.retention.seal(self, token);
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .retention_witness = retentionWitness,
+        .retained_closure = retainedClosure,
+        .remember_closure = rememberClosure,
+        .inherit_closure = inheritClosure,
+        .seal_closures = sealClosures,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
@@ -888,7 +916,7 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     return writeFileAtomicallyWithCancellation(path, contents, .none);
 }
 
-fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
+pub fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     var nonce: [16]u8 = undefined;

@@ -121,6 +121,9 @@ test "external lake incremental native publication appends replaces removes and 
             .text_segment => {
                 const native = @import("lake_index_native_text.zig");
                 const root = try native.loadRoot(ca, store, declaration.artifact, .none, null);
+                // All sibling index uploads finish before publication seals its
+                // evidence. The phase-one restoration invalidates the old scope.
+                try std.testing.expectEqual(phase != 1, try store.retainedClosure(declaration.artifact.artifact_id, .none));
                 try std.testing.expectEqual(expected, root.file_groups.len);
                 if (phase == 0 and std.mem.eql(u8, declaration.name, "body_text")) unchanged_text_manifest = root.manifests[0];
                 try std.testing.expectEqual(@as(u8, 2), root.statistics_version);

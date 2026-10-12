@@ -2271,3 +2271,102 @@ syntax, changed-file license headers, the Apache product boundary (2026 sources)
 and diff checks pass. Archive-scale throughput, RSS and provider-request
 benchmarks remain unqualified; retained serving-closure auditing remains
 corpus-wide as described above.
+
+
+### Complete directory bootstrap, ordered intersections and adaptive join probes
+
+Parallel statistics joins consume their task slot before awaiting its result.
+An error therefore leaves only outstanding tasks for deferred cancellation and
+joining. Frequency and summary regressions exercise a successful caller lane
+alongside a failing background lane.
+
+An optional term directory disabled by an unrepresentable key has no complete
+base for incremental updates. Bootstrapping it now streams unchanged segment
+summaries from the canonical serving directory, in addition to changed file
+contributions. It never publishes a changed-files-only directory as a complete
+membership proof. A surviving oversized key keeps the directory disabled; when
+that key is removed the next complete bootstrap can restore indexed routing.
+The real Parquet HTTP regression replaces an unrelated file, removes the large
+key, and refreshes another unrelated file while checking the retained match.
+
+Cold admission intersects required term memberships before acquiring readers.
+Ordered tree cursors retain their authenticated ancestor path and seek forward
+past entire unrelated sibling subtrees. Leapfrog intersection bounds resident
+state by at most 32 term cursors and applies the 4,096 candidate limit to the
+intersection, even when each term independently exceeds that limit. An 8 MiB
+working/read budget and 65,536 cursor-operation budget retain the full serving
+fallback if the proof is too expensive. Recursive Boolean proofs intersect known
+necessary sets; unknown and negative clauses retain conservative supersets.
+Global corpus totals and BM25 statistics do not change with admission.
+
+SQL dynamic filters retain a complete exact build-key set while it fits both
+4,096 distinct tuples and a 1 MiB allocation budget. Values are owned, NULL join
+keys are omitted, and semantic numeric equality deduplicates tuples. Exceeding
+either bound discards the entire optional set and keeps the Bloom/domain path.
+Duplicates do not consume additional exact-set capacity; join multiplicities
+remain in the build-side join state.
+
+Before the first probe pull, the external SQL adapter can select a compatible
+native ordered index using that sealed evidence. It encodes and deduplicates
+leading-key prefixes, costs their combined authenticated cardinality, and
+streams disjoint prefix ranges through one leased generation. A bounded 2 MiB
+page cache shares authenticated ancestors across cost estimates and subsequent
+probes; exhausted optional planning budgets retain the scan fallback. Covering values
+retain typed block delivery; uncovered fields hydrate bounded physical windows.
+There is no accumulated matching-row-ID list or fanout limit per key. Partial
+indexes still require implication from the static query predicates. Explicit
+cursor/order requests and accepted-write overlays retain their existing access
+paths. Larger or incompatible builds keep scan-level filtering.
+
+### Backend retention evidence for incremental serving closures
+
+Retained-closure certificates are backend-owned advisory metadata keyed by the
+complete scoped root identity. Publication leases, source binding, authorization
+and cancellation remain independent requirements. A certificate is useful only
+when the backend can attest that its immutable upload namespaces have retained
+their identities; a root digest alone is insufficient.
+
+The filesystem backend supplies namespace witnesses from directory inode,
+ctime and mtime plus a durable destructive-mutation epoch. Managed deletion
+advances a random epoch before removing a payload. Atomic object replacement,
+directory loss and directory restoration invalidate the directory witness.
+Restoration tools that modify immutable payloads in place must invalidate the
+namespace epoch before doing so. Payload integrity remains checked during normal
+verified reads; certificates do not replace payload checksums.
+
+A legacy or invalid certificate triggers the existing complete serving-closure
+audit. That audit snapshots namespace evidence before traversing references and
+only records a certificate if all evidence remains current afterward. A fresh
+build proves its newly uploaded namespace by construction. Incremental builds
+inherit an audited base's evidence and add their new upload namespace. Final
+publication seals pending certificates only after all indexes and publication
+directory uploads have completed. Existing base namespaces are never resealed
+to hide a mutation. A failed or uncommitted build cannot make a certificate into
+a publication authority.
+
+Certificates survive backend reopen. Ordinary reuse checks namespace witnesses
+instead of issuing a metadata request for every retained segment pack, block,
+descriptor and tree page. Cost therefore follows retained upload namespaces,
+while changed artifacts are checked by ordinary authenticated build reads and
+uploads. Proofs cap at 4,096 namespaces, 1 MiB serialized metadata and 64 pending
+roots; exceeding the caps retains full auditing. Cloud object stores without a
+provider retention guarantee currently retain full auditing through the same
+optional capability contract. Their future implementation must include durable
+delete/restore invalidation rather than infer retention from a warm cache.
+
+Regression coverage includes durable reopen, delta inheritance, uploads after
+inheritance but before sealing, deletion, restoration and corrupt certificate
+fallback. Real Parquet join tests cover duplicate and NULL build keys, absent
+prefixes, more than one delivery window per key, uncovered hydration, and a cold
+covering join with deliberately unreadable Parquet data pages.
+
+Validation of this refinement (Zig 0.17.0, Debug): all 346 lake integration
+checks pass (141 shared and 205 API), plus 56 focused checks with one optional
+benchmark skipped. The production CLI builds, and all eleven selected real
+Parquet/Iceberg E2Es pass against that binary: global text behavior, incremental
+artifact reuse, wide joins, the three new refresh/join cases, independent Iceberg
+snapshot/schema/delete transitions, and fragmented files/segments in both
+formats. The two native module-boundary audits, Apache product audit across
+2,026 sources, changed-source formatting/license headers, Python syntax and diff
+checks pass. Archive-scale throughput, RSS and provider-request benchmarks
+remain pending.
