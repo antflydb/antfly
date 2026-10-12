@@ -3096,6 +3096,82 @@ pub const Txn = struct {
             return self.readBatch(keys, buffers, values);
         }
 
+        pub fn readSortedScoreColumn(self: *@This(), prefix: []const u8, nodes: []const []const u8, values: []f64) !usize {
+            if (nodes.len != values.len or nodes.len > 4096) return error.InvalidBatch;
+            @memset(values, std.math.nan(f64));
+            errdefer @memset(values, std.math.nan(f64));
+            for (nodes, 0..) |node, i| if (i != 0 and std.mem.order(u8, nodes[i - 1], node) != .lt) return error.InvalidBatch;
+            var offset: usize = 0;
+            var batches: usize = 0;
+            while (offset < nodes.len) {
+                var end = offset;
+                var bytes: usize = 0;
+                while (end < nodes.len) : (end += 1) {
+                    const size = try std.math.add(usize, self.parent.prefix.len, try std.math.add(usize, prefix.len, @import("../internal_keys.zig").encodedComponentLen(nodes[end])));
+                    if (end != offset and size > 1024 * 1024 -| bytes) break;
+                    bytes = try std.math.add(usize, bytes, size);
+                }
+                const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
+                self.readSortedScoreColumnInner(prefix, nodes[offset..end], values[offset..end]) catch |err| {
+                    if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
+                    return err;
+                };
+                if (self.workspace) |w| if (w.resolved_scores.recovered_optional_failure) {
+                    w.resolved_scores.recovered_optional_failure = false;
+                    w.allocation_failed = previous_failure;
+                };
+                offset = end;
+                batches += 1;
+            }
+            return batches;
+        }
+        fn readSortedScoreColumnInner(self: *@This(), prefix: []const u8, nodes: []const []const u8, values: []f64) !void {
+            defer self.resetBatchScratch();
+            const temporary = (try self.batchScratch()).allocator();
+            const encoder = self.workingAllocator();
+            const encoding = @import("../internal_keys.zig");
+            const namespace = if (self.parent.pending_count != 0) "" else self.parent.prefix;
+            var bytes: usize = 0;
+            for (nodes) |node| {
+                bytes = try std.math.add(usize, bytes, try std.math.add(usize, namespace.len, try std.math.add(usize, prefix.len, encoding.encodedComponentLen(node))));
+            }
+            // One oversized key may progress under allocator admission, matching
+            // the generic reader. Multi-key spans stay byte bounded as well.
+            if (nodes.len > 1 and bytes > 1024 * 1024) return error.InvalidBatch;
+            // One allocation keeps release LIFO even when the arena crosses
+            // chunks. Separate key/byte owners can leave earlier chunks live
+            // for every span of a large ordinary read.
+            const metadata = try std.math.mul(usize, nodes.len, @sizeOf([]const u8));
+            const storage = try encoder.alignedAlloc(u8, .fromByteUnits(@alignOf([]const u8)), try std.math.add(usize, metadata, bytes));
+            defer encoder.free(storage);
+            const keys = @as([*][]const u8, @ptrCast(@alignCast(storage.ptr)))[0..nodes.len];
+            var encoded = std.ArrayListUnmanaged(u8).empty;
+            encoded.items = storage[metadata..][0..0];
+            encoded.capacity = bytes;
+            for (nodes, keys) |node, *key| {
+                const begin = encoded.items.len;
+                encoded.appendSliceAssumeCapacity(namespace);
+                encoded.appendSliceAssumeCapacity(prefix);
+                try encoding.appendEncodedComponent(&encoded, encoder, node);
+                key.* = encoded.items[begin..];
+            }
+            if (self.parent.pending_count != 0) {
+                // Overlay visibility keeps the established complete-reader path.
+                // visitScores adds the transaction namespace to these keys.
+                const Output = struct {
+                    values: []f64,
+                    fn write(ctx: *anyopaque, index: usize, value: ?f64) void {
+                        const out: *@This() = @ptrCast(@alignCast(ctx));
+                        out.values[index] = value orelse std.math.nan(f64);
+                    }
+                };
+                var output = Output{ .values = values };
+                return self.visitScores(keys, backend_types.CompleteScoreSink{ .context = &output, .write = Output.write });
+            }
+            const file = try self.parent.readFile();
+            try file.readDecodedScoresAtCheckpointWithState(temporary, self.parent.checkpoint, keys, values, try self.nativeState());
+        }
+
         pub fn visitManySortedScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
             const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
             self.visitScores(keys, sink) catch |err| {
@@ -10745,4 +10821,88 @@ test "lite prepared paged scores forced relocation inventories every partial gro
     };
     try Runner.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "lite typed score spans preserve binary keys namespaces missing deletions and overlays" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "typed-score.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var one: [8]u8 = undefined;
+    var two: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, @bitCast(@as(f64, 1)), .little);
+    std.mem.writeInt(u64, &two, @bitCast(@as(f64, 2)), .little);
+    const encoding = @import("../internal_keys.zig");
+    const keys = [_][]const u8{ "a\x00b", "c", "deleted", "missing", "z" };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(a);
+    const docs = try a.alloc(native.DocumentMutation, 4);
+    defer a.free(docs);
+    const offsets = [_]usize{ 0, 1, 2, 4 };
+    for (offsets) |i| {
+        try encoded.appendSlice(a, "ns\x00p/");
+        try encoding.appendEncodedComponent(&encoded, a, keys[i]);
+    }
+    var at: usize = 0;
+    for (offsets, docs) |i, *doc| {
+        const len = "ns\x00p/".len + encoding.encodedComponentLen(keys[i]);
+        doc.* = .{ .key = encoded.items[at..][0..len], .value = if (i == 2) &.{} else if (i == 1) &two else &one, .is_delete = i == 2 };
+        at += len;
+    }
+    try store.file.putDocumentBatch(docs);
+    var txn = try backend_erased.readTxnFrom(a, try Txn.openReadWithPrefix(&store, "ns\x00"));
+    defer txn.abort();
+    var scope = try txn.openReadScope(a);
+    defer scope.close();
+    try std.testing.expect(scope.supportsSortedScoreColumn());
+    var values: [5]f64 = undefined;
+    for (0..2) |_| {
+        _ = try scope.readSortedScoreColumn("p/", &keys, &values);
+        try std.testing.expectEqual(@as(f64, 1), values[0]);
+        try std.testing.expectEqual(@as(f64, 2), values[1]);
+        try std.testing.expect(std.math.isNan(values[2]) and std.math.isNan(values[3]));
+        try std.testing.expectEqual(@as(f64, 1), values[4]);
+    }
+    try std.testing.expectError(error.InvalidBatch, scope.readSortedScoreColumn("p/", &.{ "z", "a" }, values[0..2]));
+    try std.testing.expect(std.math.isNan(values[0]) and std.math.isNan(values[1]));
+    const Runner = struct {
+        fn run(backing: Allocator, parent: *Txn) !void {
+            var no_resize = @import("test_allocator.zig").NoResizeAllocator{ .backing = backing };
+            var owned = try parent.openReadScope(no_resize.allocator());
+            defer owned.close();
+            owned.beginScoreBatch();
+            var result: [5]f64 = undefined;
+            _ = try owned.readSortedScoreColumn("p/", &.{ "a\x00b", "c", "deleted", "missing", "z" }, &result);
+            try std.testing.expectEqual(@as(f64, 1), result[0]);
+            try std.testing.expectEqual(@as(f64, 2), result[1]);
+            try std.testing.expect(std.math.isNan(result[2]) and std.math.isNan(result[3]));
+            try std.testing.expectEqual(@as(f64, 1), result[4]);
+        }
+    };
+    // Force private scope ownership and relocation on every inventory run.
+    var parent = try Txn.openReadWithPrefix(&store, "ns\x00");
+    defer parent.abort();
+    try Runner.run(a, &parent);
+    try std.testing.checkAllAllocationFailures(a, Runner.run, .{&parent});
+    const long_a = try a.alloc(u8, 530000);
+    defer a.free(long_a);
+    const long_b = try a.alloc(u8, 530000);
+    defer a.free(long_b);
+    @memset(long_a, 'a');
+    @memset(long_b, 'b');
+    var missing: [2]f64 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try scope.readSortedScoreColumn("p/", &.{ long_a, long_b }, &missing));
+    try std.testing.expect(std.math.isNan(missing[0]) and std.math.isNan(missing[1]));
+    var write = try Txn.openWriteWithPrefix(&store, "ns\x00");
+    defer write.abort();
+    try write.put("p/c\x00\x00", &one);
+    try write.delete("p/z\x00\x00");
+    var pending = try write.openReadScope(a);
+    defer pending.close();
+    _ = try pending.readSortedScoreColumn("p/", &keys, &values);
+    try std.testing.expectEqual(@as(f64, 1), values[1]);
+    try std.testing.expect(std.math.isNan(values[4]));
 }

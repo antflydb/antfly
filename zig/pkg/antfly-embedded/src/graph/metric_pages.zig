@@ -43,7 +43,11 @@ pub const ScorePages = struct {
 
     pub fn create(a: Allocator, columns: usize) !*ScorePages {
         std.debug.assert(columns != 0 and columns <= 16);
-        const shift = std.math.log2_int(usize, 4096 / columns);
+        return createForRows(a, columns, @as(usize, 1) << std.math.log2_int(usize, 4096 / columns));
+    }
+    pub fn createForRows(a: Allocator, columns: usize, rows: usize) !*ScorePages {
+        std.debug.assert(columns != 0 and columns <= 16 and rows != 0 and std.math.isPowerOfTwo(rows) and rows <= 4096 / columns);
+        const shift = std.math.log2_int(usize, rows);
         const owner = try a.create(ScorePages);
         owner.* = .{ .alloc = a, .columns = columns, .row_shift = shift, .row_capacity = @as(usize, 1) << shift };
         return owner;

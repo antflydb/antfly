@@ -580,6 +580,46 @@ fn populateColumnsUsingScope(
             };
         }
     }
+    // Preserve warmed prepared delivery first. On an ordinary plan miss or a
+    // one-shot stream, strictly ordered unique rows can use typed native spans.
+    if (comptime @TypeOf(columns) == []const []f64 and scoped and @hasDecl(Scope, "readSortedScoreColumn")) {
+        if (scope) |*active| if (if (comptime @hasDecl(Scope, "supportsSortedScoreColumn")) active.supportsSortedScoreColumn() else true) {
+            var ordered_unique = true;
+            for (nodes[1..], nodes[0 .. nodes.len - 1]) |next, previous| if (std.mem.order(u8, previous, next) != .lt) {
+                ordered_unique = false;
+                break;
+            };
+            // Prefix aliases retain the generic deduplicated physical read.
+            for (prefixes, 0..) |prefix, i| if (prefix) |name| {
+                for (prefixes[0..i]) |previous| if (previous) |other| {
+                    if (std.mem.eql(u8, name, other)) ordered_unique = false;
+                };
+            };
+            if (ordered_unique) {
+                if (comptime @hasDecl(Scope, "beginScoreBatch")) {
+                    if (@typeInfo(@TypeOf(active.beginScoreBatch())) == .error_union) {
+                        active.beginScoreBatch() catch |err| {
+                            if (err != error.Unsupported) return err;
+                        };
+                    } else active.beginScoreBatch();
+                }
+                var stats = Stats{};
+                for (prefixes, columns) |prefix, column| {
+                    clearColumn(column);
+                    if (prefix) |name| {
+                        var offset: usize = 0;
+                        while (offset < nodes.len) {
+                            const end = @min(nodes.len, offset + max_keys_per_read);
+                            stats.batches += try active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]);
+                            stats.keys += end - offset;
+                            offset = end;
+                        }
+                    }
+                }
+                return stats;
+            }
+        };
+    }
     for (columns) |column| clearColumn(column);
     const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
