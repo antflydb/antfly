@@ -345,12 +345,11 @@ Still remaining in this phase:
 
 Verified in this pass:
 
-- `/api/version` now exposes built backend capabilities so e2e can gate ONNX-backed OCR checks without shelling out
+- `/api/version` exposes built backend capabilities
 - the installed `monkt/paddleocr-onnx` reader now has a model-backed e2e assertion on the generated bitmap fixture
 - `antfly inference pull hf:monkt/paddleocr-onnx --models-dir models/readers` now works against the raw upstream Hugging Face repo by selecting the nested detection/English recognition assets and synthesizing a local `termite_metadata.json`
 - the freshly pulled local `monkt/paddleocr-onnx` bundle now passes the multistage `/api/read` e2e, so PaddleOCR is no longer blocked on manual repackaging
-- plain `zig build` now auto-enables ONNX when a matching local `onnxruntime/<platform>-<arch>` bundle is present, so the default local binary keeps the PaddleOCR reader path live
-- the default build now passes `zig build test`, `e2e/inference/test_version.py`, and the `monkt/paddleocr-onnx` multistage `/api/read` e2e without extra `-Donnx=true` flags
+- PaddleOCR runs on the native ONNX implementation; the default build needs no external runtime for the `monkt/paddleocr-onnx` multistage `/api/read` e2e
 - the rebuilt default binary still passes the model-backed `monkt/paddleocr-onnx` `/api/read` e2e after the preprocessing-config parity changes
 - the current tree still passes `zig build` after the new pull fallback; `zig build test` is currently hitting an unrelated graph test crash (`fused_embedding_lookup`) outside the reader path
 
@@ -429,18 +428,16 @@ Status:
 
 Implemented in this pass:
 
-- Moondream readers load through the shared reader layer via both ONNX decoder-only VLM and ORT GenAI paths
+- Moondream readers previously loaded through ONNX Runtime (a decoder-only VLM session or an ORT GenAI package). Both paths were removed with ONNX Runtime. Moondream model directories now fail with `NativeMoondreamNotYetSupported` (HTTP 400 `INVALID_MODEL`) until a native reader plugs into the `native_moondream` seam in `src/readers/reader.zig`
 - Moondream JSON-like outputs are parsed into text, optional flattened `fields`, and an internal structured payload used by `/extract`
 - the `/api/read` boundary still accepts ordinary natural-language prompts, but the Moondream reader now restores the Go-style internal JSON-guided prompt wrapper for better local-model behavior
-- the normal Moondream reader path now prefers the working decoder-only VLM runtime again, so local `/read` and CLI flows do not pay an ORT GenAI load failure before succeeding
 - the model-gated Moondream `/api/read` e2e now uses a simple generated bitmap-text image aligned with Go's reader test instead of treating document-page OCR as the baseline regression
 - the same Moondream e2e now supports env-driven phrase and field assertions, so a local installed model can promote the current smoke check into a stronger regression
-- the forced ORT GenAI overlay package for Moondream now normalizes `config.json`, preserves the `onnx/` layout, and includes tokenizer merge/vocab files so the local `Xenova/moondream2` path loads successfully in the single-process reader flow
 
 Still remaining in this phase:
 
+- land a native Moondream reader behind the `native_moondream` seam
 - improve Moondream output quality beyond the current non-empty simple-image regression, especially on document-style fixtures like `sample-page-1.png`
-- decide whether the repaired ORT GenAI overlay path is worth keeping on the reader side at all, since the decoder-only VLM path is currently the reliable default
 - decide whether any additional model-specific fields beyond the current `mood` / `possible_source` / `tags` projection should be surfaced publicly
 
 ## Verification Plan
