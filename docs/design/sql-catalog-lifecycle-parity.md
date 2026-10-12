@@ -3853,3 +3853,20 @@ refuses a downgrade to capability 25, and text-index projection fingerprints
 exclude this unrelated feature. Decoder tests cover every truncation and a
 malformed capability boolean without allocating. This is a decoder capability,
 not authorization to activate production index workers or namespace turnover.
+
+Qualification at `a4a69e99fe` (2026-10-12) passed the full Debug SQL owner
+(750 tests plus 226 linked SQL tests; three existing skips), the full Debug
+native index system owner (203 tests), and the public HTTP immutable-index
+gate (one HTTP test plus nine linked native tests). The focused ReleaseFast
+SQL gate passed, including the schema capability fence; this is not a full
+ReleaseFast native-index lifecycle qualification. The PostgreSQL 18 oracle
+reproduced all 20 contracts and its eight audit tests passed. Regenerated SDK
+checks passed: Go relational tests, Python's 17 relational tests, and TypeScript
+type checking plus 482 tests (one existing skip). Generated OpenAPI/source
+catalog freshness, all 20 inventory audit tests and the 2,040-file Apache
+boundary passed. `make generate` and `make fmt` completed successfully.
+
+The subsequent merge of `origin/main` at `0f7fec50c5` changes documentation
+and inference comments only, not executable SQL/index code. Original-case
+dispositions remain unchanged; public production activation and the broader
+predicate/expression contracts above remain open.
