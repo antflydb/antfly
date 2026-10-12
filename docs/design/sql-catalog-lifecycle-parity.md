@@ -3331,3 +3331,47 @@ also completed successfully: 102/102 build steps and 33 component executions
 (five standalone, 27 publication and one floor test), without skips, failures
 or leaks. That historical checkpoint predates the explicit native proof and
 this receiver signing implementation, so it does not certify either change.
+
+### Durable native reporter registration CAS
+
+Standalone native reporter admission now has a signed, domain-separated
+startup contract binding the complete root identity, desired nonzero process
+reporter and optional expected reporter. An absent predecessor and an explicit
+zero reporter have different signature preimages. This grants neither root
+enrollment nor publication authority. A steady-state report publisher must not
+read a newer preimage and re-register itself; issuing registration belongs to
+startup under the actual exclusive physical-owner lease.
+
+The existing standalone catalog transaction accepts this registration only as
+a registration-only update, against an already admitted native binding and a
+durable root-signing capability floor. It compares node/store/root/cluster and
+any previously registered key, then CASes the current reporter. An exact retry
+preserves status generation and report baselines; a different reporter requires
+the signed predecessor. Store admission reuses the actual StoreRecord registry,
+normal capability/drain checks, buffered projection notifications and committed
+readback. Registration, standalone revision and any standby outbox are atomic.
+Registration-only commits do not invalidate the visible table/schema projection.
+
+The initial Debug publication gate passed 59/59 steps, including 30 publication
+tests and the decoder-floor test, with no skips, failures or leaks. This includes
+signature substitution cases and an actual committed/reopened registration
+test. A stronger final gate additionally checks that an exact duplicate retains
+an already advanced status generation and compiles the standalone consumer; it
+passed all 102 build steps and 36 component executions (five standalone, 30
+publication and one decoder-floor), with zero skips, failures or leaks. The
+original inventory integrity and 2,035-file license-boundary audits passed,
+along with Zig 0.17 formatting and diff checks. No original SQL-case disposition
+changes are earned, and optimized registration qualification remains open.
+
+This is the durable registration primitive, not completed producer startup or
+automatic worker activation. Source tracing confirms the present standalone
+DataServer registration/status loop returns early without remote metadata.
+Startup integration must prove the actual exclusive process/root lease and
+publish real native source/root observations through the shared report machinery.
+The current reused store replacement can walk an existing report membership;
+before activation, reporter turnover must instead invalidate observations with
+a constant-size generation switch and retire old/pending uploads through bounded
+baseline/GC steps. Do not introduce a parallel observation registry, preserve
+old reports under a new reporter, or silently drop incomplete uploads. These
+startup, bounded retirement, reporting, worker and distributed-fault obligations
+remain open; public native production stays disabled.

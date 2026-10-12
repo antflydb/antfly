@@ -6785,6 +6785,103 @@ fn exerciseTableCutLifecycleLock(kind: @import("../table_lifecycle_lock.zig").Ki
     try std.testing.expectEqualStrings("unrelated DDL", tables[0].description);
 }
 
+test "relational index publication native reporter CAS is durable atomic and cannot enroll its key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-reporter", .{tmp.sub_path});
+    defer alloc.free(path);
+    const group = group_ids.main_metadata_group_id;
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    const first = try (standalone_native_owner.Registration{ .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key }, .reporter_incarnation = 4, .expected_reporter_incarnation = null, .signature = undefined }).sign(root);
+    var next = first;
+    next.reporter_incarnation = 5;
+    next.expected_reporter_incarnation = 4;
+    next = try next.sign(root);
+    var final_revision: RaftApplyStore.StandaloneRevisionState = undefined;
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = first.identity.metadata_incarnation });
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .auxiliary_json = "{}" });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_registration = first }));
+        const activation = try std.json.Stringify.valueAlloc(alloc, topology_protocol.Activation{ .version = topology_protocol.store_root_enrollment_version, .incarnation = first.identity.metadata_incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        defer alloc.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_registration = first }));
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_owner = first.binding() });
+        const before = try store.standaloneRevisionState();
+        try store.updateStandaloneCatalog(group, before.revision, .{ .native_registration = first });
+        const after = try store.standaloneRevisionState();
+        try std.testing.expectEqual(before.revision + 1, after.revision);
+        try std.testing.expectEqual(before.projection_revision, after.projection_revision);
+        {
+            var registered = (try store.readStore(alloc, group, 3, false)).?;
+            defer metadata_table_manager.freeStore(alloc, registered);
+            try std.testing.expectEqual(@as(u64, 4), registered.reporter_incarnation);
+            try std.testing.expectEqual(@as(u128, 7), registered.replica_root_incarnation);
+            try std.testing.expectEqualSlices(u8, &root.public_key, &registered.replica_root_public_key);
+            try std.testing.expectEqual(@as(u64, 0), registered.status_generation);
+            registered.status_generation = 17;
+            try store.applyStandaloneCommand(group, .{ .upsert_store = registered });
+        }
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_registration = first });
+        {
+            const duplicate = (try store.readStore(alloc, group, 3, false)).?;
+            defer metadata_table_manager.freeStore(alloc, duplicate);
+            try std.testing.expectEqual(@as(u64, 17), duplicate.status_generation);
+        }
+        const stable = try store.standaloneRevisionState();
+        const mixed: metadata.TableRecord = .{ .table_id = 99, .name = "must_not_appear" };
+        try std.testing.expectError(error.InvalidStandaloneCatalog, store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = next, .tables = &.{mixed} }));
+        try std.testing.expectEqualDeep(stable, try store.standaloneRevisionState());
+        var unknown = next;
+        unknown.expected_reporter_incarnation = null;
+        unknown = try unknown.sign(root);
+        try std.testing.expectError(error.GenerationPublicationChanged, store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = unknown }));
+        var changed_root = root;
+        changed_root.root_incarnation += 1;
+        var changed = next;
+        changed.identity.root_incarnation += 1;
+        changed = try changed.sign(changed_root);
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = changed }));
+        const other_seed: [32]u8 = @splat(8);
+        const other_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(other_seed);
+        const other_root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = other_seed, .root_incarnation = 7, .public_key = other_pair.public_key.toBytes() };
+        changed = next;
+        changed.identity.public_key = other_root.public_key;
+        changed = try changed.sign(other_root);
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = changed }));
+        changed = next;
+        changed.identity.metadata_incarnation = @splat('2');
+        changed = try changed.sign(root);
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = changed }));
+        try std.testing.expectEqualDeep(stable, try store.standaloneRevisionState());
+        try store.updateStandaloneCatalog(group, stable.revision, .{ .native_registration = next });
+        // Lost reply: exact signed registration can be observed again without
+        // resetting the reporter's status generation or report baselines.
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_registration = next });
+        final_revision = try store.standaloneRevisionState();
+        try std.testing.expectError(error.GenerationPublicationChanged, store.updateStandaloneCatalog(group, final_revision.revision, .{ .native_registration = first }));
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try store.nativeIndexSigningViewTxn(&read, group, first.identity.metadata_incarnation) == null);
+    }
+    var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(final_revision, try reopened.standaloneRevisionState());
+    const registered = (try reopened.readStore(alloc, group, 3, false)).?;
+    defer metadata_table_manager.freeStore(alloc, registered);
+    try std.testing.expectEqual(@as(u64, 5), registered.reporter_incarnation);
+    try std.testing.expectEqualSlices(u8, &root.public_key, &registered.replica_root_public_key);
+    try std.testing.expectError(error.GenerationPublicationChanged, reopened.updateStandaloneCatalog(group, final_revision.revision, .{ .native_registration = first }));
+    const tables = try reopened.listTables(alloc, group);
+    defer reopened.freeTables(alloc, tables);
+    try std.testing.expectEqual(@as(usize, 0), tables.len);
+}
+
 test "native initial support finalization requires current bound root and durable owner progress" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -13034,6 +13131,47 @@ pub const RaftApplyStore = struct {
         return self.updateStandaloneCatalog(group_id, expected_revision, .{ .replace = true, .tables = tables, .ranges = ranges, .auxiliary_json = auxiliary_json });
     }
 
+    fn registerStandaloneNativeOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: standalone_native_owner.Registration) !void {
+        try request.validate();
+        const activation = try self.requireTopologyActivationTxn(txn, group_id, topology_protocol.store_root_enrollment_version);
+        if (activation.version < topology_protocol.store_root_enrollment_version) return error.TableTopologyProtocolUpgradeRequired;
+        var buf: [256]u8 = undefined;
+        const raw_binding = (try stagingGet(txn, try standalone_native_owner.key(&buf, group_id))) orelse return error.StoreRootEnrollmentChanged;
+        const binding = standalone_native_owner.decode(raw_binding) catch return error.InvalidCatalogRecord;
+        if (!binding.eql(request.binding()) or !std.mem.eql(u8, &activation.incarnation, &request.identity.metadata_incarnation))
+            return error.StoreRootEnrollmentChanged;
+        const current = try self.loadStoreHeaderTxn(txn, group_id, request.identity.store_id);
+        defer if (current) |record| metadata_table_manager.freeStore(self.alloc, record);
+        if (current) |record| {
+            if (record.store_id != request.identity.store_id or record.node_id != request.identity.node_id or
+                record.replica_root_incarnation != request.identity.root_incarnation or
+                (!std.mem.allEqual(u8, &record.replica_root_public_key, 0) and !std.mem.eql(u8, &record.replica_root_public_key, &request.identity.public_key)))
+                return error.StoreRootEnrollmentChanged;
+            // Exact lost-reply recovery is harmless; a different reporter
+            // requires the signed preimage and cannot steal a newer process.
+            if (record.reporter_incarnation == request.reporter_incarnation) {
+                if (!std.mem.eql(u8, &record.replica_root_public_key, &request.identity.public_key)) return error.StoreRootEnrollmentChanged;
+                return;
+            }
+            if (request.expected_reporter_incarnation == null or request.expected_reporter_incarnation.? != record.reporter_incarnation)
+                return error.GenerationPublicationChanged;
+        } else if (request.expected_reporter_incarnation != null) return error.GenerationPublicationChanged;
+        var replacement: metadata.StoreRecord = current orelse .{ .store_id = request.identity.store_id, .node_id = request.identity.node_id };
+        replacement.reporter_incarnation = request.reporter_incarnation;
+        replacement.replica_root_incarnation = request.identity.root_incarnation;
+        replacement.replica_root_public_key = request.identity.public_key;
+        replacement.status_generation = 0;
+        replacement.group_statuses = &.{};
+        replacement.runtime_statuses = &.{};
+        replacement.live = true;
+        try self.applyTransitionCommandTxn(txn, group_id, .{ .register_store = replacement });
+        const admitted = (try self.loadStoreHeaderTxn(txn, group_id, request.identity.store_id)) orelse return error.StoreRootEnrollmentChanged;
+        defer metadata_table_manager.freeStore(self.alloc, admitted);
+        if (admitted.node_id != request.identity.node_id or admitted.reporter_incarnation != request.reporter_incarnation or
+            admitted.replica_root_incarnation != request.identity.root_incarnation or !std.mem.eql(u8, &admitted.replica_root_public_key, &request.identity.public_key))
+            return error.StoreRootEnrollmentChanged;
+    }
+
     pub fn updateStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, update: @import("raft_apply_contract.zig").StandaloneCatalogUpdate) !void {
         const tables = update.tables;
         const ranges = update.ranges;
@@ -13073,6 +13211,15 @@ pub const RaftApplyStore = struct {
         if (revision == null and !bootstrap) return error.InvalidStandaloneCatalog;
         const current_revision = if (revision) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
         if (current_revision != expected_revision) return error.TableLifecycleConflict;
+        if (update.native_registration) |request| {
+            // Registration cannot smuggle schema/catalog changes or establish
+            // its own physical binding in the same request.
+            if (bootstrap or tables.len != 0 or ranges.len != 0 or update.table_replacements.len != 0 or
+                update.remove_tables.len != 0 or update.remove_ranges.len != 0 or update.replace or update.native_owner != null or
+                update.logical != null or update.auxiliary_json != null or update.import_catalog != null or
+                update.setting_command != null or update.policy_command != null) return error.InvalidStandaloneCatalog;
+            try self.registerStandaloneNativeOwnerTxn(&txn, group_id, request);
+        }
         if (update.native_owner) |owner| {
             try owner.validate();
             if (bootstrap) return error.InvalidStandaloneNativeOwner;
@@ -13216,7 +13363,7 @@ pub const RaftApplyStore = struct {
             try self.publishCapturedRelationsTxn(&txn, group_id, &relation_journal);
             try relation_journal.accept();
         }
-        try advanceStandaloneRevision(&txn);
+        try advanceStandaloneRevisionWithProjection(&txn, update.native_registration == null);
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
         try self.checkHotStandby();
         self.commitStandaloneTxn(&txn, &outcome, &committed) catch |err| {

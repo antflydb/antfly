@@ -111,6 +111,9 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    /// Signed startup-only reporter CAS for the already admitted native root.
+    /// Possession cannot enroll a key or authorize a publication ACK.
+    native_registration: ?@import("../standalone_native_owner.zig").Registration = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
