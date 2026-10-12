@@ -58,8 +58,9 @@ def port():
 
 
 class Server:
-    def __init__(self, binary, root, label):
+    def __init__(self, binary, root, label, seed_layout=False):
         self.binary, self.root, self.label = binary, root, label
+        self.seed_layout = seed_layout
         self.process = None
 
     def __enter__(self):
@@ -104,6 +105,14 @@ class Server:
             "--extension-package-store",
             str(self.root / "extensions"),
         ]
+        if self.seed_layout:
+            for flag, path in [
+                ("--replica-root-dir", self.root / "data" / "replicas"),
+                ("--replica-catalog-path", self.root / "data" / "catalog.txt"),
+                ("--snapshot-root-dir", self.root / "data" / "snapshots"),
+            ]:
+                command[command.index(flag) + 1] = str(path)
+            command += ["--id", "2"]
         if self.root.name == "ha-primary":
             command.extend(
                 [
@@ -664,6 +673,98 @@ def ha_cli(binary, evidence, command, primary=False, state="ha-standby"):
     return json.loads(result.stdout)
 
 
+def qualify_ha_activation(binary, old_binary, evidence, capture):
+    run = evidence / f"ha-activation-{time.time_ns()}"
+    binding = []
+    for name in [
+        "topology_id",
+        "topology_generation",
+        "node_id",
+        "target_pvc_name",
+        "target_pvc_uid",
+    ]:
+        binding += ["--" + name.replace("_", "-"), str(capture[name])]
+    common = [
+        "--generation",
+        capture["generation"],
+        "--slot",
+        capture["slot_name"],
+        "--capture-receipt-sha256",
+        capture["capture_receipt_sha256"],
+        *binding,
+    ]
+    identity = [
+        "--ha-cluster-id",
+        "847",
+        "--ha-timeline-id",
+        "1",
+        "--ha-epoch",
+        "1",
+        "--minimum-checkpoint-lsn",
+        str(capture["checkpoint_lsn"]),
+    ]
+    location = (run / "object-store").as_uri()
+
+    def artifact(executable, args):
+        result = subprocess.run(
+            [str(executable), "ha", "artifact", *args], capture_output=True, text=True
+        )
+        with (evidence / "ha-artifact.log").open("a") as log:
+            log.write(result.stdout + result.stderr)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    artifact(
+        old_binary,
+        [
+            "publish",
+            *common,
+            "--location",
+            location,
+            "--manifest",
+            capture["manifest_path"],
+            "--content-root",
+            capture["content_root"],
+            "--capture-receipt",
+            str(Path(capture["generation_root"]) / "COMPLETE.json"),
+        ],
+    )
+    artifact(
+        binary,
+        [
+            "restore",
+            *common,
+            *identity,
+            "--location",
+            location,
+            "--staging-root",
+            str(run / "stage"),
+        ],
+    )
+    active = artifact(
+        binary,
+        [
+            "activate",
+            *common,
+            *identity,
+            "--staging-root",
+            str(run / "stage"),
+            "--target-root",
+            str(run / "target"),
+            "--target-local-node-id",
+            "2",
+            "--target-replica-id",
+            "1",
+        ],
+    )
+    live = run / "target" / active["generation_path"]
+    for label in ["activated-first", "activated-second"]:
+        with Server(binary, live, label, seed_layout=True) as server:
+            verify(server, vectors=False)
+            server.batch({"c": document("activated control", [0, 0, 1])})
+            server.batch(deletes=["c"])
+
+
 def qualify_ha(binary, old_binary, release, evidence):
     capture = json.loads((evidence / "ha-capture.json").read_text())
     bootstrap = [
@@ -696,8 +797,9 @@ def qualify_ha(binary, old_binary, release, evidence):
             verify(server, vectors=False)
             server.batch({"c": document("HA control", [0, 0, 1])})
             server.batch(deletes=["c"])
+    qualify_ha_activation(binary, old_binary, evidence, capture)
     print(
-        f"{release}: HA primary/standby WAL, seed authentication and restart passed",
+        f"{release}: HA WAL/progress, published seed restore/activation, queries/writes/restart passed",
         flush=True,
     )
 

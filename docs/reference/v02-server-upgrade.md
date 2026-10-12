@@ -29,7 +29,7 @@ marker is not a rollback procedure.
 | Dense embedding source ownership | Preserve the persisted `primary_lsm` default. Moving sources into the shared vector store remains an explicit storage migration, independent of physical index migration. |
 | AFB2 portable backups, reader level 2 | Authenticate metadata before validating document rows, including released document-before-metadata archives. Verify the source fingerprint across passes. |
 | Descriptorless Raft batches | Replay through the prepared resident owner with the atomic term/index receipt, preserving exactly-once increments across restart. |
-| HA v1 records/manifests and standby progress | Retain existing readers, verify captured file digests, reopen old WAL/progress state and continue streaming. |
+| HA v1 records/manifests, topology v3, KV stream v2, capture receipt v2 and published seed receipt v4 | Retain existing readers, verify captured file digests, reopen old WAL/progress state, continue streaming, and materialize/activate the released seed. |
 | Native-generation manifest v3 | Recover canonical install paths absent from the released writer; retain ownership, digest and inventory checks. Rebuild incompatible dense/full-text projections from the authenticated primary before publication. |
 
 Legacy public/runtime schemas must agree on every field the released writer
@@ -58,7 +58,6 @@ restoration and old-reader rejection. `--seed-only` and `--verify-only` split
 fixture generation from upgrade qualification. Run the same command with
 `--swarm-only` for stopped metadata/data Raft upgrades and an exactly-once
 increment, `--schema-only` for TTL and immutable schema history, and `--ha-only`
-for primary/standby WAL and progress reopen plus seed manifest/file validation.
-The HA CLI test authenticates seed content and advances replication progress;
-it does not exercise physical seed activation or a promoted standby deployment.
-These checks do not qualify mixed-version rolling operation.
+for primary/standby WAL and progress reopen, released seed publication, current
+restore/physical activation, and query/write/restart on the materialized seed.
+Those checks do not qualify fenced failover or mixed-version rolling operation.
