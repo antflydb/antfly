@@ -1345,11 +1345,11 @@ pub const GenerationBatchingConfig = struct {
     }
 
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
-        const validated_max_items: usize = 2;
+        const validated_max_items: usize = if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) @min(@max(platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2, 1), 4) else 2;
         return .{
-            .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
+            .max_step_items = if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) validated_max_items else @min(@max(self.max_step_items, 1), validated_max_items),
             .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
-            .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
+            .max_decode_wait_us = if (self.mode == .on or platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false)) self.max_decode_wait_us else 0,
             .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 2048),
             // Wider active sets currently lose response equivalence even when
             // individual steps are capped to two rows. Preserve the proven
@@ -14361,6 +14361,16 @@ pub const Node = struct {
         out: *BatchGenerateTaskResult,
 
         fn run(self: *@This()) std.Io.Cancelable!void {
+            // Retire completed coordinated pages immediately. A finished
+            // peer must not keep the last live page on the eager row scheduler.
+            defer if (self.pipeline.cb.kind() == .metal and self.pipeline.execution_lock != null) {
+                if (self.pipeline.scheduler) |scheduler| if (self.pipeline.scheduler_lease) |lease| {
+                    if (lease.request_id != 0) {
+                        scheduler.release(lease.*);
+                        lease.request_id = 0;
+                    }
+                };
+            };
             self.runInner() catch |err| {
                 self.out.@"error" = batchGenerationError(err);
             };
@@ -14408,6 +14418,9 @@ pub const Node = struct {
         /// those objects serially avoids racing streams, scratch buffers, and
         /// graph-capture state while still amortizing backend construction.
         shared_serial,
+        /// One backend and an outer model lease; a separate mutex serializes
+        /// projector/prefill and coordinated decode steps inside this batch.
+        coordinated_shared,
     };
 
     fn batchExecutionMode(backend: runtime.kv.pool.BackendKind) BatchExecutionMode {
@@ -14424,12 +14437,14 @@ pub const Node = struct {
     const BatchModelLock = struct {
         mutex: *std.atomic.Mutex,
         owns_outer_lock: bool,
+        coordinated: bool = false,
+        step_mutex: std.atomic.Mutex = .unlocked,
 
         fn initWithControl(mode: BatchExecutionMode, mutex: *std.atomic.Mutex, io: std.Io, control: ?InferenceExecutionControl) !@This() {
-            if (mode == .shared_serial) {
+            if (mode != .isolated_parallel) {
                 if (control) |active| try active.lock(mutex) else platform.sync.lockYieldingIo(mutex, io);
             }
-            return .{ .mutex = mutex, .owns_outer_lock = mode == .shared_serial };
+            return .{ .mutex = mutex, .owns_outer_lock = mode != .isolated_parallel, .coordinated = mode == .coordinated_shared };
         }
 
         fn init(
@@ -14437,17 +14452,18 @@ pub const Node = struct {
             mutex: *std.atomic.Mutex,
             io: std.Io,
         ) @This() {
-            const owns_outer_lock = execution_mode == .shared_serial;
+            const owns_outer_lock = execution_mode != .isolated_parallel;
             if (owns_outer_lock) platform.sync.lockYieldingIo(mutex, io);
-            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock };
+            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock, .coordinated = execution_mode == .coordinated_shared };
         }
 
-        fn pipelineExecutionLock(self: *const @This()) ?*std.atomic.Mutex {
+        fn pipelineExecutionLock(self: *@This()) ?*std.atomic.Mutex {
             // The request owns the model mutex for the complete lifetime of a
             // shared Metal/CUDA backend, so the pipeline must not lock it
             // again. Besides avoiding self-deadlock, this keeps request-scoped
             // backend state (including CUDA's RunBudget pointer) from being
             // rebound by another request between generation steps.
+            if (self.coordinated) return &self.step_mutex;
             return if (self.owns_outer_lock) null else self.mutex;
         }
 
@@ -14478,6 +14494,16 @@ pub const Node = struct {
             .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
             .scratch_tier = existing.scratch_tier,
         };
+    }
+
+    fn mergeCoordinatedBatchEstimate(current: ?runtime.tier.memory.Estimate, next: runtime.tier.memory.Estimate) runtime.tier.memory.Estimate {
+        var total = current orelse return next;
+        std.debug.assert(total.kv_tier == next.kv_tier and total.scratch_tier == next.scratch_tier);
+        total.kv_bytes +|= next.kv_bytes;
+        total.scratch_bytes +|= next.scratch_bytes;
+        total.prompt_tokens +|= next.prompt_tokens;
+        total.retained_tokens +|= next.retained_tokens;
+        return total;
     }
 
     fn acquireBatchAdmission(
@@ -15033,7 +15059,12 @@ pub const Node = struct {
                         break;
                     }
                 }
-                const execution_mode = if (group_has_media)
+                const coordinated_metal_ocr = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false) and
+                    group_indices.items.len >= 2 and backend_kind == .metal and gpt_config.family == .gemma and gpt_config.gemma4_channel_protocol and gpt_config.hasPle() and model.manifest.gguf_projector_path != null and
+                    group_indices.items.len <= self.config.generation_batching.schedulerPolicy().max_active_requests_for_batching.?;
+                const execution_mode = if (coordinated_metal_ocr)
+                    BatchExecutionMode.coordinated_shared
+                else if (group_has_media)
                     BatchExecutionMode.shared_serial
                 else
                     batchExecutionMode(backend_kind);
@@ -15295,7 +15326,7 @@ pub const Node = struct {
                         continue;
                     };
                     resource_estimates[pos] = resource_estimate;
-                    if (execution_mode == .shared_serial) {
+                    if (execution_mode != .isolated_parallel) {
                         runnable_count += 1;
                         continue;
                     }
@@ -15324,7 +15355,7 @@ pub const Node = struct {
                 // admission may evict an idle model and destroy its backend.
                 var shared_batch_admission: ?BatchAdmission = null;
                 defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     while (runnable_count > 0 and shared_batch_admission == null) {
                         var combined: ?runtime.tier.memory.Estimate = null;
                         var largest_pos: ?usize = null;
@@ -15332,7 +15363,10 @@ pub const Node = struct {
                         for (group_indices.items, 0..) |idx, pos| {
                             if (!pending[idx]) continue;
                             const estimate = resource_estimates[pos].?;
-                            combined = mergeSerialBatchEstimate(combined, estimate);
+                            combined = if (execution_mode == .coordinated_shared)
+                                mergeCoordinatedBatchEstimate(combined, estimate)
+                            else
+                                mergeSerialBatchEstimate(combined, estimate);
                             const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
                             if (largest_pos == null or pressure > largest_pressure) {
                                 largest_pos = pos;
@@ -15380,7 +15414,7 @@ pub const Node = struct {
                 defer batch_model_lock.deinit();
 
                 var shared_cb: ?ops.ComputeBackend = null;
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     shared_cb = session_factory.getComputeBackendWithBudget(
                         model.session,
                         ctx.allocator,
@@ -26257,6 +26291,31 @@ test "generate batch shared backends own the outer model lock" {
     shared.deinit();
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
+}
+
+test "coordinated Metal batch retains model ownership with an independent step mutex" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var mutex: std.atomic.Mutex = .unlocked;
+    var shared = Node.BatchModelLock.init(.coordinated_shared, &mutex, io_impl.io());
+    try std.testing.expect(!mutex.tryLock());
+    const step = shared.pipelineExecutionLock().?;
+    try std.testing.expect(step != &mutex);
+    try std.testing.expect(step.tryLock());
+    step.unlock();
+    shared.deinit();
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "coordinated batch admission reserves all live KV caches and scratch" {
+    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend };
+    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend };
+    const merged = Node.mergeCoordinatedBatchEstimate(first, second);
+    try std.testing.expectEqual(@as(usize, 400), merged.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 440), merged.retained_tokens);
+    try std.testing.expectEqual(@as(usize, 1300), merged.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 900), merged.scratch_bytes);
 }
 
 test "serial batch admission covers each request without summing them" {

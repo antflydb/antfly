@@ -2,6 +2,8 @@
 
 [Compact measurement report](gemma4-ocr-comparison.json).
 
+The follow-up [runtime, resident prompt, decode batching and MTP investigation](gemma4-ocr-optimization.md) uses this pinned corpus and keeps experimental generation paths separate from these baseline measurements.
+
 This compares **OCR text generation**, rather than PDF/image embeddings. The
 Gemma4 model is the available multimodal `gemma-4-E2B-it-Q4_0.gguf`, with its
 matching Q8_0 projector. These results do not transfer to the HF

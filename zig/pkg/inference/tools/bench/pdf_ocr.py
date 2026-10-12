@@ -18,11 +18,13 @@
 
 Raster preparation is external and shared. Timings include HTTP/base64 decode,
 multimodal preprocessing, prefill, autoregressive decode and full text response.
-The generation batch endpoint currently executes multimodal GPU items serially.
+The default generation path serializes Metal media requests; experimental decode
+batching is configured on the server, independently of the HTTP wave size.
 """
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 import urllib.error
@@ -36,9 +38,9 @@ PROMPT = (
 )
 
 
-def post(base_url, body, timeout):
+def post(base_url, body, timeout, endpoint="/ai/v1/generate/batch"):
     request = urllib.request.Request(
-        base_url.rstrip("/") + "/ai/v1/generate/batch",
+        base_url.rstrip("/") + endpoint,
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -47,6 +49,26 @@ def post(base_url, body, timeout):
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"HTTP {error.code}: {error.read().decode()}") from error
+
+
+def submit(args, body):
+    if args.runtime == "antfly" and args.draft_model is None:
+        return post(args.base_url, body, args.timeout)
+    # Independent HTTP requests; llama.cpp --parallel controls active slots.
+    endpoint = "/v1/chat/completions" if args.runtime == "llama" else "/ai/v1/generate"
+
+    def complete(indexed):
+        index, request = indexed
+        payload = dict(request["body"])
+        if args.runtime == "llama":
+            payload.pop("backend", None)
+            payload["cache_prompt"] = False
+        value = post(args.base_url, payload, args.timeout, endpoint)
+        return {"index": index, "custom_id": request["custom_id"], "response": value}
+
+    with ThreadPoolExecutor(max_workers=len(body["requests"])) as pool:
+        results = list(pool.map(complete, enumerate(body["requests"])))
+    return {"summary": {"failed": 0}, "data": results}
 
 
 def run(args):
@@ -78,6 +100,13 @@ def run(args):
                 ],
             }
         )
+    if args.draft_model:
+        for body in bodies:
+            body.update(
+                draft_model=args.draft_model,
+                speculative_k=args.speculative_k,
+                speculation_policy="force",
+            )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for batch in args.batches:
         waves = []
@@ -85,10 +114,9 @@ def run(args):
         saved = []
         # One per-page warmup per case, outside measured whole-corpus passes.
         for _ in range(args.warmups):
-            post(
-                args.base_url,
+            submit(
+                args,
                 {"requests": [{"custom_id": "warmup", "body": bodies[0]}]},
-                args.timeout,
             )
         for iteration in range(args.iterations):
             started = time.perf_counter()
@@ -100,9 +128,7 @@ def run(args):
                     for p, b in zip(current, bodies[offset : offset + batch])
                 ]
                 began = time.perf_counter()
-                response = post(
-                    args.base_url, {"mode": "sync", "requests": requests}, args.timeout
-                )
+                response = submit(args, {"mode": "sync", "requests": requests})
                 elapsed = time.perf_counter() - began
                 if response["summary"]["failed"]:
                     raise RuntimeError(json.dumps(response))
@@ -121,6 +147,8 @@ def run(args):
                         "text": choice["message"]["content"],
                         "finish_reason": choice["finish_reason"],
                         "usage": value["usage"],
+                        "speculation": value.get("speculation"),
+                        "timings": value.get("timings"),
                     }
                     outputs.append(output)
                 iteration_saved += outputs
@@ -142,6 +170,9 @@ def run(args):
             # Save each completed pass, so interrupted campaigns remain reviewable.
             report = {
                 "model": args.model,
+                "runtime": args.runtime,
+                "draft_model": args.draft_model,
+                "speculative_k": args.speculative_k if args.draft_model else None,
                 "batch": batch,
                 "pages": len(pages),
                 "warmup_pages": args.warmups,
@@ -153,7 +184,9 @@ def run(args):
                 "totals": totals,
                 "waves": waves,
                 "results": saved,
-                "execution": "production multimodal Metal shared_serial",
+                "execution": "llama.cpp concurrent slots"
+                if args.runtime == "llama"
+                else "Antfly Metal (server batching flags recorded separately)",
                 "scope": "Pre-rendered PNG through HTTP to complete OCR text; model load/file reads excluded",
             }
             (args.output_dir / f"gemma4-b{batch}.json").write_text(
@@ -166,6 +199,9 @@ def main():
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--runtime", choices=["antfly", "llama"], default="antfly")
+    parser.add_argument("--draft-model")
+    parser.add_argument("--speculative-k", type=int, default=2)
     parser.add_argument("--base-url", default="http://127.0.0.1:18097")
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--iterations", type=int, default=2)

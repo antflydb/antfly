@@ -3587,6 +3587,8 @@ pub const NativeGenerationPipeline = struct {
         token_id: i64,
         seq_len: usize,
         logits: ?[]f32 = null,
+        wants_greedy: bool = false,
+        greedy_token: ?u32 = null,
         failure: ?anyerror = null,
         ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
@@ -3627,6 +3629,10 @@ pub const NativeGenerationPipeline = struct {
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        // Coordinated requests report occupancy under the step mutex instead.
+        const ocr_profile_start = if (self.cb.kind() == .metal and self.execution_lock == null and
+            platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) self.cb.debugTimingSnapshot().provider else null;
+
         const grammar_opens_public_final_channel =
             config.grammar != null and
             self.gpt_config.usesGemma4Channels();
@@ -3726,7 +3732,11 @@ pub const NativeGenerationPipeline = struct {
             !target_speculative_verification_unavailable and
             loaded_draft_requested and
             !disable_unshared_gemma4_mtp;
-        if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
+        const multimodal_mtp = (has_images or has_audio) and use_speculative and draft_is_gemma4_mtp and
+            self.cb.kind() == .metal and self.gpt_config.usesGemma4Channels() and self.gpt_config.hasPle() and
+            self.gguf_projector_path != null and gemma4MtpTargetHiddenSource() == .final and
+            platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_MULTIMODAL", false);
+        if ((has_images or has_audio) and use_speculative and !multimodal_mtp) return error.MultimodalSpeculativeDecodingNotSupported;
         if (use_speculative and self.speculativeUsesDeepSeekV4CompressedCache()) return error.DeepSeekV4CompressedSpeculativeDecodingNotSupported;
 
         const relevant_draft_config = if (use_speculative) self.draft_gpt_config else null;
@@ -3791,7 +3801,11 @@ pub const NativeGenerationPipeline = struct {
         );
 
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
-        defer if (prepared_multimodal_prompt) |*prepared| prepared.deinit(&self.cb);
+        defer if (prepared_multimodal_prompt) |*prepared| {
+            if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+            prepared.deinit(&self.cb);
+        };
         var prepared_qwen3vl_prompt: ?qwen3vl_projector.PreparedPrompt = null;
         defer if (prepared_qwen3vl_prompt) |*prepared| prepared.deinit(&self.cb);
 
@@ -3897,13 +3911,22 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
                     decode_state.qwen3vl_text_only = false;
                 } else {
+                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+                    defer if (self.execution_lock) |mutex| mutex.unlock();
                     const request_projector = if (self.projector_store == null)
                         try gemma4_projector.ProjectorStore.open(allocator, projector_path)
                     else
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_images = if (images.len > 0)
+                    const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
+                        self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);
+                    var resident_images = if (images.len > 0 and resident_images_enabled)
+                        try gemma4_projector.encodeProjectedImagesResident(&self.cb, allocator, projector, images)
+                    else
+                        null;
+                    defer if (resident_images) |*projected| projected.deinit();
+                    var projected_images = if (images.len > 0 and resident_images == null)
                         try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector, images)
                     else
                         null;
@@ -3916,7 +3939,7 @@ pub const NativeGenerationPipeline = struct {
                     const expanded_prompt = try gemma4_mm.expandPromptText(
                         allocator,
                         prompt,
-                        if (projected_images) |*projected| projected.tokens_per_image else &.{},
+                        if (resident_images) |*projected| projected.tokens_per_image else if (projected_images) |*projected| projected.tokens_per_image else &.{},
                         if (projected_audio) |*projected| projected.tokens_per_audio else &.{},
                     );
                     defer allocator.free(expanded_prompt);
@@ -3933,15 +3956,26 @@ pub const NativeGenerationPipeline = struct {
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
                     if (expanded_prompt_tokens == 0) return error.EmptyPrompt;
 
-                    prepared_multimodal_prompt = try gemma4_mm.prepareExpandedPromptEmbeddings(
-                        &self.cb,
-                        allocator,
-                        self.tokenizer,
-                        self.gpt_config,
-                        expanded_encoded.ids[0..expanded_prompt_tokens],
-                        if (projected_images) |*projected| projected else null,
-                        if (projected_audio) |*projected| projected else null,
-                    );
+                    prepared_multimodal_prompt = if (resident_images) |*projected|
+                        try gemma4_mm.prepareExpandedPromptEmbeddingsResident(
+                            &self.cb,
+                            allocator,
+                            self.tokenizer,
+                            self.gpt_config,
+                            expanded_encoded.ids[0..expanded_prompt_tokens],
+                            projected,
+                            if (projected_audio) |*audio| audio else null,
+                        )
+                    else
+                        try gemma4_mm.prepareExpandedPromptEmbeddings(
+                            &self.cb,
+                            allocator,
+                            self.tokenizer,
+                            self.gpt_config,
+                            expanded_encoded.ids[0..expanded_prompt_tokens],
+                            if (projected_images) |*projected| projected else null,
+                            if (projected_audio) |*projected| projected else null,
+                        );
                 }
             } else {
                 if (has_audio) return error.NativeAudioGenerationNotImplemented;
@@ -4188,7 +4222,7 @@ pub const NativeGenerationPipeline = struct {
         const prefill_output = if (prepared_qwen3vl_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state) }
         else if (prepared_multimodal_prompt) |*prepared|
-            PrefillOutput{ .last_logits = try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state) }
+            try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         var prefill_last_logits = prefill_output.last_logits;
@@ -5053,6 +5087,19 @@ pub const NativeGenerationPipeline = struct {
                 },
             );
         }
+        if (ocr_profile_start) |before| {
+            const after = self.cb.debugTimingSnapshot().provider;
+            std.log.info("metal_ocr_profile: decode_attempts={d} decode_hits={d} decode_fallbacks={d} frame_submits={d} frame_wait_ns={d} frame_gpu_ns={d} host_download_bytes={d} to_host_calls={d}", .{
+                after.active_decode_frame_attempts -| before.active_decode_frame_attempts,
+                after.active_decode_frame_successes -| before.active_decode_frame_successes,
+                after.active_decode_frame_fallbacks -| before.active_decode_frame_fallbacks,
+                after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits,
+                after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos,
+                after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos,
+                after.metal_tensor_host_mirror_download_bytes -| before.metal_tensor_host_mirror_download_bytes,
+                after.metal_tensor_to_host_device_calls -| before.metal_tensor_to_host_device_calls,
+            });
+        }
         const final_mtp_auto_cost_probe_rounds: usize = if (speculative_stats.mtp_enabled and speculation_policy == .auto)
             gemma4MtpAutoCostProbeRounds()
         else
@@ -5081,6 +5128,12 @@ pub const NativeGenerationPipeline = struct {
                 speculative_stats.speculation_policy_decision = .disabled_slow;
                 speculative_stats.mtp_disabled_reason = "mtp_auto_cost_probe_slow";
             }
+        }
+        if (speculative_stats.mtp_enabled and platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) {
+            std.log.info("metal_ocr_mtp_profile: rounds={d} drafted={d} matched={d} accepted={d} corrections={d} bonus={d}", .{
+                speculative_stats.rounds,          speculative_stats.drafted_tokens,    speculative_stats.matched_draft_tokens,
+                speculative_stats.accepted_tokens, speculative_stats.correction_tokens, speculative_stats.bonus_tokens,
+            });
         }
         return .{
             .text = text,
@@ -5833,7 +5886,8 @@ pub const NativeGenerationPipeline = struct {
         prepared: *gemma3_mm.PreparedPrompt,
         seq_len: usize,
         decode_state: *NativeDecodeState,
-    ) !?[]f32 {
+        capture_last_hidden: bool,
+    ) !PrefillOutput {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) {
@@ -5866,25 +5920,22 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const host_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
-        prepared.input_embeddings = null;
-        // The prompt embeddings were assembled on the host. The layer stack
-        // takes its fast, framed prefill route only for device-resident
-        // input, so upload once here instead of per op below.
-        const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
-        // This owner keeps the rows only until the forward takes them.
-        var owns_input_embeddings = true;
-        errdefer if (owns_input_embeddings) self.cb.free(input_embeddings);
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
         if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
         defer if (direct_execution_mutex) |mutex| mutex.unlock();
+        prepared.input_embeddings = null;
+        const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
+        var owns_input_embeddings = true;
+        errdefer if (owns_input_embeddings) self.cb.free(input_embeddings);
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.attn_or_mask = prepared.attn_or_mask;
         owns_input_embeddings = false;
-        const logits = try self.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, &decode_context);
-        errdefer self.allocator.free(logits);
+        const logits = try self.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, &decode_context, capture_last_hidden);
+        errdefer if (logits.last_logits) |values| self.allocator.free(values);
+        errdefer if (logits.last_hidden) |hidden| self.cb.free(hidden);
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
@@ -5905,16 +5956,18 @@ pub const NativeGenerationPipeline = struct {
         ple_token_ids: []const i64,
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
-    ) ![]f32 {
+        capture_last_hidden: bool,
+    ) !PrefillOutput {
         var owns_input = true;
         defer if (owns_input) self.cb.free(input_embeddings);
-        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context)) |logits| {
+        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden)) |logits| {
             return logits;
         }
+        if (capture_last_hidden) return error.MultimodalMtpPrefillUnavailable;
         const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
         defer if (ple_vectors) |vectors| self.cb.free(vectors);
         owns_input = false;
-        return gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
+        return .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
             &self.cb,
             self.allocator,
             self.gpt_config,
@@ -5924,7 +5977,7 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             decode_context,
             ple_vectors,
-        );
+        ) };
     }
 
     /// The planned Gemma prefill frame for a media prompt: the same route
@@ -5938,7 +5991,8 @@ pub const NativeGenerationPipeline = struct {
         ple_token_ids: []const i64,
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
-    ) !?[]f32 {
+        capture_last_hidden: bool,
+    ) !?PrefillOutput {
         if (self.cb.kind() != .metal) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
         if (!metalPreparedTailOwnsWholePrefill(ple_token_ids.len, seq_len, decode_context)) return null;
@@ -5961,7 +6015,8 @@ pub const NativeGenerationPipeline = struct {
         )) orelse return null;
         defer rows.deinit(&self.cb);
         const last_hidden = try self.cb.sliceRows2D(self.allocator, rows.final_hidden, rows.rows - 1, 1, self.gpt_config.hidden_size);
-        defer self.cb.free(last_hidden);
+        var owns_last_hidden = true;
+        defer if (owns_last_hidden) self.cb.free(last_hidden);
         const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
         defer self.cb.free(lm_w);
         const last_logits_device = try self.cb.linearNoBias(last_hidden, lm_w, 1, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
@@ -5969,7 +6024,8 @@ pub const NativeGenerationPipeline = struct {
         const last_logits = try self.cb.toFloat32(last_logits_device, self.allocator);
         gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
         debugGenerationStage("multimodal prefill metal_prepared_frame rows={d}", .{rows.rows});
-        return last_logits;
+        if (capture_last_hidden) owns_last_hidden = false;
+        return .{ .last_logits = last_logits, .last_hidden = if (capture_last_hidden) last_hidden else null, .last_hidden_rows = if (capture_last_hidden) 1 else 0 };
     }
 
     fn executePreparedQwen3VlPrefill(
@@ -6344,6 +6400,13 @@ pub const NativeGenerationPipeline = struct {
                 // and incompatible peers do not pay a coalescing delay.
                 const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
                     (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false);
+                if (route_decode_through_scheduler and self.cb.kind() == .metal and
+                    isPureGreedyConfig(config) and token_table == null and json_grammar.* == null and gbnf_grammar == null and
+                    !has_cached_prefill_logits)
+                {
+                    const scheduled = try self.runScheduledDecodeBatch(self.scheduler.?, self.scheduler_lease.?, self.io.?, decode_state, token_ids[seq_len.* - 1], seq_len.*, true);
+                    break :blk .{ .token = scheduled.token orelse return error.InvalidBatchDecodeState, .grammar_complete = false };
+                }
                 const allow_direct_device_decode = !route_decode_through_scheduler;
                 if (!has_cached_prefill_logits and allow_direct_device_decode) {
                     const direct_token = direct_token_blk: {
@@ -6409,7 +6472,7 @@ pub const NativeGenerationPipeline = struct {
                                 if (self.graph_cache == null and decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) {
                                     used_decode_microbatch = true;
                                     owns_last_logits = true;
-                                    break :logits_blk try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*);
+                                    break :logits_blk (try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*, false)).logits.?;
                                 }
                                 try scheduler.awaitTurn(lease, .decode, io);
                                 direct_decode_turn_acquired = true;
@@ -10460,6 +10523,8 @@ pub const NativeGenerationPipeline = struct {
         // ComputeBackend and tokenizer are borrowed — caller manages their lifetime.
     }
 
+    const ScheduledDecodeResult = struct { logits: ?[]f32 = null, token: ?u32 = null };
+
     fn runScheduledDecodeBatch(
         self: *NativeGenerationPipeline,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -10468,7 +10533,8 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
         token_id: i64,
         seq_len: usize,
-    ) ![]f32 {
+        wants_greedy: bool,
+    ) !ScheduledDecodeResult {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         const decode_ctx = decode_runtime.makeDecodeContext(seq_len, 1);
         var work = PendingDecodeBatchWork{
@@ -10476,6 +10542,7 @@ pub const NativeGenerationPipeline = struct {
             .decode_state = decode_state,
             .token_id = token_id,
             .seq_len = seq_len,
+            .wants_greedy = wants_greedy,
         };
         defer if (work.logits) |logits| work.allocator.free(logits);
         const pending_options = pendingWorkOptionsFromState(decode_state, 1);
@@ -10503,9 +10570,14 @@ pub const NativeGenerationPipeline = struct {
         try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .decode, io, coalesce_wait_error, &driver);
 
         if (work.failure) |err| return err;
+        if (work.greedy_token) |token| return .{ .token = token };
         const logits = work.logits orelse return error.InvalidBatchDecodeState;
+        if (wants_greedy) {
+            applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+            return .{ .token = @intCast(activations.argmax(logits)) };
+        }
         work.logits = null;
-        return logits;
+        return .{ .logits = logits };
     }
 
     fn runScheduledPrefillBatch(
@@ -10557,6 +10629,7 @@ pub const NativeGenerationPipeline = struct {
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
     const StepForwardResult = struct {
+        greedy_tokens: ?[]u32 = null,
         logits: ?[]f32,
         max_query_seq_len: usize,
     };
@@ -10710,6 +10783,29 @@ pub const NativeGenerationPipeline = struct {
             return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
         }
 
+        var all_greedy = self.cb.kind() == .metal and max_query_seq_len == 1;
+        for (claimed) |item| {
+            if (item.phase != .decode) {
+                all_greedy = false;
+                break;
+            }
+            const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            all_greedy = all_greedy and work.wants_greedy;
+        }
+        if (all_greedy) {
+            const hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, max_query_seq_len, &owned_ctx.context, "gpt.metal_batch_decode");
+            defer self.cb.free(hidden);
+            const weight = try self.graphWeight("lm_head.weight");
+            defer self.cb.free(weight);
+            const choices = try self.cb.linearNoBiasArgmaxRowsSuppress(hidden, weight, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size, self.gpt_config.suppressTokenIds(), self.allocator) orelse return error.ResidentImageOperationUnavailable;
+            if (choices.len != claimed.len) {
+                self.allocator.free(choices);
+                return error.InvalidBatchDecodeState;
+            }
+            if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) std.log.info("metal_ocr_decode_rows={d}", .{claimed.len});
+            return .{ .logits = null, .greedy_tokens = choices, .max_query_seq_len = 1 };
+        }
+
         const logits = try self.forwardAllLogits(input_ids, claimed.len, max_query_seq_len, &owned_ctx.context);
         // Past this point the forward has committed: the prefill state is
         // valid and rollback would corrupt it. Returning normally cancels the
@@ -10742,10 +10838,19 @@ pub const NativeGenerationPipeline = struct {
 
     const SuccessfulStepPublisher = struct {
         vocab_size: usize,
+        greedy_tokens: ?[]const u32 = null,
         logits: ?[]const f32,
         max_query_seq_len: usize,
 
         fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            if (self.greedy_tokens) |tokens| {
+                for (claimed, tokens) |item, token| {
+                    const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    work.greedy_token = token;
+                    work.ready.store(true, .release);
+                }
+                return;
+            }
             dispatchStepLogits(self.vocab_size, claimed, self.logits, self.max_query_seq_len);
         }
     };
@@ -10768,10 +10873,12 @@ pub const NativeGenerationPipeline = struct {
             return;
         };
         defer if (result.logits) |logits| self.allocator.free(logits);
+        defer if (result.greedy_tokens) |tokens| self.allocator.free(tokens);
 
         completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
             .vocab_size = self.gpt_config.vocab_size,
             .logits = result.logits,
+            .greedy_tokens = result.greedy_tokens,
             .max_query_seq_len = result.max_query_seq_len,
         });
     }
@@ -12195,6 +12302,24 @@ test "completeClaimedStepBeforePublish removes scheduler work before ready publi
     try std.testing.expect(ownership_was_released);
     try std.testing.expect(ready_was_clear);
     try std.testing.expect(work.ready.load(.acquire));
+}
+
+test "Metal greedy step publishes independent page choices without vocabulary rows" {
+    const a = std.testing.allocator;
+    var state = NativeDecodeState.initContiguous(a);
+    defer state.deinit();
+    var first = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &state, .token_id = 7, .seq_len = 9, .wants_greedy = true };
+    var second = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &state, .token_id = 11, .seq_len = 31, .wants_greedy = true };
+    const items = [_]runtime.scheduler.native_generate.StepItem{
+        .{ .work_ptr = @ptrCast(&first), .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 9, .kv_sequence_len = 9, .kv_position_offset = 0 },
+        .{ .work_ptr = @ptrCast(&second), .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 31, .kv_sequence_len = 31, .kv_position_offset = 0 },
+    };
+    const publisher = NativeGenerationPipeline.SuccessfulStepPublisher{ .vocab_size = 262144, .logits = null, .max_query_seq_len = 1, .greedy_tokens = &.{ 17, 29 } };
+    publisher.publish(&items);
+    try std.testing.expect(first.ready.load(.acquire) and second.ready.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 17), first.greedy_token.?);
+    try std.testing.expectEqual(@as(u32, 29), second.greedy_token.?);
+    try std.testing.expect(first.logits == null and second.logits == null);
 }
 
 test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
@@ -15579,7 +15704,7 @@ test "prepared embeddings prefill releases its rows once when the generic forwar
     defer allocator.free(ids);
     @memset(ids, 1);
     const decode_context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = rows, .total_sequence_len = rows, .query_sequence_len = rows };
-    try std.testing.expectError(error.SequenceTooLong, pipeline.forwardPreparedEmbeddingsLastLogits(input, ids, rows, &decode_context));
+    try std.testing.expectError(error.SequenceTooLong, pipeline.forwardPreparedEmbeddingsLastLogits(input, ids, rows, &decode_context, false));
 }
 
 test "prepared embeddings prefill releases its rows once when the generic forward succeeds" {
@@ -15607,8 +15732,20 @@ test "prepared embeddings prefill releases its rows once when the generic forwar
     const input = try preparedEmbeddingsTestRows(&pipeline.cb, allocator, rows, 4);
     const ids = [_]i64{ 1, 2, 3 };
     const decode_context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = rows, .total_sequence_len = rows, .query_sequence_len = rows };
-    const logits = try pipeline.forwardPreparedEmbeddingsLastLogits(input, &ids, rows, &decode_context);
+    const output = try pipeline.forwardPreparedEmbeddingsLastLogits(input, &ids, rows, &decode_context, false);
+    const logits = output.last_logits.?;
     defer allocator.free(logits);
     try std.testing.expectEqual(@as(usize, 6), logits.len);
     for (logits) |value| try std.testing.expect(std.math.isFinite(value));
+}
+
+test "prepared embeddings MTP requires the image hidden state and releases rows on rejection" {
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    var pipeline = model.pipeline(a, .{ .family = .gemma, .hidden_size = 4, .vocab_size = 6, .num_hidden_layers = 0 });
+    const input = try preparedEmbeddingsTestRows(&pipeline.cb, a, 3, 4);
+    const context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = 3, .total_sequence_len = 3, .query_sequence_len = 3 };
+    try std.testing.expectError(error.MultimodalMtpPrefillUnavailable, pipeline.forwardPreparedEmbeddingsLastLogits(input, &.{ 1, 2, 3 }, 3, &context, true));
 }

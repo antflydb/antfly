@@ -130,6 +130,40 @@ pub fn prepareExpandedPromptEmbeddings(
     projected_images: ?*const gemma4_projector.ProjectedImages,
     projected_audio: ?*const gemma4_projector.ProjectedAudio,
 ) !gemma3_mm.PreparedPrompt {
+    return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, if (projected_images) |p| .{ .tokens_per_image = p.tokens_per_image, .hidden_size = p.hidden_size, .host = p.embeddings } else null, projected_audio);
+}
+
+/// Image features and the assembled language prompt remain resident. Audio,
+/// when present, is uploaded once into the same prompt without downloading it.
+pub fn prepareExpandedPromptEmbeddingsResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    projected_images: *const gemma4_projector.ResidentProjectedImages,
+    projected_audio: ?*const gemma4_projector.ProjectedAudio,
+) !gemma3_mm.PreparedPrompt {
+    if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
+    return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, .{ .tokens_per_image = projected_images.tokens_per_image, .hidden_size = projected_images.hidden_size, .resident = projected_images.embeddings }, projected_audio);
+}
+
+const ImageFeatures = struct {
+    tokens_per_image: []const usize,
+    hidden_size: usize,
+    host: ?[]const f32 = null,
+    resident: ?ops.CT = null,
+};
+
+fn preparePromptEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    projected_images: ?ImageFeatures,
+    projected_audio: ?*const gemma4_projector.ProjectedAudio,
+) !gemma3_mm.PreparedPrompt {
     if (projected_images == null and projected_audio == null) return error.NoMultimodalInputs;
     if (projected_images) |projected| {
         if (projected.tokens_per_image.len == 0) return error.NoImages;
@@ -225,6 +259,32 @@ pub fn prepareExpandedPromptEmbeddings(
     defer cb.free(base_embeddings);
 
     const hidden_size: usize = config.hidden_size;
+    if (projected_images) |projected| if (projected.resident) |features| {
+        const scale = config.tokenEmbeddingScale();
+        const scaled = try cb.multiplyScalar(base_embeddings, scale) orelse return error.ResidentImageOperationUnavailable;
+        const input_embeddings = try cb.ensureDeviceResidentOwned(scaled);
+        errdefer cb.free(input_embeddings);
+        var source_row: usize = 0;
+        for (image_offsets, projected.tokens_per_image) |offset, count| {
+            try cb.checkExecutionControl();
+            if (!try cb.copyRows2D(allocator, input_embeddings, offset, features, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
+            source_row += count;
+        }
+        if (projected_audio) |audio| {
+            var rows: usize = 0;
+            for (audio.tokens_per_audio) |count| rows += count;
+            const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+            const audio_tensor = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(audio.embeddings, &shape));
+            defer cb.free(audio_tensor);
+            source_row = 0;
+            for (audio_offsets, audio.tokens_per_audio) |offset, count| {
+                if (count > 0 and !try cb.copyRows2D(allocator, input_embeddings, offset, audio_tensor, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
+                source_row += count;
+            }
+        }
+        return .{ .allocator = allocator, .token_ids = token_ids, .ple_token_ids = ple_token_ids, .input_embeddings = input_embeddings, .attn_or_mask = null };
+    };
+
     const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
     defer allocator.free(prompt_embeddings);
 
@@ -241,7 +301,7 @@ pub fn prepareExpandedPromptEmbeddings(
             const src = src_token_offset * hidden_size;
             @memcpy(
                 prompt_embeddings[dst..][0 .. tokens * hidden_size],
-                projected.embeddings[src..][0 .. tokens * hidden_size],
+                projected.host.?[src..][0 .. tokens * hidden_size],
             );
             src_token_offset += tokens;
         }

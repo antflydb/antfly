@@ -962,3 +962,26 @@ of up to eight and singleton fusion/fallback behavior. Both prepare one bounded
 future CPU wave, join producers on every exit and preserve indexed codec errors.
 Gemma4 audio-only server groups can use the generation-qualified broker; mixed
 and titled groups retain compatibility. No CUDA performance gain is claimed.
+
+### Gemma4 generative OCR optimization
+
+[The OCR optimization investigation](../../../docs/design/inference/gemma4-ocr-optimization.md)
+compares the identical GGUF model/projector with llama.cpp, profiles optimized
+Metal decode hits and transfer/wait counters, and keeps generative projected
+image features and prompt packing resident. The embedding measurements above
+are separate from OCR text generation.
+
+An experimental `ANTFLY_GEMMA4_METAL_OCR_BATCH=1` lane coordinates independent
+GGUF Gemma4 page decoders at two or four rows. It holds an outer model/provider
+lease, serializes projector and prefill work with a distinct step mutex, reserves
+all live KV/scratch allocations, retains per-page paged KV identities and uses
+device argmax for eligible greedy rows. Finished requests retire from the
+scheduler promptly; ordinary singletons retain the optimized direct decoder.
+The default Metal multimodal generation lane stays serialized. Larger envelopes
+alone do not qualify a native decoder batch.
+
+`ANTFLY_GEMMA4_MTP_MULTIMODAL=1` is a separate experimental lane. It seeds a
+compatible MTP assistant from the actual image prefill's final hidden row and
+target KV. An unavailable image hidden state fails instead of reconstructing a
+text-only placeholder prompt. Warm OCR speed, draft acceptance and exact
+transcript parity must pass before changing the existing automatic policy.

@@ -192,6 +192,31 @@ pub fn encodeProjectedImages(
     return encodeProjectedImagesWithWeights(cb, allocator, &weights, images);
 }
 
+/// Project GGUF images without exporting features to the host. Geometry cohorts
+/// share the encoder; the returned rows remain in the original image order.
+pub fn encodeProjectedImagesResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    projector: *ProjectorStore,
+    images: []const []const u8,
+) !ResidentProjectedImages {
+    if (images.len == 0 or images.len > 8) return error.InvalidImageBatch;
+    var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    const cfg = try parseConfig(&projector.gguf.parsed);
+    var prepared: [8]PreparedImage = undefined;
+    var initialized: usize = 0;
+    defer for (prepared[0..initialized]) |item| item.deinit();
+    for (images, prepared[0..images.len]) |bytes, *item| {
+        try cb.checkExecutionControl();
+        const decoded = try image.decode(allocator, bytes);
+        defer decoded.deinit(allocator);
+        item.* = try prepareImageView(allocator, &weights, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 });
+        initialized += 1;
+    }
+    return encodePreparedImagesResidentWithWeights(cb, allocator, &weights, cfg, prepared[0..initialized], .{});
+}
+
 /// A projector file kept open for a model's loaded lifetime. Parsing the
 /// GGUF header (hundreds of tensors) and re-reading the small `a.*` tensors
 /// was a visible share of every audio request, so the model manager opens

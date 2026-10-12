@@ -18557,9 +18557,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
             const is_mixed = kv_batch[0].per_item_query_len != null;
             const q_span = max_q_rows * h_q;
-            const output = try self.allocator.alloc(f32, batch * q_span);
-            errdefer self.allocator.free(output);
-            @memset(output, 0.0);
+            // Device inputs must not be downloaded just to assemble per-page
+            // attention results. Zero padding once, then copy each active row.
+            const resident_output: ?CT = if (q_buf.metal_tensor != null and q_buf.metal_tensor.?.isDevice() and
+                k_buf.metal_tensor != null and k_buf.metal_tensor.?.isDevice() and
+                v_buf.metal_tensor != null and v_buf.metal_tensor.?.isDevice())
+            blk: {
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :blk null;
+                const shape = [_]i32{ @intCast(batch * max_q_rows), @intCast(h_q) };
+                var tensor = try MetalTensor.deviceAllocate(runtime, batch * q_span * @sizeOf(f32), .shared, &shape);
+                errdefer tensor.deinit();
+                const handle = tensor.deviceHandle() orelse return error.UnsupportedTensorType;
+                const raw = metal_runtime.termite_metal_buffer_contents(handle) orelse return error.UnsupportedTensorType;
+                const zeros: [*]f32 = @ptrCast(@alignCast(raw));
+                @memset(zeros[0 .. batch * q_span], 0);
+                break :blk try self.ctFromOwnedMetalTensor(tensor);
+            } else null;
+            errdefer if (resident_output) |tensor| freeOp(ctx, tensor);
+            const output: ?[]f32 = if (resident_output == null) try self.allocator.alloc(f32, batch * q_span) else null;
+            errdefer if (output) |values| self.allocator.free(values);
+            if (output) |values| @memset(values, 0.0);
 
             for (0..batch) |b| {
                 const view = kv_batch[b];
@@ -18598,14 +18615,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
                 const item_ct = try gqaPagedAttentionOp(ctx, q_slice, k_slice, v_slice, null, item_attention, 1, num_heads, num_kv_heads, head_dim);
                 defer freeOp(ctx, item_ct);
+                if (resident_output) |tensor| {
+                    if (!try copyRows2DOp(ctx, tensor, b * max_q_rows, item_ct, 0, item_q_len, h_q)) return error.UnsupportedTensorType;
+                    continue;
+                }
                 const item_output = try hostSliceForBuf(toBuf(item_ct));
                 const item_q_span = item_q_len * h_q;
                 if (item_output.len != item_q_span) return error.InvalidAttentionShape;
-                @memcpy(output[b * q_span ..][0..item_q_span], item_output);
+                @memcpy(output.?[b * q_span ..][0..item_q_span], item_output);
             }
 
+            if (resident_output) |tensor| return tensor;
             const out_shape = [_]i32{ @intCast(batch * max_q_rows), @intCast(h_q) };
-            return denseBuf(self.allocator, output, true, &out_shape);
+            return denseBuf(self.allocator, output.?, true, &out_shape);
         }
         if (batch != 1) return error.UnsupportedTensorType;
         if (bufElemCount(q_buf) != attention.query_sequence_len * h_q) return error.InvalidAttentionShape;
@@ -32296,11 +32318,11 @@ test "metal_compute: mixed paged attention batch matches native" {
 
     const q_shape = [_]i32{ @intCast(2 * max_q_len), @intCast(hidden_q) };
     const kv_shape = [_]i32{ @intCast(2 * max_q_len), @intCast(hidden_kv) };
-    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    const metal_q = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&q_data, &q_shape));
     defer metal_cb.free(metal_q);
-    const metal_k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    const metal_k = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&k_data, &kv_shape));
     defer metal_cb.free(metal_k);
-    const metal_v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    const metal_v = try metal_cb.ensureDeviceResidentOwned(try metal_cb.fromFloat32Shape(&v_data, &kv_shape));
     defer metal_cb.free(metal_v);
     const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
     defer native_cb.free(native_q);
@@ -32396,6 +32418,7 @@ test "metal_compute: mixed paged attention batch matches native" {
     const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, native_attention, 2, num_heads, num_kv_heads, head_dim);
     defer native_cb.free(native_out);
 
+    try std.testing.expect(MetalCompute.toBuf(metal_out).metal_tensor.?.isDevice());
     const metal_data = try metal_cb.toFloat32(metal_out, allocator);
     defer allocator.free(metal_data);
     const native_data = try native_cb.toFloat32(native_out, allocator);
