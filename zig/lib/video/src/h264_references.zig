@@ -417,6 +417,17 @@ pub fn StateFor(comptime Sample: type) type {
             return reset;
         }
         pub fn commit(self: *Self, allocator: std.mem.Allocator, planar: []const Sample, motions: [2][]const motion.Motion, max_refs: usize) !void {
+            return self.commitStorage(allocator, planar, motions, max_refs, null);
+        }
+        /// Completed frame storage is immutable until the workspace detaches.
+        /// The owner covers planar, both motion arrays and current_meta, all
+        /// allocated by the same allocator. Field completion retains copying.
+        pub fn commitShared(self: *Self, allocator: std.mem.Allocator, planar: []Sample, motions: [2][]motion.Motion, max_refs: usize, owners: *usize) !void {
+            std.debug.assert(owners.* != 0);
+            if (self.field_picture) return error.InvalidVideoReference;
+            return self.commitStorage(allocator, planar, .{ motions[0], motions[1] }, max_refs, owners);
+        }
+        fn commitStorage(self: *Self, allocator: std.mem.Allocator, planar: []const Sample, motions: [2][]const motion.Motion, max_refs: usize, shared: ?*usize) !void {
             if (!self.reference) return;
             self.previous_reference_num = self.current_num;
             if (max_refs == 0) return;
@@ -562,16 +573,16 @@ pub fn StateFor(comptime Sample: type) type {
                 return;
             }
             if (complementary == null and self.count >= max_refs) return error.MalformedVideoPacket;
-            const owned = try allocator.dupe(Sample, planar);
-            errdefer allocator.free(owned);
-            const motion0 = try allocator.dupe(motion.Motion, motions[0]);
-            errdefer allocator.free(motion0);
-            const motion1 = try allocator.dupe(motion.Motion, motions[1]);
-            errdefer allocator.free(motion1);
-            const owned_meta = try allocator.dupe(@import("h264_entropy.zig").Meta, self.current_meta);
-            errdefer allocator.free(owned_meta);
-            const owners = try allocator.create(usize);
-            owners.* = 1;
+            const owned = if (shared != null) @constCast(planar) else try allocator.dupe(Sample, planar);
+            errdefer if (shared == null) allocator.free(owned);
+            const motion0 = if (shared != null) @constCast(motions[0]) else try allocator.dupe(motion.Motion, motions[0]);
+            errdefer if (shared == null) allocator.free(motion0);
+            const motion1 = if (shared != null) @constCast(motions[1]) else try allocator.dupe(motion.Motion, motions[1]);
+            errdefer if (shared == null) allocator.free(motion1);
+            const owned_meta = if (shared != null) @constCast(self.current_meta) else try allocator.dupe(@import("h264_entropy.zig").Meta, self.current_meta);
+            errdefer if (shared == null) allocator.free(owned_meta);
+            const owners = shared orelse try allocator.create(usize);
+            if (shared != null) owners.* += 1 else owners.* = 1;
             self.pictures[self.count] = .{ .owners = owners, .pair_id = self.current_pair, .fields = self.current_fields, .meta = owned_meta, .paired = self.paired, .planar = owned, .motions = .{ motion0, motion1 }, .long_term = self.current_long, .field_long = .{ if (self.current_fields[0]) self.current_long else null, if (self.current_fields[1]) self.current_long else null }, .frame_num = self.current_num, .poc = self.current_poc, .field_poc = self.current_field_poc, .id = self.next_id, .list_ids = list_ids };
             self.next_id += 1;
             self.count += 1;

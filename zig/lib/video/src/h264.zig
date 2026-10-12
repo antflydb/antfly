@@ -22,6 +22,12 @@ const media = @import("antfly_media");
 const preparation = @import("preparation.zig");
 const Bits = @import("h264_bits.zig").Bits;
 const tables = @import("h264_tables.zig");
+/// Progressive payload bytes retained/copied at commits and late-slice detaches.
+pub const ReferenceStorageStats = struct {
+    copied_commit_bytes: u64 = 0,
+    retained_payload_bytes: u64 = 0,
+    cow_copied_bytes: u64 = 0,
+};
 pub const Options = struct {
     max_pixels: usize = 16 * 1024 * 1024,
     max_packet_bytes: usize = 16 * 1024 * 1024,
@@ -35,6 +41,9 @@ pub const Options = struct {
     max_parameter_bytes: usize = 4 * 1024 * 1024,
     max_configurations: usize = 256,
     picture_observer: ?PictureObserver = null,
+    /// Copying remains available as a differential/benchmark oracle.
+    share_reference_storage: bool = true,
+    reference_storage_stats: ?*ReferenceStorageStats = null,
 };
 pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
 pub const Config = struct {
@@ -1332,6 +1341,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     const explicit_size = if (cfg.groups.explicit) |map| map.len else 0;
     const meta_size = group_size + explicit_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta);
     var peak = try std.math.add(usize, indexes.len, try std.math.add(usize, try std.math.add(usize, planar_size + mode_size + qp_size + meta_size + 2 * motion_size + reference_size, output_size), try std.math.add(usize, count_size, try std.math.add(usize, try std.math.mul(usize, max_packet, 2), reader.track.avcc.len * 2))));
+    peak = try std.math.add(usize, peak, @sizeOf(usize));
     if (options.max_slices > 4096) return error.ResourceLimitExceeded;
     if (cfg.profile == 88) peak = try std.math.add(usize, peak, options.max_slices * 2 * @import("h264_partitions.zig").Registry.entry_bytes);
     if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
@@ -1341,7 +1351,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     defer transient.deinit();
     const Workspace = @import("h264_assembly.zig").Workspace(Sample, PictureHeader);
     if (options.max_pending_pictures == 0 or options.max_pending_pictures > 16) return error.ResourceLimitExceeded;
-    const workspace_size = planar_size + count_size + mode_size + qp_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + 2 * motion_size + group_size + indexes.len;
+    const workspace_size = planar_size + count_size + mode_size + qp_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + 2 * motion_size + group_size + indexes.len + @sizeOf(usize);
     const snapshot_size = reference_size + @sizeOf(Workspace.State);
     var workspaces: [16]?Workspace = @splat(null);
     defer for (&workspaces) |*slot| if (slot.*) |*workspace| workspace.deinit(allocator);
@@ -1443,6 +1453,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                             try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
                             workspaces[free] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
                         }
+                        try workspaces[free].?.writable(allocator, false);
                         workspaces[free].?.reset(next_picture_id);
                         next_picture_id += 1;
                     }
@@ -1463,6 +1474,11 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                         workspace.pts = if (workspace.pts) |pts| @min(pts, part.pts) else part.pts;
                         workspace.end = if (first_part) part_end else @max(workspace.end, part_end);
                     }
+                    const detached = workspace.owners.* != 1;
+                    try workspace.writable(allocator, true);
+                    if (detached) if (options.reference_storage_stats) |stats| {
+                        stats.cow_copied_bytes +|= workspace.planar.len * @sizeOf(Sample) + workspace.metadata.len * @sizeOf(@import("h264_entropy.zig").Meta) + (workspace.motions[0].len + workspace.motions[1].len) * @sizeOf(@import("h264_motion.zig").Motion);
+                    };
                     const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
                     const counts = [3][]u8{ workspace.counts[0 .. coded_pixels / 16], workspace.counts[coded_pixels / 16 ..][0 .. chroma_pixels / 16], workspace.counts[coded_pixels / 16 + chroma_pixels / 16 ..] };
                     const prediction = workspace.snapshot orelse &references;
@@ -1478,7 +1494,14 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                         }
                         try @import("h264_deblock.zig").picture(planes, cfg.coded_width, workspace.qps, workspace.metadata, counts, workspace.motions, .{ cfg.chroma_offset, cfg.chroma_offset1 }, cfg.bit_depth, cfg.chroma_format, cfg.mbaff or prefix.field, reader.input.control);
                         restoreMarking(&references, workspace, header, prefix.parity, cfg.mbaff);
-                        try references.commit(allocator, workspace.planar, workspace.motions, cfg.max_refs);
+                        if (options.share_reference_storage and cfg.frame_only)
+                            try references.commitShared(allocator, workspace.planar, workspace.motions, cfg.max_refs, workspace.owners)
+                        else
+                            try references.commit(allocator, workspace.planar, workspace.motions, cfg.max_refs);
+                        if (cfg.frame_only and references.reference and cfg.max_refs != 0) if (options.reference_storage_stats) |stats| {
+                            const bytes = workspace.planar.len * @sizeOf(Sample) + workspace.metadata.len * @sizeOf(@import("h264_entropy.zig").Meta) + (workspace.motions[0].len + workspace.motions[1].len) * @sizeOf(@import("h264_motion.zig").Motion);
+                            if (options.share_reference_storage and cfg.frame_only) stats.retained_payload_bytes +|= bytes else stats.copied_commit_bytes +|= bytes;
+                        };
                         workspace.committed[prefix.parity] = true;
                         if (prefix.field) {
                             for (workspace.metadata, 0..) |*m, i| if (i / (cfg.coded_width / 16) % 2 == prefix.parity) {

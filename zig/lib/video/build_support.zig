@@ -102,11 +102,12 @@ pub fn addBenchmarks(b: *std.Build, root: std.Build.LazyPath, target: std.Build.
     const executable = b.addExecutable(.{ .name = "video-benchmark", .root_module = module, .use_llvm = b.option(bool, "video-use-llvm", "Use LLVM for video tests and benchmarks") });
     const run = b.addRunArtifact(executable);
     if (b.option([]const u8, "benchmark-input", "MP4/MOV file for the video benchmark")) |path| run.addArg(path) else run.addArg("-");
-    run.addArg(b.option([]const u8, "benchmark-backend", "auto or cpu") orelse "auto");
+    run.addArg(b.option([]const u8, "benchmark-backend", "auto, cpu or cpu-copy") orelse "auto");
     run.addArg(b.option([]const u8, "benchmark-iterations", "Completed samples including cold (2..100)") orelse "21");
     run.addArg(b.option([]const u8, "benchmark-size", "Square preparation size in pixels") orelse "48");
     b.step("bench-video", "Measure completed decode/preparation latency, GPU time and memory").dependOn(&run.step);
     b.step("check-video-benchmark", "Compile the native video benchmark").dependOn(&executable.step);
+    b.step("install-video-benchmark", "Install completed video benchmarking for external execution").dependOn(&b.addInstallArtifact(executable, .{}).step);
     const webm_module = b.createModule(.{ .root_source_file = root.path(b, "webm_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     configure(b, webm_module, root, target, null);
     // Benchmark-only source substitution permits matched experiments without

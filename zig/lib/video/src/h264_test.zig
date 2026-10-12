@@ -1668,3 +1668,76 @@ test "video split partitions enforce aggregate packet and shared gathering budge
     src.control = .{ .check_fn = Stop.check };
     try std.testing.expectError(error.Cancelled, Span.init(a, &split, index, 0, lease.bytes, .{}));
 }
+
+test "video H264 shared reconstruction detaches transactionally from DPB and snapshots" {
+    const W = @import("h264_assembly.zig").Workspace(u16, u8);
+    var workspace = try W.init(a, 256, 4, 0, 1);
+    defer workspace.deinit(a);
+    workspace.planar[0] = 1023;
+    workspace.metadata[0].kind = 7;
+    workspace.motions[0][0].reference = 2;
+    var refs = @import("h264_references.zig").StateFor(u16){ .reference = true, .current_meta = workspace.metadata };
+    defer refs.deinit(a);
+    try refs.commitShared(a, workspace.planar, workspace.motions, 2, workspace.owners);
+    try std.testing.expectEqual(@as(usize, 2), workspace.owners.*);
+    try std.testing.expectEqual(workspace.planar.ptr, refs.pictures[0].planar.ptr);
+    var snapshot = refs.clone();
+    defer snapshot.deinit(a);
+    try workspace.writable(a, true);
+    try std.testing.expectEqual(@as(usize, 1), workspace.owners.*);
+    try std.testing.expectEqual(@as(u16, 1023), workspace.planar[0]);
+    try std.testing.expectEqual(@as(u8, 7), workspace.metadata[0].kind);
+    workspace.planar[0] = 0;
+    workspace.metadata[0].kind = 0;
+    workspace.motions[0][0].reference = -2;
+    try std.testing.expectEqual(@as(u16, 1023), snapshot.pictures[0].planar[0]);
+    try std.testing.expectEqual(@as(u8, 7), refs.pictures[0].meta[0].kind);
+    try std.testing.expectEqual(@as(i8, 2), refs.pictures[0].motions[0][0].reference);
+}
+
+fn sharedWorkspaceFailure(allocator: std.mem.Allocator) !void {
+    const W = @import("h264_assembly.zig").Workspace(u8, u8);
+    var workspace = try W.init(allocator, 256, 4, 0, 1);
+    defer workspace.deinit(allocator);
+    workspace.planar[0] = 77;
+    var refs = @import("h264_references.zig").State{ .reference = true, .current_meta = workspace.metadata };
+    defer refs.deinit(allocator);
+    try refs.commitShared(allocator, workspace.planar, workspace.motions, 2, workspace.owners);
+    const previous = workspace.planar.ptr;
+    workspace.writable(allocator, false) catch |err| {
+        try std.testing.expectEqual(previous, workspace.planar.ptr);
+        try std.testing.expectEqual(@as(usize, 2), workspace.owners.*);
+        try std.testing.expectEqual(@as(u8, 77), refs.pictures[0].planar[0]);
+        return err;
+    };
+    workspace.reset(1);
+    try std.testing.expectEqual(@as(u8, 77), refs.pictures[0].planar[0]);
+    try std.testing.expectEqual(@as(u8, 0), workspace.planar[0]);
+}
+
+test "video H264 shared reconstruction allocation failures preserve old owners" {
+    try std.testing.checkAllAllocationFailures(a, sharedWorkspaceFailure, .{});
+}
+
+test "video H264 shared and copying reference paths preserve progressive output" {
+    inline for (.{ "h264-baseline-p.mp4", "h264-main-b.mp4", "h264-high-p.mp4", "h264-high10-444-cabac.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/" ++ name);
+        var src = media.source.Source{ .allocator = a, .identity = "shared-reference", .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        for (reader.packets, 0..) |_, index| {
+            var shared_stats = video.h264.ReferenceStorageStats{};
+            var copy_stats = video.h264.ReferenceStorageStats{};
+            var shared = try video.h264.decodeFrame(a, &reader, index, .{ .reference_storage_stats = &shared_stats });
+            defer shared.deinit();
+            var copied = try video.h264.decodeFrame(a, &reader, index, .{ .share_reference_storage = false, .reference_storage_stats = &copy_stats });
+            defer copied.deinit();
+            try std.testing.expectEqualSlices(u8, shared.nv12, copied.nv12);
+            try std.testing.expectEqual(shared.pts, copied.pts);
+            try std.testing.expectEqual(copy_stats.copied_commit_bytes, shared_stats.retained_payload_bytes);
+            try std.testing.expect(shared_stats.retained_payload_bytes > 0);
+            try std.testing.expectEqual(@as(u64, 0), shared_stats.copied_commit_bytes);
+            try std.testing.expectEqual(@as(u64, 0), copy_stats.retained_payload_bytes);
+        }
+    }
+}

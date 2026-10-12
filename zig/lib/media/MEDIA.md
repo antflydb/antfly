@@ -941,3 +941,19 @@ This bounded campaign does not establish sustained-production fuzz coverage.
 
 Final gates pass 12 focused recovery tests, 196 macOS video tests (two skipped),
 171 actual Linux ARM64 video tests (27 skipped) and 27 macOS model tests.
+
+### Decoder reference ownership and admission
+
+Progressive native H.264 workspaces now share immutable reconstruction buffers
+with the decoded-picture buffer and its snapshots. Buffer mutation first
+allocates a replacement owner transactionally; a normal reset needs no copy
+of the old reference payload. Field-coded reconstructions retain the existing
+copying completion path. Source ranges, independently retained packed frames
+and prepared window outputs preserve their separate lifetime contracts.
+
+Admission accounts for workspace/reference ownership counters and continues
+to reserve the conservative decoder bound. Reference copy telemetry measures
+progressive payload traffic, rather than reducing memory reservation based
+on an unproven aliasing assumption. Qualification and the pinned trailer
+copying/shared comparison are recorded in
+[the reference-storage receipt](../video/testdata/reference-storage-validation/README.md).

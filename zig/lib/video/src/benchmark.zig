@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     const iterations = try std.fmt.parseInt(usize, arguments.next() orelse "21", 10);
     const target_size = try std.fmt.parseInt(u32, arguments.next() orelse "48", 10);
     if (target_size == 0 or target_size > 2048) return error.InvalidBenchmarkArguments;
-    if (iterations < 2 or iterations > 100 or (!std.mem.eql(u8, backend, "auto") and !std.mem.eql(u8, backend, "cpu"))) return error.InvalidBenchmarkArguments;
+    if (iterations < 2 or iterations > 100 or (!std.mem.eql(u8, backend, "auto") and !std.mem.eql(u8, backend, "cpu") and !std.mem.eql(u8, backend, "cpu-copy"))) return error.InvalidBenchmarkArguments;
     if (arguments.next() != null) return error.InvalidBenchmarkArguments;
     var file: ?std.Io.File = null;
     defer if (file) |handle| handle.close(init.io);
@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     const setup_start = now(init.io);
     var metal: ?video.preparation.Metal = null;
     var device: ?*anyopaque = null;
-    if (@import("builtin").os.tag == .macos and !std.mem.eql(u8, backend, "cpu")) {
+    if (@import("builtin").os.tag == .macos and std.mem.eql(u8, backend, "auto")) {
         device = av_benchmark_device_create() orelse return error.MetalPreparationUnavailable;
         metal = try video.preparation.Metal.init(device.?);
     }
@@ -86,6 +86,8 @@ pub fn main(init: std.process.Init) !void {
         var device_bytes: u64 = 0;
         var coefficients: u64 = 0;
         var rgba: u64 = 0;
+        var reference_storage = video.h264.ReferenceStorageStats{};
+        var output_hash: [32]u8 = @splat(0);
         if (metal) |*owner| {
             if (reader.track.codec == .avc) {
                 var job = try video.apple_jobs.prepareWindows(a, init.io, &reader, &selected, owner, .{ .preparation = .{ .width = target_size, .height = target_size, .matrix = .bt709 } });
@@ -111,15 +113,16 @@ pub fn main(init: std.process.Init) !void {
                 rgba = job.rgba_staging_bytes;
             }
         } else {
-            var job = try video.software.prepareWindows(a, &reader, &selected, .{ .h264 = .{ .max_dependency_packets = reader.packets.len, .max_decode_bytes = 512 * 1024 * 1024 }, .preparation = .{ .width = target_size, .height = target_size, .matrix = .bt709 } });
+            var job = try video.software.prepareWindows(a, &reader, &selected, .{ .h264 = .{ .reference_storage_stats = &reference_storage, .share_reference_storage = !std.mem.eql(u8, backend, "cpu-copy"), .max_dependency_packets = reader.packets.len, .max_decode_bytes = 512 * 1024 * 1024 }, .preparation = .{ .width = target_size, .height = target_size, .matrix = .bt709 } });
             defer job.deinit();
             frames = job.plan.unique_indexes.len;
             dependency_packets = job.decoded_packets;
             decode_peak = job.decode_high_water;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(job.patches), &output_hash, .{});
         }
         const elapsed = now(init.io) - start;
         if (iteration != 0) warm[iteration - 1] = elapsed;
-        try output.print("{{\"kind\":\"iteration\",\"backend\":\"{s}\",\"state\":\"{s}\",\"iteration\":{d},\"completed_ns\":{d},\"frames\":{d},\"dependency_packets\":{d},\"gpu_execution_ns\":{d},\"decode_live_peak_bytes\":{d},\"device_allocated_bytes\":{d},\"process_peak_rss_bytes\":{d},\"coefficient_upload_bytes\":{d},\"rgba_upload_bytes\":{d}}}\n", .{ if (metal != null) (if (reader.track.codec == .avc) "videotoolbox-metal" else "mjpeg-metal") else (if (reader.track.codec == .avc) "h264-cpu" else "mjpeg-cpu"), if (iteration == 0) "cold" else "warm", iteration, elapsed, frames, dependency_packets, @as(u64, @intFromFloat(@max(gpu_seconds, 0) * 1e9)), decode_peak, device_bytes, av_benchmark_peak_rss(), coefficients, rgba });
+        try output.print("{{\"kind\":\"iteration\",\"backend\":\"{s}\",\"state\":\"{s}\",\"iteration\":{d},\"completed_ns\":{d},\"frames\":{d},\"dependency_packets\":{d},\"gpu_execution_ns\":{d},\"decode_live_peak_bytes\":{d},\"device_allocated_bytes\":{d},\"process_peak_rss_bytes\":{d},\"coefficient_upload_bytes\":{d},\"rgba_upload_bytes\":{d},\"reference_commit_copied_bytes\":{d},\"reference_retained_bytes\":{d},\"reference_cow_copied_bytes\":{d},\"cpu_patch_sha256\":\"{s}\"}}\n", .{ if (metal != null) (if (reader.track.codec == .avc) "videotoolbox-metal" else "mjpeg-metal") else (if (reader.track.codec == .avc) (if (std.mem.eql(u8, backend, "cpu-copy")) "h264-cpu-copy" else "h264-cpu-shared") else "mjpeg-cpu"), if (iteration == 0) "cold" else "warm", iteration, elapsed, frames, dependency_packets, @as(u64, @intFromFloat(@max(gpu_seconds, 0) * 1e9)), decode_peak, device_bytes, av_benchmark_peak_rss(), coefficients, rgba, reference_storage.copied_commit_bytes, reference_storage.retained_payload_bytes, reference_storage.cow_copied_bytes, std.fmt.bytesToHex(output_hash, .lower) });
     }
     std.mem.sort(u64, warm, {}, std.sort.asc(u64));
     const p50 = warm[(warm.len - 1) / 2];

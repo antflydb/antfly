@@ -1175,3 +1175,18 @@ This bounded campaign does not establish sustained-production fuzz coverage.
 
 Final gates pass 12 focused recovery tests, 196 macOS video tests (two skipped),
 171 actual Linux ARM64 video tests (27 skipped) and 27 macOS model tests.
+
+### Progressive H.264 reference sharing follow-up
+
+Native progressive H.264 now retains reconstruction payloads directly in the
+DPB, with transactional workspace detachment and copy-on-write for late slices.
+The copying path remains selectable for differential qualification. PAFF/MBAFF
+completion still uses copies. This advances the retained-reference performance
+requirement without changing decoded output ownership or relaxing admission.
+
+Qualification includes snapshot lifetime and allocation-failure checks, output
+equality for Baseline, Main/B, High and high-depth 4:4:4 fixtures, model tests
+and the pinned Sintel trailer. Measurements and their limits are retained in
+`zig/lib/video/testdata/reference-storage-validation`. Remaining cross-group
+model reuse, broader codec/fuzz coverage, actual Linux follow-up and streaming
+qualification stay in the full active non-CUDA objective.

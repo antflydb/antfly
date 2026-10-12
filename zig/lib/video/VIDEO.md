@@ -1699,3 +1699,29 @@ This bounded campaign does not establish sustained-production fuzz coverage.
 
 Final gates pass 12 focused recovery tests, 196 macOS video tests (two skipped),
 171 actual Linux ARM64 video tests (27 skipped) and 27 macOS model tests.
+
+### H.264 progressive reference storage
+
+Completed progressive reconstructions now share their planar samples, motion
+arrays and macroblock metadata with the decoded-picture buffer. Snapshot and
+workspace owners use the same per-decoder reference count. Reusing a workspace
+allocates replacement storage before releasing its old share; a late slice
+copies the payload before mutation. Allocation failure leaves the previous
+reference and workspace intact. Ordinary next-picture reset does not copy the
+old payload. Field-coded PAFF/MBAFF completion retains its existing copying
+path. Independently retained packed output keeps its existing ownership.
+
+`h264.Options.share_reference_storage = false` retains the copying oracle.
+Optional `reference_storage_stats` counts progressive commit payload bytes
+copied or retained, and late-slice copy-on-write bytes. These counters exclude
+normal reset clearing, packed output conversion and field completion; they
+are cumulative and saturating. Shared admission remains conservative and
+includes each new ownership counter. Eliminating copy traffic does not by
+itself reduce the reserved bound or establish a throughput improvement.
+
+`video-benchmark <mp4> cpu|cpu-copy <iterations> <preparation-size>` compares
+the two paths with completed CPU timing, peak RSS, reference counters and a
+SHA-256 of the prepared CPU patch arrays. Hashing and job cleanup are included
+in the completed timing. `install-video-benchmark` installs this executable.
+The pinned trailer comparison and qualification gates are recorded in
+[testdata/reference-storage-validation](testdata/reference-storage-validation/README.md).
