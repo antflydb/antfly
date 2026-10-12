@@ -37063,6 +37063,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
 
 test "metal native q4_0 multirow gated ffn matches decomposed" {
     try testQ4GatedFfnRows(2);
+    try testQ4GatedFfnRows(3);
     try testQ4GatedFfnRows(4);
 }
 
@@ -48397,6 +48398,58 @@ test "metal native Gemma4 matrix RMS rows match independent F64 in one frame" {
                 for (0..dim) |col| {
                     const expected: f32 = @floatCast(@as(f64, values[row * dim + col]) * inv * weights[col]);
                     try std.testing.expectApproxEqAbs(expected, actual[row * dim + col], 2e-5);
+                }
+            }
+        }
+    }
+}
+
+test "metal native Q4 short rows match F64 with offset inputs and output tails" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const out_dim: usize = 257;
+    for ([_]usize{ 32, 512, 1536 }) |in_dim| {
+        const bytes = out_dim * (in_dim / 32) * 18;
+        const raw = try std.testing.allocator.alloc(u8, bytes);
+        defer std.testing.allocator.free(raw);
+        var block: [32]f32 = undefined;
+        for (0..out_dim * (in_dim / 32)) |b| {
+            for (&block, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt((b * 17 + i * 11) % 109))) * 0.1;
+            quant_codec.quantizeQ4_0Block(&block, raw[b * 18 ..][0..18]);
+        }
+        const dense = try std.testing.allocator.alloc(f32, out_dim * in_dim);
+        defer std.testing.allocator.free(dense);
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, raw, dense);
+        const weight_shape = [_]i64{ out_dim, @intCast(in_dim) };
+        const storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = raw, .shape = &weight_shape, .raw_owned = false, .allocator = std.testing.allocator };
+        const bias_values = @as([out_dim]f32, @splat(0));
+        var bias = try MetalTensor.ownedCloneFrom(&bias_values, &.{out_dim});
+        defer bias.deinit();
+        var dummy_value = [_]f32{0};
+        const dummy = MetalTensor.borrowed(&dummy_value, 1, &.{0});
+        var stats: ops.NativeQuantTimingStats = .{};
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{ .weight = dummy, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .slot = 0, .in_dim = in_dim, .out_dim = out_dim, .retain_dense_fallback = false }, &stats));
+        for ([_]usize{ 2, 3, 4, 5 }) |rows| {
+            const prefix: usize = 16;
+            const values = try std.testing.allocator.alloc(f32, prefix + rows * in_dim);
+            defer std.testing.allocator.free(values);
+            @memset(values[0..prefix], 99);
+            for (values[prefix..], 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i % 97))) * (if (i / in_dim == rows - 1) @as(f32, 0) else @as(f32, 0.03));
+            var carrier = try testDeviceTensorFromSlice(runtime, values, &.{@intCast(values.len)});
+            defer carrier.deinit();
+            var input = try carrier.retainedView(prefix * @sizeOf(f32), rows * in_dim * @sizeOf(f32), &.{ @intCast(rows), @intCast(in_dim) });
+            defer input.deinit();
+            var output = (try decoderRuntimeApplyLinear(&provider, .{ .slot = 0, .input = input, .in_dim = in_dim, .out_dim = out_dim })) orelse return error.UnexpectedNull;
+            defer output.deinit();
+            const actual = try output.toHostSlice();
+            for (0..rows) |row| {
+                for (0..out_dim) |col| {
+                    var expected: f64 = 0;
+                    for (0..in_dim) |k| expected += @as(f64, values[prefix + row * in_dim + k]) * dense[col * in_dim + k];
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * out_dim + col], 2e-5);
                 }
             }
         }

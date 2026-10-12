@@ -134,6 +134,7 @@ const Config = struct {
     warmup_iters: usize = 20,
     measure_iters: usize = 200,
     ops_per_frame: usize = 1,
+    planned_linear_scope: bool = false,
     q4_k: bool = false,
     q4_k_f16_mps: bool = false,
     q4_k_bf16: bool = false,
@@ -153,7 +154,7 @@ const Config = struct {
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--q4-k] [--q4-k-f16-mps|--q4-k-bf16] [--compare-q6-high-row] [--compare-q4-e2b-disabled-baseline] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
+        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--q4-k] [--q4-k-f16-mps|--q4-k-bf16] [--compare-q6-high-row] [--compare-q4-e2b-disabled-baseline] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--weight-slots N] [--planned-linear-scope] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
         \\
     , .{});
 }
@@ -173,6 +174,10 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
             std.process.exit(0);
+        }
+        if (std.mem.eql(u8, arg, "--planned-linear-scope")) {
+            cfg.planned_linear_scope = true;
+            continue;
         }
         if (std.mem.eql(u8, arg, "--expect-q4-mmv-auto")) {
             cfg.expect_q4_mmv_auto = true;
@@ -592,9 +597,12 @@ fn applyOnce(
     out_dim: usize,
     weight_slots: usize,
     outputs: []MetalTensor,
+    planned_scope: bool,
 ) !u64 {
     const start = nowNanos();
     try metal_runtime.beginFrame(runtime);
+    errdefer metal_runtime.cancelFrame(runtime) catch {};
+    if (planned_scope) try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.quant_linear), .ffn);
     var produced: usize = 0;
     errdefer for (outputs[0..produced]) |*output| output.deinit();
     while (produced < outputs.len) : (produced += 1) {
@@ -605,6 +613,7 @@ fn applyOnce(
             .out_dim = out_dim,
         })) orelse return error.LinearDispatchFailed;
     }
+    if (planned_scope) try metal_runtime.endPlannedComputeScope(runtime);
     try metal_runtime.submitFrame(runtime);
     try metal_runtime.waitFrame(runtime);
     for (outputs) |*output| output.deinit();
@@ -1189,7 +1198,7 @@ pub fn main(init: std.process.Init) !void {
     var warmup: usize = 0;
     while (warmup < cfg.warmup_iters) : (warmup += 1) {
         _ = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs, cfg.planned_linear_scope),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),
@@ -1206,7 +1215,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(gpu_samples);
     for (samples, gpu_samples) |*sample, *gpu_sample| {
         sample.* = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs, cfg.planned_linear_scope),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),

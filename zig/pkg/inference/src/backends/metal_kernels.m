@@ -1348,6 +1348,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> q4_0_small_batch_r2_pipeline;
     id<MTLComputePipelineState> q4_0_small_batch_r4_pipeline;
     id<MTLComputePipelineState> q4_0_small_batch_r8_pipeline;
+    id<MTLComputePipelineState> q4_0_small_batch_r2_specialized_pipeline;
+    id<MTLComputePipelineState> q4_0_small_batch_r3_specialized_pipeline;
     id<MTLComputePipelineState> q4_0_small_batch_r2_wide_pipeline;
     id<MTLComputePipelineState> q4_0_small_batch_r4_wide_pipeline;
     id<MTLComputePipelineState> q4_0_small_batch_r8_wide_pipeline;
@@ -7278,6 +7280,15 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q4_0_linear_r2_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q4_0_linear_r_ext_impl(input, weight, output, p, lane, sgitg, tg, 2u); }\n"
            "kernel void termite_q4_0_linear_r4_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q4_0_linear_r_ext_impl(input, weight, output, p, lane, sgitg, tg, 4u); }\n"
            "kernel void termite_q4_0_linear_r8_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q4_0_linear_r_ext_impl(input, weight, output, p, lane, sgitg, tg, 5u); }\n"
+           "template<uint RPTG, uint NSG> inline void termite_q4_0_linear_short_specialized_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg) {\n"
+           "    const uint NR0 = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim || first_r >= p.rows || lane >= NW) return;\n"
+           "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = ix; float acc[4][RPTG]; _Pragma(\"clang loop unroll(full)\") for (uint a = 0u; a < 4u; ++a) _Pragma(\"clang loop unroll(full)\") for (uint c = 0u; c < RPTG; ++c) acc[a][c] = 0.0f;\n"
+           "    const uint last_r = p.rows - 1u;\n"
+           "    for (uint b = ib0; b < p.row_blocks; b += NQ) { ushort qs_cache[4][4]; float dscale[4]; _Pragma(\"clang loop unroll(full)\") for (uint row0 = 0u; row0 < NR0; ++row0) { uint o = first_o + row0; if (o >= p.out_dim) { dscale[row0] = 0.0f; qs_cache[row0][0] = 0; qs_cache[row0][1] = 0; qs_cache[row0][2] = 0; qs_cache[row0][3] = 0; continue; } uint off = o * p.row_blocks * 18u + b * 18u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); dscale[row0] = float(as_type<half>(bits)); const device ushort *qs = reinterpret_cast<const device ushort *>(weight + off + 2u) + (il >> 1); qs_cache[row0][0] = qs[0]; qs_cache[row0][1] = qs[1]; qs_cache[row0][2] = qs[2]; qs_cache[row0][3] = qs[3]; } _Pragma(\"clang loop unroll(full)\") for (uint rr = 0u; rr < RPTG; ++rr) { uint in_off = min(first_r + rr, last_r) * p.in_dim + b * 32u + il; float yl[16]; float sumy = 0.0f; _Pragma(\"clang loop unroll(full)\") for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } _Pragma(\"clang loop unroll(full)\") for (uint row0 = 0u; row0 < NR0; ++row0) { float qacc = 0.0f; _Pragma(\"clang loop unroll(full)\") for (uint i = 0u; i < 8u; i += 2u) { uint packed = uint(qs_cache[row0][i >> 1]); qacc += yl[i] * float(packed & 0x000Fu); qacc += yl[i + 1u] * float(packed & 0x0F00u); qacc += yl[i + 8u] * float(packed & 0x00F0u); qacc += yl[i + 9u] * float(packed & 0xF000u); } acc[row0][rr] += dscale[row0] * (qacc - 8.0f * sumy); } } }\n"
+           "    _Pragma(\"clang loop unroll(full)\") for (uint row0 = 0u; row0 < NR0; ++row0) { _Pragma(\"clang loop unroll(full)\") for (uint rr = 0u; rr < RPTG; ++rr) { float total = simd_sum(acc[row0][rr]); uint o = first_o + row0; uint r = first_r + rr; if (lane == 0u && o < p.out_dim && r < p.rows) output[r * p.out_dim + o] = total; } }\n"
+           "}\n"
+           "kernel void termite_q4_0_linear_r2_specialized(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q4_0_linear_short_specialized_impl<2u,4u>(input,weight,output,p,lane,sgitg,tg); }\n"
+           "kernel void termite_q4_0_linear_r3_specialized(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q4_0_linear_short_specialized_impl<3u,2u>(input,weight,output,p,lane,sgitg,tg); }\n"
            "inline void termite_q4_0_linear_r_ext4_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim || first_r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = ix; float acc[4][5]; for (uint a = 0u; a < 4u; ++a) for (uint c = 0u; c < 5u; ++c) acc[a][c] = 0.0f;\n"
@@ -20662,7 +20673,19 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 descriptor->output_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
                 (runtime->q4_0_small_batch_r2_pipeline != nil)) {
                 const size_t rptg = descriptor->rows <= 2 ? 2u : (descriptor->rows <= 4 ? 4u : 5u);
-                if (runtime->q4_0_small_batch_r2_wide_pipeline != nil) {
+                id<MTLComputePipelineState> specialized = descriptor->rows == 2u
+                    ? runtime->q4_0_small_batch_r2_specialized_pipeline
+                    : (descriptor->rows == 3u ? runtime->q4_0_small_batch_r3_specialized_pipeline : nil);
+                if (specialized != nil) {
+                    // Exact columns keep accumulators in registers; three rows
+                    // avoid the fourth padded column. Retain the four-row path.
+                    const size_t nsg = descriptor->rows == 2u ? 4u : 2u;
+                    pipeline = specialized;
+                    use_reduce = YES;
+                    reduce_shmem_floats = 16u;
+                    reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 4u * nsg - 1u) / (4u * nsg), 1, 1);
+                    reduce_threads = MTLSizeMake(32u * nsg, 1, 1);
+                } else if (runtime->q4_0_small_batch_r2_wide_pipeline != nil) {
                     pipeline = rptg == 2u
                         ? runtime->q4_0_small_batch_r2_wide_pipeline
                         : (rptg == 4u ? runtime->q4_0_small_batch_r4_wide_pipeline : runtime->q4_0_small_batch_r8_wide_pipeline);
@@ -27487,6 +27510,14 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             runtime->q4_0_mm_sg_aligned_pipeline != nil
                 ? termite_metal_make_pipeline(device, library, @"termite_q4_0_linear_mm_sg_aligned_tail")
                 : nil;
+        runtime->q4_0_small_batch_r2_specialized_pipeline = nil;
+        runtime->q4_0_small_batch_r3_specialized_pipeline = nil;
+        if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH_WIDE"))) {
+            runtime->q4_0_small_batch_r2_specialized_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_linear_r2_specialized");
+            runtime->q4_0_small_batch_r3_specialized_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_linear_r3_specialized");
+        }
         if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"))) {
             runtime->q4_0_small_batch_r2_pipeline = nil;
             runtime->q4_0_small_batch_r4_pipeline = nil;
@@ -65075,6 +65106,8 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
             runtime.q4_0_small_batch_r2_pipeline = source_runtime->q4_0_small_batch_r2_pipeline;
             runtime.q4_0_small_batch_r4_pipeline = source_runtime->q4_0_small_batch_r4_pipeline;
             runtime.q4_0_small_batch_r8_pipeline = source_runtime->q4_0_small_batch_r8_pipeline;
+            runtime.q4_0_small_batch_r2_specialized_pipeline = source_runtime->q4_0_small_batch_r2_specialized_pipeline;
+            runtime.q4_0_small_batch_r3_specialized_pipeline = source_runtime->q4_0_small_batch_r3_specialized_pipeline;
             runtime.q4_0_small_batch_r2_wide_pipeline = source_runtime->q4_0_small_batch_r2_wide_pipeline;
             runtime.q4_0_small_batch_r4_wide_pipeline = source_runtime->q4_0_small_batch_r4_wide_pipeline;
             runtime.q4_0_small_batch_r8_wide_pipeline = source_runtime->q4_0_small_batch_r8_wide_pipeline;
