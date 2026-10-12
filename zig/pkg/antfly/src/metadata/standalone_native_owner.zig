@@ -32,6 +32,16 @@ pub const Binding = struct {
     pub fn eql(self: Binding, other: Binding) bool {
         return std.meta.eql(self, other);
     }
+
+    pub fn digest(self: Binding) ![32]u8 {
+        const bytes = try encode(self);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/standalone-native-owner/v1");
+        hash.update(&bytes);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
 };
 
 const magic = "AFNOWN1\x00";
@@ -74,6 +84,14 @@ test "native owner binding is canonical and rejects malformed roots" {
     };
     const bytes = try encode(value);
     try std.testing.expect(value.eql(try decode(&bytes)));
+    try std.testing.expectEqualSlices(u8, &try value.digest(), &try (try decode(&bytes)).digest());
+    inline for (.{ "metadata_incarnation", "node_id", "store_id", "root_incarnation" }) |field| {
+        var changed = value;
+        if (comptime std.mem.eql(u8, field, "metadata_incarnation")) {
+            changed.metadata_incarnation[0] = 'f';
+        } else @field(changed, field) += 1;
+        try std.testing.expect(!std.mem.eql(u8, &try value.digest(), &try changed.digest()));
+    }
     try std.testing.expectError(error.InvalidStandaloneNativeOwner, decode(bytes[0 .. bytes.len - 1]));
     var bad = bytes;
     bad[0] = 0;

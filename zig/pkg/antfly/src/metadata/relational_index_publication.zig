@@ -31,7 +31,7 @@ const Allocator = std.mem.Allocator;
 const native_control = local.storage_db_relational_index_owner_control;
 pub const Id = progress.Id;
 pub const Digest = progress.Digest;
-pub const RootProof = @import("owner_root_attestation.zig").Proof("antfly/index-build-owner-receipt/v1");
+pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
 /// Signature verification alone is not authority. The metadata apply adapter
 /// must also check the enrolled current root/reporter and exact live placement
@@ -42,6 +42,10 @@ pub const SignedReceipt = struct {
     proof: RootProof,
 
     pub fn verifySignature(self: SignedReceipt) !void {
+        if (self.receipt.owner.authority != switch (self.proof.authority) {
+            .raft => progress.Authority.raft,
+            .native => progress.Authority.native,
+        }) return error.InvalidIndexOwnerReceipt;
         const logical_digest = self.receipt.digest() catch return error.InvalidIndexOwnerReceipt;
         self.proof.verify(logical_digest) catch return error.InvalidIndexOwnerReceipt;
     }
@@ -1090,7 +1094,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         return .{ .table_id = 101, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (RootProof{
             .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
             .reporter_incarnation = 4,
-            .replica_id = 5,
+            .authority = .{ .native = @splat(7) },
             .root_generation = 6,
             .signature = undefined,
         }).sign(root, try receipt.digest()) } };
@@ -1145,7 +1149,7 @@ test "relational index publication signatures bind owner authority position and 
         const signed: SignedReceipt = .{ .receipt = receipt, .proof = try (RootProof{
             .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
             .reporter_incarnation = 4,
-            .replica_id = 5,
+            .authority = if (authority == .native) .{ .native = @splat(7) } else .{ .raft = 5 },
             .root_generation = 6,
             .signature = undefined,
         }).sign(root, try receipt.digest()) };
@@ -1168,10 +1172,20 @@ test "relational index publication signatures bind owner authority position and 
         altered = signed;
         altered.proof.reporter_incarnation += 1;
         try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.proof.authority = if (authority == .native) .{ .raft = 5 } else .{ .native = @splat(7) };
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        // A valid root cannot certify one logical authority using the other's
+        // physical ownership contract, even with a freshly valid signature.
+        altered.proof = try altered.proof.sign(root, try receipt.digest());
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.proof.authority = if (authority == .native) .{ .native = @splat(0) } else .{ .raft = 0 };
+        try std.testing.expectError(error.InvalidGenerationPublication, altered.proof.sign(root, try receipt.digest()));
         const foreign = try (@import("initial_child_root_attestation.zig").Attestation{
             .identity = signed.proof.identity,
             .reporter_incarnation = signed.proof.reporter_incarnation,
-            .replica_id = signed.proof.replica_id,
+            .replica_id = 5,
             .root_generation = signed.proof.root_generation,
             .signature = undefined,
         }).sign(root, try receipt.digest());

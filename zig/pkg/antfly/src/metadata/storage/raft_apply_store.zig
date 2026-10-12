@@ -4254,6 +4254,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
         const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
         const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key };
+        const native_binding: standalone_native_owner.Binding = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7 };
         inline for (.{ index_progress.Authority.raft, index_progress.Authority.native }) |authority| {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -4279,11 +4280,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 var store = try RaftApplyStore.init(a, .{ .root_dir = path });
                 defer store.deinit();
                 try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+                try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .auxiliary_json = "{\"epoch\":1,\"tables\":[],\"ranges\":[]}" });
+                if (authority == .native) try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_owner = native_binding });
                 try store.applyStandaloneCommand(group, .{ .upsert_table = plan.before });
                 try store.applyStandaloneCommand(group, .{ .upsert_range = owners[0].range });
                 try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
                 try store.applyStandaloneCommand(group, .{ .register_store = current });
-                try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
+                if (authority == .raft) try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
                 const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_admission_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
                 defer a.free(activation);
                 try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
@@ -4327,7 +4330,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     .reservation_digest = prepared.head.reservation_digest,
                     .evidence_digest = @splat(8),
                 };
-                ack = .{ .table_id = plan.before.table_id, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (index_publication.RootProof{ .identity = identity, .reporter_incarnation = 4, .replica_id = 5, .root_generation = 6, .signature = undefined }).sign(root, try receipt.digest()) } };
+                ack = .{ .table_id = plan.before.table_id, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (index_publication.RootProof{ .identity = identity, .reporter_incarnation = 4, .authority = if (authority == .native) .{ .native = try native_binding.digest() } else .{ .raft = 5 }, .root_generation = 6, .signature = undefined }).sign(root, try receipt.digest()) } };
                 const bytes = try std.json.Stringify.valueAlloc(a, ack, .{});
                 defer a.free(bytes);
                 try std.testing.expect(bytes.len <= index_publication.max_ack_bytes);
@@ -4344,6 +4347,16 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try std.testing.expectEqual(before_enrollment.revision + 1, after_enrollment.revision);
                 try std.testing.expectEqual(before_enrollment.projection_revision, after_enrollment.projection_revision);
                 try store.validateRelationalIndexOwnerAck(group, bytes);
+                if (authority == .native) {
+                    var foreign_binding_ack = ack;
+                    foreign_binding_ack.signed.proof.authority.native[0] ^= 1;
+                    foreign_binding_ack.signed.proof = try foreign_binding_ack.signed.proof.sign(root, try receipt.digest());
+                    const foreign_bytes = try std.json.Stringify.valueAlloc(a, foreign_binding_ack, .{});
+                    defer a.free(foreign_bytes);
+                    // Even a genuinely signed receipt cannot choose a
+                    // different physical owner than the durable binding.
+                    try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, foreign_bytes));
+                }
                 {
                     const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
                     defer a.free(reply);
@@ -4351,7 +4364,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     defer status.deinit();
                     try std.testing.expect(!try status.value.isAcknowledged(ack));
                 }
-                const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle };
+                const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle, native_binding_missing, native_binding_changed };
                 inline for (std.meta.tags(Fault)) |fault| {
                     // Each fault has its own aborted storage cut. No simulated
                     // verification boolean can substitute for real durable reads.
@@ -4388,6 +4401,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         },
                         .active_job => try txn.put(try index_publication.activeKey(&buf, group, ack.table_id), &@as([16]u8, @splat(9))),
                         .lifecycle => try txn.delete(try @import("../table_lifecycle_lock.zig").key(&buf, group, ack.table_id)),
+                        .native_binding_missing => if (authority == .native) {
+                            try txn.delete(try standalone_native_owner.key(&buf, group));
+                        },
+                        .native_binding_changed => if (authority == .native) {
+                            var changed_binding = native_binding;
+                            changed_binding.root_incarnation += 1;
+                            try txn.put(try standalone_native_owner.key(&buf, group), &try standalone_native_owner.encode(changed_binding));
+                        },
                     }
                     changed.runtime_statuses = &changed_runtime;
                     changed.group_statuses = &changed_groups;
@@ -4397,9 +4418,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
                     if (fault == .active_job or fault == .lifecycle) {
                         try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
-                    } else if (fault == .observed_position and authority == .native) {
-                        // Native sequence 5 remains valid even when Raft index is
-                        // zero: comparing these domains would invent authority.
+                    } else if ((fault == .observed_position or fault == .placement_replica or fault == .placement_store or fault == .placement_state) and authority == .native) {
+                        // Native sequence 5 remains valid when Raft index is
+                        // zero or unrelated Raft placement changes. Neither
+                        // is authority for the native physical owner.
+                        _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                    } else if ((fault == .native_binding_missing or fault == .native_binding_changed) and authority == .raft) {
+                        // A real Raft replica never borrows native binding
+                        // authority, just as native receipts ignore Raft cuts.
                         _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
                     } else if ((fault == .source_cut or fault == .source_unknown) and authority == .raft) {
                         // Legacy Raft observations retain their actual watermark;
@@ -15653,11 +15679,23 @@ pub const RaftApplyStore = struct {
         if (range.group_id != owner.group_id or range.table_id != owner.namespace.table_id or
             metadata_table_manager.rangeDocIdentityShardId(range) != owner.namespace.shard_id or
             metadata_table_manager.rangeDocIdentityRangeId(range) != owner.namespace.range_id) return error.IndexOwnerReceiptChanged;
-        const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&buf, group_id, owner.group_id, proof.identity.node_id))) orelse return error.IndexOwnerReceiptChanged;
-        defer raft_reconciler.freeIntentOwned(self.alloc, placement);
-        if (placement.store_id != proof.identity.store_id or placement.record.group_id != owner.group_id or
-            placement.record.local_node_id != proof.identity.node_id or placement.record.replica_id != proof.replica_id or
-            placement.serving_state != .serving) return error.IndexOwnerReceiptChanged;
+        switch (proof.authority) {
+            .raft => |replica_id| {
+                const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&buf, group_id, owner.group_id, proof.identity.node_id))) orelse return error.IndexOwnerReceiptChanged;
+                defer raft_reconciler.freeIntentOwned(self.alloc, placement);
+                if (placement.store_id != proof.identity.store_id or placement.record.group_id != owner.group_id or
+                    placement.record.local_node_id != proof.identity.node_id or placement.record.replica_id != replica_id or
+                    placement.serving_state != .serving) return error.IndexOwnerReceiptChanged;
+            },
+            .native => |binding_digest| {
+                const raw_binding = (try stagingGet(txn, try standalone_native_owner.key(&buf, group_id))) orelse return error.IndexOwnerReceiptChanged;
+                const binding = standalone_native_owner.decode(raw_binding) catch return error.InvalidCatalogRecord;
+                if (!std.mem.eql(u8, &binding.metadata_incarnation, &proof.identity.metadata_incarnation) or
+                    binding.node_id != proof.identity.node_id or binding.store_id != proof.identity.store_id or
+                    binding.root_incarnation != proof.identity.root_incarnation or
+                    !std.mem.eql(u8, &try binding.digest(), &binding_digest)) return error.IndexOwnerReceiptChanged;
+            },
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();

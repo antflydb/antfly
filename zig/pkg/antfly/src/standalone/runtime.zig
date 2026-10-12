@@ -780,6 +780,7 @@ const LocalStandaloneMetadata = struct {
 
     epoch: u64 = 1,
     durable_revision: u64 = 0,
+    lifecycle_projection_reloads: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     hot_standby_projected_effect_digest: ?[32]u8 = null,
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
@@ -4285,6 +4286,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn reloadLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
+        if (builtin.is_test) self.lifecycle_projection_reloads += 1;
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         // A single read transaction prevents tagging mixed physical/logical
         // generations with a later revision during concurrent restore cutover.
@@ -13221,8 +13223,9 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
             try std.testing.expectEqual(revision + 1, metadata.epoch);
             try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
             // The receipt committed but the local epoch update/reply was lost.
-            // This fixture has no standalone catalog snapshot, so a full
-            // projection reload cannot accidentally satisfy the assertion.
+            // Count actual reloads so a full snapshot cannot accidentally
+            // satisfy the bounded owner-only recovery assertion.
+            const reloads = metadata.lifecycle_projection_reloads;
             metadata.durable_revision = revision;
             metadata.epoch = revision;
             // Resolve a lost reply with the ORIGINAL expected revision. An
@@ -13236,6 +13239,7 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
                 try std.testing.expect(try parsed.value.isAcknowledged(ack));
             }
             try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
+            try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         }
     });
 }

@@ -3219,7 +3219,7 @@ a valid queued-job value. The final gate additionally exercises visible-table
 reload and the existing remote-apply outage/recovery contract. Only that final
 corrected command is the complete passing Debug qualification above.
 
-### Remaining native receipt authority boundary
+### Remaining native receipt authority boundary at `74c0a6fb96`
 
 Source review confirms `requireIndexOwnerRootReceiptTxn` still requires a
 durable placement intent and replica ID even for a native sequence receipt.
@@ -3242,3 +3242,45 @@ lease, never a later routing lookup. Codec/capability activation, provenance
 adoption and failure campaigns must precede public worker activation. These
 native authority changes remain implementation work, not claims of this
 enrollment or projection-watermark checkpoint.
+
+### Explicit native versus Raft index attestation
+
+Index root attestations now explicitly select an actual Raft replica ID or the
+digest of the durable standalone native-owner binding. Their v2 signature domain
+binds that discriminant as well as the enrolled identity, reporter, applying
+root generation and complete logical receipt digest. A correctly signed proof
+using the wrong physical authority is rejected before catalog access. Empty
+replica IDs and binding digests cannot be signed. This replaces the unpublished
+index receipt format added in this PR; no compatibility path for that format is
+introduced. The existing coordinated admission decoder floor remains required.
+
+The transactional verifier keeps shared enrollment, live store/reporter/root,
+metadata incarnation, namespace, physical generation and observed-cut checks.
+Raft receipts additionally require the actual serving placement/replica and
+observed term/index. Native receipts instead require the exact durable native
+binding; they cannot borrow a Raft placement or watermark. The binding digest
+is canonical, domain-separated and allocation-free. The existing durable
+store-report machinery supplies native current-root/source observations, so
+no separate parallel report registry is introduced. Missing native ownership
+fails closed and corrupt binding bytes remain a catalog-integrity error.
+
+The shared fixture now bootstraps a real standalone catalog and admits its
+native binding before publication, while native owners have no Raft placement.
+Fault cases check missing/replaced native binding, genuine signatures with a
+foreign binding digest, stale reporter/root/source observations, and authority
+independence. A test-only reload counter preserves the owner-only recovery
+complexity check now that the fixture has a real catalog snapshot. The new
+Debug verifier/standalone gate passed all 102 build steps and 33 component
+executions (five standalone, 27 publication and one decoder-floor), with zero
+skips, failures or leaks. The HTTP ACK/report-authority gate passed all 76 steps
+and 66 component executions, also with zero skips, failures or leaks. These
+selections overlap the publication fixture; they are not 99 distinct contracts.
+The direct canonical binding test passed, including every identity-field
+digest substitution. Its corrected isolated harness uses the same empty
+source-owner options as the normal build; an initial direct invocation missing
+that required module failed at compilation and is not passing evidence.
+Optimized gates for earlier checkpoints do not certify this new wire format
+or verifier. Production native registration/report publishing, root signing from
+the exact applying/recovering lease, complete worker activation, adoption and
+distributed fault qualification remain open. Public production is disabled
+and original-case dispositions are unchanged.
