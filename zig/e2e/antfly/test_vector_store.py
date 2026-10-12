@@ -100,6 +100,11 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
     assert nearest("model_a", [0, 0, 1]) == ["a"]
     assert nearest("model_b", [1, 0]) == ["a"]
     if mode == "vector_store":
+        # An ANN projection may still own older artifact versions while its
+        # replacement is built. Retire both owners before requiring exactly
+        # the two current primary payloads; GC must preserve live ANN refs.
+        api.delete_index(table, "model_a")
+        api.delete_index(table, "model_b")
 
         def source_stats():
             return api.get_table(table).get("storage_status", {}).get("source_vectors")
@@ -126,10 +131,29 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
         # Allow the collector's cooldown and bounded maintenance passes, just
         # as index visibility allows asynchronous maintenance to finish above.
         stats = wait_until(reclaimed_source_stats, timeout_s=90, interval_s=0.5)
-        assert stats is not None, source_stats()
+        if stats is None:
+            pytest.fail(f"source collection did not converge: {source_stats()!r}")
         assert stats["retained_payloads"] == 2
         assert stats["retained_payload_bytes"] == 20
         assert stats["live_payloads_at_collection"] == 2
+        # Rebuild from the retained primary payloads, then prove both current
+        # families remain usable across the existing restart checks below.
+        for name, dimensions in [("model_a", 3), ("model_b", 2)]:
+            assert_created_index(
+                api.create_index(
+                    table,
+                    name,
+                    {
+                        "name": name,
+                        "type": "embeddings",
+                        "external": True,
+                        "dimension": dimensions,
+                    },
+                ),
+                name,
+                "embeddings",
+            )
+            wait_ready(name, 1)
     api.restart_server()
     assert api.get_table(table)["storage"]["dense_embeddings"] == mode
     if mode == "vector_store":

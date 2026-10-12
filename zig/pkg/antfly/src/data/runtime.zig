@@ -22951,7 +22951,10 @@ pub const DataServer = struct {
         table_filter: ?[]const []const u8,
     ) !RuntimeStatusRefreshCollection {
         const registration = self.store_registration orelse return error.UnsupportedOperation;
-        var snapshot = (try self.status_source.adminSnapshot()) orelse return error.UnsupportedOperation;
+        // Local status is collected below; fetching every store's diagnostic
+        // payload here creates a polling feedback loop and can monopolize the
+        // bounded diagnostic transfer lane. Use the fenced control authority.
+        var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.UnsupportedOperation;
         defer self.status_source.freeAdminSnapshot(&snapshot);
 
         var filter_map = std.StringHashMapUnmanaged(void).empty;
@@ -26006,6 +26009,7 @@ const RemoteMetadataSource = struct {
                 .supports_query_definitions = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
+                .control_snapshot = remoteControlSnapshot,
                 .acquire_join_planning = remoteAcquireJoinPlanning,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
@@ -26837,6 +26841,11 @@ const RemoteMetadataSource = struct {
             if (self.diagnostic_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
         }
         return null;
+    }
+
+    fn remoteControlSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.fetchSnapshotForHead(try self.fetchHead());
     }
 
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -39245,7 +39254,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
         }
 
-        test "data runtime status refresh publishes synthetic missing status for absent local group db" {
+        test "data runtime status refresh uses control metadata to publish synthetic missing status" {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -39261,13 +39270,22 @@ fn consumerTests() type {
                         .ptr = undefined,
                         .vtable = &.{
                             .status = status,
-                            .admin_snapshot = adminSnapshot,
+                            .admin_snapshot = rejectDiagnosticSnapshot,
+                            .cached_admin_snapshot = cachedControlSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                             .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
                             .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                         },
                     };
+                }
+
+                fn rejectDiagnosticSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedDiagnosticSnapshot;
+                }
+
+                fn cachedControlSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
+                    return try adminSnapshot(ptr);
                 }
 
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {

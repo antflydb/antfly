@@ -309,6 +309,10 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 return record;
             }
         };
+        // Masking the row suffix and grouping the tuple prefix preserve the
+        // forward stream's order. Avoid sorting these derived streams again.
+        predicates.sort.presorted = true;
+        tie_builder.sort.presorted = true;
         var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .ties = &tie_builder, .arena = .init(a) };
         defer collect.arena.deinit();
         page = try tree.buildSorted(a, pages.store(), &collect);
