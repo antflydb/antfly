@@ -676,7 +676,8 @@ geometry-qualification gap.
 
 **Root cause: it wasn't document size.** Reproducing single real sections at
 each reported byte size (largest sections of `zig/PDF.md`, `zig/VOPR.md`,
-`zig/VECTORDBBENCH_FINDINGS.md`, `work-log/**`) through both
+`zig/VECTORDBBENCH_FINDINGS.md` as it was then, before its log moved to
+`docs/design/dense-indexing/history/`, and `work-log/**`) through both
 `Node.extractDirect` and a live `antfly inference run --port 8098` server
 never failed -- every individual section, up to the real corpus maximum, was
 served correctly. Searching for **pairs** of real corpus sections whose
