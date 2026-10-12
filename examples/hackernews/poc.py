@@ -1034,22 +1034,35 @@ def main():
             assert len(recent["rows"]) == args.composed_current_rows
             documents = []
             for row in recent["rows"]:
-                document = dict(zip(columns, row, strict=True))
+                document = {
+                    name: value
+                    for name, value in zip(columns, row, strict=True)
+                    if value is not None
+                }
                 for column in ("hn_id", "points", "created_at"):
-                    if document[column] is not None:
+                    if column in document:
                         document[column] = int(document[column])
                 documents.append(document)
-            for offset in range(0, len(documents), 128):
+            inserts = {}
+            batch_bytes = 0
+            for document in documents:
+                document_bytes = len(json.dumps(document).encode()) + 32
+                if inserts and (
+                    len(inserts) >= 128 or batch_bytes + document_bytes > 512 * 1024
+                ):
+                    call(
+                        "POST",
+                        f"/tables/{current_benchmark}/batch",
+                        {"inserts": inserts, "sync_level": "full_index"},
+                    )
+                    inserts, batch_bytes = {}, 0
+                inserts[str(document["hn_id"])] = document
+                batch_bytes += document_bytes
+            if inserts:
                 call(
                     "POST",
                     f"/tables/{current_benchmark}/batch",
-                    {
-                        "inserts": {
-                            str(doc["hn_id"]): doc
-                            for doc in documents[offset : offset + 128]
-                        },
-                        "sync_level": "full_index",
-                    },
+                    {"inserts": inserts, "sync_level": "full_index"},
                 )
             benchmark_count = call(
                 "POST",
@@ -1066,7 +1079,12 @@ def main():
                     "key": ["hn_id"],
                 }
             }
-            call("POST", "/sources/hackernews_benchmark", {"source": benchmark_overlay})
+            if "hackernews_benchmark" not in json.dumps(call("GET", "/sources")):
+                call(
+                    "POST",
+                    "/sources/hackernews_benchmark",
+                    {"source": benchmark_overlay},
+                )
             for name, source in (
                 (
                     "union",

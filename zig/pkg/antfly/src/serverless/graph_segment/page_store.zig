@@ -158,6 +158,9 @@ pub const PageStore = struct {
             if (write.ref.bytes != write.bytes.len) return error.ArtifactIntegrityMismatch;
             bytes = try std.math.add(u64, bytes, write.bytes.len);
         }
+        // Streaming construction admits one bounded batch, not cumulative archive bytes.
+        // Every page and fan-in was validated above; query stores keep their cumulative budget.
+        if (self.streaming) self.remaining_write_bytes.* = @as(u64, tree.max_page_bytes) * writes.len;
         // Charge before spawning. Workers never race on admission counters.
         if (bytes > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes;
@@ -648,5 +651,18 @@ test "serverless graph page store bounded uploads drain failures and respect adm
     // entering the provider. Every provider that did enter has finished.
     const completed = fixture.completed_uploads.load(.acquire);
     try std.testing.expect(completed >= 17 and completed <= 24);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+    // Streaming builders can publish successive bounded batches after a serial
+    // root write has exhausted the prior single-page allowance.
+    pages.cancellation = .none;
+    fixture.cancel_upload = null;
+    pages.streaming = true;
+    write_bytes = 0;
+    const before_stream = fixture.completed_uploads.load(.acquire);
+    try store.put_many.?(store.ptr, &writes);
+    write_bytes = 0;
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(before_stream + 16, fixture.completed_uploads.load(.acquire));
+    try std.testing.expectEqual(@as(u64, tree.max_page_bytes) * tree.max_write_batch - 512, write_bytes);
     try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
 }

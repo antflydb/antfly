@@ -1843,6 +1843,9 @@ test "external lake text statistics page reductions reuse interior subtrees and 
             self.position += 1;
             return .{ .key = &self.key, .value = &self.value };
         }
+        fn many(raw: *anyopaque, writes: []const Write) !void {
+            for (writes) |write| try TestStore.put(raw, write.ref, write.bytes);
+        }
         fn reduce(alloc: Allocator, entries: []const Entry, height: u8) ![]u8 {
             var sum: u64 = 0;
             for (entries) |entry| {
@@ -1857,8 +1860,16 @@ test "external lake text statistics page reductions reuse interior subtrees and 
     };
     var store = memory.store();
     store.reduce = Source.reduce;
+    store.put_many = Source.many;
     var source: Source = .{};
     const root = try buildSorted(a, store, &source);
+    var failed: TestStore = .{ .alloc = a, .fail_put = 0 };
+    defer failed.deinit();
+    var failing_store = failed.store();
+    failing_store.reduce = Source.reduce;
+    failing_store.put_many = Source.many;
+    var failing_source: Source = .{};
+    try std.testing.expectError(error.InjectedUploadFailure, buildSorted(a, failing_store, &failing_source));
     var key: [8]u8 = undefined;
     var value: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 2000, .big);

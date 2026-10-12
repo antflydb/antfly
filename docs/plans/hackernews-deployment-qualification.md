@@ -460,3 +460,42 @@ original row and text match from remote storage without recreating missing files
 Removing remote commit authority must fail closed while fresh live reads still
 return the newer row. The public HTTP matrix also exercises partial cache loss
 before complete cache loss, sorted native filters and cursor restart.
+
+## Merged #1063 follow-up qualification
+
+PR #1063 adds term-directed admission, batched statistics, bounded 64-segment /
+32 MiB text windows, within-file small-run compaction, final-winner hydration and
+bounded planning warmup. PR #1081 must qualify those paths together with its
+compressed opening metadata before the next runtime release. Earlier timings
+in this document identify earlier binaries and do not qualify the combined code.
+
+Measure empty serving caches with optional planning warmup disabled, default
+readiness warmup after restart, and repeated queries separately. Record warmup
+attempts/pages/time outside query latency, provider requests/bytes, nested phase
+times and child-process peak RSS. Profiling currently selects a different planner;
+use health counters for the primary timing matrix and profile a separate diagnostic
+run. Both engines must use the same logical HN source, prebuilt indexes and native
+host execution. Keep OS-cache, HTTP, analyzer, thread-policy and shared-host limits
+explicit. Repeat at least two cycles and twenty warm samples.
+
+Qualify historical/current union and the saved replacement overlay with real sample
+rows in a native current table, alongside exact filters, highlights, cursors,
+nonmatching replacement suppression and mutation/restart retention. Include a
+fragmented publication above the 64-segment window boundary. A bounded current
+fixture and local filesystem source are diagnostic evidence, not full-archive or
+Antfly Cloud acceptance.
+
+Use the results to prioritize remaining work: publication-wide best-first traversal
+if routing or irrelevant posting reads dominate; cross-file compaction if small
+historical files/segments dominate; broader bounded execution if composed or pending
+write paths remain disproportionately expensive. These changes require the ownership,
+GC and conservative bound contracts in `zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`.
+
+Release handoff follows the verified PR, not the benchmark binary: human-approved CI
+on the final PR revision, merge, immutable runtime release/image digest, development
+runtime-catalog selection, and an Antfly Cloud instance. Verify the actual tenant's
+credential scope and refresh, both HN tables and saved source, replacement recovery,
+publication and the regional query matrix through the managed API. Keep public DNS
+routing disabled until those gates pass. Reconcile the existing shared cloud ledger
+before additional jobs; reuse the retained archive export and preserve prior spend
+and reservations. No standalone claim or engine is required for this Cloud path.

@@ -980,3 +980,59 @@ A small separate DuckDB HTTPS scan diagnostic on the same unchanged export took
 ARM client outside the storage region and included only two samples per term.
 It is recorded separately in the evidence and is not an indexed BM25 comparison
 or a production latency qualification.
+
+### Qualification after #1063
+
+Rebuild publications with the merged routing/statistics formats before comparing
+against the earlier results. Use `--build-only` first, and run query measurements
+after the qualification compilers finish. Repeat each scenario twice on the same
+source. Keep `--profile` out of the timed matrix: profiled requests currently use
+the legacy planner, so enabling it changes the execution being measured. Process
+health metrics still report provider requests, bytes and nested query phases.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --build-timeout 1200 --build-only
+
+# Empty serving caches: optional readiness planning prefetch is disabled.
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --cold-cache --disable-navigation-warming \
+  --no-highlights --repeats 20 --concurrency 4 \
+  --workload-terms database postgres sqlite AI
+
+# Default readiness warmup, highlights, deep cursors and historical/current reads.
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --cold-cache --repeats 20 \
+  --cursor-pages 40 --cursor-term AI \
+  --qualify-composed-sources --benchmark-composed --composed-current-rows 1000
+```
+
+`lake_indexes.navigation_warming.enabled` defaults to true. Disabling it skips
+only optional planning prefetch; source proofs, publication validation and required
+reads remain authoritative. A disabled run asserts that no warming attempt was
+recorded. Clearing disk entries before startup with warming enabled does not
+establish empty RAM planning caches. OS caches are not flushed in either scenario.
+
+Restart timing runs before cursor continuation, preventing a continuation from
+warming the historical search first. Union and saved-overlay benchmarks each use
+an independent cache-cleared restart, followed by repeated queries. Their native
+current fixture copies the sample's most recent rows; it is a bounded composition
+diagnostic, not a live feed or a full year of current HN. The existing two-row
+fixture separately checks nonmatching replacement suppression and mutable cursor
+retention. Process peak RSS covers the complete child lifetime, including any
+publication work, and must not be interpreted as query-only memory.
+
+Use common and selective terms plus a fragmented source containing more than 64
+segments to qualify bounded windows. Cross-source-file compaction and global
+best-first traversal remain separate changes. Select them based on measured
+navigation, segment-opening and posting work rather than treating the earlier
+43 MB cold-read figure as the combined implementation's result.
