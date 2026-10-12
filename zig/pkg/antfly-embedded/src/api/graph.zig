@@ -1159,14 +1159,8 @@ pub fn cloneGraphSearchResult(
     alloc: std.mem.Allocator,
     src: db_mod.types.GraphSearchResult,
 ) !db_mod.types.GraphSearchResult {
-    const nodes = if (src.nodes.len > 0)
-        try cloneGraphNodes(alloc, src.nodes)
-    else
-        @constCast((&[_]graph_query_mod.GraphResultNode{})[0..]);
-    errdefer if (nodes.len > 0) {
-        for (nodes) |*node| node.deinit(alloc);
-        alloc.free(nodes);
-    };
+    var owned_nodes = try cloneGraphNodesWithMetrics(alloc, src.nodes);
+    errdefer owned_nodes.deinit(alloc);
 
     const hits = if (src.hits.len > 0)
         try cloneSearchHits(alloc, src.hits)
@@ -1204,9 +1198,16 @@ pub fn cloneGraphSearchResult(
         alloc.free(aggregates);
     };
 
+    const metric_status = try cloneGraphMetricStatuses(alloc, src.metric_status);
+    errdefer db_mod.types.freeGraphMetricStatuses(alloc, metric_status);
+
     return .{
         .name = try alloc.dupe(u8, src.name),
-        .nodes = nodes,
+        .nodes = owned_nodes.nodes,
+        .metric_values_slab = owned_nodes.metrics.values,
+        .metric_columns = owned_nodes.metrics.columns,
+        .metric_value_names = owned_nodes.metrics.names,
+        .metric_status = metric_status,
         .paths = paths,
         .matches = matches,
         .aggregates = aggregates,
@@ -1239,10 +1240,7 @@ pub fn filterGraphSearchResult(
     for (exclude_edges) |edge| try exclude_edge_set.put(alloc, edge, {});
 
     var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
-    defer {
-        for (nodes.items) |*node| node.deinit(alloc);
-        nodes.deinit(alloc);
-    }
+    defer nodes.deinit(alloc);
     for (src.nodes) |node| {
         if (exclude.contains(.{
             .table = canonicalGraphNodeTable(source_table, node.table) orelse source_table,
@@ -1251,11 +1249,7 @@ pub fn filterGraphSearchResult(
         if (exclude_edge_set.count() > 0) {
             if (try graphResultNodeHasExcludedEdge(alloc, source_table, node, &exclude_edge_set)) continue;
         }
-        var owned_node = try cloneGraphNode(alloc, node);
-        nodes.append(alloc, owned_node) catch |err| {
-            owned_node.deinit(alloc);
-            return err;
-        };
+        try nodes.append(alloc, node);
     }
 
     var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
@@ -1315,11 +1309,8 @@ pub fn filterGraphSearchResult(
     const total_hits: u32 = @intCast(nodes.items.len);
     const name = try alloc.dupe(u8, src.name);
     errdefer alloc.free(name);
-    const owned_nodes = try nodes.toOwnedSlice(alloc);
-    errdefer {
-        for (owned_nodes) |*node| node.deinit(alloc);
-        if (owned_nodes.len > 0) alloc.free(owned_nodes);
-    }
+    var owned_nodes = try cloneGraphNodesWithMetrics(alloc, nodes.items);
+    errdefer owned_nodes.deinit(alloc);
     const owned_paths = try paths.toOwnedSlice(alloc);
     errdefer {
         for (owned_paths) |path| graph_paths_mod.freePath(alloc, path);
@@ -1344,7 +1335,10 @@ pub fn filterGraphSearchResult(
 
     return .{
         .name = name,
-        .nodes = owned_nodes,
+        .nodes = owned_nodes.nodes,
+        .metric_values_slab = owned_nodes.metrics.values,
+        .metric_columns = owned_nodes.metrics.columns,
+        .metric_value_names = owned_nodes.metrics.names,
         .paths = owned_paths,
         .matches = owned_matches,
         .hits = owned_hits,
@@ -1480,6 +1474,115 @@ pub fn freePathArray(alloc: std.mem.Allocator, path: [][]const u8) void {
 pub fn freePathEdges(alloc: std.mem.Allocator, edges: []graph_query_mod.PathEdgeInfo) void {
     for (edges) |edge| freeOwnedPathEdge(alloc, edge);
     if (edges.len > 0) alloc.free(edges);
+}
+
+/// A clone remains independent of its source, but owns one score slab and
+/// one copy of each distinct name instead of per-node allocations.
+pub const OwnedGraphNodes = struct {
+    nodes: []graph_query_mod.GraphResultNode,
+    metrics: graph_query_mod.GraphMetricOwner,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.nodes) |*node| node.deinit(alloc);
+        alloc.free(self.nodes);
+        self.metrics.deinit(alloc);
+    }
+};
+
+pub fn compactMetricLayout(nodes: []const graph_query_mod.GraphResultNode) bool {
+    if (nodes.len == 0 or nodes.len > std.math.maxInt(u32) or nodes[0].metricCount() == 0) return false;
+    const width = nodes[0].metricCount();
+    if (width > graph_query_mod.graph_metric_projection_limit) return false;
+    for (nodes) |node| {
+        if (!node.metricViewValid() or node.metricCount() != width) return false;
+        for (0..width) |column| if (!std.mem.eql(u8, node.metricAt(column).name, nodes[0].metricAt(column).name)) return false;
+    }
+    return true;
+}
+
+pub fn cloneGraphMetricOwner(alloc: std.mem.Allocator, nodes: []const graph_query_mod.GraphResultNode) !graph_query_mod.GraphMetricOwner {
+    if (compactMetricLayout(nodes)) {
+        const width = nodes[0].metricCount();
+        const owner = try alloc.create(graph_query_mod.GraphMetricColumns);
+        errdefer alloc.destroy(owner);
+        const names = try alloc.alloc([]u8, width);
+        var initialized: usize = 0;
+        errdefer {
+            for (names[0..initialized]) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        for (names, 0..) |*name, column| {
+            name.* = try alloc.dupe(u8, nodes[0].metricAt(column).name);
+            initialized += 1;
+        }
+        const scores = try alloc.alloc(f64, try std.math.mul(usize, width, nodes.len));
+        for (0..width) |column| for (nodes, 0..) |node, row| {
+            scores[column * nodes.len + row] = node.metricAt(column).score orelse std.math.nan(f64);
+        };
+        owner.* = .{ .names = names, .scores = scores, .rows = nodes.len };
+        return .{ .columns = owner };
+    }
+    for (nodes) |node| if (!node.metricViewValid()) return error.InvalidRemoteResponse;
+    var count: usize = 0;
+    for (nodes) |node| count = try std.math.add(usize, count, node.metricCount());
+    if (count == 0) return .{};
+    const values = try alloc.alloc(graph_query_mod.GraphMetricValue, count);
+    errdefer alloc.free(values);
+    var interned = std.StringHashMapUnmanaged([]u8).empty;
+    defer interned.deinit(alloc);
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    var offset: usize = 0;
+    for (nodes) |node| {
+        for (0..node.metricCount()) |column| {
+            const source = node.metricAt(column);
+            const name = interned.get(source.name) orelse new: {
+                const owned = try alloc.dupe(u8, source.name);
+                errdefer alloc.free(owned);
+                try interned.put(alloc, owned, owned);
+                names.append(alloc, owned) catch |err| {
+                    _ = interned.remove(owned);
+                    return err;
+                };
+                break :new owned;
+            };
+            values[offset] = .{ .name = name, .name_owned = false, .score = source.score };
+            offset += 1;
+        }
+    }
+    return .{ .values = values, .names = try names.toOwnedSlice(alloc) };
+}
+
+pub fn cloneGraphNodesWithMetrics(alloc: std.mem.Allocator, nodes: []const graph_query_mod.GraphResultNode) !OwnedGraphNodes {
+    var metrics = try cloneGraphMetricOwner(alloc, nodes);
+    errdefer metrics.deinit(alloc);
+    const out = try alloc.alloc(graph_query_mod.GraphResultNode, nodes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*node| node.deinit(alloc);
+        alloc.free(out);
+    }
+    var offset: usize = 0;
+    for (nodes, out, 0..) |node, *target, row| {
+        var payload = node;
+        payload.metrics = &.{};
+        payload.metric_columns = null;
+        target.* = try cloneGraphNode(alloc, payload);
+        initialized += 1;
+        if (metrics.columns) |columns| {
+            target.metrics_owned = false;
+            target.metric_columns = columns;
+            target.metric_row = @intCast(row);
+        } else {
+            target.metrics = metrics.values[offset..][0..node.metricCount()];
+            target.metrics_owned = false;
+            offset += node.metricCount();
+        }
+    }
+    return .{ .nodes = out, .metrics = metrics };
 }
 
 pub fn cloneGraphNodes(
@@ -1805,7 +1908,7 @@ pub fn cloneGraphNode(
         .path_edges = path_edges,
         .provenance = provenance,
         .table = table,
-        .metrics = try cloneGraphMetricValues(alloc, node.metrics),
+        .metrics = try node.cloneMetrics(alloc),
     };
 }
 

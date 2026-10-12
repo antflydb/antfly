@@ -20149,7 +20149,27 @@ pub const GraphIndex = struct {
         /// Independently owned, logical-order decoded columns for one-shot
         /// stage reads. Caller owns the arrays; native working retention stays
         /// bounded and no query-wide encoded key owner is constructed.
+        pub const DecodedColumnStream = struct {
+            session: *GraphMetricReadSession,
+            scores: score_read.FloatColumnStream,
+            pub fn readDecodedColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64) !void {
+                if (alloc.ptr != self.scores.allocator.ptr or alloc.vtable != self.scores.allocator.vtable) return error.InvalidBatch;
+                try self.session.readDecodedColumnsUsingScope(alloc, names, nodes, columns, &self.scores);
+            }
+            pub fn deinit(self: *@This()) void {
+                self.scores.deinit();
+                self.* = undefined;
+            }
+        };
+        /// Move-only batch stream, exclusively borrowing this pinned session.
+        /// Close the stream before moving/deinitializing its session.
+        pub fn openDecodedColumnStream(self: *@This(), alloc: Allocator) !DecodedColumnStream {
+            return .{ .session = self, .scores = score_read.FloatColumnStream.init(alloc, &self.txn) };
+        }
         pub fn readDecodedColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64) !void {
+            try self.readDecodedColumnsUsingScope(alloc, names, nodes, columns, null);
+        }
+        fn readDecodedColumnsUsingScope(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64, scope: ?*score_read.FloatColumnStream) !void {
             var buffer: [32]?[]const u8 = undefined;
             const selected = if (names.len <= buffer.len) buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
             defer if (names.len > buffer.len) alloc.free(selected);
@@ -20158,7 +20178,10 @@ pub const GraphIndex = struct {
                     if (std.mem.eql(u8, status.name, name)) break value;
                 } else return error.InvalidQueryRequest;
             }
-            const read = try score_read.populateFloatColumns(alloc, &self.txn, selected, nodes, columns);
+            const read = if (scope) |borrowed|
+                try borrowed.populate(selected, nodes, columns)
+            else
+                try score_read.populateFloatColumns(alloc, &self.txn, selected, nodes, columns);
             self.reads.keys += read.keys;
             self.reads.batches += read.batches;
         }
