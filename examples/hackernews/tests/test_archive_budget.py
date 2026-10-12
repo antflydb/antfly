@@ -100,6 +100,54 @@ class BudgetReconciliationTest(unittest.TestCase):
         self.evidence_path.write_text(json.dumps(evidence))
         return budget.bound_closed_pods(self.ledger, self.evidence_path)
 
+    def test_future_deposit_keeps_history_ceiling_and_noncompute_hold(self):
+        evidence = {
+            "project": self.config["project"],
+            "kind": "reviewed_future_run_reservation",
+            "reservation_per_run_usd": 14,
+            "resource_limits": {
+                "cpu": 8,
+                "memory_gib": 48,
+                "disk_gib": 10,
+                "lifetime_seconds": 3600,
+            },
+        }
+        self.evidence_path.write_text(json.dumps(evidence))
+        before = budget.exposure(self.original)
+        result = budget.replan_future_reservation(self.ledger, self.evidence_path)
+        self.assertEqual(result["exposure_usd"], before)
+        self.assertEqual(result["minimum_reservation_usd"], 11.187338)
+        updated = json.loads(self.ledger.read_text())
+        self.assertEqual(updated["runs"], self.original["runs"])
+        self.assertEqual(
+            updated["budget"]["ceiling_usd"], self.original["budget"]["ceiling_usd"]
+        )
+        self.assertEqual(updated["budget"]["other_run_allowance_usd"], 10)
+        self.assertEqual(
+            updated["future_reservation_changes"][0]["previous_budget"],
+            self.original["budget"],
+        )
+        self.assertTrue(
+            budget.replan_future_reservation(self.ledger, self.evidence_path)[
+                "already_applied"
+            ]
+        )
+        self.config["budget"] = updated["budget"].copy()
+        self.config["budget"]["max_runs"] = 3
+        self.config["resources"]["memory_gib"] = 49
+        with self.assertRaisesRegex(ValueError, "reviewed future reservation bounds"):
+            archive.reserve(
+                self.ledger, self.config, "oversized", extend_run_limit=True
+            )
+        # No mutation on rejection, including run-limit extension history.
+        self.assertEqual(json.loads(self.ledger.read_text()), updated)
+        for deposit in (11, 21):
+            evidence["reservation_per_run_usd"] = deposit
+            self.evidence_path.write_text(json.dumps(evidence))
+            with self.assertRaises(ValueError):
+                budget.replan_future_reservation(self.ledger, self.evidence_path)
+            self.assertEqual(json.loads(self.ledger.read_text()), updated)
+
     def test_closed_bound_keeps_noncompute_and_actual_billing_supersedes_it(self):
         result = self.apply_bound(self.closed_evidence())
         self.assertFalse(result["posted_billing"])

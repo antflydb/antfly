@@ -804,3 +804,28 @@ The native regression opens all declared field navigation with exactly two
 provider reads (directory and bundle), checks exact scores and the full byte
 round-trip, rejects a substituted range identity, and tests residency denial.
 Regional performance of this change must still pass the qualification gates.
+
+The metadata bundle binary at revision `89ccd33a2f` passed both public native
+recovery profiles and completed two regional cycles. Cold searches improved to
+12.1–13.9 seconds but still missed the 10-second gate; early cursor pages also
+missed their latency gate. Restart search took roughly half a second. See
+`publication-metadata-qualification-20261012.json`; this remains failed
+performance evidence. Phase counters placed most residual cold time in ranking
+and initial deep-page time in hydration.
+
+Lake text candidate identities can now come directly from the authenticated
+publication's ordinal-to-physical-row map. This avoids fetching stored-key pages
+for every matching candidate before final sorting and preserves canonical public
+IDs, delete-hole rank selection, scores and cursor ties. Legacy/recent/enriched
+paths retain stored-key projection. Final stored-source hydration advises a
+four-document lookahead through the current snapshot's existing bounded source
+queue; required reads retain their integrity and cancellation checks.
+
+Budget review can adjust future run deposits using
+`archive_budget.py --replan-future-reservation --ledger <ledger> --evidence <review>`
+with `kind: reviewed_future_run_reservation`, the same project, a new deposit and
+resource limits. The deposit must cover two whole hours at those resource limits
+plus the unchanged noncompute allowance, and fit the existing spend ceiling.
+The review is hash-audited, changes only future deposits, preserves original run
+reservations and costs, and constrains both planning and direct reservation.
+It does not establish actual billed spend.

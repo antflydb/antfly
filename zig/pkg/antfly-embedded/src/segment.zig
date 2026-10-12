@@ -1585,6 +1585,7 @@ pub const SegmentReader = struct {
     pub const V4StoredDocLocation = struct {
         id: []const u8,
         id_length: usize,
+        id_start: usize = 0,
         block_idx: u32,
         block_start: usize,
         block_end: usize,
@@ -1716,12 +1717,22 @@ pub const SegmentReader = struct {
         return .{
             .id = id,
             .id_length = id_len,
+            .id_start = @intCast(ids_start + id_offset),
             .block_idx = block,
             .block_start = @intCast(range.stored_offset + range.stored_metadata_length + start),
             .block_end = @intCast(range.stored_offset + range.stored_metadata_length + end),
             .doc_offset = std.mem.readInt(u32, entry[16..20], .little),
             .raw_len = std.mem.readInt(u32, entry[20..24], .little),
         };
+    }
+
+    pub fn prefetchStoredDoc(self: *const SegmentReader, doc: u32) !void {
+        if (self.native == null) return;
+        const backing_source = self.source();
+        if (backing_source != .ranges or backing_source.ranges.prefetch == null) return;
+        const location = (try self.storedLocationMetadata(doc)) orelse return error.StoredDocMissing;
+        backing_source.prefetch(location.id_start, location.id_length);
+        backing_source.prefetch(location.block_start, location.block_end - location.block_start);
     }
 
     fn storedBlockChecksum(self: *const SegmentReader, block: u32) !u32 {

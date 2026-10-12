@@ -275,13 +275,109 @@ def reconcile(ledger_path, evidence_path):
         return {"released_usd": round(before - after, 6), "exposure_usd": after}
 
 
+def validate_future_reservation(ledger, config):
+    limits = ledger.get("future_reservation_limits")
+    if limits is None:
+        return
+    resources = config["resources"]
+    for key in ("cpu", "memory_gib", "disk_gib"):
+        if not 0 < money(resources[key]) <= money(limits[key]):
+            raise ValueError("Resources exceed reviewed future reservation bounds")
+    if not 0 < config["lifetime_seconds"] <= limits["lifetime_seconds"]:
+        raise ValueError("Lifetime exceeds reviewed future reservation bounds")
+
+
+def replan_future_reservation(ledger_path, evidence_path):
+    """Adjust only future deposits; never refund history or expand the ceiling."""
+    raw = evidence_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    evidence = json.loads(raw)
+    with ledger_path.open("r+") as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        ledger = json.load(file)
+        if (
+            evidence.get("project") != ledger["project"]
+            or evidence.get("kind") != "reviewed_future_run_reservation"
+        ):
+            raise ValueError("Unsupported future reservation evidence")
+        if any(
+            audit["evidence_sha256"] == digest
+            for audit in ledger.get("future_reservation_changes", [])
+        ):
+            return {"already_applied": True, "exposure_usd": exposure(ledger)}
+        limits = evidence["resource_limits"]
+        for key, maximum in (("cpu", 8), ("memory_gib", 48), ("disk_gib", 10)):
+            if isinstance(limits[key], bool) or not 0 < money(limits[key]) <= maximum:
+                raise ValueError("Unsupported future resource bounds")
+        lifetime = limits["lifetime_seconds"]
+        if (
+            isinstance(lifetime, bool)
+            or not isinstance(lifetime, int)
+            or not 0 < lifetime <= 3600
+        ):
+            raise ValueError("Unsupported future lifetime bound")
+        previous = dict(ledger["budget"])
+        b = ledger["budget"]
+        floor = (
+            2
+            * (
+                money(limits["cpu"]) * money(b["cpu_hour_usd"])
+                + money(limits["memory_gib"]) * money(b["memory_gib_hour_usd"])
+                + money(limits["disk_gib"]) * money(b["disk_gib_hour_usd"])
+            )
+            + money(b["other_run_allowance_usd"])
+        ).quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+        deposit = money(evidence["reservation_per_run_usd"])
+        before = exposure(ledger)
+        if not floor <= deposit <= money(b["reservation_per_run_usd"]):
+            raise ValueError(
+                "Future deposit must cover two hours and the full noncompute hold"
+            )
+        if money(before) + deposit > money(b["ceiling_usd"]):
+            raise ValueError("Future run exceeds the existing spend ceiling")
+        b["reservation_per_run_usd"] = float(deposit)
+        ledger["future_reservation_limits"] = limits
+        ledger.setdefault("future_reservation_changes", []).append(
+            {
+                "at_unix": time.time(),
+                "evidence_sha256": digest,
+                "previous_budget": previous,
+                "future_reservation_usd": float(deposit),
+                "minimum_reservation_usd": float(floor),
+                "resource_limits": limits,
+                "basis": "two whole hours plus unchanged noncompute allowance; future runs only",
+            }
+        )
+        if exposure(ledger) != before:
+            raise ValueError("Future replanning cannot release historical exposure")
+        file.seek(0)
+        json.dump(ledger, file, indent=2)
+        file.write("\n")
+        file.truncate()
+        file.flush()
+        os.fsync(file.fileno())
+        return {
+            "exposure_usd": before,
+            "future_reservation_usd": float(deposit),
+            "minimum_reservation_usd": float(floor),
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--closed-pod-bound", action="store_true")
+    operations = parser.add_mutually_exclusive_group()
+    operations.add_argument("--closed-pod-bound", action="store_true")
+    operations.add_argument("--replan-future-reservation", action="store_true")
     args = parser.parse_args()
-    operation = bound_closed_pods if args.closed_pod_bound else reconcile
+    operation = (
+        replan_future_reservation
+        if args.replan_future_reservation
+        else bound_closed_pods
+        if args.closed_pod_bound
+        else reconcile
+    )
     print(json.dumps(operation(args.ledger, args.evidence), indent=2))
 
 

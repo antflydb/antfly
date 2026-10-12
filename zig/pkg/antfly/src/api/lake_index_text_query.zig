@@ -294,6 +294,7 @@ const Execution = struct {
     vector_include: ?@import("lake_index_physical_set.zig").Set = null,
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
+    ordinal_live_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
     predicate_exclusion_json: []const u8 = "",
     predicate_allow_partial: bool = true,
     delivery_request: ?types.SearchRequest = null,
@@ -496,6 +497,7 @@ const Execution = struct {
         return true;
     }
     fn deinit(self: *Execution) void {
+        self.ordinal_live_rows.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
         for (self.highlight_pins.items) |*pin| pin.deinit();
@@ -508,6 +510,16 @@ const Execution = struct {
         const self: *Execution = @ptrCast(@alignCast(@constCast(raw)));
         self.context.ensureActive() catch return true;
         return false;
+    }
+    fn publicDocNum(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32) !?[]u8 {
+        const self = from(raw);
+        try self.context.ensureActive();
+        // Recent/enriched documents retain the ordinary stored-identity path.
+        if (self.overlay != null or self.active_recent) return null;
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        if (identities.spans.len == 0) return null;
+        const row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        return try local.storage_rowsource_identity.allocId(a, row);
     }
     fn publicKey(raw: ?*anyopaque, a: A, member_key: []const u8) ![]u8 {
         const units = @import("lake_enrichment_units.zig");
@@ -761,8 +773,11 @@ const Execution = struct {
         }
         var hydrator = projection.Hydrator.init(a);
         defer hydrator.deinit();
-        if (stored_fields.len != 0) for (hits, values) |hit, *value| {
+        if (stored_fields.len != 0) for (hits, values, 0..) |hit, *value, position| {
             try self.context.ensureActive();
+            // Keep a small lookahead through the current snapshot's bounded
+            // source queue. Required reads still authenticate and report errors.
+            for (hits[position..@min(hits.len, position + 4)]) |upcoming| try pin.?.snapshot.prefetchStoredDoc(upcoming.native_text_doc_id.?);
             const key = try nativeKey(self, a, hit.id);
             defer a.free(key);
             if (value.*) |*row| try hydrator.append(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
@@ -1029,7 +1044,7 @@ const Execution = struct {
             self.predicate_exclusion_json = previous_exclusion;
             self.predicate_allow_partial = previous_allow_partial;
         }
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });

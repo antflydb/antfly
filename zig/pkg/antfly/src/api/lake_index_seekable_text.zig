@@ -77,6 +77,7 @@ pub const Read = struct {
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn check(self: Read) !void {
         try self.context.ensureActive();
+        if (self.cache) |cached| try cached.context.ensureActive();
         try self.cancellation.check();
     }
 };
@@ -1684,6 +1685,10 @@ test "external lake seekable metadata opens all field navigation with two authen
     defer a.free(roundtrip);
     try data.native.readInto(0, roundtrip);
     try std.testing.expectEqualSlices(u8, bytes, roundtrip);
+    var expired_cache = cached;
+    expired_cache.context.deadline_ns = 1;
+    var warm_byte: [1]u8 = undefined;
+    try std.testing.expectError(error.DeadlineExceeded, owner.read(.{ .store = store, .cache = expired_cache, .context = .{}, .cancellation = .none }, 0, &warm_byte));
     // A valid bundle cannot authorize a substituted logical range identity.
     const wrong = try ca.dupe(Piece, owner.directory.metadata);
     const checksum = "1111111111111111111111111111111111111111111111111111111111111111";

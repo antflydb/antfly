@@ -172,6 +172,9 @@ pub const SearchTextQueryExecutor = struct {
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
     project_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+    /// An authenticated provider ordinal map can project identity without
+    /// fetching a stored-key page. Null preserves ordinary key hydration.
+    project_doc_num: ?*const fn (?*anyopaque, Allocator, *const index_mod.IndexSnapshot, u32) anyerror!?[]u8 = null,
     native_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
     acquire_text_source: ?*const fn (?*anyopaque, ?[]const u8) anyerror!?PinnedTextSource = null,
     /// Primary rows can disappear independently of a derived posting. Keep
@@ -12193,6 +12196,16 @@ pub fn searchTextQuery(
         for (result.hits, 0..) |hit, i| {
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
+            if (!chunk_backed) if (executor.project_doc_num) |project_doc_num| if (try project_doc_num(executor.ctx, alloc, snapshot, hit.doc_id)) |key| {
+                var materialized = types.SearchHit{ .id = key, .doc_ordinal = doc_ordinal, .native_text_doc_id = hit.doc_id, .score = hit.score };
+                var assigned = false;
+                errdefer if (!assigned) materialized.deinit(alloc);
+                materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+                hits[i] = materialized;
+                assigned = true;
+                initialized += 1;
+                continue;
+            };
             const id = hit.id orelse {
                 identity_scratch.reset();
                 const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), hit.doc_id)) orelse return error.StoredDocMissing };
@@ -32496,4 +32509,104 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "external lake ordinal identity projection avoids stored key I/O and preserves score ties" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const mapper = @import("../document_mapper.zig");
+    const docs = try ca.alloc(mapper.MapperDoc, 4000);
+    var random = std.Random.DefaultPrng.init(73);
+    for (docs, 0..) |*doc, i| {
+        var payload: [128]u8 = undefined;
+        random.random().bytes(&payload);
+        doc.* = .{ .key = try std.fmt.allocPrint(ca, "native-{d}", .{i}), .value = try std.fmt.allocPrint(ca, "{{\"body\":\"alpha {s}\"}}", .{std.fmt.bytesToHex(&payload, .lower)}) };
+    }
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, docs, .{}, null)).?;
+    defer a.free(bytes);
+    const Harness = struct {
+        bytes: []const u8,
+        writer: *index_mod.IndexWriter,
+        identity_reads: usize = 0,
+        hints: [16]struct { offset: u64, length: u64 } = undefined,
+        hint_count: usize = 0,
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.hint_count < self.hints.len) self.hints[self.hint_count] = .{ .offset = offset, .length = length };
+            self.hint_count += 1;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset == 0 and out.len > 21) self.identity_reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn chunk(_: ?*anyopaque, _: Allocator, _: ?[]const u8) !bool {
+            return false;
+        }
+        fn matchAll(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn project(_: ?*anyopaque, out: Allocator, _: types.SearchRequest, _: []const u8, data: []const u8) ![]u8 {
+            return out.dupe(u8, data);
+        }
+        fn post(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+            return result;
+        }
+        fn ordinal(_: ?*anyopaque, out: Allocator, _: *const index_mod.IndexSnapshot, doc: u32) !?[]u8 {
+            return try key(out, doc);
+        }
+        fn key(out: Allocator, doc: u32) ![]u8 {
+            return std.fmt.allocPrint(out, "public-{d:0>4}", .{3999 - doc});
+        }
+        fn identity(_: ?*anyopaque, out: Allocator, id: []const u8) ![]u8 {
+            return key(out, try std.fmt.parseInt(u32, id[7..], 10));
+        }
+    };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    var harness: Harness = .{ .bytes = bytes, .writer = &writer };
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &harness, .length = bytes.len, .read_into = Harness.read, .close = Harness.close, .prefetch = Harness.prefetch } }));
+    harness.hint_count = 0;
+    try writer.snapshot().prefetchStoredDoc(3999);
+    try std.testing.expectEqual(@as(usize, 2), harness.hint_count);
+    const identity = harness.hints[0];
+    try std.testing.expectEqualStrings("native-3999", bytes[@intCast(identity.offset)..][0..@intCast(identity.length)]);
+    try std.testing.expect(harness.hints[1].length > 0);
+    try std.testing.expect(harness.hints[1].offset + harness.hints[1].length <= bytes.len);
+    harness.identity_reads = 0;
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 3, .order_by = &.{ .{ .field = "_score", .desc = true }, .{ .field = "_id" } } };
+    var executor: SearchTextQueryExecutor = .{ .ctx = &harness, .acquire_text_source = Harness.acquire, .text_index_entry = Harness.entry, .text_index_is_chunk_backed = Harness.chunk, .search_match_all = Harness.matchAll, .project_stored_search = Harness.project, .load_stored = Harness.stored, .postprocess = Harness.post, .project_key = Harness.identity, .project_doc_num = Harness.ordinal };
+    var mapped = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer mapped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), harness.identity_reads);
+    try std.testing.expectEqualStrings("public-0000", mapped.hits[0].id);
+    try std.testing.expectEqual(@as(?u32, 3999), mapped.hits[0].native_text_doc_id);
+    executor.project_doc_num = null;
+    var legacy = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer legacy.deinit();
+    try std.testing.expect(harness.identity_reads > 0);
+    try std.testing.expectEqual(mapped.total_hits, legacy.total_hits);
+    for (mapped.hits, legacy.hits) |lhs, rhs| {
+        try std.testing.expectEqualStrings(lhs.id, rhs.id);
+        try std.testing.expectEqual(lhs.score, rhs.score);
+    }
+    var next = req;
+    next.search_after = mapped.hits[mapped.hits.len - 1].sort_values;
+    executor.project_doc_num = Harness.ordinal;
+    var resumed = try searchTextQuery(a, next, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("public-0003", resumed.hits[0].id);
 }

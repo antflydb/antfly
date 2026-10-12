@@ -33,7 +33,7 @@ import sys
 import time
 import uuid
 
-from archive_budget import exposure, money
+from archive_budget import exposure, money, validate_future_reservation
 
 REQUIRED_CHECKS = {
     "remote_bm25",
@@ -58,6 +58,7 @@ def percentile(values, fraction=0.95):
 def plan(config, inventory, ledger=None):
     r, b = config["resources"], config["budget"]
     if ledger is not None:
+        validate_future_reservation(ledger, config)
         previous = ledger["budget"]
         if ledger["project"] != config["project"] or {
             k: v for k, v in previous.items() if k != "max_runs"
@@ -170,6 +171,7 @@ def reserve(ledger_path, config, run_id, *, extend_run_limit=False):
             ledger["budget"] = b
         if ledger["project"] != config["project"] or ledger["budget"] != b:
             raise ValueError("Existing ledger budget differs")
+        validate_future_reservation(ledger, config)
         if len(ledger["runs"]) >= b["max_runs"]:
             raise ValueError(
                 "Run limit exhausted; review recorded attempts before retrying"
