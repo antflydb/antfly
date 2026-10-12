@@ -422,6 +422,9 @@ pub const Cursor = struct {
     next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
     /// Borrow immutable filter evidence before any pull; false declines it.
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
+    /// Negotiate complete key spooling before building the filter. Absent
+    /// means Bloom/domain evidence suffices; do not spill unused exact tuples.
+    wants_exact_filter: ?*const fn (*anyopaque, []const @import("dynamic_filter.zig").Column) anyerror!bool = null,
     /// Split an unopened pinned scan into disjoint work for exact associative
     /// reducers. Providers may distribute row groups dynamically; child order
     /// is not source order. Children share the snapshot and close before their parent.

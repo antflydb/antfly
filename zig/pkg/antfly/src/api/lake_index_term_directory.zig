@@ -117,6 +117,7 @@ pub const Builder = struct {
     reduced_records: u64 = 0,
     aggregate_nodes: u64 = 0,
     track_branches: bool = false,
+    durable: ?@import("lake_index_delta_runs.zig").Forest = null,
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         return .{ .a = a, .changes = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024), .branches = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
@@ -148,8 +149,15 @@ pub const Builder = struct {
         defer self.a.free(key);
         @memcpy(key[0..prefix.len], prefix);
         @memcpy(key[prefix.len..], &segment);
-        try self.changes.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{ local.sql_scalar.Datum.fromJson(.{ .integer = sign }), local.sql_scalar.Datum.fromJson(.{ .string = record.value }) }, .ordinal = self.ordinal });
+        self.changes.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{ local.sql_scalar.Datum.fromJson(.{ .integer = sign }), local.sql_scalar.Datum.fromJson(.{ .string = record.value }) }, .ordinal = self.ordinal }) catch |err| {
+            if (err == error.SqlProgramLimitExceeded) return self.disable();
+            return err;
+        };
         self.ordinal += 1;
+        if (self.durable != null and (self.changes.total >= 8192 or self.changes.manager.live_bytes >= 32 * 1024 * 1024)) self.flush() catch |err| {
+            if (err == error.SqlProgramLimitExceeded) return self.disable();
+            return err;
+        };
     }
 
     fn queueBranch(self: *Builder, key: []const u8, branch: ?Branch) !void {
@@ -160,6 +168,7 @@ pub const Builder = struct {
         owner: *Builder,
         scratch: std.heap.ArenaAllocator,
         row: ?local.sql_operators.Row = null,
+        cursor: ?*tree.Cursor = null,
         key: ?[]u8 = null,
         value: [stats.Summary.max_bytes]u8 = undefined,
         sign: i64 = 0,
@@ -168,6 +177,14 @@ pub const Builder = struct {
             if (self.key) |key| self.owner.a.free(key);
         }
         pub fn next(self: *@This()) !?tree.Mutation {
+            if (self.cursor) |cursor| {
+                const record = try cursor.next() orelse return null;
+                if (record.value.len < 8) return error.InvalidNativeLakeTermDirectory;
+                self.sign = std.mem.readInt(i64, record.value[0..8], .big);
+                if (self.sign != 1 and self.sign != -1) return error.InvalidNativeLakeTermDirectory;
+                if (self.owner.track_branches) try self.owner.queueBranch(record.key[0 .. record.key.len - 31], null);
+                return .{ .key = record.key, .value = if (self.sign == 1) record.value[8..] else null };
+            }
             while (true) {
                 if (self.key) |key| self.owner.a.free(key);
                 self.key = null;
@@ -193,10 +210,67 @@ pub const Builder = struct {
             }
         }
     };
-    pub fn finish(self: *Builder, store: tree.Store, prior: Roots) !Roots {
-        if (self.disabled) return .{ .version = 2 };
+    pub fn enableDurable(self: *Builder, store: tree.Store) void {
+        self.durable = .{ .a = self.a, .store = store, .policy = .contribution };
+        self.changes.shared_runs = true;
+        self.branches.shared_runs = true;
+    }
+    fn disable(self: *Builder) void {
+        self.disabled = true;
+        const manager = self.changes.manager;
+        self.changes.deinit();
+        self.branches.deinit();
+        self.changes = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, 4 * 1024 * 1024);
+        self.branches = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, 4 * 1024 * 1024);
+        self.durable = null;
+    }
+    pub fn flush(self: *Builder) !void {
+        if (self.changes.total == 0) return;
+        const forest = if (self.durable) |*value| value else return error.InvalidNativeLakeDeltaRun;
         try self.changes.finish();
-        var changes: Changes = .{ .owner = self, .scratch = std.heap.ArenaAllocator.init(self.a) };
+        var changes: Changes = .{ .owner = self, .scratch = .init(self.a) };
+        defer changes.deinit();
+        const Source = struct {
+            changes: *Changes,
+            value: [8 + stats.Summary.max_bytes]u8 = undefined,
+            pub fn next(source: *@This()) !?tree.Cursor.Record {
+                const record = try source.changes.next() orelse return null;
+                std.mem.writeInt(i64, source.value[0..8], source.changes.sign, .big);
+                const payload = record.value orelse "";
+                @memcpy(source.value[8..][0..payload.len], payload);
+                return .{ .key = record.key, .value = source.value[0 .. 8 + payload.len] };
+            }
+        };
+        var source: Source = .{ .changes = &changes };
+        try forest.add(&source);
+        const manager = self.changes.manager;
+        const memory_bytes = self.changes.memory_bytes;
+        self.changes.deinit();
+        self.changes = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, memory_bytes);
+        self.changes.shared_runs = true;
+    }
+    pub fn finish(self: *Builder, store: tree.Store, prior: Roots) !Roots {
+        return self.finishImpl(store, prior) catch |err| {
+            // Optional acceleration must fail complete: no partial directory
+            // can be advertised as proof of term absence or score bounds.
+            if (err == error.SqlProgramLimitExceeded) {
+                self.disable();
+                return .{ .version = 2 };
+            }
+            return err;
+        };
+    }
+    fn finishImpl(self: *Builder, store: tree.Store, prior: Roots) !Roots {
+        if (self.disabled) return .{ .version = 2 };
+        var delta_cursor: ?tree.Cursor = null;
+        defer if (delta_cursor) |*value| value.deinit();
+        var run: ?tree.Ref = null;
+        if (self.durable) |*forest| {
+            try self.flush();
+            run = try forest.finish();
+            delta_cursor = try tree.Cursor.init(self.a, store, run, "", null);
+        } else try self.changes.finish();
+        var changes: Changes = .{ .owner = self, .cursor = if (delta_cursor) |*value| value else null, .scratch = std.heap.ArenaAllocator.init(self.a) };
         defer changes.deinit();
         var roots = prior;
         roots.version = 2;
@@ -208,7 +282,10 @@ pub const Builder = struct {
             if (self.distinct_changes == 0) return prior;
             changes.row = null;
             _ = changes.scratch.reset(.free_all);
-            try self.changes.rewind();
+            if (delta_cursor) |*value| {
+                value.deinit();
+                value.* = try tree.Cursor.init(self.a, store, run, "", null);
+            } else try self.changes.rewind();
             self.track_branches = true;
             self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(4096, prior.leaves.?.records / 4)) .merge else .cow) else self.strategy;
         }
@@ -481,4 +558,41 @@ test "external lake text statistics subtree reductions bound small updates and d
     const branch = try Branch.decode((try branch_cursor.next()).?.value);
     try std.testing.expectEqual(@as(u64, 10000), branch.count);
     try std.testing.expectEqual(@as(u8, 255), branch.first[0]);
+}
+
+test "external lake text statistics durable directory bounds temporary disk and disables exhausted acceleration" {
+    const a = std.testing.allocator;
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check, .max_bytes = 256 * 1024, .compression = .none };
+    defer manager.deinit();
+    var builder = Builder.init(a, &manager);
+    defer builder.deinit();
+    builder.enableDurable(memory.store());
+    builder.changes.memory_bytes = 32 * 1024;
+    var buffer: [stats.Summary.max_bytes]u8 = undefined;
+    const summary = (stats.Summary{ .frequency = 1, .max_frequency = 1, .min_norm = 2 }).encode(&buffer);
+    for (0..4096) |index| {
+        var id: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, id[24..32], index, .big);
+        try builder.addRecord(.{ .key = "common", .value = summary }, id, 1);
+        if (index % 64 == 63) try builder.flush();
+    }
+    const roots = try builder.finish(memory.store(), .{});
+    try std.testing.expect(!builder.disabled);
+    try std.testing.expectEqual(@as(u64, 4096), roots.leaves.?.records);
+    try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
+    try std.testing.expect(manager.written_bytes > manager.max_bytes);
+    var constrained = Builder.init(a, &manager);
+    defer constrained.deinit();
+    constrained.changes.memory_bytes = 0;
+    manager.max_bytes = 0;
+    try constrained.addRecord(.{ .key = "common", .value = summary }, @splat(1), 1);
+    const fallback = try constrained.finish(memory.store(), roots);
+    try std.testing.expect(constrained.disabled);
+    try std.testing.expect(fallback.leaves == null and fallback.branches == null);
 }

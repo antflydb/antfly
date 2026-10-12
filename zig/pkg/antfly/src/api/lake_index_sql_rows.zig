@@ -64,7 +64,7 @@ const Owner = struct {
     dynamic: ?*const local.sql_dynamic_filter.Filter = null,
     probe_prefixes: []const []const u8 = &.{},
     probe_position: usize = 0,
-    probe_sort: ?local.sql_spill.Sort = null,
+    probe_sort: ?*Projection = null,
     probe_scratch: std.heap.ArenaAllocator,
     probe_previous: std.ArrayList(u8) = .empty,
     probe_done: bool = true,
@@ -81,7 +81,7 @@ const Owner = struct {
         if (self.public_order) |*cursor| cursor.deinit();
         if (self.reader_open) self.reader.deinit();
         if (self.probe_cache) |*cache| cache.deinit();
-        if (self.probe_sort) |*sort| sort.deinit();
+        if (self.probe_sort) |projection| projection.release();
         self.probe_previous.deinit(self.a);
         self.probe_scratch.deinit();
         if (self.metadata) |owned| owned.release();
@@ -106,7 +106,8 @@ const Owner = struct {
         return if (self.probe_cache) |*cache| cache.store() else self.reader.pages.store();
     }
     fn nextProbe(self: *Owner) !?[]const u8 {
-        if (self.probe_sort) |*sort| {
+        if (self.probe_sort) |projection| {
+            const sort = &projection.sort;
             while (true) {
                 _ = self.probe_scratch.reset(.retain_capacity);
                 const row = try sort.next(self.probe_scratch.allocator()) orelse {
@@ -130,7 +131,7 @@ const Owner = struct {
         return prefix;
     }
     fn rewindProbes(self: *Owner) !void {
-        if (self.probe_sort) |*sort| try sort.rewind();
+        if (self.probe_sort) |projection| try projection.sort.rewind();
         self.probe_position = 0;
         self.probe_done = false;
     }
@@ -890,6 +891,7 @@ pub fn wrapDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     result.split_scan = if (child.split_scan != null) Adaptive.split else null;
     result.split_ordered = if (child.split_ordered != null) Adaptive.splitOrdered else null;
     result.set_dynamic_filter = Adaptive.install;
+    result.wants_exact_filter = Adaptive.wantsExact;
     return result;
 }
 const Adaptive = struct {
@@ -929,6 +931,27 @@ const Adaptive = struct {
         const self: *Adaptive = @ptrCast(@alignCast(raw));
         return if (self.child.split_ordered) |call| call(self.child.ptr, alloc, maximum) else null;
     }
+    fn wantsExact(raw: *anyopaque, columns: []const local.sql_dynamic_filter.Column) !bool {
+        const self: *Adaptive = @ptrCast(@alignCast(raw));
+        if (self.started or self.installed) return false;
+        const request = self.request;
+        if (request.index_range != null or request.index_equality != null or request.primary_order or request.row_refs != null or request.physical_selection != null or request.primary_key != null or request.after != null or request.before != null or request.order.len != 0) return false;
+        const definitions = self.table.external_indexes orelse return false;
+        if (definitions.schema_json.len == 0 or self.server.source.lakeIndexLifecycleAuthority(self.context) == null) return false;
+        var published = try local.metadata_lake_index_catalog.parse(self.a, definitions.catalog_json);
+        defer published.deinit();
+        if (published.value.published == null) return false;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        var parsed = try local.schema_mod.parseValidatedTableSchema(self.a, definitions.schema_json);
+        defer parsed.deinit(self.a);
+        const indexes = (try parsed.relationalIndexDefinitions(arena.allocator())) orelse return false;
+        for (indexes) |index| {
+            if (index.keys.len == 0 or index.keys[0].expression_json != null or index.keys[0].collation != null) continue;
+            for (columns) |column| if (std.mem.eql(u8, column.name, index.keys[0].column)) return true;
+        }
+        return false;
+    }
     fn install(raw: *anyopaque, filter: *const local.sql_dynamic_filter.Filter) !bool {
         const self: *Adaptive = @ptrCast(@alignCast(raw));
         if (self.started or self.installed) return false;
@@ -958,6 +981,46 @@ fn dynamicWidth(index: local.storage_relational_index.RelationalIndexDefinition,
     }
     return width;
 }
+const Projection = struct {
+    a: A,
+    fingerprint: [32]u8,
+    references: usize = 1,
+    sort: local.sql_spill.Sort,
+    fn release(self: *Projection) void {
+        self.references -= 1;
+        if (self.references != 0) return;
+        self.sort.deinit();
+        self.a.destroy(self);
+    }
+};
+const Projections = struct {
+    a: A,
+    entries: std.ArrayList(*Projection) = .empty,
+    fn deinit(self: *Projections) void {
+        for (self.entries.items) |entry| entry.release();
+        self.entries.deinit(self.a);
+    }
+    fn acquire(self: *Projections, tuple: local.storage_db_relational_index_keys.TuplePlan, index: local.storage_relational_index.RelationalIndexDefinition, filter: *const local.sql_dynamic_filter.Filter, fingerprint: [32]u8) !?*Projection {
+        for (self.entries.items) |entry| if (std.mem.eql(u8, &entry.fingerprint, &fingerprint)) {
+            entry.references += 1;
+            return entry;
+        };
+        if (self.entries.items.len >= 8) {
+            const victim = for (self.entries.items, 0..) |entry, i| {
+                if (entry.references == 1) break i;
+            } else return null;
+            self.entries.swapRemove(victim).release();
+        }
+        var sort = (try dynamicSort(self.a, tuple, index, filter)) orelse return null;
+        errdefer sort.deinit();
+        const entry = try self.a.create(Projection);
+        errdefer self.a.destroy(entry);
+        entry.* = .{ .a = self.a, .fingerprint = fingerprint, .sort = sort };
+        try self.entries.append(self.a, entry);
+        entry.references += 1;
+        return entry;
+    }
+};
 fn tryOpenDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, filter: *const local.sql_dynamic_filter.Filter) !?catalog.Cursor {
     if (!filter.hasExact() or filter.rows == 0) return null;
     if (request.index_range != null or request.index_equality != null or request.primary_order or request.row_refs != null or request.physical_selection != null or request.primary_key != null or request.after != null or request.before != null or request.order.len != 0) return null;
@@ -968,6 +1031,8 @@ fn tryOpenDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
     const indexes = (try parsed.relationalIndexDefinitions(arena.allocator())) orelse return null;
+    var projections: Projections = .{ .a = a };
+    defer projections.deinit();
     var best: ?catalog.Cursor = null;
     errdefer if (best) |cursor| cursor.close(cursor.ptr);
     var best_cost: u64 = std.math.maxInt(u64);
@@ -982,7 +1047,7 @@ fn tryOpenDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         var scan = request;
         scan.index_range = .{ .name = index.name };
         var cost: u64 = 0;
-        const cursor = (openDynamicContext(a, server, table, scan, context, source, .automatic, &cost, false, null, filter) catch |err| switch (err) {
+        const cursor = (openDynamicContext(a, server, table, scan, context, source, .automatic, &cost, false, null, filter, best_cost, &projections) catch |err| switch (err) {
             // Optional planning work must not consume the fallback scan's budget.
             error.ArtifactReadBudgetExceeded => continue,
             else => return err,
@@ -992,6 +1057,14 @@ fn tryOpenDynamic(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
             best = cursor;
             best_cost = cost;
         } else cursor.close(cursor.ptr);
+    }
+    // Candidate costing shares mutable sort replay sequentially. Restore the
+    // winning cursor before execution; only it retains the projection lease.
+    if (best) |cursor| {
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        try owner.rewindProbes();
+        owner.reader.exhausted = false;
+        _ = try owner.advanceProbe();
     }
     return best;
 }
@@ -1065,10 +1138,27 @@ fn dynamicSort(a: A, tuple: local.storage_db_relational_index_keys.TuplePlan, in
     defer scratch.deinit();
     try stream.rewind();
     var ordinal: u64 = 0;
+    var previous_arena = std.heap.ArenaAllocator.init(a);
+    defer previous_arena.deinit();
+    var previous: ?[]const local.sql_scalar.Datum = null;
     while (true) {
         _ = scratch.reset(.retain_capacity);
         const ca = scratch.allocator();
         const row = try stream.next(ca) orelse break;
+        if (previous) |keys| {
+            var same = keys.len == row.keys.len;
+            if (same) for (keys, row.keys) |left, right| {
+                if ((try local.sql_scalar.compareDatums(left, right)) != .eq) {
+                    same = false;
+                    break;
+                }
+            };
+            if (same) continue;
+        }
+        _ = previous_arena.reset(.retain_capacity);
+        const keys = try previous_arena.allocator().alloc(local.sql_scalar.Datum, row.keys.len);
+        for (keys, row.keys) |*out, value| out.* = try local.sql_operators.cloneDatum(previous_arena.allocator(), value);
+        previous = keys;
         const prefix = (dynamicBoundKey(ca, tuple, ordinals, row.keys) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidRelationalIndexBound, error.RelationalIndexKeyTooLarge => return null,
             else => return err,
@@ -1141,9 +1231,9 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null);
 }
 fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext) !?catalog.Cursor {
-    return openDynamicContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, pinned, null);
+    return openDynamicContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, pinned, null, std.math.maxInt(u64), null);
 }
-fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, dynamic: ?*const local.sql_dynamic_filter.Filter) !?catalog.Cursor {
+fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, dynamic: ?*const local.sql_dynamic_filter.Filter, cost_limit: u64, projections: ?*Projections) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
     if (request.primary_order or request.row_refs != null or request.physical_selection != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
@@ -1238,7 +1328,9 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         if (filter.exactKeys() != null) {
             owner.probe_prefixes = (try dynamicPrefixes(ca, tuple, definition, filter)) orelse return null;
         } else {
-            owner.probe_sort = dynamicSort(a, tuple, definition, filter) catch |err| switch (err) {
+            var prefix_tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, runtime, &layout, definition.keys[0..dynamicWidth(definition, filter)]);
+            defer prefix_tuple.deinit();
+            owner.probe_sort = (projections orelse return null).acquire(tuple, definition, filter, prefix_tuple.fingerprint) catch |err| switch (err) {
                 error.SqlProgramLimitExceeded => return null,
                 else => return err,
             };
@@ -1320,24 +1412,6 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
         if (identities_only) {
             cost.* = predicateIndexWork(owner.predicate_count, declaration.artifact.byte_len, resident_metadata);
         } else {
-            var candidates: u64 = 0;
-            if (!empty_range) {
-                if (dynamic != null) {
-                    // Complete costing and execution share a replayable bounded
-                    // prefix stream; neither retains an archive-sized ID list.
-                    if (owner.reader.cursor) |*cursor| cursor.deinit();
-                    owner.reader.cursor = null;
-                    owner.reader.window_upper = null;
-                    try owner.rewindProbes();
-                    while (try owner.nextProbe()) |prefix| {
-                        try owner.read_context.ensureActive();
-                        candidates +|= try tree.countRange(a, owner.probeStore(), root.page, prefix, try prefixSuccessor(owner.probe_scratch.allocator(), prefix));
-                    }
-                    try owner.rewindProbes();
-                    owner.reader.exhausted = false;
-                    _ = try owner.advanceProbe();
-                } else candidates = try owner.reader.countRange(ca, lower, upper);
-            }
             var source_rows: u64 = 0;
             for (source.inventory.files) |file| source_rows +|= file.row_count;
             source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
@@ -1352,8 +1426,34 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
                 }
             }
             const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
-            cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups);
             const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
+            const cutoff = @min(scan_cost, cost_limit);
+            const probe_limit = @min(65536, cutoff);
+            var probes: u64 = 0;
+            var candidates: u64 = 0;
+            if (!empty_range) {
+                if (dynamic != null) {
+                    // Complete costing and execution share a replayable bounded
+                    // prefix stream; neither retains an archive-sized ID list.
+                    if (owner.reader.cursor) |*cursor| cursor.deinit();
+                    owner.reader.cursor = null;
+                    owner.reader.window_upper = null;
+                    try owner.rewindProbes();
+                    while (try owner.nextProbe()) |prefix| {
+                        try owner.read_context.ensureActive();
+                        probes += 1;
+                        // Planning is optional. Bound both zero-hit seeks and
+                        // monotonically increasing candidate/hydration work.
+                        if (probes > probe_limit or probes > cutoff) return null;
+                        candidates +|= try tree.countRange(a, owner.probeStore(), root.page, prefix, try prefixSuccessor(owner.probe_scratch.allocator(), prefix));
+                        if (estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups) +| probes > cutoff) return null;
+                    }
+                    try owner.rewindProbes();
+                    owner.reader.exhausted = false;
+                    _ = try owner.advanceProbe();
+                } else candidates = try owner.reader.countRange(ca, lower, upper);
+            }
+            cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups) +| probes;
             if (cost.* > scan_cost and candidates != 0) return null;
         }
     }
@@ -1598,4 +1698,36 @@ test "external lake dynamic exact keys preserve NUMERIC payloads and decline cro
             try std.testing.expect(!std.mem.eql(u8, expected, try boundKey(ca, tuple, &.{.null})));
         }
     }
+}
+
+test "external lake dynamic exact keys share compatible prefix projection and deduplicate spilled tuples" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const filter = try local.sql_dynamic_filter.Filter.createWithSpill(a, &.{.{ .name = "k", .type = .integer }}, 256, &manager);
+    defer filter.close();
+    for (0..6000) |i| try filter.add(&.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })});
+    for (0..32) |_| try filter.add(&.{local.sql_scalar.Datum.json(.{ .integer = 5000 })});
+    filter.sealed = true;
+    const columns = [_]local.storage_schema.RelationalColumn{.{ .name = "k", .path = "/k", .column_type = .integer }};
+    const schema: local.storage_schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "k", .owner_kind = .table, .owner_name = "k", .access_method = .ordered_tuple, .keys = &.{.{ .column = "k" }} };
+    var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, schema, &layout, index.keys);
+    defer tuple.deinit();
+    var projections: Projections = .{ .a = a };
+    defer projections.deinit();
+    const first = (try projections.acquire(tuple, index, filter, tuple.fingerprint)).?;
+    defer first.release();
+    const writes = manager.written_bytes;
+    const second = (try projections.acquire(tuple, index, filter, tuple.fingerprint)).?;
+    defer second.release();
+    try std.testing.expect(first == second);
+    try std.testing.expectEqual(writes, manager.written_bytes);
+    try std.testing.expectEqual(@as(u64, 6000), first.sort.total);
 }

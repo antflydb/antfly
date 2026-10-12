@@ -4652,11 +4652,17 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
-test "SQL joins consume native column batches without invoking the JSON cursor" {
+test "lake SQL joins negotiate exact key spooling and consume native column batches" {
     const Native = struct {
         var installs: usize = 0;
+        var exact: bool = false;
+        fn wants(_: *anyopaque, _: []const @import("dynamic_filter.zig").Column) !bool {
+            return exact;
+        }
         fn install(_: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
             try std.testing.expect(filter.sealed);
+            try std.testing.expectEqual(exact, filter.spill_manager != null);
+            try std.testing.expectEqual(exact, filter.hasExact());
             installs += 1;
             return true;
         }
@@ -4689,25 +4695,30 @@ test "SQL joins consume native column batches without invoking the JSON cursor" 
                 cursor.next = rows;
                 cursor.next_columns = columns;
                 cursor.set_dynamic_filter = install;
+                cursor.wants_exact_filter = wants;
             }
             return statement;
         }
     };
-    Native.installs = 0;
-    var fixture: TestBackend = .{ .row_count = 1537 };
-    var backend = fixture.coordinated();
-    var vtable = backend.vtable.*;
-    vtable.open_statement = Native.open;
-    backend.vtable = &vtable;
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*), sum(l.id) FROM things l JOIN things r ON l.id=r.id", .{});
-    defer compiled.deinit();
-    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 7, .execution_batch_rows = 1024 });
-    defer result.deinit();
-    try std.testing.expectEqualStrings("1537", result.output.rows[0][0].string);
-    try std.testing.expectEqualStrings("1180416", result.output.rows[0][1].string);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pages);
-    try std.testing.expectEqual(@as(usize, 1), Native.installs);
-    try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    for ([_]bool{ false, true }) |exact| {
+        Native.exact = exact;
+        Native.installs = 0;
+        var fixture: TestBackend = .{ .row_count = 5000 };
+        var backend = fixture.coordinated();
+        backend.execution_io = std.testing.io;
+        var vtable = backend.vtable.*;
+        vtable.open_statement = Native.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*), sum(l.id) FROM things l JOIN things r ON l.id=r.id", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 7, .execution_batch_rows = 1024 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("12497500", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+        try std.testing.expectEqual(@as(usize, 1), Native.installs);
+        try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    }
 }
 
 test "SQL batched join defers probe expression errors beyond a satisfied limit" {

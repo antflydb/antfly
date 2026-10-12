@@ -412,7 +412,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             .segment_directory => partial_root.file_groups[0].segments[0],
             .pack => checkpoint_segment.blocks[0].retainedArtifact(),
             .statistics => stats: {
-                const ref = partial_root.term_statistics.?;
+                const ref = partial_root.term_statistics orelse partial_root.statistics_deltas[0].page;
                 const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(partial_root.domain, ref);
                 break :stats .{ .artifact_id = try partial.arena.allocator().dupe(u8, &id), .checksum = try partial.arena.allocator().dupe(u8, &std.fmt.bytesToHex(&ref.digest, .lower)), .byte_len = ref.bytes };
             },

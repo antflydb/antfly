@@ -1336,6 +1336,7 @@ pub const Adapter = struct {
                 .close = close,
                 .next_columns = if (child.next_columns != null) nextColumns else null,
                 .set_dynamic_filter = if (child.set_dynamic_filter != null) setDynamicFilter else null,
+                .wants_exact_filter = if (child.wants_exact_filter != null) wantsExactFilter else null,
                 .count_rows = if (child.count_rows != null) countRows else null,
                 // Cursor's contract keeps children inside their parent's lifetime.
                 // The statement therefore pins their shared source until close.
@@ -1366,6 +1367,11 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.statement.cursors[0];
             return cursor.next(cursor.ptr, alloc, limit);
+        }
+        fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return cursor.wants_exact_filter.?(cursor.ptr, columns);
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));

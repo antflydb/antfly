@@ -26,6 +26,10 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Optional provider-enforced protection of current object names against
+        /// deletion AND replacement. Version retention alone is insufficient.
+        immutable_prefix_until: ?*const fn (*anyopaque, []const u8, []const u8, ?types.CancellationToken) anyerror!?u64 = null,
+        validate_immutable_until: ?*const fn (*anyopaque, []const u8, u64, ?types.CancellationToken) anyerror!bool = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
         make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
@@ -43,6 +47,16 @@ pub const Client = struct {
         list_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, types.ListObjectVersionsOptions) anyerror!types.ListObjectVersionsResult = null,
     };
 
+    pub fn immutablePrefixUntil(self: *Client, bucket: []const u8, prefix: []const u8, token: ?types.CancellationToken) !?u64 {
+        if (token) |value| try value.check();
+        const call = self.vtable.immutable_prefix_until orelse return null;
+        return call(self.ptr, bucket, prefix, token);
+    }
+    pub fn validateImmutableUntil(self: *Client, bucket: []const u8, until_ms: u64, token: ?types.CancellationToken) !bool {
+        if (token) |value| try value.check();
+        const call = self.vtable.validate_immutable_until orelse return false;
+        return call(self.ptr, bucket, until_ms, token);
+    }
     pub fn deinit(self: *Client) void {
         self.vtable.deinit(self.allocator, self.ptr);
         self.* = undefined;

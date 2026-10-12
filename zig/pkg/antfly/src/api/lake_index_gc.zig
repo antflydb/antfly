@@ -291,6 +291,7 @@ pub const Collector = struct {
                     try self.markPages(a, root.domain, root.directories.files, false);
                     try self.markPages(a, root.domain, root.directories.segments, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
+                    for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
                     try self.markPages(a, root.domain, root.term_directory.leaves, false);
                     for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
@@ -774,6 +775,17 @@ test "external lake native GC follows paged file catalogs and independent text d
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
     for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
+    // A non-serving statistics checkpoint owns pages absent from the serving
+    // base. GC must retain those signed runs until finalization or retirement.
+    var signed: [8]u8 = undefined;
+    std.mem.writeInt(i64, &signed, 1, .big);
+    var delta_source: Source = .{ .key = "pending-term", .value = &signed };
+    const delta = (try @import("../serverless/graph_segment/page_tree.zig").buildSorted(a, pages.store(), &delta_source)).?;
+    const checkpoint_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .statistics_version = 1, .term_statistics = files, .statistics_deltas = &.{.{ .page = delta, .level = 0 }} }, .{});
+    var checkpoint = try store.put(checkpoint_bytes);
+    defer checkpoint.deinit(a);
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = checkpoint.artifact_id, .checksum = checkpoint.checksum, .byte_len = checkpoint.byte_len });
+    try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, delta)));
 }
 
 test "external lake native GC marks checkpoint forests and their covering blocks" {

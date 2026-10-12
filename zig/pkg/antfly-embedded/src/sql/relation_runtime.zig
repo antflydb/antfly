@@ -1827,7 +1827,8 @@ fn Engine(comptime Context: type) type {
                     }
                     column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
                 }
-                self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, self.engine.context.spill);
+                const exact = if (cursor.wants_exact_filter) |wants| try wants(cursor.ptr, columns) else false;
+                self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, if (exact) self.engine.context.spill else null);
             }
             fn membershipCheckpoint(raw: *anyopaque) !void {
                 const engine: *Self = @ptrCast(@alignCast(raw));

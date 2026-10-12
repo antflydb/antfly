@@ -2185,8 +2185,8 @@ three pages and reads five, while two identity lookups read four pages. Formatti
 Python syntax, license headers, source boundaries, and diff checks pass.
 
 Main integration through `1258e8cfcb` retains bounded per-file replay, durable
-construction checkpoints and damaged-artifact recovery. Text DF deltas apply
-once per completed file; checkpoint manifests describe exactly those totals.
+construction checkpoints and damaged-artifact recovery. Text DF checkpoints retain the base statistics and durable signed contribution
+runs for completed files. Finalization applies the combined delta once.
 Final version-3 publication reuses those completed manifests and adds paged
 routes and term contribution directories. Retained-artifact recovery streams
 compact routes one file at a time, validates independent descriptors and
@@ -2350,9 +2350,10 @@ descriptor and tree page. Cost therefore follows retained upload namespaces,
 while changed artifacts are checked by ordinary authenticated build reads and
 uploads. Proofs cap at 4,096 namespaces, 1 MiB serialized metadata and 64 pending
 roots; exceeding the caps retains full auditing. Cloud object stores without a
-provider retention guarantee currently retain full auditing through the same
-optional capability contract. Their future implementation must include durable
-delete/restore invalidation rather than infer retention from a warm cache.
+provider retention guarantee retain full auditing through the same optional
+capability contract. GCS buckets with a locked retention policy can supply
+provider-backed witnesses, as described below; ordinary mutable buckets and
+S3 version retention do not qualify.
 
 Regression coverage includes durable reopen, delta inheritance, uploads after
 inheritance but before sealing, deletion, restoration and corrupt certificate
@@ -2448,3 +2449,84 @@ and warm reverse cursors check cancellation before returning another row. All
 signed timestamp ordering. The production CLI builds. Formatting, Python syntax,
 module/product boundary audits (822 embedded and 2,027 Apache sources), and diff
 checks pass. No archive-scale throughput, RSS, or request-count claim is made.
+
+### Coalesced maintenance, shared dynamic planning and cloud retention
+
+Dense ordered refreshes filter the serving base once, then checkpoint changed
+files into the durable binary merge forest already used by initial construction.
+Finalization builds the serving trees once. Selective changes retain the existing
+copy-on-write path. When lightweight Parquet discovery has not loaded row counts,
+the strategy estimates changed rows from the retained index's per-file average.
+A restart preserves stable file slots and resumes from the filtered base and completed changed-file runs; it cannot admit a construction
+checkpoint as a serving index.
+
+Global text statistics use durable signed delta runs with at most one run per
+binary level. Each completed file checkpoints its manifest and those runs against
+the retained base; finalization combines the contributions once. Recovery audits
+and GC traverse both the base and pending runs. Final roots omit checkpoint-only
+fields. Small local batches release their scratch runs after durable upload,
+keeping temporary storage independent of archive size. Term-contribution directory
+construction uses the same bounded batching. Exhausting that optional directory's
+scratch budget disables the whole accelerator and retains exact search. Background
+reverse and directory builders bound each authenticated page rather than impose a
+cumulative query-sized I/O quota on an archive build. Query read admission remains
+bounded separately.
+
+Metadata publication walks sorted segment and physical-block spans linearly and
+streams mutation batches into durable last-write-wins runs. It applies selective
+changes in bounded COW batches or merges dense changes once. Both resident mutation
+storage and local scratch usage follow a batch, rather than the full inventory.
+The caller supplies the existing I/O context; publication creates no extra worker
+pool.
+
+SQL scan cursors explicitly negotiate whether they can consume a complete exact
+key stream. Plain scans retain bounded Bloom/domain filters without writing an
+unused exact spill stream; native index consumers can request exact spooling.
+Dynamic candidates share compatible typed prefix projections through a bounded,
+reference-counted cache. Planning deduplicates exact tuples before projection,
+stops counting candidates once their cost exceeds the scan or current winner,
+and caps probe enumeration even for absent keys. Only the selected candidate owns
+the execution cursor, and its shared projection is rewound before execution.
+Optional resource-admission failure retains the complete scan filter path.
+
+GCS locked bucket retention prevents deletion and replacement of current objects
+until their provider-reported retention expiration. The object-store capability
+checks that the policy is locked, enumerates the attempt namespace in bounded
+pages, and records its earliest expiration. Durable closure certificates bind
+that witness to the bucket, prefix, upload domain and attempt. Reopen and inherited
+closure checks validate the policy and expiration using the provider's HTTP Date,
+elapsed request time and a conservative margin. Missing or malformed evidence,
+expiration, mutable buckets, and unsupported providers decline the shortcut.
+S3 Object Lock protects versions and is deliberately insufficient for this
+current-name contract. No bucket policy is created or changed by Antfly. Ordinary
+payload authentication, publication authority, reader leases and GC rules remain
+required; provider retention may delay physical deletion. Certificates are bounded
+advisory metadata, and invalid certificates fall back to a complete closure audit.
+
+Provider contract: [GCS Bucket Lock](https://docs.cloud.google.com/storage/docs/bucket-lock)
+and [object retention expiration](https://docs.cloud.google.com/storage/docs/json_api/v1/objects).
+These changes are covered by regression tests for interrupted dense refresh,
+signed contribution replay, bounded scratch reuse, optional accelerator fallback,
+compatible projection reuse, linear span routing, and provider-proof reopen,
+inheritance and expiry. Archive-scale latency, RSS and request-count measurements
+remain required before claiming a quantified speedup.
+
+Qualification caveat: real Parquet/Iceberg HTTP E2Es were attempted, but the
+fixture rejected startup because the local volume did not meet its approximately
+16 GiB free-space floor. No disk-safety setting was disabled. The final production CLI builds after reclaiming completed test link inputs.
+Earlier combined builds exhausted local disk space; native integration was
+therefore qualified separately. These environment failures are separate from
+native real-file integration and provider-contract regression results. Live GCS retention behavior
+still requires credentialed provider integration; local coverage uses the GCS
+transport contract and a retained-provider artifact-store fixture.
+
+Final qualification on Zig 0.17.0 Debug: all 359 lake integration checks pass
+(142 shared and 217 API), plus 64 focused checks with one optional benchmark
+skipped. No allocator leaks are reported. The object-store suite passes 83 checks
+with two credentialed provider checks skipped, including the GCS retention
+transport contract. The final production CLI, both native module-boundary audits,
+the Apache product boundary across 2,028 sources, changed-source formatting and
+license headers, and diff checks pass. The interrupted dense refresh regression
+also passes in isolation. The ten selected HTTP Parquet/Iceberg E2Es could not
+start under the unchanged disk-headroom safeguard; no successful E2E rerun or
+archive-scale performance measurement is claimed for this qualification.

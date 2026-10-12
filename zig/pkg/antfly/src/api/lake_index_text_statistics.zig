@@ -202,6 +202,7 @@ pub const Builder = struct {
     selected: Strategy = .auto,
     point_seeks: u64 = 0,
     distinct_changes: u64 = 0,
+    durable: ?@import("lake_index_delta_runs.zig").Forest = null,
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         return .{ .a = a, .sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
@@ -219,33 +220,80 @@ pub const Builder = struct {
         const summary = try Summary.decode(record.value);
         try self.sort.add(.{ .keys = &.{.{ .value = .{ .string = record.key }, .sql_null = false }}, .values = &.{.{ .value = .{ .integer = sign * @as(i64, summary.frequency) }, .sql_null = false }}, .ordinal = self.ordinal });
         self.ordinal += 1;
+        if (self.durable != null and (self.sort.total >= 16384 or self.sort.manager.live_bytes >= 32 * 1024 * 1024)) try self.flush();
     }
-    pub fn finish(self: *Builder, store: tree.Store, prior: ?Ref) !?Ref {
+    const Deltas = struct {
+        a: A,
+        sort: *local.sql_spill.Sort,
+        cursor: ?*tree.Cursor = null,
+        current: ?local.sql_operators.Row = null,
+        scratch: std.heap.ArenaAllocator,
+        key: ?[]u8 = null,
+        delta: i64 = 0,
+        pub fn next(source: *@This()) !?tree.Cursor.Record {
+            if (source.cursor) |cursor| {
+                const record = try cursor.next() orelse return null;
+                if (record.value.len != 8) return error.InvalidNativeLakeTextStatistics;
+                source.delta = std.mem.readInt(i64, record.value[0..8], .big);
+                return .{ .key = record.key, .value = "" };
+            }
+            if (source.key) |key| source.a.free(key);
+            source.key = null;
+            if (source.current == null) source.current = try source.sort.next(source.scratch.allocator());
+            const first = source.current orelse return null;
+            source.key = try source.a.dupe(u8, first.keys[0].value.string);
+            source.delta = 0;
+            while (source.current) |row| {
+                if (!std.mem.eql(u8, source.key.?, row.keys[0].value.string)) break;
+                source.delta = std.math.add(i64, source.delta, row.values[0].value.integer) catch return error.InvalidNativeLakeTextStatistics;
+                _ = source.scratch.reset(.retain_capacity);
+                source.current = try source.sort.next(source.scratch.allocator());
+            }
+            return .{ .key = source.key.?, .value = "" };
+        }
+    };
+    /// Spill only one bounded batch locally, then retain immutable remote runs.
+    pub fn enableDurable(self: *Builder, store: tree.Store) void {
+        self.durable = .{ .a = self.a, .store = store, .policy = .sum };
+        self.sort.shared_runs = true;
+    }
+    pub fn flush(self: *Builder) !void {
+        if (self.sort.total == 0) return;
+        const forest = if (self.durable) |*value| value else return error.InvalidNativeLakeDeltaRun;
         try self.sort.finish();
-        const Deltas = struct {
-            a: A,
-            sort: *local.sql_spill.Sort,
-            current: ?local.sql_operators.Row = null,
-            scratch: std.heap.ArenaAllocator,
-            key: ?[]u8 = null,
-            delta: i64 = 0,
+        var deltas: Deltas = .{ .a = self.a, .sort = &self.sort, .scratch = .init(self.a) };
+        defer deltas.scratch.deinit();
+        defer if (deltas.key) |key| self.a.free(key);
+        const Source = struct {
+            deltas: *Deltas,
+            value: [8]u8 = undefined,
             pub fn next(source: *@This()) !?tree.Cursor.Record {
-                if (source.key) |key| source.a.free(key);
-                source.key = null;
-                if (source.current == null) source.current = try source.sort.next(source.scratch.allocator());
-                const first = source.current orelse return null;
-                source.key = try source.a.dupe(u8, first.keys[0].value.string);
-                source.delta = 0;
-                while (source.current) |row| {
-                    if (!std.mem.eql(u8, source.key.?, row.keys[0].value.string)) break;
-                    source.delta = std.math.add(i64, source.delta, row.values[0].value.integer) catch return error.InvalidNativeLakeTextStatistics;
-                    _ = source.scratch.reset(.retain_capacity);
-                    source.current = try source.sort.next(source.scratch.allocator());
+                while (try source.deltas.next()) |record| {
+                    if (source.deltas.delta == 0) continue;
+                    std.mem.writeInt(i64, &source.value, source.deltas.delta, .big);
+                    return .{ .key = record.key, .value = &source.value };
                 }
-                return .{ .key = source.key.?, .value = "" };
+                return null;
             }
         };
-        var deltas: Deltas = .{ .a = self.a, .sort = &self.sort, .scratch = std.heap.ArenaAllocator.init(self.a) };
+        var source: Source = .{ .deltas = &deltas };
+        try forest.add(&source);
+        const manager = self.sort.manager;
+        const memory = self.sort.memory_bytes;
+        self.sort.deinit();
+        self.sort = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, memory);
+        self.sort.shared_runs = true;
+    }
+    pub fn finish(self: *Builder, store: tree.Store, prior: ?Ref) !?Ref {
+        var delta_cursor: ?tree.Cursor = null;
+        defer if (delta_cursor) |*value| value.deinit();
+        var run: ?tree.Ref = null;
+        if (self.durable) |*forest| {
+            try self.flush();
+            run = try forest.finish();
+            delta_cursor = try tree.Cursor.init(self.a, store, run, "", null);
+        } else try self.sort.finish();
+        var deltas: Deltas = .{ .a = self.a, .sort = &self.sort, .cursor = if (delta_cursor) |*value| value else null, .scratch = std.heap.ArenaAllocator.init(self.a) };
         defer deltas.scratch.deinit();
         defer if (deltas.key) |key| self.a.free(key);
         if (prior == null) {
@@ -273,7 +321,10 @@ pub const Builder = struct {
         if (self.distinct_changes == 0) return prior;
         deltas.current = null;
         _ = deltas.scratch.reset(.free_all);
-        try self.sort.rewind();
+        if (delta_cursor) |*value| {
+            value.deinit();
+            value.* = try tree.Cursor.init(self.a, store, run, "", null);
+        } else try self.sort.rewind();
         var pending = try deltas.next();
         self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(4096, prior.?.records / 4)) .merge else .cow) else self.strategy;
         if (self.selected == .merge) {
@@ -1272,4 +1323,48 @@ test "external lake text statistics broad ranges fold authenticated interior env
     try std.testing.expect(std.math.isInf(unknown.tf_upper));
     reader.read.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, Reader.rangeSummary(&reader, a, 0, 5000, "body", "common", 10, .{}));
+}
+
+test "external lake text statistics durable deltas coalesce files and resume signed contributions" {
+    const a = std.testing.allocator;
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check, .max_bytes = 64 * 1024 };
+    defer manager.deinit();
+    var base = Builder.init(a, &manager);
+    defer base.deinit();
+    var buffer: [Summary.max_bytes]u8 = undefined;
+    const summary = (Summary{ .frequency = 3, .max_frequency = 3, .min_norm = 2 }).encode(&buffer);
+    try base.addRecord(.{ .key = "common", .value = summary }, 1);
+    const prior = try base.finish(memory.store(), null);
+    var deltas = Builder.init(a, &manager);
+    defer deltas.deinit();
+    deltas.enableDurable(memory.store());
+    // A deleted file and many replacements of common vocabulary accumulate in
+    // remote runs; the serving base is untouched until one final application.
+    try deltas.addRecord(.{ .key = "common", .value = summary }, -1);
+    try deltas.flush();
+    for (0..70) |_| {
+        try deltas.addRecord(.{ .key = "common", .value = summary }, 1);
+        try deltas.flush();
+    }
+    const checkpoint = try deltas.durable.?.snapshot(a);
+    defer a.free(checkpoint);
+    try std.testing.expect(checkpoint.len <= 7);
+    var resumed = Builder.init(a, &manager);
+    defer resumed.deinit();
+    resumed.enableDurable(memory.store());
+    try resumed.durable.?.restore(checkpoint);
+    const result = try resumed.finish(memory.store(), prior);
+    var cursor = try tree.Cursor.init(a, memory.store(), result, "", null);
+    defer cursor.deinit();
+    try std.testing.expectEqual(@as(u64, 210), try decodeFrequency((try cursor.next()).?.value));
+    try std.testing.expect((try cursor.next()) == null);
+    var old = try tree.Cursor.init(a, memory.store(), prior, "", null);
+    defer old.deinit();
+    try std.testing.expectEqual(@as(u64, 3), try decodeFrequency((try old.next()).?.value));
 }

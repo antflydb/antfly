@@ -257,6 +257,38 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         if (entries.items.len == 0) continue;
         for (entries.items) |*entry| entry.sort.memory_bytes = sort_workspace_bytes / entries.items.len;
+        for (entries.items) |*entry| {
+            const prior = entry.delta.previous orelse continue;
+            if (entry.initial_build) continue;
+            var changed_files: usize = 0;
+            var changed_rows: u64 = 0;
+            var unknown_files: u64 = 0;
+            for (entry.changed, source.inventory.files) |changed, file| if (changed) {
+                changed_files += 1;
+                changed_rows +|= file.row_count;
+                if (file.row_count == 0) unknown_files += 1;
+            };
+            const prior_rows = if (prior.page) |page| page.records else 0;
+            // Lightweight Parquet discovery can leave row counts unknown until
+            // decode. Use the retained index's average instead of treating those
+            // files as zero-cost changes and rebuilding once per file.
+            changed_rows +|= unknown_files *| @max(1, prior_rows / @max(1, prior.files.len));
+            if (!bulkRefresh(changed_files, changed_rows, prior_rows)) continue;
+            // Retire changed coordinates once, then checkpoint fresh files in
+            // the same bounded merge forest used by initial builds. Avoid N
+            // complete forward/reverse/tie/predicate rebuilds for a dense refresh.
+            var base_sort = spill.Sort.init(a, &manager, &orders, entry.sort.memory_bytes);
+            defer base_sort.deinit();
+            base_sort.encoded_bytes = true;
+            base_sort.shared_runs = true;
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .run_only = true, .previous = prior, .keep = entry.delta.keep, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            entry.published = ref;
+            try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
+            entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+            entry.initial_build = true;
+            @memset(entry.retained, true);
+            entry.delta.keep = entry.retained;
+        }
         for (entries.items) |*entry| if (entry.delta.previous == null) {
             entry.reverse = try ordered.ReverseBuilder.create(a, store, cancellation);
         };
@@ -396,6 +428,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
     }
     return result.toOwnedSlice(out);
+}
+fn bulkRefresh(changed_files: usize, changed_rows: u64, previous_rows: u64) bool {
+    // Keep selective copy-on-write updates for tiny deltas. Dense multi-file
+    // refreshes amortize the single base pass and final assembly.
+    return changed_files > 1 and changed_rows >= @max(1, previous_rows / 4);
 }
 fn claimSlot(a: A, names: *std.ArrayList([]const u8), hashes: *std.ArrayList([32]u8), vacant: *std.ArrayList(u32), file: []const u8, digest: [32]u8) !u32 {
     if (vacant.pop()) |slot| {
@@ -547,4 +584,91 @@ pub fn coverColumns(a: A, definition: local.storage_relational_index.RelationalI
         if (!exists) try columns.append(a, column);
     }
     return columns.items;
+}
+
+test "external lake dense ordered refresh checkpoints durable deltas and resumes without stale coordinates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-dense-refresh");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const old_bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ -4, 9, 1, 5 }, .field_id = 1 }});
+    defer a.free(old_bytes);
+    const new_bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 100, 100, 101, 102 }, .field_id = 1 }});
+    defer a.free(new_bytes);
+    for ([_][]const u8{ "a.parquet", "b.parquet", "c.parquet" }) |name| {
+        var uploaded = try client.putObject("antfly", name, old_bytes, .{});
+        uploaded.deinit(a);
+    }
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"relational_indexes":[{{"name":"amount_idx","keys":[{{"column":"amount"}}]}}],"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"integer"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    var original = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer original.deinit();
+    const artifact_path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(artifact_path);
+    var artifacts = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer artifacts.deinit();
+    var store = artifacts.artifactStore();
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(1) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &original, .context = .{ .io = std.testing.io } };
+    const prior = try build(a, ca, table, &original, &store, &provider, .none, &.{});
+    for ([_][]const u8{ "a.parquet", "b.parquet" }) |name| {
+        var uploaded = try client.putObject("antfly", name, new_bytes, .{});
+        uploaded.deinit(a);
+    }
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    const Progress = struct {
+        store: *stores.ArtifactStore,
+        a: A,
+        saved: ?Declared = null,
+        count: usize = 0,
+        fn save(raw: *anyopaque, declaration: Declared) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const root = try ordered.loadRoot(self.a, self.store.*, declaration.artifact, .none, null);
+            try std.testing.expect(root.building);
+            // Progress arguments belong to the active build's scratch arena.
+            // A simulated durable checkpoint must own its metadata after the
+            // injected error unwinds that build.
+            const bytes = try std.json.Stringify.valueAlloc(self.a, declaration, .{});
+            self.saved = try std.json.parseFromSliceLeaky(Declared, self.a, bytes, .{ .allocate = .alloc_always });
+            self.count += 1;
+            if (self.count == 2) return error.InjectedCheckpointStop;
+        }
+    };
+    var progress: Progress = .{ .store = &store, .a = ca };
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(2) };
+    provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .progress = .{ .ptr = &progress, .save = Progress.save } };
+    try std.testing.expectError(error.InjectedCheckpointStop, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, prior));
+    try std.testing.expectEqual(@as(usize, 2), progress.count);
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(3) };
+    provider.progress = null;
+    const resumed = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, &.{progress.saved.?});
+    const root = try ordered.loadRoot(ca, store, resumed[0].artifact, .none, null);
+    try std.testing.expect(!root.building and root.build_runs.len == 0);
+    try std.testing.expectEqual(@as(u64, 12), root.page.?.records);
+    try std.testing.expectEqual(root.page.?.records, root.reverse.?.records);
+    var reader: ordered.Reader = undefined;
+    try reader.init(a, &store, root, root.fingerprint, "", null, .none);
+    defer reader.deinit();
+    var old_count: usize = 0;
+    var new_count: usize = 0;
+    for (try reader.nextEntries(ca, 100)) |entry| {
+        const cover = entry.cover.?;
+        const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
+        const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+        if ((try block.cell(cover.row, 0)).value.integer < 100) old_count += 1 else new_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), old_count);
+    try std.testing.expectEqual(@as(usize, 8), new_count);
 }

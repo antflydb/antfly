@@ -255,6 +255,8 @@ pub const GetResult = struct {
 };
 
 pub const ListEntry = struct {
+    /// Provider-computed earliest deletion/replacement time, not user metadata.
+    retention_until_ms: ?u64 = null,
     key: []u8,
     etag: ?[]u8 = null,
     size: u64,

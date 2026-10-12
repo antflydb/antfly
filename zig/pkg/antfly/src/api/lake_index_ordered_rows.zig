@@ -135,7 +135,7 @@ pub const ReverseBuilder = struct {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         const self = try a.create(ReverseBuilder);
         self.* = .{ .a = a, .pages = undefined, .builder = undefined };
-        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes };
+        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
         self.builder = .{ .alloc = a, .store = self.pages.store() };
         return self;
     }
@@ -1494,4 +1494,33 @@ test "external lake ordered copy strategy distinguishes clustered from scattered
         }
         try std.testing.expectEqual(@as(usize, 20), count);
     }
+}
+
+test "external lake reverse construction streams beyond cumulative write admission" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("reverse-streaming-admission");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(2) };
+    const builder = try ReverseBuilder.create(a, &store, .none);
+    defer builder.deinit();
+    builder.writes = 64 * 1024;
+    for (0..6000) |row| {
+        var key: [24]u8 = undefined;
+        std.mem.writeInt(u64, key[0..8], 6000 - row, .big);
+        @memcpy(key[8..24], &coordinate(0, .{ .source_id = "s", .snapshot_id = "v", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = row }));
+        try builder.add(&key);
+    }
+    const root = (try builder.finish()).?;
+    try std.testing.expectEqual(@as(u64, 6000), root.records);
+    var cursor = try tree.Cursor.init(a, builder.pages.store(), root, "", null);
+    defer cursor.deinit();
+    var row: u64 = 0;
+    while (try cursor.next()) |record| : (row += 1) {
+        try std.testing.expectEqual(row, std.mem.readInt(u64, record.key[8..16], .big));
+        try std.testing.expectEqual(6000 - row, std.mem.readInt(u64, record.key[16..24], .big));
+    }
+    try std.testing.expectEqual(@as(u64, 6000), row);
 }

@@ -198,7 +198,25 @@ pub const Root = struct {
     admission_version: u8 = 0,
     statistics_version: u8 = 0,
     term_statistics: ?statistics.Ref = null,
+    /// Non-serving resumable checkpoint: signed DF runs relative to the base.
+    /// Final publication folds these once and never exposes pending deltas.
+    statistics_deltas: []const @import("lake_index_delta_runs.zig").Run = &.{},
     term_directory: term_directory.Roots = .{},
+    pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Root).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "statistics_deltas")) {
+                if (self.statistics_deltas.len != 0) {
+                    try stream.objectField(field);
+                    try stream.write(@field(self, field));
+                }
+            } else {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
     pub fn validate(self: Root) !void {
         return self.validateAlloc(std.heap.page_allocator);
     }
@@ -215,6 +233,15 @@ pub const Root = struct {
         if (self.file_count > 16384) return error.InvalidNativeLakeTextCorpus;
         if (self.inventory_version < 1 or self.inventory_version > 3) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
+        if (self.statistics_deltas.len != 0) {
+            if (self.statistics_version != 1 or self.inventory_version != 1 or self.statistics_deltas.len > 32) return error.InvalidNativeLakeTextCorpus;
+            var levels: u32 = 0;
+            for (self.statistics_deltas) |run| {
+                if (run.level >= 32 or levels & (@as(u32, 1) << @as(u5, @intCast(run.level))) != 0) return error.InvalidNativeLakeTextCorpus;
+                levels |= @as(u32, 1) << @as(u5, @intCast(run.level));
+                try run.page.validate();
+            }
+        }
         if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
         if ((self.term_directory.branches == null) != (self.term_directory.leaves == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.term_directory.branches) |ref| try ref.validate();
@@ -300,6 +327,7 @@ pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached
 pub fn admitInventoryBounded(a: A, scratch_backing: A, directory_value: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
     try cached.context.ensureActive();
     try cancellation.check();
+    if (directory_value.statistics_deltas.len != 0) return error.InvalidNativeLakeTextCorpus;
     if (directory_value.inventory_version == 3 and directory_value.file_groups.len == 0) return admitServingInventory(a, scratch_backing, directory_value, store, cached, cancellation);
     const directory = try text_directory.withManifests(a, directory_value, store, cached, cancellation);
     if (directory.inventory_version >= 2 and directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, false), .manifests = &.{} };
@@ -544,6 +572,7 @@ pub const CachedSegments = struct {
     }
 };
 pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation, cache: ?artifacts.CachedRead, loader: ?SegmentLoader) !local.index.IndexWriter {
+    if (root.statistics_deltas.len != 0) return error.InvalidNativeLakeTextCorpus;
     try root.validate();
     var writer = try local.index.IndexWriter.init(a);
     errdefer writer.deinit();
@@ -674,14 +703,25 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         for (records) |record| if (plan.by_id.get(record.file.id)) |index| {
             file_manifests[index] = record.manifest;
         };
+        var df_checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var df_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &df_checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer df_manager.deinit();
+        var df_reads: u64 = 0;
+        var df_writes: u64 = 0;
+        const df_scope = store.upload_scope.?;
+        var df_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = df_scope.domain, .attempt = df_scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &df_reads, .remaining_write_bytes = &df_writes, .streaming = true };
+        var df = statistics.Builder.init(a, &df_manager);
+        defer df.deinit();
+        df.enableDurable(df_pages.store());
+        if (seed) |old| try df.durable.?.restore(old.statistics_deltas);
         var global_statistics: ?statistics.Ref = if (seed) |old| old.term_statistics else null;
-        // Retain each old file contribution until its replacement is complete.
-        // A checkpoint's DF root therefore describes exactly its manifests.
+        // Checkpoints retain the base plus signed durable contributions. Fold
+        // global DF only once, including when recovering a partial refresh.
         if (seed) |old| for (old.file_groups) |group| {
             if (plan.by_id.get(group.file.id)) |index| {
                 file_manifests[index] = try publishFileManifest(a, ca, store, group, cancellation);
             } else {
-                global_statistics = try updateStatistics(a, store, provider, group, null, global_statistics, cancellation);
+                for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
         };
         for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
@@ -769,17 +809,20 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(ca, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
             file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
-            global_statistics = updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation) catch |err| return buildFailure(err, "file_statistics", file_ordinal, segments.items.len);
-            // This non-serving checkpoint has internally consistent file/DF
-            // roots, including retained old files awaiting replacement.
+            if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
+            for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
+            try df.flush();
+            // Each file remains resumable without rewriting the global tree.
+            // GC and recovery retain/authenticate both base and delta pages.
             if (provider.progress != null) {
                 var checkpoint_arena = std.heap.ArenaAllocator.init(a);
                 defer checkpoint_arena.deinit();
                 const manifests = try presentManifests(checkpoint_arena.allocator(), file_manifests);
-                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
+                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
                 try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
             }
         }
+        global_statistics = try df.finish(df_pages.store(), global_statistics);
         // Global DF touches only changed file contributions. The spill manager
         // bounds disk independently of the sort's 4 MiB resident working set.
         var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
@@ -792,7 +835,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var stats_reads: u64 = 512 * 1024 * 1024;
         var stats_writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope.?;
-        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
+        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
+        directory_builder.enableDurable(stats_pages.store());
         // A disabled optional directory has no complete base to update. Paged
         // seeds hold only changed maintenance groups, so stream unchanged
         // contributions from the canonical serving directory when bootstrapping.
@@ -852,7 +896,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const ref = try page_upload.putWithCancellation(page, cancellation);
             manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         }
-        const directories = try text_directory.publish(a, store, current_groups, manifests, if (paged_seed) seed.?.file_groups else &.{}, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, cancellation);
+        const directories = try text_directory.publish(a, store, current_groups, manifests, if (paged_seed) seed.?.file_groups else &.{}, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
         const root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .collection = if (paged_seed) try collectionDelta(ca, seed.?.collection.?, seed.?.file_groups, current_groups) else try collectionTotals(ca, current_groups) };
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
@@ -1033,6 +1077,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     defer validator.witnesses.deinit(a);
     try validator.retainArtifact(root_id);
     try validator.pages(root.term_statistics);
+    for (root.statistics_deltas) |run| try validator.pages(run.page);
     try validator.pages(root.term_directory.leaves);
     try validator.pages(root.term_directory.branches);
     if (root.inventory_version == 3) {
@@ -1060,20 +1105,6 @@ fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts
     var refs: std.ArrayList(artifacts.ChunkRef) = .empty;
     for (slots) |slot| if (slot) |ref| try refs.append(a, ref);
     return refs.toOwnedSlice(a);
-}
-fn updateStatistics(a: A, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, old: ?FileGroup, next: ?FileGroup, previous: ?statistics.Ref, cancellation: Cancellation) !?statistics.Ref {
-    var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-    defer manager.deinit();
-    var builder = statistics.Builder.init(a, &manager);
-    defer builder.deinit();
-    var reads: u64 = 512 * 1024 * 1024;
-    var writes: u64 = 512 * 1024 * 1024;
-    const scope = store.upload_scope.?;
-    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-    if (old) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, -1);
-    if (next) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, 1);
-    return builder.finish(pages.store(), previous);
 }
 fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
     const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
