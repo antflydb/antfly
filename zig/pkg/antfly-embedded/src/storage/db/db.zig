@@ -39636,7 +39636,7 @@ pub const DB = struct {
         // before resolving filters in the member index's document-number space.
         if (text_query == .match_all and primaryParentMatchAllEligible(req)) {
             if (self.core.textIndexEntry(req.index_name)) |entry| {
-                if (entry.chunk_name == null and entry.source_artifact_names.len == 0 and
+                if (entry.coversPrimaryDocuments() and
                     try self.core.textIndexIsChunkBacked(alloc, entry.config.name))
                 {
                     var executor = self.matchAllExecutor();
@@ -89408,6 +89408,9 @@ test "db default full text index searches template chunk text when chunker full 
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
     });
 
+    try db.addIndex(.{ .name = "selected_missing", .kind = .full_text, .config_json = "{\"field\":\"missing_projection_field\"}" });
+    try db.addIndex(.{ .name = "selected_body", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+
     var empty_page = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .limit = 1 });
     defer empty_page.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty_page.hits.len);
@@ -89431,6 +89434,19 @@ test "db default full text index searches template chunk text when chunker full 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expect(try db.core.textIndexIsChunkBacked(alloc, "full_text_index_v0"));
+    const population_order = [_]types.SortField{.{ .field = "_id" }};
+    for ([_][]const u8{ "full_text_index_v0", "selected_missing", "selected_body" }, [_]u32{ 2, 0, 1 }) |name, expected| {
+        for ([_]bool{ false, true }) |sorted| {
+            var count = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 0, .order_by = if (sorted) &population_order else &.{} });
+            defer count.deinit();
+            try std.testing.expectEqual(expected, count.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, count.total_hits_relation);
+            var page = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 10, .order_by = if (sorted) &population_order else &.{} });
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, expected), page.hits.len);
+            if (expected == 1) try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+        }
+    }
     var members = try db.search(alloc, .{
         .full_text = .{ .match_all = {} },
         .return_mode = .member,
@@ -134650,4 +134666,47 @@ test "db primary scan retains historical identity visibility (#1095)" {
     }
     try std.testing.expectEqual(@as(usize, 0), seen);
     try std.testing.expectEqual(@as(usize, 0), examined);
+}
+
+test "db default text index preserves empty-only primary population after reopen (#1095)" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("empty-text-population");
+    defer directory.cleanup();
+    const order = [_]types.SortField{.{ .field = "_id" }};
+    for (0..2) |pass| {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        if (pass == 0) {
+            try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{ .writes = &.{.{ .key = "empty", .value = "{}" }}, .sync_level = .full_index });
+            try db.addIndex(.{ .name = "backfilled", .kind = .full_text, .config_json = "{}" });
+        }
+        for ([_][]const u8{ "text", "backfilled" }) |name| {
+            for ([_]bool{ false, true }) |sorted| {
+                var count = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 0, .order_by = if (sorted) &order else &.{} });
+                defer count.deinit();
+                try std.testing.expectEqual(@as(u32, 1), count.total_hits);
+                var page = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 1, .order_by = if (sorted) &order else &.{} });
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+                try std.testing.expectEqualStrings("empty", page.hits[0].id);
+            }
+        }
+        if (pass == 1) {
+            for ([_][]const u8{ "{\"body\":\"new text\"}", "{}" }) |value| {
+                try db.batch(.{ .writes = &.{.{ .key = "empty", .value = value }}, .sync_level = .full_index });
+                for ([_][]const u8{ "text", "backfilled" }) |name| {
+                    var count = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 0 });
+                    defer count.deinit();
+                    try std.testing.expectEqual(@as(u32, 1), count.total_hits);
+                }
+            }
+            try db.batch(.{ .deletes = &.{"empty"}, .sync_level = .full_index });
+            for ([_][]const u8{ "text", "backfilled" }) |name| {
+                var count = try db.search(alloc, .{ .index_name = name, .full_text = .{ .match_all = {} }, .limit = 0 });
+                defer count.deinit();
+                try std.testing.expectEqual(@as(u32, 0), count.total_hits);
+            }
+        }
+    }
 }

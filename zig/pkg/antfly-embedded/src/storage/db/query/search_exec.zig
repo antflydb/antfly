@@ -18426,10 +18426,15 @@ const MatchAllCandidateCollectState = struct {
 
         errdefer candidate.deinit(self.alloc);
         if (self.consumer) |consumer| {
-            const seen_key = try self.alloc.dupe(u8, candidate.id);
-            errdefer self.alloc.free(seen_key);
-            try self.seen.put(self.alloc, seen_key, {});
-            try self.seen_key_storage.append(self.alloc, seen_key);
+            {
+                const seen_key = try self.alloc.dupe(u8, candidate.id);
+                errdefer self.alloc.free(seen_key);
+                try self.seen.put(self.alloc, seen_key, {});
+                try self.seen_key_storage.append(self.alloc, seen_key);
+            }
+            // Storage owns the dedup key before the consumer can fail. Its
+            // outer cleanup frees it; the candidate remains owned here until
+            // the consumer succeeds.
 
             try consumer(self.consumer_ctx, candidate);
             candidate.id = @constCast(&[_]u8{});
@@ -20834,6 +20839,45 @@ fn testStreamMatchAllCandidatesCallback(
     }
     _ = req;
     return .{ .accepted_count = accepted, .stopped_early = false };
+}
+
+// Exercise production candidate ownership and deduplication with a small
+// deterministic identity source; the ordinary mock stream skips that layer.
+fn testStreamPrimaryMatchAllCandidatesCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: MatchAllCandidateConsumer,
+) anyerror!MatchAllCandidateStreamStats {
+    const Harness = struct {
+        fn scan(raw: ?*anyopaque, _: Allocator, _: MatchAllCandidateCollectOptions, target: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids) |id| if (try visitor(target, id) == .stop) return;
+        }
+        fn range(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) ![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+        fn expired(_: ?*anyopaque, _: Allocator, _: []const u8) !bool {
+            return false;
+        }
+        fn ordinal(raw: ?*anyopaque, _: Allocator, id: []const u8, _: ?u64) !?doc_set.DocOrdinal {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids, 0..) |key, i| if (std.mem.eql(u8, id, key)) return if (i < source.ordinals.len) source.ordinals[i] else null;
+            return null;
+        }
+    };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, req, .{
+        .ctx = ctx,
+        .scan_ids = Harness.scan,
+        .scan_store_range = Harness.range,
+        .is_expired_key = Harness.expired,
+        .lookup_doc_ordinal = Harness.ordinal,
+    }, options, consumer_ctx, consumer);
+    const source: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx.?));
+    if (source.stream_accepted_count) |count| count.* += stats.accepted_count;
+    return stats;
 }
 
 fn testMatchAllLoadProjectedCallback(
@@ -29719,7 +29763,7 @@ test "bounded primary match_all stops after the page and owns allocation failure
                 };
                 var executor = testMatchAllExecutor(&ctx);
                 executor.bounded_unordered_page = true;
-                executor.collect_candidates_stream = testStreamMatchAllCandidatesCallback;
+                executor.collect_candidates_stream = testStreamPrimaryMatchAllCandidatesCallback;
                 var result = try searchMatchAll(alloc, .{
                     .limit = 1,
                     .offset = 1,
@@ -32609,6 +32653,16 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "primary match_all stream retains ownership on consumer error (#1095)" {
+    var source = TestMatchAllCtx{ .ids = &.{"doc:a"}, .ordinals = &.{1} };
+    const Consumer = struct {
+        fn fail(_: ?*anyopaque, _: MatchAllCandidate) !void {
+            return error.ConsumerFailure;
+        }
+    };
+    try std.testing.expectError(error.ConsumerFailure, testStreamPrimaryMatchAllCandidatesCallback(&source, std.testing.allocator, .{}, .{}, null, Consumer.fail));
 }
 
 test "external lake ranked delivery shares exact snapshot authority until its final owner closes" {
