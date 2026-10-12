@@ -2,7 +2,7 @@
 
 Status: implemented behind a gate; the expanded asynchronous-artifact protocol
 is **not advertised**. Installed mechanisms must not be treated as feature
-activation. Online merge (see [SQL extraction](sql/extraction.md#distributed-online-merge))
+activation. Online merge (see [Distributed online merge](#distributed-online-merge))
 uses only the activated subset: ordered catalogs and row-derived fulltext plus
 direct-field dense/sparse transfer. The dated implementation narrative is in
 [the activation-gate log](ordered-artifacts/history/activation-gate-log.md).
@@ -118,6 +118,63 @@ Completion:
 - Vector ingress tags authored versus generated origin; current receiver-local
   authored acceptance closes the matching provider requirement without
   inference. Raw imported origin flags grant no acceptance.
+
+## Distributed online merge
+
+Online merge admission carries an ordered artifact catalog in the same
+data-Raft command as donor admission or the receiver's initial acceptance; there
+is no separate unfenced catalog-seal window. Metadata pins immutable exact
+bindings for both owners; native apply validates namespace, prior catalog epoch,
+source/receiver scope, integrity catalog and topology before reconciling local
+materialization. Data protocol v14 and metadata protocol v20 gate the complete
+ordered artifact decoder, including typed-vector transfer, before even an empty
+first page is admitted. Eligible document owners automatically support
+row-derived fulltext and direct-field dense/sparse indexes; graph, generated
+vectors, enrichment and resolver tails remain explicitly ineligible.
+
+All ordered eligible owners capture document-owned base embeddings, including
+historical values without an active index and fulltext-only tables. Snapshot
+objects preserve exact base-artifact bytes; checksum-bound, restartable chunks
+carry large dense/sparse values. Retained vector effects and their Raft marker
+commit together; prepared transactions reserve artifact bytes before commit.
+Receiver application records positive and deleted vector effects in the derived
+replay journal. Direct-field repair reads primary rows and same-snapshot
+artifact fallbacks, excluding artifacts whose document no longer exists.
+
+Sparse replacement preserves stable document ordinals using monotone
+incarnations and point-addressable immutable posting/docmap sidecars; queries
+filter stale postings before scoring, and compaction reserves its working set
+before cloning. Native checkpoint capture waits for in-flight immutable flush
+publication before certifying the source cut.
+
+Each binding has an exact physical catalog digest and a canonical
+logical-definition digest. Compatibility ignores insertion order, absent versus
+serialized-empty catalogs, JSON key order and owner-local coverage generations;
+configuration differences reject admission. Each owner retains its own ordered
+generation, so a healthy receiver does not rebuild merely because the donor
+assigned different generations.
+
+Replica-local drift does not determine the replicated decision. After semantic
+preflight, native apply persists an exact reconciliation intent and retries
+bounded work until the intended catalog is physically ready. The intent fences
+unrelated schema, artifact, topology and row-policy publication; private
+reconciliation contexts permit only monotonic changes toward it. Obsolete
+resolver artifacts use a durable, restartable 128-key cleanup cursor. Final
+admission, ordered authority, applied receipt and intent/cursor removal commit
+atomically. Failed or repair-unavailable indexes and outstanding cleanup cannot
+certify readiness. Portable export, backup capture and restore reject a pending
+intent; catalog-preview changes before cutover durably cancel the attempt.
+
+Online merge runs through the existing merge workflow; there is no separate
+public online-merge command. `antfly metadata --online-merge-enabled false`
+(default `true`; `ServerConfig.online_merge_enabled`) stops new online merges
+on that metadata process while keeping the recovery driver, so admitted merges
+can finish or durably cancel and release their fences. The adapter requires
+the compiled native bundle, non-serverless mode and internal service
+authentication; unsupported deployments keep the guarded ordinary workflow.
+
+Open: a repeated full mounted fault matrix (one mounted fault case passes), and
+compaction/selective-query performance comparison for sparse replacement.
 
 ## Checks
 

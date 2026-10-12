@@ -9,7 +9,7 @@ is a source of test cases to port selectively, not code to copy. Current
 original-case dispositions live in [the parity inventory](parity-inventory.md);
 full native PostgreSQL regex parity is a separate required workstream in
 [the regex parity design](regex-parity.md). Asynchronous-artifact transfer,
-which online merge and TRUNCATE depend on, is specified in
+which TRUNCATE depends on, and distributed online merge are specified in
 [ordered artifact publication](../ordered-artifacts.md).
 
 Dated implementation logs, per-case evidence prose, validation runs and local
@@ -629,52 +629,7 @@ trust-on-first-use.
 
 ## Distributed online merge
 
-Online merge admission carries an ordered artifact catalog in the same
-data-Raft command as donor admission or the receiver's initial acceptance; there
-is no separate unfenced catalog-seal window. Metadata pins immutable exact
-bindings for both owners; native apply validates namespace, prior catalog epoch,
-source/receiver scope, integrity catalog and topology before reconciling local
-materialization. Data protocol v14 and metadata protocol v20 gate the complete
-ordered artifact decoder, including typed-vector transfer, before even an empty
-first page is admitted. Eligible document owners automatically support
-row-derived fulltext and direct-field dense/sparse indexes; graph, generated
-vectors, enrichment and resolver tails remain explicitly ineligible.
-
-All ordered eligible owners capture document-owned base embeddings, including
-historical values without an active index and fulltext-only tables. Snapshot
-objects preserve exact base-artifact bytes; checksum-bound, restartable chunks
-carry large dense/sparse values. Retained vector effects and their Raft marker
-commit together; prepared transactions reserve artifact bytes before commit.
-Receiver application records positive and deleted vector effects in the derived
-replay journal. Direct-field repair reads primary rows and same-snapshot
-artifact fallbacks, excluding artifacts whose document no longer exists.
-
-Sparse replacement preserves stable document ordinals using monotone
-incarnations and point-addressable immutable posting/docmap sidecars; queries
-filter stale postings before scoring, and compaction reserves its working set
-before cloning. Native checkpoint capture waits for in-flight immutable flush
-publication before certifying the source cut.
-
-Each binding has an exact physical catalog digest and a canonical
-logical-definition digest. Compatibility ignores insertion order, absent versus
-serialized-empty catalogs, JSON key order and owner-local coverage generations;
-configuration differences reject admission. Each owner retains its own ordered
-generation, so a healthy receiver does not rebuild merely because the donor
-assigned different generations.
-
-Replica-local drift does not determine the replicated decision. After semantic
-preflight, native apply persists an exact reconciliation intent and retries
-bounded work until the intended catalog is physically ready. The intent fences
-unrelated schema, artifact, topology and row-policy publication; private
-reconciliation contexts permit only monotonic changes toward it. Obsolete
-resolver artifacts use a durable, restartable 128-key cleanup cursor. Final
-admission, ordered authority, applied receipt and intent/cursor removal commit
-atomically. Failed or repair-unavailable indexes and outstanding cleanup cannot
-certify readiness. Portable export, backup capture and restore reject a pending
-intent; catalog-preview changes before cutover durably cancel the attempt.
-
-Open: a repeated full mounted fault matrix (one mounted fault case passes), and
-compaction/selective-query performance comparison for sparse replacement.
+> **Moved:** the online-merge ordered-catalog admission, transfer, reconciliation and open-work contract is storage, not SQL; it now lives in [ordered artifact publication](../ordered-artifacts.md#distributed-online-merge). It requires data protocol v14 and metadata protocol v20.
 
 ## Durable range protection
 
@@ -966,7 +921,9 @@ The focused tests do not satisfy the complete SQL extraction release gate.
   promoted-primary security workloads.
 - Typed-value gaps listed under [Exact NUMERIC](#exact-numeric) and
   [Arrays](#arrays); regex parity per [its design](regex-parity.md).
-- Ordered-artifact activation (see [its checklist](../ordered-artifacts.md#activation-checklist)).
+- Ordered-artifact activation (see [its checklist](../ordered-artifacts.md#activation-checklist))
+  and the online-merge gaps listed under
+  [distributed online merge](../ordered-artifacts.md#distributed-online-merge).
 - Remote lake end-to-end performance/recovery evidence; workload benchmarks and
   observability.
 
