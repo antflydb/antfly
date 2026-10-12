@@ -30685,7 +30685,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var ordering = try self.mtpOrderingDeviceTensor(request.token_ordering, request.vocab_size);
         defer ordering.deinit();
         if (input.dtype != .f32 or ordering.dtype != .f32 or !input.isDevice() or !ordering.isDevice()) return null;
-        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime)) {
             if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) return error.MetalFrameSyncFailed;
         }
         var token: u32 = 0;

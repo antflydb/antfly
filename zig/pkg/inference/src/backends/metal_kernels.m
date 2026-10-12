@@ -67226,5 +67226,5 @@ int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
     return rc != 0 ? rc : end_rc;
 }
 
-// Packed SIMD cluster ranking and candidate scoring.
+// Packed SIMD cluster ranking; empty borrowed frames are preserved.
 #include "metal_mtp_head_impl.h"
