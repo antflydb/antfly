@@ -56,6 +56,8 @@ pub const CandidateSource = struct {
         begin_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Batch = null,
         /// Borrowed immutable destination, retained through batch deinit.
         bound_table: ?*const fn (*anyopaque, []const u8) anyerror!?[]const u8 = null,
+        /// Optional table-scoped embedding configuration for mention blocking.
+        embed_mention: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, u32) anyerror![]f32 = null,
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.

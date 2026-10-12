@@ -153,7 +153,9 @@ typedef struct antfly_open_options {
     /* Milliseconds to retry a Lite operation while another process holds the
      * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
     uint64_t busy_timeout_ms;
-    uint64_t reserved[8];
+    uint64_t reserved[6];
+    /* Optional model directory for database enrichments; empty uses default. */
+    antfly_slice models_dir;
 } antfly_open_options;
 
 /*
@@ -268,6 +270,12 @@ typedef struct antfly_scan_hash_result {
 
 uint32_t antfly_abi_version(void);
 uint32_t antfly_open_options_size(void);
+/* Borrowed thread-local detail for the last error-code-returning call. Empty
+ * on success or when no concrete validation detail is available. Copy before
+ * another call on this thread; this accessor never changes the detail. */
+const char *antfly_last_error_detail(void);
+/* Code associated with the retained detail; ANTFLY_OK after success. */
+antfly_error_code antfly_last_error_code(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
 antfly_error_code antfly_open_options_init(antfly_open_options *options);

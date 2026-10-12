@@ -527,6 +527,7 @@ pub const storage_lite_result_scratch = @import("storage/lite/result_scratch.zig
 pub const storage_lite_read_workspace = @import("storage/lite/read_workspace.zig");
 pub const storage_lite_metadata_pool = @import("storage/lite/metadata_pool.zig");
 pub const storage_prepared_score_plan = @import("storage/prepared_score_plan.zig");
+pub const storage_prepared_score_request = @import("storage/prepared_score_request.zig");
 pub const storage_lite_reclamation = @import("storage/lite/reclamation.zig");
 pub const storage_lite_secret_store = @import("storage/lite/secret_store.zig");
 pub const storage_lite_snapshot_test = @import("storage/lite/snapshot_test.zig");

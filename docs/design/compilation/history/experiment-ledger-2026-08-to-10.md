@@ -1,11 +1,13 @@
 # Antfly Zig compilation experiment ledger
 
+> Relocated verbatim from `zig/COMPILATION_EXPERIMENTS.md` (lines 1–5187 at commit 3ce5aff4ea) on 2026-10-12. Durable decisions were folded into [COMPILATION.md](../../../../zig/COMPILATION.md) before the move. Only relative links were re-based; links into `COMPILATION.md` refer to the living design.
+
 > Historical record. This file preserves the complete investigation narrative,
 > measurements, rejected probes, accepted increments, test counts, and decisions
 > that produced the current architecture. Statements such as “current,” “next,”
 > and “pending” retain their meaning at the point in the chronology where they
 > were written. They are not the authoritative description of the present
-> build. See [COMPILATION.md](COMPILATION.md) for the current topology, baseline,
+> build. See [COMPILATION.md](../../../../zig/COMPILATION.md) for the current topology, baseline,
 > priorities, gates, and reproduction commands.
 
 The chronology is intentionally detailed. Its main eras are:
@@ -4554,7 +4556,7 @@ hosting, or offline command names is counterproductive.
 
 > Appended from `COMPILATION.md` (lines 219-299 at commit 271838a195) on
 > 2026-09-16 during the documentation cleanup, per this file's
-> [experiment-record policy](COMPILATION.md#experiment-record-policy). The
+> [experiment-record policy](../../../../zig/COMPILATION.md#experiment-record-policy). The
 > resulting per-archive memory-reservation table is the live admission
 > config kept in COMPILATION.md.
 

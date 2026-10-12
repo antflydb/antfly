@@ -120,6 +120,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
     _ = @import("hard_cancellation_watchdog.zig");
@@ -188,6 +189,8 @@ test {
     _ = @import("architectures/gliner/boundary_scorer_device_test.zig");
     _ = @import("architectures/gliner/boundary_family_device_test.zig");
     _ = @import("extractors/gliner_decide_1b_parity_test.zig");
+    _ = @import("extractors/gliner_window_parity_test.zig");
+    _ = @import("extractors/gliner_graph_qualification_fixtures.zig");
     _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");
     _ = @import("ops/native_activation_policy_test.zig");

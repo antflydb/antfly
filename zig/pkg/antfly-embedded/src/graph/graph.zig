@@ -11750,7 +11750,14 @@ pub const GraphIndex = struct {
             const target_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.target.bytes);
             if (source_idx > std.math.maxInt(u32) or target_idx > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
             if (nodes.items.len > controls.max_nodes) return error.GraphMetricBuildBudgetExceeded;
-            try edges.append(self.alloc, .{ .source = @intCast(source_idx), .target = @intCast(target_idx) });
+            if (controls.direction != .in) {
+                if (edges.items.len >= controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
+                try edges.append(self.alloc, .{ .source = @intCast(source_idx), .target = @intCast(target_idx) });
+            }
+            if (controls.direction == .in or (controls.direction == .both and source_idx != target_idx)) {
+                if (edges.items.len >= controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
+                try edges.append(self.alloc, .{ .source = @intCast(target_idx), .target = @intCast(source_idx) });
+            }
             if (edges.items.len > controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
         }
         try controls.cancellation.check();
@@ -20059,6 +20066,8 @@ pub const GraphIndex = struct {
         return .{ .status = status, .scores = scores };
     }
 
+    var next_metric_session_identity = std.atomic.Value(u64).init(1);
+
     /// One publication snapshot spanning filter, order and projection reads.
     /// Resolve every policy before reading scores, including dependencies whose
     /// eventual row selection is empty. Never reopen between query stages.
@@ -20069,8 +20078,122 @@ pub const GraphIndex = struct {
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
         reads: score_read.Stats = .{},
+        prepared_identity: u64 = 0,
+
+        // Promote only after this session repeats the same canonical plan.
+        // Shared workspace hits alone do not prove session-local reuse.
+        last_plan_identity: u64 = 0,
+        prepared_reuse_enabled: bool = false,
+        prepared_request: ?score_read.PreparedRequest = null,
+
+        pub const PreparedColumns = struct {
+            session_identity: u64,
+            request: score_read.PreparedChunks,
+            results: ?score_read.PreparedResults = null,
+            pub fn deinit(self: *@This()) void {
+                if (self.results) |*results| results.deinit();
+                self.request.deinit();
+                self.* = undefined;
+            }
+        };
+
+        /// Compile a query-owned immutable handle once for this publication
+        /// snapshot. Construction is charged to alloc; callers may keep using
+        /// readColumns when their budget cannot admit optional ownership.
+        pub fn prepareColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8) !PreparedColumns {
+            var buffer: [32]?[]const u8 = undefined;
+            const selected = if (names.len <= buffer.len) buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > buffer.len) alloc.free(selected);
+            for (names, selected) |name, *prefix| {
+                prefix.* = for (self.statuses, self.prefixes) |status, value| {
+                    if (std.mem.eql(u8, status.name, name)) break value;
+                } else return error.InvalidQueryRequest;
+            }
+            if (self.prepared_identity == 0) {
+                self.prepared_identity = next_metric_session_identity.fetchAdd(1, .monotonic);
+                if (self.prepared_identity == 0 or self.prepared_identity == std.math.maxInt(u64)) @panic("metric session identity exhausted");
+            }
+            var request = try score_read.PreparedChunks.init(alloc, selected, nodes);
+            errdefer request.deinit();
+            const results = score_read.PreparedResults.init(alloc, &request, &self.txn) catch |err| switch (@as(anyerror, err)) {
+                error.Unsupported, error.OutOfMemory, error.ResourceBudgetExceeded => null,
+                else => return err,
+            };
+            return .{ .session_identity = self.prepared_identity, .request = request, .results = results };
+        }
+
+        /// No node-input comparison, name lookup, or automatic key copies.
+        /// Shape and session identity keep the handle bound to its pinned txn.
+        pub fn readPreparedColumns(self: *@This(), alloc: Allocator, prepared: *const PreparedColumns, columns: []const []?f64) !void {
+            if (self.prepared_identity == 0 or prepared.session_identity != self.prepared_identity) return error.InvalidQueryRequest;
+            const read_stats = if (prepared.results) |*results|
+                try results.populate(alloc, &self.txn, &prepared.request, columns)
+            else
+                try score_read.populateChunks(alloc, &self.txn, &prepared.request, columns);
+            self.reads.keys += read_stats.keys;
+            self.reads.batches += read_stats.batches;
+        }
+
+        /// Consume cached scores through a lease without caller-owned output
+        /// columns. The lease survives prepared-owner/session teardown; close it
+        /// before releasing the allocator used to prepare the columns.
+        pub fn readPreparedView(self: *@This(), alloc: Allocator, prepared: *const PreparedColumns) !score_read.PreparedResults.View {
+            if (self.prepared_identity == 0 or prepared.session_identity != self.prepared_identity) return error.InvalidQueryRequest;
+            const results = prepared.results orelse return error.Unsupported;
+            const read = try results.readView(alloc, &self.txn, &prepared.request);
+            self.reads.keys += read.stats.keys;
+            self.reads.batches += read.stats.batches;
+            return read.view;
+        }
+
+        /// Independently owned, logical-order decoded columns for one-shot
+        /// stage reads. Caller owns the arrays; native working retention stays
+        /// bounded and no query-wide encoded key owner is constructed.
+        pub const DecodedColumnStream = struct {
+            session: *GraphMetricReadSession,
+            scores: score_read.FloatColumnStream,
+            pub fn readDecodedColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64) !void {
+                if (alloc.ptr != self.scores.allocator.ptr or alloc.vtable != self.scores.allocator.vtable) return error.InvalidBatch;
+                try self.session.readDecodedColumnsUsingScope(alloc, names, nodes, columns, &self.scores);
+            }
+            pub fn deinit(self: *@This()) void {
+                self.scores.deinit();
+                self.* = undefined;
+            }
+        };
+        /// Move-only batch stream, exclusively borrowing this pinned session.
+        /// Close the stream before moving/deinitializing its session.
+        pub fn openDecodedColumnStream(self: *@This(), alloc: Allocator) !DecodedColumnStream {
+            return .{ .session = self, .scores = score_read.FloatColumnStream.init(alloc, &self.txn) };
+        }
+        pub fn readDecodedColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64) !void {
+            try self.readDecodedColumnsUsingScope(alloc, names, nodes, columns, null);
+        }
+        fn readDecodedColumnsUsingScope(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []f64, scope: ?*score_read.FloatColumnStream) !void {
+            var buffer: [32]?[]const u8 = undefined;
+            const selected = if (names.len <= buffer.len) buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > buffer.len) alloc.free(selected);
+            for (names, selected) |name, *prefix| {
+                prefix.* = for (self.statuses, self.prefixes) |status, value| {
+                    if (std.mem.eql(u8, status.name, name)) break value;
+                } else return error.InvalidQueryRequest;
+            }
+            const read = if (scope) |borrowed|
+                try borrowed.populate(selected, nodes, columns)
+            else
+                try score_read.populateFloatColumns(alloc, &self.txn, selected, nodes, columns);
+            self.reads.keys += read.keys;
+            self.reads.batches += read.batches;
+        }
+
+        /// Opt in only when the caller knows this session will repeat reads.
+        /// Ordinary staged and short-lived sessions keep the warmed mutable plan.
+        pub fn enablePreparedReuse(self: *@This()) void {
+            self.prepared_reuse_enabled = true;
+        }
 
         pub fn deinit(self: *@This()) void {
+            if (self.prepared_request) |*request| request.deinit();
             self.txn.abort();
             for (self.statuses) |*status| status.deinit(self.alloc);
             self.alloc.free(self.statuses);
@@ -20082,16 +20205,51 @@ pub const GraphIndex = struct {
         pub fn readColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []?f64) !void {
             if (names.len != columns.len) return error.InvalidQueryRequest;
             for (columns) |column| if (column.len != nodes.len) return error.InvalidQueryRequest;
-            const prefixes = try alloc.alloc(?[]const u8, names.len);
-            defer alloc.free(prefixes);
+            var prefix_buffer: [32]?[]const u8 = undefined;
+            const prefixes = if (names.len <= prefix_buffer.len) prefix_buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > prefix_buffer.len) alloc.free(prefixes);
             for (names, prefixes) |name, *prefix| {
                 prefix.* = for (self.statuses, self.prefixes) |status, value| {
                     if (std.mem.eql(u8, status.name, name)) break value;
                 } else return error.InvalidQueryRequest;
             }
+            if (self.prepared_request) |*request| {
+                const plan = request.plan();
+                const equal_inputs = plan.matches(prefixes, nodes);
+                if (equal_inputs) {
+                    const prepared_stats = score_read.populatePrepared(alloc, &self.txn, request, columns) catch |err| switch (@as(anyerror, err)) {
+                        error.OutOfMemory, error.ResourceBudgetExceeded => {
+                            // The optional owned plan must not raise the floor
+                            // of a query that can still stream its original inputs.
+                            request.deinit();
+                            self.prepared_request = null;
+                            self.last_plan_identity = 0;
+                            const retry_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
+                            self.reads.keys += retry_stats.keys;
+                            self.reads.batches += retry_stats.batches;
+                            return;
+                        },
+                        else => return err,
+                    };
+                    self.reads.keys += prepared_stats.keys;
+                    self.reads.batches += prepared_stats.batches;
+                    return;
+                }
+                request.deinit();
+                self.prepared_request = null;
+                self.last_plan_identity = 0;
+            }
             const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
+            const repeated = read_stats.plan_identity != 0 and self.last_plan_identity == read_stats.plan_identity;
+            self.last_plan_identity = read_stats.plan_identity;
+            if (self.prepared_reuse_enabled and repeated) {
+                self.prepared_request = score_read.prepareRequestForReuse(self.alloc, &self.txn, prefixes, nodes) catch |err| switch (@as(anyerror, err)) {
+                    error.OutOfMemory, error.ResourceBudgetExceeded, error.GraphMetricQueryBudgetExceeded => null,
+                    else => return err,
+                };
+            }
         }
 
         /// Query-seeded personalized PageRank column. Computed fresh from the
@@ -20175,6 +20333,7 @@ pub const GraphIndex = struct {
     /// caller's limits and cancellation must bound the scan itself — the
     /// kernel's own work ceiling cannot.
     pub const PersonalizedReadControls = struct {
+        direction: enum { out, in, both } = .out,
         max_nodes: usize = default_personalized_read_max_nodes,
         max_edges: usize = default_personalized_read_max_edges,
         cancellation: cancellation_mod.CancellationToken = .none,

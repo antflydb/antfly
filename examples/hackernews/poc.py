@@ -27,6 +27,7 @@ import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import os
+import resource
 from pathlib import Path
 import subprocess
 import time
@@ -73,9 +74,7 @@ def wait_for_index(
         sleep(min(1, max(0, deadline - now())))
 
 
-def qualify_composed_sources(call, query, selected_source):
-    """Exercise historical/current visibility and retain a mutable source cursor."""
-    current, history = "hn_current_poc", "hn_archive_poc"
+def create_current_table(call, current):
     if current not in json.dumps(call("GET", "/tables")):
         call(
             "POST",
@@ -115,6 +114,12 @@ def qualify_composed_sources(call, query, selected_source):
                 "indexes": {"body_text": {"type": "full_text"}},
             },
         )
+
+
+def qualify_composed_sources(call, query, selected_source):
+    """Exercise historical/current visibility and retain a mutable source cursor."""
+    current, history = "hn_current_poc", "hn_archive_poc"
+    create_current_table(call, current)
     selected, extra = selected_source["hn_id"], 2147483647
     assert selected != extra
     documents = {
@@ -241,6 +246,22 @@ def main():
     )
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument("--qualify-composed-sources", action="store_true")
+    parser.add_argument(
+        "--benchmark-composed",
+        action="store_true",
+        help="Measure union and saved overlay with a recent-row native current fixture, independently after cache-cleared restarts",
+    )
+    parser.add_argument(
+        "--disable-navigation-warming",
+        action="store_true",
+        help="Disable optional readiness prefetch to measure empty serving caches",
+    )
+    parser.add_argument(
+        "--composed-current-rows",
+        type=int,
+        default=1000,
+        help="Bounded recent-row sample copied into a native table for composition benchmarks",
+    )
     parser.add_argument("--store-source", action="store_true")
     parser.add_argument(
         "--cursor-term", help="Separate broad query for deep cursor coverage"
@@ -258,6 +279,10 @@ def main():
     )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
+    if not 2 <= args.composed_current_rows <= 10000:
+        parser.error("composed current rows must be between 2 and 10000")
+    if args.benchmark_composed and not args.qualify_composed_sources:
+        parser.error("composed benchmarks require --qualify-composed-sources")
     if args.docker and not args.filesystem_source:
         parser.error("Docker comparison mode requires --filesystem-source")
     if args.docker_cpus < 1 or args.docker_memory_gib < 1:
@@ -339,7 +364,10 @@ def main():
             ),
         },
         "lake_cache": {"root": str(args.state / "cache"), "max_disk_bytes": 1073741824},
-        "lake_indexes": {"query_cursors": {"retention_ms": args.cursor_retention_ms}},
+        "lake_indexes": {
+            "query_cursors": {"retention_ms": args.cursor_retention_ms},
+            "navigation_warming": {"enabled": not args.disable_navigation_warming},
+        },
     }
     if args.filesystem_source:
         # The native local store publishes through its filesystem artifact store.
@@ -352,7 +380,10 @@ def main():
     log = None
     container = None
 
+    startup_samples_ms = []
+
     def start():
+        startup_started = time.monotonic()
         nonlocal process, log, container
         log = (args.state / "server.log").open("a")
         command = [
@@ -417,6 +448,9 @@ def main():
                 )
             try:
                 call("GET", "/tables")
+                startup_samples_ms.append(
+                    round((time.monotonic() - startup_started) * 1000, 2)
+                )
                 return
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 time.sleep(0.5)
@@ -512,12 +546,17 @@ def main():
             and "{" not in fields[0]
         }
 
-    def timed_query(query, phase="search"):
-        serial_profile = phase in {"cold", "cursor_initial", "cursor_depth_restart"}
+    def timed_query(query, phase="search", path="/tables/hn_archive_poc/query"):
+        serial_profile = phase in {
+            "cold",
+            "restart",
+            "cursor_initial",
+            "cursor_depth_restart",
+        } or phase.startswith("composed_cold.")
         metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
-        result = call("POST", "/tables/hn_archive_poc/query", query)
+        result = call("POST", path, query)
         elapsed = round((time.monotonic() - started) * 1000, 2)
         after = resource_counters()
         metrics_after = lake_metrics() if serial_profile else None
@@ -538,6 +577,7 @@ def main():
                         else None
                     ),
                     "lake_metrics_scope": "process; nested phases may overlap",
+                    "lake_metrics_before": metrics_before,
                     **{key: round(after[key] - before[key], 2) for key in before or {}},
                 }
             )
@@ -646,6 +686,12 @@ def main():
             if (args.state / "cache").exists():
                 shutil.rmtree(args.state / "cache")
             start()
+        if args.disable_navigation_warming:
+            baseline_metrics = lake_metrics()
+            assert (
+                baseline_metrics.get("antfly_lake_navigation_warming_attempts_total", 0)
+                == 0
+            ), "Warming was unexpectedly active in the empty-cache scenario"
         cache_files_before_search = sum(
             p.is_file() for p in (args.state / "cache").rglob("*")
         )
@@ -917,6 +963,7 @@ def main():
                 composed_error = type(exc).__name__
         stop()
         start()
+        reopened, restart_ms = timed_query(query, "restart")
         if composed_cursor is not None:
             retained = call("POST", "/query", composed_cursor)["hits"]["hits"]
             assert [
@@ -928,7 +975,6 @@ def main():
                 "saved_current_visibility",
                 "mutable_composed_cursor_restart",
             ]
-        reopened, restart_ms = timed_query(query, "restart")
         assert [(h["_id"], h["_score"]) for h in reopened["hits"]["hits"]] == [
             (h["_id"], h["_score"]) for h in hits
         ]
@@ -962,12 +1008,121 @@ def main():
         assert not empty["hits"]["hits"], (
             "Out-of-sample date range returned hits after restart"
         )
+        composed_benchmarks = {}
+        if args.benchmark_composed and composed_cursor is not None:
+            current_benchmark = "hn_current_benchmark"
+            create_current_table(call, current_benchmark)
+            columns = [
+                "hn_id",
+                "body",
+                "title",
+                "item_type",
+                "author",
+                "points",
+                "created_at",
+            ]
+            recent = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(columns)
+                    + " FROM hn_archive_poc ORDER BY created_at DESC, hn_id LIMIT "
+                    + str(args.composed_current_rows)
+                },
+            )
+            assert len(recent["rows"]) == args.composed_current_rows
+            documents = []
+            for row in recent["rows"]:
+                document = dict(zip(columns, row, strict=True))
+                for column in ("hn_id", "points", "created_at"):
+                    if document[column] is not None:
+                        document[column] = int(document[column])
+                documents.append(document)
+            for offset in range(0, len(documents), 128):
+                call(
+                    "POST",
+                    f"/tables/{current_benchmark}/batch",
+                    {
+                        "inserts": {
+                            str(doc["hn_id"]): doc
+                            for doc in documents[offset : offset + 128]
+                        },
+                        "sync_level": "full_index",
+                    },
+                )
+            benchmark_count = call(
+                "POST",
+                "/sql",
+                {"statement": "SELECT COUNT(*) FROM " + current_benchmark},
+            )
+            assert benchmark_count["rows"] == [[str(args.composed_current_rows)]], (
+                benchmark_count
+            )
+            benchmark_overlay = {
+                "overlay": {
+                    "base": {"table": "hn_archive_poc"},
+                    "changes": {"table": current_benchmark},
+                    "key": ["hn_id"],
+                }
+            }
+            call("POST", "/sources/hackernews_benchmark", {"source": benchmark_overlay})
+            for name, source in (
+                (
+                    "union",
+                    {
+                        "union": [
+                            {"table": "hn_archive_poc"},
+                            {"table": current_benchmark},
+                        ]
+                    },
+                ),
+                ("saved_overlay", {"saved": "hackernews_benchmark"}),
+            ):
+                stop()
+                if (args.state / "cache").exists():
+                    shutil.rmtree(args.state / "cache")
+                start()
+                request = dict(query, source=source, source_ranking="rrf")
+                cold, cold_ms = timed_query(request, "composed_cold." + name, "/query")
+                expected = [(h["_id"], h["_score"]) for h in cold["hits"]["hits"]]
+                samples = []
+                for _ in range(args.repeats):
+                    result, elapsed = timed_query(
+                        request, "composed_warm." + name, "/query"
+                    )
+                    assert [
+                        (h["_id"], h["_score"]) for h in result["hits"]["hits"]
+                    ] == expected
+                    samples.append(elapsed)
+                composed_benchmarks[name] = {
+                    "first_search_ms": cold_ms,
+                    "warm_samples_ms": samples,
+                    "warm_p95_ms": sorted(samples)[
+                        min(len(samples) - 1, int(len(samples) * 0.95))
+                    ],
+                    "result_count": len(expected),
+                    "current_fixture_rows": args.composed_current_rows,
+                    "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale.",
+                }
+        stop()
+        engine_peak_rss_bytes = (
+            None
+            if args.docker
+            else resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            * (1 if sys.platform == "darwin" else 1024)
+        )
         cache_files = [p for p in (args.state / "cache").rglob("*") if p.is_file()]
         report = {
             "project": None if args.filesystem_source else args.project,
             "metadata_indexes": metadata_columns,
             "metadata_indexes_queryable": list(metadata_status),
             "cold_cache_cleared_after_publication": args.cold_cache,
+            "navigation_warming_enabled": not args.disable_navigation_warming,
+            "startup_samples_ms": startup_samples_ms,
+            "engine_child_peak_rss_bytes": engine_peak_rss_bytes,
+            "engine_child_peak_rss_scope": "Maximum across child processes over the entire run, including publication if performed; not query-only RSS.",
+            "composed_benchmarks": composed_benchmarks,
             "cache_files_before_search": cache_files_before_search,
             "warm_samples_ms": warm_samples,
             "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],

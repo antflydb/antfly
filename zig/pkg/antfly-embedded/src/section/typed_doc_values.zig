@@ -750,6 +750,32 @@ pub const TypedDocValuesReader = struct {
             const buffer = self.slots[self.count].buffer;
             if (!self.inSlab(buffer)) self.allocator.free(buffer);
         }
+        /// Remove identities before a scoped reader is destroyed. Pointer reuse
+        /// must never make a later reader observe the previous reader's chunks.
+        pub fn forget(self: *PointCache, reader: *const TypedDocValuesReader) void {
+            var i: usize = 0;
+            while (i < self.count) {
+                if (self.slots[i].reader != reader) {
+                    i += 1;
+                    continue;
+                }
+                const buffer = self.slots[i].buffer;
+                self.live_bytes -= buffer.len;
+                if (!self.inSlab(buffer)) self.allocator.free(buffer);
+                self.count -= 1;
+                self.slots[i] = self.slots[self.count];
+            }
+            i = 0;
+            while (i < self.bounds_count) {
+                if (self.bounds[i].reader != reader) {
+                    i += 1;
+                    continue;
+                }
+                self.bounds_count -= 1;
+                self.bounds[i] = self.bounds[self.bounds_count];
+            }
+            self.next_bound = self.bounds_count % self.bounds.len;
+        }
         pub fn deinit(self: *PointCache) void {
             while (self.count != 0) self.evict();
             self.allocator.free(self.slab);
@@ -2330,6 +2356,38 @@ test "shared point cache keeps eight columns warm within its byte budget" {
         try std.testing.expectEqual(@as(u64, 4095), (try reader.getU64(4095)).?);
     };
     try std.testing.expectEqual(before, cache.decode_count);
+}
+
+test "external lake typed point cache forgets destroyed reader identities before pointer reuse" {
+    const a = std.testing.allocator;
+    var first = TypedDocValuesWriter.init(a, .u64_val, 128);
+    defer first.deinit();
+    var second = TypedDocValuesWriter.init(a, .u64_val, 128);
+    defer second.deinit();
+    for (0..256) |i| {
+        try first.add(@intCast(i), .{ .u64_val = i });
+        try second.add(@intCast(i), .{ .u64_val = i + 999 });
+    }
+    const bytes = try first.build();
+    defer a.free(bytes);
+    const replacement = try second.build();
+    defer a.free(replacement);
+    var cache: TypedDocValuesReader.PointCache = .{ .allocator = a, .byte_budget = 4096 };
+    defer cache.deinit();
+    var reader = try TypedDocValuesReader.init(a, bytes);
+    reader.point_cache = &cache;
+    reader.owns_point_cache = false;
+    try std.testing.expectEqual(@as(u64, 7), (try reader.getU64(7)).?);
+    try std.testing.expect(cache.count != 0);
+    cache.forget(&reader);
+    try std.testing.expectEqual(@as(usize, 0), cache.count);
+    try std.testing.expectEqual(@as(usize, 0), cache.bounds_count);
+    reader.deinit();
+    reader = try TypedDocValuesReader.init(a, replacement);
+    defer reader.deinit();
+    reader.point_cache = &cache;
+    reader.owns_point_cache = false;
+    try std.testing.expectEqual(@as(u64, 1006), (try reader.getU64(7)).?);
 }
 
 test "cached variable bytes are indexed and borrowed while owned results survive eviction" {

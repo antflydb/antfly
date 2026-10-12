@@ -126,7 +126,39 @@ pub const PinnedTextSource = struct {
     stored_projection_fields: []const []const u8 = &.{},
     /// Immutable provider metadata retained by release_owner's lease.
     provider_metadata: ?*const anyopaque = null,
+    shared_owner: ?*Shared = null,
+    const Shared = struct {
+        allocator: Allocator,
+        source: PinnedTextSource,
+        references: std.atomic.Value(usize) = .init(1),
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            self.source.deinit();
+            self.allocator.destroy(self);
+        }
+    };
+    /// Consume this pin into shared query ownership. Ranking and deferred
+    /// delivery keep the same native document-number space and authority;
+    /// only the final owner quiesces the source and releases provider metadata.
+    pub fn share(self: PinnedTextSource, allocator: Allocator) !PinnedTextSource {
+        if (self.shared_owner != null) return self;
+        const owner = try allocator.create(Shared);
+        owner.* = .{ .allocator = allocator, .source = self };
+        var result = self;
+        result.shared_owner = owner;
+        return result;
+    }
+    pub fn clone(self: PinnedTextSource) !PinnedTextSource {
+        const owner = self.shared_owner orelse return error.InvalidArgument;
+        _ = owner.references.fetchAdd(1, .monotonic);
+        return self;
+    }
     pub fn deinit(self: *PinnedTextSource) void {
+        if (self.shared_owner) |owner| {
+            owner.release();
+            self.* = undefined;
+            return;
+        }
         self.snapshot.quiesceReadContext();
         self.snapshot.release();
         if (self.release_owner) |release| release(self.owner.?);
@@ -5460,6 +5492,31 @@ fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, h
     return false;
 }
 
+/// Shared typed ordering for bounded coordinators. Validate once at admission;
+/// heap comparisons then use the same numeric, timestamp, null and ID contract
+/// as local collection and distributed cursor merging.
+pub const SearchHitOrder = struct {
+    effective: EffectiveSortRequest,
+    plan: SortExecutionPlan,
+    pub fn init(a: Allocator, req: types.SearchRequest, runtime: ?runtime_schema_mod.TableSchema) !SearchHitOrder {
+        var effective = try effectiveSortRequestAlloc(a, req);
+        errdefer effective.deinit(a);
+        try validateSortPageOptions(effective.req);
+        if (effective.req.order_by.len == 0) return error.InvalidQueryRequest;
+        return .{ .effective = effective, .plan = .{ .kind = .distributed_k_way_merge, .runtime_schema = runtime } };
+    }
+    pub fn deinit(self: *SearchHitOrder, a: Allocator) void {
+        self.effective.deinit(a);
+    }
+    pub fn validate(self: SearchHitOrder, hit: types.SearchHit) !void {
+        _ = try compareSearchHitSortValues(self.effective.req, self.plan, hit, hit);
+        if (!try searchHitAllowedByCursor(self.effective.req, self.plan, hit)) return error.InvalidQueryRequest;
+    }
+    pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
+        return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
+    }
+};
+
 const DistributedSortedShard = struct {
     hits: []const types.SearchHit = &.{},
     total_hits: ?u32 = null,
@@ -6832,7 +6889,10 @@ fn nativeSortValueFromTextDocValuesAlloc(
     field: []const u8,
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
-    const segment = &snapshot.segments[resolved.seg_idx];
+    var segment_lease = try snapshot.leaseSegment(resolved.seg_idx);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
+    try reads.retainSegment(segment_lease);
     const reader = (try reads.get(&segment.reader, field)) orelse {
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
@@ -7812,7 +7872,10 @@ fn buildSortedSegmentDocMembershipAlloc(
 
     var doc_base: u32 = 0;
     var candidate_count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, i| {
+    for (snapshot.segments, 0..) |_, i| {
+        var segment_lease = try snapshot.leaseSegment(i);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         defer doc_base += segment.reader.doc_count;
         bitmaps[i] = try filter.executeWithOffset(alloc, segment, doc_base);
         candidate_count += bitmaps[i].cardinality();
@@ -7875,7 +7938,9 @@ fn decorateSortedSegmentDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
-    const segment = &snapshot.segments[segment_index];
+    var segment_lease = try snapshot.leaseSegment(segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     const ordinal = try segment.reader.docOrdinal(local_doc_id);
     const global_doc_id = doc_base + local_doc_id;
     const raw_hit = types.SearchHit{
@@ -7980,7 +8045,9 @@ fn sortedSegmentSeekStartDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     reverse: bool,
 ) !i64 {
-    const segment = &snapshot.segments[iterator.segment_index];
+    var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     const doc_count = segment.reader.doc_count;
     if (doc_count == 0) return -1;
     const cursor = activeSortCursor(req);
@@ -8074,7 +8141,9 @@ fn nextSortedSegmentHeadAlloc(
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const iterator = &iterators[iterator_index];
-    const segment = &snapshot.segments[iterator.segment_index];
+    var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
         const local_doc_id: u32 = @intCast(iterator.next_doc);
         sortedSegmentIteratorAdvance(iterator, reverse);
@@ -8163,8 +8232,11 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
     defer constraint_membership.deinit(alloc);
 
     var count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, segment_index| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         for (0..segment.reader.doc_count) |local_doc_id_usize| {
             const local_doc_id: u32 = @intCast(local_doc_id_usize);
             scanned_count +|= 1;
@@ -8229,7 +8301,9 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
 
     var count: usize = 0;
     for (iterators) |*iterator| {
-        const segment = &snapshot.segments[iterator.segment_index];
+        var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
             const local_doc_id: u32 = @intCast(iterator.next_doc);
             sortedSegmentIteratorAdvance(iterator, reverse);
@@ -12166,6 +12240,7 @@ pub fn searchTextQuery(
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,
                 .distributed_text_stats = effective_req.distributed_text_stats,
+                .minimum_competitive_score = effective_req.minimum_competitive_score,
                 .filter_doc_nums = native_constraints.filter_doc_nums,
                 .filter_doc_nums_positive = native_constraints.positive_filter,
                 .exclude_doc_nums = native_constraints.exclude_doc_nums,
@@ -12582,7 +12657,10 @@ fn textDocNumsForDocIdsAlloc(
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12844,7 +12922,10 @@ fn collectFilteredExplicitTextStats(
     var selected_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &selected_doc_keys);
     var doc_offset: u32 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12895,7 +12976,10 @@ fn collectFilteredExplicitTextStats(
         // Index-only adapters have no primary document store. Retain an exact
         // fallback by summing native term frequencies for allowed documents.
         doc_offset = 0;
-        for (snapshot.segments) |*seg| {
+        for (snapshot.segments, 0..) |_, segment_index| {
+            var segment_lease = try snapshot.leaseSegment(segment_index);
+            defer segment_lease.deinit();
+            const seg = segment_lease.entry;
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
             {
@@ -16381,8 +16465,14 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
     validation: ?index_mod.CoverageValidation,
 ) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = snapshot.leaseSegment(segment_index) catch |err| switch (err) {
+            error.Canceled => return error.Cancelled,
+            else => return err,
+        };
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
             // Search requests use the historical double-l spelling at this
             // layer; keep that public contract while the shared token remains
@@ -16418,8 +16508,11 @@ fn snapshotGeoPointDocValuesCoverage(
     snapshot: *const index_mod.IndexSnapshot,
     field: []const u8,
 ) !TypedDocValuesCoverageStatus {
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
         const value_type = cached.value_type orelse return cached.status;
         if (value_type != .geo_point) return .doc_values_kind_mismatch;
@@ -16717,8 +16810,11 @@ fn snapshotSegmentsHaveIndexSortAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         covered_live_segments = true;
         if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
     }
@@ -16799,8 +16895,11 @@ fn snapshotSegmentsHaveIndexSortBoundsAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         covered_live_segments = true;
         const bounds = segment.reader.indexSortBoundsAlloc(alloc) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -16961,7 +17060,10 @@ fn buildAllOrdinalTextDocIdMapAlloc(
 
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();
@@ -16996,7 +17098,10 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();
@@ -32609,4 +32714,45 @@ test "external lake ordinal identity projection avoids stored key I/O and preser
     var resumed = try searchTextQuery(a, next, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
     defer resumed.deinit();
     try std.testing.expectEqualStrings("public-0003", resumed.hits[0].id);
+}
+
+test "external lake ranked delivery shares exact snapshot authority until its final owner closes" {
+    const a = std.testing.allocator;
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{.{ .key = "row", .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithId(1, bytes);
+    const Context = struct {
+        allowed: bool = true,
+        releases: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allowed) return error.Forbidden;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var context: Context = .{};
+    const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &context, .check = Context.check, .io = std.testing.io });
+    var ranking: PinnedTextSource = .{ .snapshot = snapshot, .name = "body", .text_analysis = .{}, .runtime_schema = null, .owner = &context, .release_owner = Context.release };
+    ranking = try ranking.share(a);
+    var delivery = try ranking.clone();
+    const inspect = snapshot.retain();
+    defer inspect.release();
+    ranking.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.releases);
+    {
+        var lease = try delivery.snapshot.leaseSegment(0);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u32, 1), lease.entry.reader.doc_count);
+    }
+    context.allowed = false;
+    try std.testing.expectError(error.Forbidden, delivery.snapshot.leaseSegment(0));
+    context.allowed = true;
+    delivery.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.releases);
+    try std.testing.expectError(error.Canceled, inspect.leaseSegment(0));
 }

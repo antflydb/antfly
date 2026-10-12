@@ -20,7 +20,9 @@ use std::path::Path;
 use antfly_embedded_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
 
 use crate::error::{Error, Result};
-use crate::ffi::{HandleGate, borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
+use crate::ffi::{
+    HandleGate, borrow_slice, check, path_has_suffix, path_to_bytes, path_to_cstring, take_buffer,
+};
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
 
 /// The Antfly C ABI version this binding expects.
@@ -297,6 +299,10 @@ impl Database {
         c_opts.inference_scratch_budget_mb = options.scratch_budget_mb;
         c_opts.inference_process_memory_budget_mb = options.process_memory_budget_mb;
         c_opts.busy_timeout_ms = options.busy_timeout_ms();
+        let models_dir_bytes = options.models_dir.as_deref().map(path_to_bytes);
+        if let Some(bytes) = &models_dir_bytes {
+            c_opts.models_dir = borrow_slice(bytes);
+        }
 
         if let Some(ttl) = &options.ttl_cleanup {
             c_opts.flags |= sys::ANTFLY_OPEN_FLAG_TTL_CLEANUP;

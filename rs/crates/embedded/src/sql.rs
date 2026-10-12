@@ -38,10 +38,11 @@ impl fmt::Display for SqlError {
 impl std::error::Error for SqlError {}
 impl From<Error> for SqlError {
     fn from(native: Error) -> Self {
+        let message = native.to_string();
         Self {
             native,
             sqlstate: None,
-            message: native.to_string(),
+            message,
             body: Vec::new(),
         }
     }
@@ -55,7 +56,7 @@ fn output(code: i32, body: Vec<u8>) -> Result<Vec<u8>> {
         .ok()
         .and_then(|v| v.get("error").cloned());
     Err(SqlError {
-        native: Error::from_code(code),
+        native: Error::from_native(code),
         sqlstate: diagnostic
             .as_ref()
             .and_then(|v| v["code"].as_str())

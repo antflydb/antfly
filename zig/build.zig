@@ -1018,6 +1018,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_main_mod,
+        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
     lite_main_mod.linkLibrary(embedded.native_inference);
     lite_main_mod.linkLibrary(embedded.native_enrichment);

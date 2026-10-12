@@ -2654,7 +2654,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics" },
+        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -3684,7 +3684,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster production managed index publication recovery exact replay"},
+        .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_managed_index_vopr_tests = b.addRunArtifact(production_cluster_managed_index_vopr_tests);
@@ -5706,6 +5706,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",
+        "distributed graph supports cross-range traverse target selectors",
+        "distributed graph traverse target nodes filter returned nodes without pruning frontier",
+        "distributed graph traverse routes cross-table frontier by table generation",
+        "distributed graph path materialization preserves table provenance",
+        "public graph metric borrowed wire",
+        "graph metric native response adoption",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
@@ -5955,6 +5961,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const v02_upgrade_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_marker_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"ensureCompatible"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_upgrade_step = b.step("antfly-v02-upgrade-test", "Verify released v0.2.1+ schema/backup fixtures and directory admission");
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_upgrade_tests).step);
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_marker_tests).step);
+    lib_storage_test_step.dependOn(v02_upgrade_step);
+
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },
@@ -6601,6 +6622,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.prepared_score_plan.",
+            "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
             "storage.typed_json.",

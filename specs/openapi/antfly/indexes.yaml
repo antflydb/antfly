@@ -4450,6 +4450,14 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
+        deduplicate_nodes:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: >-
+            Return each node once across all starts. Set false with include_paths
+            to return each reaching path, including its start node. Depth, result,
+            and work limits still bound path enumeration.
         include_paths: { type: boolean, default: false }
         include_documents:
           type: boolean
@@ -5639,6 +5647,13 @@ components:
         - index
         - metric
       properties:
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: >-
+            Direction of query-time personalized PageRank; defaults to out.
+            Requires seed_nodes and metric_freshness=fresh. Both treats every
+            selected relationship as undirected, allowing entity seeds to reach
+            documents through incoming mention edges.
         name:
           type: string
           minLength: 1
@@ -5700,6 +5715,13 @@ components:
         - index
         - metric
       properties:
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: >-
+            Direction of query-time personalized PageRank; defaults to out.
+            Requires seed_nodes and metric_freshness=fresh. Both treats every
+            selected relationship as undirected, allowing entity seeds to reach
+            documents through incoming mention edges.
         index:
           type: string
           description: Graph index that owns the published metric.

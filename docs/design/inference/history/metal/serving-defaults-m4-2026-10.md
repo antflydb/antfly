@@ -1,5 +1,7 @@
 # Metal serving default qualification — Apple M4, 2026-10-02
 
+> Relocated verbatim from `zig/pkg/inference/scripts/metal_serving_defaults_m4_summary.md` (lines 1–164 at commit 3ce5aff4ea) on 2026-10-12. Durable decisions were folded into [METAL.md](../../../../../zig/pkg/inference/METAL.md#m4-serving-defaults) before the move.
+
 This receipt covers the merged branch plus the default-promotion changes. The
 candidate runs use no Qwen or Gemma enable flags. Reports, Gemma request/output bodies, server
 logs, host samples, executable/model hashes, and failed attempts remain locally

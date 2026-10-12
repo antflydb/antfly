@@ -254,6 +254,8 @@ file's own title and a one-line description taken from its first paragraph.
 - [CDC.md](CDC.md) — CDC: the Postgres replication-source / CDC subsystem.
 - [SCHEMA.md](SCHEMA.md) — Schema: the current split in how schema is defined
   and enforced.
+- [SYSTEM_CATALOG.md](SYSTEM_CATALOG.md) — System Catalog: databases, namespaces,
+  table identities, and tablespaces that SQL and other frontends bind through.
 - [STANDALONE.md](STANDALONE.md) — Standalone Runtime, Providers, and Shard DB
   Access: node-level design for metadata, data, local providers, and DB
   runtime ownership.
@@ -378,6 +380,9 @@ file's own title and a one-line description taken from its first paragraph.
   `zig/pkg/antfly/src/extensions/`; the doc has not been reconciled to match.
 - [OPENAPI.md](OPENAPI.md) — OpenAPI: how generated Zig OpenAPI code is kept
   checked in and imported.
+- [COMPILATION.md](COMPILATION.md) — Antfly Zig compilation architecture: the
+  seven compiled runtime archives, internal ABI rules, memory reservations,
+  acceptance gates, and cold-build commands.
 
 ### Testing
 
@@ -385,8 +390,8 @@ file's own title and a one-line description taken from its first paragraph.
   package-scoped and special-purpose test tiers.
 - [VOPR.md](VOPR.md) — VOPR: Deterministic Autonomous Testing for Antfly: the
   common VOPR engine and deterministic `std.Io` runtime integration.
-- [FLAKES.md](FLAKES.md) — Zig runtime flakes: recorded flake evidence,
-  reproduction conditions, and regression status.
+- [FLAKES.md](FLAKES.md) — Zig runtime flakes: table of flakes seen, where,
+  and whether they are open or closed (details in git history and PRs).
 - [BENCHMARKS.md](BENCHMARKS.md) — Benchmarks and build tools: commands for
   building and running benchmarks and tools from `zig/`.
 

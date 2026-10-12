@@ -1,85 +1,42 @@
-# DevOps Guide for Antfly
+# Minikube Deployment
 
-This guide explains how to deploy Antfly in a Minikube Kubernetes environment.
+Deploys an Antfly cluster to a local Minikube using the manifests in this directory and the published `ghcr.io/antflydb/antfly:latest` image. For production-style Kubernetes deployments, use the operator in `go/pkg/operator`.
 
 ## Prerequisites
 
-- Docker installed
-- Minikube installed
-- kubectl installed
-- Zig 0.16 installed (`make build` drives `zig build`), plus Node and pnpm for Antfarm
+- Docker
+- Minikube (the Makefile uses the `vfkit` driver)
+- kubectl
 
-## Building and Deploying
-
-### Local Build
-
-To build the application locally:
+## Deploy
 
 ```bash
-make build
+make minikube-start    # start Minikube, then run minikube-deploy
+make minikube-deploy   # pull and load the image, apply these manifests
+make minikube-status   # Antfly pods, services, and StatefulSets
 ```
 
-This will create an `antfly` binary in the current directory.
-
-### Minikube Deployment
-
-1. Start Minikube:
-
-```bash
-make minikube-start
-```
-
-2. Build and deploy to Minikube:
-
-```bash
-make minikube-deploy
-```
-
-This command will:
-- Build a Docker image for Antfly
-- Push the image to Minikube's Docker registry
-- Deploy the metadata and worker nodes to Minikube
-
-3. Check the status of the deployment:
-
-```bash
-make minikube-status
-```
-
-This will show the status of all pods, services, and deployments.
+`minikube-deploy` pulls the published image, tags it `antfly:latest`, loads it into Minikube (the manifests use `imagePullPolicy: Never`), and applies every manifest in this directory.
 
 ## Architecture
 
-The Minikube deployment consists of:
+| Component | Kind | Replicas | Ports |
+|-----------|------|----------|-------|
+| `antfly-metadata` | StatefulSet + headless `antfly-metadata-svc` | 3 | API 12377, Raft 9017, health 4200 |
+| `antfly-workers` | StatefulSet + headless `antfly-workers-svc` | 3 | API 12380, Raft 9021, health 4200 |
+| `public-api-svc` | NodePort → metadata API | — | 30002 |
 
-1. **metadata Node**: A single pod running with the `--metadata` flag.
-2. **Worker Nodes**: Four worker nodes running in a single pod with different IDs and ports:
-   - Worker 1: ID 1, Raft port 9021, API port 12380
-   - Worker 2: ID 2, Raft port 9022, API port 22380
-   - Worker 3: ID 3, Raft port 9023, API port 32380
-   - Worker 4: ID 4, Raft port 9024, API port 42380
+Shared configuration lives in the `antfly-config` ConfigMap.
 
-## Accessing the Services
-
-To access the services from your local machine, you can use port forwarding:
+## Access
 
 ```bash
-# Forward metadata API port
-kubectl port-forward svc/antfly-metadata-svc 12379:12379
-
-# Forward worker API ports
-kubectl port-forward svc/antfly-workers-svc 12380:12380 22380:22380 32380:32380 42380:42380
+minikube service public-api-svc --url --profile=minikube   # public API URL
+kubectl --context=minikube port-forward svc/antfly-metadata-svc 12377:12377
+kubectl --context=minikube port-forward svc/antfly-workers-svc 12380:12380
 ```
 
-## Cleaning Up
-
-To stop Minikube:
-
-```bash
-make minikube-delete
-```
-
-To delete the Minikube cluster:
+## Clean Up
 
 ```bash
 make minikube-delete
@@ -87,17 +44,9 @@ make minikube-delete
 
 ## Troubleshooting
 
-If pods are not starting properly, check the logs:
-
 ```bash
-kubectl logs -l app=antfly,role=metadata
-kubectl logs -l app=antfly,role=worker
+kubectl --context=minikube logs -l app=antfly,role=metadata
+kubectl --context=minikube logs -l app=antfly,role=worker
 ```
 
-If the Docker image isn't being found, ensure you're building with Minikube's Docker daemon:
-
-```bash
-eval $(minikube docker-env)
-docker pull ghcr.io/antflydb/antfly:latest
-docker tag ghcr.io/antflydb/antfly:latest antfly:latest
-```
+If pods report `ErrImageNeverPull`, rerun `make minikube-deploy` to load the image into Minikube.

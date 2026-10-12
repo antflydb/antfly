@@ -1,11 +1,11 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-01
+Last updated: 2026-10-12
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
-probes and superseded measurements, is preserved in
-[COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md).
+probes and superseded measurements, is preserved in the
+[experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md).
 
 ## Status at a glance
 
@@ -26,8 +26,8 @@ The current verification separates three questions:
 production artifacts. The smaller `tools/test_runtime_cache.py` fixtures check
 build options and generators. Neither establishes release performance.
 
-The earlier six-unit release baseline is recorded in
-[COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md), including Actions runs
+The earlier six-unit release baseline is recorded in the
+[experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md), including Actions runs
 `31643584514` and `31645335108`. Those runs predate this integration; their
 compiler timings and memory reservations are historical, not measurements of
 the current source roots. The matched x86_64 GNU release measurement below
@@ -224,8 +224,8 @@ the source-mutation matrix does not prove independence for every leaf file.
 
 > **Relocated:** The 2026-09-12 cold x86_64 Linux release-scheduling comparison
 > and the boundary-runtime-cost sample that previously lived here are
-> preserved verbatim in
-> [COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md#2026-09-12-cold-x86_64-linux-release-scheduling-and-boundary-runtime-cost).
+> preserved verbatim in the
+> [experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md#2026-09-12-cold-x86_64-linux-release-scheduling-and-boundary-runtime-cost).
 
 These per-archive reservations, adopted from that measurement, apply only to
 native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
@@ -314,8 +314,15 @@ There is one canonical Zig C API identity:
 - shared library: `libantfly`;
 - public header: `antfly.h`.
 
-Historical references to two C API libraries in the experiment ledger predate
-this consolidation.
+Historical references to two C API libraries in the
+[experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md) predate this consolidation.
+
+The storage archive compiles with function and data sections, and linked
+executables and `libantfly` link with section garbage collection
+(`pkg/antfly/build/runtime.zig`, `build_support/embedded/shared_library.zig`).
+When the C API first reused a shared runtime archive, `libantfly.so` grew from
+16.6 MB to 28.3 MB until section GC returned it to 16.55 MB. Keep section GC on
+for every linked product.
 
 #### Embedded inference
 
@@ -326,6 +333,15 @@ ABI without a server binary. Opening a Lite handle with the local-runtime
 configured flag reports `inference_mode: "local_embedded"` and
 `local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
 section). There is no inference-free `libantfly` product.
+
+ELF builds select LLVM for the C API, both Lite CLI build definitions, and their
+embedded inference and enrichment archives. The final export boundary requires LLD, which cannot link Zig's
+self-hosted Debug output. The provider archives must use the same backend:
+borrowed `std.Io` executors exchange internal Zig callback pointers, whose
+calling convention differs between LLVM and the self-hosted backend. Mixing
+them crashes the first provider background job even though the public C ABI
+links successfully. Keep the native `capi-smoke` runtime check alongside the
+export and executable/shared-consumer linkage checks.
 
 ## Why compiled boundaries are required
 
@@ -346,6 +362,24 @@ References:
 
 - [Zig compilation model](https://ziglang.org/documentation/0.16.0/#Compilation-Model)
 - [Zig 0.16 release notes](https://ziglang.org/download/0.16.0/release-notes.html)
+
+## Rejected approaches
+
+Each of these was measured and rejected; the evidence is in the
+[experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md#experiment-log). Do not retry one without new evidence
+that addresses the recorded reason.
+
+- Larger runners, swap, or serial (`-j1`) compilation as the fix: diagnostic
+  workarounds that lengthen the build or raise cost.
+- Source facades, import cleanups, or narrow call wrappers without moving
+  physical ownership: lazy file removal does not remove emitted code.
+- Small role splits (isolated local HA, remote-only metadata, API/control
+  coalescing, top-level inference command splits): they add aggregate LLVM
+  work and duplicate storage or engine code faster than they shorten the
+  critical unit.
+- Moving individual operations behind owner callbacks or vtables (exact-sort
+  merge, control-only write vtable) while the consumer still imports the
+  physical implementation: the shell is small and the broad root remains.
 
 ## Original failure conclusion
 
@@ -414,6 +448,14 @@ compiled runtime island.
 - Existing compact wire payloads or borrowed descriptors are preferred over
   universal JSON. JSON is acceptable when it is already the natural external
   form and profiling shows it is immaterial.
+- The storage batch and query owner calls still use internal JSON transport,
+  and it is a material remaining cost: a local Debug sample spent 8.9 ms
+  encoding/parsing a 1,000-document batch (owner batch 46.7 ms) and 11.2 ms
+  decoding a 1,000-hit query result (owner query 20.9 ms). A replacement compact
+  or borrowed transport must preserve complete-operation calls, provider-owned
+  result lifetimes, request validation, and exact error/cancellation semantics.
+  Measure with `storage_boundary_bench` (see
+  [Boundary runtime cost](#boundary-runtime-cost)).
 
 ### Operation granularity
 
@@ -507,7 +549,8 @@ variance in the other.
 ### Artifact and duplication budget
 
 Phase 4ab's accepted API split intentionally grew the executable to
-72,995,616 bytes, 5.20% above Phase 4aa and 11.40% above Phase 4y. That artifact
+72,995,616 bytes, 5.20% above Phase 4aa and 11.40% above Phase 4y (phases are
+described in the [experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md#phase-4y-post-main-ha-seed-source-selection-repair)). That artifact
 is now the comparison baseline for subsequent experiments, while the cumulative
 Phase 4y delta remains visible as architectural debt.
 
@@ -551,8 +594,10 @@ Repeat this loop until the exit criteria are satisfied:
      benefit; or
    - **revert** when the boundary duplicates the implementation, grows the
      wrong artifact, weakens behavior, or lacks a credible path to the target.
-8. Record full evidence in [COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md)
-   and update only the current baseline and decision here.
+8. Record full evidence in a new dated file under
+   [`docs/design/compilation/history/`](../docs/design/compilation/history/)
+   (see the [experiment-record policy](#experiment-record-policy)) and update
+   only the current baseline and decision here.
 
 ## Acceptance gates
 
@@ -617,7 +662,7 @@ normally needs:
 - a cold local ARM64 Linux musl `ReleaseFast` comparison; and
 - a cold normal-runner build for any candidate considered for acceptance.
 
-Historical numeric test counts belong in the experiment ledger. This living
+Historical numeric test counts belong in compilation history files. This living
 document names required suites so ordinary test growth does not make it stale.
 
 ## Canonical commands
@@ -644,12 +689,15 @@ The production packaging script at
 `../scripts/packaging/build_zig_release_archive.sh` uses the same unconditional
 split-storage `antfly` and `capi` topology.
 
-For a genuine cold comparison, add different empty paths on both sides:
+For a genuine cold comparison, add different empty paths on both sides. Keep
+them inside the worktree (under the ignored `.zig-cache/`), never in `/tmp` or
+`~/.cache` (see the [build-cache rules](../AGENTS.md#build-caches)), and delete them when the
+comparison is recorded:
 
 ```sh
 zig build antfly capi \
-  --cache-dir /tmp/antfly-candidate-local-cache \
-  --global-cache-dir /tmp/antfly-candidate-global-cache \
+  --cache-dir .zig-cache/cold/candidate-local \
+  --global-cache-dir .zig-cache/cold/candidate-global \
   -Dtarget=aarch64-linux-musl \
   -Doptimize=fast \
   -Dstrip=true \
@@ -660,7 +708,9 @@ zig build antfly capi \
   -Dproduction-lsm-only=true
 ```
 
-Do not compare a cold candidate with a warm baseline.
+Use `.zig-cache/cold/baseline-local` and `.zig-cache/cold/baseline-global` in
+the baseline worktree. Do not compare a cold candidate with a warm baseline.
+Remove the cold directories afterward (`rm -rf .zig-cache/cold`).
 
 ### Native Debug and compatibility
 
@@ -732,13 +782,13 @@ Run on an
 otherwise idle host. Record host, SDK, commit and cache state alongside results;
 native Darwin timings do not establish Linux cross-build performance.
 
-Start the exact candidate build with fresh caches, `--time-report`, and a local
-WebUI:
+Start the exact candidate build with fresh worktree-local caches (removed
+afterward, as above), `--time-report`, and a local WebUI:
 
 ```sh
 zig build antfly capi \
-  --cache-dir /tmp/antfly-report-local-cache \
-  --global-cache-dir /tmp/antfly-report-global-cache \
+  --cache-dir .zig-cache/cold/report-local \
+  --global-cache-dir .zig-cache/cold/report-global \
   -Dtarget=aarch64-linux-musl \
   -Doptimize=fast \
   -Dstrip=true \
@@ -799,11 +849,30 @@ Attribution uses Zig's named function and data sections. A monolithic object is
 reported as unassigned rather than being falsely attributed from the lazy
 compiler file list.
 
+### Boundary runtime cost
+
+`zig build antfly-storage-bench` installs `storage_boundary_bench`, which
+compares the internal batch encoder/parser with the production owner's batch
+operation, and the typed query-result parser with the owner's query operation
+(about 500-byte documents, ten iterations per JSON output line). Pass a new
+directory; the benchmark creates and removes it:
+
+```sh
+zig build antfly-storage-bench -Doptimize=Debug
+./zig-out/bin/storage_boundary_bench zig-out/boundary-benchmark-run
+```
+
+Each timing is a separate measurement, not additive phases of one request.
+
 ## Experiment-record policy
 
-Append full results to
-[COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md), not to the middle of
-this living design. Use this schema:
+Record full results in a new dated file under
+[`docs/design/compilation/history/`](../docs/design/compilation/history/), not in
+the middle of this living design, and add a row for it to the
+[history index](../docs/design/history.md). Name the file after what it records
+and its date (for example `darwin-release-cold-2026-10.md`). The
+[experiment ledger](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md) through 2026-10-11 is closed; do not append to it.
+Use this schema:
 
 | Field | Required content |
 |---|---|
@@ -823,7 +892,7 @@ this living design. Use this schema:
 
 Update the status table in this file only when an accepted candidate becomes
 the new comparison baseline. Rejected and intermediate measurements remain in
-the ledger and must not silently redefine “current.”
+history and must not silently redefine “current.”
 
 ## Definition of done
 

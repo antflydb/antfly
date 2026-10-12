@@ -3057,6 +3057,14 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: |
+            Pull-time qualified request profiles for this exact artifact,
+            including backend, supported features and min/max geometry.
+            Runtime admission revalidates artifact identity and resource limits.
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:

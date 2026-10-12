@@ -6050,7 +6050,8 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
-    errdefer self.allocator.free(out);
+    var raw_owned = true;
+    errdefer if (raw_owned) self.allocator.free(out);
     const weight_buf = toBuf(weight);
     if (weight_buf.quantized_storage) |storage| {
         const rows = try quantizedEmbeddingRows(storage, dim);
@@ -6171,7 +6172,11 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             @memcpy(out[i * dim .. (i + 1) * dim], emb_table[idx * dim .. (idx + 1) * dim]);
         }
     }
-    return self.makeBuf(out, true);
+    const result = try self.makeBuf(out, true);
+    raw_owned = false;
+    errdefer freeTensor(self, result);
+    _ = try self.withLogicalShape(result, &.{ @intCast(total), @intCast(dim) });
+    return result;
 }
 
 const QuantLinearKind = enum {
@@ -52315,4 +52320,31 @@ test "native integer numeric views retain exact bytes and propagate allocation f
     const exact = (try cb.exportTensorData(output, a)).?;
     defer a.free(exact.payload.bytes);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
+}
+
+test "native embedding rows preserve shape through Gemma PLE arithmetic and layer slicing" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const weight = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+    defer cb.free(weight);
+    const tokens = try cb.embeddingLookup(weight, &.{ 1, 0 }, 2, 4);
+    defer cb.free(tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, tensorStoredShape(tokens).?);
+    const scalar = try cb.fromFloat32Shape(&.{2}, &.{1});
+    defer cb.free(scalar);
+    const scaled = try cb.multiply(tokens, scalar);
+    defer cb.free(scaled);
+    const projection = try cb.fromFloat32Shape(&.{ 1, 1, 1, 1, 2, 2, 2, 2 }, &.{ 2, 4 });
+    defer cb.free(projection);
+    const combined = try cb.add(scaled, projection);
+    defer cb.free(combined);
+    const normalized = (try cb.multiplyScalar(combined, 0.5)).?;
+    defer cb.free(normalized);
+    const layer = try cb.sliceLastDim(normalized, 2, 4);
+    defer cb.free(layer);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorStoredShape(layer).?);
+    try std.testing.expectEqualSlices(f32, &.{ 7.5, 8.5, 4, 5 }, getData(layer));
 }

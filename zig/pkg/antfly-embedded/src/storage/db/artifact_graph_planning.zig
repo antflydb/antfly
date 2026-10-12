@@ -128,6 +128,25 @@ pub const Context = struct {
         return self.alloc.dupe(u8, try fork.get(key));
     }
 
+    /// Resolution input participates in the publication receipt and CAS guard.
+    pub fn getResolutionAlloc(self: *Context, key: []const u8) !?[]u8 {
+        for (self.base.artifact_sources) |source| if (std.mem.eql(u8, source.key, key)) {
+            return self.getAlloc(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        };
+        const sources = try self.owned.alloc(publication.ArtifactSource, self.base.artifact_sources.len + 1);
+        @memcpy(sources[0..self.base.artifact_sources.len], self.base.artifact_sources);
+        sources[sources.len - 1] = try self.guard(key);
+        std.mem.sort(publication.ArtifactSource, sources, {}, guardLess);
+        self.base.artifact_sources = sources;
+        return self.getAlloc(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
     fn guard(self: *Context, key: []const u8) !publication.ArtifactSource {
         var fork = try self.read.forkRead();
         defer fork.abort();

@@ -1937,8 +1937,22 @@ const RaftTableApplyStateMachine = struct {
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
-            const descriptor = storage_owner_descriptor orelse
-                return error.MissingStorageKernelOwnerDescriptor;
+            const descriptor = storage_owner_descriptor orelse {
+                // Released v0.2.1+ Raft commands did not pin owner descriptors.
+                // Use the already-prepared resident owner, as those writers
+                // did. This never resolves metadata on the progress thread;
+                // startup/control must open it first, or apply yields. The
+                // original atomic term/index receipt still prevents replay.
+                _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    entry,
+                );
+                if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+                return;
+            };
             try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
                 self.alloc,
                 group_id,
@@ -2573,6 +2587,9 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
         try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
+        inline for (.{ "attempts", "failures", "pages", "nanoseconds" }) |field| {
+            try health_metrics.appendPromMetric(writer, "antfly_lake_navigation_warming_" ++ field ++ "_total", "counter", "Bounded lake navigation warming " ++ field, @field(api_request_stats.lake_navigation_warming, field));
+        }
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
@@ -22937,7 +22954,10 @@ pub const DataServer = struct {
         table_filter: ?[]const []const u8,
     ) !RuntimeStatusRefreshCollection {
         const registration = self.store_registration orelse return error.UnsupportedOperation;
-        var snapshot = (try self.status_source.adminSnapshot()) orelse return error.UnsupportedOperation;
+        // Local status is collected below; fetching every store's diagnostic
+        // payload here creates a polling feedback loop and can monopolize the
+        // bounded diagnostic transfer lane. Use the fenced control authority.
+        var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.UnsupportedOperation;
         defer self.status_source.freeAdminSnapshot(&snapshot);
 
         var filter_map = std.StringHashMapUnmanaged(void).empty;
@@ -25992,6 +26012,7 @@ const RemoteMetadataSource = struct {
                 .supports_query_definitions = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
+                .control_snapshot = remoteControlSnapshot,
                 .acquire_join_planning = remoteAcquireJoinPlanning,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
@@ -26823,6 +26844,11 @@ const RemoteMetadataSource = struct {
             if (self.diagnostic_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
         }
         return null;
+    }
+
+    fn remoteControlSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.fetchSnapshotForHead(try self.fetchHead());
     }
 
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -39231,7 +39257,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
         }
 
-        test "data runtime status refresh publishes synthetic missing status for absent local group db" {
+        test "data runtime status refresh uses control metadata to publish synthetic missing status" {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -39247,13 +39273,22 @@ fn consumerTests() type {
                         .ptr = undefined,
                         .vtable = &.{
                             .status = status,
-                            .admin_snapshot = adminSnapshot,
+                            .admin_snapshot = rejectDiagnosticSnapshot,
+                            .cached_admin_snapshot = cachedControlSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                             .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
                             .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                         },
                     };
+                }
+
+                fn rejectDiagnosticSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedDiagnosticSnapshot;
+                }
+
+                fn cachedControlSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
+                    return try adminSnapshot(ptr);
                 }
 
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {

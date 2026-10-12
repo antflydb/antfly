@@ -18430,6 +18430,8 @@ pub const GraphMetricProfile = struct {
 
 /// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
 pub const GraphMetricQuery = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Optional result key. Defaults to the metric name.
     name: ?[]const u8 = null,
     /// Graph index that owns the published metric.
@@ -18447,6 +18449,7 @@ pub const GraphMetricQuery = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "name", "name", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
@@ -18466,6 +18469,10 @@ pub const GraphMetricQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         if (self.name) |value| {
             try jw.objectField("name");
             try jw.write(value);
@@ -18496,6 +18503,8 @@ pub const GraphMetricQuery = struct {
 
 /// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
 pub const GraphMetricRerank = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Graph index that owns the published metric.
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
@@ -18519,6 +18528,7 @@ pub const GraphMetricRerank = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
         .{ "candidate_count", "candidate_count", true },
@@ -18541,6 +18551,10 @@ pub const GraphMetricRerank = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         try jw.objectField("index");
         try jw.write(self.index);
         try jw.objectField("metric");
@@ -20564,6 +20578,8 @@ pub const GraphTraversal = struct {
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
+    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
@@ -20591,6 +20607,7 @@ pub const GraphTraversal = struct {
         .{ "max_depth", "max_depth", true },
         .{ "edge_weight", "edge_weight", true },
         .{ "limit", "limit", true },
+        .{ "deduplicate_nodes", "deduplicate_nodes", true },
         .{ "include_paths", "include_paths", true },
         .{ "include_documents", "include_documents", true },
         .{ "fields", "fields", true },
@@ -20636,6 +20653,10 @@ pub const GraphTraversal = struct {
         }
         if (self.limit) |value| {
             try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
             try jw.write(value);
         }
         if (self.include_paths) |value| {
@@ -25515,6 +25536,8 @@ pub const InferenceModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const InferenceModelInfo = struct {
+    /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -25522,6 +25545,7 @@ pub const InferenceModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -25536,6 +25560,10 @@ pub const InferenceModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
         if (self.capabilities) |value| {
             try jw.objectField("capabilities");
             try jw.write(value);

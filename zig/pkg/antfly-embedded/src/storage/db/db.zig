@@ -8367,6 +8367,17 @@ pub const DB = struct {
     /// right after a DB is opened, since managed DBs open lazily and cannot
     /// thread the source through `OpenOptions`. No-op when this DB has no
     /// resolution runtime (e.g. read-only / status opens).
+    /// The embedder must outlive all resolution work. Call under the owner fence
+    /// when replacing a managed enrichment runtime.
+    pub fn setResolutionEmbedder(self: *DB, embedder: ?embedder_mod.DenseEmbedder) void {
+        if (self.resolution_runtime) |runtime| {
+            while (!runtime.catch_up_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer runtime.catch_up_mutex.unlock();
+            runtime.embedder = embedder;
+        }
+        self.resolution_embedder = embedder;
+    }
+
     pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
         self.resolution_candidate_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
@@ -13602,6 +13613,7 @@ pub const DB = struct {
         err_name: []const u8,
         terminal: bool,
     ) !void {
+        if (terminal) std.log.warn("index repair failed terminally repair_id={x} err={s}", .{ repair_id, err_name });
         try self.updateIndexRepairIntentWithBindingEffect(
             alloc,
             repair_id,
@@ -21699,7 +21711,10 @@ pub const DB = struct {
                 // Restore opens with optional workers disabled and drains them
                 // synchronously. Starting a background worker here races the
                 // foreground catch-up in the next phase over index mutation.
-                if (self.local_execution.optional_runtime_workers_enabled) try runtime.start();
+                if (self.local_execution.optional_runtime_workers_enabled)
+                    try runtime.start()
+                else
+                    try runtime.resumeInlineAfterStop();
                 std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
             }
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
@@ -29175,7 +29190,7 @@ pub const DB = struct {
     }
 
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
-        if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
+        if (!self.core.hasGeneratedEnrichmentTargets() and self.core.index_manager.enrichments.items.len == 0) return .{};
         const resources = self.core.batchExecutionResources();
         const checkpoint = try enrichment_state.loadProjectionCheckpoint(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
         const applied = checkpoint.applied_sequence;
@@ -29190,6 +29205,7 @@ pub const DB = struct {
             .projection_checkpoint_generation = checkpoint.generation,
             .projection_checkpoint_config_hash = checkpoint.config_hash,
             .checkpoint_replay_tail_sequence_count = target -| checkpoint.applied_sequence,
+            .last_error_code = status.last_error_code,
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
@@ -34596,6 +34612,56 @@ pub const DB = struct {
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 
+    /// A table restore reassigns canonical document identities after native
+    /// validation creates selective repair debt. That debt is still unstarted
+    /// and belongs to this unpublished candidate, so bind fresh replica-local
+    /// repair identities to the destination group before running any quantum.
+    /// Calling again after a crash between namespace publication and this
+    /// checkpoint write completes the same transition without losing debt.
+    pub fn rebindUnstartedNativeRestoreRepairIdentity(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        if (self.open_mode != .writer_no_replay) return error.InvalidNativeRestoreOpenMode;
+        const location = try self.indexRepairStateLocation();
+        var state = index_repair_state.loadAt(self.alloc, location) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer state.deinit(self.alloc);
+        const group_id = self.localRepairGroupId();
+        const needs_rebind = for (state.entries.items) |entry| {
+            if (entry.intent.group_id != group_id) break true;
+        } else false;
+        if (!needs_rebind) return;
+        var restore = (try readRestoreStateForPathAlloc(self.alloc, self.core.path)) orelse
+            return error.InvalidRestoreImportMarker;
+        defer restore.deinit(self.alloc);
+        if (!restore.primary_restored or !std.mem.eql(u8, restore.phase, "repair_indexes"))
+            return error.InvalidRestoreImportMarker;
+        const intents = try self.alloc.alloc(index_repair_state.IndexRepairIntent, state.entries.items.len);
+        defer self.alloc.free(intents);
+        for (state.entries.items, intents) |entry, *intent| {
+            if (entry.intent.trigger != .projection_generation_invalid or
+                entry.intent.phase != .detected or entry.intent.owner_epoch != 0 or
+                entry.intent.source_replay_state != .not_required or
+                entry.intent.candidate_relative_path != null or entry.pin != null or
+                entry.intent.root_generation != self.core.root_generation)
+                return error.InvalidIndexRepairTransition;
+            intent.* = entry.intent;
+            intent.group_id = group_id;
+        }
+        var rebound = try index_repair_state.resetForRootGenerationWithIntentsAt(
+            self.alloc,
+            location,
+            state.identity,
+            self.core.root_generation,
+            intents,
+        );
+        rebound.deinit(self.alloc);
+    }
+
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
@@ -38623,7 +38689,7 @@ pub const DB = struct {
                 rerank.seed_nodes,
                 rerank.damping,
                 node_ids,
-                .{ .cancellation = req.cancellation orelse .none },
+                .{ .cancellation = req.cancellation orelse .none, .direction = @fromBackingInt(@intCast(@backingInt(rerank.direction))) },
             );
         } else try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
             .require_published = true,
@@ -38710,7 +38776,7 @@ pub const DB = struct {
                 named.query.seed_nodes,
                 named.query.damping,
                 named.query.top_k,
-                .{ .cancellation = cancellation orelse .none },
+                .{ .cancellation = cancellation orelse .none, .direction = @fromBackingInt(@intCast(@backingInt(named.query.direction))) },
             );
         } else try entry.index.graphMetricTopKSnapshotAlloc(
             named.query.metric_name,
@@ -76749,7 +76815,10 @@ test "db enrichments precomputed watermark advances across replay entries withou
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    // This probes foreground precomputed advancement; a concurrent replay
+    // worker could consume the inert entry before the initial observation.
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -114536,23 +114605,18 @@ test "db text compaction preserves ordinal filters across reopen" {
     }
 }
 
-test "db provisioning reopen preserves an older encoding of the same schema epoch" {
+test "db v02 provisioning binds released epoch with missing local public metadata" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db-schema-format-retry");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
-    const schema_json =
-        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
-    ;
+    const schema_json = @embedFile("../testdata/v02-server/schema.json");
     var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
     defer schema_mod.freeSchema(alloc, runtime_schema);
-    // The text projection still uses the deployed document-schema format.
-    // This default schema has no capability-only fields to exclude.
-    const original = try schema_mod.serializeTextProjectionSchema(alloc, runtime_schema);
-    defer alloc.free(original);
+    const original = @embedFile("../testdata/v02-server/schema.asch");
     const versioned_key = try schema_mod.schemaVersionKeyAlloc(alloc, 0);
     defer alloc.free(versioned_key);
     const active_key = "\x00\x00__metadata__:schema";
@@ -114562,6 +114626,10 @@ test "db provisioning reopen preserves an older encoding of the same schema epoc
         try db.setSchemaJson(alloc, schema_json);
         try db.core.store.put(active_key, original);
         try db.core.store.put(versioned_key, original);
+        try db.core.store.delete(public_schema_json_key);
+        const public_version_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, 0);
+        defer alloc.free(public_version_key);
+        try db.core.store.delete(public_version_key);
     }
     for (0..3) |_| {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -114570,12 +114638,15 @@ test "db provisioning reopen preserves an older encoding of the same schema epoc
         });
         defer db.close();
         try std.testing.expect(try schema_mod.schemasEqual(alloc, runtime_schema, db.core.schema.?));
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        try std.testing.expect(view.validator() != null);
         for ([_][]const u8{ active_key, versioned_key }) |key| {
             const actual = try db.core.store.get(alloc, key);
             defer alloc.free(actual);
             try std.testing.expectEqualSlices(u8, original, actual);
         }
-        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"text\":\"still writable\"}" }} });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"_type\":\"doc\",\"body\":\"still writable\",\"count\":7}" }} });
     }
 }
 
@@ -126637,22 +126708,27 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
     try DB.markRestoreRuntimeRepairNeeded(alloc, std.mem.span(restore_path));
     try std.testing.expect(try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path)));
 
-    // Keep every repair phase isolated in writer-no-replay mode so background
-    // workers cannot accidentally make the assertion pass.
-    while (try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path))) {
+    // Run every phase on one writer-no-replay owner without background
+    // workers so inline provider admission and completion proofs are required.
+    {
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
         var restored = try DB.open(alloc, std.mem.span(restore_path), .{
             .primary_backend = primary_backend,
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
+            .start_optional_runtime_workers = false,
             .enrichment = .{
                 .owner_id = "worker-a",
                 .dense_embedder = deterministic.interface(),
             },
         });
         defer restored.close();
-
-        try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+        // Keep the same runtime across reset, source replay and inline drain.
+        // Reopening between phases would hide a stale shutdown admission flag.
+        while (try restored.restoreRuntimeRepairNeeded()) {
+            try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+            try std.testing.expect(!restored.enrichment_runtime.?.isStarted());
+        }
     }
 
     {
@@ -134071,4 +134147,52 @@ test "issue1015 degraded primary writes reject backlog exhaustion before commit"
         };
     }
     return error.TestUnexpectedResult;
+}
+
+test "db v02 native restore repairs released projections" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("db");
+    defer tmp.cleanup();
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(tmp.path().ptr));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const snapshot_root = "pkg/antfly-embedded/src/storage/testdata/v02-server/native";
+    try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged, alloc, std.testing.io, snapshot_root, staged.path(), .{}, .{
+        .backup_id = "released-native",
+        .location = "local",
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        .snapshot_path = snapshot_root,
+        .group_id = 4351204774573063798,
+    });
+    var db = try DB.open(alloc, staged.path(), .{
+        .open_mode = .writer_no_replay,
+        .staged_generation = &staged,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer db.close();
+    // Match the public restore: the source snapshot keeps its old group, then
+    // the hidden destination receives a fresh table/replica namespace.
+    try db.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 123, .shard_id = 456, .range_id = 456 });
+    try db.rebindUnstartedNativeRestoreRepairIdentity(&staged);
+    try db.rebindUnstartedNativeRestoreRepairIdentity(&staged);
+    const row = (try db.get(alloc, "a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+    _ = try db.rehydrateSchemaJson(@embedFile("../testdata/v02-server/schema.json"));
+    _ = try @import("../../metadata/index_reconcile.zig").reconcileDbIndexesWithOptions(alloc, &db, @embedFile("../testdata/v02-server/native-indexes.json"), .{ .drain_resolver_backfill = false });
+    for (0..30) |_| {
+        _ = db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(alloc, std.testing.io, .{}) catch |err| {
+            if (err == error.RestoreRuntimeRepairIncomplete) continue;
+            const path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
+            defer alloc.free(path);
+            var state = try index_repair_state.load(alloc, path);
+            defer state.deinit(alloc);
+            for (state.entries.items) |entry| std.debug.print("native repair {s}: {s} {?s}\n", .{ entry.intent.index_name, @tagName(entry.intent.phase), entry.intent.last_error });
+            return err;
+        };
+        if (!try db.restoreRuntimeRepairNeeded()) return;
+    }
+    return error.RestoreRuntimeRepairIncomplete;
 }

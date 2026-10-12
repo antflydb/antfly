@@ -10245,12 +10245,15 @@ test "append merge uses fixed scratch for sparse document spaces and deletion ra
     var deleted = roaring.RoaringBitmap.init(a);
     defer deleted.deinit();
     try deleted.add(7);
+    // Compare allocate/copy/free peaks independently of whether the backing
+    // heap can grow or relocate a particular allocation in place.
+    var stable = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
     var peaks: [2]usize = undefined;
     for ([_]u32{ 1024, 100_000 }, 0..) |space, case| {
         var output = @import("../segment.zig").MemorySegmentSink.init(a);
         defer output.deinit();
         var sink = output.sink();
-        var budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 256 * 1024 };
+        var budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = stable.allocator(), .limit = 256 * 1024 };
         try writeMergedInvertedSectionSlotsWithDeletes(budget.allocator(), &sink, @as([]const ?[]const u8, &.{ bytes, null, bytes }), &.{ space, 7, space }, &.{ deleted, null, deleted }, productionIndexConfig());
         peaks[case] = budget.peak;
         var reader = try ScopedInvertedIndexReader.initContiguous(a, output.out.items);

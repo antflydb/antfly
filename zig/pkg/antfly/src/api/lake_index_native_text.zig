@@ -28,9 +28,15 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const statistics = @import("lake_index_text_statistics.zig");
+pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
-pub const metadata_version: u16 = 9;
+// Paged canonical inventories, term directories and pending DF runs require
+// a new wire identity. Catalog protocol 34 fences older workers before decode.
+pub const metadata_version: u16 = 10;
+pub fn supportsBuildMetadata(version: u16) bool {
+    return version == 9 or version == metadata_version;
+}
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
 /// Source duplication is an explicit per-index policy. The complete config
@@ -65,17 +71,37 @@ test "external lake stored source recipe attests production without changing sou
     try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
 }
 pub const physical = @import("lake_index_physical_ordinals.zig");
+pub const text_directory = @import("lake_index_text_directory.zig");
+pub const SegmentRouting = struct {
+    pub const Field = local.segment.SegmentReader.RoutingField;
+    ref: artifacts.ChunkRef,
+    summary: ?statistics.Ref,
+    bytes: u64,
+    doc_count: u32,
+    fields: []const Field,
+    descriptor: ?artifacts.ChunkRef = null,
+};
 pub const FileGroup = struct {
     file: state.File,
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
     summaries: []const ?statistics.Ref = &.{},
     opening_packs: []const @import("lake_index_text_opening_pack.zig").Pack = &.{},
+    admissions: []const local.segment.SegmentReader.Admission = &.{},
+    descriptors: []const artifacts.ChunkRef = &.{},
+    physical_manifest: ?artifacts.ChunkRef = null,
+    /// Query-only intervals map selected segment ordinals to original file ranks.
+    selected: []const text_directory.Interval = &.{},
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.opening_packs.len > 65536) return error.InvalidNativeLakeTextCorpus;
         for (self.opening_packs) |pack| try pack.validate(domain);
         if (self.summaries.len != 0 and self.summaries.len != self.segments.len) return error.InvalidNativeLakeTextCorpus;
+        if (self.admissions.len != 0 and self.admissions.len != self.segments.len) return error.InvalidNativeLakeTextCorpus;
+        if (self.descriptors.len != 0 and self.descriptors.len != self.segments.len) return error.InvalidNativeLakeTextCorpus;
+        for (self.descriptors) |ref| try text_directory.validateRef(ref, domain);
+        if (self.physical_manifest) |ref| try text_directory.validateRef(ref, domain);
+        for (self.admissions) |metadata| try metadata.validate();
         for (self.summaries) |summary| if (summary) |ref| try ref.validate();
         try state.validate(&.{self.file}, domain);
         _ = try physical.validate(self.rows);
@@ -91,6 +117,62 @@ pub const FileGroup = struct {
         }
     }
 };
+pub const Collection = struct {
+    pub const Field = struct { name: []const u8, total_length: u64 };
+    documents: u32,
+    fields: []const Field,
+    fn validate(self: Collection) !void {
+        for (self.fields, 0..) |field, i| {
+            if (field.name.len == 0 or (i != 0 and std.mem.order(u8, self.fields[i - 1].name, field.name) != .lt)) return error.InvalidNativeLakeTextCorpus;
+        }
+    }
+};
+/// Collection state retains one counter per field, independently of the
+/// number of files/segments whose durable manifests have been consumed.
+const CollectionBuilder = struct {
+    a: A,
+    documents: u32 = 0,
+    segments: u32 = 0,
+    fields: std.StringHashMapUnmanaged(u64) = .empty,
+    fn deinit(self: *@This()) void {
+        var keys = self.fields.keyIterator();
+        while (keys.next()) |key| self.a.free(key.*);
+        self.fields.deinit(self.a);
+    }
+    fn field(self: *@This(), name: []const u8, length: u64, subtract: bool) !void {
+        if (self.fields.getPtr(name)) |value| {
+            value.* = if (subtract) try std.math.sub(u64, value.*, length) else try std.math.add(u64, value.*, length);
+        } else {
+            if (subtract and length != 0) return error.InvalidNativeLakeTextCorpus;
+            const owned = try self.a.dupe(u8, name);
+            errdefer self.a.free(owned);
+            try self.fields.put(self.a, owned, length);
+        }
+    }
+    fn add(self: *@This(), group: FileGroup, subtract: bool) !void {
+        const count: u32 = @intCast(group.segments.len);
+        self.segments = if (subtract) try std.math.sub(u32, self.segments, count) else try std.math.add(u32, self.segments, count);
+        if (self.segments > max_segments) return error.NativeLakeTextCorpusTooLarge;
+        for (group.admissions) |segment| {
+            self.documents = if (subtract) try std.math.sub(u32, self.documents, segment.doc_count) else try std.math.add(u32, self.documents, segment.doc_count);
+            for (segment.fields) |f| if (f.stats) |stats| try self.field(f.name, stats.total_field_len, subtract);
+        }
+    }
+    fn finish(self: *@This(), out: A) !Collection {
+        const fields = try out.alloc(Collection.Field, self.fields.count());
+        var it = self.fields.iterator();
+        for (fields) |*f| {
+            const entry = it.next().?;
+            f.* = .{ .name = try out.dupe(u8, entry.key_ptr.*), .total_length = entry.value_ptr.* };
+        }
+        std.mem.sort(Collection.Field, fields, {}, struct {
+            fn less(_: void, l: Collection.Field, r: Collection.Field) bool {
+                return std.mem.order(u8, l.name, r.name) == .lt;
+            }
+        }.less);
+        return .{ .documents = self.documents, .fields = fields };
+    }
+};
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
@@ -104,12 +186,70 @@ pub const Root = struct {
     recipe: [32]u8 = @splat(0),
     file_groups: []const FileGroup = &.{},
     manifests: []const artifacts.ChunkRef = &.{},
+    /// Authenticated paged serving inventory; file manifests remain maintenance units.
+    serving_inventory: ?statistics.Ref = null,
+    inventory_version: u8 = 1,
+    file_count: u32 = 0,
+    segment_count: u32 = 0,
+    directories: text_directory.Roots = .{},
+    serving_routes: ?statistics.Ref = null,
+    segment_files: ?statistics.Ref = null,
+    collection: ?Collection = null,
+    /// Query-selected serving view only; never persisted.
+    partial_inventory: bool = false,
+    /// Expanded serving view only; never accepted in a persisted directory.
+    routing: []const []const SegmentRouting = &.{},
+    admission_version: u8 = 0,
     statistics_version: u8 = 0,
     term_statistics: ?statistics.Ref = null,
+    /// Non-serving resumable checkpoint: signed DF runs relative to the base.
+    /// Final publication folds these once and never exposes pending deltas.
+    statistics_deltas: []const @import("lake_index_delta_runs.zig").Run = &.{},
+    term_directory: term_directory.Roots = .{},
+    pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Root).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "statistics_deltas")) {
+                if (self.statistics_deltas.len != 0) {
+                    try stream.objectField(field);
+                    try stream.write(@field(self, field));
+                }
+            } else {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
     pub fn validate(self: Root) !void {
+        return self.validateAlloc(std.heap.page_allocator);
+    }
+    fn validateAlloc(self: Root, a: A) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
-        if (self.statistics_version > 1 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
+        if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
+        if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.serving_inventory) |ref| try ref.validate();
+        if (self.serving_routes) |ref| try ref.validate();
+        if (self.segment_files) |ref| try ref.validate();
+        if (self.collection) |collection| try collection.validate();
+        try self.directories.validate();
+        if (self.file_count > 16384 or self.segment_count > max_segments) return error.InvalidNativeLakeTextCorpus;
+        if (self.inventory_version < 1 or self.inventory_version > 3) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
+        if (self.statistics_deltas.len != 0) {
+            if (self.statistics_version != 1 or self.inventory_version != 1 or self.statistics_deltas.len > 32) return error.InvalidNativeLakeTextCorpus;
+            var levels: u32 = 0;
+            for (self.statistics_deltas) |run| {
+                if (run.level >= 32 or levels & (@as(u32, 1) << @as(u5, @intCast(run.level))) != 0) return error.InvalidNativeLakeTextCorpus;
+                levels |= @as(u32, 1) << @as(u5, @intCast(run.level));
+                try run.page.validate();
+            }
+        }
+        if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
+        if ((self.term_directory.branches == null) != (self.term_directory.leaves == null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.term_directory.branches) |ref| try ref.validate();
+        if (self.term_directory.leaves) |ref| try ref.validate();
         try self.binding.validate();
         if (self.binding.sidecar_kind != .text) return error.InvalidNativeLakeTextCorpus;
         if (self.file_groups.len > 16384) return error.InvalidNativeLakeTextCorpus;
@@ -122,7 +262,8 @@ pub const Root = struct {
         var segment_position: usize = 0;
         for (self.file_groups) |group| {
             try group.validate(self.domain);
-            if (self.statistics_version == 1 and group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+            if (self.admission_version == 1 and group.admissions.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+            if (self.statistics_version >= 1 and group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
             for (group.segments) |segment| {
                 if (segment_position >= self.segments.len or (!std.mem.eql(u8, segment.artifact_id, self.segments[segment_position].artifact_id) or !std.mem.eql(u8, segment.checksum, self.segments[segment_position].checksum) or segment.byte_len != self.segments[segment_position].byte_len)) return error.InvalidNativeLakeTextCorpus;
                 segment_position += 1;
@@ -130,26 +271,37 @@ pub const Root = struct {
         }
         if (self.file_groups.len != 0 and segment_position != self.segments.len) return error.InvalidNativeLakeTextCorpus;
         var identities: std.StringHashMapUnmanaged(void) = .empty;
-        defer identities.deinit(std.heap.page_allocator);
+        defer identities.deinit(a);
         for (self.segments) |segment| {
             if (segment.byte_len == 0 or segment.byte_len > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(segment.artifact_id, segment.checksum);
             const scope = (try stores.uploadScopeFromArtifactId(segment.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
-            if (!std.mem.eql(u8, &scope.domain, &self.domain) or (try identities.getOrPut(std.heap.page_allocator, segment.artifact_id)).found_existing) return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &self.domain) or (try identities.getOrPut(a, segment.artifact_id)).found_existing) return error.InvalidNativeLakeTextCorpus;
         }
     }
 };
 /// Read only the authenticated root directory; callers own child admission.
 pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .text_segment or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    if (ref.kind != .text_segment or !supportsBuildMetadata(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
-    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    if (root.version != ref.metadata_version) return error.InvalidNativeLakeTextCorpus;
+    // Historical roots remain usable by recovery/retained readers. Reconciliation
+    // only advertises the new identity and upgrades protocol-33 publications.
+    root.version = metadata_version;
     try root.validate();
+    if (root.inventory_version == 3 and (root.manifests.len != 0 or root.file_groups.len != 0 or root.segments.len != 0 or (root.file_count != 0 and root.directories.files == null))) return error.InvalidNativeLakeTextCorpus;
+    if (root.routing.len != 0 or root.partial_inventory) return error.InvalidNativeLakeTextCorpus;
     if (root.manifests.len != 0 and (root.segments.len != 0 or root.file_groups.len != 0)) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
     return root;
+}
+/// Directory-only metadata has a distinct cache type from expanded roots.
+pub const Directory = struct { root: Root };
+pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Directory {
+    return .{ .root = try loadRootDirectory(a, store, ref, cancellation, cache) };
 }
 /// One independently admitted immutable file manifest. Share validation with
 /// serving while allowing GC to checkpoint between file jobs.
@@ -160,22 +312,205 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
     const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
     defer a.free(bytes);
     const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    if (group.selected.len != 0) return error.InvalidNativeLakeTextCorpus;
     try group.validate(domain);
     return group;
 }
+/// Cold corpus admission borrows independently cached manifests. Leases end
+/// after the corpus has copied its metadata; warm corpora need only a directory.
+pub const Inventory = struct {
+    root: Root,
+    manifests: []?@import("lake_index_decoded_metadata.zig").Owned(FileGroup),
+    pub fn deinit(self: Inventory) void {
+        for (self.manifests) |manifest| if (manifest) |owned| owned.release();
+    }
+};
+pub fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    return loadFileManifest(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, scope.domain, cancellation, cache);
+}
+pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    return admitInventoryBounded(a, std.heap.page_allocator, directory, store, cached, cancellation);
+}
+pub fn admitInventoryBounded(a: A, scratch_backing: A, directory_value: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    if (directory_value.statistics_deltas.len != 0) return error.InvalidNativeLakeTextCorpus;
+    if (directory_value.inventory_version == 3 and directory_value.file_groups.len == 0) return admitServingInventory(a, scratch_backing, directory_value, store, cached, cancellation);
+    const directory = try text_directory.withManifests(a, directory_value, store, cached, cancellation);
+    if (directory.inventory_version >= 2 and directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, false), .manifests = &.{} };
+    if (directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try readServingInventory(a, scratch_backing, directory, store, cached, cancellation), .manifests = &.{} };
+    const Owned = @import("lake_index_decoded_metadata.zig").Owned(FileGroup);
+    const manifests = try a.alloc(?Owned, directory.manifests.len);
+    @memset(manifests, null);
+    var inventory: Inventory = .{ .root = directory, .manifests = manifests };
+    errdefer inventory.deinit();
+    if (manifests.len == 0 or directory.file_groups.len != 0) {
+        try directory.validateAlloc(scratch_backing);
+        return inventory;
+    }
+    const Work = struct {
+        directory: Root,
+        store: stores.ArtifactStore,
+        cached: artifacts.CachedRead,
+        cancellation: Cancellation,
+        manifests: []?Owned,
+        next: std.atomic.Value(usize) = .init(0),
+        bytes: std.atomic.Value(usize) = .init(0),
+        fn run(self: *@This()) anyerror!void {
+            while (true) {
+                try self.cancellation.check();
+                try self.cached.context.ensureActive();
+                const index = self.next.fetchAdd(1, .monotonic);
+                if (index >= self.manifests.len) return;
+                const manifest = self.directory.manifests[index];
+                const owned = try @import("lake_index_decoded_metadata.zig").acquire(FileGroup, self.cached, self.store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len }, self.cancellation, loadCachedFile);
+                errdefer owned.release();
+                try owned.value.validate(self.directory.domain);
+                // Bound actual decoded capacity, independently of active decode
+                // admission. No arbitrary aggregate wire-byte cutoff is needed.
+                const bytes = owned.lease.item.budget.live;
+                var retained = self.bytes.load(.monotonic);
+                while (true) {
+                    if (bytes > 64 * 1024 * 1024 -| retained) return error.NativeLakeTextCorpusTooLarge;
+                    retained = self.bytes.cmpxchgWeak(retained, retained + bytes, .monotonic, .monotonic) orelse break;
+                }
+                self.manifests[index] = owned;
+            }
+        }
+    };
+    var work: Work = .{ .directory = directory, .store = store, .cached = cached, .cancellation = cancellation, .manifests = manifests };
+    const scheduler = local.sql_parallel_scheduler;
+    var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
+    // Join before output leases or borrowed request data can be released.
+    defer if (cached.context.io) |io| for (&tasks) |*slot| if (slot.*) |*task| {
+        task.cancel(io) catch {};
+    };
+    if (cached.context.io) |io| for (tasks[0..@min(3, manifests.len - 1)]) |*slot| {
+        slot.* = scheduler.global().submitIo(io, 8 * 1024 * 1024, Work.run, .{&work});
+    };
+    try work.run();
+    if (cached.context.io) |io| for (&tasks) |*slot| if (slot.*) |*task| {
+        var joined = task.*;
+        slot.* = null;
+        try joined.await(io);
+    };
+    var count: usize = 0;
+    for (manifests) |manifest| {
+        const group = manifest.?.value;
+        if (group.segments.len > max_segments -| count) return error.InvalidNativeLakeTextCorpus;
+        count += group.segments.len;
+    }
+    const groups = try a.alloc(FileGroup, manifests.len);
+    const segments = try a.alloc(artifacts.ChunkRef, count);
+    var offset: usize = 0;
+    for (manifests, groups) |manifest, *group| {
+        group.* = manifest.?.value.*;
+        @memcpy(segments[offset..][0..group.segments.len], group.segments);
+        offset += group.segments.len;
+    }
+    inventory.root.file_groups = groups;
+    inventory.root.segments = segments;
+    try inventory.root.validateAlloc(scratch_backing);
+    return inventory;
+}
+
+pub fn admitSelectedServingInventory(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, files: []const [32]u8) !Inventory {
+    if (directory.inventory_version == 3) return .{ .root = try text_directory.loadSelected(a, scratch_backing, directory, store, cached, cancellation, files), .manifests = &.{} };
+    return .{ .root = try @import("lake_index_serving_inventory.zig").loadSelected(a, scratch_backing, directory, store, cached, cancellation, files), .manifests = &.{} };
+}
+pub fn admitServingInventory(a: A, scratch_backing: A, directory_value: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    if (directory_value.routing.len != 0) return .{ .root = directory_value, .manifests = &.{} };
+    if (directory_value.inventory_version == 3 and directory_value.file_groups.len == 0) return .{ .root = try text_directory.loadAll(a, scratch_backing, directory_value, store, cached, cancellation), .manifests = &.{} };
+    const directory = directory_value;
+    if (directory.routing.len != 0) return .{ .root = directory, .manifests = &.{} };
+    if (directory.inventory_version >= 2 and directory.serving_routes != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, true), .manifests = &.{} };
+    return admitInventoryBounded(a, scratch_backing, directory, store, cached, cancellation);
+}
+// Serving records are bounded chunks of one file descriptor, ordered by file
+// and byte offset. This preserves the existing validated descriptor contract
+// while packing many small files into ordinary 32 KiB authenticated pages.
+// Only one encoded descriptor is retained while streaming in either direction.
+const inventory_chunk_bytes = 16 * 1024;
+const inventory_tree = @import("../serverless/graph_segment/page_tree.zig");
+const inventory_pages = @import("../serverless/graph_segment/page_store.zig");
+fn readServingInventory(a: A, scratch_backing: A, directory: Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Root {
+    const Read = struct {
+        cached: artifacts.CachedRead,
+        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cached.context.ensureActive();
+            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
+            try stores.chargeReadBudget(budget, length);
+            return artifacts.readArtifact(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        }
+    };
+    var reader: Read = .{ .cached = cached };
+    var store = store_value;
+    var reads: u64 = 128 * 1024 * 1024;
+    var writes: u64 = 0;
+    var pages: inventory_pages.PageStore = .{ .domain = directory.domain, .artifacts = &store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &reader, .read = Read.page } };
+    // Cursor pages and encoded descriptor scratch are released immediately;
+    // only the parsed serving descriptors enter the admission allocator.
+    var scratch_budget: local.sql_memory_budget = .{ .backing = scratch_backing, .limit = 8 * 1024 * 1024 };
+    const scratch = scratch_budget.allocator();
+    var cursor = try inventory_tree.Cursor.init(scratch, pages.store(), directory.serving_inventory, "", null);
+    defer cursor.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(scratch);
+    var groups: std.ArrayList(FileGroup) = .empty;
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    while (try cursor.next()) |record| {
+        try cached.context.ensureActive();
+        try cancellation.check();
+        if (record.key.len != 8 or record.value.len == 0 or record.value.len > inventory_chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+        const file = std.mem.readInt(u32, record.key[0..4], .big);
+        const offset = std.mem.readInt(u32, record.key[4..8], .big);
+        if (offset == 0 and bytes.items.len != 0) {
+            try appendServingGroup(a, directory, bytes.items, &groups, &segments, cancellation);
+            bytes.clearRetainingCapacity();
+        }
+        if (file != groups.items.len or offset != bytes.items.len or record.value.len > max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+        try bytes.appendSlice(scratch, record.value);
+    }
+    if (bytes.items.len != 0) try appendServingGroup(a, directory, bytes.items, &groups, &segments, cancellation);
+    if (groups.items.len != directory.manifests.len) return error.InvalidNativeLakeTextCorpus;
+    var root = directory;
+    root.file_groups = groups.items;
+    root.segments = segments.items;
+    try root.validateAlloc(scratch_backing);
+    return root;
+}
+fn appendServingGroup(a: A, directory: Root, bytes: []const u8, groups: *std.ArrayList(FileGroup), segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation) !void {
+    if (groups.items.len >= directory.manifests.len or groups.items.len >= 16384) return error.InvalidNativeLakeTextCorpus;
+    const manifest = directory.manifests[groups.items.len];
+    if (manifest.byte_len != bytes.len) return error.InvalidNativeLakeTextCorpus;
+    // Serving and maintenance/GC must describe exactly the same children.
+    try stores.validatePayloadSha256WithCancellation(bytes, manifest.checksum, cancellation);
+    const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
+    try groups.append(a, group);
+    try segments.appendSlice(a, group.segments);
+}
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    var root = try loadRootDirectory(a, store, ref, cancellation, cache);
+    // Legacy/maintenance callers own the returned plain descriptors in their
+    // allocator. Bound parse allocations (including unreclaimed arena scratch)
+    // without imposing an unrelated sum of encoded artifact lengths.
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024, .monotonic = true };
+    const bounded = budget.allocator();
+    var root = try loadRootDirectory(bounded, store, ref, cancellation, cache);
+    root = try text_directory.withManifests(bounded, root, store, cache, cancellation);
     if (root.manifests.len != 0) {
         var groups: std.ArrayList(FileGroup) = .empty;
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
-        var metadata_budget: u64 = 32 * 1024 * 1024;
         for (root.manifests) |manifest| {
             try cancellation.check();
-            try stores.chargeReadBudget(&metadata_budget, manifest.byte_len);
-            const group = try loadFileManifest(a, store, manifest, root.domain, cancellation, cache);
+            const group = try loadFileManifest(bounded, store, manifest, root.domain, cancellation, cache);
             if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
-            try groups.append(a, group);
-            try segments.appendSlice(a, group.segments);
+            try groups.append(bounded, group);
+            try segments.appendSlice(bounded, group.segments);
         }
         root.file_groups = groups.items;
         root.segments = segments.items;
@@ -245,6 +580,7 @@ pub const CachedSegments = struct {
     }
 };
 pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation, cache: ?artifacts.CachedRead, loader: ?SegmentLoader) !local.index.IndexWriter {
+    if (root.statistics_deltas.len != 0) return error.InvalidNativeLakeTextCorpus;
     try root.validate();
     var writer = try local.index.IndexWriter.init(a);
     errdefer writer.deinit();
@@ -297,77 +633,146 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v9:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v10:{s}", .{want.binding.index_config_hash});
         const recipe = sourceRecipe(table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
+        var exact_seed: ?Root = null;
+        var seed_artifact: ?[]const u8 = null;
         if (prior) |declaration| {
-            const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.statistics_version == 1 and std.mem.eql(u8, &root.recipe, &recipe)) {
-                try validateReuse(a, store.*, root, provider.context, cancellation);
+            const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            if (root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
+                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
             }
+            if (root.seekable and root.statistics_version >= 1 and std.mem.eql(u8, &root.recipe, &recipe) and std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) {
+                try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+                seed_artifact = declaration.artifact.artifact_id;
+                exact_seed = root;
+            }
         }
-        const seed: ?Root = for (candidates) |declaration| {
+        var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
             if (declaration.artifact.kind != .text_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, want.name)) continue;
             var old = declaration.binding;
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
-            const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.statistics_version != 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
-            try validateReuse(a, store.*, root, provider.context, cancellation);
+            const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
+            try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
+            seed_artifact = declaration.artifact.artifact_id;
             break root;
         } else null;
+        const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
+        const manifest_seed = if (seed) |root| !paged_seed and root.manifests.len != 0 and root.file_groups.len == 0 else false;
+        const reference_seed = paged_seed or manifest_seed;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
         defer previous_groups.deinit(a);
-        if (seed) |root| for (root.file_groups) |group| try previous_groups.put(a, group.file.id, group);
-        const previous = try ca.alloc(state.File, if (seed) |root| root.file_groups.len else 0);
-        if (seed) |root| for (previous, root.file_groups) |*file, group| {
+        var previous_refs: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
+        defer previous_refs.deinit(a);
+        const records = if (paged_seed) try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, store.*, cancellation) else &.{};
+        const previous = try ca.alloc(state.File, if (reference_seed) records.len else if (seed) |root| root.file_groups.len else 0);
+        if (reference_seed) {
+            for (previous, records) |*file, record| {
+                file.* = record.file;
+                try previous_refs.put(a, record.file.id, record);
+            }
+        } else if (seed) |root| for (previous, root.file_groups) |*file, group| {
             file.* = group.file;
+            try previous_groups.put(a, group.file.id, group);
         };
         var plan = try state.Plan.init(a, ca, provider, previous);
         defer plan.deinit();
-        const groups = try ca.alloc(FileGroup, plan.files.len);
+        if (paged_seed) {
+            var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+            for (records) |record| if (!plan.unchanged(record.file)) try removed_refs.append(ca, record.manifest);
+            // Keep only durable references. Removed/replaced admissions are
+            // decoded in a file arena when their contributions are subtracted.
+            seed.?.file_groups = &.{};
+            seed.?.manifests = removed_refs.items;
+        }
         const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(a, spec.config_json, runtime);
         defer local.introducer.freeTextAnalysisConfig(a, analysis);
         var batch_arena = std.heap.ArenaAllocator.init(a);
         defer batch_arena.deinit();
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
-        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
-        var summaries: std.ArrayList(?statistics.Ref) = .empty;
+        var file_arena = std.heap.ArenaAllocator.init(a);
+        defer file_arena.deinit();
         var input_bytes: usize = 0;
         const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
         @memset(file_manifests, null);
+        for (records) |record| if (plan.by_id.get(record.file.id)) |index| {
+            file_manifests[index] = record.manifest;
+        };
+        var df_checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var df_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &df_checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer df_manager.deinit();
+        var df_reads: u64 = 0;
+        var df_writes: u64 = 0;
+        const df_scope = store.upload_scope.?;
+        var df_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = df_scope.domain, .attempt = df_scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &df_reads, .remaining_write_bytes = &df_writes, .streaming = true };
+        var df = statistics.Builder.init(a, &df_manager);
+        defer df.deinit();
+        df.enableDurable(df_pages.store());
+        if (seed) |old| try df.durable.?.restore(old.statistics_deltas);
         var global_statistics: ?statistics.Ref = if (seed) |old| old.term_statistics else null;
-        // Retain each old file contribution until its replacement is complete.
-        // A checkpoint's DF root therefore describes exactly its manifests.
+        // Checkpoints retain the base plus signed durable contributions. Fold
+        // global DF only once, including when recovering a partial refresh.
         if (seed) |old| for (old.file_groups) |group| {
             if (plan.by_id.get(group.file.id)) |index| {
                 file_manifests[index] = try publishFileManifest(a, ca, store, group, cancellation);
             } else {
-                global_statistics = try updateStatistics(a, store, provider, group, null, global_statistics, cancellation);
+                for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
         };
-        for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
-            group.* = .{ .file = file, .segments = &.{} };
+        if (reference_seed) for (records) |record| {
+            if (plan.by_id.contains(record.file.id)) continue;
+            _ = file_arena.reset(.free_all);
+            const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
+            for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
+        };
+        for (plan.files, plan.changed, 0..) |file, changed, file_ordinal| {
+            _ = file_arena.reset(.free_all);
+            const fa = file_arena.allocator();
+            var file_group: FileGroup = .{ .file = file, .segments = &.{} };
+            const group = &file_group;
+            var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+            var summaries: std.ArrayList(?statistics.Ref) = .empty;
+            var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
             if (!changed) {
-                const previous_group = previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
+                if (paged_seed) continue;
+                const previous_group = if (manifest_seed) try loadRecordedFile(fa, store.*, previous_refs.get(file.id) orelse return error.InvalidNativeLakeTextCorpus, seed.?.domain, cancellation) else previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
                 group.summaries = previous_group.summaries;
                 group.opening_packs = previous_group.opening_packs;
+                group.admissions = previous_group.admissions;
+                group.descriptors = previous_group.descriptors;
+                group.physical_manifest = previous_group.physical_manifest;
+                if (group.admissions.len == 0 and group.segments.len != 0) {
+                    const upgraded = try fa.alloc(local.segment.SegmentReader.Admission, group.segments.len);
+                    for (group.segments, upgraded) |ref, *metadata| {
+                        var data = try @import("lake_index_seekable_text.zig").load(a, .{ .store = store.*, .cache = null, .context = provider.context, .cancellation = cancellation }, ref);
+                        defer data.deinit(a);
+                        var reader = try data.initReader(a);
+                        defer reader.deinit();
+                        metadata.* = try reader.admission(fa);
+                    }
+                    group.admissions = upgraded;
+                }
+                if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
-                try summaries.appendSlice(ca, group.summaries);
-                try segments.appendSlice(ca, group.segments);
                 file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
                 continue;
             }
-            const first_segment = segments.items.len;
-            var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = ca, .store = store, .cancellation = cancellation };
+            var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = fa, .store = store, .cancellation = cancellation };
             defer opening.deinit();
-            var ordinals = physical.Builder.init(a, ca, store, cancellation);
+            var compactor: Compactor = .{ .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            defer compactor.deinit();
+            var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
             var previous_id: ?[96]u8 = null;
             var input = provider.*;
@@ -403,41 +808,131 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io, &opening);
+                        try flush(&compactor, builder.batch(), analysis, store_source);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io, &opening);
+            try flush(&compactor, builder.batch(), analysis, store_source);
+            try compactor.finish();
             try opening.flush();
             group.opening_packs = opening.refs.items;
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
-            group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
-            group.summaries = try ca.dupe(?statistics.Ref, summaries.items[first_segment..]);
+            group.segments = segments.items;
+            group.summaries = summaries.items;
+            group.admissions = admissions.items;
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
+            if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
+            try group.validate(store.upload_scope.?.domain);
             file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
-            global_statistics = updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation) catch |err| return buildFailure(err, "file_statistics", file_ordinal, segments.items.len);
-            // This non-serving checkpoint has internally consistent file/DF
-            // roots, including retained old files awaiting replacement.
+            if (previous_refs.get(file.id)) |record| {
+                const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
+                for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
+            } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
+            for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
+            try df.flush();
+            // Each file remains resumable without rewriting the global tree.
+            // GC and recovery retain/authenticate both base and delta pages.
             if (provider.progress != null) {
                 var checkpoint_arena = std.heap.ArenaAllocator.init(a);
                 defer checkpoint_arena.deinit();
                 const manifests = try presentManifests(checkpoint_arena.allocator(), file_manifests);
-                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
+                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
                 try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
             }
         }
-        var root: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        global_statistics = try df.finish(df_pages.store(), global_statistics);
+        // Global DF touches only changed file contributions. The spill manager
+        // bounds disk independently of the sort's 4 MiB resident working set.
+        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer spill_manager.deinit();
+        var directory_builder = term_directory.Builder.init(a, &spill_manager);
+        defer directory_builder.deinit();
+        const prior_directory: term_directory.Roots = if (seed) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
+        const incremental_directory = prior_directory.leaves != null;
+        var stats_reads: u64 = 512 * 1024 * 1024;
+        var stats_writes: u64 = 512 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
+        directory_builder.enableDurable(stats_pages.store());
+        // A disabled optional directory has no complete base to update. Paged
+        // seeds hold only changed maintenance groups, so stream unchanged
+        // contributions from the canonical serving directory when bootstrapping.
+        if (paged_seed and !incremental_directory) {
+            const Bootstrap = struct {
+                a: A,
+                pages: *@import("../serverless/graph_segment/page_store.zig").PageStore,
+                plan: *const state.Plan,
+                builder: *term_directory.Builder,
+                provider: *@import("lake_index_row_source.zig").Provider,
+                cancellation: Cancellation,
+                pub fn check(self: *@This()) !void {
+                    try self.provider.context.ensureActive();
+                    try self.cancellation.check();
+                }
+                pub fn record(self: *@This(), entry: anytype) !void {
+                    if (!self.plan.unchanged(entry.file)) return;
+                    try addStatisticsContribution(self.a, self.pages.store(), entry.route.summary, term_directory.identity(entry.route.ref.artifact_id), 1, null, self.builder);
+                }
+            };
+            var bootstrap: Bootstrap = .{ .a = a, .pages = &stats_pages, .plan = &plan, .builder = &directory_builder, .provider = provider, .cancellation = cancellation };
+            try text_directory.walkSegments(a, seed.?, store.*, cancellation, &bootstrap);
+        }
+        if (seed) |old| for (old.file_groups) |group| {
+            const current = plan.by_id.get(group.file.id);
+            if (current != null and !plan.changed[current.?]) continue;
+            for (group.summaries, group.segments) |ref, segment| {
+                try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), -1, null, if (incremental_directory) &directory_builder else null);
+            }
+        };
+        var totals: CollectionBuilder = .{ .a = a };
+        defer totals.deinit();
+        if (paged_seed) {
+            totals.documents = seed.?.collection.?.documents;
+            totals.segments = seed.?.segment_count;
+            for (seed.?.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
+            for (seed.?.manifests) |ref| {
+                _ = file_arena.reset(.free_all);
+                const group = try loadFileManifest(file_arena.allocator(), store.*, ref, seed.?.domain, cancellation, null);
+                try totals.add(group, true);
+                if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
+                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
+                };
+            }
+        }
+        var current_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+        for (file_manifests, plan.changed) |slot, changed| {
+            if (paged_seed and !changed) continue;
+            const ref = slot orelse return error.InvalidNativeLakeTextCorpus;
+            try current_refs.append(ca, ref);
+            _ = file_arena.reset(.free_all);
+            const group = try loadFileManifest(file_arena.allocator(), store.*, ref, store.upload_scope.?.domain, cancellation, null);
+            for (group.summaries, group.segments) |summary, segment| {
+                if (changed or !incremental_directory) try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+            }
+            try totals.add(group, false);
+        }
+        const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
+        const directories = try text_directory.publishManifests(a, store, current_refs.items, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+        const root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         try root.validate();
-        root.manifests = try presentManifests(ca, file_manifests);
-        root.file_groups = &.{};
-        root.segments = &.{};
-        try declarations.append(out, try publishRoot(a, out, store, want.name, root, cancellation));
+        const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
+        if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+        var upload = store.*;
+        upload.allocator = ca;
+        const uploaded = try upload.putWithCancellation(bytes, cancellation);
+        store.inheritClosure(uploaded.artifact_id, seed_artifact, cancellation) catch {
+            try provider.context.ensureActive();
+            try cancellation.check();
+        };
+        const owned = try std.json.Stringify.valueAlloc(ca, Declared{ .name = want.name, .binding = binding, .artifact = .{ .name = want.name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len } }, .{});
+        try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
     }
     return declarations.toOwnedSlice(out);
 }
@@ -445,83 +940,232 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
 // bound memory and avoid downloading the archive; normal serving continues to
 // authenticate posting ranges. Metadata trees are read and authenticated in
 // bounded pages, including descendants not touched by incremental updates.
-fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    var retained_backend = backend;
+    const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;
+    try context.ensureActive();
+    try cancellation.check();
+    if (certified) return;
     const tree = @import("../serverless/graph_segment/page_tree.zig");
+    var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing_a };
+    const a = locked.allocator();
     const Validator = struct {
+        const Pending = struct { task: local.sql_parallel_scheduler.Task(anyerror!void), ref: artifacts.ChunkRef };
+        pending: [8]?Pending = @splat(null),
+        cursor: usize = 0,
         a: A,
         store: stores.ArtifactStore,
         context: local.serverless_query_lake_read_context.Context,
         cancellation: Cancellation,
+        domain: [32]u8,
         remaining_reads: u64 = tree.max_page_bytes,
-        fn check(v: *@This()) !void {
+        witnesses: std.AutoHashMapUnmanaged(stores.UploadScope, stores.RetentionWitness) = .empty,
+        certifiable: bool = true,
+        fn retain(v: *@This(), scope: stores.UploadScope) !void {
+            if (!v.certifiable or v.witnesses.contains(scope)) return;
+            if (v.witnesses.count() == 4096) {
+                v.certifiable = false;
+                return;
+            }
+            const proof = v.store.retentionWitness(scope, v.cancellation) catch {
+                v.certifiable = false;
+                try v.check();
+                return;
+            };
+            const witness = proof orelse {
+                v.certifiable = false;
+                return;
+            };
+            try v.witnesses.put(v.a, scope, witness);
+        }
+        fn retainArtifact(v: *@This(), id: []const u8) !void {
+            if (try stores.uploadScopeFromArtifactId(id)) |scope| try v.retain(scope) else v.certifiable = false;
+        }
+        fn certify(v: *@This(), id: []const u8) !void {
+            if (!v.certifiable) return;
+            const witnesses = try v.a.alloc(stores.RetentionWitness, v.witnesses.count());
+            defer v.a.free(witnesses);
+            var it = v.witnesses.valueIterator();
+            for (witnesses) |*entry| entry.* = it.next().?.*;
+            v.store.rememberClosure(id, witnesses, v.cancellation) catch {
+                try v.check();
+            };
+        }
+        pub fn check(v: *@This()) !void {
             try v.context.ensureActive();
             try v.cancellation.check();
         }
-        fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
-            try v.check();
-            var metadata = try v.store.statWithCancellationUsingAllocator(v.a, ref.artifact_id, v.cancellation);
-            defer metadata.deinit(v.a);
+        fn auditLeaf(a_: A, backend_: stores.ArtifactStore, ref: artifacts.ChunkRef, context_: local.serverless_query_lake_read_context.Context, token: Cancellation) anyerror!void {
+            try context_.ensureActive();
+            try token.check();
+            var budget: local.sql_memory_budget = .{ .backing = a_, .limit = 64 * 1024 };
+            const scratch = budget.allocator();
+            var store_ = backend_;
+            var metadata = try store_.statWithCancellationUsingAllocator(scratch, ref.artifact_id, token);
+            defer metadata.deinit(scratch);
             if (metadata.byte_len != ref.byte_len or !std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) or !std.mem.eql(u8, metadata.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
         }
-        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+        fn finish(v: *@This(), index: usize, cancel: bool) !void {
+            if (v.pending[index]) |entry| {
+                var owned = entry;
+                v.pending[index] = null;
+                defer v.a.free(owned.ref.artifact_id);
+                defer v.a.free(owned.ref.checksum);
+                if (cancel) return owned.task.cancel(v.context.io.?);
+                return owned.task.await(v.context.io.?);
+            }
+        }
+        fn drain(v: *@This(), cancel: bool) void {
+            for (0..v.pending.len) |i| v.finish(i, cancel) catch {};
+        }
+        fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
             try v.check();
+            try v.retainArtifact(ref.artifact_id);
+            const io = v.context.io orelse return auditLeaf(v.a, v.store, ref, v.context, v.cancellation);
+            const index = v.cursor;
+            v.cursor = (index + 1) % v.pending.len;
+            try v.finish(index, false);
+            const id = try v.a.dupe(u8, ref.artifact_id);
+            const checksum = v.a.dupe(u8, ref.checksum) catch |err| {
+                v.a.free(id);
+                return err;
+            };
+            const retained: artifacts.ChunkRef = .{ .artifact_id = id, .checksum = checksum, .byte_len = ref.byte_len };
+            if (local.sql_parallel_scheduler.global().submitIoTransient(io, 64 * 1024, auditLeaf, .{ v.a, v.store, retained, v.context, v.cancellation })) |task| {
+                v.pending[index] = .{ .task = task, .ref = retained };
+            } else {
+                defer v.a.free(checksum);
+                defer v.a.free(id);
+                try auditLeaf(v.a, v.store, retained, v.context, v.cancellation);
+            }
+        }
+        pub fn skip(v: *@This(), ref: tree.Ref) !bool {
+            try v.check();
+            try v.retain(.{ .domain = v.domain, .attempt = ref.attempt });
             v.remaining_reads = tree.max_page_bytes;
             return false;
         }
         pub fn visit(_: *@This(), _: tree.Ref) !void {}
-        fn pages(v: *@This(), domain: [32]u8, ref: ?tree.Ref) !void {
+        fn pages(v: *@This(), ref: ?tree.Ref) !void {
             var writes: u64 = 0;
-            var pages_store: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
+            var pages_store: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = v.domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
             if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
         }
-    };
-    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation };
-    try validator.pages(root.domain, root.term_statistics);
-    for (root.file_groups) |group| {
-        for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
-        for (group.summaries) |summary| try validator.pages(root.domain, summary);
-        for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
-    }
-    for (root.segments) |segment| {
-        if (!root.seekable) {
-            try validator.leaf(segment);
-            continue;
-        }
-        try validator.check();
-        // loadDirectory independently bounds each decoded directory to 4 MiB.
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = backend, .cache = null, .context = context, .cancellation = cancellation }, segment);
-        if (directory.metadata_bundle) |bundle| try validator.leaf(bundle);
-        for ([_][]const @import("lake_index_seekable_text.zig").Piece{ directory.metadata, directory.blocks }) |pieces| {
-            var prior: ?artifacts.ChunkRef = null;
-            for (pieces) |piece| {
-                const retained = piece.retainedArtifact();
-                if (prior) |old| if (std.mem.eql(u8, old.artifact_id, retained.artifact_id)) continue;
-                try validator.leaf(retained);
-                prior = retained;
+        fn segment(v: *@This(), ref: artifacts.ChunkRef, seekable: bool) !void {
+            try v.retainArtifact(ref.artifact_id);
+            if (!seekable) return v.leaf(ref);
+            try v.check();
+            var scratch = std.heap.ArenaAllocator.init(v.a);
+            defer scratch.deinit();
+            const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = v.store, .cache = null, .context = v.context, .cancellation = v.cancellation }, ref);
+            if (directory.metadata_bundle) |bundle| try v.leaf(bundle);
+            for ([_][]const @import("lake_index_seekable_text.zig").Piece{ directory.metadata, directory.blocks }) |pieces| {
+                var prior: ?artifacts.ChunkRef = null;
+                for (pieces) |piece| {
+                    const retained = piece.retainedArtifact();
+                    if (prior) |old| if (std.mem.eql(u8, old.artifact_id, retained.artifact_id)) continue;
+                    try v.leaf(retained);
+                    prior = retained;
+                }
             }
         }
+        pub fn record(v: *@This(), entry: anytype) !void {
+            try v.check();
+            for (entry.rows) |block| if (block.bitmap) |bitmap| try v.leaf(bitmap);
+            if (entry.physical) |physical_ref| try v.leaf(physical_ref);
+            try v.leaf(entry.route.descriptor orelse return error.InvalidNativeLakeTextCorpus);
+            try v.pages(entry.route.summary);
+            try v.segment(entry.route.ref, true);
+        }
+        pub fn route(v: *@This(), file: anytype) !void {
+            try state.validate(&.{file.file}, v.domain);
+            var scratch = std.heap.ArenaAllocator.init(v.a);
+            defer scratch.deinit();
+            const physical_ref = file.physical orelse return error.InvalidNativeLakeTextCorpus;
+            try v.retainArtifact(physical_ref.artifact_id);
+            const physical_group = try loadFileManifest(scratch.allocator(), v.store, physical_ref, v.domain, v.cancellation, null);
+            if (!std.mem.eql(u8, physical_group.file.id, file.file.id) or !std.mem.eql(u8, &physical_group.file.digest, &file.file.digest)) return error.InvalidNativeLakeTextCorpus;
+            for (physical_group.opening_packs) |pack| try v.leaf(pack.artifact);
+            for (physical_group.rows) |block| if (block.bitmap) |bitmap| try v.leaf(bitmap);
+            for (file.segments) |entry| {
+                try text_directory.validateRef(entry.ref, v.domain);
+                const descriptor = entry.descriptor orelse return error.InvalidNativeLakeTextCorpus;
+                try text_directory.validateRef(descriptor, v.domain);
+                try v.leaf(descriptor);
+                try v.pages(entry.summary);
+                try v.segment(entry.ref, true);
+            }
+        }
+    };
+    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain };
+    defer validator.drain(true);
+    defer validator.witnesses.deinit(a);
+    try validator.retainArtifact(root_id);
+    try validator.pages(root.term_statistics);
+    for (root.statistics_deltas) |run| try validator.pages(run.page);
+    try validator.pages(root.term_directory.leaves);
+    try validator.pages(root.term_directory.branches);
+    if (root.inventory_version == 3) {
+        try validator.pages(root.directories.files);
+        try validator.pages(root.directories.segments);
+        try validator.pages(root.directories.routing);
+        try validator.pages(root.serving_inventory);
+        try validator.pages(root.segment_files);
+        try validator.pages(root.serving_routes);
+        try text_directory.walkSegments(a, root, backend, cancellation, &validator);
+        if (root.serving_routes != null) try @import("lake_index_serving_inventory.zig").walkRoutes(a, root, backend, cancellation, &validator);
+        for (0..validator.pending.len) |i| try validator.finish(i, false);
+        try validator.certify(root_id);
+        return;
     }
+    if (root.file_groups.len == 0 and root.manifests.len != 0) {
+        var file_arena = std.heap.ArenaAllocator.init(a);
+        defer file_arena.deinit();
+        for (root.manifests) |ref| {
+            _ = file_arena.reset(.free_all);
+            try validator.leaf(ref);
+            const group = try loadFileManifest(file_arena.allocator(), backend, ref, root.domain, cancellation, null);
+            for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
+            for (group.summaries) |summary| try validator.pages(summary);
+            for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
+            for (group.descriptors) |descriptor| try validator.leaf(descriptor);
+            if (group.physical_manifest) |physical_ref| try validator.leaf(physical_ref);
+            for (group.segments) |segment| try validator.segment(segment, root.seekable);
+        }
+    }
+    for (root.file_groups) |group| {
+        for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
+        for (group.summaries) |summary| try validator.pages(summary);
+        for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
+    }
+    for (root.segments) |ref| try validator.segment(ref, root.seekable);
+    for (0..validator.pending.len) |i| try validator.finish(i, false);
+    try validator.certify(root_id);
 }
+
+fn loadRecordedFile(a: A, store: stores.ArtifactStore, record: text_directory.FileRecord, domain: [32]u8, cancellation: Cancellation) !FileGroup {
+    const group = try loadFileManifest(a, store, record.manifest, domain, cancellation, null);
+    if (!std.mem.eql(u8, group.file.id, record.file.id) or !std.mem.eql(u8, &group.file.digest, &record.file.digest)) return error.InvalidNativeLakeTextCorpus;
+    return group;
+}
+
+fn checkpointFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+    const records = try out.alloc(text_directory.FileRecord, root.manifests.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (root.manifests, records) |ref, *record| {
+        try cancellation.check();
+        _ = arena.reset(.free_all);
+        const group = try loadFileManifest(arena.allocator(), store, ref, root.domain, cancellation, null);
+        record.* = .{ .file = .{ .id = try out.dupe(u8, group.file.id), .digest = group.file.digest, .key_width = group.file.key_width }, .manifest = ref };
+    }
+    return records;
+}
+
 fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {
     var refs: std.ArrayList(artifacts.ChunkRef) = .empty;
     for (slots) |slot| if (slot) |ref| try refs.append(a, ref);
     return refs.toOwnedSlice(a);
-}
-fn updateStatistics(a: A, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, old: ?FileGroup, next: ?FileGroup, previous: ?statistics.Ref, cancellation: Cancellation) !?statistics.Ref {
-    var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-    defer manager.deinit();
-    var builder = statistics.Builder.init(a, &manager);
-    defer builder.deinit();
-    var reads: u64 = 512 * 1024 * 1024;
-    var writes: u64 = 512 * 1024 * 1024;
-    const scope = store.upload_scope.?;
-    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = provider.context.io };
-    if (old) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, -1);
-    if (next) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, 1);
-    return builder.finish(pages.store(), previous);
 }
 fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
     const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
@@ -546,25 +1190,106 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
     defer a.free(encoded);
     return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize, io: ?std.Io, opening: *@import("lake_index_text_opening_pack.zig").Collector) !void {
-    try cancellation.check();
-    // Version 8 attests ascending producer identities inside each file group.
-    // Segment construction preserves input order; the predicate consumer may seek.
-    for (batch.docs, 0..) |doc, i| {
-        if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
+/// Consolidate only adjacent fresh runs from one immutable file. Eight-run
+/// pressure triggers one bounded merge; small files and inherited historical
+/// runs retain their original bytes. Concatenation preserves physical ranks,
+/// producer identity order and score ties without a cross-file coordinate map.
+const Compactor = struct {
+    const fan_in = 8;
+    const target_bytes = 16 * 1024 * 1024;
+    a: A,
+    out: A,
+    store: *stores.ArtifactStore,
+    segments: *std.ArrayList(artifacts.ChunkRef),
+    summaries: *std.ArrayList(?statistics.Ref),
+    admissions: *std.ArrayList(local.segment.SegmentReader.Admission),
+    cancellation: Cancellation,
+    file_ordinal: usize,
+    opening: ?*@import("lake_index_text_opening_pack.zig").Collector = null,
+    io: ?std.Io = null,
+    workspace_bytes: usize = 64 * 1024 * 1024,
+    pending: [fan_in]?[]u8 = @splat(null),
+    count: usize = 0,
+    bytes: usize = 0,
+    fn deinit(self: *Compactor) void {
+        for (self.pending[0..self.count]) |value| self.a.free(value.?);
+        self.count = 0;
+        self.bytes = 0;
     }
-    const encoded = mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", file_ordinal, segments.items.len);
-    defer mapper.freeTextSegments(a, encoded);
-    for (encoded) |bytes| {
+    fn add(self: *Compactor, bytes: []const u8) !void {
+        try self.cancellation.check();
+        if (self.count != 0 and bytes.len > target_bytes -| self.bytes) try self.finish();
+        if (bytes.len > target_bytes) return self.publish(bytes);
+        self.pending[self.count] = try self.a.dupe(u8, bytes);
+        self.count += 1;
+        self.bytes += bytes.len;
+        if (self.count == fan_in) try self.finish();
+    }
+    fn finish(self: *Compactor) !void {
+        if (self.count == 0) return;
+        defer self.deinit();
+        try self.cancellation.check();
+        if (self.count == fan_in) {
+            // Optional acceleration cannot exhaust the publication allocator.
+            // A pathological dictionary/source shape falls back to the exact
+            // original runs, rather than failing ingestion or raising limits.
+            var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = @min(self.workspace_bytes, local.sql_memory_budget.headroom(self.a) orelse self.workspace_bytes) };
+            const a = budget.allocator();
+            const merged = self.merge(a) catch |err| switch (err) {
+                error.OutOfMemory => null,
+                else => return err,
+            };
+            if (merged) |bytes| {
+                defer a.free(bytes);
+                // A merge must save an artifact and respect the serving cap.
+                if (bytes.len <= 32 * 1024 * 1024 and bytes.len <= self.bytes + 64 * 1024) {
+                    try self.cancellation.check();
+                    try self.publish(bytes);
+                    return;
+                }
+            }
+        }
+        for (self.pending[0..self.count]) |bytes| try self.publish(bytes.?);
+    }
+    fn merge(self: *Compactor, a: A) ![]u8 {
+        var readers: [fan_in]local.segment.SegmentReader = undefined;
+        var opened: usize = 0;
+        defer for (readers[0..opened]) |*reader| reader.deinit();
+        var inputs: [fan_in]local.segment.MergeInput = undefined;
+        for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
+            reader.* = try local.segment.SegmentReader.init(a, bytes.?);
+            opened += 1;
+            input.* = .{ .reader = reader };
+        }
+        return local.segment.mergeSegmentInputs(a, &inputs);
+    }
+    fn publish(self: *Compactor, bytes: []const u8) !void {
+        const a = self.a;
+        const out = self.out;
+        const cancellation = self.cancellation;
+        const store = self.store;
+        const segments = self.segments;
         try cancellation.check();
         if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
-        const ref = @import("lake_index_seekable_text.zig").publishWithOpeningCollector(a, out, &upload, bytes, cancellation, opening) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
-        const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, io) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
-        try summaries.append(out, summary);
+        const ref = @import("lake_index_seekable_text.zig").publishWithOpeningCollector(a, out, &upload, bytes, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
+        var reader = try local.segment.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try self.admissions.append(out, try reader.admission(out));
+        const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, self.io) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
+};
+fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
+    try compactor.cancellation.check();
+    for (batch.docs, 0..) |doc, i| {
+        if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
+    }
+    const encoded = mapper.buildTextSegmentsFromProjectionBatch(compactor.a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
+    defer mapper.freeTextSegments(compactor.a, encoded);
+    for (encoded) |bytes| try compactor.add(bytes);
 }
 fn putPath(a: A, root: *std.json.Value, path: []const u8, value: std.json.Value) !void {
     if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
@@ -586,7 +1311,94 @@ const StatisticsCheckpoint = struct {
     }
 };
 
+/// Feed both indexes from a single authenticated summary cursor, including
+/// version-1 upgrades where only the new directory needs unchanged metadata.
+fn addStatisticsContribution(a: A, store: @import("../serverless/graph_segment/page_tree.zig").Store, root: ?statistics.Ref, segment: [32]u8, sign: i64, global: ?*statistics.Builder, directory: ?*term_directory.Builder) !void {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    var cursor = try tree.Cursor.init(a, store, root, "", null);
+    defer cursor.deinit();
+    while (try cursor.next()) |record| {
+        if (global) |builder| try builder.addRecord(record, sign);
+        if (directory) |builder| try builder.addRecord(record, segment, sign);
+    }
+}
+
 fn buildFailure(err: anyerror, stage: []const u8, file_ordinal: usize, completed_segments: usize) anyerror {
     if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake text construction deferred stage={s} file_index={d} completed_segments={d} err={s}", .{ stage, file_ordinal, completed_segments, @errorName(err) });
     return err;
+}
+
+test "external lake text statistics wire upgrade fences new roots and admits historical v9 recovery" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("text-wire-upgrade");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const legacy: Root = .{ .version = 9, .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .seekable = true, .statistics_version = 1 };
+    // Reproduce a v9 root without extension fields introduced by this branch.
+    var wire = try std.json.parseFromSliceLeaky(std.json.Value, ca, try std.json.Stringify.valueAlloc(ca, legacy, .{}), .{});
+    for ([_][]const u8{ "term_directory", "directories", "collection", "file_count", "segment_count", "serving_routes", "segment_files", "partial_inventory", "routing" }) |field| _ = wire.object.swapRemove(field);
+    const bytes = try std.json.Stringify.valueAlloc(ca, wire, .{});
+    var upload = try store.putWithCancellation(bytes, .none);
+    defer upload.deinit(a);
+    var ref: Ref = .{ .kind = .text_segment, .metadata_version = 9, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
+    const recovered = try loadRootDirectory(ca, store, ref, .none, null);
+    try std.testing.expectEqual(metadata_version, recovered.version);
+    // Metadata identity is checked against the authenticated body before any
+    // normalization. Neither future formats nor a falsely advertised v10 pass.
+    ref.metadata_version = metadata_version;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    ref.metadata_version = metadata_version + 1;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    try std.testing.expect(metadata_version > 9 and local.metadata_lake_index_catalog.native_reader_protocol > 33);
+}
+
+test "external lake text compaction preserves all physical keys in input order" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-text-compaction");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    for ([_]usize{ 64 * 1024 * 1024, 1 }) |workspace| {
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var summaries: std.ArrayList(?statistics.Ref) = .empty;
+        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var compactor: Compactor = .{ .a = a, .out = ca, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .workspace_bytes = workspace };
+        defer compactor.deinit();
+        // Eight tiny runs become one; the next current-data run remains separate.
+        const file_id: [64]u8 = @splat('0');
+        for (0..9) |i| {
+            const key = try std.fmt.allocPrint(ca, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i + 10 });
+            const bytes = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = key, .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
+            defer a.free(bytes);
+            try compactor.add(bytes);
+        }
+        try compactor.finish();
+        try std.testing.expectEqual(@as(usize, if (workspace == 1) 9 else 2), segments.items.len);
+        try std.testing.expectEqual(@as(u32, if (workspace == 1) 1 else 8), admissions.items[0].doc_count);
+        try std.testing.expectEqual(@as(u32, 1), admissions.items[1].doc_count);
+        for (segments.items, 0..) |segment, i| {
+            var data = try @import("lake_index_seekable_text.zig").load(a, .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none }, segment);
+            defer data.deinit(a);
+            var reader = try data.initReader(a);
+            defer reader.deinit();
+            for (0..reader.doc_count) |doc| {
+                const key = (try reader.storedIdAlloc(a, @intCast(doc))).?;
+                defer a.free(key);
+                const expected = try std.fmt.allocPrint(a, "lake1:{s}:00000000:{x:0>16}", .{ file_id, (if (workspace == 1) i else if (i == 0) doc else 8) + 10 });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, key);
+            }
+        }
+    }
 }

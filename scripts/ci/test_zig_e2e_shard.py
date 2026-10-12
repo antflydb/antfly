@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import json
+import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,6 +85,69 @@ class ShardTests(unittest.TestCase):
                 shards.pytest_collection_modifyitems(
                     config("ordinary-0", str(path)), entries[:-1]
                 )
+
+    @unittest.skipUnless(importlib.util.find_spec("pytest"), "requires pytest")
+    def test_base_plan_and_execution_collect_the_same_marked_tests(self):
+        # Exercise pytest's marker deselection and the real planning hook,
+        # including the integration marker that previously split collection.
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "pytest.ini").write_text(
+                "[pytest]\nmarkers =\n    iceberg_integration: full suite only\n"
+            )
+            (root / "test_collection.py").write_text(
+                "import pytest\n"
+                "def test_base(): pass\n"
+                "@pytest.mark.iceberg_integration\n"
+                "def test_iceberg(): pass\n"
+            )
+            marker = subprocess.check_output(
+                [sys.executable, str(Path(shards.__file__)), "base-marker"],
+                text=True,
+            ).strip()
+            command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "zig_e2e_shard",
+                "-m",
+                marker,
+                str(root),
+            ]
+            env = dict(
+                os.environ,
+                PYTHONPATH=os.pathsep.join(
+                    (
+                        str(Path(shards.__file__).parent),
+                        str(Path(__file__).resolve().parents[2] / "zig/e2e/antfly"),
+                    )
+                ),
+            )
+            env.pop("ANTFLY_E2E_SHARD_PLAN", None)
+            plan = root / "plan.json"
+            result = subprocess.run(
+                command + ["--antfly-ci-plan-output", str(plan)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(plan.read_text())
+            self.assertEqual(len(data["assignments"]), 1)
+            self.assertTrue(next(iter(data["assignments"])).endswith("::test_base"))
+            shard = next(iter(data["assignments"].values()))
+            result = subprocess.run(
+                command + ["--antfly-ci-plan", str(plan), "--antfly-ci-shard", shard],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("test_base", result.stdout)
+            self.assertNotIn("test_iceberg", result.stdout)
 
     def test_balancing_accounts_for_long_cases(self):
         rows = [
@@ -218,6 +285,14 @@ class ShardTests(unittest.TestCase):
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
         ).read_text()
+        planner = workflow.split("  e2e-base-plan:\n", 1)[1].split(
+            "  e2e-base-tests:\n", 1
+        )[0]
+        runner = (Path(__file__).with_name("zig-e2e-base-linux.sh")).read_text()
+        for invocation in (planner, runner):
+            self.assertIn("zig_e2e_shard.py", invocation)
+            self.assertIn("base-marker)", invocation)
+            self.assertNotIn("not objectstore_integration", invocation)
         base = workflow.split("  e2e-base-tests:\n", 1)[1].split(
             "  e2e-base-low-fd:\n", 1
         )[0]

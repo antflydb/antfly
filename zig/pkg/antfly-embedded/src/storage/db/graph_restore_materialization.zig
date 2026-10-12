@@ -226,7 +226,8 @@ pub fn appendRelationItem(
         // contract.
         break :blk switch (source_value) {
             .string => |external| if (external.len > 0) external else doc_key,
-            else => doc_key,
+            .object => |endpoint| if (jsonStringField(.{ .object = endpoint }, "document_id") orelse jsonStringField(.{ .object = endpoint }, "doc_key") orelse jsonStringField(.{ .object = endpoint }, "key")) |explicit| explicit else return,
+            else => return,
         };
     };
     if (source_doc.len == 0) return error.InvalidGraphEdges;
@@ -585,7 +586,23 @@ fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Va
         .string => return findGraphArtifactEntity(artifact_value, value.string),
         .object => {
             if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
-            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
+            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse {
+                const text = jsonStringField(value, "text") orelse return null;
+                if (artifact_value != .object) return null;
+                const entities = artifact_value.object.get("entities") orelse return null;
+                if (entities != .array) return null;
+                var found: ?std.json.Value = null;
+                var found_index: usize = 0;
+                for (entities.array.items, 0..) |entity, index| {
+                    const surface = jsonStringField(entity, "text") orelse continue;
+                    if (!std.mem.eql(u8, surface, text)) continue;
+                    if (found != null) return null;
+                    found = entity;
+                    found_index = index;
+                }
+                if (found != null) return graphArtifactEntityAtIndex(artifact_value, @intCast(found_index));
+                return null;
+            };
             return findGraphArtifactEntity(artifact_value, entity_id);
         },
         else => return null,
@@ -742,4 +759,17 @@ test "graph restore page planner owns nested templates and resumes raw ordinals 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}
+
+test "graph restore text endpoints resolve unique canonical mentions and drop ambiguity" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"entities":[{"id":"e0","text":"Antfly"},{"id":"e1","text":"git"},{"id":"e2","text":"ambiguous"},{"id":"e3","text":"ambiguous"}],"_entities":{"e0":{"id":"e0","text":"Antfly","document_id":"concept/antfly"},"e1":{"id":"e1","text":"git","document_id":"concept/git"}},"endpoint":{"text":"Antfly"},"ambiguous":{"text":"ambiguous"},"unknown":{"text":"missing"}}
+    , .{});
+    defer parsed.deinit();
+    const artifact = parsed.value;
+    const endpoint = resolveGraphEndpointEntity(artifact.object.get("endpoint").?, artifact).?;
+    try std.testing.expectEqualStrings("concept/antfly", jsonEndpointDocumentId(endpoint).?);
+    try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("ambiguous").?, artifact) == null);
+    try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("unknown").?, artifact) == null);
 }

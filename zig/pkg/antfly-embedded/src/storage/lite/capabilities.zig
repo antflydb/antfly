@@ -142,6 +142,7 @@ pub const InferenceStatus = struct {
 };
 
 pub const InferenceOpenOptions = struct {
+    models_dir: ?[]const u8 = null,
     remote_provider_configured: bool = false,
     local_runtime_configured: bool = false,
     // Explicit resource-budget overrides for a local embedded runtime; 0
