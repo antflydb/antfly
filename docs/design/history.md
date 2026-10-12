@@ -68,6 +68,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 | Inference | [inference/pjrt-status-history.md](inference/history/pjrt-status-history.md) | [PJRT.md](../../zig/pkg/inference/PJRT.md) | PJRT whole-model artifact status bullets |
 | Inference | [inference/gliner2/cuda-qualification-2026-07.md](inference/history/gliner2/cuda-qualification-2026-07.md) | [gliner2/CUDA.md](../../zig/pkg/inference/models/gliner2/CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
 | Audio | [audio/benchmark-baseline-2026-04.md](audio/history/benchmark-baseline-2026-04.md) | [AUDIO.md](../../zig/lib/audio/AUDIO.md) | 2026-04-14 single-run codec benchmark baseline |
+| Compilation | [compilation/experiment-ledger-2026-08-to-10.md](compilation/history/experiment-ledger-2026-08-to-10.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Former COMPILATION_EXPERIMENTS.md: phase-by-phase compilation-unit experiments, rejected probes, and runner measurements through 2026-10-11 |
 
 
 ## Additional records
