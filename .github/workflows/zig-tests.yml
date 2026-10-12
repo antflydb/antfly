@@ -2287,6 +2287,9 @@ jobs:
           # decoder working set plus its scoped projector to complete. Keep
           # 2000MiB inside the process envelope for harness and process overhead.
           ANTFLY_INFERENCE_HOST_BUDGET_MB: "12000"
+          # Florence CPU runs reserve encoder output, decoder logits and KV
+          # plus workspace. Keep that scratch inside the same 12000Mi host cap.
+          ANTFLY_INFERENCE_SCRATCH_BUDGET_MB: "2048"
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.
           RUN_MULTIMODAL_GENERATOR_TESTS: "1"
@@ -2308,6 +2311,7 @@ jobs:
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB: "14000"
           ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
+          ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB: "2048"
           ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"
         run: |
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
