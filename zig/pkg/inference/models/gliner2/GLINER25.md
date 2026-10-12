@@ -19,8 +19,8 @@ backend limits, and reproducible family checks.
 | --- | --- | --- | --- | --- |
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (single-window) |
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (single-window) |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 182,000 document bytes; see [geometry evidence](#long-document-geometry-evidence)) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes; see [geometry evidence](#long-document-geometry-evidence)) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
 | `fastino/gliner2.5-multi-v1` (rev `2ca71aafb3446d9014e1c55c7ff51c9bc7209c47`) | multi | fp32 | native, metal | Qualified measured single-window family profiles; see [family record](GLINER25_FAMILY.md) |
 | `fastino/GLiNER2.5-multi-Decide` (rev `a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f`) | multi | fp32 | native, metal | Qualified measured single-window extraction and public Decide profiles; see [family record](GLINER25_FAMILY.md) |
@@ -122,12 +122,57 @@ independent of document length.
   run one window per call. An `error.OutOfMemory` on a group retries the same
   starting window with a halved group (down to one window) instead of failing
   the document.
-- `Limits.max_total_attention_work` (default 8 GiB of attention-score
-  elements) is a separate cumulative safety cap; a document inside the
+- `Limits.max_total_encoded_tokens` (default 131,072) and
+  `Limits.max_total_attention_work` (default 8 GiB of attention-score
+  elements) are separate cumulative safety caps; a document inside the
   reviewed geometry can still fail closed with
   `error.LongDocumentWorkLimitExceeded`.
 - `examples/dogfood` requests `"long_document":{"mode":"window"}` for every
   section; the wire default mode is `.reject`.
+
+### Long-document geometry evidence
+
+The long-document `LengthContract` comes from
+`extractors/gliner_boundary_qualification.zig`'s test "gliner boundary
+qualification measures pinned base checkpoint long-document production
+geometry", which tokenizes and plans real documents through the long
+executor's window planner (no model weights) with
+`long_document.mode=window` at window_words 1024 and 4096, against the
+dogfood schema. Its probe inputs are frozen fixtures under
+`zig/pkg/inference/testdata/gliner25/long_document_probe/`:
+
+| Fixture | Source | Size | Role |
+| --- | --- | --- | --- |
+| `vopr_completion_claim_audit.txt` | `zig/VOPR.md` "Completion-Claim Audit" at commit `3ce5aff4ea` | 37,138 bytes; 2 windows at 4096 words | Multi-window document for the HTTP and in-process canonical-envelope and fp32-vs-fp16 parity tests |
+| `pdf_review_findings.txt` | `zig/PDF.md` "Review findings and required fixes" at commit `3ce5aff4ea` | 99,008 bytes (largest real section in the original heading-to-heading survey) | Corpus-maximum document for geometry, envelope, and parity tests |
+| `combo130.txt` | `zig/PDF.md`'s two largest sections concatenated | 130,302 bytes | Synthetic margin above the corpus maximum |
+| `combo182.txt` | same | 182,000 bytes / 28,275 words; 29 windows at 1024 words, 8 at 4096 | Synthetic document that sets the row's upper bounds |
+
+- The two real-section fixtures are byte-for-byte snapshots (heading line up to, but
+  excluding, the next line starting with `#`), so editing or slimming the
+  source design docs never changes probe inputs. They use `.txt` so
+  Markdown tooling does not treat them as documentation.
+- Real corpus sizes behind the bound: a survey of the 2,355 `zig/*.md` and
+  `work-log/**/*.md` sections found p95 7,285 bytes; the `docsaf`-accurate maximum is
+  `zig/PDF.md`'s "Review findings and required fixes" at 92,302 body bytes,
+  14,503 words, and 15 windows at the 1024-word default. The 182,000-byte
+  bound qualifies roughly 2x past it from measured synthetic documents, not
+  extrapolation. Per-window token counts on the synthetic documents peak at
+  4,831, under the row's 5,708 maximum.
+- The long executor serializes the same `pipeline.Sample` as the
+  single-window path through `extraction_v2.zig`'s `writeSample`: entities
+  carry `text`/`label`/`start`/`end`/`score`; relations carry `type`,
+  `source`/`target` resolved to `entity_index` in the deduplicated entities
+  array, and `score`, never the pipeline's internal `head`/`tail`.
+  `server/gliner_boundary_service_test.zig` asserts this through both
+  `extractWithAdmission` call sites (HTTP `/ai/v1/extract` and
+  `Node.extractDirect`) on native and Metal.
+- Offsets rebase through `gliner_boundary_long_document.zig`
+  (`Plan`/`rebaseSource`); mentions merge with `mergeMentions`; relations
+  merge in `gliner_boundary_long_relations.zig`.
+- Reference: a live `antfly inference run` server serves the 99,631-byte
+  corpus-maximum request end to end (HTTP 200, 279 entities, 13 relations,
+  ~6–7 s).
 
 ### Admission, batching, and errors
 
@@ -220,7 +265,7 @@ All reproduction commands below run from the repository root, with
 `ANTFLY_GLINER25_BASE_MODEL_DIR` set to the pulled artifact directory
 (`~/.antfly/inference/models/fastino/gliner2.5-base-v1` by default).
 
-> **Relocated:** the dated qualification and follow-up narrative (sections 2–8 and 12–14 in full, and the non-probe parts of sections 9–11 and 15) → [GLiNER2.5 base qualification evidence](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md). Section numbers are unchanged; code comments cite them as "GLINER25.md section N".
+> **Relocated:** the dated qualification and follow-up narrative (sections 2–14 in full, and the single-window part of section 15) → [GLiNER2.5 base qualification evidence](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md). Section numbers are unchanged; code comments cite them as "GLINER25.md section N".
 
 - [2. Correctness](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#2-correctness): pinned ten-fixture Python parity, native and Metal.
 - [3. Geometry (LengthContract bounds)](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#3-geometry-lengthcontract-bounds): first single-window geometry measurement.
@@ -229,9 +274,9 @@ All reproduction commands below run from the repository root, with
 - [6. Two more gates discovered and fixed during this qualification](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#6-two-more-gates-discovered-and-fixed-during-this-qualification): listing, capability, and plain-request routing fixes.
 - [7. Memory budget](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#7-memory-budget): budget flags that admit the fp32 checkpoint.
 - [8. Follow-up: the in-process provider entry, and widening for the real dogfood schema](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#8-follow-up-the-in-process-provider-entry-and-widening-for-the-real-dogfood-schema): `extractWithAdmission` upgrade and dogfood-schema widening.
-- [9. Follow-up: long-document windowing qualified for the real dogfood schema](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#9-follow-up-long-document-windowing-qualified-for-the-real-dogfood-schema): throughput, end-to-end, and in-process ingest results (design and geometry remain below).
-- [10. Follow-up: long-document throughput (window size, batching, precision)](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#10-follow-up-long-document-throughput-window-size-batching-precision): window-size sweep, batching, and the first fp16 probe.
-- [11. Follow-up: the 9-request incident was batching, not document geometry, plus a widened bound and named length-limit errors](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#11-follow-up-the-9-request-incident-was-batching-not-document-geometry-plus-a-widened-bound-and-named-length-limit-errors): batching root cause, named errors, OOM retry, retry-storm notes.
+- [9. Follow-up: long-document windowing qualified for the real dogfood schema](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#9-follow-up-long-document-windowing-qualified-for-the-real-dogfood-schema): design, corpus survey, geometry, canonical-envelope tests, throughput, end-to-end, and in-process ingest results.
+- [10. Follow-up: long-document throughput (window size, batching, precision)](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#10-follow-up-long-document-throughput-window-size-batching-precision): window-size sweep, the 1024/32 default change, batching, and the first fp16 probe.
+- [11. Follow-up: the 9-request incident was batching, not document geometry, plus a widened bound and named length-limit errors](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#11-follow-up-the-9-request-incident-was-batching-not-document-geometry-plus-a-widened-bound-and-named-length-limit-errors): batching root cause, named errors, OOM retry, widened 182,000-byte bound, retry-storm notes.
 - [12. Follow-up: fp16-encoder qualification attempt -- real-pipeline parity measured, does not yet clear the bar](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#12-follow-up-fp16-encoder-qualification-attempt----real-pipeline-parity-measured-does-not-yet-clear-the-bar): first fp16 parity attempt.
 - [13. Follow-up: closing the in-process-vs-HTTP throughput gap -- measured equal, root cause is elsewhere](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#13-follow-up-closing-the-in-process-vs-http-throughput-gap----measured-equal-root-cause-is-elsewhere): HTTP versus `Node.extractDirect` throughput.
 - [14. Follow-up: the corpus-minimum document, the serial batch contract, and the plan-resolution floor](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#14-follow-up-the-corpus-minimum-document-the-serial-batch-contract-and-the-plan-resolution-floor): corpus-minimum floor, serial batch contract, planning floor.
@@ -261,173 +306,7 @@ python3 zig/pkg/inference/scripts/gliner25/oracle.py verify-references
 These are the exact digests compiled into `gliner_boundary_qualification.zig`'s
 `fastino_gliner25_base_v1` identity.
 
-### 9. Follow-up: long-document windowing qualified for the real dogfood schema
-
-Section 8 widened the single-window bound to `document_bytes<=610` for the
-real dogfood schema, but recorded that most of `examples/dogfood`'s
-longer design-doc sections still needed long-document windowing, which
-remained unqualified (`.long_document` was not in the feature set) and
-correctly failed closed with `error.UnsupportedGlinerBoundaryRuntime`. This
-section qualifies it.
-
-**Design already in place.** `extractors/gliner_boundary_long_executor.zig`
-(landed with the boundary architecture in PR #720) already implements
-windowed execution: overlapping windows sized to the checkpoint's own
-declared per-window body-word capacity (`config.max_len` = 4096 words for
-the base backbone, matching the wire's own `long_document.window_words`
-default), offsets mapped back to whole-document coordinates
-(`gliner_boundary_long_document.zig`'s `Plan`/`rebaseSource`), entities
-deduplicated across overlapping windows (`mergeMentions`), and relations
-resolved only when both endpoints fall in one window and then merged/
-deduplicated document-wide (`gliner_boundary_long_relations.zig`). Model
-tensors (encoder/head activations) are freed after every window; only
-bounded scalar evidence survives to the next, so one window's memory
-profile is independent of document length, and cumulative admission
-(`Limits.max_total_encoded_tokens`/`max_total_attention_work`) bounds total
-work across the whole document regardless of window count. This section's
-job was purely to measure and review this existing design against real
-long documents, not to build it.
-
-**Document-size bound.** Section boundaries in this repository come from
-`docsaf.MarkdownProcessor` (one section per Markdown heading, no minimum
-merge threshold as `examples/dogfood` configures it -- see
-`examples/dogfood/ingest.go`). A survey of every such section under
-`zig/*.md` and `work-log/**/*.md` (2,355 sections) found: p50 = 982 bytes,
-p90 = 4,378, **p95 = 7,285**, p99 = 23,428, **max = 99,008** (`zig/PDF.md`'s
-"Review findings and required fixes"). This matches the follow-up brief's
-"typical sections are 1-8 KB, some are 20-90 KB" characterization.
-
-**Geometry.** `extractors/gliner_boundary_qualification.zig`'s new
-`"gliner boundary qualification measures pinned base checkpoint
-long-document production geometry"` test tokenizes and plans (no model
-weights) real sections through the long executor's window planner, with
-`long_document.mode=window` and the wire's default window/overlap words
-(4096/128), against the real dogfood schema (11 entities, 6 relations):
-
-- The two short single-window-shaped fixtures from section 3 (still sent
-  with `long_document.mode=window`, since `examples/dogfood` now requests
-  it unconditionally -- see below), producing exactly one window each.
-- `zig/pkg/antfly/src/storage/lsm/LSM.md`'s "Read And Scan Work" (6,787
-  bytes, ~p95): 1 window, window_words=1183, padded_sequence_tokens=1455.
-- `zig/VOPR.md`'s "Completion-Claim Audit" (37,143 bytes when measured;
-  the frozen fixture `zig/pkg/inference/testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt`
-  is 37,138 bytes): 2 windows,
-  window_words=[2139,4096], padded_sequence_tokens=[3131,5708].
-- `zig/PDF.md`'s "Review findings and required fixes" (99,008 bytes, the
-  corpus max; frozen as
-  `zig/pkg/inference/testdata/gliner25/long_document_probe/pdf_review_findings.txt`): 4 windows, window_words=[3994,4096],
-  padded_sequence_tokens=[4594,4690].
-
-The VOPR.md and PDF.md sections the tests use are frozen, byte-for-byte
-snapshots taken at commit `3ce5aff4ea` (heading line up to, but excluding,
-the next line starting with `#`) under
-`zig/pkg/inference/testdata/gliner25/long_document_probe/`
-(`vopr_completion_claim_audit.txt`, `pdf_review_findings.txt`), so editing or
-slimming those design docs never changes the long-document probe inputs.
-
-Exact observed range across all cases: `document_bytes=[26,99008]
-document_words=[5,15894] window_count=[1,4] window_words=[5,4096]
-padded_sequence_tokens=[106,5708]`. This is the exact `LengthContract` on
-the new `fastino_gliner25_base_v1_long_document_features` production rows
-(native and Metal) in `models/gliner_boundary_qualification.zig`, with
-features `entities, relations, word_whitespace, overlap_flat, offset_utf8,
-decoder_auto, long_document, record_identity_occurrence, confidence, spans`
--- exactly `examples/dogfood`'s real schema shape (entities + relations
-only) and nothing wider. This is a separate row from the single-window
-row, not a widening of it: the two require disjoint features
-(`.single_window` vs `.long_document`), so a single-window request cannot
-borrow the long-document row's wider bounds, and vice versa.
-
-**Canonical envelope shape.** The long executor's `mergeAll` builds the
-same `pipeline.Sample` type the single-window executor does, so both are
-serialized by the identical `extraction_v2.zig` `writeSample`/`endpoint`
-code: entities carry `text`/`label`/`start`/`end`/`score`; relations carry
-`type` and `source`/`target` objects resolved to `entity_index` (matched
-against the final deduplicated entities array by exact rebased byte span
-and text) plus `score` -- never the pipeline's internal `head`/`tail`
-value representation. This was exercised end to end, on both backends,
-through both the HTTP handler and the in-process provider entry (matching
-the two real call sites of `extractWithAdmission` from section 8):
-
-- `"gliner boundary long executor HTTP canonical schema_version 2 shape for
-  a real multi-window document with relations native/Metal"`
-  (`server/gliner_boundary_service_test.zig`): a real HTTP `/ai/v1/extract`
-  request against `zig/VOPR.md`'s "Completion-Claim Audit" (37KB, 2
-  windows; now read from the frozen
-  `long_document_probe/vopr_completion_claim_audit.txt` fixture), asserting every entity and relation in the response matches the
-  canonical shape and that no `head`/`tail` key ever appears.
-- `"gliner boundary long executor provider extractDirect canonical
-  schema_version 2 relations shape for a windowed request native/Metal"`:
-  the same assertions through `Node.extractDirect`, the entry point the
-  in-process/embedded worker actually calls.
-
-> **Relocated:** the rest of section 9 (Metal process isolation, schema-specific floor, throughput, end-to-end, dogfood windowing, in-process ingest) → [history](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#9-follow-up-long-document-windowing-qualified-for-the-real-dogfood-schema).
-
-### 10. Follow-up: long-document throughput (window size, batching, precision)
-
-> **Relocated:** the window-size sweep, batching design notes and measurements, and the first fp16 probe → [history](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#10-follow-up-long-document-throughput-window-size-batching-precision).
-
-**Default changed, bound stays wide.** `extraction_v2.zig`'s
-`LongDocument.window_words`/`overlap_words` defaults changed from
-4096/128 to **1024/32**; the qualified `window_words` upper bound stays at
-4096 (a request may still explicitly opt into up to 4096, e.g. to trade
-throughput for fewer, larger windows), and `window_count`'s upper bound
-widened from 4 to **17** (the real observed maximum, at 1024 words/window,
-for `zig/PDF.md`'s 99,008-byte corpus-max section -- see the updated
-`fastino_gliner25_base_v1_long_document_lengths` row, which is now the
-union of the 1024-word and 4096-word sweeps' measured ranges). This
-request option was already public (`options.long_document.window_words`);
-only its default value and the qualified bound changed. No
-`examples/dogfood` change was needed for this part (it does not set
-`window_words`, so it picks up the new default automatically).
-
-### 11. Follow-up: the 9-request incident was batching, not document geometry, plus a widened bound and named length-limit errors
-
-A real `examples/dogfood ingest -reset` run against the corpus (1,205
-sections; see `dogfood-followup-final2.log`, scratchpad) reported 9
-extraction failures with `error.UnsupportedGlinerBoundaryRuntime`,
-`request_bytes` from 33,130 to 99,631 -- all comfortably within section 9's
-qualified `document_bytes<=99,008` bound, which made the failures look like a
-geometry-qualification gap.
-
-> **Relocated:** the batching root cause and fix, named length-limit errors, OOM group retry, and retry-storm notes → [history](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#11-follow-up-the-9-request-incident-was-batching-not-document-geometry-plus-a-widened-bound-and-named-length-limit-errors).
-
-**Widened the long-document bound anyway, with real measured margin.**
-Independently of the above, the corpus's real maximum section (per an exact
-`docsaf`-accurate Go-side sweep of the whole ingest corpus, not the
-approximate heading-to-heading text search sections 9-10's evidence used)
-is `zig/PDF.md`'s "Review findings and required fixes" at 92,302 body bytes
-/ 14,503 words / 15 windows at the default 1024-word window -- already
-inside the section 9/10 bound, and no other real section comes close. To
-qualify past today's corpus maximum with real margin (not extrapolation --
-this file's stated policy), two synthetic documents were built by
-concatenating `zig/PDF.md`'s two largest real sections verbatim (130KB and
-182KB/28,275 words), fixtured under
-`zig/pkg/inference/testdata/gliner25/long_document_probe/`, and swept
-through `extractors/gliner_boundary_qualification.zig`'s existing
-long-document geometry test at both window_words=1024 and 4096:
-
-```
-document_bytes=[26,182000] document_words=[5,28275] window_count=[1,29] window_words=[5,4096] padded_sequence_tokens=[106,5708]
-```
-
-`window_count` rose from 17 to 29 (window_words=1024: up to 29 windows;
-window_words=4096: up to 8) and `document_bytes`/`document_words` rose to
-182,000/28,275; `window_words`/`padded_sequence_tokens` were already wide
-enough (the new synthetic documents' per-window token counts, up to 4,831,
-stayed under the existing 5,708 maximum). This is now the production
-`fastino_gliner25_base_v1_long_document_lengths` row.
-
-**Verification.** `zig build inference-test -Doptimize=fast --
---test-filter "gliner boundary"` (native + Metal; `160` selected, `138`
-passed, `22` skipped, `0` failed) and `--test-filter "extraction"` (`100`
-selected, `99` passed, `1` skipped, `0` failed) after every change in this
-section. A live `antfly inference run --port 8098` server (same budget
-flags as section 9) served the real 99,631-byte corpus-maximum request
-(`zig/PDF.md`'s "Review findings and required fixes") end to end: HTTP 200,
-279 entities and 13 relations, ~6-7s, both before and after a full
-`zig build -Doptimize=fast` rebuild with every change in this
-section applied.
+> **Relocated:** the long-document probe narrative of sections 9–11 (corpus survey, geometry sweeps, canonical-envelope tests, window-size default change, widened bound, and verification) → [GLiNER2.5 base qualification evidence](../../../../../docs/design/inference/history/gliner2/gliner25-base-qualification-2026-09.md#9-follow-up-long-document-windowing-qualified-for-the-real-dogfood-schema). Current rules and numbers are under [Long-document geometry evidence](#long-document-geometry-evidence).
 
 ### 15. Follow-up: fp16-encoder single-window qualification -- root cause, reviewed tolerance, and selection wiring
 
