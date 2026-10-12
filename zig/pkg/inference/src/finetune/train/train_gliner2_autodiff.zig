@@ -3021,7 +3021,9 @@ fn trainingStateFingerprint(
         .build_enable_metal = build_options.enable_metal,
         .build_enable_cuda = build_options.enable_cuda,
         .build_enable_pjrt = build_options.enable_pjrt,
-        .build_enable_onnx = build_options.enable_onnx,
+        // ONNX Runtime was removed; the field stays false so existing
+        // training-state identities remain resumable.
+        .build_enable_onnx = false,
         .build_target_arch = @tagName(builtin.cpu.arch),
         .build_target_os = @tagName(builtin.os.tag),
         .build_optimize_mode = @tagName(builtin.mode),

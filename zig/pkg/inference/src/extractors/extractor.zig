@@ -730,7 +730,7 @@ fn shouldInvalidateReaderSelection(err: anyerror) bool {
         error.NoBackendAvailable,
         error.IncompatibleModel,
         error.UnknownModelCompatibility,
-        error.OnnxNotEnabled,
+        error.NativeMoondreamNotYetSupported,
         error.NativePix2StructNotYetSupported,
         => true,
         else => false,

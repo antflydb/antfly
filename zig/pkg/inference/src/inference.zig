@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // Antfly inference: ML service for embeddings, chunking, and reranking.
-// Zig implementation with ONNX Runtime, Metal, CUDA, WASM, and native backends.
+// Zig implementation with native CPU, Metal, CUDA, PJRT, and WASM backends; ONNX
+// models run on Antfly's own ONNX implementation.
 
 const std = @import("std");
 const build_options = @import("build_options");

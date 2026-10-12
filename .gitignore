@@ -17,7 +17,6 @@ models/*
 
 # main db dirs for antfly
 antflydb
-onnxruntime
 
 # ai
 .aider*
@@ -36,7 +35,6 @@ gosec_output.txt
 dist/
 
 # Runtime libraries
-onnxruntime/
 pjrt/
 
 # releasing
