@@ -3315,8 +3315,8 @@ repository Zig 0.17 compiler. The first 0.17 compilation exposed a misplaced
 signing-context declaration; it was corrected before the passing gate. After
 additional native projection fault checks, the final HTTP/authority Debug gate
 passed 76/76 build steps and 67 component executions (28 publication, four
-service authority, 19 HTTP ACK/catalog identity, 12 mounted client and four
-durable report/authority tests), without skips, failures or leaks. The compiled
+ACK/catalog-identity, 19 plus 12 split-owner runtime-status/durable-report/ACK,
+and four service protocol-authority tests), without skips, failures or leaks. The compiled
 data-receiver Debug gate passed 91/91 steps and its one selected receiver test,
 also without skips, failures or leaks. The selections overlap and are not 68
 distinct original SQL contracts. License-boundary (2,035 source files), original
