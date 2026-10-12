@@ -6704,6 +6704,7 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
         api_server_cfg.relational_index_claims = .{ .ptr = self, .execute_fn = nativeIndexClaimsControl };
+        api_server_cfg.relational_index_control = .{ .ptr = self, .execute_fn = nativeIndexOwnerControl };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -11599,6 +11600,16 @@ pub const DataServer = struct {
         if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
         const owners = try self.ensureKernelOwnerSource();
         return antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
+    }
+
+    fn nativeIndexOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try request.validate(group_id);
+        // This native receiver cannot borrow a data-Raft leader's authority.
+        if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
+        const owners = try self.ensureKernelOwnerSource();
+        return antfly.public_api.relational_index_owner_execution.step(alloc, owners, &self.status_source, table_name, request, context);
     }
 
     fn installRowPolicyControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.row_policy_install.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.row_policy_install.Response {
@@ -33933,12 +33944,17 @@ fn consumerTests() type {
         }
         test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
             var server: DataServer = undefined;
+            const control: antfly.public_api.relational_index_owner_execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
             const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
             var signal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .deadline_ns = 0 }));
+            try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 8, control, .{}));
             try std.testing.expectError(error.Canceled, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
             try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
             server.api_server_cfg = .{ .deployment_mode = .standalone };
             server.data_raft = @ptrFromInt(4096);
+            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{}));
             try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
         }
         test "system catalog runtime observation targets its group and preserves errors" {

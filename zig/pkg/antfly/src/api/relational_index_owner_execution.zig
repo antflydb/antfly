@@ -32,6 +32,11 @@ pub const Request = struct {
     id: [16]u8,
     operation: enum { fence, reserve },
 
+    pub fn validate(self: Request, group_id: u64) !void {
+        if (self.group_id != group_id) return error.GenerationPublicationChanged;
+        try self.lookup(.permission).validate();
+    }
+
     fn lookup(self: Request, projection: @FieldType(publication.OwnerRequest, "projection")) publication.OwnerRequest {
         return .{
             .table_id = self.table_id,
@@ -91,6 +96,72 @@ pub const Result = union(enum) {
             .controlled => |value| value.root_generation,
             .acknowledged, .applied => null,
         };
+    }
+
+    /// Borrowed response; retain this result until serialization completes.
+    pub fn response(self: *const Result) !ControlResponse {
+        return switch (self.*) {
+            .acknowledged => .acknowledged,
+            .applied => |value| .{ .admitted = value.value },
+            .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value } },
+            .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt } },
+        };
+    }
+};
+
+pub const control_remaining_ms_header = "X-Antfly-Index-Control-Remaining-Ms";
+pub const max_control_request_bytes = 4096;
+
+/// Internal progress only. Neither the applying-root generation nor an unsigned
+/// logical receipt grants metadata publication authority to a remote caller.
+pub const ControlResponse = union(enum) {
+    acknowledged,
+    admitted: native.Outcome,
+    controlled: RootedOutcome,
+    recovered: RootedOutcome,
+
+    pub const RootedOutcome = struct { root_generation: u64, outcome: native.Outcome };
+
+    pub fn validate(self: ControlResponse, request: Request) !void {
+        try request.validate(request.group_id);
+        const outcome: native.Outcome = switch (self) {
+            .acknowledged => return,
+            .admitted => |value| blk: {
+                if (request.operation != .fence or value.receipt != null or value.binding.phase != .fencing)
+                    return error.InvalidPrivateIndexNativeReceipt;
+                break :blk value;
+            },
+            .controlled, .recovered => |value| blk: {
+                if (value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
+                break :blk value.outcome;
+            },
+        };
+        const binding = outcome.binding;
+        try outcome.validateRecovery(.{
+            .identity = .{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id },
+            .effect = switch (request.operation) {
+                .fence => .fenced,
+                .reserve => .reserved,
+            },
+        });
+        if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+pub const ControlPort = struct {
+    ptr: *anyopaque,
+    execute_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, Request, operation.RequestContext) anyerror!Result,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const VTable = struct { execute_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, Request, operation.RequestContext) anyerror!Result };
+    const BoundaryAbi = local.runtime_callback_abi.Boundary(VTable);
+
+    pub fn execute(self: ControlPort, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: Request, context: operation.RequestContext) !Result {
+        try context.ensureActive();
+        try request.validate(group_id);
+        var result = try BoundaryAbi.call("execute_fn", self.boundary_dispatch, self.execute_fn, .{ self.ptr, alloc, table_name, group_id, request, context });
+        errdefer result.deinit();
+        try (try result.response()).validate(request);
+        return result;
     }
 };
 
@@ -877,6 +948,8 @@ test "relational index publication native receiver stages one effect recovers pe
         var result = try step(alloc, &driver, &driver, plan.before.name, request, .{});
         defer result.deinit();
         try std.testing.expect(result == .applied);
+        try (try result.response()).validate(request);
+        try std.testing.expect((try result.response()) == .admitted);
         try std.testing.expect(result.outcome().?.receipt == null);
         try std.testing.expect(result.rootGeneration() == null);
         try std.testing.expectEqual(@as(usize, 1), driver.permission_reads);
@@ -888,6 +961,20 @@ test "relational index publication native receiver stages one effect recovers pe
         var result = try step(alloc, &driver, &driver, plan.before.name, request, .{});
         defer result.deinit();
         try std.testing.expect(result == .controlled);
+        try (try result.response()).validate(request);
+        var invalid = try result.response();
+        invalid.controlled.root_generation = 0;
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, invalid.validate(request));
+        invalid = try result.response();
+        invalid.controlled.outcome.binding.id[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, invalid.validate(request));
+        var foreign_request = request;
+        foreign_request.table_id += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, (try result.response()).validate(foreign_request));
+        foreign_request = request;
+        foreign_request.operation = .reserve;
+        const admitted: ControlResponse = .{ .admitted = result.controlled.outcome.value };
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, admitted.validate(foreign_request));
         try std.testing.expectEqual(@as(?u64, 9), result.rootGeneration());
         driver.root_generation = 10;
         try std.testing.expectEqual(@as(?u64, 9), result.rootGeneration());
@@ -914,6 +1001,7 @@ test "relational index publication native receiver stages one effect recovers pe
         defer result.deinit();
         @memset(&pending_name, 'x');
         try std.testing.expect(result == .recovered);
+        try (try result.response()).validate(request);
         try std.testing.expectEqual(@as(u64, 9), result.recovered.root_generation);
         driver.root_generation = 10;
         try std.testing.expectEqual(@as(u64, 9), result.recovered.root_generation);

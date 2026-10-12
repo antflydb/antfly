@@ -1439,6 +1439,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
         try server.post(table_prefix ++ routes.relational_index_claims_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexClaims));
+        try server.post(table_prefix ++ routes.relational_index_control_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexControl));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
@@ -2512,31 +2513,39 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupRelationalIndexClaims(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, true);
+    }
+
+    fn internalGroupRelationalIndexControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, false);
+    }
+
+    fn internalGroupRelationalIndexOwner(self: *AntflyApiHandler, ctx: *httpx.Context, comptime claims: bool) !httpx.Response {
         // No tokenless migration exception for private index mutations.
         const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
         var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
         defer service.deinit(self.api_server.alloc);
         if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         const execution = @import("relational_index_owner_execution.zig");
-        const budget_header = ctx.header(execution.claim_remaining_ms_header) orelse return textResponse(ctx, 400, "private index claim budget required");
-        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index claim budget");
-        if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index claim budget");
-        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index claim deadline expired");
+        const budget_header = ctx.header(if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header) orelse return textResponse(ctx, 400, "private index operation budget required");
+        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index operation budget");
+        if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index operation budget");
+        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index operation deadline expired");
         const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
         context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
         context.deadline_io = null;
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index claims required");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index operation required");
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
-        if (body.len > native.max_claim_wire_bytes) return textResponse(ctx, 413, "private index claims too large");
-        var parsed = std.json.parseFromSlice(execution.ClaimRequest, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
-            error.OutOfMemory => textResponse(ctx, 503, "private index claim decoder unavailable"),
-            else => textResponse(ctx, 400, "invalid private index claims"),
+        if (body.len > (if (claims) native.max_claim_wire_bytes else execution.max_control_request_bytes)) return textResponse(ctx, 413, "private index operation too large");
+        var parsed = std.json.parseFromSlice(if (claims) execution.ClaimRequest else execution.Request, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, "private index operation decoder unavailable"),
+            else => textResponse(ctx, 400, "invalid private index operation"),
         };
         defer parsed.deinit();
-        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid private index claim scope");
-        const port = self.api_server.cfg.relational_index_claims orelse return textResponse(ctx, 503, "private index claim receiver unavailable");
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid private index operation scope");
+        const port = (if (claims) self.api_server.cfg.relational_index_claims else self.api_server.cfg.relational_index_control) orelse return textResponse(ctx, 503, "private index owner receiver unavailable");
         var result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, context) catch |err| return switch (err) {
             error.UnsupportedNativeIndexOwner => textResponse(ctx, 501, @errorName(err)),
             error.UniqueConstraintViolation => textResponse(ctx, 409, @errorName(err)),
@@ -2545,7 +2554,7 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 503, @errorName(err)),
         };
         defer result.deinit();
-        return ctx.json(result.response());
+        return ctx.json(if (claims) result.response() else try result.response());
     }
 
     fn internalGroupRowPolicyInstall(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -16771,6 +16780,111 @@ test "httpx private index claims require explicit service authentication and bou
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     try std.testing.expectEqual(@as(usize, 2), fixture.batches);
+}
+
+test "httpx private index control requires explicit service authority and mounts bounded fence reserve requests" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        effects: usize = 0,
+        operation: @FieldType(execution.Request, "operation") = .fence,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.Request, context: operation_contract.RequestContext) !execution.Result {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(self.operation, value.operation);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            self.effects += 1;
+            // An authenticated transport fixture, not proof of a real build.
+            return .acknowledged;
+        }
+        fn expectStatus(handler: *AntflyApiHandler, request: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupRelationalIndexControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "private-control-test-secret-0123456789";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .relational_index_control = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/relational-index-control");
+    defer request.deinit();
+    var value: execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
+    const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(body);
+    try request.setBody(body);
+    try Fixture.expectStatus(&handler, &request, 401, null);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    try request.headers.append(internal_service_auth.header_name, token);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    try Fixture.expectStatus(&handler, &request, 408, 0);
+    const unknown = try std.fmt.allocPrint(alloc, "{s},\"authority\":true}}", .{body[0 .. body.len - 1]});
+    defer alloc.free(unknown);
+    try request.setBody(unknown);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.setBody(body);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "30001");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "0");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    value.group_id = 8;
+    const foreign = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(foreign);
+    try request.setBody(foreign);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    const oversized = try alloc.alloc(u8, execution.max_control_request_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    try request.setBody(oversized);
+    try Fixture.expectStatus(&handler, &request, 413, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.effects);
+    value.group_id = 7;
+    inline for (.{ .fence, .reserve }) |action| {
+        value.operation = action;
+        fixture.operation = action;
+        const action_body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(action_body);
+        try request.setBody(action_body);
+        try Fixture.expectStatus(&handler, &request, 200, null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.effects);
+    fixture.operation = .fence;
+    var mounted: HttpxE2eServer = undefined;
+    try mounted.init(alloc, &api_server);
+    defer mounted.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try mounted.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-control", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.control_remaining_ms_header, "1000" } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 3), fixture.effects);
 }
 
 test "httpx FK source control rejects missing service token in legacy internal mode" {
