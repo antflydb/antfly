@@ -33915,6 +33915,22 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "boundary dispatcher preserves native index claim conflicts and capability failures across runtime units" {
+            const abi = @import("antfly_runtime_abi");
+            const VTable = struct { apply: *const fn (*const anyerror) anyerror!u64 };
+            const TestBoundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+            const Callbacks = struct {
+                fn apply(err: *const anyerror) anyerror!u64 {
+                    return err.*;
+                }
+                fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+                    return TestBoundary.local_dispatch(contract, callback, args, output);
+                }
+            };
+            for ([_]anyerror{ error.UnsupportedNativeIndexOwner, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled, error.InvalidPrivateIndexClaimReceipt, error.UniqueConstraintViolation }) |err| {
+                try std.testing.expectError(err, TestBoundary.call("apply", &Callbacks.foreign, &Callbacks.apply, .{&err}));
+            }
+        }
         test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
             var server: DataServer = undefined;
             const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };

@@ -1885,7 +1885,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx FK source control rejects missing service token in legacy internal mode",
         "httpx private index claims",
         "private index claim client",
-        "boundary dispatcher preserves native index claim",
         "hidden generation handoff receipt requires exact scoped read-index request",
         "hidden generation handoff identity requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
