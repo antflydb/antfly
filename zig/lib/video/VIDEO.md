@@ -498,9 +498,11 @@ right-aligned, and chroma plane dimensions must match the declared subsampling.
 `submitHost` stages owned native integer planes without a CPU RGB conversion;
 `native_staging_bytes` and the host staging bound cover this copy. Both routes reuse
 cached bicubic coefficients and match CPU preparation across range and rotation.
-Monochrome Metal import is explicitly unsupported. VideoToolbox/CoreVideo NV12
-imports and the Apple hardware qualifier retain their 8-bit 4:2:0 contract; expanded
-integer textures do not advertise P010/CoreVideo or high-depth hardware decoding.
+Monochrome native import/staging and uncompressed CoreVideo P010 imports are
+implemented and qualified in the later "Monochrome and P010 Metal surfaces"
+section. The VideoToolbox compressed decoder and its hardware qualifier retain
+their 8-bit 4:2:0 output contract; importing P010 does not establish high-depth
+hardware decoding.
 CUDA/NVDEC and model execution remain separate work.
 
 Independent x264/FFmpeg vectors cover intra prediction, CAVLC/CABAC 8x8 transforms,
