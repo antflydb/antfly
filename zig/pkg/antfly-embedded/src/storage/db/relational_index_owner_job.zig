@@ -476,6 +476,14 @@ fn logicalReceipt(binding: Binding, action: NativeEffect, cut: NativeCut) !publi
     };
 }
 
+/// Validate the logical proof against its exact physical cut. This establishes
+/// internal consistency, not durable existence, enrollment or live authority.
+pub fn validateNativeReceipt(binding: Binding, action: NativeEffect, position: positions.Native, receipt: publication.Receipt) !void {
+    const expected = try logicalReceipt(binding, action, .{ .position = position, .evidence = try nativeEvidence(binding, action) });
+    _ = receipt.digest() catch return error.InvalidPrivateIndexNativeReceipt;
+    if (!std.meta.eql(expected, receipt)) return error.InvalidPrivateIndexNativeReceipt;
+}
+
 /// Fetch a previously committed native proof without inventing a new cut on
 /// retry. Metadata admission/phase authority is independently checked by the
 /// receiving worker; local state and a checksum alone cannot grant it.

@@ -214,6 +214,44 @@ pub const Outcome = struct {
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
     receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+
+    /// Provider bytes are not a signing authority. Validate the exact command
+    /// identity and any returned proof before retaining an applying-root cut.
+    pub fn validateFor(self: Outcome, command: Command) !void {
+        try command.validate();
+        var actual = self.binding;
+        actual.phase = .fencing;
+        const actual_bytes = actual.encode() catch return error.InvalidPrivateIndexNativeReceipt;
+        const expected_bytes = try command.binding.encode();
+        if (!std.mem.eql(u8, &actual_bytes, &expected_bytes)) return error.InvalidPrivateIndexNativeReceipt;
+        try self.validateCut(command.effect);
+    }
+
+    pub fn validateRecovery(self: Outcome, request: ReceiptRequest) !void {
+        try request.identity.validate();
+        const binding = self.binding;
+        const identity = request.identity;
+        if (!std.mem.eql(u8, &binding.id, &identity.id) or
+            !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &binding.owner_digest, &identity.owner_digest) or
+            binding.ordinal != identity.ordinal or binding.fence.owner_group_id != identity.owner_group_id or
+            !binding.fence.namespace.eql(identity.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+        try self.validateCut(switch (request.effect) {
+            .fenced => .fenced,
+            .reserved => .reserved,
+        });
+    }
+
+    fn validateCut(self: Outcome, effect: jobs.NativeEffect) !void {
+        _ = self.binding.encode() catch return error.InvalidPrivateIndexNativeReceipt;
+        self.position.validate() catch return error.InvalidPrivateIndexNativeReceipt;
+        if (self.binding.authority != .native or !self.position.namespace.eql(self.binding.fence.namespace) or
+            (self.replication_pending and self.error_name == null)) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.receipt) |receipt| {
+            if (self.replication_pending or self.error_name != null) return error.InvalidPrivateIndexNativeReceipt;
+            try jobs.validateNativeReceipt(self.binding, effect, self.position, receipt);
+        }
+    }
 };
 
 /// Physical progress only, not a canceled publication receipt or source cut.

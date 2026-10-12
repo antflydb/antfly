@@ -393,6 +393,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {
             errdefer recovered.deinit();
+            try value.validateRecovery(.{ .identity = identity, .effect = effect });
             _ = try permission.value.nativeControl(hot_request, value.binding);
             return .{ .recovered = .{ .root_generation = recovered.root_generation, .outcome = recovered.outcome } };
         }
@@ -401,6 +402,8 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         // The source rechecks activity immediately before compiled dispatch,
         // and returns committed pending outcomes even if cancellation follows.
         const controlled = try source.applyNativeIndexOwnerControlAtRoot(alloc, request.group_id, table_name, command, context);
+        errdefer controlled.outcome.deinit();
+        try controlled.outcome.value.validateFor(command);
         return .{ .controlled = .{ .root_generation = controlled.root_generation, .outcome = controlled.outcome } };
     }
     if (request.operation != .fence) return error.GenerationAdmissionPending;

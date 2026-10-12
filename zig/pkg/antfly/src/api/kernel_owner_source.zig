@@ -3746,9 +3746,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().nativeIndexOwnerReceiptJson(table_name, encoded);
         defer response.deinit();
+        var parsed = try std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (parsed.value) |value| try value.validateRecovery(request);
         return .{
             .root_generation = lease.entry.generation,
-            .outcome = try std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false }),
+            .outcome = parsed,
         };
     }
 
@@ -3995,7 +3998,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().nativeIndexOwnerControlJson(table_name, operation, encoded);
         defer response.deinit();
-        const parsed = try std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        var parsed = try std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (!canceling) try parsed.value.validateFor(command);
         return .{ .root_generation = lease.entry.generation, .outcome = parsed };
     }
 

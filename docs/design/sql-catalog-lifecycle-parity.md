@@ -3018,3 +3018,29 @@ coordinated cancellation/epoch retirement, restore/adoption and distributed
 fault qualification still require implementation and evidence. No original
 SQL case receives credit from this component gate; totals remain
 478 implemented / 136 rejected / 73 superseded / 899 unresolved.
+
+### Native control response validation before attestation
+
+Fresh fence/reserve responses now validate their complete normalized binding
+against the dispatched command inside the applying lease. Recovered responses
+validate the requested immutable owner identity. Both validate native authority,
+namespace and cut before returning an owned rooted result; the receiver repeats
+validation at its generic source boundary. Parsing success is not proof validity.
+
+Any returned publication receipt must match its owner, action, candidate and
+reservation digests, exact physical position and deterministic effect evidence.
+Pending replication or an error cannot coexist with a publishable receipt.
+Committed progress whose proof lookup failed remains an owned, receiptless
+outcome; validation must not misrepresent it as an uncommitted mutation or
+encourage replay. These bounded checks add no metadata lookup or table scan.
+
+The Debug publication and index-page gates passed all 71 build steps and 45
+component executions (26 publication, one decoder-floor, 13 candidate and five
+LSM/page tests), with zero skips, failures or leaks. The actual standby/reopen
+fixture validates fresh, duplicate and recovered cuts, and rejects substituted
+positions, owner ordinals, candidate/evidence digests, physical bindings, foreign
+recovery identities/actions and receipts carrying pending/error state.
+
+This closes a provider-response validation prerequisite, not root signing,
+enrollment, worker activation or distributed-fault qualification. Public native
+production remains disabled and original-case dispositions are unchanged.

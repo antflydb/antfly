@@ -178,6 +178,7 @@ test "relational index build pages native owner control preserves committed cuts
         }
         if (effect != .admitted) primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
         const outcome = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
+        try outcome.validateFor(control.command);
         try std.testing.expect(!outcome.duplicate);
         if (effect == .fenced) {
             try std.testing.expect(outcome.replication_pending);
@@ -258,11 +259,47 @@ test "relational index build pages native owner control preserves committed cuts
         try replication_ingress.applyRecord(&standby, record);
         try replication_ingress.applyRecord(&standby, record);
         const primary_retry = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
+        try primary_retry.validateFor(control.command);
         try std.testing.expect(primary_retry.duplicate);
         try std.testing.expectEqual(outcome.position, primary_retry.position);
         try std.testing.expectEqual(effect != .admitted, primary_retry.receipt != null);
         if (effect != .admitted) {
             const recovered = (try primary.nativeIndexOwnerReceipt(.{ .identity = receipt_identity, .effect = if (effect == .fenced) .fenced else .reserved })).?;
+            const receipt_request: @import("relational_index_owner_control.zig").ReceiptRequest = .{ .identity = receipt_identity, .effect = if (effect == .fenced) .fenced else .reserved };
+            try recovered.validateRecovery(receipt_request);
+            try recovered.validateFor(control.command);
+            var corrupt = recovered;
+            corrupt.position.sequence += 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateRecovery(receipt_request));
+            corrupt = recovered;
+            corrupt.receipt.?.evidence_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.receipt.?.owner.ordinal += 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.receipt.?.candidate_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateRecovery(receipt_request));
+            corrupt = recovered;
+            corrupt.replication_pending = true;
+            corrupt.error_name = "ReplicationOutboxPending";
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.error_name = "OutOfMemory";
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt.receipt = null;
+            // A committed effect with failed proof lookup remains recoverable
+            // progress; it must not be turned into a rollback-looking error.
+            try corrupt.validateFor(control.command);
+            corrupt = recovered;
+            corrupt.binding.inputs_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            var foreign = receipt_request;
+            foreign.identity.owner_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, recovered.validateRecovery(foreign));
+            foreign = receipt_request;
+            foreign.effect = if (effect == .fenced) .reserved else .fenced;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, recovered.validateRecovery(foreign));
             try std.testing.expect(!recovered.replication_pending);
             try std.testing.expect(recovered.duplicate);
             try std.testing.expectEqual(outcome.position, recovered.position);
