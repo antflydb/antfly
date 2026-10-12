@@ -2940,3 +2940,28 @@ attestation/capability integration, full build/validation/install/release,
 cohort cancellation/epoch retirement, native restore/adoption and authenticated
 distributed faults remain required; failed-UNIQUE-build atomicity remains open.
 No original SQL case is credited by these transport and callback components.
+
+The combined frozen transport source at `50b01750ca` passed all 149 Debug
+build steps, including strict linked-owner selection audits, mounted transport
+and the production data receiver. Companion suites also passed. This is a
+focused combined gate, not full-suite or distributed-fault qualification.
+
+### Applying-root provenance for native fence and reserve
+
+Checkpoint `2e3b68ad53` retains the exact applying lease root with fresh native
+fence/reserve control outcomes, matching the existing rooted claim and recovery
+paths. The receiver carries the owned outcome and its root together. Later
+signing must not relabel that result with a fresh routing/status lookup after
+the applying lease has ended. Admission-only results deliberately expose no
+receipt root. No extra lookup or allocation is introduced by retaining the
+root beside the existing owned response; this is not a measured latency claim.
+
+Frozen-source qualification passed all 94 Debug build steps and 27 component
+executions: 23 publication, one decoder-floor and three actual compiled-owner
+adapter tests. The latter cover fresh fence/reserve root provenance, reserved
+LSM receipt recovery after closing/reopening storage, duplicate claim delivery,
+foreign namespace rejection, early cancellation/deadlines and subsequent root
+replacement without relabeling an already-owned result. Synthetic sequencing
+also verifies that changing the current root does not change a returned root.
+All runs have zero skips, failures or leaks. Root provenance is not a signature
+or enrollment check; all activation and original-case boundaries above remain.
