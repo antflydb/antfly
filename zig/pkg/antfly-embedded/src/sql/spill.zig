@@ -1707,6 +1707,10 @@ pub const Sort = struct {
     offset: u64 = 0,
     finished: bool = false,
     total: usize = 0,
+    /// The caller guarantees input order according to `orders`. Stream one
+    /// run without sorting or repeatedly merging already ordered prefixes.
+    presorted: bool = false,
+    presorted_run: ?Sequential = null,
     parallel_runs: bool = true,
     pending_run: ?*RunJob = null,
     parallel_runs_started: usize = 0,
@@ -1768,6 +1772,7 @@ pub const Sort = struct {
         return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .arena = std.heap.ArenaAllocator.init(backing), .values = .init(backing), .keys = .init(backing) };
     }
     pub fn deinit(self: *Sort) void {
+        if (self.presorted_run) |*run| run.close();
         if (self.pending_run) |job| {
             if (job.task.?.cancel(self.manager.io)) |value| {
                 var file = value;
@@ -1799,6 +1804,13 @@ pub const Sort = struct {
         for (row.values) |v| bytes +|= try operators.datumBytes(v);
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
         self.max_row_bytes = @max(self.max_row_bytes, bytes);
+        if (self.presorted) {
+            if (self.presorted_run == null) self.presorted_run = try Sequential.init(self.manager, self.blockBytes());
+            _ = try self.presorted_run.?.append(row, none);
+            self.total += 1;
+            return;
+        }
+        try self.collectPresortedRun();
         if (bytes > self.memory_bytes / 3) {
             // A legal row may exceed the preferred in-memory run size. Encode
             // it directly as a singleton run without copying it into the heap;
@@ -1956,6 +1968,14 @@ pub const Sort = struct {
         transferred = true;
         return self.admitRun(run);
     }
+    fn collectPresortedRun(self: *Sort) !void {
+        if (self.presorted_run) |*run| {
+            try run.seal();
+            const owned = run.*;
+            self.presorted_run = null;
+            try self.admitRun(owned);
+        }
+    }
     fn admitRun(self: *Sort, input: Sequential) !void {
         std.debug.assert(self.run_limit >= 1 and self.run_limit <= self.runs.len);
         var run = input;
@@ -2019,7 +2039,10 @@ pub const Sort = struct {
     fn fanIn(self: *const Sort) usize {
         const block_workspace = if (self.blockBytes() > 128) self.blockBytes() *| 8 else 0;
         const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| block_workspace +| 512;
-        return @min(self.run_limit + 1, @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
+        // Keep one retained run outside a full-directory compaction. Otherwise
+        // a small directory with fan-in = run_limit + 1 rewrites its entire
+        // growing prefix whenever the next run arrives.
+        return @min(@max(@as(usize, 2), self.run_limit), @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
     }
     fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
@@ -2113,6 +2136,7 @@ pub const Sort = struct {
     }
     fn finishImpl(self: *Sort, leased: bool) !void {
         if (self.finished) return;
+        try self.collectPresortedRun();
         if (self.pending_run != null) {
             try self.flush();
             try self.collectRun();
@@ -3263,4 +3287,65 @@ test "SQL spill sorts singleton rows larger than the preferred run buffer" {
     defer arena.deinit();
     try std.testing.expect((try sort.next(arena.allocator())) == null);
     try std.testing.expect(quota.peak <= quota.limit);
+}
+
+test "SQL narrow spill directories bound growing-prefix rewrites" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    const count = 32768;
+    const payload: [128]u8 = @splat('x');
+    var dummy: u8 = 0;
+    var written: [2]u64 = undefined;
+    for ([_]usize{ 4, 24 }, 0..) |limit, variant| {
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+        defer manager.deinit();
+        var sort = Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+        sort.run_limit = limit;
+        sort.parallel_runs = false;
+        defer sort.deinit();
+        for (0..count) |index| {
+            try sort.add(.{ .values = &.{Datum.json(.{ .string = &payload })}, .keys = &.{Datum.json(.{ .integer = @intCast(count - 1 - index) })}, .ordinal = index });
+        }
+        if (limit == 4) try std.testing.expectEqual(@as(usize, 4), sort.fanIn());
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (0..count) |index| {
+            _ = scratch.reset(.retain_capacity);
+            const row = (try sort.next(scratch.allocator())).?;
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.keys[0].value.integer);
+            try std.testing.expectEqualStrings(&payload, row.values[0].value.string);
+        }
+        try std.testing.expect((try sort.next(a)) == null);
+        written[variant] = manager.written_bytes;
+        if (limit == 4) try std.testing.expect(manager.peak_files <= 8);
+    }
+    std.debug.print("SQL narrow directory rewrite bytes: narrow={d} wide={d}\n", .{ written[0], written[1] });
+    try std.testing.expect(written[0] * 2 <= written[1] * 3);
+}
+
+test "SQL presorted streams retain one run without merge rewrites" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    var sort = Sort.init(a, &manager, &.{.{}}, 128 * 1024);
+    sort.presorted = true;
+    defer sort.deinit();
+    for (0..32768) |index| try sort.add(.{ .keys = &.{Datum.json(.{ .integer = @intCast(index) })}, .values = &.{Datum.json(.{ .integer = @intCast(index * 3) })}, .ordinal = index });
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..32768) |index| {
+        _ = scratch.reset(.retain_capacity);
+        const row = (try sort.next(scratch.allocator())).?;
+        try std.testing.expectEqual(@as(i64, @intCast(index)), row.keys[0].value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(index * 3)), row.values[0].value.integer);
+    }
+    try std.testing.expect((try sort.next(a)) == null);
+    try std.testing.expectEqual(@as(usize, 1), manager.peak_files);
+    try std.testing.expectEqual(@as(usize, 0), manager.merges);
 }

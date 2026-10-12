@@ -77189,7 +77189,10 @@ test "db enrichments precomputed watermark advances across replay entries withou
     defer cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    // This probes foreground precomputed advancement; a concurrent replay
+    // worker could consume the inert entry before the initial observation.
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),

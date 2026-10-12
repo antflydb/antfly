@@ -671,6 +671,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api session maintenance recovers crash window after durable 2pc commit",
             "api session maintenance skips live commit execution and acknowledgement",
             "session maintenance activation follows current range leadership without follower RPCs",
+            "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
