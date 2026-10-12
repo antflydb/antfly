@@ -3774,13 +3774,31 @@ nodes with exactly 509, 2,045 and 8,189 scalar fold steps; only the folded root
 remains reachable. This proves linear fold work for that balanced-DAG campaign,
 not universal query speed or complete DDL activation.
 
-The native HTTP regression writes all 19 admitted shapes, closes and reopens
-each database, and checks base fields, generated results, types and SQL NULLs
-against the oracle. SQL integer transport is deliberately lossless text, not a
-JSON number. This exercises native schema preparation, storage and public reads;
+The native HTTP regressions verify all 15 rejected shapes' exact PostgreSQL
+SQLSTATEs. The storage/query regression writes all 19 admitted shapes, closes
+and reopens each database, and checks base fields, generated results, types and
+SQL NULLs against the oracle. SQL integer transport is deliberately lossless
+text, not a JSON number. This exercises native schema preparation, storage and public reads;
 it is not public CREATE/ALTER catalog lifecycle or distributed-fault evidence.
+
+Final generated-expression qualification: full SQL Debug passes 21/21 build
+steps, with 748 main-owner and 226 additional-owner tests passing, three existing
+skips and no failures/leaks. Focused public parity passes 80/80 steps and both
+HTTP regressions. The broader API gate passes 117/117 steps, including all 437
+main API-owner tests, with no failures, skips or leaks. These selections overlap
+and are not additional original-case credit or a remote CI-green claim.
+Formatting, generated control-catalog freshness, original
+inventory integrity, its 20 audit unit tests and the 2,040-file Apache boundary
+pass. A final rerun's old local cache disappeared while compilers were active;
+these final gate results use a fresh private cache, not the failed runs.
 
 Original-case accounting remains unchanged. General generated-expression VM
 coverage, partial/expression-index admission and distributed catalog lifecycle
 qualification remain required; these component contracts do not certify all
 340 unresolved DDL originals or complete native-index production activation.
+The shared planner's index follow-up must preserve full-versus-empty membership
+for constant TRUE versus FALSE/UNKNOWN predicates, alongside immutable key and
+predicate admission. An isolated 16-case PostgreSQL probe confirms dead mutable
+calls are pruned, reachable mutable calls reject with 42P17, and demanded
+constant errors retain their ordering. That exploratory probe is not a checked-in
+index fixture or original-case qualification.
