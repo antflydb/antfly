@@ -887,3 +887,57 @@ pass 27 macOS and 25 Linux tests (two Metal skips). Independent fresh campaigns
 pass 103,200 demux and 110,618 normalization runs with four positive serialized
 seeds each. Source/binary/fixture/report bindings are recorded in
 `zig/lib/media/testdata/transport/assembly-validation`.
+
+
+### Explicit WebM entropy-corruption recovery
+
+`video.webm_pictures.walkRecoveringIndexed` adds bounded recovery after a
+successfully parsed header index. It catches only coded-data decode failures,
+destroys the failed decoder owner, and advances to the next codec-parsed key
+restart. AV1 restores that restart's verified sequence bootstrap. Original
+logical picture IDs and timestamps remain intact; the required gap callback
+reports the failed packet, first lost picture, next restart packet/picture and
+reason. A restart event identifies the planned target, which must still decode
+successfully. Corrupt restart pictures can trigger another bounded advance.
+A missing later restart returns `UnrecoverableVideoData`; exhausted recovery or
+skipped-packet budgets return `RecoveryLimitExceeded`.
+
+Source reads and frame/gap callbacks remain outside the recoverable decode
+boundary. A control watcher preserves the provenance of cancellation, deadline
+and arbitrary provider control errors, even if their error name also resembles
+coded-data corruption. Admission/allocation/unsupported-policy failures remain
+terminal. Packet leases and decoder owners release before the gap callback or
+replacement owner. Independently retained output bytes remain valid across
+replacement. Container sync hints never authorize a restart.
+
+Inference continues to use strict `walkIndexed`: damaged selected inputs fail
+rather than silently embedding a reduced clip. The explicit recovery API is for
+callers that handle reported gaps. It requires valid header metadata; malformed
+headers/container indexing and undetected/concealed corruption are separate
+qualification/recovery work. H.264/TS resynchronization, broader mixed-tool
+streams and sustained corruption/fuzz campaigns remain in the original active
+non-CUDA scope. This does not change the v6 embedding recipe or establish new
+pretrained output parity.
+
+Qualification includes VP8/VP9/AV1 entropy mutations, a Sintel-derived VP8 clip,
+false sync hints, retained frames, corrupt restart/tail handling, gap/frame
+callback failures, source/control/cancellation errors, shared admission denial
+and allocation-failure cleanup. Surviving picture hashes match clean decoding;
+this is restart-equivalence evidence, not an independent codec conformance
+oracle. Source/binary/report receipts are in
+`zig/lib/video/testdata/recovery-validation`.
+
+Recovery fuzzing exposed and retained VP8 and VP9 transform overflow inputs.
+VP8 multiplication and VP9 8-point ADST intermediates now use 64-bit arithmetic;
+VP9 checks the upstream valid coefficient bounds through the existing owned
+error path, returning coded-data failure instead of panicking. Both inputs have
+portable regressions. Exploratory failed campaigns remain separate from final
+passing reports; a successful Zig build summary does not establish fuzz success.
+
+The final fresh recovery campaign passes 13,497 executions (801 unique), with
+four accepted Smith seeds and no panic. All 4,623 clean corpus pictures across
+six VP8/VP9/AV1 streams retain independent FFmpeg NV12 hashes after the fixes.
+This bounded campaign does not establish sustained-production fuzz coverage.
+
+Final gates pass 12 focused recovery tests, 196 macOS video tests (two skipped),
+171 actual Linux ARM64 video tests (27 skipped) and 27 macOS model tests.

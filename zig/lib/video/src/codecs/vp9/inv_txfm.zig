@@ -124,13 +124,8 @@ pub const sinpi_1_9 = common.sinpi_1_9;
 pub const sinpi_2_9 = common.sinpi_2_9;
 pub const sinpi_3_9 = common.sinpi_3_9;
 pub const sinpi_4_9 = common.sinpi_4_9;
-pub fn check_range(arg_input: tran_high_t) callconv(.c) tran_high_t {
-    var input = arg_input;
-    _ = &input;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    return input;
+pub fn check_range(input: tran_high_t) callconv(.c) tran_high_t {
+    return @import("../runtime.zig").vp9TransformRange(input, 8);
 }
 pub fn dct_const_round_shift(arg_input: tran_high_t) callconv(.c) tran_high_t {
     var input = arg_input;
@@ -145,19 +140,8 @@ pub fn dct_const_round_shift(arg_input: tran_high_t) callconv(.c) tran_high_t {
     }
     return rv;
 }
-pub fn highbd_check_range(arg_input: tran_high_t, arg_bd: c_int) callconv(.c) tran_high_t {
-    var input = arg_input;
-    _ = &input;
-    var bd = arg_bd;
-    _ = &bd;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    _ = &bd;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    return input;
+pub fn highbd_check_range(input: tran_high_t, bd: c_int) callconv(.c) tran_high_t {
+    return @import("../runtime.zig").vp9TransformRange(input, bd);
 }
 pub fn highbd_clip_pixel_add(arg_dest: u16, arg_trans: tran_high_t, arg_bd: c_int) callconv(.c) u16 {
     var dest = arg_dest;
@@ -878,21 +862,21 @@ pub export fn antfly_vp9_iadst8_c(arg_input: [*c]const tran_low_t, arg_output: [
     if (antfly_codec_afz_vp9_failed() != 0) {
         return;
     }
-    var s0: c_int = undefined;
+    var s0: tran_high_t = undefined;
     _ = &s0;
-    var s1: c_int = undefined;
+    var s1: tran_high_t = undefined;
     _ = &s1;
-    var s2: c_int = undefined;
+    var s2: tran_high_t = undefined;
     _ = &s2;
-    var s3: c_int = undefined;
+    var s3: tran_high_t = undefined;
     _ = &s3;
-    var s4: c_int = undefined;
+    var s4: tran_high_t = undefined;
     _ = &s4;
-    var s5: c_int = undefined;
+    var s5: tran_high_t = undefined;
     _ = &s5;
-    var s6: c_int = undefined;
+    var s6: tran_high_t = undefined;
     _ = &s6;
-    var s7: c_int = undefined;
+    var s7: tran_high_t = undefined;
     _ = &s7;
     if (antfly_codec_afz_vp9_failed() != 0) {
         return;

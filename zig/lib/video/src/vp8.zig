@@ -104,23 +104,35 @@ pub const Session = struct {
         if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
         var lease = try self.reader.readPacket(index);
         defer lease.deinit();
-        if (lease.bytes.len < 3) return error.WebpDecodeFailed;
-        if (lease.bytes[0] & 1 == 0) {
-            if (lease.bytes.len < 10) return error.WebpDecodeFailed;
-            const width = std.mem.readInt(u16, lease.bytes[6..8], .little) & 0x3fff;
-            const height = std.mem.readInt(u16, lease.bytes[8..10], .little) & 0x3fff;
+        return self.decodePacketBytes(lease.bytes, self.reader.input.control);
+    }
+    /// Decode the next indexed packet from an already acquired lease. Keeping
+    /// source errors outside this call permits callers to distinguish corrupt
+    /// coded bytes from transport failures. On decode failure, destroy/restart
+    /// the session; partially updated references must not be reused.
+    pub fn decodePacketBytes(self: *Session, bytes: []const u8, control: media.source.Control) !?Frame {
+        try control.check();
+        if (self.next_index >= self.reader.packets.len) return error.InvalidPacketIndex;
+        if (bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+        const index = self.next_index;
+        const packet = self.reader.packets[index];
+        if (bytes.len < 3) return error.WebpDecodeFailed;
+        if (bytes[0] & 1 == 0) {
+            if (bytes.len < 10) return error.WebpDecodeFailed;
+            const width = std.mem.readInt(u16, bytes[6..8], .little) & 0x3fff;
+            const height = std.mem.readInt(u16, bytes[8..10], .little) & 0x3fff;
             if (width != self.reader.track.width or height != self.reader.track.height) return error.UnsupportedDynamicGeometry;
         }
-        const visible = lease.bytes[0] & 16 != 0 and !packet.invisible;
+        const visible = bytes[0] & 16 != 0 and !packet.invisible;
         const w: usize = (self.reader.track.width + 15) / 16 * 16;
         const h: usize = (self.reader.track.height + 15) / 16 * 16;
-        const bytes = w * h * 3 / 2;
-        var reservation = if (visible and self.options.admission_pool != null) try self.options.admission_pool.?.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+        const output_bytes = w * h * 3 / 2;
+        var reservation = if (visible and self.options.admission_pool != null) try self.options.admission_pool.?.acquire(.{ .host_bytes = output_bytes }) else media.admission.Token{};
         errdefer reservation.deinit();
-        var scope = image.work_control.Scope.enter(.{ .context = self.reader.input.control.context, .check_fn = self.reader.input.control.check_fn });
+        var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
         defer scope.deinit();
         self.budget.denied = false;
-        var p = self.decoder.decode(self.budget.allocator(), lease.bytes, .{ .max_pixels = self.options.max_pixels, .max_rgba_bytes = self.options.max_decode_bytes }) catch |err| {
+        var p = self.decoder.decode(self.budget.allocator(), bytes, .{ .max_pixels = self.options.max_pixels, .max_rgba_bytes = self.options.max_decode_bytes }) catch |err| {
             return if (err == error.ImageTooLarge or (err == error.OutOfMemory and self.budget.denied)) error.ResourceLimitExceeded else err;
         };
         self.next_index += 1;
@@ -129,7 +141,7 @@ pub const Session = struct {
             return null;
         }
         const retained = p.y.len + p.u.len + p.v.len;
-        std.debug.assert(retained == bytes);
+        std.debug.assert(retained == output_bytes);
         // Transfer the output to the backing allocator and its own admission
         // token. Only reference pictures remain charged to the session budget.
         self.budget.live -= retained;

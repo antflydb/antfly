@@ -286,3 +286,20 @@ pub export fn antfly_codec_sort(base: ?*anyopaque, count: usize, width: usize, c
         }
     }
 }
+
+/// libvpx inv_txfm.h specifies signed (8 + depth) intermediate coefficients
+/// for valid streams. Reject violations through the normal owned error path,
+/// rather than overflowing transform arithmetic or asserting on coded data.
+pub fn vp9TransformRange(input: i64, depth: c_int) i64 {
+    if (antfly_codec_afz_vp9_failed() != 0) return 0;
+    if (depth != 8 and depth != 10 and depth != 12) {
+        antfly_codec_afz_vp9_fail(null, 3);
+        return 0;
+    }
+    const limit: i64 = @as(i64, 1) << @intCast(7 + depth);
+    if (input < -limit or input >= limit) {
+        antfly_codec_afz_vp9_fail(null, 3);
+        return 0;
+    }
+    return input;
+}

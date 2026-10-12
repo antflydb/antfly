@@ -119,27 +119,11 @@ pub extern fn antfly_vp9_vpx_idct8x8_1_add_c(input: [*c]const tran_low_t, dest: 
 pub extern fn antfly_vp9_vpx_idct8x8_64_add_c(input: [*c]const tran_low_t, dest: [*c]u8, stride: c_int) void;
 pub extern fn antfly_vp9_vpx_iwht4x4_16_add_c(input: [*c]const tran_low_t, dest: [*c]u8, stride: c_int) void;
 pub extern fn antfly_vp9_vpx_iwht4x4_1_add_c(input: [*c]const tran_low_t, dest: [*c]u8, stride: c_int) void;
-pub fn check_range(arg_input: tran_high_t) callconv(.c) tran_high_t {
-    var input = arg_input;
-    _ = &input;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    return input;
+pub fn check_range(input: tran_high_t) callconv(.c) tran_high_t {
+    return @import("../runtime.zig").vp9TransformRange(input, 8);
 }
-pub fn highbd_check_range(arg_input: tran_high_t, arg_bd: c_int) callconv(.c) tran_high_t {
-    var input = arg_input;
-    _ = &input;
-    var bd = arg_bd;
-    _ = &bd;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    _ = &bd;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return 0;
-    }
-    return input;
+pub fn highbd_check_range(input: tran_high_t, bd: c_int) callconv(.c) tran_high_t {
+    return @import("../runtime.zig").vp9TransformRange(input, bd);
 }
 pub extern fn antfly_vp9_idct4_c(input: [*c]const tran_low_t, output: [*c]tran_low_t) void;
 pub extern fn antfly_vp9_idct8_c(input: [*c]const tran_low_t, output: [*c]tran_low_t) void;

@@ -345,10 +345,9 @@ test "AV1 header metadata preserves selected scalable operating-point timelines"
     }
 }
 
-fn fuzzSeed(comptime path: []const u8) []const u8 {
+fn fuzzSeed(comptime bytes: []const u8) []const u8 {
     return comptime blk: {
         @setEvalBranchQuota(1_000_000);
-        const bytes = @embedFile(path);
         const size = std.mem.readInt(u32, bytes[32..36], .little);
         var encoded: [4 + size]u8 = undefined;
         std.mem.writeInt(u32, encoded[0..4], size, .little);
@@ -373,7 +372,7 @@ test "video fuzz AV1 metadata headers and reference cleanup" {
             session.finish() catch return;
         }
     };
-    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ fuzzSeed("../../testdata/vpx-av1/av1.ivf"), fuzzSeed("../../testdata/vpx-av1/av1-grain.ivf"), fuzzSeed("../../testdata/av1-extended/av1-c0-12.ivf"), fuzzSeed("../../testdata/av1-extended/av1-c3-12.ivf"), fuzzSeed("../../testdata/av1-extended/av1-svc.ivf") } });
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ fuzzSeed(@embedFile("../../testdata/vpx-av1/av1.ivf")), fuzzSeed(@embedFile("../../testdata/vpx-av1/av1-grain.ivf")), fuzzSeed(@embedFile("../../testdata/av1-extended/av1-c0-12.ivf")), fuzzSeed(@embedFile("../../testdata/av1-extended/av1-c3-12.ivf")), fuzzSeed(@embedFile("../../testdata/av1-extended/av1-svc.ivf")) } });
 }
 
 test "AV1 metadata fuzz seeds emit displayed pictures through Smith" {
@@ -384,8 +383,8 @@ test "AV1 metadata fuzz seeds emit displayed pictures through Smith" {
             self.count += 1;
         }
     };
-    inline for (.{ "../../testdata/vpx-av1/av1.ivf", "../../testdata/vpx-av1/av1-grain.ivf", "../../testdata/av1-extended/av1-c0-12.ivf", "../../testdata/av1-extended/av1-c3-12.ivf", "../../testdata/av1-extended/av1-svc.ivf" }) |path| {
-        const encoded = fuzzSeed(path);
+    inline for (.{ @embedFile("../../testdata/vpx-av1/av1.ivf"), @embedFile("../../testdata/vpx-av1/av1-grain.ivf"), @embedFile("../../testdata/av1-extended/av1-c0-12.ivf"), @embedFile("../../testdata/av1-extended/av1-c3-12.ivf"), @embedFile("../../testdata/av1-extended/av1-svc.ivf") }) |fixture| {
+        const encoded = fuzzSeed(fixture);
         var smith = std.testing.Smith{ .in = encoded };
         var bytes: [128 * 1024]u8 = undefined;
         const length = smith.sliceWithHash(&bytes, 0xA17FA101);

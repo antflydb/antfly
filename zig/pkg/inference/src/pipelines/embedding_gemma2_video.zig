@@ -1146,10 +1146,10 @@ test "embeddinggemma2 video preflight bounds temporary owners and plans geometry
 fn preflightAllocationRun(backing: std.mem.Allocator) !void {
     var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
     const a = no_resize.allocator();
-    inline for (.{ "mjpeg.mov", "vp9.webm", "bframes.ts", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+    inline for (.{ @embedFile("../testdata/video/mjpeg.mov"), @embedFile("../testdata/video/vp9.webm"), @embedFile("../testdata/video/bframes.ts"), @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4") }) |bytes| {
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
         defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
-        const plan = try inspectPlan(a, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool, true);
+        const plan = try inspectPlan(a, bytes, .{}, .reference, &pool, true);
         try std.testing.expect(plan.pixels > 0);
     }
 }

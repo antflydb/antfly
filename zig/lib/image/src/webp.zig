@@ -1265,11 +1265,11 @@ fn vp8YuvToRgba(y: u8, u: u8, v: u8, alpha: u8) [4]u8 {
 }
 
 fn vp8TransformAc3Mul1(value: i32) i32 {
-    return ((value * vp8_transform_ac3_c1) >> 16) + value;
+    return @intCast(((@as(i64, value) * vp8_transform_ac3_c1) >> 16) + value);
 }
 
 fn vp8TransformAc3Mul2(value: i32) i32 {
-    return (value * vp8_transform_ac3_c2) >> 16;
+    return @intCast((@as(i64, value) * vp8_transform_ac3_c2) >> 16);
 }
 
 fn vp8StoreTransformPixel(dst: []u8, index: usize, value: i32) void {

@@ -209,7 +209,7 @@ fn appendHeader(collector: *Collect, packet: media.webm.Packet, geometry: @impor
 /// The callback borrows the frame until it returns. Repeated selections publish
 /// once; the model reuses that projection in each requested presentation slot.
 pub fn walk(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
-    return walkFrom(a, reader, options, .{}, selected, context, accept);
+    return walkFrom(a, reader, options, .{}, selected, context, accept, null);
 }
 /// Restarts only at parsed codec key pictures, retaining logical output IDs.
 /// AV1 reloads the most recent sequence OBU before replaying the key packet.
@@ -229,10 +229,99 @@ pub fn walkIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Op
             restart = point;
         }
     }
-    return walkFrom(a, reader, options, restart, selected, context, accept);
+    return walkFrom(a, reader, options, restart, selected, context, accept, null);
 }
-fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, restart: Restart, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
+pub const RecoveryOptions = struct {
+    max_recoveries: usize = 8,
+    max_skipped_packets: usize = 4096,
+};
+pub const RecoveryGap = struct {
+    failed_packet: usize,
+    first_lost_picture: usize,
+    next_packet: usize,
+    next_picture: usize,
+    reason: anyerror,
+};
+pub const RecoveryStats = struct { recoveries: usize = 0, skipped_packets: usize = 0 };
+fn corruptDecode(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidVideoData, error.WebpDecodeFailed, error.MalformedVideoPacket, error.MissingVideoReference, error.InvalidVideoReference => true,
+        else => false,
+    };
+}
+/// Explicit entropy-corruption recovery using a successfully parsed header index.
+/// Decode owners are destroyed before a gap is reported or a new owner starts.
+/// Source, callback, cancellation and capacity errors remain terminal. Inference
+/// uses strict walkIndexed; callers opting into recovery must handle every gap.
+pub fn walkRecoveringIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, indexed: Index, recovery: RecoveryOptions, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void, gap_context: *anyopaque, gap: *const fn (*anyopaque, RecoveryGap) anyerror!void) !RecoveryStats {
+    if (indexed.reader != reader) return error.InvalidVideoIndex;
+    if (reader.track.codec == .av1 and (indexed.operating_point != options.decoder.av1_operating_point or indexed.all_layers != options.decoder.av1_all_layers)) return error.InvalidDecodeOptions;
+    var restart: Restart = .{};
+    if (selected) |ids| {
+        if (ids.len == 0) return .{};
+        var first = ids[0];
+        for (ids) |id| {
+            if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
+            first = @min(first, id);
+        }
+        for (indexed.restarts) |point| {
+            if (point.logical > first) break;
+            restart = point;
+        }
+    }
+    var stats = RecoveryStats{};
+    while (true) {
+        try options.decoder.control.check();
+        var failure: ?DecodeFailure = null;
+        walkFrom(a, reader, options, restart, selected, context, accept, &failure) catch |err| {
+            const failed = failure orelse return err;
+            if (!corruptDecode(err)) return err;
+            if (stats.recoveries >= recovery.max_recoveries) return error.RecoveryLimitExceeded;
+            var next: ?Restart = null;
+            for (indexed.restarts) |point| {
+                if (point.packet > failed.packet) {
+                    next = point;
+                    break;
+                }
+            }
+            const point = next orelse return error.UnrecoverableVideoData;
+            if (point.logical < failed.logical or point.packet > reader.packets.len) return error.InvalidVideoIndex;
+            const skipped = point.packet - failed.packet;
+            if (skipped > recovery.max_skipped_packets -| stats.skipped_packets) return error.RecoveryLimitExceeded;
+            try options.decoder.control.check();
+            try gap(gap_context, .{ .failed_packet = failed.packet, .first_lost_picture = failed.logical, .next_packet = point.packet, .next_picture = point.logical, .reason = err });
+            stats.recoveries += 1;
+            stats.skipped_packets += skipped;
+            restart = point;
+            continue;
+        };
+        return stats;
+    }
+}
+const DecodeFailure = struct { packet: usize, logical: usize };
+fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, restart: Restart, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void, failure: ?*?DecodeFailure) !void {
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    if (reader.track.codec == .av1 and options.decoder.av1_framing != .low_overhead) return error.InvalidDecodeOptions;
+    const Watch = struct {
+        first: media.source.Control,
+        second: media.source.Control,
+        failed: bool = false,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.first.check() catch |err| {
+                self.failed = true;
+                return err;
+            };
+            self.second.check() catch |err| {
+                self.failed = true;
+                return err;
+            };
+        }
+    };
+    var watch = Watch{ .first = options.decoder.control, .second = reader.input.control };
+    const control = media.source.Control{ .context = &watch, .check_fn = Watch.check };
+    var decoder_options = options.decoder;
+    decoder_options.control = control;
     if (selected) |ids| if (ids.len == 0) return;
     var last: usize = 0;
     if (selected) |ids| for (ids) |id| {
@@ -248,8 +337,19 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
         while (session.next_index < reader.packets.len) {
             try options.decoder.control.check();
             if (options.replay_stats) |stats| stats.packets_decoded += 1;
-            var decoded = (try session.next()) orelse continue;
+            const packet_id = session.next_index;
+            if (reader.packets[packet_id].size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
+            var lease = try reader.readPacket(packet_id);
+            defer lease.deinit();
+            watch.failed = false;
+            var decoded = (session.decodePacketBytes(lease.bytes, control) catch |err| {
+                if (!watch.failed) {
+                    if (failure) |out| out.* = .{ .packet = packet_id, .logical = logical };
+                }
+                return err;
+            }) orelse continue;
             defer decoded.deinit();
+            try control.check();
             if (logical >= options.max_pictures) return error.ResourceLimitExceeded;
             if (selected == null or std.mem.indexOfScalar(usize, selected.?, logical) != null) {
                 const p = decoded.planes;
@@ -263,7 +363,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             if (selected != null and logical > last) return;
         }
     } else {
-        const session = try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, options.decoder);
+        const session = try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, decoder_options);
         defer session.destroy();
         try session.initializeWebm(reader);
         if (restart.sequence) |span| {
@@ -281,8 +381,19 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
         }
         for (reader.packets[restart.packet..], restart.packet..) |packet, packet_id| {
             if (options.replay_stats) |stats| stats.packets_decoded += 1;
-            var batch = try session.decodeWebmPacket(reader, packet_id);
+            try options.decoder.control.check();
+            if (packet.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
+            var lease = try reader.readPacket(packet_id);
+            defer lease.deinit();
+            watch.failed = false;
+            var batch = session.decode(lease.bytes, packet.pts, packet.duration_ns) catch |err| {
+                if (!watch.failed) {
+                    if (failure) |out| out.* = .{ .packet = packet_id, .logical = logical };
+                }
+                return err;
+            };
             defer batch.deinit();
+            try control.check();
             // Container-invisible packets still update codec references.
             if (packet.invisible) continue;
             for (batch.frames) |*frame| {
@@ -579,4 +690,289 @@ test "WebM indexed replay preserves expanded VP9 AV1 depth chroma grain and laye
         try std.testing.expectEqualSlices(u8, &baseline.digest, &replay.digest);
         try std.testing.expectEqual(@as(usize, 1), stats.packets_decoded);
     }
+}
+
+const RecoveryCapture = struct {
+    hashes: [64][32]u8 = undefined,
+    seen: [64]bool = @splat(false),
+    gaps: usize = 0,
+    last_gap: ?RecoveryGap = null,
+    callback_error: bool = false,
+    gap_error: bool = false,
+    hold_first: bool = false,
+    pool: ?*media.admission.Pool = null,
+    retained: ?codecs.Frame = null,
+    fn accept(raw: *anyopaque, id: usize, frame: *const codecs.Frame) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.callback_error) return error.InvalidVideoData;
+        if (id >= self.seen.len) return error.ResourceLimitExceeded;
+        std.crypto.hash.sha2.Sha256.hash(frame.bytes, &self.hashes[id], .{});
+        self.seen[id] = true;
+        if (id == 0 and self.hold_first and self.retained == null) {
+            var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = frame.bytes.len }) else media.admission.Token{};
+            errdefer reservation.deinit();
+            var owned = frame.*;
+            owned.allocator = std.testing.allocator;
+            owned.bytes = try std.testing.allocator.dupe(u8, frame.bytes);
+            owned.reservation = reservation;
+            self.retained = owned;
+        }
+    }
+    fn gap(raw: *anyopaque, value: RecoveryGap) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.gap_error) return error.InvalidVideoData;
+        if (self.retained) |frame| {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(frame.bytes, &hash, .{});
+            try std.testing.expectEqualSlices(u8, &self.hashes[0], &hash);
+        }
+        self.gaps += 1;
+        self.last_gap = value;
+    }
+};
+test "WebM recovery restarts VP8 VP9 AV1 after detected entropy corruption" {
+    const a = std.testing.allocator;
+    inline for (.{ "../testdata/vp8-keyframes.webm", "../testdata/vp8-sintel.webm", "../testdata/vpx-av1/vp9.webm", "../testdata/vpx-av1/av1.webm" }) |path| {
+        const fixture = @embedFile(path);
+        const damaged = try a.dupe(u8, fixture);
+        defer a.free(damaged);
+        var source = media.source.Source{ .allocator = a, .identity = path, .storage = .{ .borrowed = damaged } };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var baseline = RecoveryCapture{};
+        try walk(a, &reader, .{}, null, &baseline, RecoveryCapture.accept);
+        const packet = reader.packets[1];
+        var found = false;
+        for (0..64) |attempt| {
+            @memcpy(damaged, fixture);
+            const offset: usize = @intCast(packet.offset);
+            const first = @min(packet.size - 1, @max(@as(usize, 12), packet.size / 2));
+            if (attempt == 0) {
+                @memset(damaged[offset + first .. offset + packet.size], 0xff);
+            } else {
+                const at = first + (attempt - 1) % (packet.size - first);
+                damaged[offset + at] ^= @as(u8, 1) << @intCast((attempt - 1) % 8);
+            }
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+            defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+            const options = Options{ .decoder = .{ .max_decode_bytes = 64 * 1024 * 1024, .admission_pool = &pool } };
+            // Container key hints must not authorize an interframe restart.
+            for (reader.packets) |*item| item.sync = true;
+            var indexed = index(a, &reader, options) catch continue;
+            defer indexed.deinit();
+            var strict = RecoveryCapture{};
+            var decode_failed = false;
+            walkIndexed(a, &reader, options, indexed, null, &strict, RecoveryCapture.accept) catch |err| {
+                if (corruptDecode(err)) decode_failed = true else return err;
+            };
+            if (!decode_failed) continue;
+            var recovered = RecoveryCapture{ .hold_first = true, .pool = &pool };
+            defer if (recovered.retained) |*frame| frame.deinit();
+            const stats = try walkRecoveringIndexed(a, &reader, options, indexed, .{}, null, &recovered, RecoveryCapture.accept, &recovered, RecoveryCapture.gap);
+            try std.testing.expectEqual(@as(usize, 1), stats.recoveries);
+            try std.testing.expectEqual(@as(usize, 1), recovered.gaps);
+            try std.testing.expect(recovered.retained != null);
+            var rejected = RecoveryCapture{ .gap_error = true };
+            try std.testing.expectError(error.InvalidVideoData, walkRecoveringIndexed(a, &reader, options, indexed, .{}, null, &rejected, RecoveryCapture.accept, &rejected, RecoveryCapture.gap));
+            try std.testing.expectEqual(@as(usize, 0), rejected.gaps);
+            const gap = recovered.last_gap.?;
+            try std.testing.expectEqual(@as(usize, 1), gap.failed_packet);
+            try std.testing.expect(gap.next_packet > gap.failed_packet);
+            for (baseline.seen, 0..) |seen, id| {
+                const lost = id >= gap.first_lost_picture and id < gap.next_picture;
+                try std.testing.expectEqual(seen and !lost, recovered.seen[id]);
+                if (recovered.seen[id]) try std.testing.expectEqualSlices(u8, &baseline.hashes[id], &recovered.hashes[id]);
+            }
+            try std.testing.expectError(error.RecoveryLimitExceeded, walkRecoveringIndexed(a, &reader, options, indexed, .{ .max_recoveries = 0 }, null, &strict, RecoveryCapture.accept, &strict, RecoveryCapture.gap));
+            try std.testing.expectError(error.RecoveryLimitExceeded, walkRecoveringIndexed(a, &reader, options, indexed, .{ .max_skipped_packets = 0 }, null, &strict, RecoveryCapture.accept, &strict, RecoveryCapture.gap));
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+test "WebM recovery preserves callback control and admission failures" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "recovery-errors", .storage = .{ .borrowed = @embedFile("../testdata/vpx-av1/vp9.webm") } };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var indexed = try index(a, &reader, .{});
+    defer indexed.deinit();
+    var capture = RecoveryCapture{ .callback_error = true };
+    try std.testing.expectError(error.InvalidVideoData, walkRecoveringIndexed(a, &reader, .{}, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(@as(usize, 0), capture.gaps);
+    capture.callback_error = false;
+    const ControlError = struct {
+        calls: usize = 0,
+        reason: anyerror = error.InvalidVideoData,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.calls >= 6) return self.reason;
+        }
+    };
+    var control = ControlError{};
+    try std.testing.expectError(error.InvalidVideoData, walkRecoveringIndexed(a, &reader, .{ .decoder = .{ .control = .{ .context = &control, .check_fn = ControlError.check } } }, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(@as(usize, 0), capture.gaps);
+    control.calls = 0;
+    control.reason = error.Cancelled;
+    try std.testing.expectError(error.Cancelled, walkRecoveringIndexed(a, &reader, .{ .decoder = .{ .control = .{ .context = &control, .check_fn = ControlError.check } } }, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(@as(usize, 0), capture.gaps);
+    const FailedRead = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: media.source.Control) !usize {
+            return error.InvalidVideoData;
+        }
+    };
+    var unused: u8 = 0;
+    const source_length = source.length();
+    source.storage = .{ .range = .{ .context = &unused, .read_at = FailedRead.read, .length = source_length } };
+    try std.testing.expectError(error.InvalidVideoData, walkRecoveringIndexed(a, &reader, .{}, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(@as(usize, 0), capture.gaps);
+    const reads_before = source.reads;
+    try std.testing.expectError(error.ResourceLimitExceeded, walkRecoveringIndexed(a, &reader, .{ .decoder = .{ .max_packet_bytes = 0 } }, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(reads_before, source.reads);
+    var denied = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, walkRecoveringIndexed(a, &reader, .{ .decoder = .{ .admission_pool = &denied } }, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+    try std.testing.expectEqual(media.admission.Resources{}, denied.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), capture.gaps);
+}
+
+test "WebM recovery skips a corrupt restart and rejects unrecoverable tail" {
+    const a = std.testing.allocator;
+    const fixture = @embedFile("../testdata/vp8-keyframes.webm");
+    const damaged = try a.dupe(u8, fixture);
+    defer a.free(damaged);
+    var source = media.source.Source{ .allocator = a, .identity = "repeated-corruption", .storage = .{ .borrowed = damaged } };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var baseline = RecoveryCapture{};
+    try walk(a, &reader, .{}, null, &baseline, RecoveryCapture.accept);
+    for (reader.packets[0..2]) |packet| {
+        const offset: usize = @intCast(packet.offset);
+        const first = @max(@as(usize, 12), packet.size / 2);
+        @memset(damaged[offset + first .. offset + packet.size], 0xff);
+    }
+    var indexed = try index(a, &reader, .{});
+    defer indexed.deinit();
+    var capture = RecoveryCapture{};
+    const stats = try walkRecoveringIndexed(a, &reader, .{}, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap);
+    try std.testing.expectEqual(@as(usize, 2), stats.recoveries);
+    try std.testing.expectEqual(@as(usize, 2), capture.gaps);
+    try std.testing.expect(!capture.seen[0] and !capture.seen[1] and capture.seen[2]);
+    try std.testing.expectEqualSlices(u8, &baseline.hashes[2], &capture.hashes[2]);
+    const last = reader.packets[2];
+    const offset: usize = @intCast(last.offset);
+    @memset(damaged[offset + @max(@as(usize, 12), last.size / 2) .. offset + last.size], 0xff);
+    try std.testing.expectError(error.UnrecoverableVideoData, walkRecoveringIndexed(a, &reader, .{}, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap));
+}
+
+fn recoveryAllocationRun(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    const fixture = @embedFile("../testdata/vp8-keyframes.webm");
+    const damaged = try a.dupe(u8, fixture);
+    defer a.free(damaged);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+    var source = media.source.Source{ .allocator = a, .identity = "recovery-allocations", .storage = .{ .borrowed = damaged }, .admission_pool = &pool };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const packet = reader.packets[1];
+    const offset: usize = @intCast(packet.offset);
+    @memset(damaged[offset + @max(@as(usize, 12), packet.size / 2) .. offset + packet.size], 0xff);
+    const options = Options{ .decoder = .{ .max_decode_bytes = 64 * 1024 * 1024, .admission_pool = &pool } };
+    var indexed = try index(a, &reader, options);
+    defer indexed.deinit();
+    var capture = RecoveryCapture{};
+    const stats = try walkRecoveringIndexed(a, &reader, options, indexed, .{}, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap);
+    try std.testing.expectEqual(@as(usize, 1), stats.recoveries);
+}
+test "WebM recovery allocation failures release old new and partial owners" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, recoveryAllocationRun, .{});
+}
+
+const RecoveryFuzz = struct {
+    fn seed(comptime program: []const u8) []const u8 {
+        return comptime blk: {
+            var data: [4 + program.len]u8 = undefined;
+            std.mem.writeInt(u32, data[0..4], program.len, .little);
+            @memcpy(data[4..], program);
+            const frozen = data;
+            break :blk &frozen;
+        };
+    }
+    const seeds = .{ seed(&.{ 0, 0 }), seed(&.{ 0, 1 }), seed(&.{ 1, 1 }), seed(&.{ 2, 2, 0, 1 }) };
+    fn run(program: []const u8) !RecoveryStats {
+        const a = std.testing.allocator;
+        const fixture = switch (if (program.len == 0) @as(u8, 0) else program[0] % 3) {
+            0 => @embedFile("../testdata/vp8-keyframes.webm"),
+            1 => @embedFile("../testdata/vpx-av1/vp9.webm"),
+            else => @embedFile("../testdata/vpx-av1/av1.webm"),
+        };
+        const data = try a.dupe(u8, fixture);
+        defer a.free(data);
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+        var source = media.source.Source{ .allocator = a, .identity = "recovery-fuzz", .storage = .{ .borrowed = data }, .admission_pool = &pool };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        if (program.len > 1 and program[1] != 0) {
+            const packet = reader.packets[1];
+            const offset: usize = @intCast(packet.offset);
+            const first = @min(packet.size - 1, @max(@as(usize, 12), packet.size / 2));
+            if (program[1] == 1) {
+                @memset(data[offset + first .. offset + packet.size], 0xff);
+                for (program[2..], 0..) |value, i| {
+                    data[offset + first + i % (packet.size - first)] ^= value;
+                }
+            } else {
+                const at = first + (if (program.len > 2) @as(usize, program[2]) else 0) % (packet.size - first);
+                data[offset + at] ^= if (program.len > 3) program[3] else 1;
+            }
+        }
+        const options = Options{ .max_packets = 64, .max_pictures = 64, .decoder = .{ .max_decode_bytes = 64 * 1024 * 1024, .admission_pool = &pool } };
+        var indexed = try index(a, &reader, options);
+        defer indexed.deinit();
+        var capture = RecoveryCapture{};
+        return walkRecoveringIndexed(a, &reader, options, indexed, .{ .max_recoveries = 3, .max_skipped_packets = 64 }, null, &capture, RecoveryCapture.accept, &capture, RecoveryCapture.gap);
+    }
+};
+test "WebM recovery fuzz seeds reach clean and recovered output through Smith" {
+    inline for (RecoveryFuzz.seeds, 0..) |seed, i| {
+        var smith = std.testing.Smith{ .in = seed };
+        var program: [20]u8 = undefined;
+        const length = smith.sliceWithHash(&program, 0x57524301);
+        const stats = try RecoveryFuzz.run(program[0..length]);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 0 else 1), stats.recoveries);
+    }
+}
+test "WebM recovery fuzz bounded entropy mutations restart and admission cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var program: [20]u8 = undefined;
+            const length = smith.sliceWithHash(&program, 0x57524301);
+            _ = RecoveryFuzz.run(program[0..length]) catch return;
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &RecoveryFuzz.seeds });
+}
+
+test "WebM recovery VP8 transform overflow crash regression" {
+    var smith = std.testing.Smith{ .in = @embedFile("../testdata/recovery-validation/vp8-transform-crash.smith") };
+    var program: [20]u8 = undefined;
+    const length = smith.sliceWithHash(&program, 0x57524301);
+    _ = RecoveryFuzz.run(program[0..length]) catch |err| switch (err) {
+        error.InvalidVideoData, error.UnrecoverableVideoData, error.RecoveryLimitExceeded => {},
+        else => return err,
+    };
+}
+
+test "WebM recovery VP9 transform overflow crash regression" {
+    var smith = std.testing.Smith{ .in = @embedFile("../testdata/recovery-validation/vp9-transform-crash.smith") };
+    var program: [20]u8 = undefined;
+    const length = smith.sliceWithHash(&program, 0x57524301);
+    _ = RecoveryFuzz.run(program[0..length]) catch |err| switch (err) {
+        error.InvalidVideoData, error.UnrecoverableVideoData, error.RecoveryLimitExceeded => {},
+        else => return err,
+    };
 }
