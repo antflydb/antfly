@@ -32,7 +32,7 @@ class RecoverySummaryTest(unittest.TestCase):
             "fixed_queries_recall": 0.98405,
         }
         candidate = {
-            "mode": "subgroup_routing",
+            "mode": "treatment",
             "pair": 1,
             "fixed_queries_count": 1000,
             "fixed_queries_recall": 0.90753,
