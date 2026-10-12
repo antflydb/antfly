@@ -333,3 +333,37 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
         }
     }
 }
+
+test "video Metal preparation admission denies before submit and retains output until destruction" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var pool = media.admission.Pool{ .limits = .{ .device_bytes = 4 * 1024 * 1024, .commands = 1 } };
+    var metal = try video.preparation.Metal.init(device);
+    var metal_live = true;
+    defer if (metal_live) metal.deinit();
+    try metal.admit(&pool, 1024 * 1024);
+    var pixels: [13 * 7 * 4]u8 = @splat(127);
+    const options = video.preparation.Options{ .width = 48, .height = 48, .matrix = .bt601, .admission_pool = &pool };
+    var first = try metal.submitRgba(a, &pixels, 13, 7, options, .{});
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    const retained = pool.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), retained.commands);
+    try std.testing.expectError(error.SharedAdmissionExceeded, metal.submitRgba(a, &pixels, 13, 7, options, .{}));
+    try std.testing.expectEqual(retained, pool.snapshot());
+    try first.wait(std.testing.io, .{});
+    try first.releaseSource();
+    try first.releaseSource();
+    const output_bytes = first.geometry.values() * @sizeOf(f32);
+    try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 1024 * 1024 + output_bytes }, pool.snapshot());
+    var second = try metal.submitRgba(a, &pixels, 13, 7, options, .{});
+    // Destruction fences even when the caller never waited for completion.
+    second.deinit();
+    try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 1024 * 1024 + output_bytes }, pool.snapshot());
+    first.deinit();
+    first_live = false;
+    metal.deinit();
+    metal_live = false;
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}

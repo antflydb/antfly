@@ -28,6 +28,7 @@ pub const Options = struct {
     max_decode_bytes: usize = 128 * 1024 * 1024,
 };
 pub const Frame = struct {
+    reservation: media.admission.Token = .{},
     allocator: std.mem.Allocator,
     decode_index: usize,
     pts: i64,
@@ -39,6 +40,7 @@ pub const Frame = struct {
     decode_high_water: usize,
     pub fn deinit(self: *Frame) void {
         self.allocator.free(self.rgba);
+        self.reservation.deinit();
         self.* = undefined;
     }
 };
@@ -49,6 +51,8 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     if (index >= reader.packets.len) return error.InvalidPacketIndex;
     const packet = reader.packets[index];
     if (packet.size > options.max_packet_bytes) return error.ResourceLimitExceeded;
+    var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.max_decode_bytes }) else media.admission.Token{};
+    errdefer reservation.deinit();
     var lease = try reader.readPacket(index);
     defer lease.deinit();
     var scope = image.work_control.Scope.enter(.{ .context = reader.input.control.context, .check_fn = reader.input.control.check_fn });
@@ -70,7 +74,8 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     // Decoder scratch has released; transfer the sole remaining allocation to
     // the frame's original allocator, without retaining a stack allocator.
     std.debug.assert(budget.live == decoded.rgba.len);
-    return .{ .allocator = allocator, .decode_index = index, .pts = packet.pts, .duration = packet.duration, .timescale = reader.track.timescale, .width = decoded.width, .height = decoded.height, .rgba = decoded.rgba, .decode_high_water = budget.peak };
+    try reservation.resize(.{ .host_bytes = decoded.rgba.len });
+    return .{ .reservation = reservation, .allocator = allocator, .decode_index = index, .pts = packet.pts, .duration = packet.duration, .timescale = reader.track.timescale, .width = decoded.width, .height = decoded.height, .rgba = decoded.rgba, .decode_high_water = budget.peak };
 }
 pub const PreparedWindows = struct {
     output_reservation: media.admission.Token = .{},

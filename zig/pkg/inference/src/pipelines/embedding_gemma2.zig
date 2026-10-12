@@ -21,6 +21,7 @@ const projector = @import("../architectures/gemma4_projector.zig");
 const Session = @import("../backends/session.zig").Session;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
+const media_admission = @import("antfly_media").admission;
 const scoring = @import("antfly_decisions").scoring;
 pub const SampledVideo = struct { bytes: []const u8, sampling: @import("embedding_gemma2_video.zig").Sampling };
 pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
@@ -66,7 +67,7 @@ pub fn workspaceBackingAllocator(backend: @import("../backends/backends.zig").Ba
 pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
-    const result = embedScoped(bounded.allocator(), session, tokenizer, group, options, lock, control) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+    const result = embedScoped(bounded.allocator(), session, tokenizer, group, options, lock, control) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
     defer bounded.allocator().free(result.vector);
     return .{ .vector = try out.dupe(f32, result.vector), .input_tokens = result.input_tokens };
 }
@@ -89,16 +90,22 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     try effective.check();
     // Reserve the maximum encoder sequence and a bounded media preprocessing
     // working set before decoding or allocating any projected soft tokens.
-    // Metal video also charges three 128 MiB preparation slots: two queued
-    // and the producer submission that can block behind them.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 1920) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    // Two queued preparations, two consumer jobs and one producer may coexist.
+    // Each slot admits scratch plus copied source planes, up to 256 MiB;
+    // persistent resize coefficients have a separate 16 MiB ceiling. Native
+    // decoder surfaces add a 512 MiB bound to the 1536 MiB model workspace.
+    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 3344) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
     defer permit.deinit();
+    // This sub-ledger is backed by the already-acquired process-wide permit.
+    // Decoders/preparers cannot grow beyond its reserved preprocessing share.
+    var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = if (session.backend() == .metal) 1808 * 1024 * 1024 else 0, .commands = if (session.backend() == .metal) 5 else 0 } };
+    defer std.debug.assert(std.meta.eql(video_budget.snapshot(), media_admission.Resources{}));
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const prepared = try prepareGroup(a, cb, tokenizer, group, options, effective);
+    const prepared = try prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget);
     defer prepared.deinit(a);
     const count = prepared.ids.len;
     const mask = prepared.mask;
@@ -146,6 +153,9 @@ const PreparedGroup = struct {
 };
 
 fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control) !PreparedGroup {
+    return prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, null);
+}
+fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control, video_budget: ?*media_admission.Pool) !PreparedGroup {
     const image_scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer image_scope.deinit();
     const prefix = try encoder.taskPrefix(options.task_type);
@@ -179,7 +189,7 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
             inline .video, .sampled_video => |payload| {
                 const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                 const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                const encoded = try @import("embedding_gemma2_video.zig").encodeWithSampling(a, cb, bytes, effective, sampling);
+                const encoded = try @import("embedding_gemma2_video.zig").encodeWithBudget(a, cb, bytes, effective, sampling, video_budget);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {

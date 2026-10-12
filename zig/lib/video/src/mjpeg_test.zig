@@ -224,3 +224,30 @@ test "video MJPEG window cancellation releases partial preparation and permits r
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.reusedSelections());
 }
+
+test "video MJPEG shared admission retries without leaks and frame ownership survives reader" {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    var src = source();
+    src.admission_pool = &pool;
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
+    const before = pool.snapshot();
+    var held = try pool.acquire(.{ .host_bytes = pool.limits.host_bytes - before.host_bytes - 128 * 1024 * 1024 + 1 });
+    defer held.deinit();
+    const denied = pool.snapshot();
+    try std.testing.expectError(error.SharedAdmissionExceeded, video.mjpeg.decodeFrame(a, &reader, 0, .{}));
+    try std.testing.expectEqual(denied, pool.snapshot());
+    held.deinit();
+    var frame = try video.mjpeg.decodeFrame(a, &reader, 0, .{});
+    var frame_live = true;
+    defer if (frame_live) frame.deinit();
+    try std.testing.expectEqual(before.host_bytes + frame.rgba.len, pool.snapshot().host_bytes);
+    reader.deinit();
+    reader_live = false;
+    try std.testing.expectEqual(@as(u64, frame.rgba.len), pool.snapshot().host_bytes);
+    for (frame.rgba, rgba[0..frame.rgba.len]) |actual, expected| try std.testing.expect(@abs(@as(i16, actual) - @as(i16, expected)) <= 3);
+    frame.deinit();
+    frame_live = false;
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}

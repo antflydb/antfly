@@ -578,3 +578,19 @@ source timestamp policies retain their existing contracts; media code does not
 perform model normalization. Actual device ownership/planned-scope units and
 pretrained CPU/Metal vector/dimension/retry campaigns qualify this consumer path.
 See the [normalization receipt](../../../tools/embeddinggemma2/testdata/resident-normalization/README.md).
+
+
+### Model pipeline admission bridge
+
+EmbeddingGemma 2 supplies a media Pool as a sub-ledger of its already-acquired
+shared model execution permit. MP4/WebM sources, indexers and portable decoder
+sessions use its host preprocessing share; Metal preparations and coefficient
+storage use its device/command share. MJPEG output frames retain their reservation
+after the reader is destroyed. Submitted Metal owners fence work before releasing
+capacity; releasing completed source storage retains the output charge.
+
+The same parent controller gates concurrent model requests before decoding.
+HTTP video preflight still needs its own shared reservation, and cross-request
+decode/preparation ahead of the model gate remains work. Library callers continue
+to supply a shared Pool explicitly; the bridge does not silently introduce a
+process-global singleton.

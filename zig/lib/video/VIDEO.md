@@ -1255,3 +1255,29 @@ presentation mapping while packet timestamps retain the native track clock.
 Broader HLS coverage remains implementation work.
 See [MEDIA.md](../media/MEDIA.md#dash-template-and-live-ingestion) for selection
 options, timing requirements and unsupported addressing features.
+
+
+## Pipeline admission ownership
+
+The model adapter now supplies a media admission sub-ledger backed by its
+process-wide execution permit. MP4/WebM source/indexing and portable decoder
+reservations share the prepaid host preprocessing bound. MJPEG reserves its
+decode peak before allocating, then retains only the RGBA output charge until
+frame destruction. Metal preparations reserve scratch/staged source storage and
+a command slot before uploading coefficients or submitting driver work.
+`releaseSource` shrinks that reservation to the retained output after completion;
+`deinit` fences the command before releasing capacity.
+
+Five preparations may coexist: two queued, two consumer jobs and one producer.
+The conservative video workspace reservation now includes 1536 MiB for model
+execution, five 256 MiB preparation bounds, 16 MiB coefficient storage and
+512 MiB native decoder surfaces (3344 MiB total). The request-local device ledger
+has the corresponding 1808 MiB preprocessing share and five command slots.
+The parent shared controller gates concurrent requests before decode. This
+closes the missing reservation hooks, but does not yet move decode/preparation
+ahead of the shared model execution gate or cover HTTP preflight with the same
+reservation. Those scheduling changes remain implementation work. The current server passes the six original pretrained video/mixed cases on CPU
+and Metal, including admission/decode retry and reduced dimensions. Eight WebM
+vectors (five clips and three queries) preserve all reference rankings/top-k;
+concurrent/sustained and disconnect/retry checks pass. These are correctness and
+ownership checks on a shared host, not isolated throughput measurements.

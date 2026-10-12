@@ -206,15 +206,18 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     return encodeWithSampling(a, cb, bytes, control, .reference);
 }
 pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling) !Encoded {
+    return encodeWithBudget(a, cb, bytes, control, sampling, null);
+}
+pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     const webm = isWebm(bytes);
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
     if (webm) webm_reader = try media.webm.Reader.init(a, &source, .{}) else reader = try media.mp4.Reader.init(a, &source, .{});
     defer if (webm) webm_reader.deinit() else reader.deinit();
-    var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control } }) else null;
+    var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
     defer if (webm_index) |*index| index.deinit();
     const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
     defer a.free(selected);
@@ -234,7 +237,11 @@ pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes
     }
     var preparer: ?video.preparation.Metal = null;
     if (comptime build_options.enable_metal) {
-        if (cb.kind() == .metal) preparer = try video.preparation.Metal.init(try MetalCompute.videoDevice(cb));
+        if (cb.kind() == .metal) {
+            preparer = try video.preparation.Metal.init(try MetalCompute.videoDevice(cb));
+            errdefer preparer.?.deinit();
+            if (pool) |shared| try preparer.?.admit(shared, 16 * 1024 * 1024);
+        }
     }
     defer if (preparer) |*value| value.deinit();
     const resident = if (cb.kind() == .metal) try a.alloc(?CT, selected.len) else null;
@@ -243,7 +250,7 @@ pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes
         a.free(tensors);
     };
     if (resident) |tensors| @memset(tensors, null);
-    var capture = Capture{ .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var capture = Capture{ .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -259,7 +266,7 @@ pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes
         thread.join();
     };
     const decoded = if (webm)
-        video.webm_pictures.walk(a, &webm_reader, .{ .decoder = .{ .control = source.control } }, selected, &capture, Capture.publishWebm)
+        video.webm_pictures.walk(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, selected, &capture, Capture.publishWebm)
     else
         decodeSelection(a, &reader, selected, configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -307,7 +314,8 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             if (capture.copyDuplicate(slot)) continue;
             var frame = try video.mjpeg.decodeFrame(a, reader, index, .{});
             defer frame.deinit();
-            const options = try policy(reader.track, frame.width, frame.height);
+            var options = try policy(reader.track, frame.width, frame.height);
+            options.admission_pool = capture.pool;
             if (capture.metal) |metal| {
                 const prepared = try metal.submitRgba(a, frame.rgba, frame.width, frame.height, options, control);
                 try capture.projectGpu(slot, prepared, options);
@@ -318,6 +326,10 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             try capture.project(slot, patches, options);
         }
     } else if (capture.metal != null and !reader.track.inband_parameter_sets and compatibleApple(reader.track.avcc)) {
+        // VideoToolbox's bounded decoder surface working set shares the same
+        // prepaid device budget as queued preparation commands.
+        var surfaces = if (capture.pool) |pool| try pool.acquire(.{ .device_bytes = 512 * 1024 * 1024 }) else media.admission.Token{};
+        defer surfaces.deinit();
         var batch = try video.apple.decodeTo(a, reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = capture, .accept = Capture.publishApple });
         defer batch.deinit();
     } else {
@@ -374,6 +386,7 @@ const Capture = struct {
     a: std.mem.Allocator,
     cb: *const ComputeBackend,
     track: media.mp4.Track,
+    pool: ?*media.admission.Pool = null,
     control: media.source.Control,
     output: []f32,
     resident: ?[]?CT = null,
@@ -568,7 +581,8 @@ const Capture = struct {
             .transfer = if (color.transfer == 2) null else color.transfer,
             .matrix = if (color.matrix == 2) null else color.matrix,
         };
-        const options = try policySignal(self.track, frame.width, frame.height, signal);
+        var options = try policySignal(self.track, frame.width, frame.height, signal);
+        options.admission_pool = self.pool;
         if (self.metal) |metal| {
             const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
             return self.projectGpu(slot, prepared, options);
@@ -580,7 +594,8 @@ const Capture = struct {
     fn publishApple(raw: *anyopaque, frame: *const video.apple.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
         try self.validateRange(frame.surface.format.fullRange());
-        const options = try policySignal(self.track, frame.surface.width, frame.surface.height, self.signal);
+        var options = try policySignal(self.track, frame.surface.width, frame.surface.height, self.signal);
+        options.admission_pool = self.pool;
         // Duplicate logical samples must receive the same projection.
         const first = std.mem.indexOfScalar(usize, self.selected, frame.decode_index) orelse return error.InvalidPacketIndex;
         if (self.copyDuplicate(first)) return;
@@ -597,7 +612,8 @@ const Capture = struct {
         const self: *Capture = @ptrCast(@alignCast(raw));
         if (self.copyDuplicate(slot)) return;
         try self.validateRange(frame.full_range);
-        const options = try policySignal(self.track, frame.width, frame.height, frame.color);
+        var options = try policySignal(self.track, frame.width, frame.height, frame.color);
+        options.admission_pool = self.pool;
         if (self.metal) |metal| {
             const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
             return self.projectGpu(slot, prepared, options);
@@ -753,5 +769,15 @@ test "embeddinggemma2 video logical field partition selection and timestamp wind
         defer a.free(native);
         try std.testing.expectEqual(@as(usize, 1), native.len);
         try std.testing.expect(try inspectPixelsWithSampling(bytes, .{}, .{ .timestamps = .{ .max_frames = 1 } }) > 0);
+    }
+}
+
+test "embeddinggemma2 video admission rejects all container paths before model execution" {
+    const a = std.testing.allocator;
+    inline for (.{ "mjpeg.mov", "vp8.webm", "vp9.webm", "av1.webm", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
+        var unopened: ComputeBackend = undefined;
+        try std.testing.expectError(error.SharedAdmissionExceeded, encodeWithBudget(a, &unopened, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool));
+        try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     }
 }

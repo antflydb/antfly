@@ -738,3 +738,33 @@ execution passes the same 75 portable tests. The parser and live-reload campaign
 inject every allocation failure through period combination, transactional reload
 and decoder epoch reconfiguration. Logs, source/fixture hashes and the Linux
 binary hash are in `zig/lib/media/testdata/dash-periods/report.json`.
+
+
+### Coordinated pipeline admission continuation (2026-10-11)
+
+Video sources, WebM decoder sessions and Metal preparations now use a media
+sub-ledger within the already-acquired process-wide model execution permit.
+MJPEG has an owned frame reservation; Metal command/output ownership releases
+capacity after fencing rather than at submission. The preparation estimate
+accounts for two consumer jobs plus two queued jobs and a producer, staged
+source planes, persistent coefficients and native decoder surfaces. The
+conservative parent video workspace bound becomes 3344 MiB; the host
+preprocessing allocation ceiling stays 512 MiB. Shared-admission failures map
+to the pipeline's memory-budget error contract.
+
+The focused model gate passes 17 tests; the full macOS video suite passes
+156 with two platform skips. The production server passes all six original
+CPU/Metal pretrained video/mixed cases, 128 dimensions, forced admission retry
+and damaged-selected-frame cleanup/retry. Its eight WebM vectors preserve all
+three reference rankings and top-k sets on both backends; concurrent/sustained
+and disconnect/retry checks pass. Cross-request stage overlap, preflight admission
+and measured/tuned reservations remain work; the full non-CUDA scope remains
+active. These changes must not be described as completed whole-pipeline
+scheduling until those remaining paths are implemented and qualified.
+
+Actual Linux ARM64 executes the updated portable video suite: 134 passes and
+24 platform skips. Source/binary/artifact hashes and the macOS CPU/Metal
+pretrained reports are in
+`tools/embeddinggemma2/testdata/pipeline-admission/qualification.json`. The current
+Linux pretrained binary still needs its own execution receipt after these
+admission changes; the older Linux pretrained results retain their prior scope.
