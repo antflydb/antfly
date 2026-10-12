@@ -5618,11 +5618,15 @@ pub const AntflyApiHandler = struct {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
-                        if (value.temporal() != null) return error.UnsupportedSqlShape;
+                        if (value.temporal() != null) try value.validateTemporal();
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
+                        } else if (value.temporal() != null) {
+                            var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                            const exact = try @import("antfly_local_sources").sql_scalar.formatTimestampResult(value, definition.type, &text);
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else if (value.array) |array| {
                             if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
@@ -13728,6 +13732,59 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
         "sql-0289", "sql-0290", "sql-0291", "sql-0293", "sql-0294", "sql-0298", "sql-0299",
     };
     try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+}
+
+test "httpx SQL transaction timestamp results retain typed values through public streaming" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-transaction-time");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "u1", .value = "{\"id\":\"u1\"}" }}, .timestamp_ns = 42 });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT CURRENT_TIMESTAMP AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT now() AS planned_at_ns, transaction_timestamp() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM usage_records WHERE id=$1",
+        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1 ORDER BY id",
+    }) |sql| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = sql, .parameters = .{"u1"} }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("transaction timestamp rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqualStrings("planned_at_ns", result.value.columns[0].name);
+        for (result.value.columns, result.value.rows[0], result.value.sql_nulls.?[0]) |column_, value, is_null| {
+            try std.testing.expectEqual(.datetime, column_.type);
+            try std.testing.expect(!is_null);
+            try std.testing.expectEqualStrings(result.value.rows[0][0].string, value.string);
+            const parsed = try local.sql_temporal_text.parseCanonical(.timestamp_tz, value.string);
+            try std.testing.expect(parsed.timestamp_tz.micros != std.math.minInt(i64) and parsed.timestamp_tz.micros != std.math.maxInt(i64));
+        }
+    }
 }
 
 test "httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results" {

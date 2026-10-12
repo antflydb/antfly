@@ -373,6 +373,45 @@ test "pgwire native array page delivery preserves dimensions NULLs and exact int
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
+test "SQL transaction timestamp pgwire pages preserve exact native values and reject relabeling" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const temporal = sources.sql_temporal_value;
+            for ([_]i64{ -946_684_800_000_001, temporal.end_timestamp - 1, std.math.minInt(i64), std.math.maxInt(i64) }) |micros| {
+                const value: temporal.Value = .{ .timestamp_tz = try temporal.Timestamp.init(micros) };
+                var values = [_]sources.sql_scalar.Datum{sources.sql_scalar.Datum.typedTemporal(&value)};
+                var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                    .arena = std.heap.ArenaAllocator.init(a),
+                    .columns = &.{.{ .name = "t", .type = .datetime }},
+                    .values = .{ .rows = &.{&values} },
+                    .exhausted = true,
+                } };
+                defer owner.page.deinit();
+                const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
+                try std.testing.expect(!cell.sql_null);
+                const bytes = try wire_values.encode(alloc, .datetime, 1, cell.value);
+                try std.testing.expectEqual(@as(usize, 8), bytes.len);
+                try std.testing.expectEqual(micros, std.mem.readInt(i64, bytes[0..8], .big));
+                const text = try wire_values.encode(alloc, .datetime, 0, cell.value);
+                var expected: [sources.sql_temporal_text.output_capacity]u8 = undefined;
+                try std.testing.expectEqualStrings(try sources.sql_temporal_text.format(value, &expected), text);
+                values[0].sql_null = true;
+                try std.testing.expectError(error.SqlTypeMismatch, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
+                values[0] = .{ .sql_null = true };
+                try std.testing.expect((try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0)).sql_null);
+                const wrong: temporal.Value = .{ .timestamp = try temporal.Timestamp.init(micros) };
+                values[0] = sources.sql_scalar.Datum.typedTemporal(&wrong);
+                try std.testing.expectError(error.UnsupportedSqlShape, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
@@ -611,7 +650,10 @@ const OwnedRead = struct {
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const value = try self.page.values.cell(alloc, row, column);
-            if (value.temporal() != null) return error.UnsupportedSqlShape;
+            if (value.temporal() != null) {
+                const instant = try @import("antfly_local_sources").sql_scalar.timestampResult(value, self.page.columns[column].type);
+                return .{ .value = try wire_values.timestampEnvelope(alloc, instant), .sql_null = false };
+            }
             if (value.array) |array| {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns() != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;

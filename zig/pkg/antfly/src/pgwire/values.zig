@@ -433,7 +433,8 @@ pub fn timestampValue(alloc: std.mem.Allocator, nanos: i128) !std.json.Value {
     return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{nanos}) };
 }
 
-fn timestampEnvelope(alloc: std.mem.Allocator, value: temporal.Timestamp) !std.json.Value {
+pub fn timestampEnvelope(alloc: std.mem.Allocator, value: temporal.Timestamp) !std.json.Value {
+    _ = try temporal.Timestamp.init(value.micros);
     if (value.unixNanoseconds()) |ns| return timestampValue(alloc, ns);
     return .{ .string = try alloc.dupe(u8, if (value.infinity() < 0) "-infinity" else "infinity") };
 }

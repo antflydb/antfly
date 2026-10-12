@@ -144,7 +144,7 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
             var backend = fixture.backend();
             backend.clock_source = fake.source();
             backend.transaction_start = try Clock.Instant.fromUnixMicroseconds(10_000_000);
-            var compiled = try compiler.compile(a, "SELECT n + 1 FROM docs", .{});
+            var compiled = try compiler.compile(a, "SELECT n + 1, now() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM docs", .{});
             defer compiled.deinit();
             var binding_arena = std.heap.ArenaAllocator.init(a);
             defer binding_arena.deinit();
@@ -160,7 +160,7 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
             for (0..1000) |_| {
                 const inherited = try pinned.pinStatementClock();
                 const limits = @import("decision_eval.zig").limitsFor(inherited);
-                try std.testing.expectEqual(view.statement.micros, limits.statement_clock.?.statement.micros);
+                try std.testing.expectEqual(view.statement.micros, limits.clock_values.?.view.statement.micros);
                 try std.testing.expect(limits.clock_values.? == &owner_frame);
             }
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -176,6 +176,10 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
                 var page = try stream.next(2);
                 defer page.deinit();
                 seen += page.output.rows.len;
+                for (page.output.rows) |row| {
+                    try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[1].string);
+                    try std.testing.expectEqualStrings(row[1].string, row[2].string);
+                }
                 try std.testing.expectEqual(view.statement.micros, stream.context.backend.statement_clock.?.statement.micros);
                 try std.testing.expectEqual(view.transaction.micros, stream.context.backend.statement_clock.?.transaction.micros);
                 const limits = @import("decision_eval.zig").limitsFor(stream.context.backend);
@@ -186,21 +190,23 @@ test "SQL statement clock admission pins runtime cursors fallback and child view
             try std.testing.expectEqual(@as(usize, 21), seen);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             fixture.offset = 0;
-            var derived = try compiler.compile(a, "SELECT n FROM (SELECT n FROM docs) AS q", .{});
+            var derived = try compiler.compile(a, "SELECT now() AS txn, n FROM (SELECT n FROM docs) AS q", .{});
             defer derived.deinit();
             var result = try runtime.execute(a, pinned, &derived, &.{}, .{ .result_rows = 32, .page_rows = 3 });
             defer result.deinit();
             try std.testing.expectEqual(@as(usize, 21), result.output.rows.len);
+            for (result.output.rows) |row| try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[0].string);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             fixture.offset = 0;
             // An unsupported blocking stream declines before row reads. Its
             // materializing fallback must retain the ingress statement cut.
-            var ordered = try compiler.compile(a, "SELECT n FROM docs ORDER BY n DESC", .{});
+            var ordered = try compiler.compile(a, "SELECT n, now() AS txn FROM docs ORDER BY n DESC", .{});
             defer ordered.deinit();
             try std.testing.expect((try Stream.open(a, pinned, &ordered, &.{}, .{ .result_rows = 32 })) == null);
             var fallback = try runtime.execute(a, pinned, &ordered, &.{}, .{ .result_rows = 32 });
             defer fallback.deinit();
             try std.testing.expectEqual(@as(usize, 21), fallback.output.rows.len);
+            for (fallback.output.rows) |row| try std.testing.expectEqualStrings("1970-01-01 00:00:10+00", row[1].string);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
             const next_statement = try backend.pinStatementClock();
             try std.testing.expectEqual(@as(usize, 2), fake.calls);

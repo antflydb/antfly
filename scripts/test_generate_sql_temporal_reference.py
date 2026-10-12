@@ -72,6 +72,34 @@ class TemporalReferenceTest(unittest.TestCase):
                     result = self.db.execute(f"SELECT CURRENT_TIMESTAMP({precision}) = transaction_timestamp()::timestamptz({precision}), pg_typeof(CURRENT_TIMESTAMP({precision}))::oid").fetchone()
                     self.assertEqual((True, 1184), result)
 
+    def test_cursor_fetch_rebinds_statement_time_but_retains_transaction_time(self):
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("DECLARE clock_cursor CURSOR FOR SELECT now(), statement_timestamp() FROM generate_series(1, 2)")
+            first = self.db.execute("FETCH 1 FROM clock_cursor").fetchone()
+            # Wait server-side only to make distinct command instants certain;
+            # this is not a monotonicity guarantee for the realtime clock.
+            self.db.execute("SELECT pg_sleep(0.002)")
+            second = self.db.execute("FETCH 1 FROM clock_cursor").fetchone()
+            self.assertEqual(first[0], second[0])
+            self.assertNotEqual(first[1], second[1])
+
+    def test_precision_syntax_and_warning_contract_are_not_silent_clamping(self):
+        notices = []
+        handler = lambda notice: notices.append((notice.severity, notice.sqlstate, notice.message_primary))
+        self.db.add_notice_handler(handler)
+        try:
+            result = self.db.execute("SELECT CURRENT_TIMESTAMP(7), CURRENT_TIMESTAMP(0x6)")
+            self.assertEqual([1184, 1184], [column.type_code for column in result.description])
+            self.assertTrue(any(severity == "WARNING" and code == "22023" and "6" in message for severity, code, message in notices))
+        finally:
+            self.db.remove_notice_handler(handler)
+        with self.assertRaises(psycopg.errors.SyntaxError) as caught:
+            self.db.execute("SELECT CURRENT_TIMESTAMP(-1)")
+        self.assertEqual("42601", caught.exception.sqlstate)
+        with self.assertRaises(psycopg.errors.UndefinedFunction) as caught:
+            self.db.execute("SELECT now(1)")
+        self.assertEqual("42883", caught.exception.sqlstate)
+
     def test_wall_clock_remains_a_finite_timestamp_without_monotonicity_claim(self):
         result = self.db.execute("SELECT isfinite(clock_timestamp()), pg_typeof(clock_timestamp())::oid").fetchone()
         self.assertEqual((True, 1184), result)

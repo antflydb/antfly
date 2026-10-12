@@ -392,8 +392,8 @@ pub const Context = struct {
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
         if (datum.temporal() != null) {
-            try datum.validateTemporal();
-            return error.UnsupportedSqlShape; // requires exact public type/OID activation
+            var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            return .{ .string = try self.arena.dupe(u8, try @import("scalar.zig").formatTimestampResult(datum, kind, &text)) };
         }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);

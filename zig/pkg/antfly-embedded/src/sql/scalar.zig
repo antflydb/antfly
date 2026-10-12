@@ -285,8 +285,6 @@ pub const BindLimits = struct {
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
 pub const EvalLimits = struct {
-    /// Invocation-owned immutable clock cut; never attached to Program.
-    statement_clock: ?@import("statement_clock.zig").View = null,
     /// Immutable stable-address typed values owned by the enclosing execution.
     clock_values: ?*const @import("statement_clock.zig").Frame = null,
     steps: usize = 65_536,
@@ -305,7 +303,218 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, md5 };
+pub const Volatility = enum { immutable, stable, @"volatile" };
+pub const Function = enum {
+    ai_decide,
+    ai_choice,
+    ai_score,
+    ai_probability,
+    abs,
+    lower,
+    upper,
+    length,
+    octet_length,
+    concat,
+    coalesce,
+    nullif,
+    greatest,
+    least,
+    ceil,
+    floor,
+    round,
+    sqrt,
+    power,
+    mod,
+    substring,
+    trim,
+    ltrim,
+    rtrim,
+    replace,
+    starts_with,
+    date_part,
+    date_trunc,
+    to_timestamp,
+    current_setting,
+    @"$single",
+    @"$pattern_quantified",
+    trunc,
+    sign,
+    to_jsonb,
+    jsonb_build_object,
+    jsonb_extract_path_text,
+    concat_ws,
+    bit_length,
+    strpos,
+    jsonb_typeof,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    left,
+    right,
+    split_part,
+    translate,
+    overlay,
+    ascii,
+    chr,
+    @"$array",
+    @"$array_quantified",
+    cardinality,
+    array_ndims,
+    array_length,
+    array_lower,
+    array_upper,
+    @"$array_pattern_quantified",
+    @"$contains",
+    @"$overlaps",
+    array_to_string,
+    jsonb_exists,
+    string_to_array,
+    @"$like_escape",
+    jsonb_set,
+    array_position,
+    array_positions,
+    array_remove,
+    array_replace,
+    array_append,
+    array_prepend,
+    array_cat,
+    jsonb_exists_any,
+    jsonb_exists_all,
+    regexp_like,
+    regexp_count,
+    regexp_instr,
+    regexp_substr,
+    regexp_replace,
+    jsonb_array_length,
+    initcap,
+    jsonb_extract_path,
+    md5,
+    now,
+    transaction_timestamp,
+    @"$current_timestamp",
+    pub fn volatility(self: Function) Volatility {
+        return switch (self) {
+            .ai_decide, .ai_choice, .ai_score, .ai_probability => .@"volatile",
+            .now, .transaction_timestamp, .@"$current_timestamp", .current_setting, .date_part, .date_trunc, .to_timestamp, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
+            else => .immutable,
+        };
+    }
+};
+
+fn clockFunction(function: Function) ?@import("statement_clock.zig").StableFunction {
+    return switch (function) {
+        .now, .transaction_timestamp, .@"$current_timestamp" => .transaction,
+        else => null,
+    };
+}
+
+/// The existing public datetime descriptor identifies OID 1184 only. Other
+/// native temporal kinds must not be relabeled or lose their typed payload.
+pub fn timestampResult(datum: Datum, kind: ?ast.ColumnType) !@import("temporal_value.zig").Timestamp {
+    try datum.validateTemporal();
+    const value = datum.temporal() orelse return error.SqlTypeMismatch;
+    if (kind != .datetime or value.kind() != .timestamp_tz) return error.UnsupportedSqlShape;
+    return value.timestamp_tz;
+}
+
+pub fn formatTimestampResult(datum: Datum, kind: ?ast.ColumnType, output: *[@import("temporal_text.zig").output_capacity]u8) ![]const u8 {
+    return @import("temporal_text.zig").format(.{ .timestamp_tz = try timestampResult(datum, kind) }, output);
+}
+
+test "SQL transaction timestamp expressions borrow execution values without allocation or sampling" {
+    const Clock = @import("statement_clock.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.UnexpectedClockSample;
+        }
+    };
+    var fake: Fake = .{};
+    const view: Clock.View = .{ .source = .{ .callback = .{ .ptr = &fake, .now = Fake.sample } }, .transaction = try Clock.Instant.init(-946_684_800_000_001), .statement = try Clock.Instant.init(0) };
+    const first = try Clock.Frame.init(view);
+    var next_view = view;
+    next_view.statement = try Clock.Instant.init(1_000_000);
+    const second = try Clock.Frame.init(next_view);
+    for ([_][]const u8{ "now()", "transaction_timestamp()", "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(6)", "CURRENT_TIMESTAMP(0x6)", "now()::timestamptz", "coalesce(NULL::timestamptz, now())", "CASE WHEN true THEN now() ELSE CURRENT_TIMESTAMP(0) END" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, query, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(ast.ColumnType.datetime, program.output_type.kind.?);
+        try std.testing.expect(program.constant_pool == null);
+        try std.testing.expect(!@import("typed_kernel.zig").supported(&program));
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        for ([_]*const Clock.Frame{ &first, &second }) |frame| {
+            for (0..10_000) |_| {
+                const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = frame });
+                try std.testing.expect(value.temporal().? == try frame.value(.transaction, 6));
+                try std.testing.expect(!value.sql_null);
+            }
+        }
+        try std.testing.expectError(error.SqlClockUnavailable, program.evaluate(none.allocator(), &.{}, &.{}, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(Volatility.stable, Function.now.volatility());
+    try std.testing.expectEqual(Volatility.stable, Function.@"$current_timestamp".volatility());
+}
+
+test "SQL transaction timestamp precisions use the pinned frame and lazy branches need no clock" {
+    const Clock = @import("statement_clock.zig");
+    const frame = try Clock.Frame.init(.{ .source = .{ .io = std.testing.io }, .transaction = try Clock.Instant.init(-123_456_789), .statement = try Clock.Instant.init(42) });
+    for (0..7) |precision| {
+        var query: [64]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&query, "CURRENT_TIMESTAMP({d})", .{precision});
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const datum = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame });
+        try std.testing.expect(datum.temporal().? == try frame.value(.transaction, @intCast(precision)));
+    }
+    var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, "CASE WHEN false THEN now() ELSE NULL::timestamptz END", .{});
+    defer parsed.deinit();
+    var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{}, .{})).sql_null);
+    for ([_][]const u8{ "now(1)", "transaction_timestamp(1)" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, bind(std.testing.allocator, invalid.expression, &.{}, &.{}, .{}));
+    }
+}
+
+test "SQL transaction timestamp precision is demanded lazily and keeps exact public type identity" {
+    const Clock = @import("statement_clock.zig");
+    const frame = try Clock.Frame.init(.{ .source = .{ .io = std.testing.io }, .transaction = try Clock.Instant.init(@import("temporal_value.zig").end_timestamp - 1), .statement = try Clock.Instant.init(0) });
+    for ([_][]const u8{ "CASE WHEN false THEN CURRENT_TIMESTAMP(0) ELSE now() END", "coalesce(now(), CURRENT_TIMESTAMP(0))", "greatest(now(), transaction_timestamp())" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, query, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame });
+        var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+        try std.testing.expectEqualStrings("294276-12-31 23:59:59.999999+00", try formatTimestampResult(value, .datetime, &output));
+        try std.testing.expectError(error.UnsupportedSqlShape, formatTimestampResult(value, .string, &output));
+        try std.testing.expectError(error.UnsupportedRelationalValueType, @import("runtime.zig").encodeStorageDatum(none.allocator(), value, .{ .name = "v", .path = "v", .type = .datetime, .nullable = false }, 1024));
+    }
+    var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, "CURRENT_TIMESTAMP(0)", .{});
+    defer parsed.deinit();
+    var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.TemporalOutOfRange, program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame }));
+    const other: @import("temporal_value.zig").Value = .{ .timestamp = try Clock.Instant.init(0) };
+    try std.testing.expectError(error.UnsupportedSqlShape, timestampResult(Datum.typedTemporal(&other), .datetime));
+    var invalid = Datum.typedTemporal(try frame.value(.transaction, 6));
+    invalid.sql_null = true;
+    try std.testing.expectError(error.SqlTypeMismatch, timestampResult(invalid, .datetime));
+}
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -371,6 +580,7 @@ pub const Program = struct {
             .cast => |cast| earlier[cast.operand],
             .unary => |unary| earlier[unary.operand],
             .call => |call| blk: {
+                if (call.function.volatility() != .immutable) break :blk false;
                 switch (call.function) {
                     .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .sqrt => {},
                     else => break :blk false,
@@ -2061,6 +2271,8 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
+        .now, .transaction_timestamp => count == 0,
+        .@"$current_timestamp" => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
@@ -2090,7 +2302,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arrayCompatibleFunction(function) or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (clockFunction(function) != null or arrayCompatibleFunction(function) or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2273,6 +2485,13 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (clockFunction(function) != null) {
+                    if (function == .@"$current_timestamp") {
+                        const arg = call.args[0];
+                        if (arg.* != .literal or arg.literal != .integer or arg.literal.integer < 0 or arg.literal.integer > 6) return error.InvalidSqlProgram;
+                    }
+                    break :blk .{ .kind = .datetime, .nullable = false };
+                }
                 if (function == .jsonb_extract_path or function == .jsonb_extract_path_text) {
                     for (call.args, 0..) |arg, i| {
                         const actual = try self.infer(arg, depth + 1);
@@ -2828,6 +3047,7 @@ const Binder = struct {
                         .lpad, .rpad => if (i == 1) .integer else .string,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
+                        .@"$current_timestamp" => .integer,
                         .concat => null,
                         .to_jsonb, .jsonb_build_object => null,
                         .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
@@ -3224,6 +3444,8 @@ const Evaluator = struct {
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
                 if (datum.temporal() != null) {
+                    try datum.validateTemporal();
+                    if (cast.type == .datetime and datum.temporal().?.kind() == .timestamp_tz and cast.element_type == null) break :blk datum;
                     if (cast.type != .string) return error.UnsupportedSqlShape;
                     break :blk Datum.json(.{ .string = try self.temporalText(datum) });
                 }
@@ -3354,6 +3576,15 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (clockFunction(call.function)) |function| {
+                    const frame = self.limits.clock_values orelse return error.SqlClockUnavailable;
+                    const precision: u8 = if (call.function == .@"$current_timestamp") p: {
+                        const value = try self.runDatum(call.args[0], depth + 1);
+                        if (value.sql_null or value.value != .integer or value.value.integer < 0 or value.value.integer > 6) return error.InvalidSqlProgram;
+                        break :p @intCast(value.value.integer);
+                    } else 6;
+                    break :blk Datum.typedTemporal(try frame.value(function, precision));
+                }
                 if (decisions.descriptor(@tagName(call.function))) |desc| {
                     if (self.limits.decision_values) |values| if (index < values.len) if (values[index]) |value| break :blk value;
                     const args = try self.alloc.alloc(Json, call.args.len);

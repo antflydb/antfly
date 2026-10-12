@@ -3679,3 +3679,44 @@ This activates owned scalar clock storage, not the public SQL functions.
 Parser/binder time expressions, exact public result activation, volatility,
 protocol receive-time cuts and session-timezone semantics remain unfinished.
 No original SQL disposition changes: 898 remain unresolved.
+
+### Native transaction-time expression activation
+
+`now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` (precision 0 through
+6) now borrow immutable native timestamptz values from the execution-owned
+clock frame. They do not allocate, sample wall time, or round each output row.
+Stable-function metadata prevents their values from becoming cached plan
+constants. Lazy branches preserve demand-driven precision overflow and do not
+require a clock when the time expression is not evaluated.
+
+Native timestamptz results retain their typed payload through scalar selectors,
+derived reads, cursor pages, materialized results, public HTTP serialization and
+pgwire delivery. The existing public `datetime` result identity is OID 1184;
+other native temporal kinds cannot be relabeled as that type. Physical storage
+and temporal-array capability guards remain in place. This is not full temporal
+schema, parameter, row/index or timezone activation.
+
+The independent PostgreSQL 18 oracle corrects an important earlier cursor
+assumption: `now()` stays transaction-stable across successive SQL `FETCH`
+commands, but `statement_timestamp()` changes for each command. Retaining a
+statement cut across internal pages is not sufficient for exposing that
+function across separate protocol commands. `statement_timestamp()` therefore
+remains unexposed pending per-command rebinding and ownership of retained values;
+`clock_timestamp()` also remains unexposed pending volatile evaluation support.
+Receive-time cuts, rather than execution-admission cuts, and exact implicit
+protocol transaction boundaries remain required for full PostgreSQL parity.
+
+PostgreSQL accepts precision greater than 6 with SQLSTATE 22023 WARNING and
+reduces it to 6. Until public notice delivery exists, that shape explicitly
+returns unsupported instead of silently dropping the warning. Negative and
+noninteger precision syntax remains invalid. PostgreSQL nondecimal integer
+tokens now pass the shared lexer with validated prefixes and separators.
+
+The regression scope includes all seven supported precisions, zero-allocation
+repeated evaluation, missing clock owners, lazy branches, native result type
+checks, allocation-failure cleanup, pgwire full-range/infinity delivery and
+public HTTP streaming/materialized paths. These component regressions do not
+qualify additional original inventory cases by themselves. Original case
+accounting remains unchanged at 898 unresolved; mixed legacy document-datetime
+comparisons, clock-bearing EXECUTE argument evaluation, session timezone/input
+semantics and the remaining temporal capabilities are still unfinished.

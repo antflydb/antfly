@@ -141,6 +141,23 @@ fn lexicalError(kind: lexer.LexErrorKind) Error {
     };
 }
 
+test "SQL transaction timestamp syntax retains labels quoted columns and unsupported warning boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "SELECT CURRENT_TIMESTAMP", "SELECT CURRENT_TIMESTAMP(6)", "SELECT CURRENT_TIMESTAMP(0x6)", "SELECT CURRENT_TIMESTAMP(0x_6)", "SELECT CURRENT_TIMESTAMP(0o6)", "SELECT CURRENT_TIMESTAMP(0b110)" }) |sql| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualStrings("current_timestamp", compiled.statement.select.columns[0].alias.?);
+        try std.testing.expectEqualStrings("$current_timestamp", compiled.statement.select.columns[0].expression.?.call.name);
+    }
+    var quoted = try compileScalar(a, "\"current_timestamp\"", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("current_timestamp", quoted.expression.column);
+    for ([_][]const u8{ "CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP(-1)", "CURRENT_TIMESTAMP(1.5)", "CURRENT_TIMESTAMP($1)", "CURRENT_TIMESTAMP(1 + 1)" }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "CURRENT_TIMESTAMP(7)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "CURRENT_TIMESTAMP(0xe)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "\"$current_timestamp\"(6)", .{}));
+}
+
 test "SQL escape string diagnostics retain PostgreSQL SQLSTATEs" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileScalar(a, "E'\\u12'", .{}));
@@ -516,6 +533,22 @@ const Parser = struct {
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime } });
+        } else if (self.keyword(.current_timestamp)) {
+            var precision: i64 = 6;
+            if (self.take(.lparen)) {
+                if (!self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
+                const text = self.tokens[self.pos].text;
+                const radix = text.len > 2 and text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", text[1]) != null;
+                if (!radix and std.mem.indexOfAny(u8, text, ".eE") != null) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
+                precision = std.fmt.parseInt(i64, self.tokens[self.pos].text, 0) catch return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision is outside the supported domain");
+                self.pos += 1;
+                try self.expect(.rparen);
+                // PostgreSQL clamps >6 with a WARNING. Do not silently omit
+                // that observable contract until notice delivery is wired.
+                if (precision > 6) return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision warnings are not yet supported");
+            }
+            const arg = try self.scalarNode(.{ .literal = .{ .integer = precision } });
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_timestamp", .args = try self.alloc.dupe(*const ast.Scalar, &.{arg}) } });
         } else if (self.keyword(.case)) {
             const base = if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.when)) null else try self.scalar(depth + 1, 0);
             var branches: std.ArrayList(ast.Scalar.Branch) = .empty;
@@ -1690,7 +1723,7 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
             .case_when => "case",
             else => null,
         };

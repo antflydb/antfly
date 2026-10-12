@@ -927,8 +927,8 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
     if (raw.temporal() != null) {
         try raw.validateTemporal();
-        // Until exact public temporal identities are bound, do not erase the
-        // typed payload through the legacy document-datetime string adapter.
+        if (kind == .datetime and element_type == null and raw.temporal().?.kind() == .timestamp_tz) return raw;
+        // Other temporal types still require exact schema/type activation.
         return error.UnsupportedSqlShape;
     }
     if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
