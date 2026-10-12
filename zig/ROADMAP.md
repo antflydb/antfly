@@ -380,6 +380,9 @@ file's own title and a one-line description taken from its first paragraph.
   `zig/pkg/antfly/src/extensions/`; the doc has not been reconciled to match.
 - [OPENAPI.md](OPENAPI.md) — OpenAPI: how generated Zig OpenAPI code is kept
   checked in and imported.
+- [COMPILATION.md](COMPILATION.md) — Antfly Zig compilation architecture: the
+  seven compiled runtime archives, internal ABI rules, memory reservations,
+  acceptance gates, and cold-build commands.
 
 ### Testing
 

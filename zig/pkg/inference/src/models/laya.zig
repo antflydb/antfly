@@ -35,7 +35,7 @@ pub const max_fuse_layers = 256;
 /// use `.none`; a packed mode requires weights fine-tuned for that layout.
 pub const PackingMode = enum(u8) { none, question, candidate };
 
-/// Two-stage choice (roadmap 2b, LAYA.md "Two-stage choice for many options").
+/// Two-stage choice (roadmap 2b, LAYA.md "Two-stage choice (roadmap 2b)").
 /// Stage 1 scores every option as its own candidate branch; when a `choice`
 /// question has more options than `top_k`, stage 2 packs the surviving
 /// finalists into one joint (question-style) branch off the same trunk, so
@@ -132,8 +132,8 @@ pub const Config = struct {
     packing: Packing = .{},
     weight_quantization: WeightQuantization = .none,
     /// How options are scored from the head's output. `scorer` (upstream):
-    /// an MLP over each option marker. `pointer` (LAYA.md, "Lessons from
-    /// Jeeves"): a scaled dot product between a query projection of the
+    /// an MLP over each option marker. `pointer` (LAYA.md, "Pointer
+    /// head"): a scaled dot product between a query projection of the
     /// question's `[CLS]` anchor and a key projection of each option marker,
     /// `pointer.q`/`pointer.k`, each `[pointer_dim, hidden]`, both reading
     /// the head's output through the LayerNorm `pointer.norm`.
