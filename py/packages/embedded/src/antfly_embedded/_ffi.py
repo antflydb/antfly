@@ -327,6 +327,8 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_get_schema_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_set_schema_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_list_indexes_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_render_resolver_key_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_merge_resolver_keys_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_add_index_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_delete_index", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
     ("antfly_db_list_enrichments_json", [_VOID_P, _BUF_P], _ERR),

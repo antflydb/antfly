@@ -225,6 +225,7 @@ pub fn resolveExtraction(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    resolver.aliases = cfg.aliases;
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
@@ -349,6 +350,7 @@ pub fn processChangedExtractionWithConfig(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    resolver.aliases = cfg.aliases;
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -1094,6 +1096,7 @@ const SourceCandidateProvider = struct {
                     .index_name = self.ann_index_name,
                     .embedding = emb,
                     .k = self.candidate_limit,
+                    .vector_fields = try self.resolver.candidateVectorFields(allocator),
                 }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.NearestUnsupported => return,
                     else => return e,

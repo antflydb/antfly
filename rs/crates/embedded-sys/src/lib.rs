@@ -634,6 +634,17 @@ unsafe extern "C" {
         db: *mut antfly_db,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_render_resolver_key_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        mention_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_merge_resolver_keys_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        merge_json: antfly_slice,
+    ) -> antfly_error_code;
     pub fn antfly_db_add_index_json(
         db: *mut antfly_db,
         config_json: antfly_slice,

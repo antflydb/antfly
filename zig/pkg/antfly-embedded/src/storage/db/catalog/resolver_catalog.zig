@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 
 /// Durable resolver-backfill cursors. They live with the resolver catalog
@@ -87,6 +88,10 @@ pub const ResolverConfig = struct {
     resolution_artifact: []const u8,
     /// Template that renders a canonical entity key from a mention.
     key_template: []const u8,
+    /// Explicit key redirects, usable without entity promotion.
+    aliases: []const resolver_lib.KeyAlias = &.{},
+    /// Materialize canonical entity documents; false resolves graph keys only.
+    promote: bool = true,
     /// Mention labels this resolver consumes. Empty means all labels
     /// (catch-all). Labeled resolvers sharing a source artifact must claim
     /// disjoint label sets (admission-enforced), and catch-alls skip labels
@@ -149,6 +154,8 @@ pub const ResolverConfig = struct {
                 const b = @field(other, reflected_name);
                 if (a.len != b.len) return false;
                 for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+            } else if (field_type == []const resolver_lib.KeyAlias) {
+                if (!aliasesEqual(self.aliases, other.aliases)) return false;
             } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
         }
         return true;
@@ -162,6 +169,31 @@ pub const ResolverConfig = struct {
         return false;
     }
 
+    pub fn aliasesEqual(a: []const resolver_lib.KeyAlias, b: []const resolver_lib.KeyAlias) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!std.mem.eql(u8, x.key, y.key) or !std.mem.eql(u8, x.target, y.target)) return false;
+        return true;
+    }
+
+    fn cloneAliases(alloc: Allocator, aliases: []const resolver_lib.KeyAlias) ![]const resolver_lib.KeyAlias {
+        const out = try alloc.alloc(resolver_lib.KeyAlias, aliases.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |alias| {
+                alloc.free(alias.key);
+                alloc.free(alias.target);
+            }
+            alloc.free(out);
+        }
+        for (aliases, out) |alias, *dest| {
+            const key = try alloc.dupe(u8, alias.key);
+            errdefer alloc.free(key);
+            dest.* = .{ .key = key, .target = try alloc.dupe(u8, alias.target) };
+            initialized += 1;
+        }
+        return out;
+    }
+
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),
@@ -170,6 +202,8 @@ pub const ResolverConfig = struct {
             .source_artifact_kind = cfg.source_artifact_kind,
             .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
             .key_template = try alloc.dupe(u8, cfg.key_template),
+            .aliases = try cloneAliases(alloc, cfg.aliases),
+            .promote = cfg.promote,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
@@ -193,6 +227,11 @@ pub const ResolverConfig = struct {
         alloc.free(@constCast(self.source_artifact));
         alloc.free(@constCast(self.resolution_artifact));
         alloc.free(@constCast(self.key_template));
+        for (self.aliases) |alias| {
+            alloc.free(alias.key);
+            alloc.free(alias.target);
+        }
+        alloc.free(self.aliases);
         for (self.labels) |l| alloc.free(@constCast(l));
         if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
@@ -209,6 +248,7 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        try resolver_lib.validateAliases(self.aliases);
         if (self.name.len == 0 or
             self.table.len == 0 or
             self.source_artifact.len == 0 or

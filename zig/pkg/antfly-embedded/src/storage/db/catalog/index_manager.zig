@@ -12229,7 +12229,9 @@ pub const IndexManager = struct {
     }
 
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
-        return !std.mem.eql(u8, existing.table, next.table) or
+        return existing.promote != next.promote or
+            !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
+            !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
             !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or

@@ -118,6 +118,7 @@ pub const Resolution = struct {
     arena: std.heap.ArenaAllocator,
     config_generation: u64,
     entities: []const ResolvedEntity,
+    skipped_mentions: usize = 0,
 
     pub fn deinit(self: *Resolution) void {
         self.arena.deinit();
@@ -132,6 +133,8 @@ pub const Resolution = struct {
 
         try out.appendSlice(allocator, "{\"config_generation\":");
         try appendInt(allocator, &out, self.config_generation);
+        try out.appendSlice(allocator, ",\"skipped_mentions\":");
+        try appendInt(allocator, &out, self.skipped_mentions);
         try out.appendSlice(allocator, ",\"entities\":[");
         for (self.entities, 0..) |e, i| {
             if (i > 0) try out.append(allocator, ',');
@@ -170,10 +173,37 @@ pub const Resolution = struct {
 
 /// A parsed, reusable resolver config. Owns the entity table name, key template,
 /// and optional scorer.
+/// Explicit redirects between fully rendered keys in the resolver's table.
+pub const KeyAlias = struct { key: []const u8, target: []const u8 };
+
+pub fn canonicalAliasKey(aliases: []const KeyAlias, key: []const u8) ![]const u8 {
+    var current = key;
+    for (0..aliases.len + 1) |_| {
+        var next: ?[]const u8 = null;
+        for (aliases) |alias| {
+            if (std.mem.eql(u8, alias.key, current)) {
+                next = alias.target;
+                break;
+            }
+        }
+        current = next orelse return current;
+    }
+    return error.InvalidResolverAliasCycle;
+}
+
+pub fn validateAliases(aliases: []const KeyAlias) !void {
+    for (aliases, 0..) |alias, i| {
+        if (alias.key.len == 0 or alias.target.len == 0) return error.InvalidResolverAlias;
+        for (aliases[0..i]) |prior| if (std.mem.eql(u8, prior.key, alias.key)) return error.InvalidResolverAlias;
+        _ = try canonicalAliasKey(aliases, alias.key);
+    }
+}
+
 pub const Resolver = struct {
     arena: std.heap.ArenaAllocator,
     table: []const u8,
     key_template: []const u8,
+    aliases: []const KeyAlias = &.{},
     /// Mention labels this resolver consumes; empty is a catch-all. Lets
     /// several resolvers partition one extraction artifact by label (e.g.
     /// `event` mentions to an events table, everything else to entities).
@@ -248,10 +278,17 @@ pub const Resolver = struct {
             scorer = try matcher.Scorer.parseValue(gpa, sv);
         }
 
+        const aliases = if (obj.get("aliases")) |value|
+            (try std.json.parseFromValue([]KeyAlias, a, value, .{ .allocate = .alloc_always })).value
+        else
+            &.{};
+        try validateAliases(aliases);
+
         return .{
             .arena = arena,
             .table = table,
             .key_template = key_template,
+            .aliases = aliases,
             .labels = labels,
             .exclude_labels = exclude_labels,
             .type_must_match = type_must_match,
@@ -331,6 +368,21 @@ pub const Resolver = struct {
         return false;
     }
 
+    /// Candidate fields compared to the mention's generated name vector.
+    pub fn candidateVectorFields(self: *const Resolver, a: std.mem.Allocator) ![]const []const u8 {
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (self.scorer) |scorer| for (scorer.comparisons) |comparison| {
+            if (!std.mem.eql(u8, comparison.left, "name_embedding")) continue;
+            var duplicate = false;
+            for (fields.items) |field| if (std.mem.eql(u8, field, comparison.right)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try fields.append(a, comparison.right);
+        };
+        return fields.items;
+    }
+
     /// In-place compaction of `entities` down to the mentions this resolver
     /// consumes. Returns the kept prefix. Used before candidate blocking so
     /// filtered mentions never pay for embedding backfill or candidate search.
@@ -376,13 +428,24 @@ pub const Resolver = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const resolved = try a.alloc(ResolvedEntity, entities.len);
+        var resolved: std.ArrayListUnmanaged(ResolvedEntity) = .empty;
         for (entities, 0..) |entity, i| {
             const cands: []const Candidate = if (i < candidates.len) candidates[i] else &.{};
-            resolved[i] = try self.resolveOne(a, gpa, entity, cands);
+            var value = self.resolveOne(a, gpa, entity, cands) catch |err| switch (err) {
+                error.EmptyEntityKey => {
+                    std.log.warn("resolver skipped mention {s}: key template produced an empty slug", .{entity.local_id});
+                    continue;
+                },
+                else => return err,
+            };
+            if (std.mem.eql(u8, value.doc_ref.table, self.table)) {
+                const canonical = try canonicalAliasKey(self.aliases, value.doc_ref.key);
+                value.doc_ref.key = try a.dupe(u8, canonical);
+            }
+            try resolved.append(a, value);
         }
 
-        return .{ .arena = arena, .config_generation = config_generation, .entities = resolved };
+        return .{ .arena = arena, .config_generation = config_generation, .entities = resolved.items, .skipped_mentions = entities.len - resolved.items.len };
     }
 
     fn resolveOne(
@@ -398,6 +461,16 @@ pub const Resolver = struct {
         // independent of probabilistic scoring. Never infer this from a fuzzy
         // candidate, or link a dangling redirect to an unavailable survivor.
         const minted_key = try renderKey(a, self.key_template, entity);
+        const canonical_key = try canonicalAliasKey(self.aliases, minted_key);
+        if (!std.mem.eql(u8, minted_key, canonical_key)) return .{
+            .local_id = local_id,
+            .doc_ref = .{ .table = try a.dupe(u8, self.table), .key = try a.dupe(u8, canonical_key) },
+            .confidence = 1,
+            .decision = .match,
+            .label = try a.dupe(u8, entity.label),
+            .canonical_name = try a.dupe(u8, entity.text),
+            .surface_form = try a.dupe(u8, entity.text),
+        };
         for (candidates) |candidate| {
             if (!std.mem.eql(u8, candidate.doc_ref.table, self.table) or
                 !std.mem.eql(u8, candidate.doc_ref.key, minted_key)) continue;
@@ -1235,13 +1308,33 @@ pub const ResolutionStage = struct {
         // extraction artifact into its own resolution artifact.
         parsed.entities = self.resolver.filterEntitiesByLabel(parsed.entities);
 
+        // Reject only the unkeyable mention before blocking; keep its siblings.
+        // Invalid templates and resource failures still fail the operation.
+        const admitted_count = parsed.entities.len;
+        const alias_mask = try parsed.arena.allocator().alloc(bool, admitted_count);
+        var kept: usize = 0;
+        for (parsed.entities) |entity| {
+            const key = self.resolver.renderKeyAlloc(parsed.arena.allocator(), entity) catch |err| switch (err) {
+                error.EmptyEntityKey => {
+                    std.log.warn("resolver skipped mention {s}: key template produced an empty slug", .{entity.local_id});
+                    continue;
+                },
+                else => return err,
+            };
+            const canonical = try canonicalAliasKey(self.resolver.aliases, key);
+            alias_mask[kept] = !std.mem.eql(u8, key, canonical);
+            parsed.entities[kept] = entity;
+            kept += 1;
+        }
+        parsed.entities = parsed.entities[0..kept];
+
         // Backfill name embeddings for mentions that arrived without one, using
         // the parse arena so the vectors outlive scoring. Embedding failures are
         // non-fatal: the mention simply scores without a vector.
         if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
             const arena = parsed.arena.allocator();
-            for (parsed.entities) |*entity| {
-                if (entity.embedding != null or entity.text.len == 0) continue;
+            for (parsed.entities, 0..) |*entity, i| {
+                if (alias_mask[i] or entity.embedding != null or entity.text.len == 0) continue;
                 entity.embedding = embedder.embed(arena, entity.text) catch null;
             }
         }
@@ -1251,14 +1344,26 @@ pub const ResolutionStage = struct {
         const a = scratch.allocator();
 
         const lists = try a.alloc([]const Candidate, parsed.entities.len);
+        for (lists) |*list| list.* = &.{};
         if (provider) |p| {
-            try p.candidatesForBatch(a, parsed.entities, lists);
-        } else {
-            for (lists) |*l| l.* = &.{};
+            // Explicit aliases require neither entity records nor ANN/embedding IO.
+            var pending: std.ArrayListUnmanaged(ExtractedEntity) = .empty;
+            var indices: std.ArrayListUnmanaged(usize) = .empty;
+            for (parsed.entities, 0..) |entity, i| {
+                if (alias_mask[i]) continue;
+                try pending.append(a, entity);
+                try indices.append(a, i);
+            }
+            if (pending.items.len > 0) {
+                const blocked = try a.alloc([]const Candidate, pending.items.len);
+                try p.candidatesForBatch(a, pending.items, blocked);
+                for (indices.items, blocked) |i, candidates| lists[i] = candidates;
+            }
         }
 
         var resolution = try self.resolver.resolve(gpa, self.config_generation, parsed.entities, lists);
         defer resolution.deinit();
+        resolution.skipped_mentions += admitted_count - kept;
 
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
@@ -2323,7 +2428,7 @@ test "resolution exact minted key aliases require no scorer" {
 test "uslug normalizes Unicode identities without changing legacy ASCII keys" {
     const a = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "Qwen3", "qwen3" }, .{ "qwen3", "qwen3" },
+        .{ "Qwen3", "qwen3" },        .{ "qwen3", "qwen3" },
         .{ "Ｑｗｅｎ３", "qwen3" },
         .{ "Straße", "strasse" },
         .{ "Σίσυφος", "σίσυφοσ" },
@@ -2331,6 +2436,10 @@ test "uslug normalizes Unicode identities without changing legacy ASCII keys" {
         .{ "CAFÉ", "café" },
         .{ "Cafe\u{301}", "café" },
         .{ "한글", "한글" },
+        .{ "हिन्दी", "हिन्दी" },
+        .{ "العَرَبِيَّة", "العَرَبِيَّة" },
+        .{ "ภาษาไทย น้ำ", "ภาษาไทย_น้ํา" },
+        .{ "\u{301}Hindi", "hindi" },
         .{ "ﬃ ①", "ffi_1" },
     };
     for (cases) |case| {
@@ -2347,4 +2456,52 @@ test "uslug normalizes Unicode identities without changing legacy ASCII keys" {
         try std.testing.expectError(error.EmptyEntityKey, renderKey(a, template, .{ .local_id = "e0", .label = "concept", .text = "!!!" }));
     try std.testing.expectError(error.EmptyEntityKey, renderKey(a, "entity/{{ slug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "東京" }));
     try std.testing.expectError(error.InvalidUtf8, renderKey(a, "{{ uslug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "\xff" }));
+}
+
+test "empty mention slug is isolated before candidate blocking" {
+    const a = std.testing.allocator;
+    var resolver = try Resolver.parse(a, "{\"table\":\"entities\",\"key_template\":\"entity/{{ uslug _entity.text }}\"}");
+    defer resolver.deinit();
+    const entities = [_]ExtractedEntity{
+        .{ .local_id = "bad", .label = "concept", .text = "!!!" },
+        .{ .local_id = "good", .label = "concept", .text = "हिन्दी" },
+    };
+    var resolution = try resolver.resolve(a, 1, &entities, &.{});
+    defer resolution.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resolution.entities.len);
+    try std.testing.expectEqual(@as(usize, 1), resolution.skipped_mentions);
+    try std.testing.expectEqualStrings("entity/हिन्दी", resolution.entities[0].doc_ref.key);
+}
+
+test "resolver key aliases work without promoted documents and reject cycles" {
+    const aliases = [_]KeyAlias{ .{ .key = "concept/qwen3", .target = "concept/qwen3_embedding" }, .{ .key = "concept/qwen3_embedding", .target = "concept/qwen" } };
+    try validateAliases(&aliases);
+    try testing.expectError(error.InvalidResolverAliasCycle, validateAliases(&.{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "a" } }));
+    var resolver = try Resolver.parse(testing.allocator, "{\"table\":\"default\",\"key_template\":\"concept/{{ uslug _entity.text }}\",\"aliases\":[{\"key\":\"concept/qwen3\",\"target\":\"concept/qwen3_embedding\"},{\"key\":\"concept/qwen3_embedding\",\"target\":\"concept/qwen\"}]}");
+    defer resolver.deinit();
+    var result = try resolver.resolve(testing.allocator, 3, &.{.{ .local_id = "q", .label = "concept", .text = "Qwen3" }}, &.{});
+    defer result.deinit();
+    try testing.expectEqualStrings("concept/qwen", result.entities[0].doc_ref.key);
+    try testing.expectEqual(Decision.match, result.entities[0].decision);
+}
+
+test "resolver explicit aliases bypass unavailable candidate sources" {
+    var resolver = try Resolver.initFromParts(testing.allocator, "default", "concept/{{ uslug _entity.text }}", .{}, true, "");
+    defer resolver.deinit();
+    resolver.aliases = &.{.{ .key = "concept/qwen3", .target = "concept/qwen" }};
+    var store = MapStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    try store.store().put("extraction", "{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Qwen3\"}]}");
+    const Unavailable = struct {
+        fn candidates(_: *anyopaque, _: std.mem.Allocator, _: ExtractedEntity, _: *std.ArrayListUnmanaged(Candidate)) anyerror!void {
+            return error.Unavailable;
+        }
+    };
+    var token: u8 = 0;
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+    const bytes = (try stage.computeAlloc(testing.allocator, store.store(), .{ .ptr = &token, .vtable = &.{ .candidates_for = Unavailable.candidates } }, "extraction")).?;
+    defer testing.allocator.free(bytes);
+    var result = try parseResolution(testing.allocator, bytes);
+    defer result.deinit();
+    try testing.expectEqualStrings("concept/qwen", result.entities[0].doc_ref.key);
 }

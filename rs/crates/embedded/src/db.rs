@@ -513,6 +513,33 @@ impl Database {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_list_indexes_json(h, out) })
     }
 
+    /// Render the durable template and follow key aliases, without writes or ANN search.
+    pub fn render_resolver_key_json(
+        &self,
+        resolver: &str,
+        mention: impl AsRef<[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(mention.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_render_resolver_key_json(
+                h,
+                borrow_slice(resolver.as_bytes()),
+                input,
+                out,
+            )
+        })
+    }
+
+    /// Persist a {"key","target"} redirect. Drain to re-key existing resolution edges.
+    pub fn merge_resolver_keys_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_merge_resolver_keys_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
+    }
+
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(config.as_ref(), |h, input| unsafe {
             sys::antfly_db_add_index_json(h, input)

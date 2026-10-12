@@ -278,3 +278,11 @@ backups.
 
 See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
 transaction, savepoint, result-size, and commit-outcome behavior.
+
+
+The real local synonym/ANN regression is opt-in with
+`ANTFLY_LITE_EMBEDDING_MODELS_DIR=/path/to/inference/models`. It uses that explicit
+model root (containing `Qwen/Qwen3-Embedding-0.6B-GGUF`), rather than searching the
+user's home directory. The Zig CI gate separately downloads the pinned GLiNER base
+bundle and runs real extraction, promotion, and a public `direction: "both"`
+PageRank query; Unicode resolver tests run in the ordinary `lib-test` gate.

@@ -50,7 +50,7 @@ pub export fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slic
         return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": if (guard.handle.parent_id != null)");
+    if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": operation requires a root database handle");
     out.* = describe(guard.handle, request.bytes()) catch |err| return @import("sql_cursor.zig").diagnostic(err, out);
     return .ok;
 }

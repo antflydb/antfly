@@ -694,6 +694,26 @@ func (db *DB) IndexesJSON() ([]byte, error) {
 	})
 }
 
+// RenderResolverKeyJSON renders the durable resolver template and follows key aliases, without writes or ANN search.
+func (db *DB) RenderResolverKeyJSON(resolver string, mention []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(mention)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_render_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// MergeResolverKeysJSON persists {"key","target"}; RunUntilIdle re-keys existing resolution edges.
+func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.withInput(request, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_db_merge_resolver_keys_json((*C.antfly_db)(handle), name, input)
+	})
+}
+
 // AddIndexJSON adds an index from its JSON configuration.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {

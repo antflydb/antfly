@@ -8,7 +8,7 @@ import unicodedata as u
 from pathlib import Path
 
 assert u.unidata_version == "16.0.0", u.unidata_version
-mappings, values, classes, compositions, ranges = [], [], [], [], []
+mappings, values, classes, compositions, ranges, marks = [], [], [], [], [], []
 start = None
 for cp in range(0x110000):
     char = chr(cp)
@@ -23,6 +23,8 @@ for cp in range(0x110000):
         parts = list(map(lambda x: int(x, 16), decomp.split()))
         if len(parts) == 2 and u.normalize("NFC", "".join(map(chr, parts))) == char:
             compositions.append(((parts[0] << 21) | parts[1], cp))
+    if u.category(char)[0] == "M":
+        marks.append((cp, cp))
     allowed = u.category(char)[0] in "LN"
     if allowed and start is None:
         start = cp
@@ -39,7 +41,8 @@ for cp, offset, length in mappings:
 out.append("};\npub const values = [_]u21{\n" + ",".join(map(str, values)) + "\n};\n")
 for name, fields, rows in [("classes", "cp: u21, class: u8", classes),
                            ("compositions", "pair: u42, cp: u21", sorted(compositions)),
-                           ("letters_digits", "first: u21, last: u21", ranges)]:
+                           ("letters_digits", "first: u21, last: u21", ranges),
+                           ("marks", "first: u21, last: u21", marks)]:
     names = [f.split(":")[0] for f in fields.split(", ")]
     out.append(f"pub const {name} = [_]struct {{ {fields} }}{{\n")
     for row in rows:

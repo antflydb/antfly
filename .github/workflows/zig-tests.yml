@@ -612,6 +612,7 @@ jobs:
 
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
@@ -664,6 +665,19 @@ jobs:
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          model_dir="$GITHUB_WORKSPACE/zig/.test-models/lite-graph-base"
+          trap 'rm -rf "$model_dir"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir"
+          cd zig
+          ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' -j1
 
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
@@ -1028,6 +1042,7 @@ jobs:
 
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'

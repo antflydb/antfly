@@ -2670,10 +2670,11 @@ func TestNativeDiagnosticsOwnDetailsAndResetForSQL(t *testing.T) {
 }
 
 func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testing.T) {
-	if !liteLocalEmbeddingModelAvailable() {
-		t.Skip("local Qwen embedding model is not installed")
+	modelsDir := os.Getenv("ANTFLY_LITE_EMBEDDING_MODELS_DIR")
+	if modelsDir == "" {
+		t.Skip("set ANTFLY_LITE_EMBEDDING_MODELS_DIR to run the real embedding regression")
 	}
-	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "resolver.aflite"), OpenOptions{Profile: ProfileNative, LocalRuntimeConfigured: true})
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "resolver.aflite"), OpenOptions{Profile: ProfileNative, LocalRuntimeConfigured: true, ModelsDir: modelsDir})
 	if err != nil {
 		t.Fatal(err)
 	}
