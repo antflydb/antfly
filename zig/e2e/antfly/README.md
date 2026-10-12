@@ -2,8 +2,9 @@
 
 This directory holds portable end-to-end tests for Antfly Zig.
 
-See [FLAKES.md](../FLAKES.md) for intermittent failures, CI evidence, fix commits,
-and regression-soak commands and results.
+See [FLAKES.md](../FLAKES.md) for the table of known E2E flakes, where they were
+seen, and whether they are open or closed. Investigation details live in git
+history and the linked PRs.
 
 Use product-area names for test files. Do not use migration labels like `*_parity.py`.
 

@@ -1,0 +1,289 @@
+# Qwen3-Embedding baseline results
+
+> Relocated verbatim from `zig/pkg/inference/scripts/qwen3_embedding/BASELINE.md` (lines 21–119 and 242–426 at commit 3ce5aff4ea) on 2026-10-12. Durable decisions were folded into [PERFORMANCE.md](../../../../../zig/pkg/inference/models/qwen/PERFORMANCE.md#qwen3-embedding-reference-results) before the move. The measurement protocol these results follow remains in [BASELINE.md](../../../../../zig/pkg/inference/scripts/qwen3_embedding/BASELINE.md); references below to sections "above" mean that protocol.
+
+## Short-query and capacity results — 2026-10-01
+
+The local short-query and capacity implementation was measured on an Apple M4
+with 16 GiB RAM and macOS 26.5. The candidate was the uncommitted working tree
+over `60dbc97e27648e9744b91a1449482576e8684d97`; its executable SHA-256 was
+`35b506fd745cc2fb7434f53fd85a3c2c48d791129abf9a8c76411f09d7334839`.
+Both endpoints used the identical 0.6B Q8_0 GGUF with SHA-256
+`06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
+The reference was llama.cpp `b8990-660b1b4bd`, executable SHA-256
+`8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590`.
+The [compact qualification summary](../../../../../zig/pkg/inference/scripts/qwen3_embedding/reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
+records results, provenance hashes, failures, and qualification limits. Complete
+raw receipts retain all measured rounds, source/model/fixture hashes, live process
+arguments, tests, and soak memory samples outside Git; their hashes and local
+archive location are recorded in the summary.
+
+Each cell ran three rounds of three warmups and twenty alternating AB/BA
+endpoint measurements. Exact-token fixtures include EOS. Query lengths include
+the complete rendered instruction prefix; reference slots were erased before
+each query outside timing. Every measured vector was checked against the
+reference. The table reports the worst confidence lower bound and p95 ratio
+across the three rounds, rather than selecting the best round.
+
+| Input | Tokens including EOS | Candidate mean latency | Lowest 95% throughput-ratio bound | Highest candidate/reference p95 ratio |
+|-------|----------------------|------------------------|----------------------------------|---------------------------------------|
+| Document | 20 | 23.495–23.533 ms | 1.038 | 0.973 |
+| Document | 32 | 24.066–24.221 ms | 1.010 | 0.978 |
+| Document | 64 | 35.868–35.932 ms | 1.189 | 0.849 |
+| Rendered query | 32 | 23.157–23.755 ms | 1.029 | 0.959 |
+| Rendered query | 64 | 36.255–36.501 ms | 1.164 | 0.889 |
+
+All 15 short rounds passed the lower-bound >=1.0 and p95-ratio <=1.05 gates.
+The lowest short-vector cosine was 0.9999977587. All three 32×256 capacity rounds
+passed at the default derived scratch/combined limits with a 4 GiB process
+budget. Their confidence lower bounds were 1.240, 1.244 and 1.216 against
+llama.cpp, with minimum cosine 0.9999899002. Mean request latency ranged from
+6.364 to 7.115 seconds. The API accepted all 32 rows; internal chunks were bounded
+by actual padded tokens and memory admission.
+
+All 18 paired fixed-audit-baseline regression rounds passed across six supported
+shapes (256/511/2551-token singletons, 8×20, 32×20 and 8×256). The worst lower
+bound was 0.990 against the required 0.95. This lane used explicit 1536 MiB
+scratch and 3072 MiB combined caps on both builds to admit the long singleton.
+Those overrides were absent from the capacity and soak lanes. The llama.cpp
+reference used a bounded 2048-token physical microbatch, or the full singleton
+length when longer, while accepting the same API batch. These results do not
+qualify an unbounded physical microbatch.
+
+All 25 HTTP correctness checks passed: ragged row order, finite/unit vectors,
+32/256/1024 dimensions, query-prefix limits, both error policies, partial-result
+indexes, disconnect/overload recovery and eviction/reload. The local harness
+suite passed 132 tests. The Hugging Face tokenizer suite passed 82 tests; one
+optional installed SPLADE-fixture test skipped. Focused admission/ownership and
+physical Metal checks
+passed 28 selected tests; four final short-kernel checks and an existing-kernel
+fallback replay passed with no skips. The final checks include real Q/KV/FFN
+widths and row boundaries 1/8/9/16/20/31/32/33/64/65.
+
+The initial final-binary soak completed 1835.94 seconds with 243 requests,
+7776 vectors, zero failures, unchanged worker PIDs and no host swap growth.
+Downward RSS transitions in its final half produced a 110.03 MiB range against
+the 32 MiB allowance, so that run failed the plateau gate. The cause of those
+residency changes is unproven. Its failing result remains in the summary and
+archived raw receipt.
+
+A separate repeat used a fixed 600-second, eight-worker conditioning phase
+followed by an independent 1800-second measured phase on the same supervisor
+and worker. Conditioning completed 113 requests with zero failures. The measured
+phase completed 1829.51 seconds, 310 requests and 9920 vectors with zero failures,
+no worker restart and no host swap growth. Its final-half RSS range was 2.203 MiB;
+the unchanged criterion is max-minus-min <= max(32 MiB, 5% mean). All returned
+rows retained same-binary order/vector parity at cosine >=0.99999. The archived
+raw receipt contains both full memory trajectories and the conditioning driver source.
+This is qualification of the explicitly conditioned steady-state run; it does
+not reclassify the initial failing soak.
+
+Those historical runs explicitly enabled the three serving controls:
+`TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1`,
+`TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING=1`, and
+`TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1`. The later
+[merged-branch default qualification](../metal/serving-defaults-m4-2026-10.md)
+records the current M4 default policy and fresh results. Qualification required Metal and
+resident execution. Other Apple devices, precision tiers, 4B/8B models, the full
+32K context and canonical CI remain separate qualification work.
+
+## Native CPU admission qualification — 2026-09-04
+
+An Apple arm64 host loaded the managed Q8_0 bundle through the production model
+manager with both `native` and `metal`. The tested GGUF SHA-256 was
+`06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
+Single measured smoke iterations produced normalized 1,024-dimensional vectors:
+
+| Tokens | Native latency | Metal latency | Native/Metal cosine | Max absolute difference |
+|--------|----------------|---------------|---------------------|-------------------------|
+| 20     | 202.44 ms      | 45.72 ms      | 0.999503            | 0.004179                |
+| 256    | 1102.38 ms     | 62.78 ms      | 0.999262            | 0.004604                |
+
+These are admission and output-parity smoke results, not stable performance
+baselines. Use the full warmup/iteration protocol below for performance claims.
+
+## Interim results — 2026-09-02 perf session (batch-1 endpoint, graph phase)
+
+Machine: Apple M4 (fanless), 16GB, Darwin 25.5.0 — branch qwenvl_metal (uncommitted
+working tree over 4eee44472) — Qwen3-Embedding-0.6B GGUF Q8_0.
+
+Timings are the `text.encoder.qwen3.graph` phase from `TERMITE_EMBED_TIMING=1`
+on single-document requests; llama.cpp reference is `llama-bench -p N -n 0`
+(build 660b1b4bd) on the identical GGUF.
+
+**Historical only:** the llama.cpp column below used llama-bench's generation
+graph defaults (`embeddings=false`, `ubatch=512`, flash attention off), so it is
+not an apples-to-apples embedding endpoint comparison. Keep it only as the
+optimization session's original reference point; use the strict endpoint
+protocol above and the closure results below for parity claims.
+
+| Tokens | naive baseline | +batched Q8_0 FFN | +SG flash (q8 tile) | +q16 tile | llama.cpp pp |
+|--------|----------------|-------------------|---------------------|-----------|--------------|
+| 511    | 3.4 s          | —                 | 0.51 s              | 0.46 s (1107 tok/s) | 2012 tok/s |
+| 2551   | 52 s (34.5 s warm) | 34.5 s        | 5.2 s               | 4.12 s (620 tok/s)  | 1608 tok/s |
+| 8192   | ~600 s (timeouts) | —              | 37 s                | —         | —            |
+
+Fix 1: `tryDeviceQuantizedGatedFfnResidual` per-row loop → batched Q8_0 device
+encode (dispatches per 2551-tok request: 214,761 → 477). Rollback:
+`TERMITE_METAL_FORCE_Q8_0_GATED_FFN_ROWWISE=1`.
+
+Fix 2: `termite_attention_f32_dense_causal_sg[_q16]` flash kernels replace the
+naive/tiled f32 attention for full causal self-attention from position zero
+(q_len >= 8, no bias/mask/window, head_dim % 32 == 0; q16 variant for
+q_len >= 16 and head_dim <= 128). Rollbacks:
+`TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION[_Q16]=1`.
+Measured refutation: raising the tiled-kernel 2048 kv gate to 7936 (plan B1.d.1)
+was 2.5x SLOWER than the naive kernel at 2551 tokens (barrier-bound) — do not
+revisit without restructuring.
+
+All 78 qualification gates re-pass after each fix (reports in session scratch;
+regenerate via qualify_qwen3_embedding_metal.py). Remaining gap vs llama.cpp:
+~1.8x short / ~2.6x long. Next levers: GQA head-pair K/V sharing in the flash
+kernel, Q8_0 mm_sg linear throughput (~1.2 TFLOP/s observed), f16 activations
+(B1.e), batching hygiene (B1.c). Full protocol tables above still to be filled
+via bench-qwen3-embedding-e2e once the batch campaign runs.
+
+## Parity-plan results — 2026-09-02 (batch-1 endpoint, graph phase, interleaved with llama-bench)
+
+Same machine/model as above. All timings from a thermally-interleaved A/B run
+(fanless M4: only interleaved comparisons are valid).
+
+The llama.cpp values in this historical table have the same llama-bench protocol
+mismatch noted above and overstate the fair gap. They are not the final parity
+result.
+
+| Tokens | before plan | final (f16-KV flash + zero-bias elision) | llama.cpp pp (same window) | gap |
+|--------|-------------|------------------------------------------|----------------------------|-----|
+| 511    | 0.46 s (1107 tok/s) | **0.42 s (1217 tok/s)** | 2060 tok/s | 1.69x |
+| 2551   | 4.12 s (620 tok/s)  | **3.03 s (842 tok/s)**  | 1640 tok/s | 1.95x |
+
+Landed (all uncommitted, kill switches in parens):
+- f16 K/V flash attention: per-layer f32→f16 K/V convert into two persistent
+  private buffers + `termite_attention_f32_dense_causal_sg_q16_f16kv` with
+  direct device simdgroup loads, tail chunk staged
+  (`TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_F16KV`). 3.18 s @2551 alone.
+- Zero-bias elision default-on — qwen3 GGUF slots carry synthesized zero
+  biases; skipping the add is an identity
+  (`TERMITE_METAL_DISABLE_ZERO_BIAS_ELISION`).
+
+Measured refutations this round (do not revisit without new evidence):
+- Preferring the split mm_sg route over the fused scalar
+  `q8_0_pair_activation_multiply_mm` for gate+up at rows>=129: 33% SLOWER
+  end-to-end — the fused kernel's per-row-group weight re-reads are
+  cache-resident and the split pays extra dispatches + intermediate traffic.
+- GQA head-pair attention kernel (2 q-heads per 256-thread TG sharing K/V
+  reads, `..._sg_q16_f16kv_gqa2`): ~35% SLOWER — 23KB threadgroup footprint
+  halves occupancy. Kernel kept opt-in via
+  `TERMITE_METAL_ENABLE_DENSE_CAUSAL_SG_ATTENTION_GQA_PAIR`.
+
+Exit state per plan: remaining ~2x sits in the Q8_0 mm-class linears
+(~1.9 s of the 3.03 s @2551, ~1.2 TFLOP/s effective vs llama.cpp's ~2-3).
+Closing it needs either a counter-guided mm_sg schedule campaign or end-to-end
+f16 activations (new f16-input mm_sg + f16 norm/rope plumbing) — both out of
+scope for the parity plan. Deferred small item: per-layer Q/K retainedCopy
+removal (B1.f, ~10 ms). All 78 qualification gates pass on the final config.
+
+## Gap-closure results — 2026-09-02 (strict embedding endpoint)
+
+Machine: Apple M4 (fanless), 16 GB, Darwin 25.5.0. Antfly branch
+`qwenvl_metal`. The server was built from the Metal source patch identified in
+the raw reports as base `d90bd83a493ddca2f124621ed0648158633b1953` plus
+SHA-256 `3a0e8f0efaa8e4395017bf791f122e050a7928f5f812fe0273ba720bbdfac786`;
+those exact kernel sources are now captured by `d9753f524369509d9533a3f16e8436c01963e6cf`.
+The final Antfly executable SHA-256 is
+`06b0824cd0dfc10e3736d3f3f30af4df2c183728707b358e12a91efdd130afdb`;
+the live llama.cpp build is `b8990-660b1b4bd`, executable SHA-256
+`8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590`.
+Both endpoints opened the byte-identical Qwen3-Embedding-0.6B Q8_0 GGUF with SHA-256
+`06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
+
+Strict cache-neutral endpoint results (batch 1, 2 warmups, 20 measured,
+alternating AB/BA, distinct first token every timed request). The 2551-token
+result used eight unmeasured alternating thermal-preconditioning pairs over
+two additional reserved prompts:
+
+| Model tokens | Antfly mean | llama.cpp mean | Antfly/llama estimate | paired 95% CI | min cosine | gate |
+|--------------|--------------|----------------|------------------------|---------------|------------|------|
+| 511 | 310.82 ms, 1644.0 tok/s | 293.17 ms, 1743.0 tok/s | **94.32%** | 94.17%-94.48% | 0.99999896 | PASS (lower CI >= 90%) |
+| 2551 | 2303.85 ms, 1107.3 tok/s | 2120.87 ms, 1202.8 tok/s | **92.06%** | 90.20%-94.06% | 0.99996579 | PASS (lower CI >= 90%) |
+
+The first preconditioned long run still crossed a thermal transition late in
+the timed window and is retained as failed evidence: 90.72% estimate with an
+89.11%-92.16% CI. An immediate steady-state replicate with the same protocol
+passed. Report both when discussing fanless-host variance; use the passing
+steady-state run above for the thermally stable comparison, not the faster
+transition-state absolute tok/s.
+
+The checked-in raw reports for this final executable are:
+
+- `reports/qwen3_embedding_strict_511_pr.json`
+- `reports/qwen3_embedding_strict_2551_pr.json` (thermal-transition failure)
+- `reports/qwen3_embedding_strict_2551_pr_steady.json` (steady-state pass)
+- `reports/qwen3_embedding_qualification_pr.json` (78/78 gates)
+
+### Q8_0 matmul work that closed the gap
+
+All winning routes are default-on and have startup-time rollback switches:
+
+- Single-linear SG-v2: vectorized Q8_0 block dequantization, direct simdgroup
+  matrix loads, a barrier-free 32-row bulk store, and a separate ragged tail.
+  Roll back with `TERMITE_METAL_DISABLE_Q8_0_SG_V2=1`.
+- Fused gate+up SG-v2: one activation tile feeds both Q8_0 projections and the
+  SiLU/multiply epilogue, with f32 and f16-output variants. This removed the
+  dominant duplicate activation traffic. Roll back with
+  `TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_SG_V2=1`.
+- F32-input M64 single-linear schedule: 64 rows by 64 output columns, eight
+  simdgroups, K=32 panels, and separate bulk/tail stores. Roll back with
+  `TERMITE_METAL_DISABLE_Q8_0_SG_M64=1`.
+
+Optimization ladder from same-session cool focused runs:
+
+| Configuration | 511 tokens | 2551 tokens |
+|---------------|------------|-------------|
+| previous parity-plan final | 1217 tok/s | 842 tok/s |
+| + single-linear SG-v2 | 1218 tok/s | 854 tok/s |
+| + fused gate+up SG-v2 | 1779.6 tok/s | 1218.6 tok/s |
+| + f32 M64 schedule | 1882.8 tok/s | 1246.0 tok/s |
+
+The freshly rebuilt no-enable-flags focused binary reached 1119.2 tok/s at
+2551 tokens after the sustained endpoint run; disabling M64 produced the same
+`-0.378788` checksum, and disabling fused gate+up selected its fallback with
+checksum `-0.378625`. Treat those ordered rollback timings only as route proof,
+not an A/B speed comparison, because the device temperature was changing.
+
+Measured refutations retained opt-in for future hardware/schedule work:
+
+- F16-input M64 (`TERMITE_METAL_ENABLE_Q8_0_SG_M64_F16=1`) was slower:
+  1221.7 versus about 1246 tok/s at 2551 tokens. The f16-input SG-v2 M32 route
+  remains the default.
+- Sharing one activation tile across QKV's K/V projections
+  (`TERMITE_METAL_ENABLE_Q8_KV_PAIR_SG=1`) was neutral within noise: 1237.6
+  versus 1236.7 tok/s. It remains off.
+- The earlier 23 KB GQA head-pair attention and split gate/up experiments
+  remain refuted as documented above.
+
+The refuted opt-in pipeline states are now created only when their enable flag
+is present; promoted pipelines are not created when their rollback flag is
+present.
+
+### Correctness and build evidence
+
+- Fresh serial package production build from `zig/pkg/inference`:
+  `zig build -j1 -Doptimize=fast -Dmetal=true -Donnx=false -Dpjrt=false`.
+- Fresh server with no performance enable flags and
+  `TERMITE_EMBED_RESIDENT_FAIL_CLOSED=1`: all 78 q8_0 gates passed, including
+  oracle, MRL, batch equivalence, 8192-token truncation, retrieval, and role
+  distinction. Lowest oracle cosine: 0.998499.
+- Endpoint harness: 45 unit tests pass; scripts compile with `py_compile`; all
+  48 checked-in fixture cases round-trip exactly through llama.cpp tokenization
+  at their declared 511/2551 model-token lengths.
+- Focused Metal hardware tests cover both promoted high-row paths: single Q8_0
+  SG-v2/M64 linears match the host reference at 65, 96, and 128 rows, and the
+  65-row fused gated-FFN route matches both the decomposed implementation and
+  its rollback path.
+
+The full repository test suite was not rerun locally. The monorepo production
+build also stopped at its safety check before compiling: the storage-kernel
+step declares an 18 GiB RSS bound on this 16 GiB host. The scoped inference
+package production build and focused tests above pass; run the aggregate suite
+in CI or on a host with adequate RAM and cache space.

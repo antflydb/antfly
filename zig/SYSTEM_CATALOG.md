@@ -385,7 +385,7 @@ These contracts and optimizations do not depend on the optional M1–M3 refactor
 
 ## Benchmark workloads
 
-[System catalog benchmarks](zig/pkg/antfly/benchmarks/SYSTEM_CATALOG.md) document
+[System catalog benchmarks](pkg/antfly/benchmarks/SYSTEM_CATALOG.md) document
 the ReleaseFast catalog-scale target and disposable live-server workloads.
 They cover tenant provisioning, scoped reads and joins, NDJSON reuse, concurrent
 lookups, table listing and rename, tenant offboarding, and multi-node ingestion

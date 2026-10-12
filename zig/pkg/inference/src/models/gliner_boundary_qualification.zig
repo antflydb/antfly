@@ -231,7 +231,9 @@ pub const Entry = struct {
 //    qualification measures pinned base checkpoint production geometry").
 //    The bounds below are the exact observed range; widening them requires
 //    new measurement, not extrapolation.
-//  - Throughput: BENCHMARK.md's 2026-09-09 recorded CPU run for this exact
+//  - Throughput: the 2026-09-09 recorded CPU run (scripts/gliner25/BENCHMARK.md
+//    "Reference results"; full receipt in
+//    docs/design/inference/history/gliner2/gliner25-cpu-benchmark-runs.md) for this exact
 //    checkpoint (native/Python latency ratios 0.58-0.80 across the same ten
 //    tasks; mixed-task median 36.174 ms native versus 45.159 ms Python).
 //

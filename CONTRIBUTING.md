@@ -54,17 +54,17 @@ Run `make help` for the full list. Key targets:
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
-| `make generate` | Regenerate OpenAPI types, Go/TS/Python SDKs, and the embedded Antfarm dashboard |
+| `make build` | Build the `antfly` binary with the committed Antfarm assets |
+| `make generate` | Join the public `openapi.yaml` and regenerate OpenAPI types, Go/TS/Python/Rust SDKs, and the embedded Antfarm dashboard |
 | `make fmt` | Format Zig, Go, Python, TypeScript, and Rust sources |
 | `make fmt-check` | Verify repository formatting without changing files |
 | `make repository-check` | Run formatting, SDK, memoryaf, and release-tooling checks serially |
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
-| `make zig-test` | Run the Zig test aggregate |
-| `make build-antfarm` | Build the Antfarm dashboard |
-| `make build-docs` | Join and lint OpenAPI specs with Redocly |
+| `make zig-test` | Run the Zig test aggregate (`make zig-<target>` runs any `zig/Makefile` target) |
+| `make tla-check` | Model-check the TLA+ specs (`make tla-<target>` runs any TLA+ target) |
+| `make gc` | Garbage-collect build caches across all worktrees |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
 | `make license-check` | Verify first-party license headers are present |
@@ -82,10 +82,11 @@ Run `make help` for the full list. Key targets:
 
 | Target | Description |
 |--------|-------------|
-| `make minikube-start` | Start Minikube with ingress, metrics, and registry |
-| `make minikube-deploy` | Build and deploy to Minikube |
-| `make minikube-status` | Show pods, services, and deployments |
+| `make minikube-start` | Start Minikube and deploy `devops/minikube` |
+| `make minikube-deploy` | Load the published `antfly` image and apply `devops/minikube` |
+| `make minikube-status` | Show Antfly pods, services, and StatefulSets |
 | `make minikube-restart` | Delete and recreate Minikube |
+| `make minikube-delete` | Delete the Minikube cluster |
 
 ## Running Locally
 
@@ -122,7 +123,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 ## Dependency Hygiene
 
-`make build` and `make generate` may auto-run `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
+`make generate` auto-runs `make tidy` as part of keeping the multi-module workspace buildable. CI separately runs `make tidy-check` so dependency drift is still surfaced explicitly.
 
 If you want the same check locally before pushing, install the repository hooks once:
 

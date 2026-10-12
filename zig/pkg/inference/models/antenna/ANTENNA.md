@@ -8,8 +8,9 @@ decisions, embeddings, and chunk boundaries. Its backbone is ModernBERT
 from open Apache-2.0 teachers rather than trained from scratch.
 
 This document records why we want it, the design, the decisions already
-taken, the evidence behind them, and a gated plan. **Nothing here is
-implemented yet.** Statements about third-party models are sourced; our own
+taken, the evidence behind them, and a gated plan. Antenna is **not served**;
+its training pipeline and fused training attention exist (see
+[Status](#status)). Statements about third-party models are sourced; our own
 inferences are labelled.
 
 The name follows the ant theme of the project: an ant's antennae are one
@@ -40,9 +41,9 @@ trail following), as this model is one encoder with many heads.
   with the GLiNER2.5 heads on it, then Laya's decision head, then embedding
   and chunking heads modelled on the fused chunker's.
 - Training is **Zig-first**. PyTorch serves only as the parity oracle and to
-  run the two span teachers we do not serve natively. The main missing piece
-  is a fused ModernBERT training attention (forward and backward), which
-  also removes Laya's ~2k-token training cap.
+  run the two span teachers we do not serve natively. A fused ModernBERT
+  training attention (forward and backward) removes Laya's ~2k-token
+  training cap.
 - The plan starts with a small native distillation: GLiNER2.5 boundary heads
   on the extracted ModernBERT trunk at 512 tokens on Metal. That needs no new
   kernels, so the quality question is answered before the kernel work.
@@ -317,9 +318,9 @@ options:
    compute.
 
 The plan starts with the GLiNER2 layout (the exact distillation target) and
-decides between these options at step 7, with measurements. Measured
-2026-10-03: the shared trunk trades extraction for retrieval and stays far
-below a dedicated embedder, so option 3 is proposed (see Status).
+decides between these options at step 7, with measurements. Measured: the
+shared trunk trades extraction for retrieval and stays far below a dedicated
+embedder, so option 3 is proposed (see [Status](#status)).
 
 ### Expected cost
 
@@ -406,8 +407,8 @@ The teachers are zero-shot, so both texts and schemas can be generated:
 
 ## Training infrastructure
 
-Antenna trains natively. This inventory was taken from the tree on
-2026-09-25 (`src/finetune/`, `src/graph/`, `lib/ml/src/graph/`,
+Antenna trains natively. This inventory was taken from the tree before
+step 1 (`src/finetune/`, `src/graph/`, `lib/ml/src/graph/`,
 [finetuning/FINETUNING.md](../../finetuning/FINETUNING.md)).
 
 ### Already in Zig
@@ -418,7 +419,7 @@ Antenna trains natively. This inventory was taken from the tree on
 | LoRA, LoRA+, QLoRA (NF4), recursive LoRA | `src/finetune/lora*.zig`, `qlora_nf4.zig`, `recursive_lora.zig` | |
 | Activation checkpointing and bounded recomputation | `lib/ml/src/graph/checkpoint.zig`, `src/graph/recomputed_training.zig` | |
 | Device-resident training on Metal and CUDA | `src/graph/resident_training_*.zig` | GLiNER2.5 and Laya |
-| Fused training attention with backward | `src/ops/cuda/gliner25.zig` (`debertaTrainingAttentionBackwardV1`) | **DeBERTa only**, CUDA |
+| Fused training attention with backward | `src/ops/cuda/gliner25.zig` (`debertaTrainingAttentionBackwardV1`) | DeBERTa, CUDA; the ModernBERT op (CPU, Metal) is gap 1 |
 | Host contrastive and embedding losses: InfoNCE, Matryoshka, cross-batch memory, SPLADE with FLOPS regularization, NEFTune | `src/finetune/fused_chunker_train.zig`, `infonce_cpu.zig` | loss code only; not yet connected to a trained encoder (see Background) |
 | ModernBERT training graph on resident Metal | `src/finetune/laya/graph.zig`, `training.zig`, `job.zig` | Hugging Face layout, global and local layers, runtime RoPE tables and masks; attention materialized, capped at `batch·S²·heads ≤ 64Mi` |
 | Encoder-independent boundary heads and losses | `src/finetune/gliner/boundary_encoder_graph.zig` (`RoutedNodes`), `boundary_train_step.zig` | encoder is one builder call; DeBERTa-specific today |
@@ -462,7 +463,7 @@ unless the Metal trainer, measured after gaps 1–2, turns out fast enough.
 ### Gaps, in priority order
 
 1. **Fused ModernBERT training attention, forward and backward: Metal and a
-   CPU reference first, then CUDA before step 4.** Plain attention in
+   CPU reference first (done, step 2), then CUDA before step 4.** Plain attention in
    `lib/ml` (`Builder.sdpa`) is decomposed for backward, so scores are fully
    materialized; that is why the Laya trainer admits about 2k tokens at
    batch 1. The kernel needs RoPE at explicit logical positions, the
@@ -473,7 +474,7 @@ unless the Metal trainer, measured after gaps 1–2, turns out fast enough.
    `debertaTrainingAttentionBackwardV1`. It also unblocks Laya's
    long-context step (LAYA.md step 2c) and packed training.
 2. **A shared ModernBERT training trunk, and the GLiNER2.5 boundary trainer
-   on it.** Extract the trunk from `laya/graph.zig`. Then make the boundary
+   on it (done, step 1).** Extract the trunk from `laya/graph.zig`. Then make the boundary
    trainer's encoder config a choice of DeBERTa or ModernBERT, switch the
    encoder in `boundary_encoder_graph`, add a byte-level BPE tokenizer
    profile, and let PEFT handle bias-free linears. Start with the
@@ -539,17 +540,22 @@ Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
 the critical path because step 0 can score Decide in PyTorch.
 
-## Status (2026-10-03)
+## Status
 
-### Step 0: baselines (done)
+Steps 0, 1 (pipeline), and 2 are done; the step 1 pilot gate is not met on
+classification. Per-run evidence is indexed in the
+[Antenna history](../../../../../docs/design/inference/history/antenna/README.md).
 
-Full tables, commands and pins:
-[docs/design/inference/history/antenna/2026-09-25-baselines.md](../../../../../docs/design/inference/history/antenna/2026-09-25-baselines.md).
+> **Relocated:** the dated step 0–2 status narrative → [history/antenna/2026-10-03-status.md](../../../../../docs/design/inference/history/antenna/2026-10-03-status.md).
+
+### Step 0 baselines
+
 Seeded subsamples (500 classification records, 300 NER sentences per
 dataset) carry roughly ±2–4 points of noise. "In-domain" means the pilot's
 training datasets (Banking77, AG News, CrossNER AI/literature/music, MIT
 Restaurant); "held-out" is CLINC150, SST-5, typed-decisions, CrossNER
-politics/science, MIT Movie.
+politics/science, MIT Movie. Full tables, commands, and pins:
+[2026-09-25-baselines.md](../../../../../docs/design/inference/history/antenna/2026-09-25-baselines.md).
 
 | Mean | Decide | gliner2.5-base | gliner2-large |
 | --- | ---: | ---: | ---: |
@@ -562,100 +568,80 @@ Decide is the best calibrated (typed-decisions ECE 0.106 against 0.30–0.36
 for the other GLiNER models). Encoder latency at 64/512/2,048 tokens:
 gliner2.5-base 29/292/3,534 ms on CPU and 224/324/873 ms on Metal; Laya's
 ModernBERT-large 311/1,473/12,720 ms and 209/781/4,903 ms (encoders of
-different sizes; see the report for caveats).
+different sizes).
 
-### Step 1: pipeline (done) and pilot (gate not met)
+### Training pipeline
 
 - `scripts/antenna/init_student.py` builds the student: pretrained
   `answerdotai/ModernBERT-base` (pinned) with fresh published heads, 158.8M
-  parameters. The native training source loads it, and the processor
-  matches upstream's token ids with its tokenizer.
-- `scripts/antenna/teacher_targets.py` writes training rows from the
-  in-domain train splits: classification rows with soft per-label targets
-  `0.5 * gold + 0.5 * sigmoid(Decide logit)` over sampled label subsets,
-  entity rows with gold spans. Training rows accept `probabilities`, which
-  replace the 0/1 classification targets.
+  parameters. The processor matches upstream's token ids.
+- `scripts/antenna/teacher_targets.py` writes classification rows with soft
+  per-label targets `0.5 * gold + 0.5 * sigmoid(Decide logit)` over sampled
+  label subsets, and entity rows with gold spans. Training rows accept
+  `probabilities`, which replace the 0/1 classification targets.
 - `antfly-inference finetune train gliner25` trains a ModernBERT source on
-  resident Metal and exports a portable model that upstream
-  `AutoExtractor` loads, so `scripts/antenna/baselines.py` evaluates it.
+  resident Metal and exports a portable model that upstream `AutoExtractor`
+  loads, so `scripts/antenna/baselines.py` evaluates it.
 - ModernBERT-base needs job budgets above the small-DeBERTa defaults (see
   `scripts/antenna/README.md`). On a shared machine the job's live-memory
-  admission can refuse it; the admission's dynamic reserve is 9.66 GB on a
-  36 GB Mac.
-- The span-versus-boundary head ablation (Decision 4) is not run: span heads
+  admission can refuse it; its dynamic reserve is 9.66 GB on a 36 GB Mac.
+- The trunk is bootstrapped by feature distillation (decision 9): a trunk
+  trained directly on task labels collapses to constant outputs, in the
+  native trainer and upstream's alike, and so does raw DeBERTa-v3-base.
+  Feature distillation from gliner2.5-base's encoder over unlabeled text under
+  random schemas (z-space MSE on aligned words and schema markers, through
+  the closed-form neck) does not. The neck, feature-distillation jobs with a
+  frozen DeBERTa teacher on the CPU, and the closed-form neck fit on the
+  job's backend are native. `scripts/antenna/distill_pool.py` builds the text
+  pool (`--source` for the mixed web/news/Wikipedia pool, `--wikipedia` for
+  encyclopedic breadth).
+- Native task fine-tuning matches upstream's trainer from the same
+  checkpoint. Native ModernBERT Metal results from before the resident
+  `dot_general` transposed-operand fix are invalid.
+- The span-versus-boundary head ablation (decision 4) is not run: span heads
   exist natively only on DeBERTa.
-- **Pilot result:** the ModernBERT-base student trained directly on task
-  labels collapses to constant outputs (classification 0.13, NER F1 0.0), in
-  the native trainer and upstream's alike. Raw DeBERTa-v3-base collapses the
-  same way: any freshly initialized component on top of an encoder that is not
-  GLiNER-trained makes a constant output the fastest early descent.
-- **What works:** feature distillation from gliner2.5-base's encoder over
-  unlabeled text under random schemas, through a projection fitted in closed
-  form before training (z-space MSE on aligned words and schema markers).
-  After 14,000 steps (two hours on the Studio) the student, read through
-  gliner2.5-base's own heads, scores 0.662 / 0.378 classification and
-  0.449 / 0.364 NER F1 (in-domain / held-out; gliner2.5-base 0.728 / 0.483
-  and 0.543 / 0.515). Task fine-tuning on the pilot rows then lifts it to
-  0.742 / 0.345 and 0.675 / 0.477, past released gliner2.5-base in-domain.
-  Details:
-  [docs/design/inference/history/antenna/2026-09-25-pilot.md](../../../../../docs/design/inference/history/antenna/2026-09-25-pilot.md).
-- **Native (Zig):** the GLiNER neck (decision 9), feature-distillation jobs
-  with a frozen DeBERTa teacher on the CPU, and a closed-form neck fit on the
-  job's backend are implemented and tested. A resident Metal bug (transposed
-  right operands of `dot_general` ran untransposed, corrupting ModernBERT
-  attention scores) invalidated every earlier native ModernBERT Metal result;
-  after the fix, native task fine-tuning matches upstream's trainer from the
-  same checkpoint (0.743 / 0.345 and 0.684 / 0.511 against 0.741 / 0.353 and
-  0.673 / 0.482). Details:
-  [docs/design/inference/history/antenna/2026-09-26-native-distillation.md](../../../../../docs/design/inference/history/antenna/2026-09-26-native-distillation.md).
-  `scripts/antenna/distill_pool.py --wikipedia` adds encyclopedic passages to
-  the text pool for held-out breadth.
-- **Native end to end:** distilling on a mixed pool (`distill_pool.py
-  --source`: web sentences with free-form types, commands, comments,
-  questions and abstracts next to news and Wikipedia; one epoch, 34,264
-  steps) and then fine-tuning on the pilot rows, all in Zig on resident
-  Metal, gives 0.734 / 0.368 classification and 0.719 / 0.629 NER F1.
-  gliner2.5-base fine-tuned the same way reaches 0.808 / 0.467 and
-  0.723 / 0.624: NER matches, and classification trails by 0.07-0.10. The
-  probe `scripts/antenna/gap_probe.py` places the remaining gap in the
-  classification label markers; the next pool adds real label sets.
-- **Clean recipe:** with permissively licensed data only, two distillation
-  epochs and stage 3 give 0.663 / 0.415 classification and 0.645 / 0.626 NER
-  F1 (run26). The second epoch adds 0.03 held-out classification and leaves
-  NER unchanged. Details:
-  [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
-- **Decision head:** a Laya decision head trained on the frozen Antenna trunk
-  (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
-  count plus one; Open-Jev, then Laya's step-0 split) scores 0.511 on Laya's
-  step-0 typed-decision eval on the clean trunk, against
-  0.387 for released Laya-large and about 0.62 for Laya's full step-0
-  fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
-  heads. Fine-tuning the whole trunk does not beat it on average: 0.505
-  over three seeds on Laya's step-0 recipe, against 0.439 for plain
-  ModernBERT-base and 0.621 for Laya-large. Details: LAYA.md, "Base-size
-  encoder (step 2d)".
-- **Embeddings (step 7):** the shared trunk does not embed well.
-  - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's
-    SQuAD retrieval NDCG@10 (0.454 against 0.823).
-  - Training the top eight layers reaches 69% and costs about 0.05 NER F1.
-  - Proposed: option 3, a separate pass with the embedder Antfly already ships
-    (Qwen3-Embedding-0.6B).
-  - Details:
-    [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
 
-### Step 2: fused ModernBERT training attention (done)
+### Current results
 
-A fused op computes global and sliding-window attention with linear storage
-(per-row logsumexp, backward replay), CPU reference and Metal kernels.
-Laya's gradient parity against PyTorch holds with it (2.1e-6 CPU and Metal),
-as does the ModernBERT boundary encoder's (1.3e-5 CPU, 1.4e-5 Metal). A
-4,096-token step runs on Metal past the old 64Mi score cap. On the released
-Laya checkpoint, a resident Metal step at 2,048 tokens takes 25 s fused
-against 65 s materialized. The materialized profile stays the default; the
-ModernBERT boundary encoder uses it under `replay_tiled_v1`. Laya now trains
-with the tree-packing branch's segment attention op, whose dropout-free calls
-run on these Metal kernels (7.2x the host bridge at 2,048 tokens; see
-`models/laya/LAYA.md`).
+Classification accuracy and NER F1, as in-domain / held-out:
+
+| Model | Classification | NER F1 |
+| --- | --- | --- |
+| Antenna, native end to end (mixed pool, one epoch, then pilot fine-tune) | 0.734 / 0.368 | 0.719 / 0.629 |
+| Antenna, clean recipe (permissive data only, two epochs, run26) | 0.663 / 0.415 | 0.645 / 0.626 |
+| gliner2.5-base, fine-tuned the same way | 0.808 / 0.467 | 0.723 / 0.624 |
+
+NER matches; classification trails by 0.07–0.10. `scripts/antenna/gap_probe.py`
+places the gap in the classification label markers.
+
+- **Decision head:** a Laya decision head on the frozen trunk
+  (`scripts/antenna/init_decision_head.py`, `freeze_layers` = layer count + 1)
+  scores 0.511 on Laya's step-0 typed-decision eval, against 0.387 for
+  released Laya-large and about 0.62 for Laya's full step-0 fine-tune. The
+  trunk stays bit-identical, so it keeps serving the GLiNER heads. Fine-tuning
+  the whole trunk does not beat it (0.505 over three seeds).
+- **Embeddings (step 7):** the shared trunk does not embed well. A head on the
+  frozen trunk reaches 55% of granite-embedding-english-r2's SQuAD
+  NDCG@10 (0.454 against 0.823); training the top eight layers reaches 69%
+  and costs about 0.05 NER F1. Proposed: layout option 3, a separate pass
+  with the embedder Antfly already ships (Qwen3-Embedding-0.6B). Evidence:
+  [2026-10-03-embedding-layout.md](../../../../../docs/design/inference/history/antenna/2026-10-03-embedding-layout.md).
+- **Fused ModernBERT training attention (step 2):** one op computes global and
+  sliding-window attention with linear storage (per-row logsumexp, backward
+  replay), with a CPU reference and Metal kernels. Gradient parity against
+  PyTorch holds for Laya (2.1e-6 CPU and Metal) and the ModernBERT boundary
+  encoder (1.3e-5 CPU, 1.4e-5 Metal), and a 4,096-token step runs on Metal
+  past the old 64Mi score cap. At 2,048 tokens on released Laya, a resident
+  Metal step takes 25 s fused against 65 s materialized. The materialized
+  profile stays the default; the ModernBERT boundary encoder uses the fused op
+  under `replay_tiled_v1`. Laya's segment attention op runs its dropout-free
+  calls on these kernels ([LAYA.md](../laya/LAYA.md)).
+
+### Open work
+
+- Close the classification gap (label-marker targets, real label sets).
+- Steps 0b and 3–8 of the [Plan](#plan); step 7's layout decision is
+  proposed as option 3 and awaits sign-off.
 
 ## Risks and open questions
 
@@ -667,9 +653,9 @@ run on these Metal kernels (7.2x the host bridge at 2,048 tokens; see
   risks the extraction heads. Multi-task batches and the distillation anchor
   are the mitigation; step 7 measures it.
 - **Training kernels:** long-context training depends on the fused ModernBERT
-  training attention (step 2). Until it lands, native training is limited to
-  about 2k tokens at batch 1, which is enough for step 1 and the 512-token
-  stage of step 4.
+  training attention (step 2). It exists on CPU and Metal, but the
+  materialized profile, limited to about 2k tokens at batch 1, is still the
+  default, and there is no CUDA port yet (step 3).
 - **Per-word tokenization:** the GLiNER2.5 processor encodes each word on
   its own. SentencePiece adds its word marker to every word, but
   ModernBERT's byte-level BPE (`add_prefix_space=false`) produces the
