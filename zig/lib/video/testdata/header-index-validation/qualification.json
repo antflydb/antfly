@@ -42,11 +42,18 @@
       "successful_requests": 1,
       "retryable_admission_denials": 4,
       "note": "shared-host load; not a successful sustained-capacity qualification"
-    }
+    },
+    "cpu_pretrained": "8 vectors, 3 exact query rankings/top-k sets, disconnect retry and all 5 concurrent load requests pass",
+    "corruption_retry": {
+      "backend": "metal",
+      "first_packet_mutations": 3,
+      "clean_retries": "reference agreement",
+      "scope": "zeroed first coded packet; broader corruption recovery remains active"
+    },
+    "vp9_fuzz_followup": "100K campaign with verified Smith-serialized seeds; exact counters in vp9-fuzz.log"
   },
   "pending": [
-    "pretrained CPU and current Linux model qualification",
-    "corrupted-input clean retry under available process capacity"
+    "current Linux pretrained model qualification"
   ],
   "measurement_limits": [
     "Index timings are completed logical indexing only; sampling and comparison excluded.",
@@ -67,7 +74,7 @@
     "zig/lib/video/src/webm_benchmark.zig": "29e2a574517d2d3c9ef18194dfd4809015003ecee3db77216d5c3f93aaa395c6"
   },
   "artifacts_sha256": {
-    "README.md": "2bdb9d31a2331703c52dab71e274c127fe79873d49079e625f95fd527e9f0c04",
+    "README.md": "578720c6e784c201e1d40e5438bf57ed5db3fe25e68a03c73b2d8c6e6dc82b1c",
     "fuzz-seed-tests.log": "6f9f10b14bfe7312b4ba51aa6d720e778ffeca6248f9a6c38ed38d1cd81b8c62",
     "linux-arm64/sintel-av1-1080p.jsonl": "a83d3435ec3230690df1e0bfdfc52fdd781e3f619d36f07f989f7a145d09eba2",
     "linux-arm64/sintel-av1-480p.jsonl": "6db7a578f2e149630fcff753736e483d70e0639a56254cd0dcca4c762c5388d2",
@@ -85,7 +92,25 @@
     "macos/sintel-vp9-480p.jsonl": "b3a362fc21beae92852e7e294d9e5c1ed89087dfaea710b26cd137624405d095",
     "macos-video-tests.log": "449286cbbcbc69d4d1a46bb502a305741c6bf4d1811f8b0b609e3d654abac466",
     "metadata-fuzz.log": "c9e048cf175deea2b29e74abc2f4675f34a695cef48136c4e18bdf671fad530f",
+    "metal-corruption-retry.json": "3d37fa50c5e1f1d3ef5642b062569440c360bc2e3435a7da4271cb6da94bd694",
     "metal-webm.json": "9a14b43af6cda4a75661ece16273264337dc3d79d03ed9acf081aa68a03e5856",
-    "model-tests.log": "9ba5f99c2741b65946645e1d9e70b9375ab70f5ddce2fa18dc1ee12237e4647d"
-  }
+    "model-tests.log": "9ba5f99c2741b65946645e1d9e70b9375ab70f5ddce2fa18dc1ee12237e4647d",
+    "native-webm.json": "212f9e28fb4f76a8aaf52fbed1fd51e3d9fbdb68bb931d7ed513ca86a21455a8",
+    "vp9-fuzz.log": "63319ce09789fc4847699f195599e7237250f03b20535902c1e5541a8cb2ddba"
+  },
+  "toolchain": {
+    "zig": "0.17.0",
+    "model_binary_optimize": "Debug",
+    "index_benchmark_optimize": "ReleaseSafe",
+    "linux_target": "aarch64-linux-musl"
+  },
+  "commands": [
+    "zig build test-video --summary all",
+    "zig build test-video-model --summary all (zig/pkg/inference)",
+    "zig build install-webm-benchmark -Doptimize=ReleaseSafe -Dvideo-use-llvm=true",
+    "webm-benchmark CLIP index_compare 2",
+    "zig build install-video-tests install-webm-benchmark -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -Dvideo-use-llvm=true",
+    "zig build fuzz-video -Dvideo-fuzz-filter=\"fuzz seed\"",
+    "zig build fuzz-video -Dvideo-fuzz-filter=\"video fuzz AV1 metadata\" -Doptimize=ReleaseSafe --fuzz=100K"
+  ]
 }

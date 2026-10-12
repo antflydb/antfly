@@ -18,8 +18,12 @@ clip in `../benchmarks/webm/corpus`. Cross-compile with
 
 The correctly Smith-serialized metadata campaign passes 101,937 runs. Separate
 seed gates require all 13 decoder and five metadata seeds to reach valid output.
-Current pretrained CPU/Linux and HTTP corruption/retry follow-ups remain in
-progress. The receipt explicitly records
+Current macOS CPU and Metal preserve eight pretrained vectors and three exact
+query rankings/top-k sets. CPU completes all five concurrent load requests;
+Metal records one completion and four retryable admission denials under host
+pressure. Metal rejects three zeroed-first-packet cases and preserves clean-retry
+vectors. Broader corruption recovery remains active. Current Linux pretrained
+qualification remains in progress. The receipt explicitly records
 which gates pass and which are pending. This does not close broader codec,
 SIMD/scheduling, display or streaming requirements.
 
