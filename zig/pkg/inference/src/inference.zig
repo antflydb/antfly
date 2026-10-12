@@ -258,6 +258,7 @@ test {
     _ = run_options;
     _ = native_smoke;
     _ = native_compute.native;
+    _ = @import("backends/decoder_gated_runtime.zig");
     if (build_options.enable_metal) {
         _ = backends.metal_kv_storage;
         _ = metal_runtime;

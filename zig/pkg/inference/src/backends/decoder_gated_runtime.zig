@@ -299,6 +299,37 @@ fn gemma4MtpVerifyTailFrameEnabled() bool {
         !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME");
 }
 
+fn gemma4MtpVerifyInputFrameEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME");
+}
+
+fn supportsMtpVerifyInputFrame(config: gpt_mod.Config, rows: usize, seq_len: usize) bool {
+    return config.family == .gemma and config.global_head_dim != 0 and
+        config.hasPle() and !config.usesMoe() and rows >= 2 and rows <= 4 and seq_len > rows;
+}
+
+// The direct Gemma decoder adopts an already-active frame. Only cancel an
+// input frame we opened if preparation fails or the direct path declines;
+// successful decoding/tail readout has already submitted and consumed it.
+const MtpVerifyInputFrame = struct {
+    cb: *const ops.ComputeBackend,
+    owned: bool,
+
+    fn begin(cb: *const ops.ComputeBackend) !MtpVerifyInputFrame {
+        if (cb.decoderRuntimeHasActiveFrame()) return .{ .cb = cb, .owned = false };
+        var result: MtpVerifyInputFrame = .{ .cb = cb, .owned = try cb.decoderRuntimeBeginFrame() };
+        errdefer result.deinit();
+        if (result.owned) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+        return result;
+    }
+
+    fn deinit(self: *MtpVerifyInputFrame) void {
+        if (self.owned and self.cb.decoderRuntimeHasActiveFrame()) cancelDecoderRuntimeFrame(self.cb, &self.owned);
+        self.owned = false;
+    }
+};
+
 fn gatedFamilyCompareRequested() bool {
     return getenvBool("TERMITE_METAL_COMPARE_GATED_FAMILY") or gemmaPrefillCompareRequested();
 }
@@ -6664,6 +6695,14 @@ fn forwardFinalHiddenRowsInternal(
     if (decode_context.attention_mode != .paged_prefill and decode_context.attention_mode != .paged_decode) return null;
 
     const phase: BlockTimingPhase = if (decode_context.attention_mode == .paged_decode) .greedy else .prefill;
+    var input_frame: ?MtpVerifyInputFrame = if (cb.kind() == .metal and
+        gemma4MtpVerifyInputFrameEnabled() and supportsMtpVerifyInputFrame(gpt_config, input_ids.len, seq_len) and
+        !disableDirectGatedFamilyRequested() and shouldUseDecoderRuntimeFrame(phase, gpt_config, configured_layer_count, decode_context))
+        try MtpVerifyInputFrame.begin(cb)
+    else
+        null;
+    defer if (input_frame) |*frame| frame.deinit();
+
     const started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
     const finished_at = monotonicNowNs();
@@ -7298,6 +7337,87 @@ test "resident sampled decode rejects sampling outside exact nucleus contract be
 
 test "Gemma4 MTP verify-tail frame defaults off" {
     try std.testing.expect(!gemma4MtpVerifyTailFrameEnabled());
+}
+
+test "Gemma4 MTP input frame excludes full prompts and unsupported models" {
+    const base: gpt_mod.Config = .{ .family = .gemma, .global_head_dim = 512, .ple_hidden_size = 256 };
+    for (2..5) |rows| try std.testing.expect(supportsMtpVerifyInputFrame(base, rows, 1024));
+    for ([_]usize{ 0, 1, 5, 16 }) |rows| try std.testing.expect(!supportsMtpVerifyInputFrame(base, rows, 1024));
+    try std.testing.expect(!supportsMtpVerifyInputFrame(base, 3, 3));
+    var other = base;
+    other.family = .qwen3;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.global_head_dim = 0;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.ple_hidden_size = 0;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.num_local_experts = 8;
+    other.num_experts_per_tok = 2;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+}
+
+test "Gemma4 MTP input frame transfers and cancels only owned frames" {
+    const Probe = struct {
+        active: bool = false,
+        fail_regime: bool = false,
+        begins: usize = 0,
+        cancels: usize = 0,
+
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn begin(raw: *anyopaque) !bool {
+            const self = from(raw);
+            try std.testing.expect(!self.active);
+            self.active = true;
+            self.begins += 1;
+            return true;
+        }
+        fn hasActive(raw: *anyopaque) bool {
+            return from(raw).active;
+        }
+        fn regime(raw: *anyopaque, value: ops.DecoderRuntimeFrameRegime) !void {
+            try std.testing.expectEqual(ops.DecoderRuntimeFrameRegime.prefill, value);
+            if (from(raw).fail_regime) return error.DeviceLost;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self = from(raw);
+            try std.testing.expect(self.active);
+            self.active = false;
+            self.cancels += 1;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.decoderRuntimeBeginFrame = Probe.begin;
+    table.decoderRuntimeHasActiveFrame = Probe.hasActive;
+    table.decoderRuntimeSetActiveFrameRegime = Probe.regime;
+    table.decoderRuntimeCancelFrame = Probe.cancel;
+    var probe = Probe{};
+    const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    var frame = try MtpVerifyInputFrame.begin(&cb);
+    frame.deinit(); // Preparation error/decline leaves an owned frame to cancel.
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.active = true;
+    frame = try MtpVerifyInputFrame.begin(&cb);
+    frame.deinit(); // A borrowed caller frame must survive our cleanup.
+    try std.testing.expect(probe.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.begins);
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.active = false;
+    frame = try MtpVerifyInputFrame.begin(&cb);
+    probe.active = false; // Direct decoder/tail consumed the transferred frame.
+    frame.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.fail_regime = true;
+    try std.testing.expectError(error.DeviceLost, MtpVerifyInputFrame.begin(&cb));
+    try std.testing.expect(!probe.active);
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
 }
 
 test "raw whole-token gated supports multimodal decode-only gemma config" {
