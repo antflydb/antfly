@@ -4246,8 +4246,7 @@ fn scoreLeafMemberIds(
         try drainGlobalSubgroups(self, txn, scratch, req, approx_query, results, profile, false, now_fn_u64, elapsed_fn_u64);
         start = now_fn_u64();
     }
-    var subgroup_routing_ns: u64 = 0;
-    defer profile.leaf_score_ns += elapsed_fn_u64(start) -| subgroup_routing_ns;
+    defer profile.leaf_score_ns += elapsed_fn_u64(start);
     profile.max_leaf_vectors_considered = @max(
         profile.max_leaf_vectors_considered,
         @as(u64, @intCast(member_ids.len)),
@@ -4259,51 +4258,6 @@ fn scoreLeafMemberIds(
     // point lookup (plus cache lock) for every quantized candidate.
     const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0 or req.key_predicate != null;
     const NativeIndex = childType(@TypeOf(self));
-    const subgroup_enabled = if (comptime @hasDecl(NativeIndex, "nativeSubgroupRoutingEnabled")) self.nativeSubgroupRoutingEnabled() else false;
-    if (subgroup_enabled and coverage_policy != .complete_snapshot and self.config.metric == .cosine and
-        !filters_active and req.distance_over == null and req.distance_under == null and
-        self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
-        native_projections == null and native_subgroups != null and std.meta.activeTag(native_quantized.?.*) == .rabit)
-    {
-        try validateQuantizedSet(self, native_quantized.?, member_ids.len);
-        const grouping = @import("posting_subgroups.zig");
-        const plan = native_subgroups.?;
-        const route_start = now_fn_u64();
-        var order: [grouping.max_groups]u8 = undefined;
-        var scores: [grouping.max_groups]f64 = undefined;
-        try plan.rank(exact_query, &order, &scores);
-        var sink: RangeCandidateScoreSink = .{ .base = .{ .results = results, .ids = member_ids } };
-        var selected = @as([grouping.max_groups]bool, @splat(false));
-        const keep = @max(@as(usize, 1), plan.ends.len * 3 / 4);
-        var selected_rows: usize = 0;
-        for (order[0..keep]) |group| {
-            selected[group] = true;
-            const range = plan.range(group);
-            selected_rows += range.end - range.start;
-        }
-        var ranges: [grouping.max_groups]quantizer_mod.ScoreRange = undefined;
-        var range_count: usize = 0;
-        for (selected[0..plan.ends.len], 0..) |keep_group, group| if (keep_group) {
-            const range = plan.range(group);
-            if (range_count != 0 and ranges[range_count - 1].end == range.start) {
-                ranges[range_count - 1].end = range.end;
-            } else {
-                ranges[range_count] = .{ .start = range.start, .end = range.end };
-                range_count += 1;
-            }
-        };
-        subgroup_routing_ns = elapsed_fn_u64(route_start);
-        profile.subgroup_routing_ns += subgroup_routing_ns;
-        try self.quantizer.estimateDistancesInRangesTo(&native_quantized.?.rabit, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, ranges[0..range_count], &sink);
-        sink.base.flush();
-        profile.subgroup_leaves_scored += 1;
-        profile.subgroup_vectors_skipped += member_ids.len - selected_rows;
-        profile.approx_leaves_scored += 1;
-        profile.approx_vectors_scored += selected_rows;
-        profile.traversal_eligible_vectors += selected_rows;
-        noteLeafScanBytes(profile, selected_rows, @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) * @sizeOf(u64));
-        return;
-    }
     const fuse_no_copy = if (comptime @hasDecl(NativeIndex, "nativeFusedNoCopyEnabled")) self.nativeFusedNoCopyEnabled() else false;
     const direct_no_copy = fuse_no_copy and native_projections == null and
         !filters_active and req.distance_over == null and req.distance_under == null and

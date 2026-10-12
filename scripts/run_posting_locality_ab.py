@@ -71,7 +71,6 @@ REFINEMENTS.update(
         "subgroups_4": ["ANTFLY_EXPERIMENT_SUBGROUPS_4"],
         "subgroups_8": ["ANTFLY_EXPERIMENT_SUBGROUPS_8"],
         "subgroups_16": ["ANTFLY_EXPERIMENT_SUBGROUPS_16"],
-        "subgroup_routing": ["ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"],
         "global_subgroup_routing": ["ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"],
         "compact_subgroup_routing": [
             "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING",
@@ -122,13 +121,8 @@ def digest(path):
 
 
 def validate_subgroup_treatment(arm, environment, filename="public-query-profile.json"):
-    enabled = any(
-        environment.get(flag) == "1"
-        for flag in (
-            "ANTFLY_EXPERIMENT_SUBGROUP_ROUTING",
-            "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING",
-        )
-    ) and any(
+    routing = environment.get("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING") == "1"
+    enabled = routing and any(
         environment.get(f"ANTFLY_EXPERIMENT_SUBGROUPS_{count}") == "1"
         for count in (4, 8, 16)
     )
@@ -260,12 +254,7 @@ def main():
         )
     if (
         candidate_flags.intersection(layout_flags)
-        and candidate_flags.intersection(
-            {
-                "ANTFLY_EXPERIMENT_SUBGROUP_ROUTING",
-                "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING",
-            }
-        )
+        and "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING" in candidate_flags
         and args.profile_count <= 0
     ):
         parser.error(
