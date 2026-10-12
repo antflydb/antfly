@@ -615,6 +615,8 @@ def native(args, data, result):
                                     if row["path"].endswith(".mov")
                                     else "video/webm"
                                     if row["path"].endswith(".webm")
+                                    else "video/mp2t"
+                                    if row["path"].endswith(".ts")
                                     else "video/mp4",
                                     "data": base64.b64encode(
                                         Path(row["path"]).read_bytes()
@@ -646,6 +648,7 @@ def native(args, data, result):
                     samples.append(elapsed)
             result["cases"][row["id"]] = {
                 "vector": vector,
+                "prompt_tokens": response["usage"]["prompt_tokens"],
                 "cold_seconds": cold,
                 "completed_timing": compare.timing(samples),
             }
@@ -768,6 +771,17 @@ def pytorch(args, data, result):
                     encoder_samples.append(encoder_elapsed)
             result["cases"][row["id"]] = {
                 "vector": vector,
+                # Text endpoint usage counts lexical tokens; video groups count
+                # the expanded encoder sequence, including modality spans.
+                "prompt_tokens": len(
+                    tokenizer(
+                        "task: search result | query: " + row["text"],
+                        add_special_tokens=False,
+                    )["input_ids"]
+                )
+                if "text" in row
+                else int(inputs["attention_mask"].sum().item()),
+                "encoder_tokens": int(inputs["attention_mask"].sum().item()),
                 "cold_seconds": cold,
                 "completed_timing": compare.timing(samples),
                 "encoder_and_readback_timing": compare.timing(encoder_samples),
@@ -870,6 +884,12 @@ def main():
                 for n, c in result["cases"].items()
             }
             for name, case in result["cases"].items():
+                reference_case = expected["cases"][name]
+                if (
+                    "prompt_tokens" in reference_case
+                    and case["prompt_tokens"] != reference_case["prompt_tokens"]
+                ):
+                    raise ValueError(f"prompt-token parity failed: {name}")
                 compare.assert_agreement(
                     case["vector"], expected["cases"][name]["vector"]
                 )

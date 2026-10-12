@@ -150,6 +150,26 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h2
 fn isWebm(bytes: []const u8) bool {
     return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3");
 }
+// Own normalized TS storage alongside the packet reader. Returning this owner
+// is safe: the snapshot's Source address is stable until deinit.
+const PacketInput = struct {
+    reader: media.mp4.Reader,
+    snapshot: ?*media.stream.Snapshot = null,
+    fn init(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !PacketInput {
+        if (media.transport_stream.isTransportStream(bytes)) {
+            const normalized = try video.transport_avc.Reader.init(a, source.identity, bytes, .{}, .{
+                .transport = .{ .max_bytes = 64 * 1024 * 1024 },
+                .stream = .{ .max_bytes = 64 * 1024 * 1024, .control = source.control, .admission_pool = source.admission_pool },
+            });
+            return .{ .reader = normalized.reader, .snapshot = normalized.snapshot };
+        }
+        return .{ .reader = try media.mp4.Reader.init(a, source, .{}) };
+    }
+    fn deinit(self: *PacketInput) void {
+        self.reader.deinit();
+        if (self.snapshot) |snapshot| snapshot.deinit();
+    }
+};
 fn webmTrack(track: media.webm.Track) !media.mp4.Track {
     // Codec-independent display policy; codec reconstruction remains in WebM.
     return .{ .codec = .avc, .id = 1, .timescale = 1_000_000_000, .width = std.math.cast(u16, track.width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u16, track.height) orelse return error.ResourceLimitExceeded, .avcc = &.{}, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
@@ -250,13 +270,14 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
         }
         return plan;
     }
-    var reader = try media.mp4.Reader.init(a, &source, .{});
-    defer reader.deinit();
+    var input = try PacketInput.init(a, &source, bytes);
+    defer input.deinit();
+    const reader = &input.reader;
     // AVC combines VUI and container declarations in parameterSession below.
     if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
-    const selected = try selectWithSampling(a, &reader, sampling);
+    const selected = try selectWithSampling(a, reader, sampling);
     defer a.free(selected);
-    const configurations = try parameterSession(a, &reader);
+    const configurations = try parameterSession(a, reader);
     defer if (configurations) |session| session.deinit();
     const static_config = if (reader.track.codec == .avc and configurations == null) try video.h264.configParse(a, reader.track.avcc) else null;
     defer if (static_config) |cfg| cfg.groups.deinit(a);
@@ -371,8 +392,14 @@ pub const Prefetch = struct {
         const webm = isWebm(bytes);
         var webm_reader: media.webm.Reader = undefined;
         var reader: media.mp4.Reader = undefined;
-        if (webm) webm_reader = try media.webm.Reader.init(a, &source, .{}) else reader = try media.mp4.Reader.init(a, &source, .{});
-        defer if (webm) webm_reader.deinit() else reader.deinit();
+        var packet_input: ?PacketInput = null;
+        if (webm) {
+            webm_reader = try media.webm.Reader.init(a, &source, .{});
+        } else {
+            packet_input = try PacketInput.init(a, &source, bytes);
+            reader = packet_input.?.reader;
+        }
+        defer if (webm) webm_reader.deinit() else packet_input.?.deinit();
         var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
         defer if (webm_index) |*index| index.deinit();
         const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
@@ -501,8 +528,14 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     const webm = isWebm(bytes);
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
-    if (webm) webm_reader = try media.webm.Reader.init(a, &source, .{}) else reader = try media.mp4.Reader.init(a, &source, .{});
-    defer if (webm) webm_reader.deinit() else reader.deinit();
+    var packet_input: ?PacketInput = null;
+    if (webm) {
+        webm_reader = try media.webm.Reader.init(a, &source, .{});
+    } else {
+        packet_input = try PacketInput.init(a, &source, bytes);
+        reader = packet_input.?.reader;
+    }
+    defer if (webm) webm_reader.deinit() else packet_input.?.deinit();
     var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
     defer if (webm_index) |*index| index.deinit();
     const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
@@ -1079,7 +1112,7 @@ test "embeddinggemma2 video logical field partition selection and timestamp wind
 
 test "embeddinggemma2 video admission rejects all container paths before model execution" {
     const a = std.testing.allocator;
-    inline for (.{ "mjpeg.mov", "vp8.webm", "vp9.webm", "av1.webm", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+    inline for (.{ "mjpeg.mov", "vp8.webm", "vp9.webm", "av1.webm", "closed.ts", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
         var unopened: ComputeBackend = undefined;
         try std.testing.expectError(error.SharedAdmissionExceeded, encodeWithBudget(a, &unopened, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool));
@@ -1113,7 +1146,7 @@ test "embeddinggemma2 video preflight bounds temporary owners and plans geometry
 fn preflightAllocationRun(backing: std.mem.Allocator) !void {
     var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
     const a = no_resize.allocator();
-    inline for (.{ "mjpeg.mov", "vp9.webm", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+    inline for (.{ "mjpeg.mov", "vp9.webm", "bframes.ts", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
         defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
         const plan = try inspectPlan(a, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool, true);
@@ -1156,7 +1189,11 @@ test "embeddinggemma2 video producer failure preserves error and releases partia
 
 test "embeddinggemma2 video producer allocation failure drains metadata and prepared patches" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // Producer ArrayList resize depends on heap placement. Exercise
+            // every allocation fallback deterministically on both hosts.
+            var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+            const a = no_resize.allocator();
             var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
             defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
             var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 512 * 1024 * 1024 };
@@ -1226,4 +1263,66 @@ test "embeddinggemma2 video WebM presentation and container colour reach model p
     try std.testing.expectError(error.UnsupportedVideoColor, webmHost(track, &frame));
     track.colour = .{ .subsampling_h = 0 };
     try std.testing.expectError(error.UnsupportedVideoColor, webmHost(track, &frame));
+}
+
+test "embeddinggemma2 video native TS sampling and preflight preserve MP4 pictures" {
+    const a = std.testing.allocator;
+    inline for (.{ "closed", "bframes" }) |name| {
+        const ts = @embedFile("../testdata/video/" ++ name ++ ".ts");
+        const mp4 = @embedFile("../testdata/video/" ++ name ++ ".mp4");
+        var ts_source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = ts } };
+        var mp4_source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = mp4 } };
+        var normalized = try PacketInput.init(a, &ts_source, ts);
+        defer normalized.deinit();
+        var original = try PacketInput.init(a, &mp4_source, mp4);
+        defer original.deinit();
+        const selected = try select(a, &normalized.reader);
+        defer a.free(selected);
+        const expected = try select(a, &original.reader);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(usize, expected, selected);
+        const ts_plan = try inspectPlan(a, ts, .{}, .reference, null, false);
+        const mp4_plan = try inspectPlan(a, mp4, .{}, .reference, null, false);
+        try std.testing.expectEqualDeep(mp4_plan, ts_plan);
+        try std.testing.expectError(error.Timeout, inspectPlan(a, ts, .{ .deadline_ns = 0 }, .reference, null, false));
+    }
+}
+
+test "embeddinggemma2 video TS producer preserves prepared MP4 patches and drains owners" {
+    const CapturePatches = struct {
+        fn run(bytes: []const u8) ![][32]u8 {
+            const a = std.testing.allocator;
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+            defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+            const producer = try Prefetch.start(a, std.testing.io, null, bytes, .{}, .reference, &pool);
+            defer producer.deinit();
+            var hashes: std.ArrayList([32]u8) = .empty;
+            defer hashes.deinit(a);
+            var jobs: [1]Prefetch.Job = undefined;
+            while (true) {
+                _ = producer.queue.getUncancelable(std.testing.io, &jobs, 1) catch break;
+                defer producer.discard(&jobs[0]);
+                switch (jobs[0]) {
+                    .header => {},
+                    .native => |job| {
+                        var hash: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(job.patches), &hash, .{});
+                        try hashes.append(a, hash);
+                    },
+                    .metal => return error.TestUnexpectedResult,
+                }
+            }
+            producer.join();
+            if (producer.failure) |err| return err;
+            return hashes.toOwnedSlice(a);
+        }
+    };
+    inline for (.{ "closed", "bframes" }) |name| {
+        const original = try CapturePatches.run(@embedFile("../testdata/video/" ++ name ++ ".mp4"));
+        defer std.testing.allocator.free(original);
+        const normalized = try CapturePatches.run(@embedFile("../testdata/video/" ++ name ++ ".ts"));
+        defer std.testing.allocator.free(normalized);
+        try std.testing.expect(original.len > 0);
+        try std.testing.expectEqualSlices([32]u8, original, normalized);
+    }
 }

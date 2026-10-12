@@ -23370,6 +23370,7 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_video, "video/mp4" },
         .{ accepts_video, "video/quicktime" },
         .{ accepts_video, "video/webm" },
+        .{ accepts_video, "video/mp2t" },
     }) |mime| {
         if (!mime[0]) continue;
         if (mime_index > 0) try buf.append(allocator, ',');
@@ -31696,7 +31697,7 @@ fn appendDenseEmbedBinary(
         return;
     }
 
-    if (std.ascii.eqlIgnoreCase(mime_type, "video/mp4") or std.ascii.eqlIgnoreCase(mime_type, "video/quicktime") or std.ascii.eqlIgnoreCase(mime_type, "video/webm")) {
+    if (std.ascii.eqlIgnoreCase(mime_type, "video/mp4") or std.ascii.eqlIgnoreCase(mime_type, "video/quicktime") or std.ascii.eqlIgnoreCase(mime_type, "video/webm") or std.ascii.eqlIgnoreCase(mime_type, "video/mp2t")) {
         if (!parsed.allow_video or manifest.embedding_style != .embedding_gemma2 or !model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportVideoInput;
         try parsed.videos.append(allocator, .{ .index = index, .bytes = bytes, .mime_type = mime_type, .owned = owned });
         return;
@@ -31920,7 +31921,7 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.MediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
         error.InvalidMediaBase64 => "invalid base64 media data",
         error.MediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
-        error.UnsupportedMediaMimeType => "unsupported media MIME type; video groups accept video/mp4, video/quicktime or video/webm",
+        error.UnsupportedMediaMimeType => "unsupported media MIME type; video groups accept video/mp4, video/quicktime, video/webm or video/mp2t",
         error.ModelDoesNotSupportVideoInput => "video requires an ordered EmbeddingGemma 2 content group",
         error.ModelDoesNotSupportTextInput => "model does not support text input",
         error.ModelDoesNotSupportImageInput => "model does not support image input",
@@ -31980,6 +31981,20 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         error.UnsupportedSampleSize,
         error.UnsupportedTimeline,
         error.UnsupportedContainer,
+        error.MalformedTransportStream,
+        error.MalformedTransportPes,
+        error.TransportContinuityError,
+        error.InvalidTransportCrc,
+        error.TruncatedTransportSection,
+        error.TruncatedTransportPes,
+        error.MissingTransportTables,
+        error.MissingTransportTimestamp,
+        error.MissingTransportDuration,
+        error.TransportTimestampRegression,
+        error.UnsupportedTransportProgram,
+        error.AmbiguousTransportPictureTiming,
+        error.MalformedAnnexB,
+        error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video input" },
         error.ImageDecodeFailed => .{
             .status = 400,
@@ -36242,6 +36257,8 @@ test "embeddinggemma2 video MIME is accepted only inside family ordered groups" 
     try std.testing.expectError(error.ModelDoesNotSupportVideoInput, appendDenseEmbedBinary(a, &other, &parsed, "mp4", "video/mp4", 0, false));
     try appendDenseEmbedBinary(a, &manifest, &parsed, "webm", "video/webm", 0, false);
     try std.testing.expectEqual(@as(usize, 2), parsed.videos.items.len);
+    try appendDenseEmbedBinary(a, &manifest, &parsed, "ts", "video/mp2t", 0, false);
+    try std.testing.expectEqual(@as(usize, 3), parsed.videos.items.len);
     try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.UnsupportedVideoColor).status);
     try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.InvalidVideoData).status);
     try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.WebpDecodeFailed).status);

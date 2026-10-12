@@ -814,3 +814,34 @@ The final bounded TS fuzz campaign adds 101,456 runs to the previous 102,382
 All generated fixtures and the manifest regenerate byte for byte. The media
 allocation-failure helper forces resize fallbacks after actual Linux exposed
 heap-placement-dependent counts; production allocation behavior is unchanged.
+
+
+### Raw MPEG-TS model input continuation
+
+EmbeddingGemma 2 model input now accepts `video/mp2t`. Byte detection routes TS
+through the owned native AVC normalizer during preflight, synchronous encoding
+and queued preparation, before existing logical-picture sampling and model
+execution. Normalized snapshots outlive packet/configuration readers and queued
+patch production; teardown releases them after decoder owners. Temporary
+normalization/configuration storage participates in the existing request pool.
+Malformed TS clocks/tables/continuity and ambiguous picture timing return
+HTTP 400. Preflight uses the existing `INVALID_REQUEST` response; decoder
+execution errors use `INVALID_VIDEO`. Neither path publishes an embedding.
+
+Closed-GOP and reordered B-frame fixtures retain the same selected pictures,
+geometry/admission plans and exact prepared-patch hashes as their original MP4
+payloads. The video processor recipe remains v6: existing container outputs and
+presentation policies are unchanged. Pretrained qualification is recorded in
+`zig/pkg/inference/src/testdata/video/transport-validation`, including pinned
+PyTorch, native CPU, Metal and actual Linux ARM64 source/binary receipts. These
+synthetic cases do not qualify TS SAR/HDR/VFR policies or arbitrary PES layouts.
+HLS playlist orchestration into model groups remains separate from raw TS input.
+
+Final raw-TS model gates pass 27 macOS tests and 25 actual Linux ARM64 tests
+(two Metal skips). Both TS/MP4 pairs preserve pinned pretrained vectors on
+native CPU, Metal and Linux; maximum error is below 3.6e-7, every cosine exceeds
+0.999999999997, rankings/top-k are exact, and video token counts match (824/266).
+TS/MP4 vectors are identical within each backend. Four concurrent-load requests
+per backend return 200, with disconnect/retry checks recorded; these small
+shared-host checks do not establish sustained production capacity. Corrupt PAT
+requests return preflight HTTP 400 on all three backends without embeddings.
