@@ -408,7 +408,26 @@ pub fn loadNamespaceTxn(txn: anytype) !?Namespace {
         error.NotFound => return null,
         else => return err,
     };
+    try requireLiveDirectoryTxn(mutable_txn);
     return try decodeNamespace(raw);
+}
+
+/// Missing or unsupported directory metadata must fail closed, never produce
+/// an apparently empty primary population. New owners publish this marker in
+/// the same transaction as their namespace and directory mutations.
+pub fn requireLiveDirectoryTxn(txn: anytype) !void {
+    const raw = txn.get(&internal_keys.identity_live_directory_manifest_key) catch |err| switch (err) {
+        error.NotFound => return error.InvalidDocIdentity,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, raw, internal_keys.identity_live_directory_manifest_value)) return error.InvalidDocIdentity;
+}
+
+pub fn writeNamespaceTxn(txn: anytype, namespace: Namespace) !void {
+    var encoded: [24]u8 = undefined;
+    encodeNamespace(&encoded, namespace);
+    try txn.put(&internal_keys.identity_namespace_key, &encoded);
+    try txn.put(&internal_keys.identity_live_directory_manifest_key, internal_keys.identity_live_directory_manifest_value);
 }
 
 pub fn loadNamespaceFromStore(store: *docstore_mod.DocStore) !?Namespace {
@@ -447,11 +466,9 @@ pub fn loadOrInitNamespaceWithPolicy(
 }
 
 pub fn writeNamespaceToStore(store: *docstore_mod.DocStore, namespace: Namespace) !void {
-    var buf: [24]u8 = undefined;
-    encodeNamespace(buf[0..], namespace);
     var txn = try store.beginWriteTxn();
     errdefer txn.abort();
-    try txn.put(internal_keys.identity_namespace_key[0..], &buf);
+    try writeNamespaceTxn(&txn, namespace);
     try txn.commit();
 }
 
@@ -498,7 +515,7 @@ pub fn reassignNamespaceWithMetadataAlloc(
         var state = (try lookupStateTxn(&txn, row.ordinal)) orelse return error.InvalidDocIdentity;
         try deleteCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id);
         state.canonical_doc_id = canonicalDocIdForNamespace(namespace, row.doc_id);
-        try writeOrdinalStateTxn(&txn, row.ordinal, state);
+        try writeOrdinalStateTxn(alloc, &txn, row.ordinal, state);
         try writeCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id, row.ordinal);
     }
 
@@ -597,9 +614,7 @@ pub fn initializePristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn, n
         try writeVisibilitySummaryTxn(txn, empty);
     }
     if (stored_namespace == null) {
-        var encoded: [24]u8 = undefined;
-        encodeNamespace(&encoded, namespace);
-        try txn.put(&internal_keys.identity_namespace_key, &encoded);
+        try writeNamespaceTxn(txn, namespace);
     }
     return empty;
 }
@@ -620,6 +635,19 @@ pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?Do
     };
     if (raw.len != @sizeOf(u32)) return error.InvalidDocIdentity;
     return std.mem.readInt(u32, raw[0..4], .big);
+}
+
+fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
+    const key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
+    defer alloc.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (value.len != 4) return error.InvalidDocIdentity;
+    const ordinal = std.mem.readInt(u32, value[0..4], .big);
+    if (ordinal == 0) return error.InvalidDocIdentity;
+    return ordinal;
 }
 
 pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]?DocOrdinal {
@@ -738,13 +766,22 @@ pub fn ensureOrdinalForNamespaceTxn(
             }
             state.created_generation = generation;
             state.deleted_generation = null;
-            try writeOrdinalStateTxn(mutable_txn, ordinal, state);
+            try writeOrdinalStateTxn(alloc, mutable_txn, ordinal, state);
             var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
             defer chunk.deinit(alloc);
             try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
             try writeVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal), &chunk);
         }
         try ensureCanonicalOrdinalMappingTxn(mutable_txn, state.canonical_doc_id, ordinal);
+        if (try lookupLiveOrdinalTxn(alloc, mutable_txn, doc_id)) |live_ordinal| {
+            if (live_ordinal != ordinal) return error.InvalidDocIdentity;
+        } else {
+            const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
+            defer alloc.free(live_key);
+            var ordinal_value: [4]u8 = undefined;
+            std.mem.writeInt(u32, &ordinal_value, ordinal, .big);
+            try mutable_txn.put(live_key, &ordinal_value);
+        }
         return .{
             .ordinal = ordinal,
             .canonical_doc_id = state.canonical_doc_id,
@@ -762,7 +799,7 @@ pub fn ensureOrdinalForNamespaceTxn(
     };
     try writeDocOrdinalMappingTxn(alloc, mutable_txn, doc_id, ordinal);
     try writeOrdinalDocMappingTxn(mutable_txn, ordinal, doc_id);
-    try writeOrdinalStateTxn(mutable_txn, ordinal, state);
+    try writeOrdinalStateTxn(alloc, mutable_txn, ordinal, state);
     try writeCanonicalOrdinalMappingTxn(mutable_txn, state.canonical_doc_id, ordinal);
     var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
     defer chunk.deinit(alloc);
@@ -791,7 +828,7 @@ pub fn markDeletedTxn(alloc: Allocator, txn: anytype, generation: u64, doc_id: [
             try writeVisibilitySummaryTxn(mutable_txn, summary);
         }
         state.deleted_generation = generation;
-        try writeOrdinalStateTxn(mutable_txn, ordinal, state);
+        try writeOrdinalStateTxn(alloc, mutable_txn, ordinal, state);
         var chunk = (try readVisibilityChunkTxn(alloc, mutable_txn, visibilityChunkId(ordinal))) orelse VisibilityChunk{};
         defer chunk.deinit(alloc);
         try chunk.put(alloc, visibilityChunkOffset(ordinal), state);
@@ -1207,7 +1244,7 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
             if (!std.mem.eql(u8, reverse_doc_id, row.doc_id)) return error.InvalidDocIdentity;
         }
 
-        try validateStateForDocTxn(&txn, namespace, row.ordinal, row.doc_id);
+        try validateStateForDocTxn(alloc, &txn, namespace, row.ordinal, row.doc_id);
         const expected_canonical = canonicalDocIdForNamespace(namespace, row.doc_id);
         if (try lookupCanonicalOrdinalTxn(&txn, expected_canonical)) |mapped_ordinal| {
             if (mapped_ordinal != row.ordinal) return error.InvalidDocIdentity;
@@ -1223,7 +1260,7 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
 
         const mapped_ordinal = (try lookupOrdinalTxn(alloc, &txn, row.doc_id)) orelse return error.InvalidDocIdentity;
         if (mapped_ordinal != row.ordinal) return error.InvalidDocIdentity;
-        try validateStateForDocTxn(&txn, namespace, row.ordinal, row.doc_id);
+        try validateStateForDocTxn(alloc, &txn, namespace, row.ordinal, row.doc_id);
     }
 
     var canonical_rows = CanonicalOrdinalRows{};
@@ -1237,7 +1274,7 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
         {
             const doc_id = (try lookupDocIdTxn(alloc, &txn, row.ordinal)) orelse return error.InvalidDocIdentity;
             defer alloc.free(doc_id);
-            try validateStateForDocTxn(&txn, namespace, row.ordinal, doc_id);
+            try validateStateForDocTxn(alloc, &txn, namespace, row.ordinal, doc_id);
         }
     }
 
@@ -1253,11 +1290,12 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
             defer alloc.free(doc_id);
             const mapped_ordinal = (try lookupOrdinalTxn(alloc, &txn, doc_id)) orelse return error.InvalidDocIdentity;
             if (mapped_ordinal != ordinal) return error.InvalidDocIdentity;
-            try validateStateForDocTxn(&txn, namespace, ordinal, doc_id);
+            try validateStateForDocTxn(alloc, &txn, namespace, ordinal, doc_id);
         }
     }
 
     try validateVisibilityChunksAlloc(alloc, store, &txn);
+    try validateLiveDirectoryAlloc(alloc, store, &txn);
 
     if (max_ordinal > 0 and next_ordinal <= max_ordinal) return error.InvalidDocIdentity;
 }
@@ -1294,6 +1332,29 @@ pub fn validatePrimaryDocumentCoverageAlloc(alloc: Allocator, store: *docstore_m
     const upper = [_]u8{internal_keys.user_namespace + 1};
     try store.scanWithContext(lower[0..], upper[0..], .{}, &coverage, Coverage.visit);
     if (coverage.live_documents != identity_stats.live_ordinals) return error.InvalidDocIdentity;
+}
+
+fn validateLiveDirectoryAlloc(alloc: Allocator, store: *docstore_mod.DocStore, txn: *docstore_mod.DocStore.Txn) !void {
+    const Scan = struct {
+        alloc: Allocator,
+        txn: *docstore_mod.DocStore.Txn,
+        fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const term = internal_keys.findComponentTerminator(key, 2) orelse return error.InvalidDocIdentity;
+            if (term + 2 != key.len or value.len != 4) return error.InvalidDocIdentity;
+            const id = try internal_keys.decodeBodyAlloc(self.alloc, key[2..term]);
+            defer self.alloc.free(id);
+            const ordinal = std.mem.readInt(u32, value[0..4], .big);
+            if (ordinal == 0 or try lookupOrdinalTxn(self.alloc, self.txn, id) != ordinal) return error.InvalidDocIdentity;
+            const state = (try lookupStateTxn(self.txn, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive()) return error.InvalidDocIdentity;
+            return .@"continue";
+        }
+    };
+    var scan = Scan{ .alloc = alloc, .txn = txn };
+    const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_live_doc_to_ordinal_kind };
+    const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_live_doc_to_ordinal_kind + 1 };
+    try store.scanWithContext(&lower, &upper, .{}, &scan, Scan.visit);
 }
 
 fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore, txn: anytype) !void {
@@ -1941,11 +2002,15 @@ fn parseIdentityDocToOrdinalKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     return try internal_keys.decodeBodyAlloc(alloc, key[2..terminator]);
 }
 
-fn validateStateForDocTxn(txn: anytype, namespace: Namespace, ordinal: DocOrdinal, doc_id: []const u8) !void {
+fn validateStateForDocTxn(alloc: Allocator, txn: anytype, namespace: Namespace, ordinal: DocOrdinal, doc_id: []const u8) !void {
     const state = (try lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
     try state.validate();
     const expected = canonicalDocIdForNamespace(namespace, doc_id);
     if (state.canonical_doc_id != expected) return error.InvalidDocIdentity;
+    const live_ordinal = try lookupLiveOrdinalTxn(alloc, txn, doc_id);
+    if (state.isLive()) {
+        if (live_ordinal != ordinal) return error.InvalidDocIdentity;
+    } else if (live_ordinal != null) return error.InvalidDocIdentity;
 }
 
 pub fn liveFilteredDocSetFromStoreAlloc(
@@ -2009,6 +2074,7 @@ pub fn appendBatchIdentityMetadataAlloc(
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     doc_upserts: []const []const u8,
     doc_deletes: []const []const u8,
+    metadata_deletes: ?*std.ArrayListUnmanaged([]u8),
 ) !void {
     return try appendBatchIdentityMetadataForNamespaceAlloc(
         alloc,
@@ -2018,6 +2084,7 @@ pub fn appendBatchIdentityMetadataAlloc(
         out,
         doc_upserts,
         doc_deletes,
+        metadata_deletes,
     );
 }
 
@@ -2029,29 +2096,31 @@ pub fn appendBatchIdentityMetadataForNamespaceAlloc(
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     doc_upserts: []const []const u8,
     doc_deletes: []const []const u8,
+    metadata_deletes: ?*std.ArrayListUnmanaged([]u8),
 ) !void {
-    return try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+    return try appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
         alloc,
         store,
         namespace,
         generation,
         out,
-        null,
+        metadata_deletes,
         doc_upserts,
         doc_deletes,
     );
 }
 
-pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+pub fn appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     namespace: Namespace,
     generation: u64,
     out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
-    visibility_deletes: ?*std.ArrayListUnmanaged([]u8),
+    metadata_deletes: ?*std.ArrayListUnmanaged([]u8),
     doc_upserts: []const []const u8,
     doc_deletes: []const []const u8,
 ) !void {
+    if (doc_deletes.len != 0 and metadata_deletes == null) return error.IdentityDeletesRequireOutput;
     if (doc_upserts.len == 0 and doc_deletes.len == 0) return;
 
     if (try appendBatchIdentityMetadataBatchedFastPath(
@@ -2060,7 +2129,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         namespace,
         generation,
         out,
-        visibility_deletes,
+        metadata_deletes,
         doc_upserts,
         doc_deletes,
     )) return;
@@ -2088,6 +2157,10 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
     defer upsert_states.deinit(alloc);
     var visibility_chunks = VisibilityChunkMap.empty;
     defer deinitVisibilityChunkMap(alloc, &visibility_chunks);
+
+    var final_deletes = std.StringHashMapUnmanaged(void).empty;
+    defer final_deletes.deinit(alloc);
+    for (doc_deletes) |doc_id| try final_deletes.put(alloc, doc_id, {});
 
     var next_ordinal = try readNextOrdinalTxn(&txn);
     var reserved_new_ordinal = false;
@@ -2120,6 +2193,9 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
             } else {
                 try appendCanonicalOrdinalWrite(alloc, out, state.canonical_doc_id, ordinal);
             }
+            if (try lookupLiveOrdinalTxn(alloc, &txn, doc_id)) |live_ordinal| {
+                if (live_ordinal != ordinal) return error.InvalidDocIdentity;
+            } else if (!final_deletes.contains(doc_id)) try appendLiveDocOrdinalWrite(alloc, out, doc_id, ordinal);
             try upsert_states.put(alloc, ordinal, state);
             continue;
         }
@@ -2138,7 +2214,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
             noteSummaryLiveCreate(summary, generation);
             visibility_summary_dirty = true;
         }
-        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try appendIdentityWritesForDoc(alloc, out, doc_id, ordinal, state, !final_deletes.contains(doc_id));
         try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
         try upsert_states.put(alloc, ordinal, state);
     }
@@ -2154,6 +2230,11 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
             .canonical_doc_id = canonicalDocIdForNamespace(namespace, doc_id),
             .created_generation = generation,
         };
+        {
+            const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
+            errdefer alloc.free(live_key);
+            try metadata_deletes.?.append(alloc, live_key);
+        }
         if (state.deleted_generation == null) {
             if (visibility_summary) |*summary| {
                 noteSummaryDelete(summary, generation);
@@ -2168,7 +2249,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
     if (reserved_new_ordinal) {
         try appendNextOrdinalWrite(alloc, out, next_ordinal);
     }
-    try appendPendingVisibilityChunkWritesAlloc(alloc, out, visibility_deletes, &visibility_chunks);
+    try appendPendingVisibilityChunkWritesAlloc(alloc, out, metadata_deletes, &visibility_chunks);
     if (visibility_summary_dirty) {
         try appendVisibilitySummaryWrite(alloc, out, visibility_summary.?);
     }
@@ -2204,7 +2285,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
 ) !bool {
     if (doc_upserts.len == 0) return true;
 
-    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 5), 2);
     try out.ensureUnusedCapacity(alloc, identity_write_capacity);
 
     var txn = try store.beginProbeTxn();
@@ -2244,7 +2325,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
             .created_generation = generation,
         };
         if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
-        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try appendIdentityWritesForDoc(alloc, out, doc_id, ordinal, state, true);
         try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
@@ -2283,7 +2364,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForName
 ) !bool {
     if (doc_upserts.len == 0) return true;
 
-    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 5), 2);
     try out.ensureUnusedCapacity(alloc, identity_write_capacity);
 
     var seen_doc_ids = std.StringHashMapUnmanaged(void).empty;
@@ -2315,7 +2396,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForName
             .created_generation = generation,
         };
         noteSummaryLiveCreate(&visibility_summary, generation);
-        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, doc_state);
+        try appendIdentityWritesForDoc(alloc, out, doc_id, ordinal, doc_state, true);
         const chunk_id = try updateOwnedVisibilityChunkAlloc(alloc, &state.visibility_chunks, ordinal, doc_state);
         try dirty_visibility_chunks.put(alloc, chunk_id, {});
     }
@@ -2349,7 +2430,7 @@ fn appendBatchIdentityMetadataBatchedFastPath(
     doc_deletes: []const []const u8,
 ) !bool {
     if (doc_upserts.len == 0 or doc_deletes.len != 0) return false;
-    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 4), 2);
+    const identity_write_capacity = try std.math.add(usize, try std.math.mul(usize, doc_upserts.len, 5), 2);
     try out.ensureUnusedCapacity(alloc, identity_write_capacity);
 
     var txn = try store.beginProbeTxn();
@@ -2411,7 +2492,7 @@ fn appendBatchIdentityMetadataBatchedFastPath(
             .created_generation = generation,
         };
         if (visibility_summary) |*summary| noteSummaryLiveCreate(summary, generation);
-        try appendIdentityWritesForLiveDoc(alloc, out, doc_id, ordinal, state);
+        try appendIdentityWritesForDoc(alloc, out, doc_id, ordinal, state, true);
         try updatePendingVisibilityChunkAlloc(alloc, &txn, &visibility_chunks, ordinal, state);
     }
     try appendNextOrdinalWrite(alloc, out, next_ordinal);
@@ -2420,8 +2501,8 @@ fn appendBatchIdentityMetadataBatchedFastPath(
     return true;
 }
 
-/// Ordinary document overwrites do not mutate identity. Prove that in three
-/// sorted reads on one snapshot instead of three point probes per document.
+/// Ordinary document overwrites do not mutate identity. Prove that in four
+/// sorted reads on one snapshot instead of per-document point probes.
 /// Missing/deleted states and incomplete mappings retain the general repair
 /// path; a conflicting canonical mapping remains a hard correctness error.
 fn classifyIdentityUpserts(alloc: Allocator, txn: anytype, lookups: []const IdentityLookup) !enum { all_new, unchanged, needs_mutation } {
@@ -2437,6 +2518,29 @@ fn classifyIdentityUpserts(alloc: Allocator, txn: anytype, lookups: []const Iden
     };
     if (existing == 0) return .all_new;
     if (existing != lookups.len) return .needs_mutation;
+
+    const live_keys = try alloc.alloc([]u8, lookups.len);
+    var initialized: usize = 0;
+    defer {
+        for (live_keys[0..initialized]) |key| alloc.free(key);
+        alloc.free(live_keys);
+    }
+    const ordinals = try alloc.alloc(DocOrdinal, lookups.len);
+    defer alloc.free(ordinals);
+    for (lookups, values, live_keys, ordinals, keys) |lookup, value, *live_key, *ordinal, *key| {
+        const raw = value.?;
+        if (raw.len != 4) return error.InvalidDocIdentity;
+        ordinal.* = std.mem.readInt(u32, raw[0..4], .big);
+        live_key.* = try alloc.dupe(u8, lookup.key);
+        initialized += 1;
+        live_key.*[1] = internal_keys.identity_live_doc_to_ordinal_kind;
+        key.* = live_key.*;
+    }
+    try txn.getManySorted(keys, values);
+    for (ordinals, values) |ordinal, value| {
+        const raw = value orelse return .needs_mutation;
+        if (raw.len != 4 or std.mem.readInt(u32, raw[0..4], .big) != ordinal) return error.InvalidDocIdentity;
+    }
 
     const Probe = struct {
         key: [10]u8 = @splat(0),
@@ -2474,7 +2578,7 @@ fn classifyIdentityUpserts(alloc: Allocator, txn: anytype, lookups: []const Iden
     return .unchanged;
 }
 
-test "identity unchanged batch proves live state and canonical mappings with three sorted reads" {
+test "identity unchanged batch proves live state and canonical mappings with four sorted reads" {
     const mem_backend = @import("../mem_backend.zig");
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
@@ -2483,7 +2587,7 @@ test "identity unchanged batch proves live state and canonical mappings with thr
     defer store.close();
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &writes);
-    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 10, &writes, &.{ "doc:z", "doc:a", "doc:m" }, &.{});
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 10, &writes, &.{ "doc:z", "doc:a", "doc:m" }, &.{}, null);
     try store.putBatchWithReplay(null, writes.items, &.{}, null);
 
     var lookups: [3]IdentityLookup = undefined;
@@ -2508,25 +2612,25 @@ test "identity unchanged batch proves live state and canonical mappings with thr
         };
         var counter = Counter{ .inner = &txn };
         try std.testing.expectEqual(.unchanged, try classifyIdentityUpserts(alloc, &counter, &lookups));
-        try std.testing.expectEqual(@as(usize, 3), counter.calls);
+        try std.testing.expectEqual(@as(usize, 4), counter.calls);
     }
     var unchanged = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &unchanged);
-    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 20, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{});
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 20, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}, null);
     try std.testing.expectEqual(@as(usize, 0), unchanged.items.len);
 
     const canonical = canonicalDocIdForNamespace(default_namespace, "doc:a");
     const canonical_key = internal_keys.identityCanonicalToOrdinalKey(canonical);
     // Missing mappings must be repaired rather than certifying a no-op.
     try store.putBatchWithReplay(null, &.{}, &.{&canonical_key}, null);
-    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 21, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{});
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 21, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}, null);
     try std.testing.expectEqual(@as(usize, 1), unchanged.items.len);
     try std.testing.expectEqualSlices(u8, &canonical_key, unchanged.items[0].key);
     try store.putBatchWithReplay(null, unchanged.items, &.{}, null);
     // Existing but conflicting mappings remain an error, not a fast-path miss.
     const wrong = [_]u8{ 0, 0, 0, 99 };
     try store.putBatchWithReplay(null, &.{.{ .key = &canonical_key, .value = &wrong }}, &.{}, null);
-    try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}));
+    try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}, null));
 }
 
 test "restore staging pristine identity bootstrap is atomic and fail closed" {
@@ -2588,9 +2692,7 @@ test "relational index system namespace preinitialization seeds first visibility
     var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
-    var namespace_bytes: [24]u8 = undefined;
-    encodeNamespace(&namespace_bytes, namespace);
-    try store.putBatch(&.{.{ .key = &internal_keys.identity_namespace_key, .value = &namespace_bytes }}, &.{});
+    try writeNamespaceToStore(&store, namespace);
     {
         var read = try store.beginReadTxn();
         defer read.abort();
@@ -2609,7 +2711,7 @@ test "relational index system namespace preinitialization seeds first visibility
     try store.putBatch(&.{}, &.{old_key});
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &writes);
-    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 10, &writes, &.{ "a", "b" }, &.{});
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 10, &writes, &.{ "a", "b" }, &.{}, null);
     const summary = (try visibilitySummaryFromWrites(writes.items)).?;
     try std.testing.expectEqual(@as(u64, 2), summary.live_ordinals);
     try store.putBatch(writes.items, &.{});
@@ -2684,11 +2786,25 @@ fn writeOrdinalDocMappingTxn(txn: anytype, ordinal: DocOrdinal, doc_id: []const 
     try mutable_txn.put(key[0..], doc_id);
 }
 
-fn writeOrdinalStateTxn(txn: anytype, ordinal: DocOrdinal, state: OrdinalState) !void {
+fn writeOrdinalStateTxn(alloc: Allocator, txn: anytype, ordinal: DocOrdinal, state: OrdinalState) !void {
     const mutable_txn = txn;
     const key = internal_keys.identityOrdinalStateKey(ordinal);
     const encoded = encodeOrdinalState(state);
     try mutable_txn.put(key[0..], encoded[0..]);
+    const doc_id = (try lookupDocIdTxn(alloc, mutable_txn, ordinal)) orelse return error.InvalidDocIdentity;
+    defer alloc.free(doc_id);
+    const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
+    defer alloc.free(live_key);
+    if (state.isLive()) {
+        var value: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value, ordinal, .big);
+        try mutable_txn.put(live_key, &value);
+    } else {
+        mutable_txn.delete(live_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn writeCanonicalOrdinalMappingTxn(txn: anytype, canonical_doc_id: u64, ordinal: DocOrdinal) !void {
@@ -2716,12 +2832,27 @@ fn ensureCanonicalOrdinalMappingTxn(txn: anytype, canonical_doc_id: u64, ordinal
     try writeCanonicalOrdinalMappingTxn(txn, canonical_doc_id, ordinal);
 }
 
-fn appendIdentityWritesForLiveDoc(
+fn appendLiveDocOrdinalWrite(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), doc_id: []const u8, ordinal: DocOrdinal) !void {
+    const key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
+    errdefer alloc.free(key);
+    const value = try alloc.alloc(u8, 4);
+    errdefer alloc.free(value);
+    std.mem.writeInt(u32, value[0..4], ordinal, .big);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+pub fn freeIdentityDeleteKeys(alloc: Allocator, deletes: *std.ArrayListUnmanaged([]u8)) void {
+    for (deletes.items) |key| alloc.free(key);
+    deletes.deinit(alloc);
+}
+
+fn appendIdentityWritesForDoc(
     alloc: Allocator,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     doc_id: []const u8,
     ordinal: DocOrdinal,
     state: OrdinalState,
+    live: bool,
 ) !void {
     const doc_to_ordinal = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id);
     var ordinal_buf = try alloc.alloc(u8, @sizeOf(u32));
@@ -2734,6 +2865,7 @@ fn appendIdentityWritesForLiveDoc(
         .value = try alloc.dupe(u8, doc_id),
     });
 
+    if (live) try appendLiveDocOrdinalWrite(alloc, writes, doc_id, ordinal);
     try appendOrdinalStateWrite(alloc, writes, ordinal, state);
     try appendCanonicalOrdinalWrite(alloc, writes, state.canonical_doc_id, ordinal);
 }
@@ -2822,12 +2954,19 @@ fn appendNamespaceWrite(
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     namespace: Namespace,
 ) !void {
-    var value = try alloc.alloc(u8, 24);
-    encodeNamespace(value[0..24], namespace);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, internal_keys.identity_namespace_key[0..]),
-        .value = value,
-    });
+    {
+        const key = try alloc.dupe(u8, &internal_keys.identity_namespace_key);
+        errdefer alloc.free(key);
+        const value = try alloc.alloc(u8, 24);
+        errdefer alloc.free(value);
+        encodeNamespace(value, namespace);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+    const key = try alloc.dupe(u8, &internal_keys.identity_live_directory_manifest_key);
+    errdefer alloc.free(key);
+    const value = try alloc.dupe(u8, internal_keys.identity_live_directory_manifest_value);
+    errdefer alloc.free(value);
+    try writes.append(alloc, .{ .key = key, .value = value });
 }
 
 fn encodeOrdinalState(state: OrdinalState) [25]u8 {
@@ -2911,6 +3050,8 @@ test "identity namespace reassignment rewrites canonical states" {
         }
         identity_writes.deinit(alloc);
     }
+    var live_deletes_identity_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_identity_writes);
     try appendBatchIdentityMetadataForNamespaceAlloc(
         alloc,
         &store,
@@ -2919,8 +3060,9 @@ test "identity namespace reassignment rewrites canonical states" {
         &identity_writes,
         &.{ "doc:a", "doc:b" },
         &.{"doc:b"},
+        &live_deletes_identity_writes,
     );
-    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, identity_writes.items, live_deletes_identity_writes.items, null);
     try validateStoreAlloc(alloc, &store);
 
     const new_namespace = Namespace{ .table_id = 7, .shard_id = 72, .range_id = 702 };
@@ -2969,11 +3111,14 @@ test "identity namespace reassignment preserves snapshot generations and rejects
         &initial_writes,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
 
     var delete_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &delete_writes);
+    var live_deletes_delete_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_delete_writes);
     try appendBatchIdentityMetadataForNamespaceAlloc(
         alloc,
         &store,
@@ -2982,8 +3127,9 @@ test "identity namespace reassignment preserves snapshot generations and rejects
         &delete_writes,
         &.{},
         &.{"doc:b"},
+        &live_deletes_delete_writes,
     );
-    try store.putBatchWithReplay(null, delete_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, delete_writes.items, live_deletes_delete_writes.items, null);
 
     var before_reassign_txn = try store.beginProbeTxn();
     const ordinal_a = (try lookupOrdinalTxn(alloc, &before_reassign_txn, "doc:a")).?;
@@ -3034,6 +3180,7 @@ test "identity namespace reassignment preserves snapshot generations and rejects
         &stale_writer_writes,
         &.{"doc:c"},
         &.{},
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 0), stale_writer_writes.items.len);
 }
@@ -3065,6 +3212,7 @@ test "identity validation accepts missing canonical rows but rejects conflicts" 
         &identity_writes,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try validateStoreAlloc(alloc, &store);
@@ -3127,6 +3275,7 @@ test "identity allocation rejects canonical row conflicts before reserving ordin
         &identity_writes,
         &.{"doc:a"},
         &.{},
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 0), identity_writes.items.len);
 }
@@ -3182,6 +3331,7 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
         &first_writes,
         &.{ "doc:a", "doc\x00b" },
         &.{},
+        null,
     );
     const first_summary = (try visibilitySummaryFromWrites(first_writes.items)).?;
     try std.testing.expect(allVisibleFromSummary(first_summary, 10));
@@ -3202,6 +3352,8 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
 
     var second_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &second_writes);
+    var live_deletes_second_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_second_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3211,10 +3363,11 @@ test "batch identity metadata persists ordinal mappings and delete generations" 
         &second_writes,
         &.{"doc:a"},
         &.{"doc\x00b"},
+        &live_deletes_second_writes,
     );
     const second_summary = (try visibilitySummaryFromWrites(second_writes.items)).?;
     try std.testing.expect(!allVisibleFromSummary(second_summary, null));
-    try store.putBatchWithReplay(null, second_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, second_writes.items, live_deletes_second_writes.items, null);
 
     try std.testing.expectEqual(@as(?bool, false), try allVisibleFromSummaryFast(&store, null));
 
@@ -3305,11 +3458,14 @@ test "batch identity metadata delete observes buffered resurrection state" {
         &first_writes,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, first_writes.items, &.{}, null);
 
     var delete_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &delete_writes);
+    var live_deletes_delete_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_delete_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3319,8 +3475,9 @@ test "batch identity metadata delete observes buffered resurrection state" {
         &delete_writes,
         &.{},
         &.{"doc:a"},
+        &live_deletes_delete_writes,
     );
-    try store.putBatchWithReplay(null, delete_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, delete_writes.items, live_deletes_delete_writes.items, null);
 
     {
         var resurrect_txn = try store.beginWriteTxn();
@@ -3339,6 +3496,8 @@ test "batch identity metadata delete observes buffered resurrection state" {
 
     var second_delete_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &second_delete_writes);
+    var live_deletes_second_delete_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_second_delete_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3348,11 +3507,14 @@ test "batch identity metadata delete observes buffered resurrection state" {
         &second_delete_writes,
         &.{},
         &.{"doc:a"},
+        &live_deletes_second_delete_writes,
     );
-    try store.putBatchWithReplay(null, second_delete_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, second_delete_writes.items, live_deletes_second_delete_writes.items, null);
 
     var resurrect_delete_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &resurrect_delete_writes);
+    var live_deletes_resurrect_delete_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_resurrect_delete_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3362,8 +3524,10 @@ test "batch identity metadata delete observes buffered resurrection state" {
         &resurrect_delete_writes,
         &.{"doc:a"},
         &.{"doc:a"},
+        &live_deletes_resurrect_delete_writes,
     );
-    try store.putBatchWithReplay(null, resurrect_delete_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, resurrect_delete_writes.items, live_deletes_resurrect_delete_writes.items, null);
+    try validateStoreAlloc(alloc, &store);
 
     var txn = try store.beginProbeTxn();
     defer txn.abort();
@@ -3404,6 +3568,7 @@ test "batch identity metadata fails closed at ordinal capacity" {
         &too_many_writes,
         &.{ "doc:last", "doc:overflow" },
         &.{},
+        null,
     ));
     {
         var txn = try store.beginProbeTxn();
@@ -3424,6 +3589,7 @@ test "batch identity metadata fails closed at ordinal capacity" {
         &final_writes,
         &.{"doc:last"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, final_writes.items, &.{}, null);
 
@@ -3438,6 +3604,7 @@ test "batch identity metadata fails closed at ordinal capacity" {
         &exhausted_writes,
         &.{"doc:overflow"},
         &.{},
+        null,
     ));
 
     var verify_txn = try store.beginProbeTxn();
@@ -3478,6 +3645,7 @@ test "near-u32 ordinal pressure preserves sparse high ordinal state through reas
         &final_writes,
         &.{"doc:last"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, final_writes.items, &.{}, null);
 
@@ -3523,6 +3691,7 @@ test "validate store rejects invalid ordinal generation history" {
         &writes,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, writes.items, &.{}, null);
 
@@ -3561,6 +3730,7 @@ test "live primary doc set requires complete live primary coverage" {
         &initial_writes,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try appendPrimaryDocWrite(alloc, &initial_writes, "doc:a");
     try appendPrimaryDocWrite(alloc, &initial_writes, "doc:b");
@@ -3579,6 +3749,7 @@ test "live primary doc set requires complete live primary coverage" {
         &repair_writes,
         &.{"doc:b"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, repair_writes.items, &.{}, null);
 
@@ -3594,6 +3765,8 @@ test "live primary doc set requires complete live primary coverage" {
 
     var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &tombstone_writes);
+    var live_deletes_tombstone_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3603,8 +3776,9 @@ test "live primary doc set requires complete live primary coverage" {
         &tombstone_writes,
         &.{},
         &.{"doc:b"},
+        &live_deletes_tombstone_writes,
     );
-    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, tombstone_writes.items, live_deletes_tombstone_writes.items, null);
 
     try std.testing.expectEqual(@as(?doc_set.ResolvedDocSet, null), try livePrimaryDocSetIfCompleteFromStoreAlloc(alloc, &store));
     try std.testing.expectEqual(@as(?doc_set.ResolvedDocSet, null), try visiblePrimaryDocSetIfCompleteFromStoreAlloc(alloc, &store, 12));
@@ -3636,6 +3810,7 @@ test "document identity prefix resolution preserves byte prefixes and generation
         &initial_writes,
         &.{ "tenant:a", "tenant:a\x00child", "tenant:b" },
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
 
@@ -3652,6 +3827,8 @@ test "document identity prefix resolution preserves byte prefixes and generation
 
     var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &tombstone_writes);
+    var live_deletes_tombstone_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3661,8 +3838,9 @@ test "document identity prefix resolution preserves byte prefixes and generation
         &tombstone_writes,
         &.{},
         &.{"tenant:a"},
+        &live_deletes_tombstone_writes,
     );
-    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, tombstone_writes.items, live_deletes_tombstone_writes.items, null);
 
     var tenant_a_at_11 = try visibleDocSetForPrefixFromStoreAlloc(alloc, &store, "tenant:a", 11);
     defer tenant_a_at_11.deinit(alloc);
@@ -3695,6 +3873,7 @@ test "non-visible doc set complements visibility per generation" {
         &initial_writes,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
 
@@ -3738,6 +3917,8 @@ test "non-visible doc set complements visibility per generation" {
 
     var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &tombstone_writes);
+    var live_deletes_tombstone_writes = std.ArrayListUnmanaged([]u8).empty;
+    defer freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_writes);
     try appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -3747,8 +3928,9 @@ test "non-visible doc set complements visibility per generation" {
         &tombstone_writes,
         &.{},
         &.{"doc:b"},
+        &live_deletes_tombstone_writes,
     );
-    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+    try store.putBatchWithReplay(null, tombstone_writes.items, live_deletes_tombstone_writes.items, null);
 
     var later_create_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer freeIdentityWrites(alloc, &later_create_writes);
@@ -3761,6 +3943,7 @@ test "non-visible doc set complements visibility per generation" {
         &later_create_writes,
         &.{"doc:c"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, later_create_writes.items, &.{}, null);
 
@@ -3822,7 +4005,7 @@ test "non-visible doc set complements visibility per generation" {
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try writeOrdinalStateTxn(&txn, 2, tombstone_state);
+        try writeOrdinalStateTxn(alloc, &txn, 2, tombstone_state);
         var chunk = try rebuildVisibilityChunkFromIdentityStatesAlloc(alloc, &store, &txn, 0);
         defer chunk.deinit(alloc);
         try writeVisibilityChunkTxn(alloc, &txn, 0, &chunk);
@@ -3885,7 +4068,7 @@ test "visibility deleted side index removes stale live chunks" {
             for (visibility_deletes.items) |key| alloc.free(key);
             visibility_deletes.deinit(alloc);
         }
-        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+        try appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
             alloc,
             &store,
             default_namespace,
@@ -3912,7 +4095,7 @@ test "visibility deleted side index removes stale live chunks" {
             for (visibility_deletes.items) |key| alloc.free(key);
             visibility_deletes.deinit(alloc);
         }
-        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+        try appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
             alloc,
             &store,
             default_namespace,
@@ -3939,7 +4122,7 @@ test "visibility deleted side index removes stale live chunks" {
             for (visibility_deletes.items) |key| alloc.free(key);
             visibility_deletes.deinit(alloc);
         }
-        try appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+        try appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
             alloc,
             &store,
             default_namespace,
@@ -4104,4 +4287,83 @@ test "ordinal batch lookup scalar uses inline escaped keys and falls back for lo
     txn = .{ .expected = expected };
     try std.testing.expectError(error.OutOfMemory, lookupOrdinalTxn(failing.allocator(), &txn, &long));
     try std.testing.expectEqual(@as(?DocOrdinal, 7), try lookupOrdinalTxn(alloc, &txn, &long));
+}
+
+test "identity live directory validates repairs and aborts atomically (#1095)" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace = Namespace{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    try writeNamespaceToStore(&store, namespace);
+    const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "a\x00b");
+    defer alloc.free(live_key);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        _ = try ensureOrdinalForNamespaceTxn(alloc, &txn, namespace, 10, "a\x00b");
+        try std.testing.expect(try lookupLiveOrdinalTxn(alloc, &txn, "a\x00b") != null);
+    }
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupLiveOrdinalTxn(alloc, &txn, "a\x00b"));
+        try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupOrdinalTxn(alloc, &txn, "a\x00b"));
+    }
+    var ordinal: DocOrdinal = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        ordinal = (try ensureOrdinalForNamespaceTxn(alloc, &txn, namespace, 10, "a\x00b")).ordinal;
+        try txn.commit();
+    }
+    try validateStoreAlloc(alloc, &store);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try markDeletedTxn(alloc, &txn, 20, "a\x00b");
+        try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupLiveOrdinalTxn(alloc, &txn, "a\x00b"));
+    }
+    try validateStoreAlloc(alloc, &store);
+    try store.putBatch(&.{}, &.{live_key});
+    try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+    var repair_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &repair_writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 20, &repair_writes, &.{"a\x00b"}, &.{}, null);
+    try store.putBatch(repair_writes.items, &.{});
+    try validateStoreAlloc(alloc, &store);
+    // A dangling directory row or wrong ordinal must not authorize a query.
+    const extra_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "orphan");
+    defer alloc.free(extra_key);
+    var ordinal_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ordinal_bytes, ordinal, .big);
+    try store.putBatch(&.{.{ .key = extra_key, .value = &ordinal_bytes }}, &.{});
+    try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+    try store.putBatch(&.{}, &.{extra_key});
+    std.mem.writeInt(u32, &ordinal_bytes, ordinal + 1, .big);
+    try store.putBatch(&.{.{ .key = live_key, .value = &ordinal_bytes }}, &.{});
+    try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+    var conflicting_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &conflicting_writes);
+    try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 20, &conflicting_writes, &.{"a\x00b"}, &.{}, null));
+    std.mem.writeInt(u32, &ordinal_bytes, ordinal, .big);
+    try store.putBatch(&.{.{ .key = live_key, .value = &ordinal_bytes }}, &.{});
+    try validateStoreAlloc(alloc, &store);
+    try store.putBatch(&.{}, &.{&internal_keys.identity_live_directory_manifest_key});
+    try std.testing.expectError(error.InvalidDocIdentity, loadNamespaceFromStore(&store));
+    try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+}
+
+test "identity live directory metadata releases allocation failures (#1095)" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer freeIdentityWrites(alloc, &writes);
+            try appendNamespaceWrite(alloc, &writes, default_namespace);
+            try appendLiveDocOrdinalWrite(alloc, &writes, "a\x00b", 1);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

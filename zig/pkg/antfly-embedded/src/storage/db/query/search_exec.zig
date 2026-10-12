@@ -17644,7 +17644,9 @@ pub fn searchMatchAll(
         executor.collect_candidates_stream != null)
     {
         const start_ns = if (postprocess_req.profile) platform_time.monotonicNs() else 0;
-        const paging = componentPaging(postprocess_req);
+        // This is the final page of a proven single primary population.
+        // Fusion windows do not widen its public pagination or zero-limit count.
+        const paging = ComponentPaging{ .offset = postprocess_req.offset, .limit = postprocess_req.limit };
         const count_only = postprocess_req.count_only or paging.limit == 0;
         var page = MatchAllPageContext{
             .alloc = alloc,

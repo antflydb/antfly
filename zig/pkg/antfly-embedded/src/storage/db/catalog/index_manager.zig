@@ -37487,6 +37487,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
         &identity_writes,
         &.{"doc:target"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -37675,6 +37676,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
         &identity_writes,
         &.{"doc:legacy"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -39622,6 +39624,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
         &identity_writes,
         doc_ids[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -42580,6 +42583,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
         &identity_writes,
         doc_ids[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -42707,6 +42711,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
         &identity_writes,
         &.{"doc:primary"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 

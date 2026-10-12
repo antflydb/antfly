@@ -663,6 +663,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db search filters expired documents when ttl schema",
         "db full text match_all applies",
         "docstore runtime point get does not clone mutable snapshot",
+        "storage.db.doc_identity",
     };
     const parent_match_all_tests = b.addTest(.{
         .root_module = antfly_test_mod,

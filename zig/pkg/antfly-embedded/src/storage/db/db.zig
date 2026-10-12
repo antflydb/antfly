@@ -24541,8 +24541,7 @@ pub const DB = struct {
             if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
                 if (!stored.eql(command.scope().fence.namespace)) return error.IdentityNamespaceMismatch;
             } else {
-                const namespace_bytes = command.scope().namespace();
-                try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
+                try doc_identity.writeNamespaceTxn(&txn, command.scope().fence.namespace);
             }
             const source_authority = @import("../source_authority.zig");
             if (command.scope().authority == .native) {
@@ -24649,7 +24648,7 @@ pub const DB = struct {
             if (!source.scope().fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
             if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
                 if (!stored.eql(source.scope().fence.namespace)) return error.IdentityNamespaceMismatch;
-            } else try txn.put(&internal_keys.identity_namespace_key, &source.scope().namespace());
+            } else try doc_identity.writeNamespaceTxn(&txn, source.scope().fence.namespace);
             if (existing) |state| if (state.phase != .none and state.phase != .finalized and state.phase != .rolled_back) return error.IntegrityTopologyBusy;
             const authority = @import("../source_authority.zig");
             if (try authority.load(&txn) != null) _ = try authority.require(&txn, .raft, source.scope().namespace());
@@ -25874,9 +25873,7 @@ pub const DB = struct {
         if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
             if (!stored.eql(command.fence.namespace)) return error.IdentityNamespaceMismatch;
         } else {
-            var namespace_bytes: [24]u8 = undefined;
-            doc_identity.encodeNamespace(&namespace_bytes, command.fence.namespace);
-            try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
+            try doc_identity.writeNamespaceTxn(&txn, command.fence.namespace);
         }
         const topology = @import("relational_integrity_topology.zig");
         if (ordered_receipt != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
@@ -35130,9 +35127,7 @@ pub const DB = struct {
         } else {
             // Empty document owners may never have written a schema or row.
             // Their reservation itself must make the fresh identity durable.
-            var namespace_bytes: [24]u8 = undefined;
-            doc_identity.encodeNamespace(&namespace_bytes, namespace);
-            try txn.put(internal_keys.identity_namespace_key[0..], &namespace_bytes);
+            try doc_identity.writeNamespaceTxn(&txn, namespace);
         }
         try txn.put(staging.key, raw);
         try txn.commit();
@@ -41931,7 +41926,7 @@ pub const DB = struct {
         }, options, consumer_ctx, consumer);
     }
 
-    /// Identity mappings contain one row per source document, independently
+    /// The current-live directory contains one row per source document, independently
     /// of the number of colocated artifact, vector, and publication records.
     /// The outer apply lease keeps this population stable while streaming.
     const PrimaryMatchAllIdentityScan = struct {
@@ -41940,16 +41935,21 @@ pub const DB = struct {
         visitor_ctx: ?*anyopaque = null,
         visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction = undefined,
         alloc: Allocator = undefined,
+        observed_rows: ?*usize = null,
 
         fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.alloc = alloc;
             self.visitor = visitor;
             self.visitor_ctx = visitor_ctx;
-            const prefix = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind };
-            const end = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind + 1 };
+            // Explicit historical reads still need identities deleted since
+            // that generation. Current reads use the compact live population.
+            const historical = if (self.req.identity_read_generation) |generation| generation < try self.db.currentIdentityReadGeneration() else false;
+            const kind: u8 = if (historical) internal_keys.identity_doc_to_ordinal_kind else internal_keys.identity_live_doc_to_ordinal_kind;
+            const prefix = [_]u8{ internal_keys.identity_namespace, kind };
+            const end = [_]u8{ internal_keys.identity_namespace, kind + 1 };
             const after = if (options.primary_key_start_after) |id|
-                try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id)
+                try mappingKeyAlloc(alloc, id, kind)
             else
                 null;
             defer if (after) |key| alloc.free(key);
@@ -41958,19 +41958,48 @@ pub const DB = struct {
             const lower_owned = if (after) |key| try std.mem.concat(alloc, u8, &.{ key, &.{0} }) else null;
             defer if (lower_owned) |key| alloc.free(key);
             const before = if (options.primary_key_stop_before) |id|
-                try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id)
+                try mappingKeyAlloc(alloc, id, kind)
             else
                 null;
             defer if (before) |key| alloc.free(key);
+            // Splits retain historical identity metadata for both children.
+            // Seek directly into the owner's range instead of traversing the
+            // other child's live identities before reaching its first row.
+            const owner_range = self.db.core.byteRange();
+            const range_lower = if (owner_range.start.len != 0) try mappingKeyAlloc(alloc, owner_range.start, kind) else null;
+            defer if (range_lower) |key| alloc.free(key);
+            const range_upper = if (owner_range.end.len != 0) try mappingKeyAlloc(alloc, owner_range.end, kind) else null;
+            defer if (range_upper) |key| alloc.free(key);
+            var lower: []const u8 = lower_owned orelse &prefix;
+            if (range_lower) |key| if (std.mem.lessThan(u8, lower, key)) {
+                lower = key;
+            };
+            var upper: []const u8 = before orelse &end;
+            if (range_upper) |key| if (std.mem.lessThan(u8, key, upper)) {
+                upper = key;
+            };
+            if (!std.mem.lessThan(u8, lower, upper)) return;
             // The outer apply lease supplies stability. A current scan avoids
             // copying the entire mutable store just to return one identity.
+            {
+                var probe = try self.db.core.store.beginProbeTxn();
+                defer probe.abort();
+                if (try doc_identity.loadNamespaceTxn(&probe) == null) return;
+            }
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
-            try self.db.core.store.scanReadTxnWithContext(&txn, lower_owned orelse &prefix, before orelse &end, .{ .reverse = options.primary_key_reverse }, self, visit);
+            try self.db.core.store.scanReadTxnWithContext(&txn, lower, upper, .{ .reverse = options.primary_key_reverse }, self, visit);
+        }
+
+        fn mappingKeyAlloc(alloc: Allocator, id: []const u8, kind: u8) ![]u8 {
+            const key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id);
+            key[1] = kind;
+            return key;
         }
 
         fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.observed_rows) |count| count.* += 1;
             try db_query_search.checkSearchRequestDeadline(self.req);
             if (key.len < 4 or internal_keys.findComponentTerminator(key, 2) != key.len - 2 or value.len != 4)
                 return error.InvalidDocIdentity;
@@ -41983,7 +42012,7 @@ pub const DB = struct {
             };
             if (self.req.identity_read_generation) |generation| {
                 if (!state.isVisibleAt(generation)) return .@"continue";
-            } else if (!state.isLive()) return .@"continue";
+            } else if (!state.isLive()) return error.InvalidDocIdentity;
             const body = key[2 .. key.len - 2];
             if (try internal_keys.decodeBodyView(body)) |id| return self.visitId(id);
             const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
@@ -47616,7 +47645,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
     const identity_live_before = (try doc_identity.fastStatsFromStore(ctx.store)).live_ordinals;
-    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
         ctx.alloc,
         ctx.store,
         ctx.identity_namespace,
@@ -66899,6 +66928,7 @@ test "db resolved doc-set projection honors identity read generation" {
         &create_identity,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
 
@@ -66910,6 +66940,8 @@ test "db resolved doc-set projection honors identity read generation" {
         }
         delete_identity.deinit(alloc);
     }
+    var live_deletes_delete_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_delete_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         db.core.store,
@@ -66919,8 +66951,9 @@ test "db resolved doc-set projection honors identity read generation" {
         &delete_identity,
         &.{},
         &.{"doc:a"},
+        &live_deletes_delete_identity,
     );
-    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, live_deletes_delete_identity.items, null);
 
     var future_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
@@ -66939,6 +66972,7 @@ test "db resolved doc-set projection honors identity read generation" {
         &future_identity,
         &.{"doc:b"},
         &.{},
+        null,
     );
     try db.core.store.putBatchWithReplay(null, future_identity.items, &.{}, null);
 
@@ -68045,6 +68079,7 @@ test "db explicit doc-id filter resolution honors identity generation" {
         &create_identity,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
 
@@ -68056,6 +68091,8 @@ test "db explicit doc-id filter resolution honors identity generation" {
         }
         delete_identity.deinit(alloc);
     }
+    var live_deletes_delete_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_delete_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         db.core.store,
@@ -68065,8 +68102,9 @@ test "db explicit doc-id filter resolution honors identity generation" {
         &delete_identity,
         &.{},
         &.{"doc:a"},
+        &live_deletes_delete_identity,
     );
-    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, live_deletes_delete_identity.items, null);
 
     var visible_at_create = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 1);
     defer visible_at_create.deinit(alloc);
@@ -89370,6 +89408,11 @@ test "db default full text index searches template chunk text when chunker full 
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
     });
 
+    var empty_page = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .limit = 1 });
+    defer empty_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_page.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), empty_page.total_hits);
+
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
@@ -89395,6 +89438,24 @@ test "db default full text index searches template chunk text when chunker full 
     });
     defer members.deinit();
     try std.testing.expect(members.hits.len > 2);
+    var merged_page = try db.search(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .offset = 1,
+        .limit = 1,
+        .merge_config = .{ .strategy = .rrf, .window_size = 10 },
+    });
+    defer merged_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", merged_page.hits[0].id);
+    var merged_count = try db.search(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .limit = 0,
+        .merge_config = .{ .strategy = .rrf, .window_size = 1 },
+    });
+    defer merged_count.deinit();
+    try std.testing.expectEqual(@as(usize, 0), merged_count.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), merged_count.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, merged_count.total_hits_relation);
     for ([_]?[]const u8{ null, "full_text_index_v0" }) |index_name| {
         const backend = db.core.primary_store_owner.lsmBackend().?;
         const before_snapshot = backend.snapshotMaintenanceStats();
@@ -89473,6 +89534,26 @@ test "db default full text index searches template chunk text when chunker full 
     defer reverse_page.deinit();
     try std.testing.expectEqual(@as(usize, 1), reverse_page.hits.len);
     try std.testing.expectEqualStrings("doc:a\x00tail", reverse_page.hits[0].id);
+    try db.updateRange(.{ .start = "doc:a\x00tail", .end = "doc:b" });
+    var range_rows: usize = 0;
+    var range_hits: usize = 0;
+    var range_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &range_rows };
+    const RangeVisitor = struct {
+        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+            try std.testing.expectEqualStrings("doc:a\x00tail", id);
+            return .@"continue";
+        }
+    };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try DB.PrimaryMatchAllIdentityScan.scan(&range_scan, alloc, .{}, &range_hits, RangeVisitor.visit);
+    }
+    try std.testing.expectEqual(@as(usize, 1), range_hits);
+    try std.testing.expectEqual(@as(usize, 1), range_rows);
+    try db.updateRange(.{ .start = "", .end = "" });
     const orphan_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(orphan_key);
     try db.core.store.delete(orphan_key);
@@ -134433,4 +134514,140 @@ test "db v02 native restore repairs released projections" {
         if (!try db.restoreRuntimeRepairNeeded()) return;
     }
     return error.RestoreRuntimeRepairIncomplete;
+}
+
+test "db live primary directory bounds reads after deletion and survives reopen (#1095)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 128 * 1024 * 1024 } },
+    });
+    var closed = false;
+    defer if (!closed) db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var writes: [33]types.BatchWrite = undefined;
+    var deleted: [32][]const u8 = undefined;
+    for (0..32) |i| {
+        deleted[i] = try std.fmt.allocPrint(arena.allocator(), "a{d:0>4}", .{i});
+        writes[i] = .{ .key = deleted[i], .value = "{\"title\":\"historical source\",\"body\":\"text\"}" };
+    }
+    writes[32] = .{ .key = "z", .value = "{\"title\":\"live source\",\"body\":\"text\"}" };
+    try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+    try db.batch(.{ .deletes = &deleted, .sync_level = .full_index });
+    const Visitor = struct {
+        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+            try std.testing.expectEqualStrings("z", id);
+            return .stop;
+        }
+    };
+    for (0..2) |pass| {
+        var examined: usize = 0;
+        var accepted: usize = 0;
+        var scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &examined };
+        {
+            db.core.lockApplyShared();
+            defer db.core.unlockApplyShared();
+            try DB.PrimaryMatchAllIdentityScan.scan(&scan, alloc, .{}, &accepted, Visitor.visit);
+        }
+        try std.testing.expectEqual(@as(usize, 1), accepted);
+        try std.testing.expectEqual(@as(usize, 1), examined);
+        var page = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .limit = 1, .include_stored = false });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+        try std.testing.expectEqualStrings("z", page.hits[0].id);
+        try doc_identity.validateStoreAlloc(alloc, db.core.store);
+        if (pass == 0) {
+            db.close();
+            closed = true;
+            db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            closed = false;
+        }
+    }
+}
+
+test "db primary scan retains historical identity visibility (#1095)" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("historical-primary-identity");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .primary_backend = .{ .mem = .{} }, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .sync_level = .full_index });
+    const created = blk: {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "a")).?;
+        break :blk (try doc_identity.lookupStateTxn(&txn, ordinal)).?.created_generation;
+    };
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &deletes);
+    // Retain the source while its identity has become a historical tombstone.
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(alloc, db.core.store, db.core.identity_namespace, created + 1, &writes, &.{}, &.{"a"}, &deletes);
+    try db.core.store.putBatch(writes.items, deletes.items);
+    // This fixture bypasses the mutation coordinator, which normally publishes
+    // the committed visibility summary with these writes.
+    db.core.identity_visibility.summary = null;
+    var seen: usize = 0;
+    var historical = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{ .identity_read_generation = created } };
+    const Visitor = struct {
+        fn visit(raw: ?*anyopaque, id: []const u8) !docstore_mod.DocStore.ScanAction {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+            try std.testing.expectEqualStrings("a", id);
+            return .@"continue";
+        }
+    };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try DB.PrimaryMatchAllIdentityScan.scan(&historical, alloc, .{}, &seen, Visitor.visit);
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+    // Public searches continue to require the current captured generation.
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.search(alloc, .{ .limit = 10, .identity_read_generation = created }));
+    // The normal captured current request must select the live directory even
+    // though its generation is non-null.
+    seen = 0;
+    var examined: usize = 0;
+    var current = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = try db.searchRequestAtCurrentIdentityGeneration(.{}), .observed_rows = &examined };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try DB.PrimaryMatchAllIdentityScan.scan(&current, alloc, .{}, &seen, Visitor.visit);
+    }
+    try std.testing.expectEqual(@as(usize, 0), seen);
+    try std.testing.expectEqual(@as(usize, 0), examined);
 }
