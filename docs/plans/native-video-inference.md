@@ -969,3 +969,29 @@ synthetic SDR policy oracles, not universal real-world/HDR qualification.
 Source/binary/report receipts are in
 `zig/lib/video/testdata/presentation-validation`. Broader non-CUDA work remains
 active.
+
+### HLS master discovery continuation
+
+Native HLS ingestion now accepts master playlists and preserves variant and
+rendition declarations. Explicit constraints choose a stable video URL; DEFAULT
+or named alternate-camera selection supplies its media playlist. Initial discovery
+is transactional across both playlist reads, and subsequent reloads retain that
+URL. Initialization/media references resolve from the selected playlist while
+credential origin checks remain unchanged. Held packets survive reconfiguration,
+and allocation/cancellation failures reclaim temporary metadata and admission.
+
+The public Apple sample master is pinned for metadata-only parsing/selection;
+its MPEG-TS references are not downloaded. Synthetic authenticated fMP4 HTTP
+fixtures exercise alternate video selection, nested URI bases and reload/epoch
+transitions. Dedicated portable and HTTP test installation steps permit actual
+Linux execution, and serialized fuzz seeds have positive selection checks before
+coverage-guided mutation. Encrypted, MPEG-TS, low-latency and separate-track
+assembly remain implementation work; this continuation does not complete the
+full non-CUDA scope.
+
+Final HLS master gates pass 90 portable and six production HTTP tests on both
+macOS and actual Linux ARM64. A fresh bounded parser/selection campaign passes
+117,703 runs with four positively accepted Smith seeds, including the public
+Apple master fixture. Source/binary/report receipts are in
+`zig/lib/media/testdata/hls/master-validation`; these are protocol/ownership
+results, not codec, model, performance or arbitrary HLS conformance claims.

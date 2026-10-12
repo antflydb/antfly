@@ -31,7 +31,13 @@ pub fn build(b: *std.Build) void {
     http_integration.addImport("httpx", objectstore.module("objectstore").import_table.get("httpx").?);
     http_integration.addImport("antfly_media", b.modules.get("antfly_media").?);
     const http_tests = b.addTest(.{ .root_module = http_integration });
-    b.step("test-media-http", "Run native HTTP and live HLS ingestion tests").dependOn(&b.addRunArtifact(http_tests).step);
+    const run_http_tests = b.addRunArtifact(http_tests);
+    run_http_tests.has_side_effects = true;
+    b.step("test-media-http", "Run native HTTP and live HLS ingestion tests").dependOn(&run_http_tests.step);
+    b.step("install-media-http-tests", "Install production HTTP qualification tests for another host").dependOn(&b.addInstallArtifact(http_tests, .{ .dest_sub_path = "media-http-tests" }).step);
+    const fuzz_root = b.createModule(.{ .root_source_file = b.path("hls_master_fuzz_root.zig"), .target = target, .optimize = optimize });
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_root, .filters = &.{"HLS master fuzz"}, .use_llvm = true });
+    b.step("test-media-hls-fuzz", "Qualify bounded HLS master parsing and selection; accepts --fuzz=limit").dependOn(&b.addRunArtifact(fuzz_tests).step);
     b.step("check-media-http", "Compile native HTTP and live HLS ingestion tests").dependOn(&http_tests.step);
     support.addTests(b, b.path("."), target, optimize);
 }

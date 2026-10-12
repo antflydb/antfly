@@ -428,7 +428,7 @@ retrying a failed snapshot commit does not download or append that media twice.
 `zig build test-media-http` tests authenticated reads, exact ranges, redirect
 refusal and a complete reload/configuration transition against a local HTTP
 server using the production client. The portable suite additionally injects
-allocation failures across both epochs. Encrypted, MPEG-TS, master-selection,
+allocation failures across both epochs. HLS master selection is now implemented as described below. Encrypted, MPEG-TS,
 low-latency HLS and broader DASH support remain open.
 
 
@@ -698,3 +698,44 @@ quarter turns and SDR/PQ/HLG policies, with explicit failures for stereo,
 spherical projections, nonorthogonal poses and explicit chroma siting that
 requires another reconstruction filter. Media retains declarations without
 performing pixel conversion.
+
+## HLS master discovery and video rendition selection
+
+`hls_master.parse` retains borrowed variant and audio/video/subtitle/caption
+rendition metadata. `Master.select` chooses the highest advertised peak bandwidth
+within optional URI, resolution, frame-rate and declared-codec constraints.
+Codec matching respects the sample-type prefix boundary; audio codec entries
+can accompany the selected video codec. Missing declarations do not satisfy an
+explicit constraint. Video DEFAULT is honored unless a rendition name is
+provided. Equal-bandwidth choices use lexical URI and descriptor ordering,
+including duplicate video URIs with different audio groups. Separate audio and
+subtitle metadata remains available to callers; the live reader ingests video.
+These declarations follow [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216.html).
+
+`hls_live.Reader` accepts a master or direct media URL. Initial discovery fetches
+the master and chosen media playlist. The selected URL commits only when the
+media snapshot validates; failed transport, parsing, allocation or cancellation
+retains the previous state. Later reloads poll the selected media URL, without
+hidden adaptation or another master fetch. Maps and media resolve relative to
+that URL while authentication remains pinned to the original transport origin.
+Foreign-origin choices fail before an authenticated request. Existing epoch,
+mutation/gap, retry and held-packet ownership rules remain in effect.
+
+Master parsing/selection checks cancellation and bounds input, attributes,
+variants, renditions, URIs and planning storage. Its arrays carry shared
+host-memory admission through destruction, including growth/shrink overlap.
+Portable tests cover deterministic selection, malformed groups/attributes,
+allocation failures and cancellation; production HTTP tests exercise authenticated
+alternate-camera discovery and an initialization change with an old packet held.
+A pinned public Apple master configuration additionally tests real metadata;
+its referenced MPEG-TS media is not part of this qualification. Use
+`zig build test-media-hls-fuzz --fuzz=100000` for the bounded parser/selection
+campaign. Encrypted/MPEG-TS/low-latency ingestion and automatic separate-track
+assembly remain within the active streaming scope.
+
+Final HLS master gates pass 90 portable and six production HTTP tests on both
+macOS and actual Linux ARM64. A fresh bounded parser/selection campaign passes
+117,703 runs with four positively accepted Smith seeds, including the public
+Apple master fixture. Source/binary/report receipts are in
+`zig/lib/media/testdata/hls/master-validation`; these are protocol/ownership
+results, not codec, model, performance or arbitrary HLS conformance claims.

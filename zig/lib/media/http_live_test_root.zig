@@ -219,3 +219,62 @@ test "production DASH multiple periods authenticate repeated initialization and 
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 5), transport.requests);
 }
+
+test "production HLS master selects authenticated alternate video and resolves relative initialization across reload" {
+    const master = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"camera\",NAME=\"main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"cameras/main/list.m3u8\"\n#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"camera\",NAME=\"side\",URI=\"cameras/side/list.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\",VIDEO=\"camera\"\nlarge/list.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=700000,CODECS=\"avc1.4d401e\",VIDEO=\"camera\"\nsmall/list.m3u8\n";
+    const first = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\nseg.mp4\n";
+    const second = first ++ "#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init2.mp4\"\n#EXTINF:2,\nseg2.mp4\n#EXT-X-ENDLIST\n";
+    const original = @embedFile("testdata/fragmented.mp4");
+    const changed = @embedFile("testdata/live-reconfigure.mp4");
+    const split = struct {
+        fn at(bytes: []const u8) !usize {
+            var cursor: usize = 0;
+            while (cursor < bytes.len) {
+                const box = try media.isobmff.readBox(bytes, cursor);
+                if (box.typ == media.isobmff.fourcc("moof")) return cursor;
+                cursor = box.end;
+            }
+            return error.MissingMedia;
+        }
+    }.at;
+    const offset = try split(original);
+    const changed_offset = try split(changed);
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/hls/master.m3u8", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = master } },
+        .{ .path = "/hls/cameras/side/list.m3u8", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = first } },
+        .{ .path = "/hls/cameras/side/list.m3u8", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = second } },
+        .{ .path = "/hls/cameras/side/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..offset] } },
+        .{ .path = "/hls/cameras/side/seg.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[offset..] } },
+        .{ .path = "/hls/cameras/side/init2.mp4", .assert_request = Verify.auth, .respond = .{ .body = changed[0..changed_offset] } },
+        .{ .path = "/hls/cameras/side/seg2.mp4", .assert_request = Verify.auth, .respond = .{ .body = changed[changed_offset..] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/hls/master.m3u8", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{ .selection = .{ .max_bandwidth = 1000000, .video_rendition_name = "side", .codec_prefixes = &.{ "avc1", "avc3" } } });
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 7 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    const selected_url = try std.fmt.allocPrint(a, "{s}/hls/cameras/side/list.m3u8", .{server.baseUrl()});
+    defer a.free(selected_url);
+    try std.testing.expectEqualStrings(selected_url, reader.mediaUrl());
+    var old = (try reader.next()).?;
+    defer old.deinit();
+    var lease = try old.reader.readPacket(0);
+    defer lease.deinit();
+    const retained = try a.dupe(u8, lease.bytes);
+    defer a.free(retained);
+    try reader.reload();
+    var new = (try reader.next()).?;
+    defer new.deinit();
+    try std.testing.expectEqual(@as(usize, 1), new.epoch);
+    try std.testing.expectEqual(@as(u16, 96), new.reader.track.width);
+    try std.testing.expectEqualSlices(u8, retained, lease.bytes);
+    try std.testing.expect(reader.ended());
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 7), transport.requests);
+}

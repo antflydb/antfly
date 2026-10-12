@@ -27,5 +27,6 @@ pub fn attach(b: *std.Build, consumer: *std.Build.Module, root: std.Build.LazyPa
 pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) void {
     const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = root.path(b, "media_test_root.zig"), .target = target, .optimize = optimize }) });
     b.step("test-media", "Run shared container, source and timeline tests").dependOn(&b.addRunArtifact(tests).step);
+    b.step("install-media-tests", "Install portable container/source qualification for another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "media-tests" }).step);
     b.step("check-media", "Compile shared media tests without executing them").dependOn(&tests.step);
 }

@@ -15,6 +15,7 @@
 
 //! Bounded RFC 8216 fMP4 media-playlist parsing. Strings borrow the input.
 const std = @import("std");
+pub const master = @import("hls_master.zig");
 pub const Range = struct { offset: u64, length: u64 };
 pub const Initialization = struct { uri: []const u8, range: ?Range };
 /// DASH period identity survives live-window removal and XML reordering.
@@ -66,6 +67,8 @@ pub const Segment = struct {
 pub const Limits = struct {
     max_bytes: usize = 1024 * 1024,
     max_segments: usize = 4096,
+    max_variants: usize = 1024,
+    max_renditions: usize = 4096,
     max_uri_bytes: usize = 4096,
     max_periods: usize = 4096,
     max_timeline_entries: usize = 4096,
@@ -150,6 +153,7 @@ fn map(value: []const u8, limits: Limits) !Initialization {
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist {
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.MalformedHls;
+    if (master.isMaster(bytes)) return error.UnsupportedHls;
     for (bytes) |c| if ((c < 0x20 and c != '\n' and c != '\r') or c == 0x7f) return error.MalformedHls;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next().?, "\r"), "#EXTM3U")) return error.MalformedHls;

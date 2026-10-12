@@ -19,7 +19,7 @@ const hls = @import("hls.zig");
 const network = @import("http_stream.zig");
 const live = @import("live_mp4.zig");
 const dash_cursor = @import("dash_cursor.zig");
-pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{} };
+pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{} };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range);
 }
@@ -32,8 +32,9 @@ fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
     return std.math.order(left.sequence, right.sequence);
 }
 
-/// Single consumer, borrowing a native HTTP adapter. reload() performs one
-/// bounded request; the caller's scheduler waits between reloads. next() returns
+/// Single consumer, borrowing a native HTTP adapter. Initial master discovery
+/// requests a master and selected media playlist; subsequent reloads request one
+/// pinned media playlist; the caller's scheduler waits between reloads. next() returns
 /// an independently owned immutable segment; epochs require a decoder reset.
 pub fn Reader(comptime http: type) type {
     return ReaderWithManifest(http, hls);
@@ -47,6 +48,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         allocator: std.mem.Allocator,
         transport: *network.Adapter(http),
         url: []u8,
+        /// Committed only after the selected media snapshot validates.
+        media_url: ?[]u8 = null,
         options: ReaderOptions,
         manifest: ?network.Body = null,
         playlist: ?hls.Playlist = null,
@@ -65,19 +68,37 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             if (self.playlist) |*playlist| playlist.deinit();
             if (self.manifest) |*manifest| manifest.deinit();
             if (self.active_initialization) |initialization| self.allocator.free(initialization.uri);
+            if (self.media_url) |url| self.allocator.free(url);
             self.allocator.free(self.url);
             self.* = undefined;
+        }
+        pub fn mediaUrl(self: *const Self) []const u8 {
+            return self.media_url orelse self.url;
         }
         /// Initial load starts at the oldest available segment. A live window
         /// advancing past an unconsumed sequence fails instead of dropping data.
         /// Overlapping sequence descriptors must remain immutable across reloads.
         pub fn reload(self: *Self) !void {
             try self.transport.control.check();
-            var body = try self.transport.fetch(self.url, self.url, null, self.options.playlist.max_bytes);
+            var body = try self.transport.fetch(self.mediaUrl(), self.mediaUrl(), null, self.options.playlist.max_bytes);
             errdefer body.deinit();
+            var selected_url: ?[]u8 = null;
+            defer if (selected_url) |url| self.allocator.free(url);
+            if (comptime @hasDecl(manifest_parser, "master")) {
+                if (self.media_url == null and manifest_parser.master.isMaster(body.bytes)) {
+                    var master = try manifest_parser.master.parseControlled(self.allocator, body.bytes, self.options.playlist, self.transport.control, self.transport.pool);
+                    defer master.deinit();
+                    const selected = try master.selectControlled(self.options.selection, self.transport.control);
+                    selected_url = try network.resolve(self.allocator, self.transport.root_url, self.url, selected.uri, self.transport.limits.max_uri_bytes);
+                    const media_body = try self.transport.fetch(selected_url.?, selected_url.?, null, self.options.playlist.max_bytes);
+                    body.deinit();
+                    body = media_body;
+                }
+            }
+            const manifest_url = selected_url orelse self.mediaUrl();
             var parsed = if (@hasDecl(manifest_parser, "parseAtWithSelection")) blk: {
                 var selection = self.options.selection;
-                selection.manifest_url = self.url;
+                selection.manifest_url = manifest_url;
                 break :blk try manifest_parser.parseAtWithSelection(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null, selection);
             } else if (@hasDecl(manifest_parser, "parseAt"))
                 try manifest_parser.parseAt(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null)
@@ -120,10 +141,15 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (expected_sequence > last + 1) return error.SourceVersionChanged;
                 } else if (self.playlist != null and self.playlist.?.segments.len != 0) return error.SourceVersionChanged;
             }
+            try self.transport.control.check();
             if (self.playlist) |*previous| previous.deinit();
             if (self.manifest) |*previous| previous.deinit();
             self.playlist = parsed;
             self.manifest = body;
+            if (selected_url) |url| {
+                self.media_url = url;
+                selected_url = null;
+            }
             if (self.dash_position) |*position| position.refresh(parsed);
             if (self.next_sequence == null and parsed.segments.len != 0) {
                 self.next_sequence = parsed.segments[0].sequence;
@@ -167,24 +193,24 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             };
             const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence or (if (item.dash) |timing| !std.meta.eql(self.active_dash_period, @as(?[32]u8, timing.period.identity)) else false) else true;
             if (needs_initialization) {
-                var initialization = try self.transport.fetch(self.url, item.initialization.uri, item.initialization.range, self.options.ingest.stream.max_bytes);
+                var initialization = try self.transport.fetch(self.mediaUrl(), item.initialization.uri, item.initialization.range, self.options.ingest.stream.max_bytes);
                 defer initialization.deinit();
                 const owned_uri = try self.allocator.dupe(u8, item.initialization.uri);
                 errdefer self.allocator.free(owned_uri);
                 if (self.ingest) |*ingest| {
-                    try ingest.reconfigure(self.url, initialization.bytes);
+                    try ingest.reconfigure(self.mediaUrl(), initialization.bytes);
                 } else {
                     var options = self.options.ingest;
                     options.stream.control = self.transport.control;
                     if (options.stream.admission_pool == null) options.stream.admission_pool = self.transport.pool;
-                    self.ingest = try live.Ingest.init(self.allocator, self.url, initialization.bytes, options);
+                    self.ingest = try live.Ingest.init(self.allocator, self.mediaUrl(), initialization.bytes, options);
                 }
                 if (self.active_initialization) |previous| self.allocator.free(previous.uri);
                 self.active_initialization = .{ .uri = owned_uri, .range = item.initialization.range };
                 self.active_discontinuity_sequence = item.discontinuity_sequence;
                 self.active_dash_period = if (item.dash) |timing| timing.period.identity else null;
             }
-            var media = try self.transport.fetch(self.url, item.uri, item.range, self.options.ingest.stream.max_bytes);
+            var media = try self.transport.fetch(self.mediaUrl(), item.uri, item.range, self.options.ingest.stream.max_bytes);
             defer media.deinit();
             try self.ingest.?.push(media.bytes);
             var result = try self.ingest.?.finishSegment();
@@ -520,4 +546,100 @@ fn dashPeriodAllocationRun(backing: std.mem.Allocator) !void {
 }
 test "live DASH reload and period reconfiguration release every failing allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dashPeriodAllocationRun, .{});
+}
+
+const master_manifest = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\",RESOLUTION=1280x720\nvariants/high/list.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=700000,CODECS=\"avc1.4d401e\",RESOLUTION=640x360\nvariants/low/list.m3u8\n";
+const MasterHttp = struct {
+    pub const Client = struct {
+        master: []const u8 = master_manifest,
+        media: []const u8 = first_manifest,
+        calls: usize = 0,
+        fail_playlist: bool = false,
+        pub fn get(self: *@This(), url: []const u8, options: anytype) !FakeHttp.Response {
+            self.calls += 1;
+            if (std.mem.endsWith(u8, url, "/master.m3u8")) return .{ .body = self.master };
+            if (!std.mem.startsWith(u8, url, "https://example.test/live/variants/low/")) return error.IncorrectHlsVariantBase;
+            if (std.mem.endsWith(u8, url, "/list.m3u8")) {
+                if (self.fail_playlist) return error.ConnectionReset;
+                return .{ .body = self.media };
+            }
+            var original = FakeHttp.Client{ .manifest = self.media };
+            return original.get(url, options);
+        }
+    };
+};
+test "live HLS master selects media base and pins it across reload and epoch transitions" {
+    const a = std.testing.allocator;
+    var client = MasterHttp.Client{};
+    var transport = network.Adapter(MasterHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/master.m3u8" };
+    var reader = try Reader(MasterHttp).init(a, &transport, transport.root_url, .{ .selection = .{ .max_bandwidth = 1000000, .codec_prefixes = &.{"avc1"} } });
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expectEqualStrings("https://example.test/live/variants/low/list.m3u8", reader.mediaUrl());
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var held = try first.reader.readPacket(0);
+    defer held.deinit();
+    const bytes = try a.dupe(u8, held.bytes);
+    defer a.free(bytes);
+    client.master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://other.test/changed.m3u8\n";
+    client.media = second_manifest;
+    try reader.reload();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.epoch);
+    try std.testing.expectEqualSlices(u8, bytes, held.bytes);
+    try std.testing.expect(reader.ended());
+    try std.testing.expectEqual(@as(usize, 7), client.calls);
+}
+test "live HLS master discovery failures retain uncommitted URL and release admission" {
+    const a = std.testing.allocator;
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    var client = MasterHttp.Client{ .fail_playlist = true };
+    var transport = network.Adapter(MasterHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/master.m3u8", .pool = &pool };
+    var reader = try Reader(MasterHttp).init(a, &transport, transport.root_url, .{ .selection = .{ .max_bandwidth = 1000000 } });
+    defer reader.deinit();
+    try std.testing.expectError(error.ConnectionReset, reader.reload());
+    try std.testing.expect(reader.media_url == null and reader.playlist == null and reader.next_sequence == null);
+    try std.testing.expectEqual(@import("admission.zig").Resources{}, pool.snapshot());
+    client.fail_playlist = false;
+    client.media = "#EXTM3U\n#EXTINF:2,\n";
+    try std.testing.expectError(error.MalformedHls, reader.reload());
+    try std.testing.expect(reader.media_url == null and reader.playlist == null);
+    try std.testing.expectEqual(@import("admission.zig").Resources{}, pool.snapshot());
+    client.media = first_manifest;
+    try reader.reload();
+    try std.testing.expect(reader.media_url != null);
+    try std.testing.expectEqual(@as(usize, 6), client.calls);
+}
+test "live HLS master refuses foreign-origin variants before authenticated transport" {
+    const a = std.testing.allocator;
+    var client = MasterHttp.Client{ .master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://other.test/media.m3u8\n" };
+    var transport = network.Adapter(MasterHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/master.m3u8" };
+    var reader = try Reader(MasterHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.MediaOriginChanged, reader.reload());
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    try std.testing.expect(reader.media_url == null and reader.playlist == null);
+}
+fn masterAllocations(a: std.mem.Allocator, pool: *@import("admission.zig").Pool) !void {
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), @import("admission.zig").Resources{}));
+    var client = MasterHttp.Client{};
+    var transport = network.Adapter(MasterHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/master.m3u8", .pool = pool };
+    var reader = try Reader(MasterHttp).init(a, &transport, transport.root_url, .{ .selection = .{ .max_bandwidth = 1000000 } });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var held = try first.reader.readPacket(0);
+    defer held.deinit();
+    client.media = second_manifest;
+    try reader.reload();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.epoch);
+}
+test "live HLS master selection allocation failures release snapshots epochs and packet owners" {
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, masterAllocations, .{&pool});
 }

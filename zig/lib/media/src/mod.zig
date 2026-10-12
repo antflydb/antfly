@@ -26,6 +26,7 @@ pub const dash = @import("dash.zig");
 pub const dash_live = @import("dash_live.zig");
 pub const hls_live = @import("hls_live.zig");
 pub const hls = @import("hls.zig");
+pub const hls_master = @import("hls_master.zig");
 pub const stream = @import("stream.zig");
 pub const source = @import("source.zig");
 pub const timeline = @import("timeline.zig");
@@ -38,6 +39,7 @@ test {
     _ = stream;
     _ = live_mp4;
     _ = hls;
+    _ = hls_master;
     _ = dash;
     _ = dash_live;
     _ = http_stream;
