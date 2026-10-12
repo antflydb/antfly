@@ -636,6 +636,16 @@ pub const DocStore = struct {
             return value;
         }
 
+        /// Exact key presence in this transaction's view. Physical references
+        /// prove presence without resolving external source/artifact payloads.
+        pub fn contains(self: *Txn, key: []const u8) !bool {
+            _ = self.getPhysical(key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            return true;
+        }
+
         pub fn getArtifactMetadata(self: *Txn, key: []const u8) !artifact_payload.Metadata {
             const value = try self.getPhysical(key);
             const metadata = try artifact_payload.Metadata.decode(value);
@@ -5366,6 +5376,15 @@ test "docstore runtime point get does not clone mutable snapshot" {
     const value = try store.get(alloc, "doc:a");
     defer alloc.free(value);
     try std.testing.expectEqualStrings("alpha", value);
+    {
+        var probe = try store.beginProbeTxn();
+        defer probe.abort();
+        try std.testing.expect(try probe.contains("doc:a"));
+        try std.testing.expect(!try probe.contains("doc:"));
+        try std.testing.expect(!try probe.contains("doc:missing"));
+        try store.delete("doc:a");
+        try std.testing.expect(!try probe.contains("doc:a"));
+    }
     const after = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

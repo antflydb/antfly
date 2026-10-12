@@ -39635,6 +39635,32 @@ pub const DB = struct {
     }
 
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
+        // A primary-document projection may also contain generated members.
+        // For a plain source-parent match_all those members cannot add a parent
+        // or improve its constant score. Read the primary population directly,
+        // before resolving filters in the member index's document-number space.
+        if (text_query == .match_all and primaryParentMatchAllEligible(req)) {
+            if (self.core.textIndexEntry(req.index_name)) |entry| {
+                if (entry.chunk_name == null and entry.source_artifact_names.len == 0 and
+                    try self.core.textIndexIsChunkBacked(alloc, entry.config.name))
+                {
+                    var executor = self.matchAllExecutor();
+                    executor.bounded_unordered_page = true;
+                    var primary_req = req;
+                    primary_req.index_name = entry.config.name;
+                    // The population proof replaces the retrieval predicate.
+                    // Leaving it here would resolve match_all as a full-text
+                    // filter and enumerate the very members we eliminated.
+                    primary_req.full_text = null;
+                    const metric_name = self.textQueryMetricIndexName(req);
+                    const start_ns = platform_time.monotonicNs();
+                    errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
+                    const result = try db_query_search.searchMatchAll(alloc, primary_req, executor);
+                    db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
+                    return result;
+                }
+            }
+        }
         const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
         var algebraic_filter = if (needs_algebraic_doc_filter)
             try self.searchRequestWithAlgebraicDocFilterAlloc(req)
@@ -41842,7 +41868,11 @@ pub const DB = struct {
     }
 
     fn searchMatchAll(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try db_query_search.searchMatchAll(alloc, req, .{
+        return try db_query_search.searchMatchAll(alloc, req, self.matchAllExecutor());
+    }
+
+    fn matchAllExecutor(self: *DB) db_query_search.MatchAllExecutor {
+        return .{
             .ctx = self,
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
             .collect_candidates_stream = streamSearchMatchAllCandidatesCallback,
@@ -41856,7 +41886,7 @@ pub const DB = struct {
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
-        });
+        };
     }
 
     fn collectSearchMatchAllCandidatesCallback(
@@ -41887,8 +41917,11 @@ pub const DB = struct {
         consumer: db_query_search.MatchAllCandidateConsumer,
     ) anyerror!db_query_search.MatchAllCandidateStreamStats {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var identity_scan = PrimaryMatchAllIdentityScan{ .db = self, .req = req };
         return try db_query_search.streamMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
+            .scan_ids_ctx = &identity_scan,
+            .scan_ids = PrimaryMatchAllIdentityScan.scan,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -41897,6 +41930,85 @@ pub const DB = struct {
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         }, options, consumer_ctx, consumer);
     }
+
+    /// Identity mappings contain one row per source document, independently
+    /// of the number of colocated artifact, vector, and publication records.
+    /// The outer apply lease keeps this population stable while streaming.
+    const PrimaryMatchAllIdentityScan = struct {
+        db: *DB,
+        req: types.SearchRequest,
+        visitor_ctx: ?*anyopaque = null,
+        visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction = undefined,
+        alloc: Allocator = undefined,
+
+        fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.alloc = alloc;
+            self.visitor = visitor;
+            self.visitor_ctx = visitor_ctx;
+            const prefix = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind };
+            const end = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind + 1 };
+            const after = if (options.primary_key_start_after) |id|
+                try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id)
+            else
+                null;
+            defer if (after) |key| alloc.free(key);
+            // Appending zero excludes the complete mapping key while admitting
+            // arbitrary longer document IDs, including IDs containing NUL.
+            const lower_owned = if (after) |key| try std.mem.concat(alloc, u8, &.{ key, &.{0} }) else null;
+            defer if (lower_owned) |key| alloc.free(key);
+            const before = if (options.primary_key_stop_before) |id|
+                try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id)
+            else
+                null;
+            defer if (before) |key| alloc.free(key);
+            // The outer apply lease supplies stability. A current scan avoids
+            // copying the entire mutable store just to return one identity.
+            var txn = try self.db.core.store.beginCurrentScanTxn();
+            defer txn.abort();
+            try self.db.core.store.scanReadTxnWithContext(&txn, lower_owned orelse &prefix, before orelse &end, .{ .reverse = options.primary_key_reverse }, self, visit);
+        }
+
+        fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try db_query_search.checkSearchRequestDeadline(self.req);
+            if (key.len < 4 or internal_keys.findComponentTerminator(key, 2) != key.len - 2 or value.len != 4)
+                return error.InvalidDocIdentity;
+            const ordinal = std.mem.readInt(u32, value[0..4], .big);
+            if (ordinal == 0) return error.InvalidDocIdentity;
+            const state = state: {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                break :state (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.InvalidDocIdentity;
+            };
+            if (self.req.identity_read_generation) |generation| {
+                if (!state.isVisibleAt(generation)) return .@"continue";
+            } else if (!state.isLive()) return .@"continue";
+            const body = key[2 .. key.len - 2];
+            if (try internal_keys.decodeBodyView(body)) |id| return self.visitId(id);
+            const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
+            defer self.alloc.free(id);
+            return self.visitId(id);
+        }
+
+        fn visitId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
+            // Identity rows can outlive their source during cleanup. Probe
+            // keys without hydrating source bodies, so counts and identity-only
+            // pages retain the same presence proof as primary-store scans.
+            const primary_key = try internal_keys.documentKeyAlloc(self.alloc, id);
+            defer self.alloc.free(primary_key);
+            const present = present: {
+                var txn = try self.db.core.store.beginProbeTxn();
+                defer txn.abort();
+                if (try txn.contains(primary_key)) break :present true;
+                const relational_key = try internal_keys.relationalRowKeyAlloc(self.alloc, id);
+                defer self.alloc.free(relational_key);
+                break :present try txn.contains(relational_key);
+            };
+            if (!present) return .@"continue";
+            return self.visitor(self.visitor_ctx, id);
+        }
+    };
 
     fn lookupLiveDocOrdinalNoLockCallback(
         ctx: ?*anyopaque,
@@ -89208,7 +89320,27 @@ test "db leased enrichment worker persists chunk storage when chunker enables fu
     try std.testing.expect(chunk_count > 0);
 }
 
-test "db default full text index searches template chunk text when chunker full text indexing is enabled" {
+fn primaryParentMatchAllEligible(req: types.SearchRequest) bool {
+    return db_query_search.isDefaultMatchAll(req.query) and
+        req.return_mode == .parent and req.hierarchy_group_level == .source and
+        !req.hierarchy_grouped_matches and req.hierarchy_children == null and
+        !req.hierarchy_include_source and !req.hierarchy_include_unit and
+        req.order_by.len == 0 and req.highlight == null and
+        req.filter_ids.len == 0 and req.exclude_ids.len == 0 and
+        req.search_after.len == 0 and req.search_before.len == 0 and
+        req.filter_text == null and req.exclusion_text == null and
+        req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and
+        req.authorization_filter_query_json.len == 0 and req.resolved_text_doc_filter == null and
+        req.doc_filter_bindings.len == 0 and !req.require_algebraic_filter_resolution and
+        req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and
+        req.dense_queries.len == 0 and req.sparse_queries.len == 0 and
+        req.aggregations_json.len == 0 and req.graph_queries.len == 0 and
+        req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and
+        req.reranker == null and req.expand_strategy == null and
+        !req.hasHitEvaluation() and req.evaluation_limit == 0 and req.pruner == null;
+}
+
+test "db default full text index searches template chunk text when chunker full text indexing is enabled (#1095)" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -89223,6 +89355,7 @@ test "db default full text index searches template chunk text when chunker full 
             .dense_embedder = deterministic.interface(),
         },
         .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 128 * 1024 * 1024 } },
     });
     defer db.close();
 
@@ -89240,6 +89373,7 @@ test "db default full text index searches template chunk text when chunker full 
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+            .{ .key = "doc:b", .value = "{\"empty\":true}" },
         },
         .sync_level = .full_index,
     });
@@ -89253,6 +89387,123 @@ test "db default full text index searches template chunk text when chunker full 
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expect(try db.core.textIndexIsChunkBacked(alloc, "full_text_index_v0"));
+    var members = try db.search(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .return_mode = .member,
+        .limit = 100,
+    });
+    defer members.deinit();
+    try std.testing.expect(members.hits.len > 2);
+    for ([_]?[]const u8{ null, "full_text_index_v0" }) |index_name| {
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const before_snapshot = backend.snapshotMaintenanceStats();
+        var page = try db.search(alloc, .{
+            .index_name = index_name,
+            .full_text = .{ .match_all = {} },
+            .limit = 1,
+            .include_stored = true,
+            .fields = &.{"title"},
+        });
+        defer page.deinit();
+        try std.testing.expectEqual(before_snapshot.mutable_snapshot_clone_calls, backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
+        try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+        try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+        try std.testing.expectEqual(@as(u32, 1), page.total_hits);
+        try std.testing.expectEqual(types.TotalHitsRelation.gte, page.total_hits_relation);
+        try std.testing.expectEqual(@as(usize, 0), page.hits[0].sort_values.len);
+        try std.testing.expect(std.mem.indexOf(u8, page.hits[0].stored_data.?, "Alpha") != null);
+        var offset_page = try db.search(alloc, .{
+            .index_name = index_name,
+            .full_text = .{ .match_all = {} },
+            .offset = 1,
+            .limit = 1,
+        });
+        defer offset_page.deinit();
+        try std.testing.expectEqualStrings("doc:b", offset_page.hits[0].id);
+        for ([_]bool{ false, true }) |count_only| {
+            var count = try db.search(alloc, .{
+                .index_name = index_name,
+                .full_text = .{ .match_all = {} },
+                .limit = if (count_only) 10 else 0,
+                .count_only = count_only,
+            });
+            defer count.deinit();
+            try std.testing.expectEqual(@as(usize, 0), count.hits.len);
+            try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, count.total_hits_relation);
+        }
+    }
+    // A named artifact-only projection must not acquire unrelated primary rows.
+    try db.addIndex(.{
+        .name = "only_chunks",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"semantic_template_chunked_idx_chunks\"}",
+    });
+    var artifact_parents = try waitForSearchResult(alloc, &db, .{
+        .index_name = "only_chunks",
+        .full_text = .{ .match_all = {} },
+        .limit = 100,
+    }, 1);
+    defer artifact_parents.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifact_parents.hits.len);
+    try std.testing.expectEqualStrings("doc:a", artifact_parents.hits[0].id);
+    var filtered = try db.search(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .filter_prefix = "doc:b",
+        .limit = 1,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:b", filtered.hits[0].id);
+    try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .full_index });
+    var after_delete = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .limit = 0 });
+    defer after_delete.deinit();
+    try std.testing.expectEqual(@as(u32, 1), after_delete.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, after_delete.total_hits_relation);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a\x00tail", .value = "{\"title\":\"escaped identity\"}" }}, .sync_level = .full_index });
+    const order = [_]types.SortField{.{ .field = "_id" }};
+    const after = [_]std.json.Value{.{ .string = "doc:a" }};
+    var cursor_page = try db.search(alloc, .{ .order_by = &order, .search_after = &after, .limit = 1 });
+    defer cursor_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cursor_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a\x00tail", cursor_page.hits[0].id);
+    const before = [_]std.json.Value{.{ .string = "doc:b" }};
+    var reverse_page = try db.search(alloc, .{ .order_by = &order, .search_before = &before, .limit = 1 });
+    defer reverse_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reverse_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a\x00tail", reverse_page.hits[0].id);
+    const orphan_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(orphan_key);
+    try db.core.store.delete(orphan_key);
+    var orphan_count = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .limit = 0 });
+    defer orphan_count.deinit();
+    try std.testing.expectEqual(@as(u32, 1), orphan_count.total_hits);
+    var orphan_page = try db.search(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer orphan_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), orphan_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a\x00tail", orphan_page.hits[0].id);
+}
+
+test "db primary parent match_all eligibility preserves transformed populations (#1095)" {
+    try std.testing.expect(primaryParentMatchAllEligible(.{}));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .return_mode = .member }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .return_mode = .parent_with_chunks }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .return_mode = .unit }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .filter_text = .{ .match_all = {} } }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .filter_query_json = "{}" }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .aggregations_json = "{}" }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .hierarchy_include_source = true }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .dense = .{ .vector = &.{1} } }));
+    try std.testing.expect(!primaryParentMatchAllEligible(.{ .full_text_queries = &.{.{
+        .name = "named",
+        .index_name = "ft",
+        .query = .{ .match_all = {} },
+    }} }));
 }
 
 test "db full_text sync level does not precompute template chunk full text routing" {
