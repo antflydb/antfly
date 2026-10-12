@@ -1490,8 +1490,9 @@ pub const OwnedGraphNodes = struct {
 };
 
 pub fn compactMetricLayout(nodes: []const graph_query_mod.GraphResultNode) bool {
-    if (nodes.len == 0 or nodes.len > std.math.maxInt(u32) or nodes[0].metric_columns == null) return false;
+    if (nodes.len == 0 or nodes.len > std.math.maxInt(u32) or nodes[0].metricCount() == 0) return false;
     const width = nodes[0].metricCount();
+    if (width > graph_query_mod.graph_metric_projection_limit) return false;
     for (nodes) |node| {
         if (!node.metricViewValid() or node.metricCount() != width) return false;
         for (0..width) |column| if (!std.mem.eql(u8, node.metricAt(column).name, nodes[0].metricAt(column).name)) return false;
@@ -1521,6 +1522,7 @@ pub fn cloneGraphMetricOwner(alloc: std.mem.Allocator, nodes: []const graph_quer
         owner.* = .{ .names = names, .scores = scores, .rows = nodes.len };
         return .{ .columns = owner };
     }
+    for (nodes) |node| if (!node.metricViewValid()) return error.InvalidRemoteResponse;
     var count: usize = 0;
     for (nodes) |node| count = try std.math.add(usize, count, node.metricCount());
     if (count == 0) return .{};

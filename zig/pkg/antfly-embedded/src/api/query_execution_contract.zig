@@ -5141,6 +5141,7 @@ pub fn parseRemoteGraphResults(
         results[initialized] = .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .nodes = parsed_nodes.nodes,
+            .metric_columns = parsed_nodes.metric_columns,
             .paths = paths,
             .matches = parsed_matches.matches,
             .aggregates = aggregates,
@@ -5188,10 +5189,12 @@ pub fn parseRemoteGraphAggregates(
 pub const ParsedRemoteGraphNodes = struct {
     nodes: []graph_query_mod.GraphResultNode = &.{},
     hits: []db_mod.types.SearchHit = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
 
     pub fn deinit(self: ParsedRemoteGraphNodes, alloc: std.mem.Allocator) void {
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |owner| owner.deinit(alloc);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
     }
@@ -5209,12 +5212,59 @@ pub const ParsedRemoteGraphMatches = struct {
     }
 };
 
+// A wire node may omit metrics entirely or use a different dictionary. Keep
+// that compatibility path, but decode uniform projections directly into their
+// final column owner without per-node values or duplicated names.
+fn parseRemoteUniformMetricColumns(alloc: std.mem.Allocator, nodes: []const indexes_openapi.GraphResultNode) !?*graph_query_mod.GraphMetricColumns {
+    if (nodes.len == 0) return null;
+    const first = nodes[0].metrics orelse return null;
+    const width = first.map.count();
+    if (width == 0) return null;
+    if (width > graph_query_mod.graph_metric_projection_limit) return error.InvalidRemoteResponse;
+    for (nodes) |node| {
+        const metrics = node.metrics orelse return null;
+        if (metrics.map.count() != width) return null;
+        for (first.map.keys()) |name| if (!metrics.map.contains(name)) return null;
+    }
+    const owner = try alloc.create(graph_query_mod.GraphMetricColumns);
+    errdefer alloc.destroy(owner);
+    const names = try alloc.alloc([]u8, width);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    const scores = try alloc.alloc(f64, try std.math.mul(usize, width, nodes.len));
+    errdefer alloc.free(scores);
+    for (first.map.keys(), names, 0..) |name, *owned, column| {
+        if (!graph_query_mod.isValidIdentifier(name)) return error.InvalidRemoteResponse;
+        owned.* = try alloc.dupe(u8, name);
+        initialized += 1;
+        for (nodes, 0..) |node, row| {
+            const score: f64 = switch (node.metrics.?.map.get(name).?) {
+                .null => std.math.nan(f64),
+                .integer => |value| @floatFromInt(value),
+                .float => |value| blk: {
+                    if (!std.math.isFinite(value)) return error.InvalidRemoteResponse;
+                    break :blk value;
+                },
+                else => return error.InvalidRemoteResponse,
+            };
+            scores[column * nodes.len + row] = score;
+        }
+    }
+    owner.* = .{ .names = names, .scores = scores, .rows = nodes.len };
+    return owner;
+}
+
 pub fn parseRemoteGraphNodes(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphResultNode,
 ) !ParsedRemoteGraphNodes {
     if (value.len > public_limits.max_graph_result_items)
         return error.InvalidRemoteResponse;
+    const metric_columns = try parseRemoteUniformMetricColumns(alloc, value);
+    errdefer if (metric_columns) |owner| owner.deinit(alloc);
     const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -5228,7 +5278,11 @@ pub fn parseRemoteGraphNodes(
     }
 
     for (value, 0..) |item, i| {
-        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, item.key, item);
+        var payload = item;
+        if (metric_columns != null) payload.metrics = null;
+        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, item.key, payload);
+        nodes[i].metric_columns = metric_columns;
+        nodes[i].metric_row = @intCast(i);
         initialized += 1;
         if (item.document) |document| {
             try appendRemoteGraphDocumentHit(alloc, &hits, item.key, item.table, document);
@@ -5236,6 +5290,7 @@ pub fn parseRemoteGraphNodes(
     }
     return .{
         .nodes = nodes,
+        .metric_columns = metric_columns,
         .hits = try hits.toOwnedSlice(alloc),
     };
 }
@@ -6501,4 +6556,73 @@ test "ancestors-only hierarchy survives the internal wire re-encode without a st
     try std.testing.expectEqual(@as(usize, 2), second.req.hierarchy_source_fields.len);
     try std.testing.expectEqualStrings("title", second.req.hierarchy_source_fields[0]);
     try std.testing.expectEqualStrings("url", second.req.hierarchy_source_fields[1]);
+}
+
+test "remote graph metric ingress packs reordered dictionaries and preserves heterogeneous presence" {
+    const a = std.testing.allocator;
+    const wire = "[{\"key\":\"a\",\"depth\":0,\"metrics\":{\"rank\":3.5,\"missing\":null}},{\"key\":\"b\",\"depth\":0,\"metrics\":{\"missing\":null,\"rank\":7}}]";
+    const parsed = try std.json.parseFromSlice([]indexes_openapi.GraphResultNode, a, wire, .{});
+    defer parsed.deinit();
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, source: []const indexes_openapi.GraphResultNode) !void {
+            var result = try parseRemoteGraphNodes(alloc, source);
+            defer result.deinit(alloc);
+            try std.testing.expect(result.metric_columns != null);
+            try std.testing.expectEqual(@as(usize, 0), result.nodes[0].metrics.len);
+            try std.testing.expectEqual(@as(?f64, 3.5), result.nodes[0].metricAt(0).score);
+            try std.testing.expectEqual(@as(?f64, 7), result.nodes[1].metricAt(0).score);
+            try std.testing.expectEqual(@as(?f64, null), result.nodes[1].metricAt(1).score);
+        }
+    };
+    try Runner.run(a, parsed.value);
+    try std.testing.checkAllAllocationFailures(a, Runner.run, .{parsed.value});
+    var heterogeneous = parsed.value[1];
+    heterogeneous.metrics = null;
+    var result = try parseRemoteGraphNodes(a, &.{ parsed.value[0], heterogeneous });
+    defer result.deinit(a);
+    try std.testing.expect(result.metric_columns == null);
+    try std.testing.expectEqual(@as(usize, 2), result.nodes[0].metricCount());
+    try std.testing.expectEqual(@as(usize, 0), result.nodes[1].metricCount());
+    var invalid = parsed.value[0];
+    var map: std.json.ArrayHashMap(std.json.Value) = .{};
+    defer map.deinit(a);
+    try map.map.put(a, "rank", .{ .float = std.math.inf(f64) });
+    invalid.metrics = map;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodes(a, &.{invalid}));
+}
+
+test "remote graph metric ingress allocation measurement" {
+    const a = std.testing.allocator;
+    const n = public_limits.max_graph_result_items;
+    var metrics: std.json.ArrayHashMap(std.json.Value) = .{};
+    defer metrics.deinit(a);
+    try metrics.map.put(a, "rank", .{ .float = 1 });
+    try metrics.map.put(a, "degree", .{ .float = 2 });
+    try metrics.map.put(a, "hub", .{ .float = 3 });
+    try metrics.map.put(a, "missing", .null);
+    const source = try a.alloc(indexes_openapi.GraphResultNode, n);
+    defer a.free(source);
+    for (source) |*node| node.* = .{ .key = "00000001", .depth = 0, .metrics = metrics };
+    for (0..2) |mode| {
+        var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        const alloc = counter.allocator();
+        var parsed: ParsedRemoteGraphNodes = if (mode == 1) try parseRemoteGraphNodes(alloc, source) else legacy: {
+            const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, n);
+            var initialized: usize = 0;
+            errdefer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+            }
+            for (source, nodes) |node, *out| {
+                out.* = try parseRemoteGraphNodeWithKey(alloc, node.key, node);
+                initialized += 1;
+            }
+            break :legacy .{ .nodes = nodes };
+        };
+        try std.testing.expectEqual(@as(usize, 4), parsed.nodes[n - 1].metricCount());
+        try std.testing.expectEqual(@as(?f64, null), parsed.nodes[n - 1].metricAt(3).score);
+        std.debug.print("REMOTE_INGRESS mode={d} nodes={d} peak_bytes={d} allocations={d} retained_bytes={d}\n", .{ mode, n, counter.peak, counter.alloc_calls, counter.live });
+        parsed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
 }

@@ -5864,10 +5864,25 @@ fn toOpenApiGraphNodes(
             .path = if (include_paths) try toOpenApiGraphNodePath(alloc, node) else null,
             .path_edges = if (include_paths) try toOpenApiOptionalGraphPathEdges(alloc, node) else null,
             .provenance = node.provenance,
+            .metrics = try graphNodeMetricsObjectMap(alloc, node),
             .evidence = try graphNodeEvidenceObjectMap(alloc, node),
         };
     }
     return nodes;
+}
+
+fn graphNodeMetricsObjectMap(alloc: std.mem.Allocator, node: graph_query_mod.GraphResultNode) !?std.json.ArrayHashMap(std.json.Value) {
+    if (!node.metricViewValid() or node.metricCount() > graph_query_mod.graph_metric_projection_limit) return error.InvalidRemoteResponse;
+    if (node.metricCount() == 0) return null;
+    var out: std.json.ArrayHashMap(std.json.Value) = .{};
+    errdefer out.deinit(alloc);
+    for (0..node.metricCount()) |column| {
+        const metric = node.metricAt(column);
+        if (!graph_query_mod.isValidIdentifier(metric.name) or out.map.contains(metric.name)) return error.InvalidRemoteResponse;
+        if (metric.score) |score| if (!std.math.isFinite(score)) return error.InvalidRemoteResponse;
+        try out.map.put(alloc, metric.name, if (metric.score) |score| .{ .float = score } else .null);
+    }
+    return out;
 }
 
 fn validateCanonicalGraphResultNode(node: graph_query_mod.GraphResultNode) !void {
@@ -19090,4 +19105,32 @@ test "external lake query parser accepts bounded retained capabilities and rejec
     const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
     defer a.free(oversized);
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", oversized));
+}
+
+test "public graph metric projections survive canonical wire conversion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names = [_][]u8{ @constCast("rank"), @constCast("missing") };
+    var scores = [_]f64{ 3.5, std.math.nan(f64) };
+    var columns = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    var metrics = [_]graph_query_mod.GraphMetricValue{ .{ .name = "rank", .score = 3.5, .name_owned = false }, .{ .name = "missing", .score = null, .name_owned = false } };
+    var lookup = try GraphDocumentLookup.init(a, &.{}, false);
+    defer lookup.deinit(a);
+    for (0..2) |mode| {
+        var nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .depth = 0, .distance = 0, .metrics = if (mode == 0) &metrics else &.{}, .metrics_owned = false, .metric_columns = if (mode == 1) &columns else null }};
+        const result = db_mod.types.GraphSearchResult{ .name = @constCast("g"), .nodes = &nodes, .hits = &.{}, .total_hits = 1 };
+        const output = try toOpenApiGraphNodes(a, result, &lookup, false);
+        try std.testing.expectEqual(@as(usize, 2), nodes[0].metricCount());
+        try std.testing.expectEqual(@as(?f64, 3.5), nodes[0].metricAt(0).score);
+        try std.testing.expectEqual(@as(f64, 3.5), output[0].metrics.?.map.get("rank").?.float);
+        const wire = try std.json.Stringify.valueAlloc(a, output, .{});
+        const parsed = try std.json.parseFromSlice([]indexes_openapi.GraphResultNode, a, wire, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(f64, 3.5), parsed.value[0].metrics.?.map.get("rank").?.float);
+        try std.testing.expect(parsed.value[0].metrics.?.map.get("missing").? == .null);
+        var remote = try @import("query_execution_contract.zig").parseRemoteGraphNodes(a, parsed.value);
+        defer remote.deinit(a);
+        try std.testing.expectEqual(@as(?f64, 3.5), remote.nodes[0].metricAt(0).score);
+    }
 }
