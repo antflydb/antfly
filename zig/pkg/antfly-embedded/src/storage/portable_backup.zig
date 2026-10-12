@@ -3140,15 +3140,16 @@ fn validateAndImportPortableStagingAfterHeader(
         .snapshot_alloc = alloc,
     };
     defer archive.deinit(alloc);
-    const metadata_primed = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, store);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, store);
+    defer probe.deinit(alloc);
     var imported_identity = false;
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
     var payload_bytes: u64 = 0;
     const restore_started_ns = platform_time.monotonicNs();
-    while (reader.hasRemaining()) {
+    while (probe.first != null or reader.hasRemaining()) {
         try opts.cancellation.check();
-        const block = try reader.readBlock(alloc);
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (block_index == 0 and block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
         if (block.block_type == .bundle_manifest) {
@@ -3159,7 +3160,7 @@ fn validateAndImportPortableStagingAfterHeader(
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (!metadata_primed and block.block_type == .metadata_batch and archive.saw_document_block)
+        if (!probe.metadata_primed and block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
         switch (block.block_type) {
             .document_batch => {
@@ -3175,7 +3176,7 @@ fn validateAndImportPortableStagingAfterHeader(
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .metadata_batch => if (!metadata_primed) try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
+            .metadata_batch => if (!probe.metadata_primed) try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
             .chunk_batch => if (opts.import_derived_indexes) try importChunkBatch(alloc, store, block.payload),
             .artifact_batch => if (opts.import_derived_indexes) try importPublicArtifactBatch(alloc, store, block.payload, .asset),
             .resolution_batch => if (opts.import_derived_indexes) try importResolutionArtifactBatch(alloc, store, block.payload),
@@ -3285,11 +3286,12 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         .source_copy = opts.source_copy,
     };
     defer archive.deinit(alloc);
-    const metadata_primed = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, null);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, null);
+    defer probe.deinit(alloc);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
-    while (reader.hasRemaining()) {
-        const block = try reader.readBlock(alloc);
+    while (probe.first != null or reader.hasRemaining()) {
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (header.format_version == backup_codec.format_version and block_index == 0 and
             block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
@@ -3301,10 +3303,10 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (!metadata_primed and header.format_version == backup_codec.format_version and
+        if (!probe.metadata_primed and header.format_version == backup_codec.format_version and
             block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
-        if (!metadata_primed or block.block_type != .metadata_batch)
+        if (!probe.metadata_primed or block.block_type != .metadata_batch)
             try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
         if (block.block_type == .document_batch) archive.saw_document_block = true;
         block_index += 1;
@@ -3313,6 +3315,23 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         return error.InvalidBackupManifest;
     try archive.finish(alloc);
 }
+
+const PortableMetadataProbe = struct {
+    metadata_primed: bool = false,
+    first: ?backup_codec.Block = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.first) |block| alloc.free(block.payload);
+    }
+
+    fn next(self: *@This(), alloc: Allocator, reader: anytype) !backup_codec.Block {
+        if (self.first) |block| {
+            self.first = null;
+            return block;
+        }
+        return reader.readBlock(alloc);
+    }
+};
 
 // Released v0.2.1+ AFB2 writers place documents before their schema metadata.
 // Authenticate a bounded streaming metadata pass first, then reset the same
@@ -3324,18 +3343,21 @@ fn primeReleasedPortableMetadata(
     opts: ImportOptions,
     archive: *PortableArchiveValidation,
     store: ?*DocStore,
-) !bool {
-    if (archive.format_version != backup_codec.format_version) return false;
+) !PortableMetadataProbe {
+    if (archive.format_version != backup_codec.format_version) return .{};
     if (!reader.hasRemaining()) return error.InvalidBackupManifest;
     const first = try reader.readBlock(alloc);
-    defer alloc.free(first.payload);
+    var first_owned = true;
+    defer if (first_owned) alloc.free(first.payload);
     if (first.block_type != .bundle_manifest) return error.InvalidBackupManifest;
     var manifest = try backup_bundle.parseManifest(alloc, first.payload);
     defer manifest.deinit();
     if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
     if (manifest.value.compatibility.min_afb_reader != backup_bundle.base_afb_reader_version) {
-        try reader.reset(alloc);
-        return false;
+        // Current archives continue their authenticated pass with this block.
+        // Reset is only legal after the footer has completed the pass.
+        first_owned = false;
+        return .{ .first = first };
     }
     while (reader.hasRemaining()) {
         try opts.cancellation.check();
@@ -3351,7 +3373,7 @@ fn primeReleasedPortableMetadata(
         }
     }
     try reader.reset(alloc);
-    return true;
+    return .{ .metadata_primed = true };
 }
 
 const ArchiveSchemaLayout = struct {
@@ -7108,7 +7130,7 @@ test "export skips derived data" {
     }
 }
 
-test "portable relationships preserve parallel identities and arbitrary endpoints" {
+test "portable backup relationships preserve parallel identities and arbitrary endpoints" {
     const alloc = std.testing.allocator;
     var tmp_src = std.testing.tmpDir(.{});
     defer tmp_src.cleanup();
@@ -7138,6 +7160,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
         defer manifest.deinit();
         try std.testing.expectEqual(backup_bundle.relationship_reader_version, manifest.value.compatibility.min_afb_reader);
     }
+    try validatePortable(alloc, out.items);
 
     for ([_]bool{ false, true }) |staged| {
         var tmp_dst = std.testing.tmpDir(.{});
@@ -7157,7 +7180,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
     }
 }
 
-test "portable graph retirements are primary and require reader version four" {
+test "portable backup graph retirements are primary and require reader version four" {
     const alloc = std.testing.allocator;
     const stamped = @import("graph_cleanup_contract.zig").retirementValue(42);
     for ([_][]const u8{ "1", &stamped }) |retirement| {
@@ -7188,6 +7211,7 @@ test "portable graph retirements are primary and require reader version four" {
             defer manifest.deinit();
             try std.testing.expectEqual(backup_bundle.retirement_reader_version, manifest.value.compatibility.min_afb_reader);
         }
+        try validatePortable(alloc, out.items);
         for ([_]bool{ false, true }) |staged| {
             for ([_]bool{ false, true }) |derived| {
                 var tmp_dst = std.testing.tmpDir(.{});

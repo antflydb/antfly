@@ -5954,7 +5954,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const v02_upgrade_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication" },
+        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const v02_marker_tests = b.addTest(.{

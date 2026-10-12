@@ -31,9 +31,11 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -804,7 +806,7 @@ def qualify_ha(binary, old_binary, release, evidence):
     )
 
 
-def restore(server, location, kind):
+def restore(server, location, kind, verify_restored=verify):
     response = server.request(
         "POST",
         "/tables/upgrade/restore",
@@ -826,7 +828,7 @@ def restore(server, location, kind):
 
         job = wait(finished, f"{kind} restore job")
         assert job["phase"] == "succeeded", job
-    verify(server)
+    verify_restored(server)
 
 
 def qualify(binary, old_binary, release, evidence, formats):
@@ -885,12 +887,212 @@ def qualify(binary, old_binary, release, evidence, formats):
     )
 
 
+def qualify_managed(
+    binary,
+    old_binary,
+    release,
+    evidence,
+    seed_only=False,
+    verify_only=False,
+    chunked=False,
+):
+    class Embeddings(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            inputs = request["input"]
+            if isinstance(inputs, str):
+                inputs = [inputs]
+            raw = json.dumps(
+                {
+                    "object": "list",
+                    "model": "upgrade-test",
+                    "data": [
+                        {
+                            "object": "embedding",
+                            "index": i,
+                            "embedding": (
+                                [1.0, 0.0, 0.0] if "zebra" in text else [0.0, 1.0, 0.0]
+                            ),
+                        }
+                        for i, text in enumerate(inputs)
+                    ],
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    provider_path = evidence / "managed-provider-port.json"
+    provider_port = json.loads(provider_path.read_text()) if verify_only else 0
+    provider = ThreadingHTTPServer(("127.0.0.1", provider_port), Embeddings)
+    provider_path.write_text(json.dumps(provider.server_port) + "\n")
+    threading.Thread(target=provider.serve_forever, daemon=True).start()
+    previous_key = os.environ.get("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = "upgrade-local-test"
+    root = evidence / "managed"
+    query = {"embeddings": {"managed": [1, 0, 0]}, "indexes": ["managed"], "limit": 10}
+
+    def generated(server):
+        verify(server, vectors=False)
+        wait(lambda: server.ids(query)[0] == "a", "generated nearest neighbor")
+        server.batch(
+            {
+                "c": {
+                    "_type": "doc",
+                    "body": (
+                        "new generated alpha beta gamma delta epsilon zeta eta theta"
+                        if chunked
+                        else "new generated"
+                    ),
+                    "category": "old",
+                    "count": 7,
+                }
+            }
+        )
+        wait(
+            lambda: sorted(server.ids(query)) == ["a", "b", "c"],
+            "new generated embeddings",
+        )
+        server.batch(deletes=["c"])
+        wait(lambda: sorted(server.ids(query)) == ["a", "b"], "generated deletion")
+
+    try:
+        if not verify_only:
+            assert not root.exists(), f"managed fixture already exists: {root}"
+            with Server(old_binary, root, "released-managed") as server:
+                server.request("POST", "/tables/upgrade", {"schema": SCHEMA})
+                server.request(
+                    "POST",
+                    "/tables/upgrade/indexes/managed",
+                    {
+                        "type": "embeddings",
+                        "field": "body",
+                        "dimension": 3,
+                        **(
+                            {
+                                "chunker": {
+                                    "provider": "mock",
+                                    "text": {"target_tokens": 4, "overlap_tokens": 1},
+                                }
+                            }
+                            if chunked
+                            else {}
+                        ),
+                        "embedder": {
+                            "provider": "openai",
+                            "model": "upgrade-test",
+                            "url": f"http://127.0.0.1:{provider.server_port}/v1",
+                        },
+                    },
+                )
+                server.batch(
+                    {
+                        "a": {
+                            "_type": "doc",
+                            "body": (
+                                "zebrafish generated alpha beta gamma delta epsilon zeta eta theta"
+                                if chunked
+                                else "zebrafish generated"
+                            ),
+                            "category": "old",
+                            "count": 7,
+                        },
+                        "b": {
+                            "_type": "doc",
+                            "body": (
+                                "harbor generated alpha beta gamma delta epsilon zeta eta theta"
+                                if chunked
+                                else "harbor generated"
+                            ),
+                            "category": "old",
+                            "count": 7,
+                        },
+                    }
+                )
+                wait(
+                    lambda: sorted(server.ids(query)) == ["a", "b"],
+                    "released generated embeddings",
+                )
+                for kind in ("portable", "native"):
+                    location = evidence / f"managed-backup-{kind}"
+                    location.mkdir()
+                    backup(server, location, kind)
+            with Server(old_binary, root, "released-managed-control") as server:
+                generated(server)
+            version = subprocess.check_output(
+                [str(old_binary), "--version"], text=True, stderr=subprocess.STDOUT
+            ).strip()
+            assert release.removeprefix("v") in version, version
+            (evidence / "managed-producer.json").write_text(
+                json.dumps(
+                    {
+                        "release": release,
+                        "version": version,
+                        "binary_sha256": hashlib.sha256(
+                            old_binary.read_bytes()
+                        ).hexdigest(),
+                        "generated_by": "public create/index/batch/backup APIs with a deterministic loopback embedding provider",
+                        "chunked": chunked,
+                        "files": {
+                            str(p.relative_to(evidence)): hashlib.sha256(
+                                p.read_bytes()
+                            ).hexdigest()
+                            for p in evidence.rglob("*")
+                            if p.is_file()
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        if not seed_only:
+            for label in ("main-managed-first", "main-managed-second"):
+                with Server(binary, root, label) as server:
+                    generated(server)
+            for kind in ("portable", "native"):
+                restored = evidence / f"managed-restored-{kind}-{time.time_ns()}"
+                with Server(binary, restored, "restore") as server:
+                    restore(
+                        server, evidence / f"managed-backup-{kind}", kind, generated
+                    )
+                    generated(server)
+                with Server(binary, restored, "restore-reopen") as server:
+                    generated(server)
+        print(
+            f"{release}: managed embedding generation, reopen and backup/restore controls passed",
+            flush=True,
+        )
+    finally:
+        provider.shutdown()
+        provider.server_close()
+        if previous_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = previous_key
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--old-bin", action="append", required=True, metavar="RELEASE=PATH"
     )
     parser.add_argument("--new-bin", type=Path)
+    parser.add_argument(
+        "--managed-only",
+        action="store_true",
+        help="Qualify server-generated embeddings using a local provider",
+    )
+    parser.add_argument(
+        "--chunked",
+        action="store_true",
+        help="Use released mock chunking with --managed-only (use a separate evidence directory)",
+    )
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument(
         "--backup-format",
@@ -919,12 +1121,25 @@ def main():
     args = parser.parse_args()
     if not args.seed_only and not args.new_bin:
         parser.error("--new-bin is required unless --seed-only")
+    if args.chunked and not args.managed_only:
+        parser.error("--chunked requires --managed-only")
     for item in args.old_bin:
         release, path = item.split("=", 1)
         assert release in {f"v0.2.{i}" for i in range(1, 6)}, release
         binary = Path(path).resolve()
         evidence = args.work_dir.resolve() / release
         evidence.mkdir(parents=True, exist_ok=True)
+        if args.managed_only:
+            qualify_managed(
+                args.new_bin.resolve() if args.new_bin else None,
+                binary,
+                release,
+                evidence,
+                seed_only=args.seed_only,
+                verify_only=args.verify_only,
+                chunked=args.chunked,
+            )
+            continue
         if args.schema_only:
             qualify_schema(
                 args.new_bin.resolve() if args.new_bin else None,

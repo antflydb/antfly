@@ -35,7 +35,9 @@ marker is not a rollback procedure.
 Legacy public/runtime schemas must agree on every field the released writer
 persisted. Recovering new derived metadata does not authorize a user to change
 an immutable schema epoch. Modern archives retain their stricter ordering and
-schema requirements.
+schema requirements. For reader levels 3–8, validation and restore retain the
+consumed manifest in the original authenticated pass; they never reset an
+incomplete archive reader.
 
 For release qualification, build the server and run:
 
@@ -60,4 +62,12 @@ fixture generation from upgrade qualification. Run the same command with
 increment, `--schema-only` for TTL and immutable schema history, and `--ha-only`
 for primary/standby WAL and progress reopen, released seed publication, current
 restore/physical activation, and query/write/restart on the materialized seed.
+Use `--managed-only` for embeddings generated through a deterministic local
+provider, including portable/native restoration and fresh generation after
+restart. Add `--chunked` with a separate evidence directory to qualify released
+chunk artifacts and regenerated embeddings. Portable backups regenerate derived embeddings from their retained
+source documents, so the configured provider must remain available. Restore
+quiesces background enrichment and explicitly resumes synchronous provider
+admission before draining.
+
 Those checks do not qualify fenced failover or mixed-version rolling operation.

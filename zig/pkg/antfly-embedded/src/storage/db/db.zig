@@ -21687,7 +21687,10 @@ pub const DB = struct {
                 // Restore opens with optional workers disabled and drains them
                 // synchronously. Starting a background worker here races the
                 // foreground catch-up in the next phase over index mutation.
-                if (self.local_execution.optional_runtime_workers_enabled) try runtime.start();
+                if (self.local_execution.optional_runtime_workers_enabled)
+                    try runtime.start()
+                else
+                    try runtime.resumeInlineAfterStop();
                 std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
             }
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
@@ -126677,22 +126680,27 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
     try DB.markRestoreRuntimeRepairNeeded(alloc, std.mem.span(restore_path));
     try std.testing.expect(try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path)));
 
-    // Keep every repair phase isolated in writer-no-replay mode so background
-    // workers cannot accidentally make the assertion pass.
-    while (try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path))) {
+    // Run every phase on one writer-no-replay owner without background
+    // workers so inline provider admission and completion proofs are required.
+    {
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
         var restored = try DB.open(alloc, std.mem.span(restore_path), .{
             .primary_backend = primary_backend,
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
+            .start_optional_runtime_workers = false,
             .enrichment = .{
                 .owner_id = "worker-a",
                 .dense_embedder = deterministic.interface(),
             },
         });
         defer restored.close();
-
-        try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+        // Keep the same runtime across reset, source replay and inline drain.
+        // Reopening between phases would hide a stale shutdown admission flag.
+        while (try restored.restoreRuntimeRepairNeeded()) {
+            try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+            try std.testing.expect(!restored.enrichment_runtime.?.isStarted());
+        }
     }
 
     {
