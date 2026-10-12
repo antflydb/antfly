@@ -2,6 +2,116 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## MLX MTP reference and pending-token follow-up
+
+[The reference measurements](gemma4-ocr-mlx-reference.json) compare MTP on/off
+within a pinned MLX target on the same M4 Max and eight pre-rendered OCR pages.
+Google reports [up to threefold faster generation](https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/)
+with its specialized drafters. This experiment uses the Google-supported MLX
+ecosystem's community port, not Google's benchmark configuration. The checkout
+is `fb4b1e2f340249ca2ff17ba2e70e61049d6d4d33`; MLX is 0.32.3 and Transformers
+is 5.19.0. The target is `mlx-community/gemma-4-E2B-it-4bit`, revision
+`238767527555cb75a05732a84dff5d6ba0dd6809`, paired with the BF16 assistant at
+`a7770799b560135ebdbfae8b7f468947415003bc`. Its affine 4-bit/group-64 weights
+and vision encoder differ from Antfly's Q4_0 target/Q8_0 projector. Available
+disk space did not accommodate the 10.2 GB BF16 reference checkpoint.
+These results cannot rank the two OCR runtimes.
+
+The benchmark keeps both models loaded, warms each mode with 16 tokens, starts
+each request with independent KV, and brackets MTP with ordinary controls.
+It uses the existing OCR prompt, temperature zero, thinking disabled, a
+280-image-token budget, and a 2,048-token completion cap. MLX block size includes
+the pending bonus token: size three drafts two candidates. Size six is a ceiling
+that the reference can adapt down. Recognition timing includes image file
+loading/processing, vision encoding, prefill, decoding and detokenization;
+PDF rendering, model loading and HTTP are excluded.
+
+The initial 64-token image smoke matched output and took about 0.65 seconds
+ordinary versus 0.56 seconds with MTP. That short result did not generalize to
+the full corpus. Original floating precision changed multiple transcripts,
+and NIST page 5 repeated text to the completion cap with MTP. Ordinary controls
+repeated their output exactly despite wall times ranging from 23.1 to 38.8
+seconds. Those MTP timings fail the matched-output/work gate.
+
+A benchmark-local adapter verifies each target input as a singleton while
+keeping the MTP drafting/acceptance loop. It restores parity in the four-page,
+64-token pilot and eliminates the NIST page 5 repetition at the original
+precision. Full-corpus singleton verification still changes four pages in both
+passes; first differences occur at total contexts 603, 642, 634 and 538, beyond
+the 512-token sliding window. This narrows the investigation to verification
+geometry and the speculative cache/attention path; it does not isolate a
+particular arithmetic or cache bug. The reference replaces rotating caches
+with buffered temporal caches for speculation. Its default Gemma4 MTP path
+calls the model directly and does not select the optional exact-verifier branch.
+
+Promoting floating parameters/scales to F32, while retaining the same packed
+quantized integers, restores exact text **and token-ID** parity between ordinary
+and MTP decoding across both full passes:
+
+| F32 MLX scope | Ordinary median | MTP block 3 median | Work and quality |
+| --- | ---: | ---: | --- |
+| All eight pages | 50.292 s | 42.395 s | Same 5,439 tokens; NIST page 5 repeats/truncates in both modes |
+| Seven completed pages, excluding NIST page 5 | 31.723 s | 29.575 s | Same 3,391 tokens; no truncation; mean word-F1 proxy 0.853 |
+
+The seven-page observation is 6.8% less wall time, or 7.3% higher throughput.
+Including the repeating page inflates the apparent OCR benefit. All ordinary
+and MTP transcripts repeat within their precision configuration. F32 ordinary
+output differs from original floating precision, so precision variants are not
+matched-work speed comparisons. Unrelated CPU compilation/tests and system
+services ran concurrently; the seven-page timing ranges overlap. This is a
+local, paired observation, not dedicated-machine or saturated-serving
+qualification. Word-multiset F1 measures coverage against `pdftotext`; it does
+not establish reading order or manually verified OCR correctness.
+
+The reproducible harness is
+[`gemma4_mlx_mtp.py`](../../../zig/pkg/inference/tools/bench/gemma4_mlx_mtp.py).
+It records transcripts/token IDs, timings, acceptance counts, checkpoint/source
+metadata and quality gates. `--singleton-verify` is a diagnostic adapter, and
+`--float32` changes floating execution precision; neither modifies the upstream
+checkout. With the pinned checkout/dependencies and local model snapshots:
+
+```sh
+PYTHONPATH=/tmp/antfly-gemma4-mlx-vlm HF_HUB_OFFLINE=1 \
+  TOKENIZERS_PARALLELISM=false \
+  /tmp/antfly-gemma4-mlx-venv/bin/python \
+  zig/pkg/inference/tools/bench/gemma4_mlx_mtp.py \
+  --model /tmp/antfly-gemma4-mlx-models/target \
+  --assistant /tmp/antfly-gemma4-mlx-models/assistant \
+  --corpus .benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json \
+  --output /tmp/mlx-mtp-reference.json --blocks 0,3,0 --passes 2 --float32
+```
+
+Antfly's frozen `8af0e0904aa27ae40c427f7c7aeef18fb6486905` build also tests
+pending-token verification **with bonus acceptance enabled**, rather than the
+earlier no-bonus deferred variant. Two Attention pages, forced K=2, and explicit
+short-row-specialization-off flags produce the same 841 tokens and identical
+transcripts in every control/candidate run:
+
+| Antfly two-page configuration | Measured seconds |
+| --- | --- |
+| Ordinary resident | 11.310, 11.306, 11.363 |
+| Canonical MTP recovery with bonus | 13.541, 13.819 |
+| Pending-token verification with bonus | 16.520, 16.560 |
+
+The first canonical MTP pass spends 2.626 seconds drafting, 4.205 verifying and
+4.700 materializing correction/bonus state. Pending-token verification removes
+the separate materialization, but spends 3.205 seconds drafting and 11.227
+verifying. It processes 1,238 verification rows in 413 calls versus 506 rows in
+253 calls. The canonical path's cached next-target choice can reject a first
+draft without a verification forward and can stop drafting early; the pending
+path loses those shortcuts and includes the pending token as another row.
+Its draft steps grow from 682 to 827. This explains why removing a recovery
+forward is not, by itself, a speed improvement. The second candidate repeats
+the measured work and output. These are two-page pilot observations, not a new
+full-corpus qualification. Phase times enclose queued work and are not additive
+independent GPU kernel measurements.
+
+For Antfly, the next optimization targets remain cheap verification/readout
+and preserving useful target state across rounds. The reference demonstrates
+that this E2B OCR workload can benefit from MTP; it does not justify copying
+its unqualified low-precision matrix path. Original Q8_0 head preservation
+remains an unimplemented lead. Default inference policies remain unchanged.
+
 ## Upstream research and short-row specialization
 
 [The follow-up qualification](gemma4-ocr-q4-specialization.json) pins the new
