@@ -35,7 +35,8 @@ covering 997 of 10,521 reported edges, with two positively accepted serialized
 Smith seeds. It reports no panic. This is not sustained production fuzzing.
 The decorative `======= FUZZING REPORT =======` marker is normalized to
 `FUZZING REPORT` in the copied receipt to avoid Git conflict-marker checks;
-all execution counts and substantive report content are retained.
+all execution counts and substantive report content are retained. Trailing blank
+lines are removed from copied build reports for Git whitespace checks.
 
 Reproduce from `zig/lib/media` using Zig 0.17.0:
 
