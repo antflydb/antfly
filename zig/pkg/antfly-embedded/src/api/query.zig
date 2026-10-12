@@ -5598,7 +5598,7 @@ fn consumerTests() type {
             };
             for ([_]bool{ false, true }) |adopt| {
                 try Runner.run(std.testing.allocator, adopt);
-                try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{adopt});
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{adopt});
             }
         }
 

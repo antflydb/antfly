@@ -22,7 +22,9 @@ release its values and container after use.
 ## Ownership and response construction
 
 `GraphMetricColumns` owns one name per column and dense, independent, or paged
-`f64` score backing. Optional row mappings preserve logical response order.
+`f64` score backing. A bounded group directory supports projections read at
+different stages, including independent row mappings and mixed flat/page
+backing. Optional row mappings preserve logical response order.
 Nodes hold a borrowed owner pointer and a bounded row ordinal. Results retire
 nodes before retiring their column owners. A shard merger retains one stable
 owner per contribution; growing the result node array does not relocate scores.
@@ -67,8 +69,14 @@ The legacy materialization helpers remain available for explicit adapters.
 
 ## Transport and shard fan-in
 
-Canonical public nodes serialize accessor values into the existing metric map,
-including explicit null scores. Uniform remote maps decode directly into one
+Canonical traversal nodes serialize accessor values directly into the existing
+metric map, including explicit null scores. The encoder borrows the result until
+serialization finishes and keeps only one node's document/path/evidence adapters
+live at a time. Qualified document lookup retains borrowed hit descriptors; it
+projects document contents in scratch capped to 256 KiB between nodes. Delivery
+prepares the complete response or spool before committing headers, so malformed
+late nodes cannot cause a successful partial response. Legacy and other canonical
+graph shapes retain their generated adapters. Uniform remote maps decode directly into one
 column owner even when map key order differs; heterogeneous or omitted maps keep
 the compatibility representation. Uniform legacy clones also use compact columns.
 
@@ -80,3 +88,21 @@ Transferred bytes keep their admission charge rather than being charged twice.
 Different allocators use independent clones. Aggregates and overlapping statuses
 still require merge computation. These are copy and allocation reductions, not
 zero CPU or allocation guarantees for the complete query.
+
+
+## Distributed traversal
+
+The distributed coordinator retains one metric dictionary and growable score
+pages for its execution dependencies. Canonical edge expansion also uses shared
+columns rather than allocating values and names per edge. Each returned node
+borrows a stable row; a nonreturned frontier candidate rolls back its last score
+row immediately. Page capacity and directories share the request's retained
+memory budget, and admission denial remains `GraphWorkBudgetExceeded`.
+
+An unchanged projection transfers this storage without another allocation.
+Filtering and ordering can retain a compact row mapping. If retained backing
+would exceed dense output by more than 256 KiB, finalization prepares a dense
+replacement before changing any borrowing nodes. Hidden dependencies disappear
+from the public dictionary. Destruction and error rollback retire borrowing
+nodes before backing, and successful transfer retargets page allocation to the
+stable response allocator.
