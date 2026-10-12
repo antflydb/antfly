@@ -251,6 +251,11 @@ def main():
         help="Read a short-lived token from stdin instead of gcloud; never persist it",
     )
     parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Publish and verify count, then stop before query measurements",
+    )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
     if args.docker and not args.filesystem_source:
@@ -621,6 +626,21 @@ def main():
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
         assert count["rows"] == [[str(args.expected_rows)]], count
+        if args.build_only:
+            (args.state / "construction.json").write_text(
+                json.dumps(
+                    {
+                        "rows": args.expected_rows,
+                        "ready_seconds": ready_seconds,
+                        "registration_seconds": registration_seconds,
+                        "metadata_indexes_queryable": list(metadata_status),
+                        "query_measurements_performed": False,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            return
         if args.cold_cache:
             stop()
             if (args.state / "cache").exists():

@@ -945,3 +945,31 @@ The directory codec, decoded-size limits, per-member proofs and GC/reuse retenti
 are described in `docs/plans/lake-ingestion-and-publication.md`. Compare provider
 request and byte counters as well as wall-clock latency. Shared-host timing alone
 is not a production latency guarantee.
+
+The native ARM64 local comparison on the verified 142,577-row partition measured:
+
+| Ranked `database`, five metadata hits, no highlights | First query | Warm p95 |
+|---|---:|---:|
+| Antfly, two reset-cache processes | 104.8–129.7 ms | 6.54–6.75 ms |
+| DuckDB 1.5.6, two fresh processes | 26.15–30.54 ms | 10.24–10.31 ms |
+
+Antfly restart searches took 56.5–78.5 ms. A separate highlighted native run
+measured 178.83 ms cold, 8.87 ms warm p95 and 18.53 ms after restart. Its 4,110-hit
+cursor continuation p95 was 38.85 ms, and history/current composition checks
+passed. The matched x86 old/new publication comparison preserved exact top HN
+IDs and scores while reducing provider reads from 397 to 314 (20.91%) and bytes
+from 53,487,307 to 46,458,677 (13.14%). These are provider counters, not an HTTP
+request trace. Native physical layouts can differ from the x86 layouts.
+
+See `local-search-comparison-20261012.json` for provenance, samples and limits.
+The host had unrelated concurrent work; these timings are diagnostic rather than
+a production guarantee. OS file caches were not flushed. Antfly cleared its
+serving cache before each restart; startup created one cache file, and measured
+cold queries recorded zero disk-cache hits. DuckDB uses four threads; Antfly uses
+its default server policy and includes HTTP overhead. Neither ranked comparison
+highlights text, and scoring/tokenization are not identical between engines.
+The local results isolate substantial remote-I/O overhead in the earlier GCS
+measurements; they do not establish the new layout's regional or full-archive
+latency. Antfly still reads roughly 43 MB locally for five hits, so reducing cold
+work further remains useful. `--build-only` can prebuild and verify a publication
+without taking query timing samples while builds are active.
