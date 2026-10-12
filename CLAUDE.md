@@ -8,7 +8,7 @@ Work in a git worktree under `.worktrees/<name>` created from `origin/main`. Kee
 
 ## Project Overview
 
-Antfly is a distributed key-value store and vector search engine with a Zig server runtime, combining full-text (BM25) and vector search over multimodal data.
+What Antfly is, install options, and features are in `README.md`. Where things live:
 
 - `zig/`: the Antfly server (`zig/pkg/antfly`), storage engine shared with embedded Lite (`zig/pkg/antfly-embedded`), and inference runtime (`zig/pkg/inference`)
 - `go/`: SDK, embedded bindings, operator, proxy, and supporting libraries. Each module in `GO_MODULES` (Makefile) is independent; build it from its own directory with `GOWORK=off GOEXPERIMENT=simd go` (Make targets set this)
@@ -21,10 +21,9 @@ Read `docs/architecture.mdx` for the Raft, storage, and index design, and `specs
 ## Commands
 
 ```bash
-make build              # antfarm frontend + Zig antfly binary (copied to ./antfly)
+make build              # antfarm frontend + Zig antfly binary (copied to ./antfly; run ./antfly standalone)
 make generate           # After OpenAPI changes (Zig modules, joined openapi.yaml, Go/TS/Python/Rust SDKs, antfarm)
 make gc                 # Garbage-collect build caches across all worktrees
-./antfly standalone     # Run locally; inference models load from ~/.antfly/inference/models/
 ```
 
 ## Testing

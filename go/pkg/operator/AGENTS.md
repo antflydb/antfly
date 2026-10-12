@@ -21,7 +21,7 @@ All Go commands use `GOWORK=off` (set in Makefile).
 - **Metadata Nodes** — Raft consensus, API coordination. Fixed replica count (odd for Raft). Ports: 12377 (API), 9017 (Raft), 4200 (Health).
 - **Data Nodes** — Storage, replication, autoscaling. Default 3 replicas. Ports: 12380 (API), 9021 (Raft), 4200 (Health).
 
-Both deployed as StatefulSets with persistent volumes. Defaults applied in `controllers/antflycluster_controller.go` `applyDefaults()`.
+Both deployed as StatefulSets with persistent volumes. Defaults applied in `controllers/antfly/antflycluster_controller.go` `applyDefaults()`.
 
 **CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, InferencePool, InferenceProxy (defined in `api/antfly/v1/` and `api/inference/v1alpha1/`).
 Startup CRD bootstrap installs all five CRDs unless `--skip-crd-install` is set,
@@ -31,7 +31,7 @@ and AntflyCluster `spec.inference` management, but it does not delete previously
 owned InferencePools. Admission webhooks are independently gated by the
 `ENABLE_WEBHOOKS` environment variable.
 
-**Reconciliation order** (`controllers/antflycluster_controller.go`):
+**Reconciliation order** (`controllers/antfly/antflycluster_controller.go`):
 1. Apply defaults to DeepCopy (avoids API server conflicts)
 2. ConfigMap → Services → Leader StatefulSet → Data StatefulSet → Autoscaling → Status
 
@@ -44,7 +44,6 @@ api/inference/v1alpha1/          # Inference CRD types, webhooks, deepcopy
 controllers/antfly/            # Antfly reconcilers + autoscaler
 controllers/inference/           # Inference reconcilers
 bootstrap/antfly/              # CRD self-installation at startup
-webhook/{antfly,inference}/      # Webhook setup packages
 internal/webhook/{antfly,inference}/ # Webhook validator implementations
 manifests/                     # Shared embedded CRD/RBAC YAML (go:embed)
 config/manager/                # Deployment manifest

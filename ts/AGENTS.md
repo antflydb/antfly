@@ -7,25 +7,7 @@ search primitives, the shared design system, the graph widgets, the npm CLI
 wrappers, and the Antfarm dashboard. All published packages ship through the
 monorepo's CI and tag-triggered npm releases.
 
-## Layout
-
-```
-packages/sdk/            → @antfly/sdk (TS client for the joined public API)
-packages/components/     → @antfly/components (unstyled search primitives:
-                           QueryBox, Autosuggest, Facet, Results, AnswerResults,
-                           ChatBar, plus streaming hooks)
-packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
-                           component library: primitives, compound patterns,
-                           brand/marketing blocks, OKLCH tokens, Aeonik)
-packages/web/            → @antfly/web (local browser inference via /inference; UI in Colony)
-packages/graph/          → @antfly/graph (graph visualization widgets)
-packages/cli/            → @antfly/cli (npm wrapper that installs the antfly
-                           binary) with platform packages cli-darwin-arm64,
-                           cli-linux-arm64, cli-linux-x64
-apps/antfarm/            → dashboard (consumes sdk + components)
-apps/playground/         → design-system gallery (unpublished; used by
-                           library authors to dogfood new primitives)
-```
+Package layout and `pnpm` commands are in `README.md`; run them from `ts/`.
 
 ## Conventions
 
@@ -39,10 +21,6 @@ apps/playground/         → design-system gallery (unpublished; used by
   cross-check the tag), and npm rejects re-publishing an existing version.
   CI runs `pnpm install --frozen-lockfile`, `pnpm build --force`, and
   `pnpm test` before `pnpm --filter <pkg> publish --provenance`.
-- **Commands** (from repo root):
-  - `pnpm install` — install all workspaces
-  - `pnpm build` / `dev` / `test` / `typecheck` / `lint` — turbo-delegated
-  - `pnpm --filter <pkg> <task>` — scope to one workspace
 - **React target**: 19 for dev. peerDeps accept React 18 to keep the door
   open for the SearchAF desktop app (Wails + React 18).
 - **Lint**: biome (`biome check .` via `pnpm lint`).
