@@ -29,6 +29,7 @@ const Numeric = @import("../common/sql_builtin_type.zig").Type;
 const casts = @import("../sql/builtin_cast.zig");
 const exact = @import("../sql/numeric_value.zig");
 const binary = @import("../sql/numeric_binary.zig");
+const text_kernel = @import("../sql/text_value.zig");
 pub const max_nodes = 128;
 pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
@@ -416,7 +417,7 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5 };
 
 /// Shared structural grammar for public prechecks and typed compilation.
 /// These rules grant no column/type authority; the pinned compiler owns that.
@@ -436,7 +437,8 @@ pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
         .array => count <= 32,
-        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => count == 1,
+        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5 => count == 1,
+        .replace => count == 3,
         .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
         .in_list, .not_in_list => count >= 2 and count <= max_nodes,
         .case_when => count >= 3 and count <= 31 and count % 2 == 1,
@@ -453,6 +455,7 @@ const Node = struct {
     literal: Value = .null,
     sql_type: ?Numeric = null,
     numeric_modifier: ?exact.TypeModifier = null,
+    replace_pattern: ?text_kernel.Pattern = null,
 };
 
 pub const Plan = struct {
@@ -746,6 +749,31 @@ pub const Plan = struct {
             if (node.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, input, modifier, false);
             return input;
         }
+        if (node.op == .replace or node.op == .md5) {
+            // Strict calls still evaluate every argument before propagating
+            // NULL; a later selected argument may raise an arithmetic error.
+            var args: [3]Value = undefined;
+            var has_null = false;
+            for (node.children, 0..) |child, i| {
+                args[i] = try self.evaluateNode(execution, source, child);
+                has_null = has_null or args[i] == .null;
+            }
+            if (has_null) return .null;
+            if (node.op == .md5) {
+                if (budget.* < 32) return execution.limit();
+                const digest = try text_kernel.md5(args[0].string, &execution.numeric);
+                const output = try allocateOutput(alloc, digest.len, budget);
+                @memcpy(output, &digest);
+                return .{ .string = output };
+            }
+            const limit = @min(max_output_bytes, budget.*);
+            const result = if (node.replace_pattern) |pattern|
+                try pattern.replace(alloc, args[0].string, args[2].string, limit, &execution.numeric)
+            else
+                try text_kernel.replace(alloc, args[0].string, args[1].string, args[2].string, limit, &execution.numeric);
+            budget.* -= result.allocated_bytes;
+            return .{ .string = result.bytes };
+        }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
             operands[i] = try self.evaluateNode(execution, source, child);
@@ -819,6 +847,97 @@ pub const Plan = struct {
         }
     }
 };
+
+test "relational index system SQL durable text literal patterns compile once and retain invocation limits" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "s", .path = "s", .column_type = .string }} };
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"column","column":"s"},{"op":"literal","type":"string","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"},{"op":"literal","type":"string","value":"X"}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, table, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expect(plan.nodes[plan.nodes.len - 1].replace_pattern != null);
+    try std.testing.expect(plan.literal_bytes >= 80 * (1 + @sizeOf(usize)));
+    const input: [1024]u8 = @splat('a');
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var bytes: usize = 0;
+    var execution = Execution.init(none.allocator(), &bytes);
+    execution.numeric.remaining = 100_000_000;
+    for (0..1024) |_| {
+        const result = try plan.evaluateWithExecution(&execution, &.{.{ .string = &input }});
+        try std.testing.expectEqual(@intFromPtr(&input), @intFromPtr(result.string.ptr));
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    execution.numeric.remaining = 10;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{.{ .string = &input }}));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+}
+
+test "relational index system SQL durable text evaluation preserves lazy branches strict calls and allocation faults" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const definition = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"op":"md5","args":[{"op":"replace","args":[{"op":"literal","type":"string","value":"aaaaa"},{"op":"literal","type":"string","value":"aa"},{"op":"literal","type":"string","value":"X"}]}]}
+            , .{});
+            defer definition.deinit();
+            var plan = try Plan.init(alloc, .{}, definition.value, .string);
+            defer plan.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const result = try plan.evaluate(arena.allocator(), &.{});
+            var work: exact.Context = .{ .alloc = alloc };
+            try std.testing.expectEqualStrings(&(try text_kernel.md5("XXa", &work)), result.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"literal","type":"string"},{"op":"case_when","args":[{"op":"eq","args":[{"op":"divide","args":[{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":0}]},{"op":"literal","type":"integer","value":0}]},{"op":"literal","type":"string","value":"x"},{"op":"literal","type":"string","value":""}]},{"op":"literal","type":"string","value":""}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, .{}, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(a, &.{}));
+}
+
+test "relational index system SQL durable text dynamic search and cancellation share one owner" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "s", .path = "s", .column_type = .string },
+        .{ .name = "search", .path = "search", .column_type = .string },
+    } };
+    const definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"replace","args":[{"op":"column","column":"s"},{"op":"column","column":"search"},{"op":"literal","type":"string","value":"X"}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, table, definition.value, .string);
+    defer plan.deinit();
+    try std.testing.expect(plan.nodes[plan.nodes.len - 1].replace_pattern == null);
+    var exact_bytes: [3]u8 = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&exact_bytes);
+    var bytes: usize = exact_bytes.len;
+    var execution = Execution.init(memory.allocator(), &bytes);
+    const result = try plan.evaluateWithExecution(&execution, &.{ .{ .string = "aaaaa" }, .{ .string = "aa" } });
+    try std.testing.expectEqualStrings("XXa", result.string);
+    try std.testing.expectEqual(@as(usize, 0), bytes);
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    bytes = 4096;
+    execution = Execution.init(a, &bytes);
+    execution.numeric.checkpoint = Control.check;
+    execution.numeric.ptr = &control;
+    const wide: [4096]u8 = @splat('a');
+    try std.testing.expectError(error.QueryCanceled, plan.evaluateWithExecution(&execution, &.{ .{ .string = &wide }, .{ .string = "aaaab" } }));
+    try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+}
 
 fn numericOperand(ctx: *exact.Context, value: Value, real: bool) !exact.Value {
     return switch (value) {
@@ -1859,7 +1978,7 @@ const Compiler = struct {
                     .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     // PostgreSQL has no float4/float8 remainder operator.
                     .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
-                    .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
+                    .concat, .lower_ascii, .upper_ascii, .replace, .md5 => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
                         if (node.kind == .sql_array) node.sql_type = operand.sql_type;
                         if (node.kind == .integer or node.kind == .number or node.kind == .numeric) {
@@ -1903,6 +2022,16 @@ const Compiler = struct {
             std.mem.writeInt(u16, identity[0..2], modifier.precision, .little);
             std.mem.writeInt(i16, identity[2..4], modifier.scale, .little);
             self.frame(&identity);
+        }
+        if (op == .replace) {
+            const search = self.nodes.items[node.children[1]];
+            if (search.op == .literal and search.literal == .string) {
+                const bytes = std.math.mul(usize, search.literal.string.len, @sizeOf(usize)) catch return error.RelationalExpressionBudgetExceeded;
+                if (bytes > max_allocated_bytes -| self.literal_bytes) return error.RelationalExpressionBudgetExceeded;
+                self.literal_bytes += bytes;
+                const links = try self.alloc.alloc(usize, search.literal.string.len);
+                node.replace_pattern = try text_kernel.Pattern.init(search.literal.string, links, &self.execution.numeric);
+            }
         }
         const index: u16 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.alloc, node);

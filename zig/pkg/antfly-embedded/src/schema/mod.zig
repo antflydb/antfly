@@ -808,6 +808,69 @@ fn requiresConstantIndexPredicates(schema: ParsedTableSchema) bool {
     return false;
 }
 
+fn textExpressionJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and
+        (std.mem.eql(u8, op.string, "replace") or std.mem.eql(u8, op.string, "md5"))) return true;
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (textExpressionJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn textExpressionWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.op == .replace or expression.op == .md5) return true;
+    if (expression.args) |args| for (args) |arg| if (textExpressionWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresTextExpressions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (textExpressionWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (textExpressionWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (textExpressionWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (textExpressionJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
+test "relational index system SQL durable text capability covers every declaration owner" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (md5(s)) STORED)",
+        "CREATE TABLE t (s text DEFAULT md5('x'))",
+        "CREATE TABLE t (s text, CHECK (md5(s) <> ''))",
+        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (replace(s,'a','b')) STORED)",
+    }) |sql| {
+        var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+        defer a.free(bytes);
+        var parsed = try parseValidatedTableSchema(a, bytes);
+        defer parsed.deinit(a);
+        const runtime = try deriveRuntimeTableSchema(a, parsed);
+        defer storage_schema.freeSchema(a, runtime);
+        const checks_layout = try deriveRelationalCheckLayout(a, parsed);
+        defer storage_schema.freeSchema(a, checks_layout);
+        try std.testing.expect(runtime.requires_text_expressions);
+        try std.testing.expect(checks_layout.requires_text_expressions);
+        const serialized = try storage_schema.serializeSchema(a, runtime);
+        defer a.free(serialized);
+        const restored = try storage_schema.deserializeSchema(a, serialized);
+        defer storage_schema.freeSchema(a, restored);
+        try std.testing.expect(restored.requires_text_expressions);
+    }
+}
+
 fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
     if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
         if (typedNumericWire(expression, 0, predicate)) return true;
@@ -1226,6 +1289,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
         .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
+        .requires_text_expressions = requiresTextExpressions(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1256,6 +1320,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
         .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
+        .requires_text_expressions = requiresTextExpressions(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

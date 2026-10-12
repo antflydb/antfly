@@ -117,6 +117,27 @@ func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
 	}
 }
 
+func TestRelationalTextExpressionOperations(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte("{\"op\":\"md5\",\"args\":[{\"op\":\"replace\",\"args\":[{\"op\":\"column\",\"column\":\"s\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"X\"}]}]}"), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpMd5 || len(expression.Args) != 1 || !expression.Args[0].Op.Valid() || expression.Args[0].Op != oapi.RelationalExpressionOpReplace || len(expression.Args[0].Args) != 3 {
+		t.Fatalf("lost nested text operation contract: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Op != expression.Op || restored.Args[0].Op != expression.Args[0].Op || restored.Args[0].Args[2].Value != "X" {
+		t.Fatalf("text operation contract changed after transport: %s", encoded)
+	}
+}
+
 func TestRelationalNumericAssignmentCastBuiltinIdentity(t *testing.T) {
 	var expression RelationalScalarExpression
 	if err := json.Unmarshal([]byte(`{"op":"cast","type":"integer","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":32768}]}`), &expression); err != nil {

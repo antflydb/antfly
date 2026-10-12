@@ -36,9 +36,9 @@ class IndexPlanningReferenceTest(unittest.TestCase):
         cls.server.__exit__(None, None, None)
 
     def test_complete_independent_contracts(self):
-        self.assertEqual(20, len(self.entries))
+        self.assertEqual(24, len(self.entries))
         self.assertEqual(
-            14, sum(entry["sqlstate"] is None for entry in self.entries.values())
+            18, sum(entry["sqlstate"] is None for entry in self.entries.values())
         )
 
     def test_reachable_stable_keys_and_predicates_are_rejected(self):

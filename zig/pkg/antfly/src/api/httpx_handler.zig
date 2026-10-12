@@ -13809,7 +13809,7 @@ test "httpx SQL generated immutable planning preserves PostgreSQL stored rows af
             if (expected) |text| try std.testing.expectEqualStrings(text, row[3].string);
         }
     }
-    try std.testing.expectEqual(@as(usize, 19), admitted);
+    try std.testing.expectEqual(@as(usize, 27), admitted);
 }
 
 test "httpx SQL generated immutable planning preserves PostgreSQL rejection diagnostics" {

@@ -279,6 +279,8 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
                     .upper => "upper_ascii",
                     .coalesce => "coalesce",
                     .mod => "modulo",
+                    .replace => "replace",
+                    .md5 => "md5",
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
@@ -473,7 +475,7 @@ test "SQL generated immutable planning matches independent PostgreSQL DDL contra
         entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
     }, std.testing.allocator, @embedFile("fixtures/sql_generated_expression_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 34), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 42), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var parsed = try @import("compiler.zig").compile(std.testing.allocator, entry.sql, .{});
         defer parsed.deinit();
@@ -497,7 +499,7 @@ test "SQL immutable index planning matches independent PostgreSQL admission cont
         entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
     }, a, @embedFile("fixtures/sql_index_planning_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 20), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 24), fixture.value.entries.len);
     var base = try @import("compiler.zig").compile(a, fixture.value.base_sql, .{});
     defer base.deinit();
     const bytes = try @import("ddl_runtime.zig").createSchemaAlloc(a, base.statement.create_table);

@@ -185,6 +185,50 @@
       "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE NOT true",
       "rows": [],
       "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "replace(s, 'A', 'x')",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((replace(s, 'A', 'x')))",
+      "rows": [
+        null,
+        "",
+        "xLPHx"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "md5(s)",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((md5(s)))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "md5(replace(s, 'A', 'x'))",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((md5(replace(s, 'A', 'x'))))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "e6692fe2a788437578d0375d59283510"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "replace(s, lower(s), upper(s))",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((replace(s, lower(s), upper(s))))",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
     }
   ]
 }

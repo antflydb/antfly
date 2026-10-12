@@ -18,6 +18,8 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   coalesce: [2, 32],
   lower_ascii: [1, 1],
   upper_ascii: [1, 1],
+  replace: [3, 3],
+  md5: [1, 1],
   eq: [2, 2],
   ne: [2, 2],
   gt: [2, 2],

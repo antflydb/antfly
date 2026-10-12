@@ -23,6 +23,7 @@ class RelationalExpressionOp(StrEnum):
     LOWER_ASCII = "lower_ascii"
     LT = "lt"
     LTE = "lte"
+    MD5 = "md5"
     MODULO = "modulo"
     MULTIPLY = "multiply"
     NE = "ne"
@@ -30,6 +31,7 @@ class RelationalExpressionOp(StrEnum):
     NOT = "not"
     NOT_IN_LIST = "not_in_list"
     OR = "or"
+    REPLACE = "replace"
     SUBTRACT = "subtract"
     UPPER_ASCII = "upper_ascii"
 

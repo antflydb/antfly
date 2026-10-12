@@ -27,8 +27,16 @@ class RelationalScalarExpression:
     division truncates toward zero. Overflow and division by zero reject
     the write. Arithmetic and string operations propagate null. ASCII case
     operations leave non-ASCII bytes unchanged. No volatile functions are
-    accepted. Allocated results are bounded to 1 MiB each. Allocations
-    and byte-comparison operand work share a 4 MiB evaluation budget per
+    accepted. Allocated results are bounded to 1 MiB each.
+    The replace operation takes three text arguments and performs literal,
+    non-overlapping replacement; an empty search string leaves the input
+    unchanged. md5 takes one text argument and returns 32 lowercase hex
+    characters (a SQL compatibility fingerprint, not a security primitive).
+    Both are strict in SQL NULL and require reader capability version 27,
+    including when nested inside scalar/boolean expressions. Literal search
+    patterns are prepared with immutable plans; matching, copies and dynamic
+    pattern preparation share invocation work/cancellation admission.
+    Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
     row and expression set. An integer literal may use a decimal string
     for exact int64 transport; blob uses base64 and datetime uses the
     normal relational datetime representation.

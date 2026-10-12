@@ -8,6 +8,20 @@ describe("relational expression structural admission", () => {
   const validate = (expression: unknown) =>
     validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
 
+  it("admits generated text operations with exact arity and no irrelevant fields", () => {
+    const text = { op: "literal", type: "string", value: "a" };
+    expect(() => validate({ op: "replace", args: [text, text, text] })).not.toThrow();
+    expect(() => validate({ op: "md5", args: [text] })).not.toThrow();
+    for (const expression of [
+      { op: "replace", args: [text, text] },
+      { op: "replace", args: [text, text, text, text] },
+      { op: "md5", args: [] },
+      { op: "md5", args: [text, text] },
+      { op: "replace", args: [text, text, text], sql_type: "text" },
+    ])
+      expect(() => validate(expression)).toThrow(TypeError);
+  });
+
   const envelope = {
     dimensions: [{ length: 2, lower_bound: -4 }],
     values: ["9007199254740993", null],

@@ -70,6 +70,14 @@ CASES = (
     ("boolean", "n IS NOT NULL AND true"),
     ("boolean", "NULL::boolean OR n IS NULL"),
     ("boolean", "NULL::boolean AND n IS NULL"),
+    ("text", "replace(s, 'A', 'x')"),
+    ("text", "md5(s)"),
+    ("text", "md5(replace(s, 'A', 'x'))"),
+    ("text", "replace(s, lower(s), upper(s))"),
+    ("text", "replace(s, '', 'x')"),
+    ("text", "replace(s, 'A', '')"),
+    ("text", "coalesce(md5(s), 'missing')"),
+    ("boolean", "md5(s) IS NULL"),
 )
 ROWS = ((None, None), ("", 0), ("ALPHA", 3))
 

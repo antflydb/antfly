@@ -3913,3 +3913,53 @@ integrity and the 2,041-file Apache boundary passed. Earlier test-only failures
 that confused result-size admission with heap allocation are excluded; the
 corrected witness preserves result-size admission and uses a zero-capacity
 allocator to prove borrowing. No remote CI-green or durable activation claim.
+
+### Durable text expression integration
+
+REPLACE and text MD5 now lower into the same immutable VM for stored generated
+columns, defaults, CHECKs and ordered/unique expression keys. Public operation
+enums come from OpenAPI, with generated Go/Python/TypeScript models and explicit
+SDK arity/round-trip checks. Both operations remain immutable and strict in
+SQL NULL. Selected arguments execute before NULL propagation, retaining errors;
+CASE/COALESCE keep their existing lazy demand semantics.
+
+Literal REPLACE needles compile their failure links once in the immutable
+plan arena. Their retained capacity counts toward the schema-wide compiled
+literal allowance. Dynamic needles use bounded row scratch and the same
+sticky work/cancellation owner; no independent function budget is created.
+MD5 admits its fixed-size output before hashing. The normal one-MiB result and
+four-MiB row/expression-set allocation bounds remain in force.
+
+ASCH/catalog capability 27 fences text programs independently of physical
+column types, including nested Boolean CHECK results. Derivation covers full
+runtime schemas and reduced CHECK layouts, defaults/generation, ordinary
+expression indexes and unique expression keys. Strict binary validation reads
+the capability before allocating, rejects malformed/truncated framing and
+refuses capability-26 downgrade. Full-text projection fingerprints remain
+independent of this capability.
+
+Independent PostgreSQL 18 fixtures now contain 42 generated-expression
+contracts (27 admitted, 15 rejected) and 24 index contracts (18 admitted,
+six rejected). Typed native index tests compare their encoded keys against
+the PostgreSQL row results. Mounted HTTP qualification writes and reopens all
+27 admitted generated shapes, checking base fields, types, values and NULLs.
+The native LSM regression additionally exercises text expression indexes and
+CHECKs across reopen/portable restore, failed-batch atomicity, subsequent
+updates and index-only covered reads.
+
+This does not enable the guarded distributed native-index production worker
+or certify its unfinished authority/publication lifecycle. General durable
+scalar coverage (including JSON extraction and exact rounding), broader partial
+predicates, and the remaining temporal/distributed contracts are still open.
+No original source SQL or dispositions change: 898 originals remain unresolved.
+
+Pre-merge qualification: full SQL Debug passed 757 main-owner and 226 linked
+tests, with three existing skips and no failures/leaks. Focused ReleaseFast
+passed ten tests; mounted HTTP qualification passed 19 linked tests and three
+HTTP tests. The corrected LSM reopen/portable-restore regression passed in its
+native owner using explicit typed pages and a nullable source field so
+the CHECK, rather than structural row validation, owns rejection. Independent
+PostgreSQL fixture checks reproduced all 42 generated and 24 index contracts.
+Go relational SDK tests, 18 Python tests, TypeScript type checking and 483 tests
+(one existing skip), formatting, OpenAPI validation and the 20 inventory tests
+passed. This is not a post-main-merge, full native-lifecycle or remote CI claim.

@@ -51,6 +51,10 @@ CASES = (
     ("predicate", "NOT NULL::boolean"),
     ("predicate", "NOT false"),
     ("predicate", "NOT true"),
+    ("key", "replace(s, 'A', 'x')"),
+    ("key", "md5(s)"),
+    ("key", "md5(replace(s, 'A', 'x'))"),
+    ("key", "replace(s, lower(s), upper(s))"),
 )
 
 

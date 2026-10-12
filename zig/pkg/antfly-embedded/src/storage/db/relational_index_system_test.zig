@@ -2342,6 +2342,79 @@ test "relational index system partial membership discharges uncovered predicates
     std.debug.print("partial-index uncovered membership predicate rows=128 primary_probes=0 residual_fallback_probes=128\n", .{});
 }
 
+test "relational index system durable text indexes and CHECKs survive LSM reopen and portable restore" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("durable-text-index");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("durable-text-restored");
+    defer target.cleanup();
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        try seed.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"result_type":"string","expression":{"op":"md5","args":[{"op":"replace","args":[{"op":"column","column":"payload"},{"op":"literal","type":"string","value":"old"},{"op":"literal","type":"string","value":"new"}]}]}}],"include_columns":["id","payload"]}],"checks":[{"name":"payload_required","expression":{"op":"is_not_null","args":[{"op":"md5","args":[{"op":"column","column":"payload"}]}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"payload":{"type":"keyword","nullable":true}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(seed.core.schema.?.requires_text_expressions);
+        try seed.batch(.{ .writes = &.{
+            .{ .key = "r1", .value = "{\"id\":1,\"payload\":\"old one\"}" },
+            .{ .key = "r2", .value = "{\"id\":2,\"payload\":\"héllo\"}" },
+            .{ .key = "r3", .value = "{\"id\":3,\"payload\":\"\"}" },
+        } });
+        _ = try ready(&seed);
+        try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_text_expressions);
+        _ = try ready(db);
+        const generation = (try db.relationalIndexBuildStatus("tenant_id")).generation;
+        {
+            var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" } });
+            defer reader.deinit();
+            var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+            defer page.deinit();
+            try std.testing.expect(!page.more);
+            try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+            try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+            var seen: [3]bool = @splat(false);
+            for (page.rows) |row| {
+                const id = row.typed.?.object.get("id").?.integer;
+                try std.testing.expect(id >= 1 and id <= 3);
+                const ordinal: usize = @intCast(id - 1);
+                try std.testing.expect(!seen[ordinal]);
+                seen[ordinal] = true;
+                try std.testing.expectEqualStrings(([_][]const u8{ "old one", "héllo", "" })[ordinal], row.typed.?.object.get("payload").?.string);
+            }
+        }
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{
+            .{ .key = "not-committed", .value = "{\"id\":4,\"payload\":\"valid\"}" },
+            .{ .key = "invalid", .value = "{\"id\":5,\"payload\":null}" },
+        } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "r1", .value = "{\"id\":1,\"payload\":\"old changed\"}" }} });
+        try std.testing.expectEqual(generation, (try db.relationalIndexBuildStatus("tenant_id")).generation);
+        var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" } });
+        defer reader.deinit();
+        var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        var updated = false;
+        for (page.rows) |row| if (row.typed.?.object.get("id").?.integer == 1) {
+            try std.testing.expect(!updated);
+            updated = true;
+            try std.testing.expectEqualStrings("old changed", row.typed.?.object.get("payload").?.string);
+        };
+        try std.testing.expect(updated);
+    }
+}
+
 test "relational index system SQL immutable index constant membership survives LSM reopen and portable restore" {
     for ([_]bool{ true, false }) |constant| {
         var directory = try @import("../../common/test_directory.zig").TestDirectory.init("constant-index-membership");

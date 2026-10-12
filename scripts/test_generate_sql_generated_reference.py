@@ -36,9 +36,9 @@ class GeneratedReferenceTest(unittest.TestCase):
         cls.server.__exit__(None, None, None)
 
     def test_complete_admission_and_row_contracts(self):
-        self.assertEqual(34, len(self.result["entries"]))
+        self.assertEqual(42, len(self.result["entries"]))
         admitted = [e for e in self.entries.values() if e["sqlstate"] is None]
-        self.assertEqual(19, len(admitted))
+        self.assertEqual(27, len(admitted))
         for entry in admitted:
             self.assertEqual(3, len(entry["rows"]))
 

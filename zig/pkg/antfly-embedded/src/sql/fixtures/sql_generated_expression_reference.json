@@ -316,6 +316,94 @@
         "false"
       ],
       "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, 'A', 'x')) STORED)",
+      "type": "text",
+      "expression": "replace(s, 'A', 'x')",
+      "rows": [
+        null,
+        "",
+        "xLPHx"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (md5(s)) STORED)",
+      "type": "text",
+      "expression": "md5(s)",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (md5(replace(s, 'A', 'x'))) STORED)",
+      "type": "text",
+      "expression": "md5(replace(s, 'A', 'x'))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "e6692fe2a788437578d0375d59283510"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, lower(s), upper(s))) STORED)",
+      "type": "text",
+      "expression": "replace(s, lower(s), upper(s))",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, '', 'x')) STORED)",
+      "type": "text",
+      "expression": "replace(s, '', 'x')",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, 'A', '')) STORED)",
+      "type": "text",
+      "expression": "replace(s, 'A', '')",
+      "rows": [
+        null,
+        "",
+        "LPH"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (coalesce(md5(s), 'missing')) STORED)",
+      "type": "text",
+      "expression": "coalesce(md5(s), 'missing')",
+      "rows": [
+        "missing",
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (md5(s) IS NULL) STORED)",
+      "type": "boolean",
+      "expression": "md5(s) IS NULL",
+      "rows": [
+        "true",
+        "false",
+        "false"
+      ],
+      "sqlstate": null
     }
   ]
 }

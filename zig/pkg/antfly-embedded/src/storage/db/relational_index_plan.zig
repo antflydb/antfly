@@ -391,7 +391,7 @@ test "relational index system SQL immutable index keys and membership match Post
         entries: []const struct { kind: []const u8, sql: []const u8, sqlstate: ?[]const u8, rows: ?[]const ?[]const u8 = null },
     }, a, @embedFile("../../sql/fixtures/sql_index_planning_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 20), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 24), fixture.value.entries.len);
     var base = try @import("../../sql/compiler.zig").compile(a, fixture.value.base_sql, .{});
     defer base.deinit();
     const bytes = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, base.statement.create_table);
@@ -424,6 +424,8 @@ test "relational index system SQL immutable index keys and membership match Post
         var constant_membership = false;
         for (definitions[0].where) |condition| constant_membership = constant_membership or condition.constant != null;
         try std.testing.expectEqual(constant_membership, runtime.requires_constant_index_predicates);
+        const text_expression = std.mem.indexOf(u8, entry.sql, "md5(") != null or std.mem.indexOf(u8, entry.sql, "replace(") != null;
+        try std.testing.expectEqual(text_expression, runtime.requires_text_expressions);
         const registry_mod = @import("schema_registry.zig");
         var registry = try registry_mod.Registry.initCloned(a, std.testing.io, runtime);
         defer registry.deinit();

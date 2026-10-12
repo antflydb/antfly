@@ -5,6 +5,29 @@ from antfly.client_generated.models.relational_expression_type import Relational
 from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
 
 
+def test_generated_text_expression_operations_round_trip_recursively():
+    source = {
+        "column": "digest",
+        "expression": {
+            "op": "md5",
+            "args": [
+                {
+                    "op": "replace",
+                    "args": [
+                        {"op": "column", "column": "s"},
+                        {"op": "literal", "type": "string", "value": "a"},
+                        {"op": "literal", "type": "string", "value": "X"},
+                    ],
+                }
+            ],
+        },
+    }
+    model = RelationalColumnExpression.from_dict(source)
+    assert model.expression.op is RelationalExpressionOp.MD5
+    assert model.expression.args[0].op is RelationalExpressionOp.REPLACE
+    assert model.to_dict() == source
+
+
 def test_generated_partial_index_constants_preserve_false_and_omit_comparison_fields():
     for value in (False, True):
         source = {"constant": value}
