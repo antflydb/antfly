@@ -5618,19 +5618,20 @@ pub const AntflyApiHandler = struct {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
+                        if (value.temporal() != null) return error.UnsupportedSqlShape;
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
                         } else if (value.array) |array| {
-                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
                         } else if (value.numeric) |number| {
-                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
                             const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
-                        } else if (value.patterns) |patterns| {
+                        } else if (value.patterns()) |patterns| {
                             try writer.writer.writeByte('[');
                             var offset: u64 = 0;
                             var first = true;

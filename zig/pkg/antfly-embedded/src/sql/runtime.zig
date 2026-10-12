@@ -358,7 +358,7 @@ pub const Context = struct {
             const values = try scratch.allocator().alloc(Datum, row.len);
             for (row, values, self.binding.columns, 0..) |value_, *cell, column, ordinal| {
                 if (column.type == .array) return error.InvalidSqlBackendResponse;
-                cell.* = try describe.coerceDatum(scratch.allocator(), .{ .value = value_, .sql_null = if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, .patterns = if (output.pattern_sources) |sources| sources[index][ordinal] else null }, column.type, column.element_type);
+                cell.* = try describe.coerceDatum(scratch.allocator(), Datum.fromParts(value_, if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, if (output.pattern_sources) |sources| sources[index][ordinal] else null), column.type, column.element_type);
             }
             try sink.append(sink.ptr, values);
         }
@@ -383,6 +383,10 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.temporal() != null) {
+            try datum.validateTemporal();
+            return error.UnsupportedSqlShape; // requires exact public type/OID activation
+        }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
             if (checked.sql_null) return .null;
@@ -1596,6 +1600,10 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
 /// independently prepared MERGE images. Never encode a typed array's JSON
 /// placeholder or retain payloads borrowed from an evaluator's scratch arena.
 pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
+    if (datum.temporal() != null) {
+        try datum.validateTemporal();
+        return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
+    }
     const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
     const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
     if (checked.sql_null) {

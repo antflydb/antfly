@@ -372,7 +372,7 @@ const Owner = struct {
                     if (positions[rank] != null) return error.InvalidNativeLakeRowIndex;
                     for (request.fields, cells) |field, *cell| {
                         const value = try page.cell(sa, row, field);
-                        cell.* = .{ .value = value.value, .sql_null = value.sql_null, .patterns = value.patterns };
+                        cell.* = value;
                     }
                     positions[rank] = try self.ordered_store.?.append(cells);
                 }

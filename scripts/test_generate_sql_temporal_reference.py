@@ -35,6 +35,7 @@ class TemporalReferenceTest(unittest.TestCase):
     def test_all_domains_have_independent_binary_and_calendar_evidence(self):
         result = reference(self.db)
         self.assertEqual(174, len(result["entries"]))
+        self.assertEqual(21, len(result["comparisons"]))
         self.assertEqual({"date", "time", "time_tz", "timestamp", "timestamp_tz", "interval"}, {entry["kind"] for entry in result["entries"]})
         self.assertEqual({-1, 0, 1}, {entry["infinity"] for entry in result["entries"]})
         self.assertEqual(set(range(7)), {entry["precision"] for entry in result["entries"] if "precision" in entry})

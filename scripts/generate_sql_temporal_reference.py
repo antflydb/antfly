@@ -128,7 +128,38 @@ def reference(db):
             source = f"{TYPES[kind][0]} '{value}'"
             for precision in range(7):
                 entries.append(contract(db, kind, f"({source})::{TYPES[kind][0]}({precision})", source, precision))
-    return {"reference": "PostgreSQL exact binary and extracted temporal fields", "oracle_major": db.info.server_version // 10000, "server_version": db.info.server_version, "server_build": db.execute("SELECT version()").fetchone()[0], "encoding": db.execute("SHOW server_encoding").fetchone()[0], "timezone": "UTC", "date_style": "ISO, YMD", "interval_style": "postgres", "entries": entries}
+    pairs = (
+        ("date", "-infinity", "1970-01-01"),
+        ("date", "0001-01-01 BC", "0001-01-01 AD"),
+        ("date", "infinity", "-infinity"),
+        ("time", "00:00:00", "24:00:00"),
+        ("time", "00:00:00.000001", "00:00:00.000002"),
+        ("time_tz", "01:00:00+01", "00:00:00+00"),
+        ("time_tz", "00:00:00+00", "01:00:00+01"),
+        ("time_tz", "24:00:00+00", "00:00:00+00"),
+        ("time_tz", "23:59:59-15:59:59", "00:00:00+15:59:59"),
+        ("timestamp", "1969-12-31 23:59:59.999999", "1970-01-01 00:00:00"),
+        ("timestamp", "-infinity", "4714-11-24 00:00:00 BC"),
+        ("timestamp_tz", "2000-01-01 00:00:00+01", "1999-12-31 23:00:00+00"),
+        ("timestamp_tz", "infinity", "294276-12-31 23:59:59.999999+00"),
+        ("interval", "1 month", "30 days"),
+        ("interval", "1 year", "360 days"),
+        ("interval", "1 day", "24 hours"),
+        ("interval", "1 month -30 days", "0"),
+        ("interval", "1 month", "31 days"),
+        ("interval", "-infinity", "-9223372036854775808 microseconds"),
+        ("interval", "infinity", "9223372036854775807 microseconds"),
+        ("interval", "2147483647 months 2147483647 days -9223372036854775808 microseconds", "0"),
+    )
+    comparisons = []
+    for kind, left, right in pairs:
+        sql_type, sender, _ = TYPES[kind]
+        observed = db.execute(
+            f"SELECT encode(pg_catalog.{sender}(a),'hex'), encode(pg_catalog.{sender}(b),'hex'), CASE WHEN a<b THEN -1 WHEN a>b THEN 1 ELSE 0 END FROM (SELECT %s::{sql_type} a, %s::{sql_type} b) s",
+            (left, right),
+        ).fetchone()
+        comparisons.append({"kind": kind, "left": observed[0], "right": observed[1], "order": observed[2]})
+    return {"reference": "PostgreSQL exact binary and extracted temporal fields", "oracle_major": db.info.server_version // 10000, "server_version": db.info.server_version, "server_build": db.execute("SELECT version()").fetchone()[0], "encoding": db.execute("SHOW server_encoding").fetchone()[0], "timezone": "UTC", "date_style": "ISO, YMD", "interval_style": "postgres", "entries": entries, "comparisons": comparisons}
 
 
 def main():

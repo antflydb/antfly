@@ -2236,5 +2236,133 @@
       "source_binary": "ffffffffffffffff0000000000000000",
       "precision": 6
     }
+  ],
+  "comparisons": [
+    {
+      "kind": "date",
+      "left": "80000000",
+      "right": "ffffd533",
+      "order": -1
+    },
+    {
+      "kind": "date",
+      "left": "fff4da8b",
+      "right": "fff4dbf9",
+      "order": -1
+    },
+    {
+      "kind": "date",
+      "left": "7fffffff",
+      "right": "80000000",
+      "order": 1
+    },
+    {
+      "kind": "time",
+      "left": "0000000000000000",
+      "right": "000000141dd76000",
+      "order": -1
+    },
+    {
+      "kind": "time",
+      "left": "0000000000000001",
+      "right": "0000000000000002",
+      "order": -1
+    },
+    {
+      "kind": "time_tz",
+      "left": "00000000d693a400fffff1f0",
+      "right": "000000000000000000000000",
+      "order": -1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000000000000000000000",
+      "right": "00000000d693a400fffff1f0",
+      "order": 1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000141dd7600000000000",
+      "right": "000000000000000000000000",
+      "order": 1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000141dc81dc00000e0ff",
+      "right": "0000000000000000ffff1f01",
+      "order": 1
+    },
+    {
+      "kind": "timestamp",
+      "left": "fffca2fec4c81fff",
+      "right": "fffca2fec4c82000",
+      "order": -1
+    },
+    {
+      "kind": "timestamp",
+      "left": "8000000000000000",
+      "right": "fd0f7cc1411fa000",
+      "order": -1
+    },
+    {
+      "kind": "timestamp_tz",
+      "left": "ffffffff296c5c00",
+      "right": "ffffffff296c5c00",
+      "order": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "left": "7fffffffffffffff",
+      "right": "7fffff5bb3b29fff",
+      "order": 1
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000000000001",
+      "right": "00000000000000000000001e00000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "0000000000000000000000000000000c",
+      "right": "00000000000000000000016800000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000100000000",
+      "right": "000000141dd760000000000000000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "0000000000000000ffffffe200000001",
+      "right": "00000000000000000000000000000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000000000001",
+      "right": "00000000000000000000001f00000000",
+      "order": -1
+    },
+    {
+      "kind": "interval",
+      "left": "80000000000000008000000080000000",
+      "right": "80000000000000000000000000000000",
+      "order": -1
+    },
+    {
+      "kind": "interval",
+      "left": "7fffffffffffffff7fffffff7fffffff",
+      "right": "7fffffffffffffff0000000000000000",
+      "order": 1
+    },
+    {
+      "kind": "interval",
+      "left": "80000000000000007fffffff7fffffff",
+      "right": "00000000000000000000000000000000",
+      "order": 1
+    }
   ]
 }

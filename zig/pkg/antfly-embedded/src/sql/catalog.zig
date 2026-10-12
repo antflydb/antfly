@@ -266,7 +266,7 @@ pub const Row = struct {
             if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
             const result = cells.values[index];
             if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
-            if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
+            if (result.array != null and (result.sql_null or result.value != .null or result.patterns() != null)) return error.InvalidSqlBackendResponse;
             if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
             return result;
         }
@@ -276,7 +276,7 @@ pub const Row = struct {
         const value = self.value.object.values()[index];
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
-        return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
+        return @import("scalar.zig").Datum.fromParts(value, sql_null, if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null);
     }
 
     fn validateTyped(self: Row) !void {

@@ -31,13 +31,18 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    /// Immutable temporal payload owned by the pinned invocation/row region.
+    /// The JSON null placeholder is never a temporal value or SQL NULL.
+    extension_kind: enum(u8) { none, patterns, temporal } = .none,
+    // One tagged, pointer-sized extension; the discriminator fits existing
+    // tail padding. Constructors/accessors are the only interpretation boundary.
+    extension: ?*const anyopaque = null,
     /// Exact immutable NUMERIC payload, owned by the pinned value region.
     /// JSON null is only a placeholder and is never SQL NULL or numeric data.
     numeric: ?*const @import("numeric_value.zig").Value = null,
     /// A pinned, immutable SQL array. JSON arrays remain in value and never
     /// acquire SQL-array semantics from their payload shape.
     array: ?*const @import("array_value.zig").Value = null,
-    patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
 
@@ -53,7 +58,82 @@ pub const Datum = struct {
     pub fn typedNumeric(value: *const @import("numeric_value.zig").Value) Datum {
         return .{ .numeric = value, .sql_null = false };
     }
+    pub fn typedTemporal(value: *const @import("temporal_value.zig").Value) Datum {
+        return .{ .extension_kind = .temporal, .extension = value, .sql_null = false };
+    }
+    pub fn temporal(self: Datum) ?*const @import("temporal_value.zig").Value {
+        return if (self.extension_kind == .temporal and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
+    }
+    pub fn patterns(self: Datum) ?*PatternSet {
+        return if (self.extension_kind == .patterns and self.extension != null) @constCast(@as(*const PatternSet, @ptrCast(@alignCast(self.extension.?)))) else null;
+    }
+    pub fn fromParts(value: Json, sql_null: bool, pattern: ?*PatternSet) Datum {
+        var result: Datum = .{ .value = value, .sql_null = sql_null };
+        if (pattern) |p| {
+            result.extension_kind = .patterns;
+            result.extension = p;
+        }
+        return result;
+    }
+    pub fn validateTemporal(self: Datum) !void {
+        if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.temporal()) |value| {
+            if (self.sql_null or self.numeric != null or self.array != null or self.patterns() != null or self.value != .null) return error.SqlTypeMismatch;
+            var frame: [16]u8 = undefined;
+            _ = try @import("temporal_value.zig").encode(value.*, &frame);
+        }
+    }
 };
+
+pub fn temporalBinaryLeaky(a: Allocator, kind: @import("temporal_value.zig").Kind, bytes: []const u8, work: *arrays.Budget) !Datum {
+    try work.consume(1);
+    const value = try @import("temporal_value.zig").decode(kind, bytes);
+    const owned = try a.create(@import("temporal_value.zig").Value);
+    owned.* = value;
+    return Datum.typedTemporal(owned);
+}
+
+test "SQL temporal scalar dispatch preserves typed identity and exact text casts" {
+    // Extension identity occupies existing tail padding, not another pointer
+    // in every primitive cell. Keep this invariant on every selected target.
+    const Legacy = struct {
+        numeric: ?*const @import("numeric_value.zig").Value,
+        array: ?*const @import("array_value.zig").Value,
+        patterns: ?*PatternSet,
+        value: Json,
+        sql_null: bool,
+    };
+    try std.testing.expect(@sizeOf(Datum) <= @sizeOf(Legacy));
+    const a = std.testing.allocator;
+    const value: @import("temporal_value.zig").Value = .{ .timestamp_tz = .{ .micros = -946_684_800_000_001 } };
+    for ([_][]const u8{ "v", "coalesce(v, NULL)", "greatest(v, v)" }) |query| {
+        var compiled = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try program.evaluate(none.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.temporal() == &value);
+    }
+    for ([_][]const u8{ "v = v", "v IS NOT NULL", "v IS DISTINCT FROM NULL" }) |query| {
+        var compiled = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try program.evaluate(none.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.value.bool);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "v::text", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+    try std.testing.expectEqualStrings("1969-12-31 23:59:59.999999+00", result.value.string);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{ .output_bytes = 1 }));
+}
 
 /// Leaky constructors retain limbs and their stable view in the caller's
 /// region. Frames/operators own that region; no input bytes remain borrowed.
@@ -611,7 +691,7 @@ pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, exp
 /// Identity borrows the source; converted cells belong to alloc, and dimension
 /// metadata borrows the pinned source until the caller's ownership boundary.
 pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, limits: EvalLimits) !Datum {
-    if (datum.value != .null or datum.patterns != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.value != .null or datum.patterns() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
         if (datum.array != null) return error.SqlAssignmentTypeMismatch;
         return datum;
@@ -3101,7 +3181,7 @@ const Evaluator = struct {
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
         const result = try self.runDatum(index, depth);
-        if (result.array != null or result.numeric != null) return error.SqlTypeMismatch;
+        if (result.array != null or result.numeric != null or result.temporal() != null) return error.SqlTypeMismatch;
         return result.value;
     }
 
@@ -3139,6 +3219,10 @@ const Evaluator = struct {
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
+                if (datum.temporal() != null) {
+                    if (cast.type != .string) return error.UnsupportedSqlShape;
+                    break :blk Datum.json(.{ .string = try self.temporalText(datum) });
+                }
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
                         const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
@@ -3664,6 +3748,7 @@ const Evaluator = struct {
             _ = try builtin_cast.checkedInteger(result.value.integer, kind);
         };
         if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
+        try result.validateTemporal();
         return result;
     }
 
@@ -3918,6 +4003,7 @@ const Evaluator = struct {
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
+        if (datum.temporal() != null) return error.UnsupportedSqlShape; // JSON temporal spelling needs exact type activation
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
         if (descriptor.kind == .number and datum.value == .float) {
@@ -4146,11 +4232,21 @@ const Evaluator = struct {
     /// floating object keys are text, so JSON numeric canonicalization would
     /// incorrectly expand exponents and discard the sign of negative zero.
     fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.temporal() != null) return self.temporalText(datum);
         if (datum.numeric != null) return self.formatText(try self.numericJson(datum));
         if (descriptor.kind == .json) return self.jsonText(datum.value);
         if (descriptor.kind == .number and datum.value == .float)
             return (try self.castBuiltin(datum.value, descriptor.element_type orelse .float64, .text)).string;
         return self.formatText(datum.value);
+    }
+
+    fn temporalText(self: *Evaluator, datum: Datum) ![]const u8 {
+        try datum.validateTemporal();
+        const codec = @import("temporal_text.zig");
+        var output: [codec.output_capacity]u8 = undefined;
+        const text = try codec.format(datum.temporal().?.*, &output);
+        try self.charge(text.len);
+        return self.alloc.dupe(u8, text);
     }
 
     fn formatText(self: *Evaluator, value: Json) ![]const u8 {
@@ -4210,7 +4306,7 @@ const Evaluator = struct {
             }
             if (set != .null and set != .array) return error.SqlTypeMismatch;
             const patterns: []const Json = if (set == .null) &.{} else set.array.items;
-            if (set_datum.patterns) |source| {
+            if (set_datum.patterns()) |source| {
                 if (source.count == 0) return .{ .bool = all.bool };
                 if (operand == .null) return .null;
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -4847,7 +4943,11 @@ pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
 
 pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budget) anyerror!std.math.Order {
     try work.consume(1);
+    try left.validateTemporal();
+    try right.validateTemporal();
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.temporal()) |value| return @import("temporal_ops.zig").compare(value.*, (right.temporal() orelse return error.SqlTypeMismatch).*);
+    if (right.temporal() != null) return error.SqlTypeMismatch;
     if (left.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var ctx = work.numericContext(none.allocator());
@@ -4871,7 +4971,9 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 }
 
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
+    try value.validateTemporal();
     if (value.sql_null) return 0;
+    if (value.temporal()) |temporal| return @import("temporal_ops.zig").hash(temporal.*);
     if (value.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
         var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };

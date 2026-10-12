@@ -3513,3 +3513,45 @@ overflow; eventual SQL activation must retain that diagnostic. The native gate
 is `zig build sql-temporal-test` (also a dependency of `unit-test`); the independent
 fixture gate is `scripts/generate_sql_temporal_reference.py --check` with the
 declared psycopg runtime and owned PostgreSQL test server.
+
+### Typed temporal operator ownership and comparison
+
+Temporal values now survive scalar dispatch, owned row clones, retained columns,
+hash joins, tuple membership, DISTINCT, normalized in-memory sorting, portable
+spills and aggregate checkpoints without conversion to JSON or floating point.
+Pattern callbacks and temporal payloads share one discriminated pointer-sized
+extension: a target-specific regression requires Datum to remain no larger than
+its previous layout. This preserves the existing small-statement memory budget;
+no quota or allocation-failure assertion was relaxed.
+
+Comparison identity is deliberately separate from physical bytes. Interval
+comparison uses 30-day months with widened arithmetic while the owned value and
+spill retain months, days and microseconds independently. Timetz compares
+unwrapped GMT time, then the stored offset. Equal comparison identities share
+the grouping/join hash and sort prefix. Neither this hash nor its temporary
+sort key is a durable row-content fingerprint or a versioned native index codec.
+
+The independent PostgreSQL 18.6 oracle now includes 21 pairwise comparisons in
+addition to the existing 174 text/binary/precision contracts. Native tests cover
+actual hash joins and membership, retained ownership, checkpoint/spill recovery,
+truncated and corrupt frames, fixed working-memory limits and allocation faults.
+The full Debug SQL gate and focused ReleaseFast temporal operator gate pass;
+the standalone temporal gate and six PostgreSQL oracle tests also pass.
+
+The final revision passes 21/21 full Debug SQL build steps (728 main-owner tests
+and 226 additional-owner tests, three main-owner skips, no failures or leaks),
+all 18 focused temporal tests in Debug and ReleaseFast, and the 80/80-step
+public API gate selecting the existing HTTP and pgwire typed-array regressions.
+Parameter ingress validates the extension before SQL NULL normalization; an
+allocation-free regression rejects contradictory, missing and out-of-domain
+payloads. Formatting, the 2,038-file Apache boundary, inventory integrity and
+all 20 inventory-verifier tests pass. These overlapping gates are not additional
+original-case qualifications or a CI-green claim.
+
+Public result and storage boundaries continue to reject these new payloads
+explicitly until exact schema/type identities, AROW/index capability versions,
+pgwire codecs, temporal arrays, parser/binder rules and execution-owned clock
+capture are activated together. General temporal literals, named-zone/DST
+semantics, arithmetic and SQL JSON formatting also remain open. This delivery
+does not qualify any additional original SQL case: the inventory remains
+479 implemented / 136 rejected / 73 superseded / 898 unresolved.

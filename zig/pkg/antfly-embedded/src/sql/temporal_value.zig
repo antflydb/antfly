@@ -25,13 +25,14 @@ pub const end_timestamp: i64 = 9_223_371_331_200_000_000;
 pub const min_date: i32 = -2_451_545;
 pub const end_date: i32 = 2_145_031_949;
 
-pub const Kind = enum {
-    date,
-    time,
-    time_tz,
-    timestamp,
-    timestamp_tz,
-    interval,
+// Typed spill tags are append-only; do not reorder or recycle identities.
+pub const Kind = enum(u8) {
+    date = 0,
+    time = 1,
+    time_tz = 2,
+    timestamp = 3,
+    timestamp_tz = 4,
+    interval = 5,
     pub fn oid(self: Kind) u32 {
         return switch (self) {
             .date => 1082,

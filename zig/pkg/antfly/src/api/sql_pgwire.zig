@@ -566,14 +566,15 @@ const OwnedRead = struct {
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.temporal() != null) return error.UnsupportedSqlShape;
             if (value.array) |array| {
                 const definition = self.page.columns[column];
-                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
+                if (value.sql_null or value.value != .null or value.patterns() != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
                 return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
             }
             if (value.numeric) |number| {
                 const definition = self.page.columns[column];
-                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
+                if (value.sql_null or value.value != .null or value.patterns() != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
                 const exact = @import("antfly_local_sources").sql_numeric_value;
                 var context: exact.Context = .{ .alloc = alloc };
                 return .{ .value = .{ .string = try exact.format(&context, number.*) }, .sql_null = false };

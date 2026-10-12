@@ -17,5 +17,6 @@
 test {
     _ = @import("sql/temporal_value.zig");
     _ = @import("sql/temporal_text.zig");
+    _ = @import("sql/temporal_ops.zig");
     _ = @import("sql/statement_clock.zig");
 }
