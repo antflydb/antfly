@@ -30,7 +30,12 @@ pub const Body = struct {
     allocator: std.mem.Allocator,
     bytes: []u8,
     reservation: admission.Token = .{},
+    sensitive: bool = false,
+    pub fn wipe(self: *Body) void {
+        if (self.sensitive) std.crypto.secureZero(u8, self.bytes);
+    }
     pub fn deinit(self: *Body) void {
+        self.wipe();
         self.allocator.free(self.bytes);
         self.reservation.deinit();
         self.* = undefined;
@@ -230,4 +235,16 @@ test "HTTP media adapter bounds transport work preserves auth client options and
     adapter.limits.max_requests = 4;
     try std.testing.expectError(error.ResourceLimitExceeded, adapter.fetch(adapter.root_url, "a.mp4", .{ .offset = 2, .length = 4 }, 4));
     try std.testing.expectEqual(@as(usize, 4), client.calls);
+}
+
+test "HTTP sensitive resource wipes its complete owned allocation before release" {
+    var storage: [64]u8 = @splat(0);
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const bytes = try fixed.allocator().alloc(u8, 32);
+    @memset(bytes, 0x5a);
+    var body = Body{ .allocator = fixed.allocator(), .bytes = bytes, .sensitive = true };
+    // Observe before Allocator.free poisons the released allocation in Debug.
+    body.wipe();
+    for (storage[0..32]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    body.deinit();
 }

@@ -220,6 +220,7 @@ pub fn parseControlled(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limi
     errdefer reservation.deinit();
     var pending: ?Variant = null;
     var version: ?u64 = null;
+    var min_version: u64 = 1;
     while (lines.next()) |raw| {
         try control.check();
         const line = std.mem.trimEnd(u8, raw, "\r");
@@ -239,7 +240,12 @@ pub fn parseControlled(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limi
             if (version != null) return error.MalformedHls;
             version = try attributes.uint(line[15..]);
             if (version.? == 0 or version.? > 7) return error.UnsupportedHls;
-        } else if (std.mem.startsWith(u8, line, "#EXT-X-SESSION-KEY:")) return error.UnsupportedEncryptedMedia else if (line[0] != '#') {
+        } else if (std.mem.startsWith(u8, line, "#EXT-X-SESSION-KEY:")) {
+            const declaration = try hls.crypto.parseKey(line[19..], limits.max_uri_bytes);
+            if (declaration.key == null) return error.MalformedHls;
+            min_version = @max(min_version, declaration.min_version);
+            // Advisory preloading metadata; media EXT-X-KEY remains authoritative.
+        } else if (line[0] != '#') {
             var item = pending orelse return error.MalformedHls;
             try validateUri(line, limits);
             item.uri = line;
@@ -251,6 +257,7 @@ pub fn parseControlled(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limi
         }
     }
     if (pending != null or variants.items.len == 0) return error.MalformedHls;
+    if ((version orelse 1) < min_version) return error.UnsupportedHls;
     for (variants.items) |variant| {
         inline for (.{ .{ Kind.audio, variant.audio }, .{ Kind.video, variant.video }, .{ Kind.subtitles, variant.subtitles }, .{ Kind.closed_captions, variant.closed_captions } }) |reference| {
             if (reference[1]) |group| {
@@ -364,7 +371,7 @@ test "HLS master rejects mixed playlists invalid attributes and broken rendition
         "#EXTM3U\n#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"captions\",INSTREAM-ID=\"SERVICE64\"\n#EXT-X-STREAM-INF:BANDWIDTH=1\na\n",
         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CLOSED-CAPTIONS=NONE\na\n#EXT-X-STREAM-INF:BANDWIDTH=1\nb\n",
     }) |text| try std.testing.expectError(error.MalformedHls, parse(a, text, .{}));
-    try std.testing.expectError(error.UnsupportedEncryptedMedia, parse(a, "#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"key\"\n", .{}));
+    try std.testing.expectError(error.UnsupportedEncryptedMedia, parse(a, "#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"key\"\n", .{}));
     try std.testing.expectError(error.UnsupportedHls, parse(a, "#EXTM3U\n#EXT-X-VERSION:9\n", .{}));
 }
 
@@ -458,4 +465,12 @@ test "HLS master duplicate video URI metadata ties retain deterministic audio-gr
         defer master.deinit();
         try std.testing.expectEqualStrings("a", (try master.select(.{})).variant.audio.?);
     }
+}
+
+test "HLS master validates AES session hints without applying them as media keys" {
+    const text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"key\",KEYFORMAT=\"identity\",IV=0x1\n#EXT-X-STREAM-INF:BANDWIDTH=1\nvideo.m3u8\n";
+    var master = try parse(std.testing.allocator, text, .{});
+    defer master.deinit();
+    try std.testing.expectEqualStrings("video.m3u8", (try master.select(.{})).uri);
+    try std.testing.expectError(error.MalformedHls, parse(std.testing.allocator, "#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=NONE\n", .{}));
 }

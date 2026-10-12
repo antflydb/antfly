@@ -40,6 +40,7 @@ test {
     _ = live_mp4;
     _ = hls;
     _ = hls_master;
+    _ = @import("hls_crypto.zig");
     _ = dash;
     _ = dash_live;
     _ = http_stream;

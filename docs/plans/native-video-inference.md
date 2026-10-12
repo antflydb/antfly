@@ -995,3 +995,27 @@ macOS and actual Linux ARM64. A fresh bounded parser/selection campaign passes
 Apple master fixture. Source/binary/report receipts are in
 `zig/lib/media/testdata/hls/master-validation`; these are protocol/ownership
 results, not codec, model, performance or arbitrary HLS conformance claims.
+
+### AES-128 HLS ingestion continuation
+
+Identity-key AES-128 CBC/PKCS7 HLS resources now decrypt natively through Zig
+before fMP4 ingestion. Maps freeze key/IV declarations; media can use explicit
+or sequence-derived IVs and rotate or clear its key. One admitted key is reused
+within a snapshot and refreshed after successful reload. Secret key/response
+storage is wiped on release, with the full response allocation retained even
+when its plaintext view is shorter. Cancellation/padding failures precede input
+publication, and cursor/initialization retry semantics and held packets survive.
+
+Independent OpenSSL fixtures reproduce byte for byte. The final phase passes
+108 portable and seven production HTTP tests on macOS and actual Linux ARM64.
+Fresh independent fuzz reports cover 109,230 declaration runs and 100,046
+ciphertext runs; serialized seeds have positive plaintext/declaration gates.
+The DASH failure campaign now forces the same deterministic arena-allocation
+fallback already used by its other campaigns, avoiding heap-placement-dependent
+allocation counts after the shared segment descriptor grew. Source/binary/report
+receipts are in `zig/lib/media/testdata/hls/aes-validation`.
+
+This phase does not change codec/model execution or the v6 embedding recipe.
+SAMPLE-AES/CBCS, DRM processing, MPEG-TS, low-latency and separate-track ingestion,
+broader real-world codec/model qualification, scheduling and performance remain
+within the active non-CUDA goal.

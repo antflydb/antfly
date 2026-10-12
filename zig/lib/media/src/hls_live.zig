@@ -21,10 +21,10 @@ const live = @import("live_mp4.zig");
 const dash_cursor = @import("dash_cursor.zig");
 pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{} };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range);
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
 fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
 }
 
 fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
@@ -58,7 +58,72 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         dash_position: ?dash_cursor.Cursor = null,
         active_dash_period: ?[32]u8 = null,
         active_initialization: ?hls.Initialization = null,
+        cached_key: ?CachedKey = null,
         active_discontinuity_sequence: ?u64 = null,
+        const CachedKey = struct {
+            uri: []u8,
+            bytes: [16]u8,
+            reservation: @import("admission.zig").Token = .{},
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                std.crypto.secureZero(u8, &self.bytes);
+                a.free(self.uri);
+                self.reservation.deinit();
+                self.* = undefined;
+            }
+        };
+        const Resource = struct {
+            owner: network.Body,
+            bytes: []const u8,
+            fn deinit(self: *@This()) void {
+                self.owner.deinit();
+                self.* = undefined;
+            }
+        };
+        fn clearKey(self: *Self) void {
+            if (self.cached_key) |*key| key.deinit(self.allocator);
+            self.cached_key = null;
+        }
+        fn freeInitialization(self: *Self, value: hls.Initialization) void {
+            self.allocator.free(value.uri);
+            if (value.encryption) |key| self.allocator.free(key.uri);
+        }
+        fn cloneInitialization(self: *Self, value: hls.Initialization) !hls.Initialization {
+            const uri = try self.allocator.dupe(u8, value.uri);
+            errdefer self.allocator.free(uri);
+            var encryption = value.encryption;
+            if (encryption) |*key| key.uri = try self.allocator.dupe(u8, key.uri);
+            return .{ .uri = uri, .range = value.range, .encryption = encryption };
+        }
+        fn loadKey(self: *Self, declaration: hls.crypto.Key) !*const [16]u8 {
+            const uri = try network.resolve(self.allocator, self.transport.root_url, self.mediaUrl(), declaration.uri, self.transport.limits.max_uri_bytes);
+            errdefer self.allocator.free(uri);
+            if (self.cached_key) |*key| if (std.mem.eql(u8, key.uri, uri)) {
+                self.allocator.free(uri);
+                return &key.bytes;
+            };
+            var body = try self.transport.fetch(uri, uri, null, 16);
+            body.sensitive = true;
+            defer body.deinit();
+            if (body.bytes.len != 16) return error.InvalidHlsKey;
+            var reservation = if (self.transport.pool) |pool| try pool.acquire(.{ .host_bytes = uri.len + 16 }) else @import("admission.zig").Token{};
+            errdefer reservation.deinit();
+            try self.transport.control.check();
+            self.clearKey();
+            self.cached_key = .{ .uri = uri, .bytes = body.bytes[0..16].*, .reservation = reservation };
+            return &self.cached_key.?.bytes;
+        }
+        fn fetchResource(self: *Self, uri: []const u8, range: ?hls.Range, encryption: ?hls.crypto.Key, sequence: u64) !Resource {
+            const key = if (encryption) |declaration| try self.loadKey(declaration) else null;
+            var body = try self.transport.fetch(self.mediaUrl(), uri, range, self.options.ingest.stream.max_bytes);
+            errdefer body.deinit();
+            var bytes: []const u8 = body.bytes;
+            if (encryption) |declaration| {
+                body.sensitive = true;
+                bytes = try hls.crypto.decrypt(body.bytes, key.?, declaration.mediaIv(sequence), self.transport.control);
+                if (bytes.len == 0) return error.EmptyMediaResource;
+            }
+            return .{ .owner = body, .bytes = bytes };
+        }
         pub fn init(a: std.mem.Allocator, transport: *network.Adapter(http), url: []const u8, options: ReaderOptions) !Self {
             const owned = try network.resolve(a, transport.root_url, url, url, transport.limits.max_uri_bytes);
             return .{ .allocator = a, .transport = transport, .url = owned, .options = options };
@@ -67,7 +132,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             if (self.ingest) |*ingest| ingest.deinit();
             if (self.playlist) |*playlist| playlist.deinit();
             if (self.manifest) |*manifest| manifest.deinit();
-            if (self.active_initialization) |initialization| self.allocator.free(initialization.uri);
+            if (self.active_initialization) |initialization| self.freeInitialization(initialization);
+            self.clearKey();
             if (self.media_url) |url| self.allocator.free(url);
             self.allocator.free(self.url);
             self.* = undefined;
@@ -144,6 +210,9 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             try self.transport.control.check();
             if (self.playlist) |*previous| previous.deinit();
             if (self.manifest) |*previous| previous.deinit();
+            // Keys may rotate behind a reused URI. Never carry key bytes into
+            // another successfully committed playlist snapshot.
+            self.clearKey();
             self.playlist = parsed;
             self.manifest = body;
             if (selected_url) |url| {
@@ -193,10 +262,10 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             };
             const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence or (if (item.dash) |timing| !std.meta.eql(self.active_dash_period, @as(?[32]u8, timing.period.identity)) else false) else true;
             if (needs_initialization) {
-                var initialization = try self.transport.fetch(self.mediaUrl(), item.initialization.uri, item.initialization.range, self.options.ingest.stream.max_bytes);
+                var initialization = try self.fetchResource(item.initialization.uri, item.initialization.range, item.initialization.encryption, item.sequence);
                 defer initialization.deinit();
-                const owned_uri = try self.allocator.dupe(u8, item.initialization.uri);
-                errdefer self.allocator.free(owned_uri);
+                const owned_initialization = try self.cloneInitialization(item.initialization);
+                errdefer self.freeInitialization(owned_initialization);
                 if (self.ingest) |*ingest| {
                     try ingest.reconfigure(self.mediaUrl(), initialization.bytes);
                 } else {
@@ -205,12 +274,12 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (options.stream.admission_pool == null) options.stream.admission_pool = self.transport.pool;
                     self.ingest = try live.Ingest.init(self.allocator, self.mediaUrl(), initialization.bytes, options);
                 }
-                if (self.active_initialization) |previous| self.allocator.free(previous.uri);
-                self.active_initialization = .{ .uri = owned_uri, .range = item.initialization.range };
+                if (self.active_initialization) |previous| self.freeInitialization(previous);
+                self.active_initialization = owned_initialization;
                 self.active_discontinuity_sequence = item.discontinuity_sequence;
                 self.active_dash_period = if (item.dash) |timing| timing.period.identity else null;
             }
-            var media = try self.transport.fetch(self.mediaUrl(), item.uri, item.range, self.options.ingest.stream.max_bytes);
+            var media = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
             defer media.deinit();
             try self.ingest.?.push(media.bytes);
             var result = try self.ingest.?.finishSegment();
@@ -642,4 +711,177 @@ fn masterAllocations(a: std.mem.Allocator, pool: *@import("admission.zig").Pool)
 test "live HLS master selection allocation failures release snapshots epochs and packet owners" {
     var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, masterAllocations, .{&pool});
+}
+
+const aes_first = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\",IV=0x1\n#EXT-X-MAP:URI=\"init1\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\"\n#EXTINF:1,\nmedia10\n";
+const aes_rotated = aes_first ++ "#EXT-X-KEY:METHOD=AES-128,URI=\"key2\"\n#EXTINF:1,\nmedia11\n#EXT-X-ENDLIST\n";
+const AesHttp = struct {
+    const key1 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+    const key2 = "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+    pub const Client = struct {
+        manifest: []const u8 = aes_rotated,
+        calls: usize = 0,
+        key_calls: usize = 0,
+        fail_media: bool = false,
+        short_key: bool = false,
+        changed_key1: bool = false,
+        reused_media11: bool = false,
+        pub fn get(self: *@This(), url: []const u8, _: anytype) !FakeHttp.Response {
+            self.calls += 1;
+            if (std.mem.endsWith(u8, url, "list.m3u8")) return .{ .body = self.manifest };
+            if (std.mem.endsWith(u8, url, "key1") or std.mem.endsWith(u8, url, "key2")) {
+                self.key_calls += 1;
+                const bytes = if (self.changed_key1 or std.mem.endsWith(u8, url, "key2")) key2 else key1;
+                return .{ .body = if (self.short_key) bytes[0..15] else bytes };
+            }
+            if (std.mem.endsWith(u8, url, "init1")) return .{ .body = @embedFile("../testdata/hls/aes/init1.bin") };
+            if (std.mem.endsWith(u8, url, "init2")) return .{ .body = @embedFile("../testdata/hls/aes/init2.bin") };
+            if (self.fail_media) return error.ConnectionReset;
+            if (std.mem.endsWith(u8, url, "media10")) return .{ .body = @embedFile("../testdata/hls/aes/media10.bin") };
+            if (std.mem.endsWith(u8, url, "media11")) return .{ .body = @embedFile("../testdata/hls/aes/media11.bin") };
+            if (std.mem.endsWith(u8, url, "changed12")) return .{ .body = @embedFile("../testdata/hls/aes/changed12.bin") };
+            return error.UnexpectedAesResource;
+        }
+    };
+};
+test "live HLS AES decrypts independent init and media fixtures with key rotation and held packets" {
+    const a = std.testing.allocator;
+    var client = AesHttp.Client{};
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    const original = @embedFile("../testdata/fragmented.mp4");
+    try std.testing.expectEqualSlices(u8, original[0..11206], first.backing.bytes);
+    var held = try first.reader.readPacket(0);
+    defer held.deinit();
+    const retained = try a.dupe(u8, held.bytes);
+    defer a.free(retained);
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+    try std.testing.expectEqual(@as(usize, 2), client.key_calls);
+    try std.testing.expectEqual(@as(usize, 6), client.calls);
+    try std.testing.expectEqualSlices(u8, retained, held.bytes);
+    try std.testing.expect(reader.ended());
+}
+test "live HLS AES reload refreshes reused key URI and owns encrypted map declarations" {
+    const a = std.testing.allocator;
+    var client = AesHttp.Client{ .manifest = aes_first };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    try std.testing.expect(reader.cached_key != null);
+    client.manifest = aes_first ++ "#EXTINF:1,\nmedia11\n#EXT-X-ENDLIST\n";
+    client.changed_key1 = true;
+    try reader.reload();
+    try std.testing.expect(reader.cached_key == null);
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+    try std.testing.expectEqual(@as(usize, 2), client.key_calls);
+    try std.testing.expectEqualStrings("key1", reader.active_initialization.?.encryption.?.uri);
+    try std.testing.expect(reader.ended());
+}
+test "live HLS AES key and media errors preserve cursor and initialized retry state" {
+    const a = std.testing.allocator;
+    var client = AesHttp.Client{ .short_key = true };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.InvalidHlsKey, reader.next());
+    try std.testing.expect(reader.cached_key == null and reader.ingest == null);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+    client.short_key = false;
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, reader.next());
+    try std.testing.expect(reader.ingest != null and reader.cached_key != null);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+    const calls = client.calls;
+    client.fail_media = false;
+    var segment = (try reader.next()).?;
+    defer segment.deinit();
+    try std.testing.expectEqual(calls + 1, client.calls);
+    try std.testing.expectEqual(@as(usize, 0), segment.epoch);
+}
+fn aesAllocationRun(backing: std.mem.Allocator, pool: *@import("admission.zig").Pool) !void {
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), @import("admission.zig").Resources{}));
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    var client = AesHttp.Client{ .manifest = aes_first };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8", .pool = pool };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var held = try first.reader.readPacket(0);
+    defer held.deinit();
+    client.manifest = aes_rotated;
+    try reader.reload();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+}
+test "live HLS AES allocation failures release keys decrypted resources and held snapshots" {
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, aesAllocationRun, .{&pool});
+}
+test "live HLS AES reload rejects changed encryption metadata in an overlapping segment" {
+    const a = std.testing.allocator;
+    var client = AesHttp.Client{ .manifest = aes_first };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    client.manifest = try std.mem.replaceOwned(u8, a, aes_first, "IV=0x1", "IV=0x2");
+    defer a.free(client.manifest);
+    try std.testing.expectError(error.SourceVersionChanged, reader.reload());
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+}
+
+test "live HLS AES reconfiguration decrypts a new map and preserves the previous packet lease" {
+    const a = std.testing.allocator;
+    const updated = aes_first ++ "#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2\",IV=0x2\n#EXT-X-MAP:URI=\"init2\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2\"\n#EXTINF:1,\nchanged12\n#EXT-X-ENDLIST\n";
+    // The second listed segment follows sequence 10, so explicitly use IV 12.
+    const corrected = try std.mem.replaceOwned(u8, a, updated, "#EXT-X-KEY:METHOD=AES-128,URI=\"key2\"\n#EXTINF", "#EXT-X-KEY:METHOD=AES-128,URI=\"key2\",IV=0xC\n#EXTINF");
+    defer a.free(corrected);
+    var client = AesHttp.Client{ .manifest = aes_first };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var old = (try reader.next()).?;
+    defer old.deinit();
+    var held = try old.reader.readPacket(0);
+    defer held.deinit();
+    const retained = try a.dupe(u8, held.bytes);
+    defer a.free(retained);
+    client.manifest = corrected;
+    try reader.reload();
+    var changed = (try reader.next()).?;
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), changed.epoch);
+    try std.testing.expectEqual(@as(u16, 96), changed.reader.track.width);
+    try std.testing.expectEqualSlices(u8, retained, held.bytes);
+    try std.testing.expect(reader.ended());
+}
+test "live HLS AES foreign keys fail before fetching initialization or ciphertext" {
+    const a = std.testing.allocator;
+    const manifest = try std.mem.replaceOwned(u8, a, aes_first, "URI=\"key1\"", "URI=\"https://other.test/key\"");
+    defer a.free(manifest);
+    var client = AesHttp.Client{ .manifest = manifest };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.MediaOriginChanged, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    try std.testing.expect(reader.cached_key == null and reader.ingest == null);
 }

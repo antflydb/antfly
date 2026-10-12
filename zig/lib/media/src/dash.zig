@@ -550,8 +550,11 @@ test "DASH explicit SegmentList clocks ranges and sequence use fMP4 ingest contr
     try std.testing.expectError(error.MalformedDash, byteRange("10-9"));
     try std.testing.expectError(error.MalformedDash, byteRange("0-18446744073709551615"));
 }
-fn allocationRun(a: std.mem.Allocator) !void {
-    var playlist = try parse(a, fixture, .{});
+fn allocationRun(backing: std.mem.Allocator) !void {
+    // Arena resize success depends on heap placement; exercise all allocation
+    // fallbacks deterministically, as in the template/inheritance campaigns.
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    var playlist = try parse(no_resize.allocator(), fixture, .{});
     defer playlist.deinit();
 }
 test "DASH parser releases allocations on every failure" {

@@ -428,8 +428,8 @@ retrying a failed snapshot commit does not download or append that media twice.
 `zig build test-media-http` tests authenticated reads, exact ranges, redirect
 refusal and a complete reload/configuration transition against a local HTTP
 server using the production client. The portable suite additionally injects
-allocation failures across both epochs. HLS master selection is now implemented as described below. Encrypted, MPEG-TS,
-low-latency HLS and broader DASH support remain open.
+allocation failures across both epochs. HLS master selection is now implemented as described below. AES-128 identity-key encryption is now implemented below. SAMPLE-AES/CBCS,
+MPEG-TS, low-latency HLS and broader DASH support remain open.
 
 
 ## DASH template and live ingestion
@@ -730,7 +730,7 @@ alternate-camera discovery and an initialization change with an old packet held.
 A pinned public Apple master configuration additionally tests real metadata;
 its referenced MPEG-TS media is not part of this qualification. Use
 `zig build test-media-hls-fuzz --fuzz=100000` for the bounded parser/selection
-campaign. Encrypted/MPEG-TS/low-latency ingestion and automatic separate-track
+campaign. SAMPLE-AES/CBCS, MPEG-TS and low-latency ingestion and automatic separate-track
 assembly remain within the active streaming scope.
 
 Final HLS master gates pass 90 portable and six production HTTP tests on both
@@ -739,3 +739,34 @@ macOS and actual Linux ARM64. A fresh bounded parser/selection campaign passes
 Apple master fixture. Source/binary/report receipts are in
 `zig/lib/media/testdata/hls/master-validation`; these are protocol/ownership
 results, not codec, model, performance or arbitrary HLS conformance claims.
+
+## Native HLS AES-128 ingestion
+
+The fMP4 HLS reader handles AES-128 whole-resource CBC with PKCS7 padding using
+Zig's AES implementation. Identity key files must contain exactly 16 bytes.
+Explicit IVs are 128-bit big-endian values; media without an explicit IV derives
+one from its sequence number. Encrypted maps require an explicit IV and retain
+the declaration active at the MAP tag independently of later media key changes.
+METHOD=NONE clears media encryption. Unsupported key formats can coexist with
+an identity declaration; unsupported-only media fails before ingestion. Supported
+master SESSION-KEY hints validate without replacing the media key declaration.
+These rules follow [RFC 8216 sections 4.3.2.4 and 5](https://www.rfc-editor.org/rfc/rfc8216.html).
+
+Keys use the existing authenticated same-origin transport, request/byte budgets,
+cancellation and host admission. One key URI is cached within the current
+playlist snapshot; a successful reload invalidates its material so a reused URI
+can supply a rotated key. Maps and media decrypt in their owned response buffers,
+retain the full allocation for cleanup and ingest only the validated unpadded
+prefix. Key-cache material, key bodies and decrypted response buffers are wiped
+on release. Four-block AES decryption and portable byte-vector XOR preserve CBC
+chaining without another plaintext allocation. Exact byte ranges describe
+independently encrypted segment resources, with CBC restarted at each segment.
+
+Independent OpenSSL fixtures cover padding/block boundaries, encrypted maps,
+sequence IVs, rotated keys and reconfiguration. Portable failure tests retain
+cursor/initialized retry state, deep-own map declarations, reject foreign keys
+before initialization/media reads, and reclaim admission on every allocation
+failure. Production HTTP tests authenticate keys and ranged media while keeping
+old packet leases valid. OpenSSL is a qualification tool, never a runtime
+codec/crypto dependency. SAMPLE-AES/CBCS, DRM processing, MPEG-TS and low-latency
+HLS remain implementation work.

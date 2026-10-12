@@ -278,3 +278,57 @@ test "production HLS master selects authenticated alternate video and resolves r
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 7), transport.requests);
 }
+
+test "production HLS AES authenticates keys decrypts ranged media and rotates without losing old packets" {
+    const key1 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+    const key2 = "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+    const init = @embedFile("testdata/hls/aes/init1.bin");
+    const first = @embedFile("testdata/hls/aes/media10.bin");
+    const second = @embedFile("testdata/hls/aes/media11.bin");
+    const total = first.len + second.len;
+    const manifest = std.fmt.comptimePrint("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\",IV=0x1\n#EXT-X-MAP:URI=\"init\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{d}@0\nblob\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{d}\nblob\n#EXT-X-ENDLIST\n", .{ first.len, second.len });
+    const Ranges = struct {
+        fn firstRange(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings(std.fmt.comptimePrint("bytes=0-{d}", .{first.len - 1}), request.header("Range").?);
+        }
+        fn secondRange(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings(std.fmt.comptimePrint("bytes={d}-{d}", .{ first.len, total - 1 }), request.header("Range").?);
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/aes/list.m3u8", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
+        .{ .path = "/aes/key1", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = key1 } },
+        .{ .path = "/aes/key2", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = key2 } },
+        .{ .path = "/aes/init", .assert_request = Verify.auth, .respond = .{ .body = init } },
+        .{ .path = "/aes/blob", .assert_request = Ranges.firstRange, .max_uses = 1, .respond = .{ .status = 206, .headers = &.{.{ .name = "Content-Range", .value = std.fmt.comptimePrint("bytes 0-{d}/{d}", .{ first.len - 1, total }) }}, .body = first } },
+        .{ .path = "/aes/blob", .assert_request = Ranges.secondRange, .max_uses = 1, .respond = .{ .status = 206, .headers = &.{.{ .name = "Content-Range", .value = std.fmt.comptimePrint("bytes {d}-{d}/{d}", .{ first.len, total - 1, total }) }}, .body = second } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/aes/list.m3u8", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{});
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 6 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    var one = (try reader.next()).?;
+    defer one.deinit();
+    const original = @embedFile("testdata/fragmented.mp4");
+    try std.testing.expectEqualSlices(u8, original[0..11206], one.backing.bytes);
+    var held = try one.reader.readPacket(0);
+    defer held.deinit();
+    const retained = try a.dupe(u8, held.bytes);
+    defer a.free(retained);
+    var two = (try reader.next()).?;
+    defer two.deinit();
+    try std.testing.expectEqual(@as(usize, 0), two.epoch);
+    try std.testing.expectEqualSlices(u8, retained, held.bytes);
+    try std.testing.expect(reader.ended());
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 6), transport.requests);
+}
