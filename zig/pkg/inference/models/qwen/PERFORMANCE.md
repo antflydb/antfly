@@ -53,6 +53,41 @@ paired-block analysis preserved with their evidence below. Historical campaign
 orchestration, fixture expansion, and retention gates are archived below rather
 than maintained as a second checked-in benchmark interface.
 
+## Qwen3 embedding reference results
+
+Reference numbers for Qwen3-Embedding-0.6B Q8_0 on a fanless Apple M4
+(16 GiB), resident Metal, against llama.cpp `b8990-660b1b4bd` on the
+byte-identical GGUF, measured with [the embedding protocol](../../scripts/qwen3_embedding/BASELINE.md):
+
+| Lane | Gate | Reference result |
+| --- | --- | --- |
+| Strict endpoint, batch 1, 511 tokens | lower 95% CI of Antfly/llama.cpp throughput >= 90% | 94.32% (CI 94.17–94.48%), min cosine 0.99999896 |
+| Strict endpoint, batch 1, 2551 tokens (8 preconditioning pairs) | same | 92.06% (CI 90.20–94.06%), min cosine 0.99996579 |
+| Short documents/rendered queries, 20–64 tokens incl. EOS | lower ratio bound >= 1.0, p95 ratio <= 1.05 | worst lower bound 1.010, worst p95 ratio 0.978 |
+| 32×256 capacity, default derived scratch/combined limits, 4 GiB budget | lower ratio bound >= 0.90 | worst lower bound 1.216 |
+| 1800 s eight-worker soak after a 600 s conditioning phase | final-half RSS range <= max(32 MiB, 5% mean), no failures, restarts, or swap growth | 2.203 MiB range, zero failures |
+
+On a fanless host only thermally interleaved (AB/BA) comparisons are valid;
+a long run that crosses a thermal transition is retained as failed evidence and
+replicated rather than discarded. The unconditioned initial soak failed the
+plateau gate (110 MiB range, cause unproven) and remains unreclassified.
+
+Qualification covers Metal resident execution on M4 only. Other Apple devices,
+precision tiers, 4B/8B models, the full 32K context, unbounded physical
+microbatches, and canonical CI remain separate qualification work. Native CPU
+is admitted for output parity (cosine >= 0.9992 against Metal at 20/256
+tokens) but has no performance baseline.
+
+Measured refutations beyond those listed in
+[METAL.md](../../METAL.md#qwen3-embedding-q8_0-kernel-defaults): raising the
+tiled f32 attention kernel's 2048 KV gate to 7936 was 2.5x slower than the
+naive kernel at 2551 tokens (barrier-bound); do not revisit without
+restructuring the kernel. `llama-bench -p N -n 0` with generation defaults is
+not an endpoint-equivalent reference and overstated the early gap.
+
+> **Relocated:** Dated runs, provenance hashes, optimization ladders, and pass
+> counts → [qwen3-embedding-baseline-results.md](../../../../../docs/design/inference/history/qwen/qwen3-embedding-baseline-results.md).
+
 ## Rollback and attribution
 
 | Optimization | Baseline-only environment setting |

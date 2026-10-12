@@ -3,7 +3,7 @@
 Historical local results for Apple M4, 16 GiB RAM, macOS 26.5, and
 Qwen3-Embedding-0.6B Q8_0. These measurements cover the recorded executables,
 not the current merged branch. See the later
-[default qualification receipt](../../metal_serving_defaults_m4_summary.md)
+[default qualification receipt](../../../../../../docs/design/inference/history/metal/serving-defaults-m4-2026-10.md)
 for the current M4 serving policy and fresh qualification.
 
 ## Protocol and provenance
@@ -60,7 +60,7 @@ metadata, releasing cached model pins before execution/recovery.
 ## Original executable: 2026-10-01
 
 15/15 short cells passed; original short measurements are tabulated in
-[BASELINE.md](../BASELINE.md#short-query-and-capacity-results--2026-10-01).
+[the relocated baseline results](../../../../../../docs/design/inference/history/qwen/qwen3-embedding-baseline-results.md#short-query-and-capacity-results--2026-10-01).
 
 | Lane / shape | Mean request latency across rounds | Worst 95% throughput lower bound | Worst p95 ratio |
 |---|---:|---:|---:|
