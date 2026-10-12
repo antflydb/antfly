@@ -1767,7 +1767,7 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
-        if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        try self.refreshLifecycleProjectionLocked();
 
         const tables = try self.manager.listTables(self.alloc);
         errdefer self.manager.freeTables(self.alloc, tables);
@@ -1931,7 +1931,7 @@ const LocalStandaloneMetadata = struct {
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
         defer self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
-        if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        try self.refreshLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
     }
@@ -2568,7 +2568,7 @@ const LocalStandaloneMetadata = struct {
         var locked = true;
         defer if (locked) self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
-        if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        try self.refreshLifecycleProjectionLocked();
         try context.ensureActive();
         if (call == .table_status or call == .list_tables) {
             var capture = try self.captureCatalogTablesLocked(alloc, context, if (call == .table_status) call.table_status.listing() else call.list_tables);
@@ -4266,6 +4266,22 @@ const LocalStandaloneMetadata = struct {
         if (self.system_catalog_state) |*old| old.deinit();
         self.system_catalog_state = state;
         self.epoch = @max(parsed.value.epoch, 1);
+    }
+
+    fn refreshLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
+        const store = self.lifecycle_store orelse return;
+        const current = try store.standaloneRevisionState();
+        if (current.revision == self.durable_revision) return;
+        if (self.durable_revision != 0 and current.revision > self.durable_revision and
+            current.projection_revision <= self.durable_revision)
+        {
+            // A lost reply or another owner ACK cannot invalidate pinned
+            // catalog rows. No table scan or projection allocation is needed.
+            self.durable_revision = current.revision;
+            self.epoch = current.revision;
+            return;
+        }
+        try self.reloadLifecycleProjectionLocked();
     }
 
     fn reloadLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
@@ -13204,6 +13220,11 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
             try std.testing.expectEqual(revision + 1, metadata.durable_revision);
             try std.testing.expectEqual(revision + 1, metadata.epoch);
             try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
+            // The receipt committed but the local epoch update/reply was lost.
+            // This fixture has no standalone catalog snapshot, so a full
+            // projection reload cannot accidentally satisfy the assertion.
+            metadata.durable_revision = revision;
+            metadata.epoch = revision;
             // Resolve a lost reply with the ORIGINAL expected revision. An
             // attempted write replay must not advance the durable catalog.
             try std.testing.expectError(error.GenerationPublicationChanged, LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .relational_index_owner_ack = ack }));
@@ -13237,6 +13258,19 @@ test "standalone shared mutation refreshes a committed catalog before retry" {
     // the previous in-memory view, but the store and outbox retain the new row.
     metadata.manager.deinit();
     metadata.manager = antfly.metadata.TableManager.init(alloc);
+    metadata.durable_revision = previous_revision;
+    metadata.epoch = previous_revision;
+    {
+        // Unlike owner progress, the table commit MUST reload the projection.
+        // A global-only epoch refresh would expose the deliberately empty
+        // manager here and miss the committed table.
+        var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
+        defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &snapshot);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+        try std.testing.expectEqualStrings("committed", snapshot.tables[0].name);
+        try std.testing.expectEqual(try metadata.lifecycle_store.?.standaloneRevision(), metadata.durable_revision);
+    }
+    // Preserve the original independent mutation-admission recovery check.
     metadata.durable_revision = previous_revision;
     metadata.epoch = previous_revision;
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "next", .{});

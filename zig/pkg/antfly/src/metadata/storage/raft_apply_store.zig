@@ -4213,6 +4213,35 @@ test "relational index publication authenticated owner ACKs persist both positio
     });
 }
 
+test "relational index publication standalone projection revision rejects corrupt future stamps and initializes conservatively" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-stamp", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    try std.testing.expectEqualDeep(RaftApplyStore.StandaloneRevisionState{ .revision = 0, .projection_revision = 0 }, try store.standaloneRevisionState());
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+    try std.testing.expectEqualDeep(RaftApplyStore.StandaloneRevisionState{ .revision = 1, .projection_revision = 1 }, try store.standaloneRevisionState());
+    try store.store.put(RaftApplyStore.standalone_projection_revision_key, &.{0});
+    try std.testing.expectError(error.InvalidStandaloneCatalog, store.standaloneRevisionState());
+    var future: [8]u8 = undefined;
+    std.mem.writeInt(u64, &future, 2, .little);
+    try store.store.put(RaftApplyStore.standalone_projection_revision_key, &future);
+    try std.testing.expectError(error.InvalidStandaloneCatalog, store.standaloneRevisionState());
+    const logical_key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const write: TransitionCommand = .{ .upsert_restore_job = .{ .key = logical_key, .value = "{\"job_id\":42,\"phase\":\"queued\"}" } };
+    try std.testing.expectError(error.InvalidStandaloneCatalog, store.applyStandaloneCommand(group, write));
+    try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
+    try std.testing.expect((try store.getRestoreJobValue(a, group, logical_key)) == null);
+    try store.store.delete(RaftApplyStore.standalone_projection_revision_key);
+    try std.testing.expectEqualDeep(RaftApplyStore.StandaloneRevisionState{ .revision = 1, .projection_revision = 1 }, try store.standaloneRevisionState());
+    try store.applyStandaloneCommand(group, write);
+    try std.testing.expectEqualDeep(RaftApplyStore.StandaloneRevisionState{ .revision = 2, .projection_revision = 2 }, try store.standaloneRevisionState());
+}
+
 /// Shared real-store authority fixture. Server adapters supply only the ACK
 /// dispatch; enrollment, observed cuts, fault rejection and reopen verification
 /// remain identical to the storage contract. No production authority bypass.
@@ -4306,10 +4335,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 const enrollment_request = try store_root_enrollment.Request.sign(identity, seed);
                 const enrollment = try std.json.Stringify.valueAlloc(a, enrollment_request, .{});
                 defer a.free(enrollment);
+                const before_enrollment = try store.standaloneRevisionState();
                 if (@hasDecl(Driver, "enroll"))
                     try Driver.enroll(&store, enrollment_request)
                 else
                     try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
+                const after_enrollment = try store.standaloneRevisionState();
+                try std.testing.expectEqual(before_enrollment.revision + 1, after_enrollment.revision);
+                try std.testing.expectEqual(before_enrollment.projection_revision, after_enrollment.projection_revision);
                 try store.validateRelationalIndexOwnerAck(group, bytes);
                 {
                     const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
@@ -4389,6 +4422,9 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 defer decoded.deinit(a);
                 try std.testing.expectEqualSlices(u8, bytes, decoded.ack_relational_index_publication);
                 try Driver.apply(&store, ack, decoded);
+                const after_ack = try store.standaloneRevisionState();
+                try std.testing.expectEqual(after_enrollment.revision + 1, after_ack.revision);
+                try std.testing.expectEqual(after_enrollment.projection_revision, after_ack.projection_revision);
                 // Original revision lost: committed replay is a no-op, not a log
                 // poison. Preflight still reports the conflict to its caller.
                 try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexOwnerAck(group, bytes));
@@ -11999,6 +12035,7 @@ pub const RaftApplyStore = struct {
 
     const standalone_catalog_key = "\x00\x00__metadata__:standalone_catalog";
     const standalone_revision_key = "\x00\x00__metadata__:standalone_revision";
+    const standalone_projection_revision_key = "\x00\x00__metadata__:standalone_projection_revision";
     const metadata_hot_standby = @import("../../storage/hot_standby/metadata_effects.zig");
     const metadata_chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
     const StandbyRelationProbe = @import("../../storage/hot_standby/metadata_effect_probe.zig").PointProbe(2, 160, 2048);
@@ -12824,13 +12861,46 @@ pub const RaftApplyStore = struct {
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
+    pub const StandaloneRevisionState = struct {
+        revision: u64,
+        /// Last commit that might change the visible catalog projection.
+        projection_revision: u64,
+    };
+
+    pub fn standaloneRevisionState(self: *RaftApplyStore) !StandaloneRevisionState {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const raw = try stagingGet(&txn, standalone_revision_key);
+        if (raw != null and raw.?.len != 8) return error.InvalidStandaloneCatalog;
+        const revision = if (raw) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+        const projection_raw = try stagingGet(&txn, standalone_projection_revision_key);
+        if (projection_raw != null and projection_raw.?.len != 8) return error.InvalidStandaloneCatalog;
+        // Catalogs predating the watermark must reconcile conservatively.
+        const projection_revision = if (projection_raw) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else revision;
+        if (projection_revision > revision) return error.InvalidStandaloneCatalog;
+        return .{ .revision = revision, .projection_revision = projection_revision };
+    }
+
     fn advanceStandaloneRevision(txn: *docstore.DocStore.Txn) !void {
+        try advanceStandaloneRevisionWithProjection(txn, true);
+    }
+
+    fn advanceStandaloneRevisionWithProjection(txn: *docstore.DocStore.Txn, changes_projection: bool) !void {
         const raw = try stagingGet(txn, standalone_revision_key);
         if (raw != null and raw.?.len != 8) return error.InvalidStandaloneCatalog;
         const previous = if (raw) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+        const projection_raw = try stagingGet(txn, standalone_projection_revision_key);
+        if (projection_raw != null and projection_raw.?.len != 8) return error.InvalidStandaloneCatalog;
+        const projection_revision = if (projection_raw) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else previous;
+        if (projection_revision > previous) return error.InvalidStandaloneCatalog;
+        const next = std.math.add(u64, previous, 1) catch return error.InvalidStandaloneCatalog;
         var encoded: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded, std.math.add(u64, previous, 1) catch return error.InvalidStandaloneCatalog, .little);
+        std.mem.writeInt(u64, &encoded, next, .little);
         try txn.put(standalone_revision_key, &encoded);
+        if (changes_projection or projection_raw == null) {
+            std.mem.writeInt(u64, &encoded, if (changes_projection) next else projection_revision, .little);
+            try txn.put(standalone_projection_revision_key, &encoded);
+        }
     }
 
     pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: TransitionCommand) !void {
@@ -12896,7 +12966,12 @@ pub const RaftApplyStore = struct {
             try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected, command.compare_and_replace_table.replacement);
         };
         try self.applyTransitionCommandTxn(&txn, group_id, command);
-        try advanceStandaloneRevision(&txn);
+        // These exact commands cannot change visible table/schema/name state.
+        // All other and future commands conservatively invalidate projection.
+        try advanceStandaloneRevisionWithProjection(&txn, switch (command) {
+            .ack_relational_index_publication, .apply_store_root_enrollment => false,
+            else => true,
+        });
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
         try self.checkHotStandby();
         try self.commitStandaloneTxn(&txn, &outcome, &committed);

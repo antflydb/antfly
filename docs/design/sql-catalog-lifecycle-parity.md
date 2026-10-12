@@ -3080,7 +3080,10 @@ authentication even in migration mode, otherwise-valid unknown-field rejection,
 zero/over-limit budgets, oversized bodies, deadlines, wrong scope, cancellation,
 root retention and no client replay. An earlier combined command rejected an
 empty runtime filter; only the corrected non-empty final gates qualify this
-checkpoint. Optimized transport qualification is still pending.
+checkpoint. The same frozen transport source subsequently passed all 113
+ReleaseFast steps and the same 37 executions, with zero skips, failures or
+leaks. This optimized checkpoint predates the later main merge, standalone
+enrollment and projection-watermark work; it does not qualify those changes.
 
 This connects native controls to serving, not to automatic root signing,
 enrollment/capability activation, a complete build worker or metadata ACK
@@ -3176,3 +3179,31 @@ This new dispatch does not promote those synthetic entries into enrollment or
 invent Raft replicas. Production native root/reporter observation and placement
 admission still need integration before automatic native publication. An absent
 durable store registration remains a rejection, not an implicit local grant.
+
+### Transactional visible-projection watermark (qualification pending)
+
+Standalone catalog commits now retain a second durable watermark: the latest
+revision that may change the visible table/schema/name projection. It advances
+in the same transaction as the global revision, mutation and hot-standby outbox.
+Only signed owner ACKs and explicit root enrollment are excluded; every other
+and future command conservatively invalidates the visible projection. Missing
+watermarks on existing catalogs initialize conservatively, and malformed or
+future stamps fail closed before commit.
+
+Catalog/status reads capture both values in one read transaction. If every
+commit since the local epoch was owner-only, they update the epoch in constant
+work without scanning or allocating a catalog snapshot. Unknown, older,
+uninitialized or visibly changed cuts retain complete reconciliation. This
+also handles a durable ACK whose response and in-memory epoch update were lost;
+it is not limited to the successful-dispatch fast path. Schema/name changes
+cannot borrow an owner-only revision classification.
+
+The expanded real-store fixture asserts that enrollment and ACK each advance
+the global revision exactly once while preserving the visible watermark. Its
+adapter deliberately loses the local epoch update; recovery has no catalog
+snapshot available, so an accidental full reload cannot pass. Storage tests
+also check empty/missing stamps, visible invalidation, corruption, future
+watermarks and abort without a partial restore-job write. Debug qualification
+is running. This bounds owner-progress recovery work; it does not split shared
+commit/publication locks or qualify distributed activation. Original cases
+and public-production barriers are unchanged.
