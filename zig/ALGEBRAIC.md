@@ -897,7 +897,7 @@ temporal cylinders.
 Add a small algebraic module under the DB layer:
 
 ```text
-pkg/antfly/src/storage/db/algebraic/
+zig/pkg/antfly-embedded/src/storage/db/algebraic/
   token.zig        canonical token -> coordinate_id
   vector.zig       sparse formal vector / deltas
   algebra.zig      count, sum, min, max, avg, and support-state traits
@@ -905,6 +905,9 @@ pkg/antfly/src/storage/db/algebraic/
   index.zig        materialized token/cylinder store
   planner.zig      route supported aggregation requests to the algebraic index
 ```
+
+The module has since grown well beyond this first cut (fact, path, join, law,
+lexical, distributed, adaptive, HLL, and planner-control files, among others).
 
 The first implementation should be intentionally narrow:
 
@@ -1228,87 +1231,18 @@ query interval
 
 ### Query Planning
 
-The planner should only route to the algebraic index when the request matches a
-supported shape:
+The original routing gate admitted only single-table aggregations with no joins
+or graph expansion, a supported filter subset, supported group and measure
+fields, a supported aggregate law, and an optional aligned `date_histogram`
+bucket. Everything else fell back to the existing search/aggregation path. The
+fallback rule still holds, but the gate is now proof-based: see
+[Planning And Execution](#planning-and-execution) and
+[Planner Ownership](#planner-ownership). The physical row layout is listed in
+[Current Implementation](#current-implementation).
 
-```text
-single table
-no joins
-no graph expansion
-supported filter subset
-supported group field
-supported measure field
-supported aggregate algebra
-optional aligned date_histogram bucket
-```
-
-Example supported requests:
-
-```sql
-GROUP BY country COUNT(*)
-GROUP BY customer SUM(amount)
-GROUP BY customer AVG(amount)
-GROUP BY customer, day(created_at) SUM(amount)
-GROUP BY customer, month(created_at) COUNT(*)
-```
-
-Unsupported requests should fall back to the current search/aggregation path.
-This makes the feature safe to introduce incrementally and gives the planner a
-clear correctness boundary.
-
-### Storage Layout
-
-A simple backend layout can use prefixed keys:
-
-```text
-sym:<coordinate_id>                 -> canonical token
-docfact:<doc_key>                   -> schema-derived typed symbolic fact list
-pathfact:<doc_key>                  -> schemaless path/kind/value fact list
-path_lookup:<path>:<kind>:<value>:<doc_key> -> exact schemaless candidate lookup
-joinfact:<join_name>:<side>:<fact_key> -> projected join contribution fact
-docjf:<doc_key>:<join_name>:<side>:<fact_key> -> document-local join fact reference
-materialized_expr:<expr_id>:<axis_key> -> cached law-declared tensor expression result
-minmax:<expr_id>:<axis_key>:<value> -> support tensor for delete-safe extrema
-lexicon:<dictionary_identity>:<label> -> shared dictionary metadata
-postings:<dictionary_identity>:<label>:<doc_key> -> shared candidate/posting payload
-lexicon_fst:<dictionary_identity>   -> rebuildable FST artifact for the dictionary owner
-watermark:<index_name>              -> applied derived-log sequence
-```
-
-`docfact`, `pathfact`, and `docjf` give overwrite/delete a precise way to
-reverse prior facts. `materialized_expr` is the only durable aggregate result
-layout; support rows, lexical dictionaries, and postings are auxiliary tensors
-or shared access paths.
-
-### Prototype Bootstrap
-
-The bootstrap prototype used the following narrow milestone to prove the idea
-without committing the full database to the new execution model:
-
-```text
-1. Create an algebraic index catalog entry.
-2. Tokenize string, number, and datetime JSON fields.
-3. Maintain COUNT by one string field.
-4. Maintain SUM and AVG by one string group field and one numeric measure.
-5. Maintain daily SUM temporal expression buckets over one datetime field.
-6. Route matching aggregation requests to the algebraic index.
-7. Fall back to existing aggregation code for everything else.
-8. Add reopen/replay tests through the derived log.
-```
-
-The demonstration query set should be:
-
-```text
-GROUP BY country COUNT(*)
-GROUP BY customer SUM(amount)
-GROUP BY customer AVG(amount)
-GROUP BY customer, day(created_at) SUM(amount)
-```
-
-The current implementation has moved past this bootstrap target. Completed
-capabilities are tracked in Implementation State, durable implementation rules
-live in the Implementation Guide, and the Roadmap now records boundary
-conditions rather than an active milestone list.
+> **Relocated:** The prototype bootstrap milestone list, demonstration query
+> set, and success criteria are preserved verbatim in
+> [docs/design/algebraic/history/prototype-and-capability-log.md](../docs/design/algebraic/history/prototype-and-capability-log.md).
 
 ### Risks
 
@@ -1325,35 +1259,20 @@ symbol-table and hash-collision handling
 distributed/sharded aggregate merge semantics
 ```
 
-The mitigation is to keep the first index opt-in, schema-constrained, and
-planner-gated. The prototype should prove that derived-log replay can maintain
-algebraic materializations correctly before trying to generalize the query IR.
-
-### Success Criteria
-
-The prototype is successful if it can show:
-
-```text
-correct results across insert, overwrite, delete, reopen, and replay
-faster common group/time aggregations than scanning hit stored_data
-clear fallback behavior for unsupported query shapes
-bounded support-state behavior for MIN/MAX
-simple extension path toward more algebraic operators
-```
-
-The prototype has moved beyond that first milestone: it now has an explicit
-typed algebraic IR, materialized-expression IDs, tensor-program envelopes, and
-proof-gated access paths. Additional bounded query shapes should extend those
-artifacts only when they preserve exact semantics and have benchmark evidence;
-unsupported text, join, vector, graph, and schemaless shapes stay on explicit
-fallback paths.
+The mitigation is to keep the index opt-in, schema-constrained, and
+planner-gated, and to prove that derived-log replay maintains algebraic
+materializations correctly before generalizing the query IR. Additional bounded
+query shapes extend the typed IR, materialized-expression IDs, tensor-program
+envelopes, and proof-gated access paths only when they preserve exact semantics
+and have benchmark evidence; unsupported text, join, vector, graph, and
+schemaless shapes stay on explicit fallback paths.
 
 ## Current Implementation
 
-The current Zig prototype implements the first local algebraic sidecar under:
+The local algebraic sidecar lives under:
 
 ```text
-pkg/antfly/src/storage/db/algebraic/
+zig/pkg/antfly-embedded/src/storage/db/algebraic/
 ```
 
 It is opt-in through `.algebraic` index configs, maintained through derived
@@ -1361,124 +1280,79 @@ replay, and planner-gated so unsupported or unhealthy shapes fall back to the
 existing aggregation path. Base documents remain canonical. Algebraic state is
 derived, rebuildable, and scoped to prefixed sidecar keys.
 
-Implemented capability includes:
+> **Relocated:** The line-per-capability changelog that used to list everything
+> implemented is preserved verbatim in
+> [docs/design/algebraic/history/prototype-and-capability-log.md](../docs/design/algebraic/history/prototype-and-capability-log.md).
+> The grouped summary below is the current reference.
 
-```text
-internal algebraic index kind and derived replay target
-canonical tuple/scalar token encoding with symbol-id backed keys
-typed value canonicalization module for string/integer/number/bool/time/bytes
-algebraic law registry for group, monoid, lattice, and semiring descriptors
-explicit document fact-list projection and persisted docfact sidecar rows
-sparse tensor row/key module for law-backed coordinate slots
-tensor-only materialized-expression row decoding for new algebraic state
-direct COUNT/SUM/AVG/MIN/MAX materializations
-exact MIN/MAX support rows for duplicate values and delete repair
-hour/day/month temporal cylinders
-configured composite equi-join aggregate maintenance
-explicit join document role and side gating
-join-side fact projection to only fields required by configured materializations
-LSM-backed bulk join ingest with cursor-capable write-batch matching
-bulk maintenance-plan caching for ready adaptive materializations during overwrite/delete bulk ingest
-resource-manager accounting for algebraic tensor accumulator working memory through `algebraic.tensor_accumulators`
-temporal join bucket/window matching with range-pruned fact scans
-overwrite/delete compensation from persisted document and join fact rows
-root metric, terms, date_histogram, constrained rollup, and nested metric routing
-internal algebraic query IR for metric, bucket, constraint, and configured join shapes
-bucket child metric planning through the algebraic query IR
-strict configured join materialization matching unless the query names the materialization directly
-opt-in implicit join materialization matching when a configured join fold is declared safe for normal query planning
-bucket-limit, row-scan budget, and health checks before planner selection
-planner-visible schema lifecycle gating for stale/rebuild-required algebraic configs
-planner estimates for recent scan rows and result buckets in algebraic status
-planner last-decision, fallback, lifecycle readiness, lifecycle blocking, dictionary registry ownership, and vector symbolic-filter routing diagnostics in index status and benchmark JSONL events
-semantic dictionary registry ownership that prevents duplicate FST/postings publication for equivalent analyzed-term, canonical-scalar, sparse-token, and graph-label identities
-persisted query-shape observation and materialization recommendation scaffolding
-scannable persisted materialization-state rows and DB status counters for adaptive recommendations
-DB-open and add-index hydration of persisted adaptive observation status
-internal DB-level listing of persisted algebraic materialization recommendation states for status assembly
-internal DB-level listing of persisted adaptive query observations for status assembly
-engine-owned adaptive lifecycle transitions for persisted algebraic materialization recommendation states
-validated adaptive lifecycle transitions for materialization recommendation states, with no manual user-facing lifecycle API
-deterministic adaptive materialization ids from canonical recommendation hashes
-policy-gated adaptive candidate evaluation with persisted ranking and progress rows
-persisted adaptive candidate decision history and policy-drift status/benchmark counters
-bounded adaptive tensor backfill from persisted docfact rows with ready promotion
-planner routing for ready adaptive terms/date histogram tensors with nested metric tensors
-cost/savings-aware adaptive dematerialization recommendations with safe tensor cleanup
-adaptive lifecycle primitives for observing/recommended/backfilling/ready/stale materializations
-adaptive lifecycle recovery tests for interrupted backfill, schema drift, and dictionary-owner conflicts
-schemaless path profiles with adaptive typed path promotion, dictionary-backed lookup rows, readiness gating, and mixed-kind/coercion fallback policy
-explicit planner fallback and rejection paths for unsupported ranking, non-proven traversal, arbitrary joins, unsupported constraints, and mixed-kind/coercion cases
-explicit semiring product hooks for provenance-backed sparse vector contractions
-law-compatible tensor row merge primitive for broader tensor execution
-set-union lattice law coverage through tensor row mutation/merge and distributed partial merge
-planner metric folds routed through the algebraic law registry
-proof-gated group, lattice, and provenance-semiring laws for aggregate, MIN/MAX support-row, distributed partial, and graph/path traversal capabilities
-fact-only append-only bulk fast path for bounded sidecar fact ingestion
-benchmark counters and quick/standard/large profiles for disk usage, query time, write cost, join scans, and flushes
-benchmark reporting for planner estimates, observed query shapes, docfact rows, and recommendation candidates
-benchmark correctness classification for every algebraic-vs-baseline query comparison, with guardrails for missing classifications
-benchmark summary comparisons for adaptive materialized vs static vs fallback algebraic disk, query, and update paths
-adaptive coverage benchmark mode for root metrics, terms metrics, date histograms, constrained folds, configured joins, warmup cost, and churn
-storage-focused algebraic benchmark root so adaptive coverage smoke builds without full API/server dependencies
-bounded LSM analytics smoke mode for durable constrained/adaptive coverage checks
-LSM analytics benchmark mode for durable sidecar scale, cardinality, write amplification, churn, fanout, constrained, and adaptive coverage cases
-churn row-family benchmark counters for materialized_expr, docfact, pathfact, path_lookup, path_profile, joinfact, docjf, minmax, and sym sidecar rows
-public query guardrail query shapes for dense, hybrid, hybrid-filter, hybrid-filter-exclude, and projected hybrid filter vector searches
-public query guardrail schema and algebraic toggles so default, schema-only, and schema-plus-algebraic runs are comparable
-public query guardrail JSONL summary events for no-schema, schema-only, and schema-plus-algebraic vector-pruning comparisons, including a no-listener handler mode for reproducible archived runs and local/standalone modes for transport/server overhead evidence
-benchmark-wide performance evidence summary for dataset, query, correctness, cold/warm, fanout, constrained, wide-key, stats, cardinality, range, histogram, churn, churn row-family, public-query, LSM, symbol/support byte growth, accumulator flush, adaptive bulk-maintenance counters, and public-query RSS coverage
-mixed-role benchmark root-cardinality comparisons constrain algebraic sidecar reads by primary document role so derived customer/profile facts do not broaden doc-scan/full-text order-only baselines
-db_bench summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
-db_bench summary baseline-file comparison ratios for stable local performance guardrails
-`storage_bench summary` compares DB benchmark results, with checked-in coverage and baseline regression fixtures exercised in CI
-`scripts/run_db_query_matrix.py --suite analytics` runs the DB analytics and public schema comparisons
-`antfly-storage-db-test` includes planner ownership; `antfly-unit-test` retains dynamic-template safety coverage
-LSM bulk-session finish direct-ingests the final mutable state as a sorted run when direct bulk ingest is enabled and no immutable flush is pending, so algebraic bulk sidecars avoid a final normal flush and archived runs can guard `total_lsm_sorted_ingest_runs`
-algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds across all flushed coalescer batches and rebuild each dirty promoted dictionary once at DB bulk-session finish, before the primary store publishes the final sorted run
-durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
-schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
-schema-derived v2 configs with declared laws and adaptive defaults
-runtime-adaptive dynamic templates: bounded table-level dynamic templates (keyword/numeric/boolean/datetime) compile into capability `dynamic_field_rules` and project template-matched fields into typed docfacts at ingest; accepted template changes advance the schema generation, refresh both durable and live configs (`Index.reloadConfigJson`), and gate query acceleration until a matching generation-local completion marker proves rebuild coverage; unbounded text templates stay on the schemaless path-fact path (cardinality guard)
-public algebraic index requests constrained to schema-derived capability sidecars with internal materialization fields stripped/rejected
-canonical-token shard merge keys for distributed symbol semantics
-distributed partial merge helpers that combine shard results by canonical axis and law
-distributed partial validation tests for malformed canonical law values
-distributed partial merge tests for count, sum, sumsquares, avg-state, min, and max law families on shared canonical bucket axes
-distributed partial merge tests for set-union lattice payloads on shared canonical axes
-validated distributed partial-envelope merge tests for different shard-local symbol ids resolving to the same canonical axis
-distributed partial aggregation tests for independent shard dictionaries merging the same canonical terms/stat/join axes
-unit coverage for planner-routed stats, nested metric, range/histogram, cardinality, pathfact predicate, multi-field composite terms, partial distributed tensor programs, derived joins, and canonical distributed law merges
-distributed partial tensor-program proof/export counters in algebraic status and benchmark summaries
-distributed partial tensor-program proof/export counters are summarized through the compact public algebraic index-status contract
-adaptive coverage summaries expose rebuild-required, stale, cleanup-recommended, decision-history, and policy-drift counters
-LSM reopen coverage for adaptive dematerialization cleanup proving tensor rows, progress rows, and candidate rows stay removed while materialization state remains stale
-compact public algebraic index status exposed as a single `AlgebraicIndexStats` envelope without public `AlgebraicRuntimeHealth` or `AlgebraicAdaptiveProgressStatus` schemas in the normal index-status response
-public OpenAPI keeps detailed algebraic runtime health, adaptive progress, adaptive candidate, and candidate-decision records out of the stable status schema; those records remain internal state or diagnostics/benchmark evidence
-internal algebraic partial request protocol accepts only tensor expression/program envelopes, rejecting named materialization requests and cardinality-only bodies
-public table/index parser support for `type: "algebraic"` only through `derive_from_schema: true`
-native dense-vector pruning for safe symbolic doc-id constraints by translating doc ids to HBC vector ids
-native sparse-vector pruning for safe symbolic doc-id constraints by filtering doc nums during sparse score accumulation
-native vector pruning for structured stored filters by resolving filter doc ids through the text index before dense/sparse ranking
-required symbolic vector filters fail closed when algebraic lifecycle state is stale
-internal shard-query wire fields for native doc-id include/exclude candidate sets so resolved algebraic constraints survive distributed fanout
-proof-gated dense/sparse vector and graph constraint input tensors, including `native_doc_id_constraints` and `graph_target_constraints`, with fail-closed validation of required envelopes
-first-class tensor access-path helpers for docfact, pathfact, lexical, sparse-token postings, dense/sparse vector search, and graph layouts
-planner-owned dense/sparse vector and graph tensor-program construction, with catalog code limited to access-path discovery
-planner-owned docfact, pathfact, and derived-join range/histogram tensor-program construction for distributed partial fanout
-planner-owned configured-materialization tensor-program construction for distributed partial fanout, replacing API-local tensor expression derivation
-distributed configured-aggregate partial fanout encoded as planner-owned tensor program/access-path envelopes instead of named materialization requests
-root cardinality distributed partials can be requested through planner-owned tensor program envelopes while preserving exact distinct-value merge keys
-terms-with-nested-cardinality distributed partials can be requested through planner-owned tensor program envelopes with canonical bucket and distinct-value merge keys
-range-with-nested-cardinality distributed partials can be requested through planner-owned tensor program envelopes with canonical range and distinct-value merge keys
-histogram-with-nested-cardinality distributed partials can be requested through planner-owned tensor program envelopes with canonical bucket and distinct-value merge keys
-production distributed cardinality, terms-cardinality, range-cardinality, and histogram-cardinality aggregation paths fall back to the normal aggregation planner when a tensor program cannot be proven instead of using bespoke partial request bodies
-production distributed aggregation request planning is centralized through planner-owned tensor-program selection before provisioned or hosted shard fanout
-distributed graph expand/get-edges requests carry tensor program envelopes plus access-path proofs instead of id-only program assertions
-distributed graph validation derives expected graph tensor programs from planner-owned envelopes without exposing id-only helper APIs
-graph index status exposes bounded algebraic semiring traversal attempts, proofs, rejects, fallbacks, and result-node counts
-graph traversal benchmark smoke and summary events expose proof/reject/fallback counters, result-node counts, path bytes, and query latency
-```
+Implemented capability, by area:
+
+- **Encoding and laws.** Canonical tuple/scalar tokens with symbol-id backed
+  keys; typed canonicalization for string, integer, number, bool, time, and
+  bytes; a law registry for group, monoid, lattice (including set-union), and
+  semiring descriptors with explicit semiring product hooks; proof-gated laws
+  for aggregate, MIN/MAX support, distributed partial, and graph/path
+  capabilities; law-compatible tensor row merge.
+- **Facts and materializations.** `docfact`, `pathfact`, `path_lookup`,
+  `path_profile`, `joinfact`, and `docjf` rows; direct COUNT/SUM/AVG/MIN/MAX
+  and sumsquares tensors with exact MIN/MAX support rows; hour/day/month
+  cylinders; overwrite/delete compensation from persisted fact rows.
+- **Joins.** Configured composite equi-joins with explicit document roles and
+  side gating, side projection limited to required fields, temporal bucket or
+  window matching with range-pruned scans, strict materialization matching
+  unless the query names the materialization or the join fold is declared safe
+  for implicit matching.
+- **Planning.** Typed IR for metric, bucket, constraint, and join shapes; root
+  metric, terms (including multi-field composite), date_histogram, histogram,
+  range, stats, cardinality, constrained rollup, and nested metric routing;
+  pathfact predicate constraints; bucket-limit, scan-budget, health, and schema
+  lifecycle gating; explicit fallback/rejection for unsupported ranking,
+  non-proven traversal, arbitrary joins, unsupported constraints, and
+  mixed-kind/coercion cases.
+- **Schema.** Schema-derived v2 configs with declared laws and adaptive
+  defaults; capability fingerprints and skipped-unbounded-field metadata;
+  public `type: "algebraic"` accepted only with `derive_from_schema: true`, with
+  internal materialization fields stripped or rejected. Bounded dynamic
+  templates (keyword/numeric/boolean/datetime) compile into capability
+  `dynamic_field_rules`; accepted template changes advance the schema
+  generation, refresh durable and live configs (`Index.reloadConfigJson`), and
+  gate acceleration until a generation-local completion marker proves rebuild
+  coverage. Unbounded text templates stay on the schemaless path-fact path.
+- **Adaptive.** Persisted query-shape observations, recommendations,
+  candidates, decision history, and progress rows; deterministic
+  materialization IDs from canonical recommendation hashes; engine-owned
+  validated lifecycle transitions (observing, recommended, backfilling, ready,
+  stale); bounded backfill from `docfact` rows; cost/savings-aware
+  dematerialization; schemaless path promotion with dictionary-backed lookup
+  rows; recovery from interrupted backfill, schema drift, and dictionary-owner
+  conflicts.
+- **Lexical.** A semantic dictionary registry that prevents duplicate
+  FST/postings publication for equivalent analyzed-term, canonical-scalar,
+  sparse-token, and graph-label identities.
+- **Bulk ingest.** Fact-only append-only fast path; cursor-capable LSM write
+  batches for non-append ingest; ready-adaptive maintenance-plan caching;
+  promoted FST rebuilds deferred to session finish; final mutable state
+  direct-ingested as a sorted run when direct bulk ingest is enabled and no
+  immutable flush is pending.
+- **Distributed.** Canonical-token merge keys; tensor-program/access-path
+  envelopes for configured aggregates, `docfact`/`pathfact`/derived-join folds,
+  and root, terms, range, and histogram cardinality partials; production
+  distributed aggregation selects tensor programs centrally before provisioned
+  or hosted fanout and falls back to the normal planner when no program can be
+  proven; the internal partial protocol rejects named-materialization and
+  cardinality-only bodies.
+- **Vector and graph.** Native dense pruning (doc IDs → HBC vector IDs) and
+  sparse pruning (doc-num filtering during accumulation) for safe symbolic
+  constraints; proof-gated `native_doc_id_constraints` and
+  `graph_target_constraints` inputs; internal shard-query wire fields for native
+  include/exclude candidate sets; required symbolic vector filters fail closed
+  on stale lifecycle; distributed graph expand/get-edges carry tensor-program
+  envelopes plus access-path proofs.
+- **Observability.** Planner estimates, last decision, fallback, lifecycle,
+  dictionary ownership, vector symbolic-filter, and graph semiring
+  traversal counters in internal status and benchmark JSONL; tensor
+  accumulator memory under the `algebraic.tensor_accumulators`
+  resource-manager slice.
 
 Planner cost guards are deliberately conservative. `max_result_buckets` bounds
 returned algebraic buckets, while `max_planner_scan_rows` bounds sidecar row
@@ -1507,7 +1381,6 @@ adaptive-progress:<recommendation>  -> persisted adaptive backfill/dematerializa
 materialized_expr:<expr_id>:<axis_key> -> cached law-declared tensor expression result
 minmax:<expr_id>:<group>:<value> -> count-law support tensor for delete-safe extrema
 joinfact:<join_name>:<side>:<fact_key> -> projected left/right contribution facts
-docjf:<doc_key>:<join_name>:<side>:<fact_key> -> per-document join fact references
 lexicon:<dictionary_identity>:<label> -> owned/shared dictionary metadata for that identity
 lexicon_fst:<dictionary_identity>   -> rebuildable FST artifact only for the registry owner of row lexicons
 postings:<dictionary_identity>:<label>:<doc_key> -> owned/shared candidate/posting payload for that identity
@@ -1547,30 +1420,15 @@ The existing `antfly-unit-test` aggregate retains the dynamic-template and
 cardinality-cache checks. Planner ownership is checked by an ordinary DB test.
 There are no separate algebraic test targets or matrix scripts.
 
-The shared DB benchmark tools retain aggregation, adaptive materialization,
-cold/warm reads, joins, graph traversal, and schema comparison workloads:
-
-```sh
-# From zig/:
-zig build antfly-storage-bench antfly-api-bench
-./zig-out/bin/storage_bench analytics --mode lsm-analytics --docs 50000 --repeats 5
-./zig-out/bin/storage_bench summary --input /tmp/db-combined.jsonl
-
-# From the repository root:
-python3 scripts/run_db_query_matrix.py --suite analytics --profile smoke
-python3 scripts/run_db_query_matrix.py --suite analytics --profile bounded \
-  --baseline /tmp/prior-comparison.stderr \
-  --summary-arg=--max-algebraic-query-ms-ratio-vs-baseline --summary-arg=1.25
-```
-
-The matrix builds once, records commands and environment information, checks
-coverage and correctness, and compares no-schema, schema-only, and algebraic
-public-query paths. `--analytics-arg`, `--public-arg`, and `--summary-arg` pass
-workload, LSM tuning, and measured threshold options directly to the tools.
-`--analytics-docs` and `--public-docs` control scale. See
-[BENCHMARKS.md](BENCHMARKS.md#db-query-comparisons) for defaults and examples.
-Performance limits should come from representative measurements; tiny verifier
-fixtures test the comparison tool and do not establish production baselines.
+The shared DB benchmark tools (`storage_bench analytics`, `storage_bench
+summary`, and `scripts/run_db_query_matrix.py --suite analytics`) retain
+aggregation, adaptive materialization, cold/warm reads, joins, graph traversal,
+and no-schema/schema-only/algebraic public-query comparisons. Commands,
+defaults, and pass-through options (`--analytics-arg`, `--public-arg`,
+`--summary-arg`, `--analytics-docs`, `--public-docs`, `--baseline`) are in
+[BENCHMARKS.md](BENCHMARKS.md#db-query-comparisons). Performance limits should
+come from representative measurements; tiny verifier fixtures test the
+comparison tool and do not establish production baselines.
 
 ## Implementation State
 
@@ -1670,14 +1528,16 @@ backfills, ready promotion, and automatic dematerialization decisions.
 ### Distributed Protocol
 
 Distributed algebraic partials use canonical token semantics rather than
-shard-local ids. Partial merge keys include canonical axis, metric or expression
-identity, and law identity so distinct laws over the same coordinate do not
-collide. Coordinator-side scalar and bucket merges route through tensor row merge
-helpers.
+shard-local ids; shard-local symbol ids are physical only. Partial merge keys
+include canonical axis, metric or expression identity, and law identity so
+distinct laws over the same coordinate do not collide. Coordinator-side scalar
+and bucket merges route through tensor row merge helpers.
 
 Internal shard protocols carry access-path, tensor-expression, and tensor-program
 envelopes. Shards re-prove owner, layout, fragments, dimensions, law ids,
-dictionary identity, expression ids, and program ids before exporting partials.
+dictionary identity, expression ids, and program ids before exporting partials
+as `PartialEnvelope` rows, and the coordinator's `PartialProtocol` validator
+rejects the same mismatches before merging canonical partial rows.
 `docfact`, `pathfact`, derived-join, and configured-materialization tensor
 programs can return canonical partial rows without requiring a named
 materialization request body. Configured aggregate fallback partials are sent as
@@ -1692,20 +1552,15 @@ distinct-value and bucket/range merge keys.
 
 ### Lexical Access Paths
 
-Lexical access is shared by semantic `dictionary_identity`, not by planner. A
-single owner publishes dictionary/postings/FST rows for a given identity; algebraic
-planning consumes that advertised tensor access path instead of building a
-duplicate FST. Analyzed full-text terms, canonical scalar facts, sparse tokens,
-and graph labels remain separate identities when their semantics differ.
+Ownership follows the `dictionary_identity` rule in
+[Lexical Tensor Access Paths](#lexical-tensor-access-paths): one owner
+publishes dictionary/postings/FST rows per identity, and algebraic planning
+consumes the advertised access path rather than building a duplicate FST.
 Adaptive path promotion writes lexicon/posting rows during partial backfill while
 the dictionary registry is `building`, then rebuilds the promoted FST once and
 marks the registry `ready` only when backfill reaches the end. Ready bulk ingest
 continues to coalesce promoted dictionary dirtiness and rebuild each changed
 dictionary once per batch.
-
-Full-text remains responsible for analyzer-specific ranking behavior such as
-BM25, phrase/proximity, highlighting, and analyzer state. Algebraic consumes exact
-candidate tensors for filters, joins, vector pruning, and aggregate folds.
 
 ### Vector And Graph Integration
 
@@ -1743,43 +1598,16 @@ paths, cleanup recommendations, and fallback reasons. Internal storage can keep
 using `materialized_expr` as the durable tensor-cache row name because that is a
 physical implementation detail, not a user-facing lifecycle API.
 
-The stable public query surface is the normalized structured `query` tree.
-Compatibility shorthands normalize into that tree at the API boundary. Typed
-terms, path aliases, `terms`, and `exists` are the algebraic filter surface;
-query strings remain a full-text escape hatch rather than the algebraic planning
-contract.
+The stable public query surface is the normalized structured `query` tree
+described in [Public Query Contract](#public-query-contract); query strings are
+a full-text escape hatch, not the algebraic planning contract.
 
 ### Public Status Surface
 
-The default public index status should be compact and operator-focused. It should
-answer whether the algebraic sidecar is enabled, ready, selected recently,
-falling back, rebuilding, stale, or blocked, and it should expose enough counters
-to see broad cost and health trends. It should not expose every adaptive
-candidate, tensor expression, dictionary owner, decision-history row, or internal
-materialized-expression detail by default.
-
-`AlgebraicIndexStats` is the natural public envelope because it matches the
-normal index-status shape used by the other index families. The normal public
-OpenAPI response should not require users to understand separate
-`AlgebraicRuntimeHealth` or `AlgebraicAdaptiveProgressStatus` schemas. Those are
-implementation/debug concepts; collapse the few durable facts users need into
-`AlgebraicIndexStats`, and keep the detailed runtime/adaptive records internal.
-Fine-grained records such as `AlgebraicCapabilityStats`,
-`AlgebraicAdaptiveCandidateStatus`, and
-`AlgebraicAdaptiveCandidateDecisionStatus` are useful internal/debug data, but
-they should not be stable public OpenAPI schemas. If operators need them, add an
-explicit diagnostics/admin surface with separate compatibility expectations, or
-emit them through benchmark/debug JSONL where the shape can evolve.
-
-So the answer to whether the public API needs every algebraic status type is no.
-The stable surface should expose one public index-status envelope and a small set
-of durable fields. Capability records, adaptive candidate rows, candidate
-decision history, runtime health internals, and progress rows are implementation
-or diagnostics data. They are still important for benchmarks, debug endpoints,
-and internal recovery decisions, but making each one a public schema would lock
-the storage and adaptive policy model too early.
-
-This is the compatibility rule for the public API:
+Default public index status is compact and operator-focused: it answers whether
+the algebraic sidecar is enabled, ready, selected recently, falling back,
+rebuilding, stale, or blocked, with enough counters to see broad cost and health
+trends. The compatibility rule is:
 
 ```text
 public:   AlgebraicIndexStats
@@ -1790,37 +1618,29 @@ internal: AlgebraicRuntimeHealth
 internal: AlgebraicAdaptiveProgressStatus
 ```
 
-The public record should summarize internal state with counts, current
-lifecycle/readiness fields, last planner decision, last fallback reason, simple
-progress counters, and coarse health/error counters. It should not expose
-candidate rows, decision-history entries, tensor proof objects, dictionary
-registries, materialized-expression identifiers, exact error document keys, or
-sequence-level adaptive worker cursors as normal user-facing status.
-
-The stable public status fields should be durable concepts, not implementation
-tables:
+`AlgebraicIndexStats` matches the index-status shape of the other index
+families and is the only public envelope. Its stable fields are durable
+concepts, not implementation tables:
 
 ```text
 enabled/healthy/ready/rebuilding/stale
 planner selected/fallback counts and latest fallback reason
 schema capability lifecycle status and rebuild reason
 adaptive materialization lifecycle counts
-active backfill or cleanup progress summary
+active backfill or cleanup progress summary (embedded operation + counters)
 owned derived bytes and indexed document count
 ```
 
-The preferred stable schema shape is a small `AlgebraicIndexStats` record with
-fields like status, readiness, rebuild/stale/blocking reason, lifecycle counts,
-planner last decision/fallback reason, owned derived bytes, and indexed document
-count. If active progress is exposed, keep it embedded and simple, such as an
-operation name plus percent or item counters, rather than a standalone adaptive
-progress object.
-
-Detailed decision history, candidate scoring inputs, policy-drift records,
-canonical recommendation hashes, dictionary ownership rows, error document keys,
-worker sequence cursors, and tensor-program proof internals belong in
-debug/admin diagnostics or benchmark JSONL, where they can evolve without
-becoming a broad public compatibility burden.
+Additions to `AlgebraicIndexStats` are a compatibility-budget decision: prefer
+coarse counters and the latest operator-relevant reasons. Candidate rows,
+decision history and policy-drift counts, scoring inputs, canonical
+recommendation hashes, tensor proof objects, expression ids, dictionary
+registries, planner estimates, distributed proof counters, vector-filter
+internals, exact error document keys, and adaptive worker sequence cursors stay
+in internal state, an explicit diagnostics/admin surface with its own
+compatibility expectations, or benchmark/debug JSONL. Keep one positive contract
+test for the generated public shape rather than migration-style tests for
+unshipped alternatives.
 
 ### Coverage And Selection
 
@@ -1840,11 +1660,9 @@ CI-safe benchmark fixtures prove coverage shape, parser behavior, and regression
 plumbing. They are not production performance evidence by themselves. Production
 claims require larger repeatable runs with checked-in or archived baseline
 summaries, hardware/environment notes, and threshold tolerances chosen from
-measured variance rather than the tiny guardrail fixture.
-Recorded benchmark commands, parameters, raw JSONL, and comparison summaries
-provide reproducible evidence through the shared DB matrix. Planner-ownership
-coverage is part of `antfly-storage-db-test`; no archive-verifier or separate
-policy executable is required.
+measured variance rather than the tiny guardrail fixture. The shared DB matrix
+records commands, parameters, raw JSONL, and comparison summaries; no
+archive-verifier or separate policy executable is required.
 
 Failure-injection coverage should target stale lifecycle state, missing or
 conflicting dictionary ownership, adaptive backfill interruption, distributed
@@ -1880,17 +1698,8 @@ re-materialization.
 ### Shared Access Paths
 
 Lexical access paths are shared by semantic `dictionary_identity`, not by planner
-or index owner. Algebraic planning consumes an existing full-text,
-path-promotion, sparse-vector, or graph dictionary/postings/FST layout when its
-semantic identity exactly matches the query. It must not build a duplicate FST
-for the same field, analyzer, label kind, canonicalization version, value kind,
-and coercion policy.
-
-Distinct semantics justify distinct dictionaries: analyzed full-text terms,
-canonical scalar facts, sparse vector tokens, and graph labels can share physical
-machinery without sharing identity. Any consumer that cannot prove identity
-equality must either fall back or create a separate dictionary for its distinct
-semantic dimension.
+or index owner; the full rule and the duplicate-FST anti-pattern are in
+[Lexical Tensor Access Paths](#lexical-tensor-access-paths).
 
 ### Planner Ownership
 
@@ -1917,19 +1726,11 @@ not a goal unless the configured algebraic laws preserve exact public semantics.
 
 ### Distributed Execution
 
-Distributed partials use canonical token semantics and law-aware merge keys.
-Shard-local symbol ids are physical only. Exported partials carry canonical axis
-identity, expression or metric identity, law identity, dictionary identity where
-relevant, and enough tensor-program metadata for the coordinator to re-prove
-exact merge behavior.
-
-Protocol work should continue replacing named aggregate sidecar requests with
-tensor/access-path envelopes. The distributed merge layer now has a
-`PartialProtocol` envelope validator that rejects owner, layout, fragment,
-dimension, law, metric, dictionary identity, expression id, and program id
-mismatches before merging canonical partial rows. Tensor-program partial export
-can now return `PartialEnvelope` rows, so shard executors have a concrete
-boundary type for attaching that protocol metadata as rows leave a shard.
+Exported partials carry canonical axis identity, expression or metric identity,
+law identity, dictionary identity where relevant, and enough tensor-program
+metadata for the coordinator to re-prove exact merge behavior (see
+[Distributed Protocol](#distributed-protocol)). New distributed shapes extend
+tensor/access-path envelopes rather than named aggregate sidecar requests.
 
 ### Vector And Graph Execution
 
@@ -1950,127 +1751,86 @@ tensors, constraints, folds, or semiring programs.
 Physical optimization follows measurement. The key levers are symbol-id row
 layout, row locality, batching, bulk join fanout, dictionary/FST sharing, cold
 reads, support-row compaction, update/delete churn, and write amplification.
-Bulk ingest should follow the dense-index pattern where possible: compile shared
-batch state once, then stream document mutations through that state. Algebraic
-now caches decoded ready adaptive materialization specs across consecutive bulk
-maintenance batches and invalidates that cache whenever adaptive observation,
-progress, or materialization lifecycle state changes. The cached specs are
-reused for schemaless path promotion, direct adaptive tensors, and ready join
-tensors. Benchmark JSONL emits
-`algebraic_adaptive_maintenance_plan_build_count`,
-`algebraic_adaptive_maintenance_cached_spec_count`, and
-`algebraic_adaptive_maintenance_disabled_count` on status/churn events and
-rolls them into `performance_evidence_summary`, so archived runs can prove the
-path was exercised. This avoids repeated LSM cursor scans of adaptive
-progress/state rows during churn-heavy overwrite/delete batches while preserving
-exact stale marking for non-invertible laws inside the batch. Invertible ready
-adaptive tensor deltas, including promoted path-fact count tensors, are also
-coalesced inside the bulk maintenance context and flushed once per affected
-tensor/expression row before the batch commits. Non-append bulk ingest now also
-opens a cursor-capable write batch, so overwrite/delete maintenance, configured
-joins, adaptive joins, and schemaless path promotion can share the same LSM
-bulk-ingest transaction window instead of falling back to a plain write
-transaction whenever cursor scans are required.
-The catalog attaches the shared `ResourceManager` to algebraic indexes at open
-time. Algebraic now reports coalesced tensor accumulator working memory under
-the `algebraic.tensor_accumulators` slice and releases that usage when the batch
-or index closes. Backend runtime wiring remains inherited from DB/table open:
-algebraic writes execute through the same DocStore/LSM runtime store as the
-primary and other managed index paths.
-Internal algebraic status also exposes `algebraic_path_dictionary_fst_rebuild_count`
-to benchmark JSONL. `storage_bench summary` rolls it into
-`total_path_dictionary_fst_rebuild_count` and
-`max_path_dictionary_fst_rebuild_count`, with
-`--max-path-dictionary-fst-rebuild-count` available for archived evidence. This
-keeps the path-promotion dictionary/FST rebuild optimization measurable without
-expanding the compact public index stats shape.
+Optimizations must preserve canonical merge semantics across shards even when
+local storage uses compact ids. Rules:
 
-Churn benchmarks also emit row-family counters for `materialized_expr`,
-`docfact`, `pathfact`, `path_lookup`, `path_profile`, `joinfact`, `docjf`,
-`minmax`, and `sym`. These counters report before/after entries and bytes for
-each family plus the total workload update time. They are intended to identify
-which physical families dominate churn, not to claim per-family isolated timing.
-The overwrite path coalesces fact/path updates instead of a full delete-then-insert:
-it skips the pre-delete for overwritten upserts, diffs old and new `docfact`
-lookup rows, diffs old and new `path_lookup` rows, and only rewrites
-`docfact`/`pathfact` payload rows when their encoded payloads actually changed.
-Aggregate, adaptive, path-profile, and join deltas still run through their exact
-old-minus/new-plus maintenance paths whenever the projected dependency changes,
-and unchanged profile rows, unchanged path-promotion facts, and unchanged
-docfact adaptive/direct tensors are skipped explicitly rather than rewritten.
-Non-append bulk ingest routes through a cursor-capable write batch so this
-coalescing and skip-gating work under the same LSM bulk-ingest transaction
-window as direct sorted ingest. Adaptive constrained terms choose between lazy
-point lookups for tiny bucket sets and preloaded child metric row maps for
-larger bucket sets, trading per-lookup cost against preload cost based on
-bucket-set size. Configured and adaptive materialized tensors stay on the
-normal tensor-law mutation path inside cursor-capable bulk write batches; the
-fact-only append-only fast path remains available for schema/fact ingestion,
-but preaggregated materialization accumulation is guarded off until it has the
-same production correctness evidence as the tensor-law path, keeping LSM direct
-sorted ingest for bulk batches without treating repeated aggregate-row
-mutations as a separate append-only fold.
+- **Compile batch state once.** Bulk maintenance caches decoded ready adaptive
+  materialization specs across consecutive batches (used for schemaless path
+  promotion, direct adaptive tensors, and ready join tensors) and invalidates
+  the cache on any adaptive observation, progress, or lifecycle change.
+  Non-invertible laws are still marked stale exactly inside the batch.
+- **Coalesce deltas.** Invertible ready adaptive tensor deltas, including
+  promoted path-fact count tensors, are coalesced and flushed once per affected
+  tensor/expression row before commit.
+- **One bulk transaction window.** Non-append bulk ingest opens a
+  cursor-capable write batch so overwrite/delete maintenance, configured and
+  adaptive joins, and path promotion share the LSM bulk-ingest window. Primary
+  writes inside an external DB bulk session use
+  `BatchOptions{ .mode = .bulk_ingest }`, taking the same direct sorted-ingest
+  path as the sidecars.
+- **Diff overwrites.** Overwritten upserts skip the pre-delete, diff old and new
+  `docfact` and `path_lookup` rows, and rewrite `docfact`/`pathfact` payloads
+  only when the encoded payload changed. Aggregate, adaptive, path-profile, and
+  join deltas still run exact old-minus/new-plus maintenance whenever the
+  projected dependency changes; unchanged rows and tensors are skipped.
+- **No preaggregated append fold.** Configured and adaptive materialized tensors
+  stay on the tensor-law mutation path inside bulk batches. The fact-only
+  append-only fast path remains for fact ingestion, but preaggregated
+  materialization accumulation is guarded off until it has the same production
+  correctness evidence.
+- **FST rebuilds once.** Standalone bulk batches rebuild each dirty promoted FST
+  once before commit; DB bulk sessions carry dirty dictionaries across flushed
+  coalescer batches and rebuild each once at session finish, before the primary
+  store publishes the final sorted run. Non-bulk writes rebuild immediately.
+- **Finish boundary.** External DB bulk finish publishes the primary LSM session
+  before forcing managed-index catch-up to `full_index`, so sidecar rows fold
+  the final coalesced documents and survive a durable reopen.
+- **Bucket preload.** Adaptive constrained terms use lazy point lookups for tiny
+  bucket sets and preloaded child metric row maps for larger ones.
+- **Resource accounting.** The catalog attaches the shared `ResourceManager` at
+  open; coalesced tensor accumulator memory is reported under
+  `algebraic.tensor_accumulators` and released when the batch or index closes.
+  Algebraic writes use the same DocStore/LSM runtime store as the primary.
 
-Path-promotion dictionary maintenance batches promoted lexicon/posting changes
-during bulk maintenance: standalone bulk batches rebuild each dirty FST once
-before commit, and DB-level bulk-ingest sessions carry dirty promoted
-dictionaries across every flushed coalescer batch and rebuild each one once at
-session finish, before the primary store publishes the final sorted run.
-Non-bulk writes keep immediate rebuild semantics. Primary document writes
-inside an external DB bulk-ingest session open their LSM write batch with
-`BatchOptions{ .mode = .bulk_ingest }`, so the primary store uses the same
-direct sorted-ingest fast path as algebraic/dense sidecars instead of only
-benefiting from the elevated active-session flush threshold.
+Benchmark counters (internal status and benchmark JSONL, rolled into
+`performance_evidence_summary` by `storage_bench summary`; never part of the
+compact public stats):
 
-Algebraic benchmark instrumentation exposes permanent counters for this
-contract: `algebraic_lsm_flushes`, `algebraic_lsm_flush_output_runs`,
-`algebraic_lsm_sorted_ingest_runs`, `algebraic_lsm_sorted_ingest_bytes`,
-`algebraic_lsm_write_pressure_compactions`, and
-`algebraic_path_dictionary_fst_rebuild_count`. `storage_bench summary` rolls
-these into `performance_evidence_summary`, and archives can guardrail them with
-`--min-lsm-sorted-ingest-runs` (the direct-ingest path stayed active),
-`--max-path-dictionary-fst-rebuild-count` (no accidental per-row rebuild
-regressions), and `--max-lsm-flushes`/`--max-lsm-write-pressure-compactions`
-(stayed on direct sorted ingest instead of falling back to normal
-flush/compaction). These LSM thresholds certify the algebraic sidecar contract
-specifically; they are not a substitute for storage-specific LSM benchmarks
-covering generic compaction policy, WAL, block cache, or read amplification.
+- adaptive maintenance: `algebraic_adaptive_maintenance_plan_build_count`,
+  `algebraic_adaptive_maintenance_cached_spec_count`,
+  `algebraic_adaptive_maintenance_disabled_count`
+- LSM: `algebraic_lsm_flushes`, `algebraic_lsm_flush_output_runs`,
+  `algebraic_lsm_sorted_ingest_runs`, `algebraic_lsm_sorted_ingest_bytes`,
+  `algebraic_lsm_write_pressure_compactions`
+- FST: `algebraic_path_dictionary_fst_rebuild_count` (summarized as
+  `total_`/`max_path_dictionary_fst_rebuild_count`)
+- churn row families: before/after entries and bytes for `materialized_expr`,
+  `docfact`, `pathfact`, `path_lookup`, `path_profile`, `joinfact`, `docjf`,
+  `minmax`, and `sym`, plus total update time (attribution, not isolated
+  per-family timing)
+- correctness: `unclassified_algebraic_comparisons` and a per-query
+  `correctness_record` flag
 
-The shared DB matrix forwards LSM tuning through `--analytics-arg`, including
-`--lsm-flush-threshold`, `--lsm-flush-threshold-bytes`,
-`--lsm-bulk-ingest-flush-threshold-multiplier`,
-`--lsm-bulk-ingest-flush-threshold-bytes-multiplier`, `--lsm-direct-bulk-ingest`,
-and the compaction/level-target options, and records them in the
-`dataset_lsm_config` benchmark event so archive summaries can be tied back to
-the exact LSM finish-session policy under test. It also exposes LSM bulk finish
-controls for publish-only, flush-on-finish, compact-on-finish, deferred-L0
-targets, and bounded foreground compaction steps/bytes/time, and forwards the
-selected LSM bulk-ingest flags to the cold/warm read stage so reopen behavior
-is measured over the same direct sorted-ingest sidecar layout as the scale,
-adaptive, and churn stages instead of forcing a normal non-bulk build that
-creates unrelated flushes. External DB bulk finish publishes the primary LSM
-session before forcing managed-index catch-up to `full_index`, so algebraic
-sidecar rows fold the final coalesced documents and survive a durable LSM
-reopen at the user-visible finish boundary. The adaptive-maintenance
-ready-spec cache reduces repeated maintenance-plan builds, but materialized-adaptive
-LSM churn remains dominated by lower-level sidecar mutation cost; this stays an
-open optimization target rather than something the cache fully resolves.
+Summary guard flags: `--min-lsm-sorted-ingest-runs` (direct ingest stayed
+active), `--max-path-dictionary-fst-rebuild-count` (no per-row rebuild
+regressions), `--max-lsm-flushes` and `--max-lsm-write-pressure-compactions`
+(no fallback to normal flush/compaction), and `--require-performance-evidence`
+(unclassified comparisons must be zero). These LSM thresholds certify the
+algebraic sidecar contract only, not generic compaction, WAL, block cache, or
+read amplification. The DB matrix forwards LSM tuning and bulk-finish options
+through `--analytics-arg`, records them in the `dataset_lsm_config` event, and
+applies the same bulk flags to the cold/warm read stage. The wide-key benchmark
+issues the public multi-field `terms.fields` shape over the same canonical axes
+as its materializations, so it is an exact comparison.
 
-The wide-key benchmark issues the public multi-field `terms.fields` shape over
-the same canonical group axes as its configured materializations, so it is an
-exact comparison rather than a classified shape mismatch. The summary also
-reports `unclassified_algebraic_comparisons` and adds a `correctness_record`
-flag to query summaries; `--require-performance-evidence` requires
-unclassified comparisons to stay at zero so new algebraic benchmark
-comparisons cannot bypass correctness classification.
+Known gap: the ready-spec cache reduces maintenance-plan builds, but
+materialized-adaptive LSM churn remains dominated by lower-level sidecar
+mutation cost.
 
 > **Relocated:** The dated May 17-18, 2026 churn-benchmark narrative (smoke-run
 > timings and counter deltas, 88 lines) that previously lived here is preserved
 > verbatim in [docs/design/algebraic/history/churn-benchmarks-2026-05.md](../docs/design/algebraic/history/churn-benchmarks-2026-05.md).
 > The durable rules above were folded out of it before the move.
-
-Optimizations should preserve canonical merge semantics across shards even when
-local storage uses compact ids.
 
 ### Law Expansion
 
@@ -2086,92 +1846,6 @@ rule that future work must preserve. Completed behavior belongs in
 Implementation State. Temporary sequencing, estimates, and exit criteria belong
 in the Roadmap. Code-specific details belong beside the relevant tests or module
 docs once they are no longer architectural constraints.
-
-## Roadmap
-
-The previous short-, medium-, and long-term design rules have been folded into
-the Implementation Guide, and completed behavior has been moved into
-Implementation State. The active roadmap now tracks production-hardening work
-only. When one of these items lands, move the durable facts into the sections
-above and remove the temporary roadmap item.
-
-### Production Hardening
-
-1. Establish real performance baselines.
-   Use `scripts/run_db_query_matrix.py --suite analytics --profile bounded` for
-   LSM analytics, adaptive coverage, cold/warm reads, graph traversal, and public
-   schema comparisons. Preserve raw results and environment metadata. Set
-   `--baseline` and measured `--summary-arg` limits for latency, memory, storage,
-   and churn; pass LSM bulk/tuning options through `--analytics-arg`.
-
-2. Prove owner-suite test health.
-   Run `antfly-storage-db-test` and the API/metadata owner
-   suites, or `antfly-unit-test` for the aggregate including graph coverage. The DB matrix preserves the
-   no-schema/schema-only/algebraic public-query comparisons. Use the normal e2e
-   workflow for transport and server coverage.
-
-3. Harden crash, recovery, and rebuild behavior.
-   Add failure-injection coverage for interrupted adaptive backfill,
-   dematerialization cleanup, corrupt or stale sidecar rows, schema drift during
-   ingest, dictionary owner conflicts, and reopen/replay across the LSM backend.
-
-4. Exercise sustained write-path pressure.
-   Run long overwrite/delete/churn workloads for aggregate tensors, MIN/MAX
-   support rows, temporal buckets, joins, schemaless facts, adaptive cleanup, and
-   bulk LSM ingest. Track sidecar bytes, support-row growth, flush counts,
-   cached bulk-maintenance plan hits, row-family churn counters, and update
-   latency. Keep the cursor-capable bulk write-batch path in the archive so
-   regressions in configured/adaptive tensor maintenance show up next to
-   fact-only append and direct-write runs.
-
-5. Validate distributed and sharded failure modes.
-   Test mixed shard-local symbol ids, canonical merge keys, missing/stale shards,
-   aggregate law-family partial merges, rejected tensor envelopes, partial
-   validation failures, vector fail-closed routing, and graph traversal
-   proof/reject behavior across shard fanout. Positive coverage currently exists
-   for canonical same-token/different-local-dictionary merges, aggregate law
-   families (count/sum/sumsquares/avg/min/max), distributed stats/date/terms/
-   range/histogram/cardinality folds, and derived join partials; archived
-   integration runs should still add negative shard-health and stale/
-   missing-shard evidence.
-
-6. Bound memory and storage growth.
-   Measure and cap symbol registry growth, docfact/pathfact volume, path-profile
-   cardinality, dictionary/FST ownership, support-row compaction, accumulator
-   memory, and derived sidecar bytes under high-cardinality workloads.
-
-7. Keep the external API capability-oriented.
-   Verify that users request query capability and observe readiness/status only;
-   manual materialization lifecycle controls, internal expression ids, and
-   engine-owned adaptive transitions must stay out of the stable user-facing API.
-   Keep normal index status shaped as a single compact `AlgebraicIndexStats`
-   record, matching the other index types. Do not expose
-   `AlgebraicCapabilityStats`, `AlgebraicAdaptiveCandidateStatus`,
-   `AlgebraicAdaptiveCandidateDecisionStatus`, `AlgebraicRuntimeHealth`, or
-   `AlgebraicAdaptiveProgressStatus` as public schemas in the default status
-   response; collapse durable readiness, lifecycle, planner fallback, and simple
-   active-progress facts into `AlgebraicIndexStats`. If detailed
-   adaptive/capability diagnostics are needed, expose them separately from normal
-   index status and keep the default OpenAPI schema compact. Treat additions to
-   `AlgebraicIndexStats` as a compatibility-budget decision: prefer coarse
-   counters and latest operator-relevant reasons, and keep candidate lists,
-   proof objects, expression ids, dictionary registries, policy-scoring inputs,
-   exact error document keys, decision-history counts, policy-drift counts,
-   planner estimates, distributed proof counters, vector-filter internals, and
-   adaptive worker sequence cursors out of the stable response. Keep one positive
-   contract test for the generated public shape instead of migration-style tests
-   for unshipped alternatives.
-
-### Non-goals
-
-```text
-arbitrary query-time joins
-automatic typed materialization of every schema field or schemaless path
-automatic materialization of every aggregate combination
-manual user-facing materialization lifecycle or explicit materialization definition APIs
-best-effort approximate MIN/MAX
-using the algebraic sidecar when status indicates incomplete derived state
-```
 
 ## Approximate cardinality (HyperLogLog)
 
@@ -2232,3 +1906,74 @@ other adaptive materializations. Their initial backfill is durable and resumes
 after restart, processing no more than `max_backfill_rows_per_tick` document
 facts per maintenance tick. Reads continue using the exact path until the
 backfill cursor and any concurrent-mutation repair markers commit as complete.
+
+
+## Roadmap
+
+The previous short-, medium-, and long-term design rules have been folded into
+the Implementation Guide, and completed behavior has been moved into
+Implementation State. The active roadmap now tracks production-hardening work
+only. When one of these items lands, move the durable facts into the sections
+above and remove the temporary roadmap item.
+
+### Production Hardening
+
+1. Establish real performance baselines.
+   Use `scripts/run_db_query_matrix.py --suite analytics --profile bounded` for
+   LSM analytics, adaptive coverage, cold/warm reads, graph traversal, and public
+   schema comparisons. Preserve raw results and environment metadata. Set
+   `--baseline` and measured `--summary-arg` limits for latency, memory, storage,
+   and churn; pass LSM bulk/tuning options through `--analytics-arg`.
+
+2. Prove owner-suite test health.
+   Run `antfly-storage-db-test` and the API/metadata owner
+   suites, or `antfly-unit-test` for the aggregate including graph coverage. The DB matrix preserves the
+   no-schema/schema-only/algebraic public-query comparisons. Use the normal e2e
+   workflow for transport and server coverage.
+
+3. Harden crash, recovery, and rebuild behavior.
+   Add failure-injection coverage for interrupted adaptive backfill,
+   dematerialization cleanup, corrupt or stale sidecar rows, schema drift during
+   ingest, dictionary owner conflicts, and reopen/replay across the LSM backend.
+
+4. Exercise sustained write-path pressure.
+   Run long overwrite/delete/churn workloads for aggregate tensors, MIN/MAX
+   support rows, temporal buckets, joins, schemaless facts, adaptive cleanup, and
+   bulk LSM ingest. Track sidecar bytes, support-row growth, flush counts,
+   cached bulk-maintenance plan hits, row-family churn counters, and update
+   latency. Keep the cursor-capable bulk write-batch path in the archive so
+   regressions in configured/adaptive tensor maintenance show up next to
+   fact-only append and direct-write runs.
+
+5. Validate distributed and sharded failure modes.
+   Test mixed shard-local symbol ids, canonical merge keys, missing/stale shards,
+   aggregate law-family partial merges, rejected tensor envelopes, partial
+   validation failures, vector fail-closed routing, and graph traversal
+   proof/reject behavior across shard fanout. Positive coverage currently exists
+   for canonical same-token/different-local-dictionary merges, aggregate law
+   families (count/sum/sumsquares/avg/min/max), distributed stats/date/terms/
+   range/histogram/cardinality folds, and derived join partials; archived
+   integration runs should still add negative shard-health and stale/
+   missing-shard evidence.
+
+6. Bound memory and storage growth.
+   Measure and cap symbol registry growth, docfact/pathfact volume, path-profile
+   cardinality, dictionary/FST ownership, support-row compaction, accumulator
+   memory, and derived sidecar bytes under high-cardinality workloads.
+
+7. Keep the external API capability-oriented.
+   Users request query capability and observe readiness/status only; manual
+   materialization lifecycle controls, internal expression ids, and
+   engine-owned adaptive transitions stay out of the stable API. The status
+   rules are in [Public Status Surface](#public-status-surface).
+
+### Non-goals
+
+```text
+arbitrary query-time joins
+automatic typed materialization of every schema field or schemaless path
+automatic materialization of every aggregate combination
+manual user-facing materialization lifecycle or explicit materialization definition APIs
+best-effort approximate MIN/MAX
+using the algebraic sidecar when status indicates incomplete derived state
+```

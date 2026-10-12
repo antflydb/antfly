@@ -42,7 +42,9 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 | LSM writes | [lsm-writes/baseline-evidence-2026-06.md](lsm-writes/history/baseline-evidence-2026-06.md) | [LSM.md](../../zig/pkg/antfly/src/storage/lsm/LSM.md) | Sampled ns/op baseline (2026-06-02) |
 | LSM publication | [lsm-version-publication/validation-2026-09.md](lsm-version-publication/history/validation-2026-09.md) | [lsm-version-publication.md](lsm-version-publication.md) | Dated validation runs and local ReleaseFast measurements |
 | DOCID | [docid/query-bench-diary.md](docid/history/query-bench-diary.md) | [zig/DOCID.md](../../zig/DOCID.md) | Query and bulk-load optimization diary |
+| DOCID | [docid/implementation-notes.md](docid/history/implementation-notes.md) | [zig/DOCID.md](../../zig/DOCID.md) | Per-change identity, filtering, namespace/split/merge notes and the Phase 1–8 roadmap narrative |
 | Algebraic | [algebraic/churn-benchmarks-2026-05.md](algebraic/history/churn-benchmarks-2026-05.md) | [zig/ALGEBRAIC.md](../../zig/ALGEBRAIC.md) | May 2026 churn smoke and microbench chain |
+| Algebraic | [algebraic/prototype-and-capability-log.md](algebraic/history/prototype-and-capability-log.md) | [zig/ALGEBRAIC.md](../../zig/ALGEBRAIC.md) | Prototype bootstrap milestones, success criteria, and the line-per-capability changelog |
 | Relational | [relational/benchmarks.md](relational/history/benchmarks.md) | [zig/RELATIONAL.md](../../zig/RELATIONAL.md) | Single-host LSM benchmark tables with repro commands |
 | HTTP runtime | [http-runtime/implementation-checkpoint.md](../operations/http-runtime/history/implementation-checkpoint.md) | [zig/HTTP_API_RUNTIME.md](../../zig/HTTP_API_RUNTIME.md) | Route-by-route migration checkpoint |
 | PDF | [pdf/render-control-verification-2026-09.md](pdf/history/render-control-verification-2026-09.md) | [zig/PDF.md](../../zig/PDF.md) | September 2026 render-control verification notes |
