@@ -3870,3 +3870,46 @@ The subsequent merge of `origin/main` at `0f7fec50c5` changes documentation
 and inference comments only, not executable SQL/index code. Original-case
 dispositions remain unchanged; public production activation and the broader
 predicate/expression contracts above remain open.
+
+### Shared bounded literal-text execution foundation
+
+The next durable-expression cohort is text transformation, including original
+expression indexes using REPLACE and MD5. Query execution now shares a native
+literal-text kernel suitable for that VM boundary; durable expression exposure
+is not yet enabled. MD5 retains fixed-size lowercase text output and its shared
+invocation work owner. REPLACE compiles failure links for linear-time,
+non-overlapping literal matching instead of using uncharged repeated search
+and a growing output buffer. Short patterns use fixed local scratch; longer
+patterns admit their link capacity against the same invocation byte allowance.
+No-match and empty-pattern results borrow the pinned input. Changed results use
+one exactly sized allocation after a bounded counting pass. Both passes and
+output copies poll the existing sticky cancellation/work owner.
+
+The caller-owned immutable Pattern interface permits durable plans to retain
+failure links without per-row preparation. Native regressions include 23,808
+binary overlap witnesses checked against an independent direct scan, Unicode
+and empty-pattern contracts, exact-size/zero-capacity allocators, allocation
+fault sweeps, every observed cancellation cut, sticky quota failures and true
+OOM distinction. Independent PostgreSQL 18 verification now covers 138
+text/JSON scalar contracts, including twelve additional REPLACE witnesses.
+One ReleaseFast sample processed 1,024 prepared late-miss searches over 16 MiB
+in 60.7 ms with zero per-row heap allocation and 33,489,920 charged work units.
+Fourfold input growth (4,096 to 16,384 bytes) used 8,254 to 32,830 units,
+including pattern preparation. These are kernel measurements, not end-to-end
+latency comparisons or additional original-case qualification.
+
+Still required: typed durable VM operations and SQL lowering, a reader/catalog
+capability fence, immutable literal-pattern preparation and complete
+generated-column/index/check/restart qualification before public activation.
+The original inventory remains 479 implemented / 136 rejected / 73 superseded /
+898 unresolved; this shared foundation earns no new original dispositions.
+
+Final qualification: full SQL Debug passed 21/21 build steps with 757 main-owner
+and 226 linked-owner passes, three existing skips and no failures/leaks. All
+nine focused text/digest tests passed in ReleaseFast. The unchanged original
+MD5 public HTTP regression passed (80/80 build steps). PostgreSQL fixture
+verification, formatting, generated control-catalog freshness, inventory
+integrity and the 2,041-file Apache boundary passed. Earlier test-only failures
+that confused result-size admission with heap allocation are excluded; the
+corrected witness preserves result-size admission and uses a zero-capacity
+allocator to prove borrowing. No remote CI-green or durable activation claim.

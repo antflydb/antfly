@@ -4845,21 +4845,9 @@ const Evaluator = struct {
                 // SQL's compatibility fingerprint, not a security primitive.
                 // Hash borrowed UTF-8 bytes; retain only the fixed-size result.
                 try self.charge(32);
-                var digest = std.crypto.hash.Md5.init(.{});
-                var offset: usize = 0;
-                while (offset < text_value.len) {
-                    const end = offset + @min(256, text_value.len - offset);
-                    try self.workOwner().charge(end - offset);
-                    digest.update(text_value[offset..end]);
-                    offset = end;
-                }
-                const bytes = digest.finalResult();
+                const bytes = try @import("text_value.zig").md5(text_value, self.workOwner());
                 const output = try self.alloc.alloc(u8, 32);
-                const hex = "0123456789abcdef";
-                for (bytes, 0..) |byte, i| {
-                    output[i * 2] = hex[byte >> 4];
-                    output[i * 2 + 1] = hex[byte & 15];
-                }
+                @memcpy(output, &bytes);
                 break :blk .{ .string = output };
             },
             .trim, .ltrim, .rtrim => blk: {
@@ -4908,21 +4896,10 @@ const Evaluator = struct {
             },
             .replace => blk: {
                 if (values[1] != .string or values[2] != .string) return error.SqlTypeMismatch;
-                if (values[1].string.len == 0) break :blk first;
-                var output: std.ArrayList(u8) = .empty;
-                errdefer output.deinit(self.alloc);
-                var chunks = std.mem.splitSequence(u8, text_value, values[1].string);
-                var initial = true;
-                while (chunks.next()) |chunk| {
-                    if (!initial) {
-                        try self.charge(values[2].string.len);
-                        try output.appendSlice(self.alloc, values[2].string);
-                    }
-                    initial = false;
-                    try self.charge(chunk.len);
-                    try output.appendSlice(self.alloc, chunk);
-                }
-                break :blk .{ .string = try output.toOwnedSlice(self.alloc) };
+                const result = try @import("text_value.zig").replace(self.alloc, text_value, values[1].string, values[2].string, self.limits.output_bytes -| self.bytes, self.workOwner());
+                errdefer if (result.owned) self.alloc.free(result.bytes);
+                try self.charge(result.allocated_bytes);
+                break :blk .{ .string = result.bytes };
             },
             else => unreachable,
         };
@@ -5413,6 +5390,25 @@ test "SQL initcap uses one bounded output allocation with cancellation and OOM c
         }
     };
     try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "SQL literal replacement shares invocation admission and borrows unchanged rows" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "replace(s,$1,$2)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const text = "aaaaaaaaaaaaaaaa";
+    // Output size remains admitted even when its bytes borrow the input.
+    const unchanged = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = text })}, &.{ .{ .string = "aaab" }, .{ .string = "wider" } }, .{ .output_bytes = text.len });
+    try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(unchanged.value.string.ptr));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(a, &.{Datum.json(.{ .string = text })}, &.{ .{ .string = "aaab" }, .{ .string = "wider" } }, .{ .steps = 10 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(a, &.{Datum.json(.{ .string = "aaaa" })}, &.{ .{ .string = "a" }, .{ .string = "wide" } }, .{ .output_bytes = 15 }));
+    var exact: [16]u8 = undefined;
+    var memory = std.heap.FixedBufferAllocator.init(&exact);
+    const changed = try program.evaluate(memory.allocator(), &.{Datum.json(.{ .string = "aaaa" })}, &.{ .{ .string = "a" }, .{ .string = "wide" } }, .{ .output_bytes = 16 });
+    try std.testing.expectEqualStrings("widewidewidewide", changed.value.string);
 }
 
 test "SQL affix and digest kernels bound work allocations and cancellation" {
