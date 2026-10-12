@@ -239,7 +239,7 @@ pub fn parseControlled(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limi
         } else if (std.mem.startsWith(u8, line, "#EXT-X-VERSION:")) {
             if (version != null) return error.MalformedHls;
             version = try attributes.uint(line[15..]);
-            if (version.? == 0 or version.? > 7) return error.UnsupportedHls;
+            if (version.? == 0 or version.? > 13) return error.UnsupportedHls;
         } else if (std.mem.startsWith(u8, line, "#EXT-X-SESSION-KEY:")) {
             const declaration = try hls.crypto.parseKey(line[19..], limits.max_uri_bytes);
             if (declaration.key == null) return error.MalformedHls;
@@ -372,7 +372,7 @@ test "HLS master rejects mixed playlists invalid attributes and broken rendition
         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CLOSED-CAPTIONS=NONE\na\n#EXT-X-STREAM-INF:BANDWIDTH=1\nb\n",
     }) |text| try std.testing.expectError(error.MalformedHls, parse(a, text, .{}));
     try std.testing.expectError(error.UnsupportedEncryptedMedia, parse(a, "#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"key\"\n", .{}));
-    try std.testing.expectError(error.UnsupportedHls, parse(a, "#EXTM3U\n#EXT-X-VERSION:9\n", .{}));
+    try std.testing.expectError(error.UnsupportedHls, parse(a, "#EXTM3U\n#EXT-X-VERSION:14\n", .{}));
 }
 
 fn fuzzSeed(comptime text: []const u8) []const u8 {
@@ -473,4 +473,11 @@ test "HLS master validates AES session hints without applying them as media keys
     defer master.deinit();
     try std.testing.expectEqualStrings("video.m3u8", (try master.select(.{})).uri);
     try std.testing.expectError(error.MalformedHls, parse(std.testing.allocator, "#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=NONE\n", .{}));
+}
+
+test "HLS master version nine discovers low latency media variants" {
+    var parsed = try parse(std.testing.allocator, "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"avc1.64001f\"\nparts.m3u8\n", .{});
+    defer parsed.deinit();
+    const selected = try parsed.select(.{});
+    try std.testing.expectEqualStrings("parts.m3u8", selected.uri);
 }

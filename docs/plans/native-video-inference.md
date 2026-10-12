@@ -1222,3 +1222,21 @@ Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
 match their pinned uncached binaries exactly; reference rankings/top-1/3/5
 overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
 receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.
+
+### Partial fMP4 HLS ingestion qualification
+
+The native media reader now consumes published partial fMP4 units, exposes part
+identity, and issues explicit bounded blocking reloads without changing relative
+resource/authentication resolution. A constant-space sample commitment verifies
+completed-parent overlap before suppressing duplicates or recovering a missing
+tail. Failed fetch, allocation and admission operations retain retry position;
+old packet leases remain valid. Preload hints are parsed but never speculatively
+consumed. Independently encrypted AES-128 partial objects are qualified.
+
+The media receipt at `zig/lib/media/testdata/hls/partial-validation` records
+macOS, actual Linux ARM64, production HTTP and bounded fresh parser-fuzz results.
+Selected semantics follow the work-in-progress HLS second-edition draft 22.
+TS partials, CBC byte-range chaining, delta playlists, rendition coordination
+and model-level live window orchestration still require implementation and
+qualification. The full non-CUDA objective remains active. Codec source ports
+are owned and maintained in-tree; no runtime codec-library dependency is allowed.

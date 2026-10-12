@@ -332,3 +332,56 @@ test "production HLS AES authenticates keys decrypts ranged media and rotates wi
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 6), transport.requests);
 }
+
+test "production HTTP low latency HLS authenticates blocking reload and verifies parent overlap" {
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=1\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=2\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+    const first = prefix ++ "#EXT-X-PART:DURATION=1,URI=\"p0.m4s\",INDEPENDENT=YES\n#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"unpublished.m4s\"\n";
+    const complete = prefix ++ "#EXTINF:2,\nparent.m4s\n#EXT-X-ENDLIST\n";
+    const bytes = @embedFile("testdata/fragmented.mp4");
+    const Request = struct {
+        fn initial(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/live/list.m3u8?token=stable%26key", request.target);
+        }
+        fn blocking(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/live/list.m3u8?token=stable%26key&_HLS_msn=10&_HLS_part=1", request.target);
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/live/list.m3u8", .assert_request = Request.initial, .max_uses = 1, .respond = .{ .body = first } },
+        .{ .path = "/live/list.m3u8", .assert_request = Request.blocking, .max_uses = 1, .respond = .{ .body = complete } },
+        .{ .path = "/live/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = bytes[0..797] } },
+        .{ .path = "/live/p0.m4s", .assert_request = Verify.auth, .respond = .{ .body = bytes[797..11206] } },
+        .{ .path = "/live/parent.m4s", .assert_request = Verify.auth, .respond = .{ .body = bytes[797..20811] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/live/list.m3u8?token=stable%26key", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{});
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 5 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    var head = (try reader.next()).?;
+    defer head.deinit();
+    var retained = try head.reader.readPacket(0);
+    defer retained.deinit();
+    try std.testing.expectEqual(@as(u32, 0), head.hls_timing.?.part_index.?);
+    try reader.reloadBlocking();
+    var tail = (try reader.next()).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(@as(u64, 10), tail.hls_timing.?.sequence);
+    try std.testing.expect(tail.hls_timing.?.part_index == null);
+    try std.testing.expectEqual(head.reader.packets.len, tail.reader.packets.len);
+    try std.testing.expectEqual(head.reader.packets[head.reader.packets.len - 1].media_dts + head.reader.packets[head.reader.packets.len - 1].duration, tail.reader.packets[0].media_dts);
+    try std.testing.expect(reader.ended());
+    var again = try head.reader.readPacket(0);
+    defer again.deinit();
+    try std.testing.expectEqualSlices(u8, retained.bytes, again.bytes);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 5), transport.requests);
+}

@@ -1762,3 +1762,21 @@ Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
 match their pinned uncached binaries exactly; reference rankings/top-1/3/5
 overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
 receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.
+
+### Partial HLS ingestion boundary
+
+The shared media layer now exposes partial fMP4 HLS units and explicit bounded
+blocking reloads. Parent fallback verifies already consumed encoded samples
+before returning only the new tail, preserving packet leases and retry cursors.
+`Segment.hls_timing` carries sequence/part/discontinuity identities and an
+independence hint. Consumers must retain decoder dependencies across parts;
+the playlist hint is not a validated codec restart point. Preload hints never
+become input until published as actual parts.
+
+This closes a library ingestion gap. Model-level live window orchestration,
+TS partials, delta updates and broader live rendition/CBC-range qualification
+remain in the active non-CUDA objective. See the media
+[partial-HLS receipt](../media/testdata/hls/partial-validation/README.md).
+VP9 and AV1 remain checked-in, Antfly-maintained Zig ports with no runtime
+libvpx/dav1d/FFmpeg dependency; ownership and update rules are documented in
+[src/codecs/PORTING.md](src/codecs/PORTING.md).

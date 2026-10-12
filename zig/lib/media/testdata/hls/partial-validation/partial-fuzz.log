@@ -1,0 +1,14 @@
+FUZZING REPORT
+Step: run test
+Fuzz test: "src.hls.test.HLS partial fuzz bounded attributes sequence ranges controls and hints" (562a9985a1589a75)
+Runs: 0 -> 55971
+Unique runs: 0 -> 422
+Coverage: 0/10521 -> 997/10521 (9.48%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+test-media-hls-partial-fuzz success
++- run test 3 pass (3 total) 3s MaxRSS:17M
+   +- compile test debug native success 7s MaxRSS:453M
+

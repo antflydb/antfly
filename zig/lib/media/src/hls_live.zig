@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native HTTP fMP4 HLS ingestion with bounded explicit reload and config epochs.
+//! Native HTTP fMP4 HLS, partial-unit cursors, verified parent replay and explicit bounded reload.
 const std = @import("std");
 const hls = @import("hls.zig");
 const network = @import("http_stream.zig");
@@ -28,12 +28,50 @@ fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool 
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
 fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and std.meta.eql(left.part, right.part) and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
 }
 
 fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
     if (left.dash != null and right.dash != null) return dash_cursor.order(left, right);
-    return std.math.order(left.sequence, right.sequence);
+    const order = std.math.order(left.sequence, right.sequence);
+    if (order != .eq) return order;
+    return std.math.order(if (left.part) |part| @as(u64, part.index) else std.math.maxInt(u64), if (right.part) |part| @as(u64, part.index) else std.math.maxInt(u64));
+}
+
+fn directiveName(raw: []const u8, name: []const u8) bool {
+    var decoded: [32]u8 = undefined;
+    var used: usize = 0;
+    var pos: usize = 0;
+    while (pos < raw.len) {
+        if (used == decoded.len) return false;
+        if (raw[pos] == '%') {
+            if (raw.len - pos < 3) return false;
+            decoded[used] = std.fmt.parseInt(u8, raw[pos + 1 ..][0..2], 16) catch return false;
+            pos += 3;
+        } else {
+            decoded[used] = raw[pos];
+            pos += 1;
+        }
+        used += 1;
+    }
+    return std.mem.eql(u8, decoded[0..used], name);
+}
+/// Preserve authentication query bytes. Existing delivery directives are
+/// rejected rather than creating ambiguous duplicate query parameters.
+pub fn blockingRequestUrl(a: std.mem.Allocator, url: []const u8, sequence: u64, part: ?u32, limit: usize) ![]u8 {
+    if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidHlsDeliveryDirective;
+    const query = std.mem.indexOfScalar(u8, url, '?');
+    if (query) |offset| {
+        var fields = std.mem.splitScalar(u8, url[offset + 1 ..], '&');
+        while (fields.next()) |field| {
+            const key = field[0 .. std.mem.indexOfScalar(u8, field, '=') orelse field.len];
+            if (directiveName(key, "_HLS_msn") or directiveName(key, "_HLS_part") or directiveName(key, "_HLS_skip")) return error.InvalidHlsDeliveryDirective;
+        }
+    }
+    const separator: []const u8 = if (query == null) "?" else if (std.mem.endsWith(u8, url, "?") or std.mem.endsWith(u8, url, "&")) "" else "&";
+    const length = if (part) |index| std.fmt.count("{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.count("{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
+    if (length > limit) return error.ResourceLimitExceeded;
+    return if (part) |index| std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
 }
 
 /// Single consumer, borrowing a native HTTP adapter. Initial master discovery
@@ -59,6 +97,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         playlist: ?hls.Playlist = null,
         ingest: ?live.Ingest = null,
         next_sequence: ?u64 = null,
+        next_part: u32 = 0,
+        part_progress: live.SamplesDigest = .{},
         dash_position: ?dash_cursor.Cursor = null,
         active_dash_period: ?[32]u8 = null,
         active_initialization: ?hls.Initialization = null,
@@ -149,8 +189,23 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         /// advancing past an unconsumed sequence fails instead of dropping data.
         /// Overlapping sequence descriptors must remain immutable across reloads.
         pub fn reload(self: *Self) !void {
+            return self.reloadRequest(null);
+        }
+        pub fn canBlockReload(self: *const Self) bool {
+            const playlist = self.playlist orelse return false;
+            return @hasDecl(manifest_parser, "master") and playlist.server_control.can_block_reload and !playlist.ended;
+        }
+        /// Explicit protocol wait, bounded by the adapter timeout and control.
+        pub fn reloadBlocking(self: *Self) !void {
+            if (!self.canBlockReload()) return error.UnsupportedHlsBlockingReload;
+            const playlist = self.playlist.?;
+            const url = try blockingRequestUrl(self.allocator, self.mediaUrl(), self.next_sequence orelse return error.MediaPlaylistRequired, if (playlist.part_target_seconds != null) self.next_part else null, self.transport.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            return self.reloadRequest(url);
+        }
+        fn reloadRequest(self: *Self, request_url: ?[]const u8) !void {
             try self.transport.control.check();
-            var body = try self.transport.fetch(self.mediaUrl(), self.mediaUrl(), null, self.options.playlist.max_bytes);
+            var body = try self.transport.fetch(self.mediaUrl(), request_url orelse self.mediaUrl(), null, self.options.playlist.max_bytes);
             errdefer body.deinit();
             var selected_url: ?[]u8 = null;
             defer if (selected_url) |url| self.allocator.free(url);
@@ -208,7 +263,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     const first = parsed.segments[0].sequence;
                     const last = parsed.segments[parsed.segments.len - 1].sequence;
                     if (expected_sequence < first) return error.MediaStreamGap;
-                    if (expected_sequence > last + 1) return error.SourceVersionChanged;
+                    if (@as(u128, expected_sequence) > @as(u128, last) + 1) return error.SourceVersionChanged;
                 } else if (self.playlist != null and self.playlist.?.segments.len != 0) return error.SourceVersionChanged;
             }
             try self.transport.control.check();
@@ -234,71 +289,106 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             if (!playlist.ended) return false;
             if (playlist.segments.len == 0) return true;
             if (self.dash_position) |position| return (position.select(playlist) catch return false) == null;
-            return (self.next_sequence orelse return false) > playlist.segments[playlist.segments.len - 1].sequence;
+            return self.selectHls(playlist) == null;
         }
         /// Caller-visible polling delay; no blocking sleeper is hidden in ingest.
         pub fn reloadAfterSeconds(self: *const Self, unchanged: bool) f64 {
             if (self.playlist) |playlist| if (playlist.reload_after_seconds) |seconds| return seconds;
+            if (self.playlist) |playlist| if (playlist.part_target_seconds) |seconds| return seconds * (if (unchanged) @as(f64, 0.5) else 1.0);
             const target = if (self.playlist) |playlist| playlist.target_duration_seconds else 1;
             return @as(f64, @floatFromInt(target)) * (if (unchanged) @as(f64, 0.5) else 1.0);
         }
+        fn selectHls(self: *const Self, playlist: hls.Playlist) ?hls.Segment {
+            const sequence = self.next_sequence orelse return null;
+            var parent: ?hls.Segment = null;
+            var part: ?hls.Segment = null;
+            for (playlist.segments) |item| if (item.sequence == sequence) {
+                if (item.part) |info| {
+                    if (info.index == self.next_part) part = item;
+                } else parent = item;
+            };
+            if (self.next_part == 0 and parent != null) return parent;
+            return part orelse parent;
+        }
         fn commitCursor(self: *Self, item: hls.Segment) void {
-            self.next_sequence = item.sequence + 1;
+            if (item.part) |part| {
+                self.next_sequence = item.sequence;
+                self.next_part = part.index + 1;
+            } else {
+                self.next_sequence = item.sequence + 1;
+                self.next_part = 0;
+                self.part_progress = .{};
+            }
             if (self.dash_position) |*position| position.consumed(item);
         }
         pub fn next(self: *Self) !?live.Segment {
-            try self.transport.control.check();
-            const playlist = self.playlist orelse return error.MediaPlaylistRequired;
-            const item: hls.Segment = if (self.dash_position) |position|
-                playlist.segments[(try position.select(playlist)) orelse return null]
-            else blk: {
-                const sequence = self.next_sequence orelse return null;
-                for (playlist.segments) |segment| if (segment.sequence == sequence) break :blk segment;
-                return null;
-            };
-            if (item.initialization.uri.len == 0) {
-                if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
-                const factory = self.options.transport_stream orelse return error.UnsupportedContainer;
-                var resource = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
-                defer resource.deinit();
-                const result = try factory.accept(factory.context, self.mediaUrl(), resource.bytes, item, self.options.ingest, self.transport.control, self.transport.pool);
-                self.commitCursor(item);
-                return result;
-            }
-            // Failed snapshot allocation/validation retains pending input. Retry
-            // that commit before any fetch; never append the same object twice.
-            if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) {
-                var result = try ingest.finishSegment();
-                result.dash_timing = item.dash;
-                self.commitCursor(item);
-                return result;
-            };
-            const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence or (if (item.dash) |timing| !std.meta.eql(self.active_dash_period, @as(?[32]u8, timing.period.identity)) else false) else true;
-            if (needs_initialization) {
-                var initialization = try self.fetchResource(item.initialization.uri, item.initialization.range, item.initialization.encryption, item.sequence);
-                defer initialization.deinit();
-                const owned_initialization = try self.cloneInitialization(item.initialization);
-                errdefer self.freeInitialization(owned_initialization);
-                if (self.ingest) |*ingest| {
-                    try ingest.reconfigure(self.mediaUrl(), initialization.bytes);
-                } else {
-                    var options = self.options.ingest;
-                    options.stream.control = self.transport.control;
-                    if (options.stream.admission_pool == null) options.stream.admission_pool = self.transport.pool;
-                    self.ingest = try live.Ingest.init(self.allocator, self.mediaUrl(), initialization.bytes, options);
+            while (true) {
+                try self.transport.control.check();
+                const playlist = self.playlist orelse return error.MediaPlaylistRequired;
+                const item: hls.Segment = if (self.dash_position) |position|
+                    playlist.segments[(try position.select(playlist)) orelse return null]
+                else
+                    self.selectHls(playlist) orelse return null;
+                if (item.part) |part| if (part.gap) return error.MediaStreamGap;
+                if (item.initialization.uri.len == 0) {
+                    if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
+                    if (item.part != null) return error.UnsupportedContainer;
+                    const factory = self.options.transport_stream orelse return error.UnsupportedContainer;
+                    var resource = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
+                    defer resource.deinit();
+                    const result = try factory.accept(factory.context, self.mediaUrl(), resource.bytes, item, self.options.ingest, self.transport.control, self.transport.pool);
+                    self.commitCursor(item);
+                    return result;
                 }
-                if (self.active_initialization) |previous| self.freeInitialization(previous);
-                self.active_initialization = owned_initialization;
-                self.active_discontinuity_sequence = item.discontinuity_sequence;
-                self.active_dash_period = if (item.dash) |timing| timing.period.identity else null;
+                // Failed snapshot allocation/validation retains pending input. Retry
+                // that commit before any fetch; never append the same object twice.
+                if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) {
+                    var result = try ingest.finishSegment();
+                    result.dash_timing = item.dash;
+                    if (comptime @hasDecl(manifest_parser, "master")) result.hls_timing = .{ .sequence = item.sequence, .part_index = if (item.part) |part| part.index else null, .independent_hint = if (item.part) |part| part.independent else false, .discontinuity_sequence = item.discontinuity_sequence };
+                    self.commitCursor(item);
+                    return result;
+                };
+                const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence or (if (item.dash) |timing| !std.meta.eql(self.active_dash_period, @as(?[32]u8, timing.period.identity)) else false) else true;
+                if (needs_initialization and self.next_part != 0) return error.SourceVersionChanged;
+                if (needs_initialization) {
+                    var initialization = try self.fetchResource(item.initialization.uri, item.initialization.range, item.initialization.encryption, item.sequence);
+                    defer initialization.deinit();
+                    const owned_initialization = try self.cloneInitialization(item.initialization);
+                    errdefer self.freeInitialization(owned_initialization);
+                    if (self.ingest) |*ingest| {
+                        try ingest.reconfigure(self.mediaUrl(), initialization.bytes);
+                    } else {
+                        var options = self.options.ingest;
+                        options.stream.control = self.transport.control;
+                        if (options.stream.admission_pool == null) options.stream.admission_pool = self.transport.pool;
+                        self.ingest = try live.Ingest.init(self.allocator, self.mediaUrl(), initialization.bytes, options);
+                    }
+                    if (self.active_initialization) |previous| self.freeInitialization(previous);
+                    self.active_initialization = owned_initialization;
+                    self.active_discontinuity_sequence = item.discontinuity_sequence;
+                    self.active_dash_period = if (item.dash) |timing| timing.period.identity else null;
+                }
+                var media = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
+                defer media.deinit();
+                try self.ingest.?.push(media.bytes);
+                var result = (if (item.part != null or self.next_part != 0)
+                    self.ingest.?.finishHlsSegment(self.part_progress, item.part == null)
+                else
+                    self.ingest.?.finishSegment()) catch |err| {
+                    self.ingest.?.discardSegment();
+                    return err;
+                };
+                result.dash_timing = item.dash;
+                if (comptime @hasDecl(manifest_parser, "master")) result.hls_timing = .{ .sequence = item.sequence, .part_index = if (item.part) |part| part.index else null, .independent_hint = if (item.part) |part| part.independent else false, .discontinuity_sequence = item.discontinuity_sequence };
+                if (result.samples_digest) |digest| self.part_progress = digest;
+                self.commitCursor(item);
+                if (result.reader.packets.len == 0) {
+                    result.deinit();
+                    continue;
+                }
+                return result;
             }
-            var media = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
-            defer media.deinit();
-            try self.ingest.?.push(media.bytes);
-            var result = try self.ingest.?.finishSegment();
-            result.dash_timing = item.dash;
-            self.commitCursor(item);
-            return result;
         }
     };
 }
@@ -897,4 +987,208 @@ test "live HLS AES foreign keys fail before fetching initialization or ciphertex
     try std.testing.expectError(error.MediaOriginChanged, reader.next());
     try std.testing.expectEqual(@as(usize, 1), client.calls);
     try std.testing.expect(reader.cached_key == null and reader.ingest == null);
+}
+
+const ll_prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=1\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+const ll_first = ll_prefix ++ "#EXT-X-PART:DURATION=1,URI=\"seg-1.m4s\",INDEPENDENT=YES\n";
+const ll_second = ll_first ++ "#EXT-X-PART:DURATION=1,URI=\"seg-2.m4s\",INDEPENDENT=YES\n";
+const ll_parent = ll_prefix ++ "#EXTINF:2,\nparent.m4s\n#EXT-X-ENDLIST\n";
+const PartialHttp = struct {
+    pub const Response = FakeHttp.Response;
+    pub const Client = struct {
+        manifest: []const u8 = ll_first,
+        parent_bytes: ?[]const u8 = null,
+        fail_media: bool = false,
+        requested_blocking_part: bool = false,
+        pub fn get(self: *@This(), url: []const u8, options: anytype) !Response {
+            if (std.mem.indexOf(u8, url, "list.m3u8") != null) {
+                self.requested_blocking_part = std.mem.endsWith(u8, url, "_HLS_msn=10&_HLS_part=1");
+                return .{ .body = self.manifest };
+            }
+            if (std.mem.endsWith(u8, url, "parent.m4s")) {
+                if (self.fail_media) return error.ConnectionReset;
+                return .{ .body = self.parent_bytes orelse @embedFile("../testdata/fragmented.mp4")[797..20811] };
+            }
+            var original = FakeHttp.Client{ .manifest = self.manifest, .fail_media = self.fail_media };
+            return original.get(url, options);
+        }
+    };
+};
+test "live HLS partial reload consumes each part and acknowledges its parent without duplicate samples" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{};
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var retained = try first.reader.readPacket(0);
+    defer retained.deinit();
+    try std.testing.expect((try reader.next()) == null);
+    client.manifest = ll_second;
+    try reader.reload();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expect(second.reader.packets[0].media_dts > first.reader.packets[0].media_dts);
+    client.manifest = ll_parent;
+    try reader.reload();
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expect(reader.ended());
+    var again = try first.reader.readPacket(0);
+    defer again.deinit();
+    try std.testing.expectEqualSlices(u8, retained.bytes, again.bytes);
+}
+test "live HLS completed parent recovers unlisted tail and preserves cursor across HTTP retry" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{};
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    client.manifest = ll_parent;
+    try reader.reload();
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, reader.next());
+    client.fail_media = false;
+    var tail = (try reader.next()).?;
+    defer tail.deinit();
+    try std.testing.expect(tail.reader.packets[0].media_dts == first.reader.packets[first.reader.packets.len - 1].media_dts + first.reader.packets[first.reader.packets.len - 1].duration);
+    try std.testing.expectEqual(first.reader.packets.len, tail.reader.packets.len);
+    try std.testing.expect(reader.ended());
+}
+
+test "live HLS parent fallback verifies encoded sample prefix and allows a clean retry after mutation" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{};
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    client.manifest = ll_parent;
+    try reader.reload();
+    const altered = try a.dupe(u8, @embedFile("../testdata/fragmented.mp4")[797..20811]);
+    defer a.free(altered);
+    altered[184 + 8 + 10] ^= 1;
+    client.parent_bytes = altered;
+    try std.testing.expectError(error.SourceVersionChanged, reader.next());
+    try std.testing.expectEqual(@as(u32, 1), reader.next_part);
+    client.parent_bytes = null;
+    var tail = (try reader.next()).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(first.reader.packets.len, tail.reader.packets.len);
+}
+fn partialAllocationFailures(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), @import("admission.zig").Resources{}));
+    var client = PartialHttp.Client{};
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8", .pool = &pool };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    client.manifest = ll_parent;
+    try reader.reload();
+    var tail = (try reader.next()).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(first.reader.packets.len, tail.reader.packets.len);
+}
+test "live HLS partial parent fallback allocation failures release snapshots indexes and leases" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, partialAllocationFailures, .{});
+}
+
+test "live HLS blocking reload preserves authentication query and rejects directive aliases" {
+    const a = std.testing.allocator;
+    const result = try blockingRequestUrl(a, "https://example.test/list.m3u8?token=a%26b", 10, 2, 4096);
+    defer a.free(result);
+    try std.testing.expectEqualStrings("https://example.test/list.m3u8?token=a%26b&_HLS_msn=10&_HLS_part=2", result);
+    inline for (.{ "_HLS_msn=1", "%5FHLS_part=1", "_HLS_skip=YES", "token=x#fragment" }) |query| try std.testing.expectError(error.InvalidHlsDeliveryDirective, blockingRequestUrl(a, "https://example.test/list.m3u8?" ++ query, 10, 2, 4096));
+    try std.testing.expectError(error.ResourceLimitExceeded, blockingRequestUrl(a, "https://example.test/list.m3u8", 10, 2, 10));
+}
+test "live HLS blocking reload requests next part and retains canonical media URL" {
+    const a = std.testing.allocator;
+    const controls = "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=2\n";
+    var client = PartialHttp.Client{ .manifest = ll_first ++ controls };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expect(reader.canBlockReload());
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    client.manifest = ll_second ++ controls;
+    try reader.reloadBlocking();
+    try std.testing.expect(client.requested_blocking_part);
+    try std.testing.expectEqualStrings(transport.root_url, reader.mediaUrl());
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(f64, 0.5), reader.reloadAfterSeconds(true));
+}
+
+fn encryptPartialFixture(a: std.mem.Allocator, plain: []const u8, iv: [16]u8) ![]u8 {
+    const padding: u8 = @intCast(16 - plain.len % 16);
+    const result = try a.alloc(u8, plain.len + padding);
+    @memcpy(result[0..plain.len], plain);
+    @memset(result[plain.len..], padding);
+    const context = std.crypto.core.aes.Aes128.initEnc(@splat(0x37));
+    var previous = iv;
+    var offset: usize = 0;
+    while (offset < result.len) : (offset += 16) {
+        var block: [16]u8 = undefined;
+        for (&block, 0..) |*value, index| value.* = result[offset + index] ^ previous[index];
+        context.encrypt(&previous, &block);
+        @memcpy(result[offset..][0..16], &previous);
+    }
+    return result;
+}
+const EncryptedPartialHttp = struct {
+    pub const Response = FakeHttp.Response;
+    pub const Client = struct {
+        manifest: []const u8,
+        initialization: []const u8,
+        part: []const u8,
+        parent: []const u8,
+        pub fn get(self: *@This(), url: []const u8, _: anytype) !Response {
+            if (std.mem.endsWith(u8, url, "list.m3u8")) return .{ .body = self.manifest };
+            if (std.mem.endsWith(u8, url, "key")) return .{ .body = &@as([16]u8, @splat(0x37)) };
+            if (std.mem.endsWith(u8, url, "init.mp4")) return .{ .body = self.initialization };
+            if (std.mem.endsWith(u8, url, "p0.m4s")) return .{ .body = self.part };
+            if (std.mem.endsWith(u8, url, "parent.m4s")) return .{ .body = self.parent };
+            return error.UnexpectedFixtureUri;
+        }
+    };
+};
+test "live HLS independent AES partial objects and parent fallback preserve sample payloads" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/fragmented.mp4");
+    const key = (try hls.crypto.parseKey("METHOD=AES-128,URI=\"key\"", 4096)).key.?;
+    var init_iv: [16]u8 = @splat(0);
+    init_iv[15] = 1;
+    const initialization = try encryptPartialFixture(a, bytes[0..797], init_iv);
+    defer a.free(initialization);
+    const part = try encryptPartialFixture(a, bytes[797..11206], key.mediaIv(10));
+    defer a.free(part);
+    const parent = try encryptPartialFixture(a, bytes[797..20811], key.mediaIv(10));
+    defer a.free(parent);
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=1\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\",IV=0x1\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n";
+    var client = EncryptedPartialHttp.Client{ .manifest = prefix ++ "#EXT-X-PART:DURATION=1,URI=\"p0.m4s\",INDEPENDENT=YES\n", .initialization = initialization, .part = part, .parent = parent };
+    var transport = network.Adapter(EncryptedPartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(EncryptedPartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    client.manifest = prefix ++ "#EXTINF:2,\nparent.m4s\n#EXT-X-ENDLIST\n";
+    try reader.reload();
+    var tail = (try reader.next()).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(first.reader.packets.len, tail.reader.packets.len);
+    try std.testing.expect(reader.ended());
 }

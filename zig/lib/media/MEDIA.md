@@ -987,3 +987,34 @@ Metal and actual Linux ARM64. All 18 ordered groups and both multipart groups
 match their pinned uncached binaries exactly; reference rankings/top-1/3/5
 overlap are exact, with maximum cosine score drift below 3e-7. The frame-cache
 receipt binds the source, binaries, checkpoint, oracle and runtime artifacts.
+
+### Partial fMP4 HLS and blocking reload
+
+Native HLS ingestion now accepts published partial segments with parent media
+sequence and part-index identities, bounded byte ranges, independent/gap hints,
+PART-INF, SERVER-CONTROL and PRELOAD-HINT metadata. A completed parent is preferred
+when no part has been consumed. Otherwise the reader continues at the next part,
+or recovers the unlisted tail from the completed parent. It hashes ordered sample
+DTS/PTS, duration, sync state, size and encoded bytes to verify the consumed prefix
+before skipping duplicates. Changed prefixes fail with `SourceVersionChanged`;
+HTTP, allocation and admission failures preserve the retry cursor. Retained packet
+leases survive reload and parent acknowledgement. Normal fMP4 ingestion does not
+pay for these HLS sample commitments.
+
+`reloadBlocking` is explicit and bounded by the existing HTTP timeout/control.
+It appends `_HLS_msn` and `_HLS_part` while preserving authentication query bytes,
+rejects pre-existing delivery directives including percent-encoded aliases, and
+keeps the canonical media URL for relative resource resolution. Polling exposes
+PART-TARGET timing. Preload hints are metadata only: unpublished resources are
+never fetched or emitted. Returned `Segment.hls_timing` identifies the parent,
+part and discontinuity sequence; `independent_hint` does not prove random access.
+
+This implementation follows selected semantics in the work-in-progress
+[HLS second-edition draft 22](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-22),
+not a full protocol-conformance claim. Independently encrypted AES-128 partial
+objects and parent fallback are tested. TS partials, CBC byte-range chaining,
+delta playlists, rendition coordination and model-level live orchestration remain
+outside this qualification. No runtime codec or transport dependency was added.
+
+Source, binary, fixture and report identities are recorded in
+[testdata/hls/partial-validation](testdata/hls/partial-validation/README.md).

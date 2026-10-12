@@ -1,0 +1,14 @@
+Build Summary: 10/10 steps succeeded; 136/136 tests passed
+install-media-http-tests success
++- install test success
+   +- compile test debug native success 4s MaxRSS:620M
+install-media-tests success
++- install test success
+   +- compile test debug native success 37s MaxRSS:420M
+test-media-http success
++- run test 8 pass (8 total) 282ms MaxRSS:6M
+   +- compile test debug native (reused)
+test-media success
++- run test 128 pass (128 total) 4s MaxRSS:38M
+   +- compile test debug native (reused)
+

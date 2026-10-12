@@ -28,6 +28,34 @@ pub const Options = struct {
     max_identity_bytes: usize = 4096,
     max_ingested_bytes: u64 = 1024 * 1024 * 1024,
 };
+/// Constant-space commitment to ordered sample metadata and encoded payloads.
+/// HLS parent fallback verifies this exact prefix before discarding duplicates.
+pub const SamplesDigest = struct {
+    count: usize = 0,
+    state: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    pub fn extend(self: *SamplesDigest, reader: *mp4.Reader, begin: usize, end: usize) !void {
+        for (reader.packets[begin..end], begin..) |packet, index| {
+            var header: [25]u8 = undefined;
+            std.mem.writeInt(i64, header[0..8], packet.media_dts, .big);
+            std.mem.writeInt(i64, header[8..16], packet.media_pts, .big);
+            std.mem.writeInt(u32, header[16..20], packet.duration, .big);
+            std.mem.writeInt(u32, header[20..24], packet.size, .big);
+            header[24] = @intFromBool(packet.sync);
+            var payload = try reader.readPacket(index);
+            defer payload.deinit();
+            self.state.update(&header);
+            self.state.update(payload.bytes);
+            self.count = std.math.add(usize, self.count, 1) catch return error.ResourceLimitExceeded;
+        }
+    }
+    pub fn bytes(self: SamplesDigest) [32]u8 {
+        var state = self.state;
+        var hash: [32]u8 = undefined;
+        state.final(&hash);
+        return hash;
+    }
+};
+pub const HlsTiming = struct { sequence: u64, part_index: ?u32 = null, independent_hint: bool = false, discontinuity_sequence: u64 };
 pub const Segment = struct {
     backing: *stream.Snapshot,
     reader: mp4.Reader,
@@ -42,6 +70,8 @@ pub const Segment = struct {
     /// DASH presentation mapping; packet timestamps remain in the native track
     /// clock. Period transitions expose a new decoder epoch independently.
     dash_timing: ?@import("hls.zig").DashTiming = null,
+    samples_digest: ?SamplesDigest = null,
+    hls_timing: ?HlsTiming = null,
     pub fn deinit(self: *Segment) void {
         const allocator = self.backing.input.allocator;
         self.reader.deinit();
@@ -207,7 +237,13 @@ pub const Ingest = struct {
     pub fn finishSegment(self: *Ingest) !Segment {
         return self.commitPrefix(self.pending.items.len);
     }
+    pub fn finishHlsSegment(self: *Ingest, progress: SamplesDigest, parent_replay: bool) !Segment {
+        return self.commitPrefixProgress(self.pending.items.len, progress, parent_replay);
+    }
     fn commitPrefix(self: *Ingest, prefix: usize) !Segment {
+        return self.commitPrefixProgress(prefix, null, false);
+    }
+    fn commitPrefixProgress(self: *Ingest, prefix: usize, progress: ?SamplesDigest, parent_replay: bool) !Segment {
         try self.options.stream.control.check();
         if (self.segments >= self.options.max_segments) return error.ResourceLimitExceeded;
         var cursor: usize = 0;
@@ -237,9 +273,27 @@ pub const Ingest = struct {
         errdefer reader.deinit();
         const identity = Identity.from(reader.track);
         if (self.identity) |previous| if (!std.meta.eql(previous, identity)) return error.UnsupportedDynamicVideoConfig;
-        if (self.next_decode_time) |next| if (reader.packets[0].media_dts < next) return error.NonMonotonicMediaSegment;
+        var skip: usize = 0;
+        var digest = progress;
+        if (parent_replay) {
+            const previous = progress orelse return error.InvalidHlsReplay;
+            if (previous.count > reader.packets.len) return error.SourceVersionChanged;
+            var prefix_digest = SamplesDigest{};
+            try prefix_digest.extend(&reader, 0, previous.count);
+            if (!std.mem.eql(u8, &prefix_digest.bytes(), &previous.bytes())) return error.SourceVersionChanged;
+            skip = previous.count;
+        }
+        if (self.next_decode_time) |next| if (skip < reader.packets.len and reader.packets[skip].media_dts < next) return error.NonMonotonicMediaSegment;
+        if (digest) |*value| try value.extend(&reader, skip, reader.packets.len);
         const last = reader.packets[reader.packets.len - 1];
         const next = try std.math.add(i64, last.media_dts, last.duration);
+        if (skip != 0) {
+            var trim_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = (reader.packets.len - skip) * @sizeOf(mp4.Packet) }) else admission.Token{};
+            defer trim_reservation.deinit();
+            const tail = try self.allocator.dupe(mp4.Packet, reader.packets[skip..]);
+            self.allocator.free(reader.packets);
+            reader.packets = tail;
+        }
         self.identity = identity;
         self.next_decode_time = next;
         const ordinal = self.segments;
@@ -248,7 +302,7 @@ pub const Ingest = struct {
         std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[prefix..]);
         self.pending.items.len = remaining;
         self.resetScan();
-        return .{ .backing = snapshot, .reader = reader, .ordinal = ordinal, .epoch = self.epoch, .identity = owned_identity, .identity_reservation = identity_reservation };
+        return .{ .backing = snapshot, .reader = reader, .ordinal = ordinal, .epoch = self.epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .samples_digest = digest };
     }
     fn resetScan(self: *Ingest) void {
         self.scan_cursor = 0;
