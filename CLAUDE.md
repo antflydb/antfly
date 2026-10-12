@@ -39,7 +39,7 @@ See `docs/architecture.mdx` for full details.
 - `zig/pkg/antfly/src/metadata/`: Metadata server coordinating cluster operations
 - `zig/pkg/antfly/src/data/`: Storage nodes handling data shards and queries
 - `zig/pkg/antfly/src/raft/`: Raft consensus and transport
-- `zig/pkg/antfly/src/storage/`: Server-side storage integration (enrichment, backups, kernel ownership, shard splits)
+- `zig/pkg/antfly/src/storage/`: Server adapters around the storage owner: Raft apply and WAL clients, distributed transactions, backup/restore, hot standby, enrichment
 - `zig/pkg/antfly-embedded/src/storage/`: Native storage engine (LSM tree, indexes, transactions), shared with embedded Lite
 - `zig/pkg/antfly-client/`, `zig/pkg/antfly-server-api/`: Client library and server API types
 - `zig/pkg/inference/`: Local inference runtime
