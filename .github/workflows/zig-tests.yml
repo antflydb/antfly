@@ -1630,7 +1630,7 @@ jobs:
           fi
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not iceberg_integration and not slow" e2e/antfly
+            -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -1780,7 +1780,7 @@ jobs:
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
         run: |
-          python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
+          uv run --project zig/e2e/antfly python -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
 
       - name: Run base E2E
         env:

@@ -1593,7 +1593,18 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer added.deinit(alloc);
     try std.testing.expect(try hasSelfFk(alloc, added));
     if (restart_after_ack) try awaitRecoveredOwnerReady(alloc, io, &metadata, &data, table_id, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
-    try awaitConstraintCoverage(alloc, io, transport, &headers, base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+    awaitConstraintCoverage(alloc, io, transport, &headers, base, &.{ &meta_raft, &meta_control, &data_raft, &data_control }) catch |err| {
+        if (leader_transfer) {
+            const current = try tableGroup(alloc, &metadata, table_id);
+            defer alloc.free(current.name);
+            for (peers) |peer| if (peer) |active| {
+                try active.raft_driver.checkFailure();
+                try active.control_driver.checkFailure();
+            };
+            printBuilderRouteState(alloc, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, current.name, current.group_id);
+        }
+        return err;
+    };
     if (lost_replies) {
         var absent = try request(alloc, transport, &headers, base, "/db/v1/tables/nodes/documents/during-fence", .GET, null);
         defer absent.deinit(alloc);
@@ -1717,7 +1728,16 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     // Readiness is a distributed, epoch-fenced coverage fact, not merely a
     // successful point read. Wait only on the read-only public status route;
     // an unavailable write must never be replayed to probe activation.
-    try awaitConstraintCoverage(alloc, io, transport, &headers, restarted_base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+    awaitConstraintCoverage(alloc, io, transport, &headers, restarted_base, &.{ &meta_raft, &meta_control, &data_raft, &data_control }) catch |err| {
+        if (leader_transfer) {
+            for (peers) |peer| if (peer) |active| {
+                try active.raft_driver.checkFailure();
+                try active.control_driver.checkFailure();
+            };
+            printBuilderRouteState(alloc, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, restarted_physical.name, restarted_physical.group_id);
+        }
+        return err;
+    };
     if (leader_transfer) {
         // The restarted endpoint may forward the final write to either
         // voter. Verify every current owner can serve a linearizable read

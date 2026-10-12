@@ -17,15 +17,15 @@ const std = @import("std");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 pub const marker_file_name = "ANTFLY_FORMAT";
-pub const current_storage_format: u32 = 1;
+pub const current_storage_format: u32 = 2;
 
 const marker_contents =
     \\{
     \\  "product": "antfly",
     \\  "engine": "zig",
-    \\  "storage_format": 1,
-    \\  "min_reader_storage_format": 1,
-    \\  "migration": "Go runtime data directories are not opened in place; use portable backup and restore to migrate."
+    \\  "storage_format": 2,
+    \\  "min_reader_storage_format": 2,
+    \\  "migration": "v0.2.1+ server data is upgraded automatically. This directory now requires v0.3; rollback requires a pre-upgrade backup. Go runtime directories require portable backup and restore."
     \\}
     \\
 ;
@@ -50,7 +50,11 @@ pub fn ensureCompatible(alloc: std.mem.Allocator, io: std.Io, data_dir: []const 
     defer alloc.free(marker_path);
 
     if (pathExists(io, marker_path)) {
-        try validateMarker(alloc, io, marker_path);
+        const format = try validateMarker(alloc, io, marker_path);
+        if (format < current_storage_format) {
+            std.log.warn("upgrading Antfly data directory to storage format {d}: {s}; v0.2 rollback requires a pre-upgrade backup", .{ current_storage_format, data_dir });
+            try writeMarkerAtomically(alloc, io, marker_path);
+        }
         return;
     }
 
@@ -63,7 +67,7 @@ pub fn ensureCompatible(alloc: std.mem.Allocator, io: std.Io, data_dir: []const 
     try writeMarkerAtomically(alloc, io, marker_path);
 }
 
-fn validateMarker(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8) !void {
+fn validateMarker(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8) !u32 {
     const raw = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(16 * 1024)) catch |err| {
         std.debug.print("failed to read Antfly data-dir format marker {s}: {}\n", .{ marker_path, err });
         return err;
@@ -96,6 +100,8 @@ fn validateMarker(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8)
         return Error.IncompatibleAntflyDataDir;
     }
 
+    if (marker.storage_format == 0 or marker.min_reader_storage_format == 0) return Error.InvalidAntflyFormatMarker;
+
     if (marker.storage_format > current_storage_format or marker.min_reader_storage_format > current_storage_format) {
         std.debug.print(
             \\unsupported Antfly data directory format: {s}
@@ -106,6 +112,7 @@ fn validateMarker(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8)
         , .{ marker_path, current_storage_format, marker.storage_format });
         return Error.UnsupportedAntflyDataFormat;
     }
+    return marker.storage_format;
 }
 
 fn looksLikeLegacyGoDataDir(alloc: std.mem.Allocator, io: std.Io, data_dir: []const u8) !bool {
@@ -150,13 +157,14 @@ fn writeMarkerAtomically(alloc: std.mem.Allocator, io: std.Io, marker_path: []co
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(marker_contents);
         try writer.end();
+        try file.sync(io);
     }
 
     std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), marker_path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        if (pathExists(io, marker_path)) return;
         return err;
     };
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(marker_path) orelse ".");
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
@@ -290,10 +298,39 @@ test "ensureCompatible rejects newer storage format" {
         var buf: [256]u8 = undefined;
         var writer = file.writer(io_impl.io(), &buf);
         try writer.interface.writeAll(
-            \\{"product":"antfly","engine":"zig","storage_format":2,"min_reader_storage_format":2}
+            \\{"product":"antfly","engine":"zig","storage_format":99,"min_reader_storage_format":99}
         );
         try writer.end();
     }
 
     try std.testing.expectError(Error.UnsupportedAntflyDataFormat, ensureCompatible(alloc, io_impl.io(), data_dir));
+}
+
+test "ensureCompatible upgrades released v02 marker and preserves future marker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer alloc.free(data_dir);
+    const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
+    defer alloc.free(marker_path);
+    const io = std.testing.io;
+    try fs_paths.createDirPathPortable(io, data_dir);
+    const released = "{\"product\":\"antfly\",\"engine\":\"zig\",\"storage_format\":1,\"min_reader_storage_format\":1}";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = released });
+    try ensureCompatible(alloc, io, data_dir);
+    try std.testing.expectEqual(current_storage_format, try validateMarker(alloc, io, marker_path));
+    const upgraded = try std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(16384));
+    defer alloc.free(upgraded);
+    try std.testing.expectEqualStrings(marker_contents, upgraded);
+    try ensureCompatible(alloc, io, data_dir);
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(16384));
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, upgraded, after);
+    const future = "{\"product\":\"antfly\",\"engine\":\"zig\",\"storage_format\":99,\"min_reader_storage_format\":99}";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = future });
+    try std.testing.expectError(Error.UnsupportedAntflyDataFormat, ensureCompatible(alloc, io, data_dir));
+    const rejected = try std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(16384));
+    defer alloc.free(rejected);
+    try std.testing.expectEqualStrings(future, rejected);
 }

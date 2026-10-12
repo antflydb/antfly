@@ -58,6 +58,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     const lite = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_module,
+        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(shared.target.result),
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const install_lite = b.addInstallArtifact(lite, .{});
