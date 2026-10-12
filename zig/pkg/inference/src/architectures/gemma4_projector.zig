@@ -1033,6 +1033,11 @@ fn prepareAudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel_bins: 
         mask[frame] = frame_end >= pad_left and frame_end < pad_left + real_samples;
     }
     var prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins };
+    // The two stride-two subsampling layers retain every fourth mask row.
+    // Padded frames alone do not guarantee any usable projected audio tokens.
+    // Reject these clips before GPU execution so preparation can attribute the
+    // error to one item rather than aborting its entire encoder cohort.
+    if (prepared.tokenCount() == 0) return error.EmptyEmbeddingInput;
     if (pack_gpu and frames > 0) {
         prepared.packed_frames = try allocator.alloc(f32, frames * frame_length);
         errdefer allocator.free(prepared.packed_frames);
@@ -4756,6 +4761,34 @@ test "gemma4 prepared audio preserves encoded PCM geometry and drains allocation
             try std.testing.expectEqualSlices(f32, encoded.packed_frames, pcm.packed_frames);
             try std.testing.expectEqualSlices(f32, encoded.basis, pcm.basis);
             try std.testing.expectError(error.UnsupportedAudioFormat, prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 0 }));
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "gemma4 prepared audio rejects empty subsampled masks and preserves the first usable token" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const samples: [161]f32 = @splat(0.1);
+            for ([_]usize{ 128, 129, 160, 161 }) |length| {
+                const bytes = try audio.wav.encodeInterleaved(a, samples[0..length], 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+                defer a.free(bytes);
+                for ([_]bool{ false, true }) |encoded| {
+                    var prepared = (if (encoded)
+                        prepareEmbeddingGemma2Audio(a, bytes, .{})
+                    else
+                        prepareEmbeddingGemma2AudioPcm(a, .{ .samples = samples[0..length], .sample_rate = 16000 })) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expectEqual(error.EmptyEmbeddingInput, err);
+                        try std.testing.expect(length <= 160);
+                        continue;
+                    };
+                    defer prepared.deinit();
+                    try std.testing.expectEqual(@as(usize, 161), length);
+                    try std.testing.expectEqual(@as(usize, 1), prepared.tokenCount());
+                }
+            }
         }
     };
     try Runner.run(std.testing.allocator);

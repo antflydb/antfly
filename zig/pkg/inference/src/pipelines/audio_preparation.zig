@@ -232,4 +232,34 @@ test "audio preparation producer drains cancellation pressure and indexed codec 
     try std.testing.expect(errors[1] == null);
     valid.deinit();
     try std.testing.expectEqual(@as(usize, 0), valid.bounded.live);
+
+    const tiny_samples: [160]f32 = @splat(0.1);
+    const tiny_bytes = try audio.wav.encodeInterleaved(std.testing.allocator, &tiny_samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer std.testing.allocator.free(tiny_bytes);
+    const mixed_clips = [_]Clip{
+        .{ .pcm = .{ .samples = &tiny_samples, .sample_rate = 16000 } },
+        clips[1],
+        .{ .bytes = tiny_bytes },
+    };
+    var mixed_errors: [3]?anyerror = @splat(null);
+    var mixed = Wave.init(session, &mixed_clips, &mixed_errors, .{}, .gemma4, 64 * 1024 * 1024);
+    mixed.bounded.backing = std.testing.allocator;
+    defer mixed.deinit();
+    _ = mixed.start();
+    mixed.join();
+    try std.testing.expect(mixed.failure == null);
+    try std.testing.expectEqual(@as(usize, 3), mixed.consumed);
+    try std.testing.expectEqual(@as(usize, 1), mixed.retained);
+    try std.testing.expectEqual(@as(usize, 1), mixed.indexes[0]);
+    try std.testing.expect(mixed.gemma[0].tokenCount() > 0);
+    try std.testing.expectEqual(error.EmptyEmbeddingInput, mixed_errors[0].?);
+    try std.testing.expect(mixed_errors[1] == null);
+    try std.testing.expectEqual(error.EmptyEmbeddingInput, mixed_errors[2].?);
+
+    var fail_fast = Wave.init(session, mixed_clips[0..1], null, .{}, .gemma4, 64 * 1024 * 1024);
+    fail_fast.bounded.backing = std.testing.allocator;
+    defer fail_fast.deinit();
+    fail_fast.run();
+    try std.testing.expectEqual(error.EmptyEmbeddingInput, fail_fast.failure.?);
+    try std.testing.expectEqual(@as(usize, 0), fail_fast.bounded.live);
 }
