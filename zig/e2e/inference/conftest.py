@@ -570,7 +570,7 @@ def base_url():
     allowed_backend_exceptions: set[tuple[str, str]] = set()
     if required_backend is not None:
         required_backend = required_backend.strip().lower()
-        supported_backends = {"cuda", "metal", "native", "onnx", "pjrt", "wasm"}
+        supported_backends = {"cuda", "metal", "native", "pjrt", "wasm"}
         if required_backend not in supported_backends:
             raise pytest.UsageError(
                 "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND must be one of "

@@ -13705,7 +13705,7 @@ export interface components {
             provider: "antfly";
             /**
              * @description The name of the generator model.
-             * @example onnxruntime/Gemma-3-ONNX
+             * @example ggml-org/gemma-4-E4B-it-GGUF
              */
             model: string;
             /**
@@ -19535,7 +19535,7 @@ export interface components {
             presence_penalty?: number;
             /**
              * @description Structured output control. OpenAI-compatible entry point for requesting JSON output.
-             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
              */
             response_format?: components["schemas"]["InferenceGenerateResponseFormat"];
             /**
@@ -19802,7 +19802,7 @@ export interface components {
          *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
          */
-        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        InferenceModelBackend: "auto" | "native" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
         /**
          * @description Optional artifact format preference for loading a model.
          * @enum {string}
@@ -19824,7 +19824,6 @@ export interface components {
          *
          *     Backends:
          *     - `native` - Native CPU backend
-         *     - `onnx` - ONNX Runtime backend
          *     - `metal` - Apple Metal backend
          *     - `cuda` - NVIDIA CUDA backend
          *     - `xla` - PJRT/XLA compiled backend
@@ -20087,11 +20086,6 @@ export interface components {
              * @example true
              */
             native?: boolean;
-            /**
-             * @description Whether the ONNX Runtime backend is built into this runtime
-             * @example false
-             */
-            onnx?: boolean;
             /**
              * @description Whether the Metal backend is built into this runtime
              * @example true

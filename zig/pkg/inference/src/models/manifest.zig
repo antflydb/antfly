@@ -3598,7 +3598,7 @@ fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
 
 fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
     if (try shouldUseClipclapGgufVariant(catalog)) return true;
-    if (build_options.enable_cuda and !build_options.enable_onnx) {
+    if (build_options.enable_cuda) {
         return try catalog.exists("antfly_inference_variants.json");
     }
     return false;

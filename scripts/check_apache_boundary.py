@@ -65,8 +65,6 @@ PACKAGE_ENTRYPOINTS = (
 SOURCE_MODULES = {
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
-    "onnx_c": ("zig/pkg/inference/src/backends/onnx_c.h",),
-    "ortgenai_c": ("zig/pkg/inference/src/backends/ortgenai_c.h",),
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),

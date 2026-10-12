@@ -36,7 +36,7 @@
     "No measured reduction in peak live heap. Single-record-per-document replay timing is variable; do not claim zero overhead.",
     "Text/algebraic replay timing uses a validating consumer and excludes downstream document parsing/indexing. Graph and full-document throughput have not been benchmarked; real-body correctness is checked separately by database integration fixtures."
   ],
-  "build_command": "python3 tools/run_bounded_zig_build.py --max-rss-cap 15032385536 -- build replay-allocation-test replay-document-integration-test vector-payload-test replay-allocation-bench vector-payload-bench -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -j1 --summary all",
+  "build_command": "python3 tools/run_bounded_zig_build.py --max-rss-cap 15032385536 -- build replay-allocation-test replay-document-integration-test vector-payload-test replay-allocation-bench vector-payload-bench -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -j1 --summary all",
   "summary": {
     "replay-256-budgeted": {
       "elapsed_ns": {
