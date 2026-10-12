@@ -1003,15 +1003,9 @@ const Execution = struct {
             }
         }
     };
-    fn openOrderedTextCandidates(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
-        const self = from(raw);
+    fn orderedTextScan(self: *Execution, a: A, req: types.SearchRequest) !?local.sql_catalog.Scan {
         if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
-        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
-        var arena = std.heap.ArenaAllocator.init(a);
-        var keep_arena = false;
-        defer if (!keep_arena) arena.deinit();
-        const ca = arena.allocator();
-        const orders = try ca.alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
+        const orders = try a.alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
         for (orders, req.order_by[0..orders.len]) |*order, field| {
             const column = for (self.table.columns) |column| {
                 if (std.mem.eql(u8, column.name, field.field)) break column;
@@ -1022,12 +1016,12 @@ const Execution = struct {
         const sql_rows = @import("lake_index_sql_rows.zig");
         var conditions: std.ArrayList(local.sql_catalog.Condition) = .empty;
         if (req.filter_query_json.len != 0) {
-            const parsed = try std.json.parseFromSlice(std.json.Value, ca, req.filter_query_json, .{});
-            const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{});
+            const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(a, parsed.value);
             var required: std.ArrayList(local.sql_catalog.Condition) = .empty;
-            try @import("lake_index_text_predicate.zig").requiredConditions(ca, compiled, &required, 0);
+            try @import("lake_index_text_predicate.zig").requiredConditions(a, compiled, &required, 0);
             for (required.items) |condition| {
-                if (try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) try conditions.append(ca, condition);
+                if (try sql_rows.compatibleSearchConditions(a, self.table, &.{condition})) try conditions.append(a, condition);
             }
         }
         // Seek inclusively on the leading field. Public IDs break ties in the
@@ -1036,15 +1030,29 @@ const Execution = struct {
             const bound = if (req.search_before.len != 0) req.search_before[0] else req.search_after[0];
             if (bound == .null) return null;
             const kind = (try self.table.column(orders[0].column)).type;
-            const normalized = local.sql_lake_values.comparisonValue(ca, bound, kind) catch |err| switch (err) {
+            const normalized = local.sql_lake_values.comparisonValue(a, bound, kind) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return null,
             };
             const condition: local.sql_catalog.Condition = .{ .column = orders[0].column, .op = if (orders[0].descending != (req.search_before.len != 0)) .lte else .gte, .value = normalized };
-            if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
-            try conditions.append(ca, condition);
+            if (!try sql_rows.compatibleSearchConditions(a, self.table, &.{condition})) return null;
+            try conditions.append(a, condition);
         }
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        return .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit };
+    }
+    fn openOrderedTextCandidates(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
+        const self = from(raw);
+        // Window admission owns only a subset of native ordinals. A global
+        // ordered index would rescan its prefix for each window; collect that
+        // window with native doc values instead.
+        if (self.forced_selection != null) return null;
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(a);
+        var keep_arena = false;
+        defer if (!keep_arena) arena.deinit();
+        const scan = (try self.orderedTextScan(arena.allocator(), req)) orelse return null;
+        const sql_rows = @import("lake_index_sql_rows.zig");
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
         owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };
@@ -1066,12 +1074,13 @@ const Execution = struct {
     // Broad score queries stream immutable routing windows. Every window uses
     // the publication's collection statistics and global term frequencies;
     // only admission/doc ordinals are local. Source hydration remains after
-    // final top-K movement. Other request shapes retain their existing planner.
+    // final top-K movement. Metadata filters, typed ordering/cursors and
+    // highlights share the same bounded coordinator; source-dependent ranking
+    // and composed retrieval keep their existing planner.
     fn pagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
         if (self.forced_selection != null or !self.typed_delivery or self.overlay != null or
-            req.profile or req.highlight != null or req.order_by.len != 0 or
-            req.search_after.len != 0 or req.search_before.len != 0 or
-            req.filter_text != null or req.exclusion_text != null or requiresEncodedSource(req) or
+            req.profile or
+            req.filter_text != null or req.exclusion_text != null or requiresEarlySource(req) or
             req.filter_prefix.len != 0 or req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
             req.filter_doc_ids.len != 0 or req.filter_doc_ids_positive or req.exclude_doc_ids.len != 0 or
             req.resolved_doc_filter != null or req.resolved_text_doc_filter != null or req.native_key_predicate != null or
@@ -1112,15 +1121,52 @@ const Execution = struct {
         if (subset) |ids| if (ids.len <= 64 or ids.len < root.segment_count / 2) return null;
         var reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
         defer reader.deinit();
-        var winners = PagedWinners.init(a, if (req.count_only) 0 else @as(usize, req.offset) + req.limit);
+        var schema_ = try local.schema_mod.parseValidatedTableSchema(self.arena, self.schema_json);
+        defer schema_.deinit(self.arena);
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(self.arena, schema_);
+        var ordering: ?local.storage_db_query_search_exec.SearchHitOrder = if (req.order_by.len != 0 or req.search_after.len != 0 or req.search_before.len != 0)
+            try .init(a, req, runtime)
+        else
+            null;
+        defer if (ordering) |*order| order.deinit(a);
+        if (ordering) |order| {
+            // An ordered row index can stop after the winning prefix. Retain
+            // that global seek instead of scanning every window's doc values.
+            _ = plan.reset(.retain_capacity);
+            const scan = self.orderedTextScan(plan.allocator(), order.effective.req) catch |err| switch (err) {
+                error.OutOfMemory => return null,
+                else => return err,
+            };
+            if (scan) |candidate| {
+                const compatible = @import("lake_index_sql_rows.zig").hasOrderedPredicatePlan(plan.allocator(), self.table, candidate) catch |err| switch (err) {
+                    error.OutOfMemory => return null,
+                    else => return err,
+                };
+                if (compatible) return null;
+            }
+        }
+        // Highlight planning needs analysis/schema, not an admitted corpus.
+        // Keep that small metadata in the request arena so final hydration never
+        // reacquires every segment after the bounded search has completed.
+        if (req.highlight != null and self.highlight_queries == null) {
+            const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{ .allocate = .alloc_always });
+            const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
+            const queries = try self.arena.alloc(search.HighlightQuery, 1);
+            queries[0] = .{ .query = text, .text_analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime), .runtime_schema = runtime, .selected_field = field };
+            self.highlight_queries = queries;
+        }
+        var winners = PagedWinners.initOrdered(a, if (req.count_only) 0 else @as(usize, req.offset) + req.limit, if (ordering) |*order| order else null);
         defer winners.deinit();
         var total: u32 = 0;
         var relation: types.TotalHitsRelation = .exact;
         var ids: [64][32]u8 = undefined;
-        while (try reader.next(&ids)) |window| {
+        // Reuse the region even when the caller is itself an arena: freeing a
+        // fresh child region per window would retain every window in its parent.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        while (try reader.nextBounded(&ids, 32 * 1024 * 1024)) |window| {
             try self.context.ensureActive();
-            var scratch = std.heap.ArenaAllocator.init(a);
-            defer scratch.deinit();
+            _ = scratch.reset(.retain_capacity);
             const wa = scratch.allocator();
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities };
             defer child.deinit();
@@ -1128,6 +1174,8 @@ const Execution = struct {
             request.offset = 0;
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
+            request.highlight = null;
+            if (ordering == null and !req.count_only) request.minimum_competitive_score = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
             if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
@@ -1137,7 +1185,7 @@ const Execution = struct {
                 try winners.add(hit, ordinal);
             }
         }
-        return .{ .alloc = a, .hits = try winners.finish(req.offset), .total_hits = total, .total_hits_relation = relation };
+        return .{ .alloc = a, .hits = try winners.finish(req.offset), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
@@ -2282,16 +2330,27 @@ const PagedWinners = struct {
     const Winner = struct {
         hit: types.SearchHit,
         ordinal: u64,
-        fn worst(_: void, l: Winner, r: Winner) std.math.Order {
+        fn worst(ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder, l: Winner, r: Winner) std.math.Order {
+            if (ordering) |typed| {
+                const compared = typed.compare(l.hit, r.hit);
+                return if (typed.effective.req.search_before.len != 0) compared else compared.invert();
+            }
             const order = std.math.order(l.hit.score orelse 0, r.hit.score orelse 0);
             return if (order == .eq) std.math.order(r.ordinal, l.ordinal) else order;
         }
     };
     a: A,
     limit: usize,
-    heap: std.PriorityQueue(Winner, void, Winner.worst) = .initContext({}),
+    heap: std.PriorityQueue(Winner, ?*const local.storage_db_query_search_exec.SearchHitOrder, Winner.worst) = .initContext(null),
     fn init(a: A, limit: usize) PagedWinners {
-        return .{ .a = a, .limit = limit };
+        return initOrdered(a, limit, null);
+    }
+    fn initOrdered(a: A, limit: usize, ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder) PagedWinners {
+        return .{ .a = a, .limit = limit, .heap = .initContext(ordering) };
+    }
+    fn cutoff(self: *const PagedWinners) ?f32 {
+        if (self.limit == 0 or self.heap.items.len < self.limit or self.heap.context != null) return null;
+        return self.heap.peek().?.hit.score orelse 0;
     }
     fn deinit(self: *PagedWinners) void {
         while (self.heap.pop()) |entry| {
@@ -2303,8 +2362,9 @@ const PagedWinners = struct {
     fn add(self: *PagedWinners, hit: types.SearchHit, ordinal: u64) !void {
         if (self.limit == 0) return;
         if (!std.math.isFinite(hit.score orelse 0)) return error.InvalidNativeLakeTextCorpus;
+        if (self.heap.context) |order| try order.validate(hit);
         const candidate: Winner = .{ .hit = hit, .ordinal = ordinal };
-        if (self.heap.items.len == self.limit and Winner.worst({}, candidate, self.heap.peek().?) != .gt) return;
+        if (self.heap.items.len == self.limit and Winner.worst(self.heap.context, candidate, self.heap.peek().?) != .gt) return;
         var owned = try hit.clone(self.a);
         errdefer owned.deinit(self.a);
         // Window-local identities cannot outlive the admission pin. Final
@@ -2330,6 +2390,7 @@ const PagedWinners = struct {
                 hit.deinit(self.a);
             } else hits[remaining - skip] = entry.hit;
         }
+        if (self.heap.context) |order| if (order.effective.req.search_before.len != 0) std.mem.reverse(types.SearchHit, hits);
         return hits;
     }
 };
@@ -2356,4 +2417,27 @@ test "external lake paged native text winners retain global ties and offset acro
     try std.testing.expectEqualStrings("x", hits[1].id);
     try std.testing.expect(hits[0].native_text_doc_id == null);
     try std.testing.expectEqual(@as(usize, 0), heap.heap.items.len);
+}
+
+test "external lake paged native text winners share typed ordering and backward cursor direction" {
+    const a = std.testing.allocator;
+    const fields = [_]types.SortField{.{ .field = "_id" }};
+    const bound = [_]std.json.Value{.{ .string = "d" }};
+    for ([_]bool{ false, true }) |backward| {
+        var order = try local.storage_db_query_search_exec.SearchHitOrder.init(a, .{ .order_by = &fields, .search_before = if (backward) &bound else &.{} }, null);
+        defer order.deinit(a);
+        var heap = PagedWinners.initOrdered(a, 2, &order);
+        defer heap.deinit();
+        for ([_][]const u8{ "b", "c", "a" }, 0..) |id, ordinal| {
+            const values = [_]std.json.Value{.{ .string = id }};
+            try heap.add(.{ .id = @constCast(id), .score = 1, .sort_values = @constCast(&values) }, ordinal);
+        }
+        const hits = try heap.finish(0);
+        defer a.free(hits);
+        defer for (hits) |*hit| hit.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        try std.testing.expectEqualStrings(if (backward) "b" else "a", hits[0].id);
+        try std.testing.expectEqualStrings(if (backward) "c" else "b", hits[1].id);
+        try std.testing.expect(heap.cutoff() == null);
+    }
 }

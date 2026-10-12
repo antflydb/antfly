@@ -140,7 +140,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         plan: Plan,
         arena: std.heap.ArenaAllocator,
         probe_arena: std.heap.ArenaAllocator,
-        probe_groups: ?*operators.Grouped = null,
+        probe_groups: ?*Collected = null,
         build_side: u1 = 1,
         build: ?*operators.HashJoin = null,
         partitions: ?*@import("partition_join.zig").Join = null,
@@ -167,19 +167,48 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.arena.deinit();
             self.a.destroy(self);
         }
-        fn collectLane(group: *operators.Grouped, keys: []const Batch, inputs: []const Batch, first: usize, end: usize, ordinal: u64) anyerror!void {
+        /// Key partitions own disjoint groups. The join consumes their typed
+        /// states directly instead of copying every key into a serial reducer.
+        /// Keep the locked allocator in this stable owner until all lanes close.
+        const Collected = struct {
+            backing: A,
+            locked: @import("parallel_scheduler.zig").LockedAllocator,
+            groups: [4]?*operators.Grouped = @splat(null),
+            position: usize = 0,
+            fn deinit(self: *@This()) void {
+                for (self.groups) |group| if (group) |owned| owned.deinit();
+                self.backing.destroy(self);
+            }
+            fn nextTypedPartialResult(self: *@This(), a_: A) !?operators.GroupResult {
+                while (self.position < self.groups.len) {
+                    if (self.groups[self.position]) |group| if (try group.nextTypedPartialResult(a_)) |partial| return partial;
+                    self.position += 1;
+                }
+                return null;
+            }
+            fn groupCount(self: *const @This()) usize {
+                var count: usize = 0;
+                for (self.groups) |group| if (group) |owned| {
+                    count +|= owned.groupCount();
+                };
+                return count;
+            }
+        };
+        fn collectLane(group: *operators.Grouped, keys: []const Batch, inputs: []const Batch, selection: []const usize, hashes: []const ?u64, ordinal: u64) anyerror!void {
             var scratch = std.heap.ArenaAllocator.init(group.backing);
             defer scratch.deinit();
             const lane_alloc = scratch.allocator();
-            const selection = try lane_alloc.alloc(usize, end - first);
-            for (selection, first..) |*index, position| index.* = position;
             const local_keys = try lane_alloc.alloc(Batch, keys.len);
             const local_inputs = try lane_alloc.alloc(Batch, inputs.len);
             for (keys, local_keys) |*column, *out| out.* = try column.select(lane_alloc, selection);
             for (inputs, local_inputs) |*column, *out| out.* = try column.select(lane_alloc, selection);
-            // Preserve source ordinals across lanes and successive batches.
-            group.rows_seen = ordinal + first;
-            try group.addEncodedColumns(local_keys, local_inputs, end - first);
+            const ordinals = try lane_alloc.alloc(u64, selection.len);
+            const selected_hashes = try lane_alloc.alloc(?u64, selection.len);
+            for (selection, ordinals, selected_hashes) |index, *out, *hash| {
+                out.* = try std.math.add(u64, ordinal, index);
+                hash.* = hashes[index];
+            }
+            try group.addEncodedColumnsIdentified(local_keys, local_inputs, selection.len, .{ .ordinals = ordinals, .hashes = selected_hashes });
         }
         fn parallelReducers(specs: []const operators.AggregateSpec) bool {
             for (specs) |spec| {
@@ -197,22 +226,23 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             }
             return true;
         }
-        fn collect(self: *@This(), side: u1) !*operators.Grouped {
+        fn collect(self: *@This(), side: u1) !*Collected {
             const context = self.engine.context;
             const owned = self.arena.allocator();
             const specs = try owned.alloc(operators.AggregateSpec, self.side_inputs[side].len + 1);
             specs[0] = .{ .kind = .count };
             for (self.side_inputs[side], specs[1..]) |input, *spec| spec.* = self.plan.recipe.inputs[input].spec;
-            const grouped = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
-            errdefer grouped.deinit();
+            const collected = try self.a.create(Collected);
+            collected.* = .{ .backing = self.a, .locked = .{ .backing = self.a } };
+            errdefer collected.deinit();
+            const grouped = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
+            collected.groups[0] = grouped;
             const child = if ((side == 0) != self.iterator.flipped_join) self.iterator.left.? else self.iterator.right.?;
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             const scheduler = @import("parallel_scheduler.zig");
-            var locked: scheduler.LockedAllocator = .{ .backing = self.a };
-            var lanes: [4]?*operators.Grouped = @splat(null);
+            const lanes = &collected.groups;
             var lane_count: usize = 0;
-            defer for (lanes) |lane| if (lane) |group| group.deinit();
             var parallel_keys = true;
             for (self.plan.keys[side]) |column| switch (child.node.columns[column].type) {
                 .integer, .string, .boolean, .datetime => {},
@@ -237,16 +267,33 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 @memset(inputs, .{ .dictionary = .{ .values = one, .indices = ones } });
                 for (self.side_inputs[side], inputs[1..]) |input, *value| value.* = try source.project(temporary, self.plan.inputs[input].?.column);
                 const io = context.backend.execution_io;
-                if (lane_count == 0 and io != null and batch.len() >= 256 and parallel_keys and parallelReducers(specs)) {
+                if (ordinal == 0 and lane_count == 0 and io != null and batch.len() >= 256 and parallel_keys and parallelReducers(specs)) {
                     const requested = @min(4, scheduler.global().fanout(@min(4, batch.len() / 128), context.limits.retained_bytes / 4, 1024 * 1024));
                     if (requested > 1) {
-                        for (lanes[0..requested]) |*lane| lane.* = try operators.Grouped.create(locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4 / (requested + 1), .spill = context.spill });
+                        // Choose fixed ownership before consuming the first page.
+                        for (lanes[1..requested]) |*lane| lane.* = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4 / requested, .spill = context.spill });
+                        grouped.limits.bytes = context.limits.retained_bytes / 4 / requested;
+                        grouped.budget.limit = grouped.limits.bytes;
                         lane_count = requested;
                     }
                 }
                 if (lane_count == 0) {
                     try grouped.addEncodedColumns(keys, inputs, batch.len());
                 } else {
+                    // Hash once and scatter stable row selections. Equal SQL
+                    // keys always reach one owner, across every input page.
+                    const hashes = try @import("batch_hash.zig").encodedColumns(temporary, keys, batch.len(), true);
+                    var counts: [4]usize = @splat(0);
+                    for (hashes) |hash| counts[@intCast(hash.? % lane_count)] += 1;
+                    const selected = try temporary.alloc(usize, batch.len());
+                    var starts: [5]usize = @splat(0);
+                    for (0..lane_count) |lane| starts[lane + 1] = starts[lane] + counts[lane];
+                    var positions = starts;
+                    for (hashes, 0..) |hash, index| {
+                        const lane: usize = @intCast(hash.? % lane_count);
+                        selected[positions[lane]] = index;
+                        positions[lane] += 1;
+                    }
                     var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
                     // Join every lane while the borrowed input page is alive,
                     // including submission failures and canceled/error paths.
@@ -254,12 +301,11 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                         task.cancel(io.?) catch {};
                     };
                     for (1..lane_count) |lane| {
-                        const first = batch.len() * lane / lane_count;
-                        const end = batch.len() * (lane + 1) / lane_count;
-                        tasks[lane - 1] = scheduler.global().submit(io.?, lanes[lane].?.limits.bytes, collectLane, .{ lanes[lane].?, keys, inputs, first, end, ordinal });
-                        if (tasks[lane - 1] == null) try collectLane(lanes[lane].?, keys, inputs, first, end, ordinal);
+                        const selection = selected[starts[lane]..starts[lane + 1]];
+                        tasks[lane - 1] = scheduler.global().submit(io.?, lanes[lane].?.limits.bytes, collectLane, .{ lanes[lane].?, keys, inputs, selection, hashes, ordinal });
+                        if (tasks[lane - 1] == null) try collectLane(lanes[lane].?, keys, inputs, selection, hashes, ordinal);
                     }
-                    try collectLane(lanes[0].?, keys, inputs, 0, batch.len() / lane_count, ordinal);
+                    try collectLane(lanes[0].?, keys, inputs, selected[0..starts[1]], hashes, ordinal);
                     for (&tasks) |*slot| if (slot.*) |*task| {
                         var owned_task = task.*;
                         slot.* = null;
@@ -268,15 +314,9 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 }
                 ordinal += batch.len();
             }
-            // Lanes retain compact typed state across pages, then merge once.
-            // Importing directly supports the target's ordinary spill path.
-            for (lanes[0..lane_count]) |lane| while (true) {
-                _ = scratch.reset(.free_all);
-                const partial = try lane.?.nextTypedPartialResult(scratch.allocator()) orelse break;
-                try grouped.importTypedPartialMapped(partial.keys, partial.typed_states.?, null, partial.ordinal);
-            };
-            return grouped;
+            return collected;
         }
+
         fn prepare(self: *@This()) !void {
             // Match the row executor's cost-based orientation and install its
             // bounded scan filter before pulling any probe rows.

@@ -338,55 +338,6 @@ pub const JsonApiClient = struct {
         };
     }
 
-    fn validateImmutableUntil(self: *JsonApiClient, bucket: []const u8, until_ms: u64, token: ?types.CancellationToken) !bool {
-        const began = platform.time.authorityNs();
-        const url = try bucketMetadataUrlAlloc(self.alloc, self.cfg, bucket);
-        defer self.alloc.free(url);
-        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, 64 * 1024, token);
-        defer response.deinit(self.alloc);
-        if (response.status != 200) return false;
-        const Policy = struct { retentionPolicy: ?struct { isLocked: bool = false, retentionPeriod: ?[]const u8 = null } = null };
-        var parsed = try std.json.parseFromSlice(Policy, self.alloc, response.body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        const policy = parsed.value.retentionPolicy orelse return false;
-        if (!policy.isLocked or policy.retentionPeriod == null or (std.fmt.parseUnsigned(u64, policy.retentionPeriod.?, 10) catch 0) == 0) return false;
-        // Provider time, plus elapsed processing and a precision margin. Local
-        // wall-clock rollback must never revive an expired durable certificate.
-        const now = @import("retention_time.zig").httpDate(response.server_date orelse return false) orelse return false;
-        const elapsed = (platform.time.authorityNs() -| began) / std.time.ns_per_ms;
-        return until_ms > now +| elapsed +| 60_000;
-    }
-    fn immutablePrefixUntil(self: *JsonApiClient, bucket: []const u8, prefix: []const u8, token: ?types.CancellationToken) !?u64 {
-        if (!try self.validateImmutableUntil(bucket, std.math.maxInt(u64), token)) return null;
-        var minimum: ?u64 = null;
-        var continuation: ?[]u8 = null;
-        defer if (continuation) |value| self.alloc.free(value);
-        while (true) {
-            var page = try self.listObjects(self.alloc, bucket, .{ .prefix = prefix, .recursive = true, .max_keys = 256, .continuation_token = continuation, .cancellation = token });
-            defer page.deinit(self.alloc);
-            for (page.entries) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidRetentionEvidence;
-                const until = entry.retention_until_ms orelse return null;
-                minimum = @min(minimum orelse until, until);
-            }
-            const next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
-            errdefer if (next) |value| self.alloc.free(value);
-            if (continuation != null and next != null and std.mem.eql(u8, continuation.?, next.?)) return error.InvalidContinuationToken;
-            if (continuation) |value| self.alloc.free(value);
-            continuation = next;
-            if (continuation == null) break;
-        }
-        const until = minimum orelse return null;
-        return if (try self.validateImmutableUntil(bucket, until, token)) until else null;
-    }
-    fn erasedImmutablePrefixUntil(raw: *anyopaque, bucket: []const u8, prefix: []const u8, token: ?types.CancellationToken) !?u64 {
-        const self: *JsonApiClient = @ptrCast(@alignCast(raw));
-        return self.immutablePrefixUntil(bucket, prefix, token);
-    }
-    fn erasedValidateImmutableUntil(raw: *anyopaque, bucket: []const u8, until_ms: u64, token: ?types.CancellationToken) !bool {
-        const self: *JsonApiClient = @ptrCast(@alignCast(raw));
-        return self.validateImmutableUntil(bucket, until_ms, token);
-    }
     fn makeBucket(self: *JsonApiClient, bucket: []const u8, opts: types.BucketOptions) !void {
         const project_id = self.cfg.project_id orelse return error.MissingProjectId;
         const url = try bucketCreateUrlAlloc(self.alloc, self.cfg, project_id);
@@ -974,8 +925,10 @@ pub const JsonApiClient = struct {
     }
 
     const vtable: client_mod.Client.VTable = .{
-        .immutable_prefix_until = erasedImmutablePrefixUntil,
-        .validate_immutable_until = erasedValidateImmutableUntil,
+        // Bucket/Object Retention protects generations, not live names.
+        // Artifact references must pin generations before this provider can
+        // supply immutable-name closure evidence (including after toggling
+        // bucket versioning). Keep complete audits authoritative meanwhile.
         .deinit = erasedDeinit,
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
@@ -2286,41 +2239,22 @@ fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8
     return error.MissingHeader;
 }
 
-test "gcs locked retention evidence uses provider time and declines incomplete or mutable prefixes" {
+test "gcs version retention never certifies live artifact names" {
     const a = std.testing.allocator;
     const State = struct {
-        locked: bool = true,
-        expiry: []const u8 = "2026-10-12T12:34:56Z",
-        date: ?[]const u8 = "Sun, 11 Oct 2026 12:34:56 GMT",
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, token: ?types.CancellationToken) !TransportResponse {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (token) |value| try value.check();
-            try std.testing.expectEqual(HttpMethod.GET, method);
-            const body = if (std.mem.indexOf(u8, url, "/o?") != null)
-                try std.fmt.allocPrint(alloc, "{{\"items\":[{{\"name\":\"graph/a/page\",\"size\":\"1\",\"retentionExpirationTime\":\"{s}\"}}]}}", .{self.expiry})
-            else
-                try std.fmt.allocPrint(alloc, "{{\"retentionPolicy\":{{\"isLocked\":{},\"retentionPeriod\":\"86400\"}}}}", .{self.locked});
-            return .{ .status = 200, .body = body, .server_date = if (self.date) |date| try alloc.dupe(u8, date) else null };
+        fn request(_: ?*anyopaque, _: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            // Declining this capability must not depend on today's bucket
+            // configuration: versioning can change after a certificate is made.
+            return error.UnexpectedRetentionRequest;
         }
     };
-    var state: State = .{};
     var config = try jsonApiConfigAlloc(a, "bucket");
     defer config.deinit(a);
     const cfg = config.json_api.?;
     config.json_api = null;
-    var provider = JsonApiClient.initWithRequestFn(a, cfg, &state, State.request);
+    var provider = JsonApiClient.initWithRequestFn(a, cfg, null, State.request);
     defer provider.deinit();
     var client = provider.client();
-    const until = (try client.immutablePrefixUntil("bucket", "graph/a/", null)).?;
-    try std.testing.expect(try client.validateImmutableUntil("bucket", until, null));
-    state.locked = false;
     try std.testing.expect((try client.immutablePrefixUntil("bucket", "graph/a/", null)) == null);
-    state.locked = true;
-    state.date = "Mon, 12 Oct 2026 12:34:56 GMT";
-    try std.testing.expect(!try client.validateImmutableUntil("bucket", until, null));
-    state.date = null;
-    try std.testing.expect(!try client.validateImmutableUntil("bucket", until, null));
-    state.date = "Sun, 11 Oct 2026 12:34:56 GMT";
-    state.expiry = "not a retention timestamp";
-    try std.testing.expect((try client.immutablePrefixUntil("bucket", "graph/a/", null)) == null);
+    try std.testing.expect(!try client.validateImmutableUntil("bucket", std.math.maxInt(u64), null));
 }

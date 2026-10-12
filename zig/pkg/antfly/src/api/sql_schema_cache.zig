@@ -22,16 +22,23 @@ const schema = @import("antfly_local_sources").schema_mod;
 const native_schema = @import("antfly_local_sources").storage_schema;
 const Budget = @import("antfly_local_sources").sql_memory_budget;
 
-const Entry = struct {
-    digest: [32]u8,
-    budget: Budget,
-    arena: std.heap.ArenaAllocator,
+const Layout = struct {
     version: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
     external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
     indexes: []const catalog.Index = &.{},
     constraints: []const catalog.Constraint = &.{},
+
+    fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
+        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .constraints = self.constraints };
+    }
+};
+const Entry = struct {
+    digest: [32]u8,
+    budget: Budget,
+    arena: std.heap.ArenaAllocator,
+    layout: Layout = .{},
     refs: usize = 0,
     used: u64 = 0,
 };
@@ -64,8 +71,23 @@ pub const Cache = struct {
         self.allocator.destroy(entry);
     }
     pub fn resolve(self: *Cache, io: std.Io, alloc: std.mem.Allocator, json: []const u8, id: u64, physical_name: []const u8) !catalog.Table {
-        if (json.len > entry_budget) return error.SqlLimitExceeded;
-        const entry = try self.acquire(io, json);
+        return self.resolveWithEntryLimit(io, alloc, json, id, physical_name, entry_budget);
+    }
+    fn resolveWithEntryLimit(self: *Cache, io: std.Io, alloc: std.mem.Allocator, json: []const u8, id: u64, physical_name: []const u8, requested_limit: usize) !catalog.Table {
+        const limit = @min(entry_budget, requested_limit);
+        const cached = if (json.len <= limit) self.acquire(io, alloc, json, limit) catch |err| switch (err) {
+            error.SchemaCacheEntryTooLarge => null,
+            else => return err,
+        } else null;
+        const entry = cached orelse {
+            // Cache admission is optional. The statement allocator remains the
+            // authority for layouts that exceed the compact retention budget.
+            try io.checkCancel();
+            var layout: Layout = .{};
+            try derive(&layout, json, alloc, alloc);
+            try io.checkCancel();
+            return layout.table(id, physical_name);
+        };
         defer {
             self.mutex.lockUncancelable(io);
             entry.refs -= 1;
@@ -73,26 +95,26 @@ pub const Cache = struct {
         }
         // Copy only compact immutable columns to the request arena. Schema JSON
         // parsing/validation and runtime schema derivation happen only on miss.
-        const columns = try alloc.alloc(catalog.Column, entry.columns.len);
-        for (entry.columns, columns) |column, *out| {
+        const columns = try alloc.alloc(catalog.Column, entry.layout.columns.len);
+        for (entry.layout.columns, columns) |column, *out| {
             out.* = column;
             out.name = try alloc.dupe(u8, column.name);
             out.path = try alloc.dupe(u8, column.path);
         }
-        const indexes = try alloc.alloc(catalog.Index, entry.indexes.len);
-        for (entry.indexes, indexes) |index, *out| {
+        const indexes = try alloc.alloc(catalog.Index, entry.layout.indexes.len);
+        for (entry.layout.indexes, indexes) |index, *out| {
             const names = try alloc.alloc([]const u8, index.columns.len);
             for (index.columns, names) |name, *copy| copy.* = try alloc.dupe(u8, name);
             out.* = .{ .name = try alloc.dupe(u8, index.name), .columns = names };
         }
-        const constraints = try alloc.alloc(catalog.Constraint, entry.constraints.len);
-        for (entry.constraints, constraints) |constraint, *out| {
+        const constraints = try alloc.alloc(catalog.Constraint, entry.layout.constraints.len);
+        for (entry.layout.constraints, constraints) |constraint, *out| {
             out.* = constraint;
             out.name = try alloc.dupe(u8, constraint.name);
         }
-        return .{ .external_base_source = if (entry.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
+        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
     }
-    fn acquire(self: *Cache, io: std.Io, json: []const u8) !*Entry {
+    fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
         try self.mutex.lock(io);
@@ -127,11 +149,11 @@ pub const Cache = struct {
         if (victim) |old| self.destroy(old);
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .digest = digest, .budget = .{ .backing = self.allocator, .limit = entry_budget }, .arena = undefined };
+        entry.* = .{ .digest = digest, .budget = .{ .backing = self.allocator, .limit = limit }, .arena = undefined };
         entry.arena = std.heap.ArenaAllocator.init(entry.budget.allocator());
         errdefer entry.arena.deinit();
-        derive(entry, json) catch |err| {
-            if (err == error.OutOfMemory and entry.budget.exhausted) return error.SqlLimitExceeded;
+        derive(&entry.layout, json, scratch, entry.arena.allocator()) catch |err| {
+            if (err == error.OutOfMemory and entry.budget.exhausted) return error.SchemaCacheEntryTooLarge;
             return err;
         };
         try io.checkCancel();
@@ -161,17 +183,18 @@ pub const Cache = struct {
     }
 };
 
-fn derive(entry: *Entry, json: []const u8) !void {
-    var scratch = std.heap.ArenaAllocator.init(entry.budget.allocator());
+fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned: std.mem.Allocator) !void {
+    // Parsing and runtime schema construction are statement work, not retained
+    // cache data. Never let their geometric arena growth consume a cache slot.
+    var scratch = std.heap.ArenaAllocator.init(temporary);
     defer scratch.deinit();
     const alloc = scratch.allocator();
-    const owned = entry.arena.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
-    entry.constraints = try catalog.Constraint.derive(owned, parsed);
+    layout.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {
-        entry.storage_mode = .document;
-        entry.version = parsed.version;
-        entry.columns = try @import("antfly_local_sources").sql_document_row.deriveColumns(owned, parsed);
+        layout.storage_mode = .document;
+        layout.version = parsed.version;
+        layout.columns = try @import("antfly_local_sources").sql_document_row.deriveColumns(owned, parsed);
         return;
     }
     const native = try schema.deriveRuntimeTableSchema(alloc, parsed);
@@ -208,10 +231,10 @@ fn derive(entry: *Entry, json: []const u8) !void {
             else => return error.UnsupportedSqlExecution,
         }),
     };
-    entry.columns = columns;
+    layout.columns = columns;
     if (native.external_base_source) |source| {
-        entry.external_base_source = try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(owned, source);
-        entry.version = native.version;
+        layout.external_base_source = try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(owned, source);
+        layout.version = native.version;
         return;
     }
     var indexes: std.ArrayList(catalog.Index) = .empty;
@@ -229,8 +252,8 @@ fn derive(entry: *Entry, json: []const u8) !void {
         if (!direct) continue;
         try indexes.append(owned, .{ .name = try owned.dupe(u8, index.name), .columns = names });
     };
-    entry.indexes = try indexes.toOwnedSlice(owned);
-    entry.version = native.version;
+    layout.indexes = try indexes.toOwnedSlice(owned);
+    layout.version = native.version;
 }
 
 test "SQL schema cache reuses immutable layouts without caching table identity" {
@@ -411,5 +434,62 @@ test "SQL schema cache preserves every declared scalar builtin width through DDL
         const column = try table.column(entry.name);
         try std.testing.expectEqual(entry.kind, column.element_type.?);
         try std.testing.expectEqual(entry.oid, column.element_type.?.oid());
+    }
+}
+
+test "external lake SQL schema cache declines oversized retained layouts without limiting statements" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var properties: std.json.ObjectMap = .empty;
+    const property = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"type\":\"integer\"}", .{});
+    for (0..64) |i| try properties.put(alloc, try std.fmt.allocPrint(alloc, "v{d}", .{i}), property);
+    const json = try std.json.Stringify.valueAlloc(alloc, .{ .storage_mode = "relational", .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = std.json.Value{ .object = properties }, .additionalProperties = false } } } }, .{});
+    try std.testing.expect(json.len < 2048);
+    for ([_]usize{ 128, 2048 }) |limit| {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        for (0..2) |_| {
+            const table = try cache.resolveWithEntryLimit(std.testing.io, alloc, json, 7, "wide", limit);
+            try std.testing.expectEqual(@as(usize, 64), table.columns.len);
+            try std.testing.expectEqual(@as(u64, 7), table.id);
+            try std.testing.expectEqual(@as(usize, 0), cache.builds);
+            for (cache.slots) |slot| try std.testing.expect(slot.entry == null and !slot.building);
+        }
+    }
+}
+
+test "external lake SQL schema cache separates wide source derivation scratch from retained data" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var properties: std.json.ObjectMap = .empty;
+    const property = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"type\":\"integer\"}", .{});
+    try properties.put(alloc, "k", property);
+    for (0..128) |i| try properties.put(alloc, try std.fmt.allocPrint(alloc, "v{d}", .{i}), property);
+    const path: [1024]u8 = @splat('a');
+    for ([_]usize{ 128, 1024 }) |length| {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        const uri = try std.fmt.allocPrint(alloc, "file:///lake/{s}", .{path[0..length]});
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .version = 0,
+            .storage_mode = "relational",
+            .base_source = .{ .kind = "external", .table_id = "wide-join", .format = "parquet", .uri = uri, .schema_fingerprint = "parquet-schema:a7513e16cfbb0a57e754f680c8a5694dc29b127c69ff3d0dd3e6990b174291d8" },
+            .default_type = "row",
+            .enforce_types = true,
+            .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = std.json.Value{ .object = properties }, .required = [_][]const u8{}, .additionalProperties = false } } },
+        }, .{});
+        const table = try cache.resolve(std.testing.io, alloc, json, 1, "wide");
+        try std.testing.expectEqual(@as(usize, 129), table.columns.len);
+        try std.testing.expectEqualStrings(uri, table.external_base_source.?.source_uri);
+        var entries: usize = 0;
+        for (cache.slots) |slot| if (slot.entry) |entry| {
+            entries += 1;
+            try std.testing.expect(entry.budget.peak < 128 * 1024);
+        };
+        try std.testing.expectEqual(@as(usize, 1), entries);
     }
 }

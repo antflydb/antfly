@@ -3895,7 +3895,9 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
     """Wide reducers stream compact states instead of retaining page-sized arrays."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
-    root = tmp_path / "lake"
+    # Keep source identity long enough to exercise schema derivation admission
+    # independently of the runner's temporary directory name.
+    root = tmp_path / ("wide-source-" + "a" * 160) / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
     count, width = 8192, 128
@@ -3954,6 +3956,7 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
                 },
             },
         )
+        assert call("/sql", {"statement": "SELECT COUNT(*) FROM wide_join"})["rows"] == [[str(count)]]
         query = (
             "SELECT "
             + ",".join(f"SUM(l.v{j})" for j in range(width))
@@ -4331,22 +4334,28 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
 
         call("POST", "/tables/paged_text", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "base_source": {
+            "storage_mode": "relational", "default_type": "doc",
+            "document_schemas": {"doc": {"schema": {"type": "object", "properties": {
+                "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
+                "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+            }}}}, "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount"}], "include_columns": ["body"]}], "base_source": {
                 "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
-            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}}})
+            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}}})
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
             assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
-            if resource["status"]["readiness"]["queryable"]:
+            sortable = call("GET", "/tables/paged_text/indexes/all_text")
+            assert sortable["status"]["readiness"]["state"] != "failed", str(sortable) + server.debug_logs()
+            if resource["status"]["readiness"]["queryable"] and sortable["status"]["readiness"]["queryable"]:
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
         request = {"full_text_search": {"match": "quasar", "field": "body"},
                    "full_text_index": "body_text", "fields": ["amount"], "limit": 201}
-        # Highlighting uses the existing full-admission path, providing a score
-        # and stable tie oracle independent of the window collector.
-        oracle = call("POST", "/tables/paged_text/query", dict(request, highlight={"fields": ["body"]}))
+        # Profiling deliberately uses full admission, providing an independent
+        # score/tie oracle for the bounded coordinator and final hydration.
+        oracle = call("POST", "/tables/paged_text/query", dict(request, profile=True))
         expected = [(h["_id"], h["_score"], h["_source"]["amount"]) for h in oracle["hits"]["hits"]]
         assert len(expected) == 201
 
@@ -4361,6 +4370,34 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             counted = call("POST", "/tables/paged_text/query", dict(request, limit=0))
             assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
             assert counted["hits"]["hits"] == []
+            shapes = [
+                {"highlight": {"fields": ["body"]}},
+                {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
+                {"exclusion_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
+                {"filter_query": {"range": {"path": "/amount", "gte": 50}},
+                 "exclusion_query": {"range": {"path": "/amount", "gte": 160}}},
+                {"order_by": [{"field": "amount", "desc": True}], "full_text_index": "all_text"},
+                {"filter_query": {"range": {"path": "/amount", "gte": 50}},
+                 "order_by": [{"field": "amount"}], "full_text_index": "all_text", "highlight": {"fields": ["body"]}},
+            ]
+            for shape in shapes:
+                query = dict(request, **shape, limit=7)
+                reference = call("POST", "/tables/paged_text/query", dict(query, profile=True))
+                actual = call("POST", "/tables/paged_text/query", query)
+                assert actual["hits"]["hits"] == reference["hits"]["hits"], (actual, reference)
+                counted = call("POST", "/tables/paged_text/query", dict(query, limit=0))
+                assert counted["hits"]["total"] == call("POST", "/tables/paged_text/query", dict(query, limit=0, profile=True))["hits"]["total"]
+                assert counted["hits"]["hits"] == []
+                assert all(set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"])
+                if "highlight" in shape:
+                    assert all(h["_highlights"]["body"] for h in actual["hits"]["hits"])
+                if "order_by" in shape:
+                    cursor = actual["hits"]["hits"][-1]["_sort"]
+                    forward = dict(query, search_after=cursor, remote_snapshot=actual["remote_snapshot"])
+                    following = call("POST", "/tables/paged_text/query", forward)
+                    assert following["hits"]["hits"] == call("POST", "/tables/paged_text/query", dict(forward, profile=True))["hits"]["hits"]
+                    backward = dict(query, search_before=following["hits"]["hits"][0]["_sort"], remote_snapshot=following["remote_snapshot"])
+                    assert call("POST", "/tables/paged_text/query", backward)["hits"]["hits"] == actual["hits"]["hits"]
         check()
         server.restart()
         check()

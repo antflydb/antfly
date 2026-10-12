@@ -5489,6 +5489,31 @@ fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, h
     return false;
 }
 
+/// Shared typed ordering for bounded coordinators. Validate once at admission;
+/// heap comparisons then use the same numeric, timestamp, null and ID contract
+/// as local collection and distributed cursor merging.
+pub const SearchHitOrder = struct {
+    effective: EffectiveSortRequest,
+    plan: SortExecutionPlan,
+    pub fn init(a: Allocator, req: types.SearchRequest, runtime: ?runtime_schema_mod.TableSchema) !SearchHitOrder {
+        var effective = try effectiveSortRequestAlloc(a, req);
+        errdefer effective.deinit(a);
+        try validateSortPageOptions(effective.req);
+        if (effective.req.order_by.len == 0) return error.InvalidQueryRequest;
+        return .{ .effective = effective, .plan = .{ .kind = .distributed_k_way_merge, .runtime_schema = runtime } };
+    }
+    pub fn deinit(self: *SearchHitOrder, a: Allocator) void {
+        self.effective.deinit(a);
+    }
+    pub fn validate(self: SearchHitOrder, hit: types.SearchHit) !void {
+        _ = try compareSearchHitSortValues(self.effective.req, self.plan, hit, hit);
+        if (!try searchHitAllowedByCursor(self.effective.req, self.plan, hit)) return error.InvalidQueryRequest;
+    }
+    pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
+        return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
+    }
+};
+
 const DistributedSortedShard = struct {
     hits: []const types.SearchHit = &.{},
     total_hits: ?u32 = null,
@@ -12123,6 +12148,7 @@ pub fn searchTextQuery(
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,
                 .distributed_text_stats = effective_req.distributed_text_stats,
+                .minimum_competitive_score = effective_req.minimum_competitive_score,
                 .filter_doc_nums = native_constraints.filter_doc_nums,
                 .filter_doc_nums_positive = native_constraints.positive_filter,
                 .exclude_doc_nums = native_constraints.exclude_doc_nums,

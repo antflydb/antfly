@@ -1,9 +1,10 @@
 # Native lake performance follow-up
 
-Status: implemented; representative archive benchmarks remain pending. This follow-up builds on
-PR #1006 and keeps native execution, public snapshot tokens, exact filters, and
-reader leases. The contracts below describe the implementations and their
-validation requirements.
+Status: active follow-up. Native execution, public snapshot tokens, exact filters,
+and reader leases are implemented on top of PR #1006. The contracts below describe
+implemented refinements and their validation. Cross-source-file compaction, a
+publication-wide best-first frontier, and representative archive benchmarks remain
+pending; their requirements are recorded at the end.
 
 ## Native sparse predicate intersection
 
@@ -2351,9 +2352,9 @@ while changed artifacts are checked by ordinary authenticated build reads and
 uploads. Proofs cap at 4,096 namespaces, 1 MiB serialized metadata and 64 pending
 roots; exceeding the caps retains full auditing. Cloud object stores without a
 provider retention guarantee retain full auditing through the same optional
-capability contract. GCS buckets with a locked retention policy can supply
-provider-backed witnesses, as described below; ordinary mutable buckets and
-S3 version retention do not qualify.
+capability contract. GCS and S3 retention protect versions, which is insufficient
+for references addressed by their live object name. Both providers decline this
+shortcut until artifact references and every reader pin an immutable generation.
 
 Regression coverage includes durable reopen, delta inheritance, uploads after
 inheritance but before sealing, deletion, restoration and corrupt certificate
@@ -2489,22 +2490,18 @@ and caps probe enumeration even for absent keys. Only the selected candidate own
 the execution cursor, and its shared projection is rewound before execution.
 Optional resource-admission failure retains the complete scan filter path.
 
-GCS locked bucket retention prevents deletion and replacement of current objects
-until their provider-reported retention expiration. The object-store capability
-checks that the policy is locked, enumerates the attempt namespace in bounded
-pages, and records its earliest expiration. Durable closure certificates bind
-that witness to the bucket, prefix, upload domain and attempt. Reopen and inherited
-closure checks validate the policy and expiration using the provider's HTTP Date,
-elapsed request time and a conservative margin. Missing or malformed evidence,
-expiration, mutable buckets, and unsupported providers decline the shortcut.
-S3 Object Lock protects versions and is deliberately insufficient for this
-current-name contract. No bucket policy is created or changed by Antfly. Ordinary
-payload authentication, publication authority, reader leases and GC rules remain
-required; provider retention may delay physical deletion. Certificates are bounded
-advisory metadata, and invalid certificates fall back to a complete closure audit.
+GCS no longer supplies immutable-name witnesses. A locked retention policy can
+retain a version while Object Versioning makes it noncurrent; checking a locked
+policy and expiry does not prove that an unversioned artifact GET still resolves
+to that object. The provider declines both witness creation and validation without
+performing retention I/O, so old certificates also trigger complete audits. A
+future provider shortcut requires generation-pinned artifact references, generation
+GET/HEAD/range reads, and publication/GC proofs that carry those generations.
+Checking only whether versioning is enabled at validation time would miss an
+intervening configuration change. No bucket policy is created or changed by Antfly.
 
-Provider contract: [GCS Bucket Lock](https://docs.cloud.google.com/storage/docs/bucket-lock)
-and [object retention expiration](https://docs.cloud.google.com/storage/docs/json_api/v1/objects).
+Provider contract: [GCS retention interactions with Object Versioning](https://docs.cloud.google.com/storage/docs/bucket-lock#considerations_with_other_features).
+
 These changes are covered by regression tests for interrupted dense refresh,
 signed contribution replay, bounded scratch reuse, optional accelerator fallback,
 compatible projection reuse, linear span routing, and provider-proof reopen,
@@ -2516,9 +2513,9 @@ fixture rejected startup because the local volume did not meet its approximately
 16 GiB free-space floor. No disk-safety setting was disabled. The final production CLI builds after reclaiming completed test link inputs.
 Earlier combined builds exhausted local disk space; native integration was
 therefore qualified separately. These environment failures are separate from
-native real-file integration and provider-contract regression results. Live GCS retention behavior
-still requires credentialed provider integration; local coverage uses the GCS
-transport contract and a retained-provider artifact-store fixture.
+native real-file integration and provider-contract regression results. The
+current GCS regression asserts unsupported immutable-name evidence without I/O;
+the generic retained-provider fixture continues to cover valid provider witnesses.
 
 Final qualification on Zig 0.17.0 Debug: all 359 lake integration checks pass
 (142 shared and 217 API), plus 64 focused checks with one optional benchmark
@@ -2643,8 +2640,12 @@ an eight-byte string page bound must never be reinterpreted as an integer.
 Annotated decimal/timestamp statistics retain the existing conservative checks.
 
 Broad, ordinary term/match/phrase/Boolean score queries over more than 64 segments
-now stream the authenticated routing tree and admit one 64-segment window at a
-time. Window snapshots use publication-wide collection lengths and global term
+stream the authenticated routing tree and admit at most 64 segments and 32 MiB
+of encoded segment data per window. An indivisible segment is admitted alone.
+The cursor carries only its identity and counts when a byte limit ends a window.
+Routing decode and query scratch regions reuse capacity across pulls, including
+when their parent allocator is an arena. Window snapshots use publication-wide
+collection lengths and global term
 frequencies. A bounded heap retains `offset + limit` winners, compares score ties
 using the original corpus ordinal, and releases each window before advancing.
 Final winners hydrate from physical keys under the existing leased publication.
@@ -2654,11 +2655,29 @@ manifest, physical-map and digest continuity without retaining the inventory.
 A bounded optional selection probe preserves the existing selective route for
 small candidate sets.
 
-This is the broad score-query consumer of paged navigation. Sorted/cursor,
-highlight, metadata-filtered, overlay, multi-source composed/vector and early-source request
-shapes retain their existing planners. A fully virtual snapshot for all those
-shapes remains additional work; this change does not claim constant navigation
-memory for every search API combination. Compact source-file proof maps also
+Metadata filters, exclusion predicates, typed sorting, forward/backward cursors
+and highlights now use this bounded coordinator too. The shared sort comparator
+preserves exact NUMERIC and signed timestamps, null order and implicit public-ID
+ties. Backward pages retain the closest preceding winners and restore canonical
+output order. Compatible ordered-row index plans retain the existing global
+winning-prefix seek. Other sorted requests use native doc values within each
+window, rather than repeating a global ordered-index scan per window. Highlight planning retains
+only schema/analysis metadata and hydrates highlight dependencies after final
+ranking, including fields excluded from the public projection.
+
+The winner heap forwards a trusted score cutoff to later windows. Native range,
+segment and posting bounds can prune before payload admission even before a local
+heap fills. Equal scores remain eligible because a local document number cannot
+represent a global tie boundary. Pruned results retain a lower-bound hit relation;
+count-only execution never receives the cutoff. The public query parser cannot set
+this internal hint. A publication-wide best-first frontier is still additional
+work: current best-first navigation is within a window, and windows stream in
+immutable routing order.
+
+Profiled, overlay, multi-source composed/vector and early-source request shapes
+retain their existing planners. A fully virtual snapshot for those shapes remains
+additional work; this change does not claim constant navigation memory for every
+search API combination. Compact source-file proof maps also
 remain separate from the bounded segment window.
 
 New text-file builds compact eight adjacent small runs when their combined input
@@ -2690,9 +2709,14 @@ removing disk entries before a restart alone does not establish an empty plannin
 cache after readiness. Unit/benchmark harnesses can use fresh serving-cache
 instances to measure the genuinely cold path independently.
 
-Join preaggregation can now retain up to four partition-local typed reducers
-across native batches, subject to shared CPU/memory admission. They merge typed
-partial states once at the end through the ordinary grouped spill path. Declined
+Join preaggregation retains up to four typed reducers across native batches,
+subject to shared CPU/memory admission. Each canonical group key hashes to one
+owner for the complete input. Stable row selections preserve source ordinals and
+encoded columns; the hash is computed once per input batch. Disjoint lane states
+stream directly into compact join construction/probing, eliminating duplicated
+per-lane groups and the final serial rehash/merge. Source occurrence ordinals stay
+separate from actual row counts in resident and spilled reducers; lane cardinality
+estimates never multiply global source ordinals. Declined
 scheduler submissions run inline. Borrowed source batches remain alive until all
 workers join, including errors and cancellation. Lane and group budgets are
 fractions of the statement allowance; no larger statement or response limit is
@@ -2702,14 +2726,23 @@ whose equal values can have different display representations retain ordered
 reduction. Broader parallelism requires explicit representative/tie ordinals in
 those typed states rather than changing observable results incidentally.
 
-The main merge includes `origin/main` through `1a0e150bf9` and preserves both
-the shared spill run store and main's presorted-run collection. Final Zig 0.17.0
-Debug qualification passes all 92 combined CLI/integration/boundary build steps,
+Wide external schema derivation charges parsing/runtime workspace to the statement
+allocator, separately from the 1 MiB retained-layout cache slot. Cache admission
+never rejects an otherwise valid wide schema: oversized JSON or retained layouts
+derive directly in the bounded statement region. Cache misses retain the existing
+four-build admission and authorization/catalog checks. A deterministic long-source-
+URI Parquet regression covers single-table COUNT, wide join COUNT and 128 SUMs;
+unit tests force both oversized JSON and retained-layout bypass, repeated misses,
+slot cleanup, and compact retention of a 129-column external schema.
+
+Earlier qualification included `origin/main` through `1a0e150bf9` and preserved
+both the shared spill run store and main's presorted-run collection. That Zig 0.17.0
+Debug qualification passed all 92 combined CLI/integration/boundary build steps,
 374 lake integration tests (151 shared, 223 API), and both embedded boundary
 audits without allocator leaks. Changed-source Zig formatting, Python syntax,
 and diff checks pass.
 
-All 18 selected real Parquet/Iceberg E2Es pass against the final rebuilt CLI:
+That qualification passed 18 selected real Parquet/Iceberg E2Es against its rebuilt CLI:
 remote text ranking/filter/highlight/restart, incremental artifact reuse,
 optional-directory bootstrap, wide partial join delivery, two native joins with
 more than 70,000 distinct build keys, two exact NUMERIC covering joins, two exact
@@ -2723,3 +2756,69 @@ remain exact residual comparisons. Disk admission safeguards remain intact.
 These regressions establish correctness and bounded execution contracts;
 representative archive-scale throughput/RSS/provider-request measurements remain
 pending.
+
+### Current refinement qualification
+
+The branch includes `origin/main` through `0f7fec50c5`; the final merge was clean.
+Zig 0.17.0 Debug native qualification passed 105/105 combined production CLI,
+lake integration, public lake API, and bounded ranking build steps without
+allocator leaks. Lake integration roots passed 153 shared and 226 API tests;
+public lake API roots passed 153 shared and 208 API tests; bounded ranking roots
+passed 41 shared and 28 API tests, with one benchmark skipped. These are 809 test
+executions across the separate roots, including repeated shared contracts.
+All ten focused schema-cache tests and both focused object-store regressions
+also pass. After the final documentation/comment-only main merge, the production
+CLI rebuilt successfully in 48/48 steps using the worktree's default cache.
+
+All 20 selected real Parquet/Iceberg E2Es pass against that final CLI. The expanded
+67-file fixture compares metadata includes/exclusions, field sorts, ordered-index
+prefix seeks, forward/backward cursors, hidden highlight dependencies, exact
+counts, scores and hydration with full admission, both before and after restart.
+The wide 129-column Parquet fixture now forces a long source URI and verifies
+single-table COUNT, join COUNT and 128 SUM reducers. Other selected E2Es cover
+large dynamic joins, exact NUMERIC covering/materialized paths, conservative
+embedded Parquet pruning, incremental reuse, optional directories, fragmented
+corpora, and real Iceberg schema/partition/snapshot/delete transitions.
+
+The final authored and resolved native module boundary audits pass, as do their
+20 Python regressions. Changed-source Zig formatting, Python syntax and diff
+checks pass. Cache storage follows the newly merged worktree policy. These
+checks establish correctness and bounded-work contracts; they do not replace
+representative archive-scale latency, RSS and provider-request measurements.
+
+### Remaining physical compaction format
+
+Cross-source-file compaction remains unimplemented. The current serving record
+owns one file's physical rank directory, so concatenating bytes across files
+without changing that ownership would corrupt predicate ordinals and hydration.
+The intended implementation separates maintenance file state from serving packs:
+
+- Each serving pack owns authenticated spans identifying the original file,
+  its immutable digest, physical-row manifest, file rank interval, and pack
+  document interval. A source file may contribute to multiple packs. Predicate
+  consumers map physical ranks through these spans; hydration uses the same
+  mapping under the publication lease.
+- Size-tiered merges have bounded fan-in, input bytes, output bytes and working
+  memory. Small new runs accumulate separately from stable historical packs.
+  Updates replace only packs containing changed spans, plus bounded compaction
+  work. A small append never rebuilds an entire historical base.
+- File-level DF contributions remain independent of physical packing. Serving
+  term summaries and routing identify the merged packs. Refresh applies signed
+  contributions exactly once and preserves the complete collection statistics.
+- Maintenance records retain the metadata needed for refresh, rather than
+  permanently retaining duplicate original posting payloads after compaction.
+  GC marks pack payloads, span/physical manifests and statistics for every live
+  reader and builder generation. Recovery checkpoints retain all unfinished
+  inputs until publication commits. The reader protocol must fence this format.
+- Qualification must cover selective and broad predicates, rank/select across
+  delete holes and multiple source files, scores and ties against full admission,
+  hidden highlight fields, sorted cursor pages, restart/replay, incremental
+  append/replacement/removal, and GC while an old generation remains pinned.
+  A refresh work-count test must prove that unrelated historical payloads are
+  neither read nor rewritten.
+
+A publication-wide best-first frontier also remains unimplemented. It needs
+conservative query bounds attached to authenticated routing subtrees and a bounded
+frontier that can descend promising subtrees before opening their inventories.
+The current cross-window score cutoff is implemented; it does not eliminate the
+initial routing walk or turn sequential windows into global best-first traversal.

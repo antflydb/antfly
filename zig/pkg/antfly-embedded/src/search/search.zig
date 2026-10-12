@@ -151,6 +151,9 @@ pub const SearchRequest = struct {
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
+    /// Private coordinator hint, valid only for score top-K. Equal scores
+    /// cannot be pruned because local document numbers do not encode global ties.
+    minimum_competitive_score: ?f32 = null,
     bm25_config: inverted.BM25Config = .{},
     diagnostics: ?*scorer_mod.SearchDiagnostics = null,
 };
@@ -541,7 +544,7 @@ pub fn execute(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
-    var result = if (request.sort == null and request.search_after != null and request.aggregations.len == 0 and canStreamBool(request.query, 0))
+    var result = if (request.sort == null and (request.search_after != null or request.minimum_competitive_score != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
         (try executeStreamingTextBool(alloc, snap, if (request.query == .bool_query) request.query.bool_query else .{ .should = &.{request.query}, .min_should = 1, .pure_should_optional = true }, request, .{})).?
     else if (request.sort != null)
         try executeSort(alloc, snap, request)
@@ -1686,6 +1689,7 @@ const FastTopK = struct {
     total_count: u32 = 0,
     after: ?SearchCursor = null,
     pruned: bool = false,
+    minimum_competitive_score: ?f32 = null,
     producers: ProducerConstraints = .{},
     segment_offset: u32 = 0,
     segment_count: u32 = 0,
@@ -1762,6 +1766,7 @@ const FastTopK = struct {
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
         if (self.after) |cursor| if (!(hit.score < cursor.score or (hit.score == cursor.score and hit.doc_id > cursor.doc_id))) return;
+        if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
         try scorer_mod.offerTopK(self.alloc, &self.hits, self.k, hit);
     }
 
@@ -1775,7 +1780,7 @@ const FastTopK = struct {
 
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
         try self.flushPending();
-        if (self.k > 0 and self.hits.items.len < self.k) self.pruned = false;
+        if (self.minimum_competitive_score == null and self.k > 0 and self.hits.items.len < self.k) self.pruned = false;
         scorer_mod.sortScoredHits(self.hits.items);
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
@@ -4058,6 +4063,10 @@ fn planStreamingBoolSegmentsSelected(a: Allocator, scratch: *std.heap.ArenaAlloc
 
 fn streamingCutoff(collector: *const FastTopK, shared: ?*StreamingBoolParallel) ?scorer_mod.ScoredHit {
     var result: ?scorer_mod.ScoredHit = if (collector.worstCompetitiveDocId()) |doc| .{ .doc_id = doc, .score = collector.minCompetitiveScore() } else null;
+    if (collector.minimum_competitive_score) |floor| {
+        const inherited: scorer_mod.ScoredHit = .{ .doc_id = std.math.maxInt(u32), .score = floor };
+        if (result == null or scorer_mod.scoredHitBetterThan(inherited, result.?)) result = inherited;
+    }
     if (shared) |owner| if (owner.cutoff_valid.load(.acquire)) {
         const cutoff_bits = owner.cutoff.load(.acquire);
         const global: scorer_mod.ScoredHit = .{ .doc_id = @truncate(cutoff_bits), .score = @bitCast(@as(u32, @truncate(cutoff_bits >> 32))) };
@@ -4302,7 +4311,7 @@ const StreamingBoolParallel = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const producers: ProducerConstraints = .{ .include = if (self.include) |*adapter| adapter.wrapped() else null, .exclude = if (self.exclude) |*adapter| adapter.wrapped() else null };
-        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
+        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
         defer local.deinit();
         while (true) {
             const index = self.next_work.fetchAdd(1, .monotonic);
@@ -4469,7 +4478,7 @@ fn scoreStreamingBoolPlans(alloc: Allocator, snap: *const index_mod.IndexSnapsho
 
 fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
     if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
-    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
+    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
     defer collector.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -9801,4 +9810,71 @@ test "streaming boolean broad range planning preserves signed scores ties cursor
     provider.revoked = true;
     const bq: BoolQuery = .{ .must = &.{.{ .term = .{ .field = "title", .term = "common" } }} };
     try std.testing.expectError(error.Canceled, executeStreamingTextBool(a, snapshot, bq, .{ .query = .{ .bool_query = bq }, .k = 2 }, .{}));
+}
+
+test "streaming boolean inherited publication cutoff preserves ties and lower bound counts" {
+    const a = std.testing.allocator;
+    var collector: FastTopK = .{ .alloc = a, .k = 3, .minimum_competitive_score = 2 };
+    defer collector.deinit();
+    const inherited = streamingCutoff(&collector, null).?;
+    try std.testing.expectEqual(@as(f32, 2), inherited.score);
+    try std.testing.expectEqual(std.math.maxInt(u32), inherited.doc_id);
+    // A preceding routing window owns the competitive winners. Local state
+    // need not fill before skipping an uncompetitive subtree, and equal-score
+    // rows must survive because its global ordinal can beat a retained tie.
+    try collector.collect(10, 1);
+    try collector.collect(9, 2);
+    try collector.collect(8, 2);
+    collector.pruned = true;
+    const hits = try collector.finish();
+    defer a.free(hits);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(@as(u32, 8), hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 9), hits[1].doc_id);
+    try std.testing.expect(collector.pruned);
+    try std.testing.expectEqual(@as(u32, 3), collector.total_count);
+}
+
+test "streaming boolean inherited publication cutoff prunes before payload admission" {
+    const a = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("row", "{}");
+    var inverted_builder = inverted.InvertedIndexBuilder.init(a, .{});
+    defer inverted_builder.deinit();
+    try inverted_builder.addDocument(0, &.{.{ .term = "common", .freq = 1, .norm = 1 }});
+    const section = try inverted_builder.build();
+    defer a.free(section);
+    try segment.addSection(try segment.addField("body"), .inverted_text, section);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    var replacements: [20]index_mod.ReplacementSegmentData = undefined;
+    for (&replacements, 0..) |*replacement, i| replacement.* = .{ .id = i + 1, .data = .fromNative(.{ .contiguous = bytes }) };
+    try writer.replaceSegmentsManyData(&.{}, &replacements);
+    const Provider = struct {
+        fn check(_: *anyopaque) !void {}
+        fn ensure(_: *anyopaque, _: ?*anyopaque, _: usize) !void {
+            return error.UnexpectedPostingRead;
+        }
+        fn frequencies(_: *anyopaque, _: Allocator, _: []const u8, terms: []const []const u8, output: []u32) !void {
+            if (terms.len != output.len) return error.InvalidArgument;
+            @memset(output, 20);
+        }
+        fn summary(_: *anyopaque, _: Allocator, _: usize, _: []const u8, _: []const u8, _: f32, _: inverted.BM25Config) !index_mod.IndexSnapshot.TextTermSummary {
+            return .{ .frequency = 1, .tf_upper = 1 };
+        }
+    };
+    var provider: u8 = 0;
+    const snapshot = writer.snapshot();
+    for (snapshot.segments) |*entry| entry.reader.postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
+    snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary };
+    var diagnostics: SearchDiagnostics = .{};
+    var result = try execute(a, snapshot, .{ .query = .{ .term = .{ .field = "body", .term = "common" } }, .k = 2, .include_stored = false, .minimum_competitive_score = 1e6, .diagnostics = &diagnostics });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_pruned);
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.segments_searched);
 }

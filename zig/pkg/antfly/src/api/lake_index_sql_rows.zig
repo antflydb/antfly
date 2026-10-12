@@ -756,25 +756,14 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     var best_cost: u64 = std.math.maxInt(u64);
     var best_complete = false;
     for (indexes) |index| {
-        var conditions: std.ArrayList(catalog.Condition) = .empty;
-        for (request.conditions) |condition| for (index.keys) |key| {
-            if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
-                var normalized = condition;
-                normalized.value = try local.sql_lake_values.conditionValue(ca, condition.value, try table.column(condition.column));
-                try appendStrongBound(ca, &conditions, normalized, try table.column(condition.column));
-                break;
-            }
-        };
-        var candidate = request;
-        candidate.conditions = conditions.items;
-        const indexed = (try chooseAccess(ca, &.{index}, candidate)) orelse continue;
+        const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var cost: u64 = 0;
         const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true)) orelse continue;
         if (!cursor.order_satisfied) {
             cursor.close(cursor.ptr);
             continue;
         }
-        const complete = preparePublicOrder(a, cursor, index, parsed, candidate, reverse, search_order) catch |err| {
+        const complete = preparePublicOrder(a, cursor, index, parsed, indexed, reverse, search_order) catch |err| {
             cursor.close(cursor.ptr);
             return err;
         };
@@ -795,6 +784,47 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         return .{ .cursor = cursor, .complete_order = best_complete };
     }
     return null;
+}
+
+/// The bounded text coordinator preserves a compatible global ordered seek
+/// instead of visiting every routing window. This is planning only: opening the
+/// cursor still proves publication availability, coverage and physical bounds.
+pub fn hasOrderedPredicatePlan(a: A, table: catalog.Table, request: catalog.Scan) !bool {
+    const definitions = table.external_indexes orelse return false;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return false;
+    for (indexes) |index| {
+        const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
+        var equal: usize = 0;
+        for (index.keys) |key| {
+            const constant = for (indexed.conditions) |condition| {
+                if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+            } else false;
+            if (!constant) break;
+            equal += 1;
+        }
+        if (indexed.index_range != null and orderedBy(index, indexed, equal)) return true;
+    }
+    return false;
+}
+
+fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan) !?catalog.Scan {
+    var conditions: std.ArrayList(catalog.Condition) = .empty;
+    for (request.conditions) |condition| for (index.keys) |key| {
+        if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
+            var normalized = condition;
+            normalized.value = try local.sql_lake_values.conditionValue(a, condition.value, try table.column(condition.column));
+            try appendStrongBound(a, &conditions, normalized, try table.column(condition.column));
+            break;
+        }
+    };
+    var candidate = request;
+    candidate.conditions = conditions.items;
+    return chooseAccess(a, &.{index}, candidate);
 }
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {

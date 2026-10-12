@@ -2523,6 +2523,7 @@ const TestBackend = struct {
     writes: usize = 0,
     row_count: usize = 2,
     group_every: ?usize = null,
+    group_modulo: ?usize = null,
     metadata_count: ?u64 = null,
     cancelled: bool = false,
     ambiguous: bool = false,
@@ -2611,7 +2612,7 @@ const TestBackend = struct {
         const rows = try alloc.alloc(catalog.Row, count_rows);
         for (rows, from..) |*row, index| {
             var object: std.json.ObjectMap = .empty;
-            try object.put(alloc, "id", if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
+            try object.put(alloc, "id", if (self.group_modulo) |modulo| .{ .integer = @intCast(index % modulo) } else if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
@@ -5535,5 +5536,27 @@ test "external lake SQL parallel partition reducers preserve spilled count sum a
             try std.testing.expectEqualStrings(key, row[4].string);
         }
         try std.testing.expect(result.state.budget.peak <= 16 * 1024 * 1024);
+    }
+}
+
+// Repeated keys straddle every input page and lane boundary; grouping by a
+// deterministic hash must preserve multiplicity for both join orientations.
+test "external lake SQL key owned reducers preserve interleaved groups across pages" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |parallel| {
+        var source: TestBackend = .{ .row_count = 4096, .group_modulo = 8 };
+        var backend = source.coordinated();
+        backend.execution_io = if (parallel) std.testing.io else null;
+        var compiled = try compiler.compile(a, "SELECT l.id, COUNT(*), SUM(r.id) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 16 * 1024 * 1024, .page_rows = 257, .scan_rows = 10000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 8), result.output.rows.len);
+        for (result.output.rows, 0..) |row, id| {
+            const sum = try std.fmt.allocPrint(a, "{d}", .{id * 512 * 512});
+            defer a.free(sum);
+            try std.testing.expectEqualStrings("262144", row[1].string);
+            try std.testing.expectEqualStrings(sum, row[2].string);
+        }
     }
 }
