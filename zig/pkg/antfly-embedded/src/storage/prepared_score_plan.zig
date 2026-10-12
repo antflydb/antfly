@@ -17,12 +17,13 @@
 //! file offsets, decoded scores, or caller output buffers. Values are always
 //! resolved through the current scope's pinned checkpoint.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const keys = @import("internal_keys.zig");
 const ScoreSink = @import("backend_types.zig").ScoreSink;
 
 // A rebuild gets a process-unique identity, including after deinit and address
 // reuse. Row/column permutations keep the canonical physical key identity.
-var next_identity = std.atomic.Value(u64).init(1);
+var next_identity = platform.atomic.Value(u64).init(1);
 pub fn newCanonicalIdentity() u64 {
     const identity = next_identity.fetchAdd(1, .monotonic);
     if (identity == 0 or identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
