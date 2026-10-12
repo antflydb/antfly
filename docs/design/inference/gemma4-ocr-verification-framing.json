@@ -1,0 +1,138 @@
+{
+  "runtime_source_revision": "e6787739c455cadca95d2eafe98d0633a778c8f3",
+  "binary_sha256": "153e667020b2dc9490a2b2c335a9bab9188fc275de4376e16529ee0c9cd17594",
+  "hardware": "Apple M4 Max, 32 GPU cores, 36 GiB",
+  "scope": "Eight pre-rendered OCR pages, batch 1, greedy, 2048-token cap, forced K=2 plus bonus; 1 warm page, 2 full passes per mode; render/model loading excluded. Shared machine, unrelated work uncontrolled.",
+  "head_audit": {
+    "target_vocabulary_head": "Q8_0, 1536 input x 262144 output; existing prepared slot and termite_q8_0_linear_mmv",
+    "bf16_projection": "PLE, 1536 input x 8960 output; earlier head attribution was incorrect",
+    "q8_exploratory_probe": "Wider-row/short-row variants have overlapping timing ranges at K=2; no additional Q8 kernel shipped."
+  },
+  "framing": {
+    "input_flag": "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME",
+    "tail_flag": "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME",
+    "default": "off",
+    "tracked_target_frames_per_pass": {
+      "control": 4601,
+      "combined": 3350
+    },
+    "removed_frames": 1251,
+    "percent_removed": 27.189741360573787,
+    "interpretation": "One tracked target frame removed per verify call. Scope changes prevent direct comparison of frame GPU time. Wall-time ranges overlap; no reliable overall speed gain qualified."
+  },
+  "runs": [
+    {
+      "case": "verify-frame-full-0-resident",
+      "wall_seconds": [
+        54.10579175,
+        54.584528417
+      ],
+      "completion_tokens_per_pass": 4057,
+      "text_matches_ordinary": true,
+      "truncated_outputs": 0,
+      "phases_per_pass": []
+    },
+    {
+      "case": "verify-frame-full-1-mtp2fastbonuscontrol",
+      "wall_seconds": [
+        69.97084845799999,
+        66.998729291
+      ],
+      "completion_tokens_per_pass": 4057,
+      "text_matches_ordinary": true,
+      "truncated_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_ns": 14177399130,
+          "verify_ns": 21902723916,
+          "materialize_ns": 23581325966,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        },
+        {
+          "draft_ns": 13671953735,
+          "verify_ns": 21185904290,
+          "materialize_ns": 22774833305,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        }
+      ]
+    },
+    {
+      "case": "verify-frame-full-2-mtp2fastbonusinputtailcontrol",
+      "wall_seconds": [
+        63.446373417000004,
+        65.821675291
+      ],
+      "completion_tokens_per_pass": 4057,
+      "text_matches_ordinary": true,
+      "truncated_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_ns": 13116972372,
+          "verify_ns": 19459122025,
+          "materialize_ns": 22252856839,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        },
+        {
+          "draft_ns": 13714462603,
+          "verify_ns": 20073402394,
+          "materialize_ns": 23012010230,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        }
+      ]
+    },
+    {
+      "case": "verify-frame-full-3-mtp2fastbonuscontrol",
+      "wall_seconds": [
+        63.945723708,
+        63.612095374999996
+      ],
+      "completion_tokens_per_pass": 4057,
+      "text_matches_ordinary": true,
+      "truncated_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_ns": 13085453991,
+          "verify_ns": 20424972552,
+          "materialize_ns": 22078725874,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        },
+        {
+          "draft_ns": 13044671581,
+          "verify_ns": 20399354053,
+          "materialize_ns": 22000410306,
+          "draft_steps": 3206,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850
+        }
+      ]
+    }
+  ]
+}

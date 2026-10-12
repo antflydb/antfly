@@ -2,6 +2,85 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Verification framing and vocabulary-head audit
+
+[The framing measurements](gemma4-ocr-verification-framing.json) retain the
+original Q4_0 target/Q8_0 projector and identical eight-page greedy output
+(4,057 completion tokens per pass, no truncation). The target vocabulary head
+already uses Q8_0 and the prepared-slot Q8 matrix-vector kernel. The previously
+attributed BF16 head is actually the per-layer embedding projection (1,536 to
+8,960); the head projects 1,536 to 262,144. Exploratory wider Q8 output groups
+and short-row kernels have overlapping timings at K=2 and are excluded.
+
+Two independent opt-ins extend the existing verification frame:
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME=1` includes embedding/PLE
+preparation for supported dense Gemma4 2–4-row suffixes, and
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME=1` includes the prepared head
+and argmax. Each corresponding `DISABLE` flag overrides its enable flag.
+Owned frames cancel on early exit, borrowed frames remain owned by their caller,
+and a decoder that consumes the frame prevents a second cancellation.
+Full prompts, singleton rows, other families and MoE retain existing behavior.
+
+Combined framing reduces tracked target submissions from 4,601 to 3,350 per
+full pass: one saved submission for each of 1,251 verification calls (27.2%).
+The combined wall times are 63.446/65.822 s; controls before are 69.971/66.999 s
+and after are 63.946/63.612 s. Ordinary decoding is 54.106/54.585 s. Shared-machine
+timing ranges overlap, so fewer submissions do not qualify an overall speed
+win and MTP remains slower here. Changed frame scope also changes profiled GPU
+time attribution; those counters are not equal-work kernel timings.
+The frame ownership/shape regression selection passes all 12 tests, and the
+ReleaseFast serving build passes. Both flags remain off by default.
+
+## Cached target prefixes: reduced work, failed full-corpus parity
+
+[The seed experiment](gemma4-ocr-cached-target-seeding.json) adds
+`ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET=1`, off by default. Canonical recovery
+retains the normalized target hidden state paired with its cached next choice.
+The next K=2 round uses that known choice as slot zero and runs one assistant
+prediction for slot one. Initial/predictor-only activations do not qualify.
+The experimental lane requires resident greedy Metal drafting, final hidden
+source, constant position, adaptive K disabled and deferred recovery disabled.
+Other K values keep the existing recovery path. Target verification, completion
+budget and bonus acceptance still govern every emitted token. `cached_seeds`
+counts known target prefixes; `draft_steps` counts physical assistant calls.
+
+The two-page pilot preserves all 841 tokens and transcripts: ordinary 12.626 s,
+control 14.458 s, seed 12.814 s. Assistant steps fall 682 to 317, recovery
+forwards 427 to 314, while verification rows increase 506 to 630.
+
+Full eight-page work counters repeat across both passes: assistant steps fall
+3,206 to 1,488 (53.6% fewer), recovery forwards 1,947 to 1,475 (24.2% fewer), and
+verification rows rise 2,502 to 2,960 (18.3% more). However, Attention page 6
+omits its final paragraph in both passes: 701 rather than 742 tokens. Its output
+ends normally, rather than hitting the completion cap. All seven other page
+transcripts/counts match. Full candidate times 61.950/58.824 s therefore fail
+the matched-work gate; ordinary is 59.550/57.122 s and bracketed MTP controls
+range 68.943–80.742 s. The seven matching pages take 51.860/49.438 s versus
+57.190–66.382 s with unseeded MTP and 49.369/47.269 s ordinary. That is a
+post-hoc restricted scope, not full-corpus OCR qualification; seeded MTP remains
+slower than ordinary in those matching-page measurements too.
+
+A focused full-generation check on the failing page reproduces the same
+701-token omission with both input/tail frames disabled, input only, and tail
+only. The framing changes do not explain the failure. Changing the proposal
+schedule exposes a broader target-output parity limit; these tests do not
+isolate its numerical/cache cause. No inference default or full-corpus speed
+claim is promoted. Next work should compare canonical one-row and two-row
+verification at identical committed prefixes/KV, including prepared Q4 FFN,
+attention and final-normalization/head choices, before qualifying more drafting
+optimizations. The tests cover trusted-pair eligibility and invalidation when
+an activation is replaced. The combined MTP/decoder regression selection passes
+48 tests with no skips, and the final ReleaseFast serving build passes.
+
+The benchmark freezes runtime `ed4e54d641` with SHA-256
+`4c14dde0a7b3fdc7036b30825d606c87c199b3a0cc1bb351bf55416074497492`.
+Subsequent guard/lifetime-test changes restrict recovery to the tested K=2 lane
+without changing that lane. Reproduce using the existing `pdf_ocr.py` harness
+with batch one, two iterations, one warm page, `--draft-model assistant
+--speculative-k 2`; retain the report's explicit server flags and budget/model
+configuration. Start fresh servers for ordinary, unseeded MTP, seeded MTP and
+unseeded MTP controls. Rendering/model loading remain excluded.
+
 ## MLX MTP reference and pending-token follow-up
 
 [The reference measurements](gemma4-ocr-mlx-reference.json) compare MTP on/off
@@ -109,8 +188,9 @@ independent GPU kernel measurements.
 For Antfly, the next optimization targets remain cheap verification/readout
 and preserving useful target state across rounds. The reference demonstrates
 that this E2B OCR workload can benefit from MTP; it does not justify copying
-its unqualified low-precision matrix path. Original Q8_0 head preservation
-remains an unimplemented lead. Default inference policies remain unchanged.
+its unqualified low-precision matrix path. The subsequent dispatch audit
+corrects the earlier head diagnosis: Q8_0 head storage is already preserved.
+Default inference policies remain unchanged.
 
 ## Upstream research and short-row specialization
 
@@ -162,10 +242,11 @@ The assistant protocol audit agrees with pinned upstream
 and [Gemma4 hidden-state output](https://github.com/ggml-org/llama.cpp/blob/8bb3cf0d216a5ae48360179f2931daf284be4d01/src/models/gemma4.cpp):
 fixed positions within a draft round, shared target KV, and post-final-norm
 target hidden states.
-The GGUF's tied `token_embd.weight` is Q8_0, while Antfly's prepared vocabulary
-head is BF16. That representation difference must be accounted for in future
-head comparisons; a Q6_K switch cannot optimize this head. Preserving the
-original quantized head is a research lead, not an implemented or measured win.
+The GGUF's tied `token_embd.weight` and Antfly's prepared vocabulary head are
+Q8_0. A subsequent dispatch audit corrected the earlier BF16-head attribution:
+the traced BF16 projection has dimensions 1,536 by 8,960 and belongs to PLE.
+The Q8_0 MMV head dispatch covers 262,144 outputs. A Q6_K switch cannot optimize
+this checkpoint's head, and original-head preservation is already implemented.
 
 The latest complete corpus campaign exposes a broader parity limit: four-row
 controls with specialization **disabled** also changed the diagram-page
@@ -285,11 +366,13 @@ fallback when that route is unavailable; leaving the switch off preserves
 the earlier long-context guard. This recovery path restored exact transcripts
 with K=2 on the complete eight-page corpus, including bonus acceptance.
 
-Dispatch tracing identified a BF16 prepared vocabulary head on this checkpoint;
-the earlier Q6_K switch did not control that head. The shared BF16 linear
-kernel now keeps two-to-four-row accumulators in registers and reduces with
-SIMD shuffles using the existing binary addition tree. Larger row counts
-retain the prior path. Tests cover small rows, tails, offsets and BF16 range.
+The original BF16 vocabulary-head attribution was incorrect; subsequent shape
+and dispatch tracing identified that projection as PLE, with an existing Q8_0
+vocabulary head. The earlier Q6_K switch did not control the head. The shared
+BF16 linear kernel improvement applies to eligible BF16 projections: it keeps
+two-to-four-row accumulators in registers and reduces with SIMD shuffles using
+the existing binary addition tree. Larger row counts retain the prior path.
+Tests cover small rows, tails, offsets and BF16 range.
 
 | Configuration | Seconds, one eight-page pass | Completion tokens | Exact control text |
 | --- | ---: | ---: | --- |

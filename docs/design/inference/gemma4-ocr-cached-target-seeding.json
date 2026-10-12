@@ -1,0 +1,330 @@
+{
+  "runtime_source_revision": "ed4e54d6416004fca29eadf8d20bc11b68e082a0",
+  "binary_sha256": "4c14dde0a7b3fdc7036b30825d606c87c199b3a0cc1bb351bf55416074497492",
+  "hardware": "Apple M4 Max, 32 GPU cores, 36 GiB",
+  "model_id": "ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07",
+  "model_configuration_reference": "gemma4-ocr-q4-specialization.json",
+  "scope": "Same eight pre-rendered OCR pages, greedy, batch 1, 2048-token cap, forced K=2 plus bonus, 1 full warm page and 2 passes per mode; PDF render/model startup/file reads excluded; shared machine, unrelated work uncontrolled. All candidates use the same frozen executable.",
+  "seed_policy": {
+    "flag": "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET",
+    "default": "off",
+    "eligibility": "K=2, resident greedy Metal canonical recovery, final hidden source, constant position, no debug top-K, adaptive K disabled, deferred recovery disabled, paired cached target activation/choice",
+    "initial_round": "unchanged; prompt activation does not pair with the initialized next-target choice",
+    "mechanism": "retain canonical normalized target activation and its next choice; seed that known choice as draft slot 0, run one physical assistant step for slot 1, retain target verification and bonus policy",
+    "counters": "draft_steps counts only physical assistant calls; cached_seeds counts known target prefixes; logical drafted/matched counts include the prefix"
+  },
+  "pilot": {
+    "pages": 2,
+    "completion_tokens": 841,
+    "all_text_matches_ordinary": true,
+    "seconds": {
+      "ordinary": 12.626244834,
+      "control": 14.457912125,
+      "seed": 12.813724833
+    },
+    "draft_steps": [
+      682,
+      317
+    ],
+    "verify_rows": [
+      506,
+      630
+    ],
+    "materializations": [
+      427,
+      314
+    ]
+  },
+  "quality_gate": {
+    "full_corpus_passed": false,
+    "failure": "Attention page 6 omits its final paragraph in both passes, 701 vs 742 completion tokens. Other seven transcripts and completion counts match. Outputs end normally, not at the 2048-token cap.",
+    "interpretation": "Changed full-corpus work prevents an aggregate speed claim. The seven-matching-page subtotal is post-hoc, not full-corpus qualification. Proposal/verification scheduling exposes a target-output parity limit; its precise numerical/cache cause is not isolated. Keep the seed flag off by default."
+  },
+  "runs": [
+    {
+      "case": "resident",
+      "raw_directory": "seeded-mtp-0-resident",
+      "wall_seconds": [
+        59.55004083400001,
+        57.12211391699999
+      ],
+      "completion_tokens_per_pass": [
+        4057,
+        4057
+      ],
+      "changed_ordinary_pages": [],
+      "truncated_at_cap_outputs": 0,
+      "phases_per_pass": [],
+      "seven_matching_pages_seconds": [
+        49.368783584000006,
+        47.268617542
+      ],
+      "server_flags": {
+        "TERMITE_SERVER_GENERATE_TIMING": "1",
+        "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+        "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+        "TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE": "1",
+        "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+        "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+        "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+        "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "0",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "0",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "0",
+        "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0"
+      }
+    },
+    {
+      "case": "mtp2fastbonusinputtailcontrol",
+      "raw_directory": "seeded-mtp-1-mtp2fastbonusinputtailcontrol",
+      "wall_seconds": [
+        68.94296075,
+        78.494844958
+      ],
+      "completion_tokens_per_pass": [
+        4057,
+        4057
+      ],
+      "changed_ordinary_pages": [],
+      "truncated_at_cap_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_steps": 3206,
+          "cached_seeds": 0,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850,
+          "draft_ns": 14118266185,
+          "verify_ns": 20618029167,
+          "materialize_ns": 24024046289
+        },
+        {
+          "draft_steps": 3206,
+          "cached_seeds": 0,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850,
+          "draft_ns": 16988719921,
+          "verify_ns": 22235540829,
+          "materialize_ns": 26459421243
+        }
+      ],
+      "seven_matching_pages_seconds": [
+        57.19007449899999,
+        64.95540833400005
+      ],
+      "server_flags": {
+        "TERMITE_SERVER_GENERATE_TIMING": "1",
+        "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+        "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+        "TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE": "1",
+        "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+        "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+        "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+        "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+        "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+        "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+        "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+        "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "0",
+        "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0"
+      }
+    },
+    {
+      "case": "mtp2fastbonusinputtailseed",
+      "raw_directory": "seeded-mtp-2-mtp2fastbonusinputtailseed",
+      "wall_seconds": [
+        61.9496425,
+        58.824015083000006
+      ],
+      "completion_tokens_per_pass": [
+        4016,
+        4016
+      ],
+      "changed_ordinary_pages": [
+        {
+          "iteration": 0,
+          "document": "attention",
+          "page": 6,
+          "completion_tokens": 701,
+          "ordinary_completion_tokens": 742
+        },
+        {
+          "iteration": 1,
+          "document": "attention",
+          "page": 6,
+          "completion_tokens": 701,
+          "ordinary_completion_tokens": 742
+        }
+      ],
+      "truncated_at_cap_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_steps": 1488,
+          "cached_seeds": 1475,
+          "verify_calls": 1480,
+          "verify_rows": 2960,
+          "materializations": 1475,
+          "corrections": 421,
+          "bonus": 1054,
+          "draft_ns": 6987752724,
+          "verify_ns": 24924162768,
+          "materialize_ns": 18766363245
+        },
+        {
+          "draft_steps": 1488,
+          "cached_seeds": 1475,
+          "verify_calls": 1480,
+          "verify_rows": 2960,
+          "materializations": 1475,
+          "corrections": 421,
+          "bonus": 1054,
+          "draft_ns": 6522915493,
+          "verify_ns": 24216211353,
+          "materialize_ns": 18106762726
+        }
+      ],
+      "seven_matching_pages_seconds": [
+        51.859766001,
+        49.437690791999984
+      ],
+      "server_flags": {
+        "TERMITE_SERVER_GENERATE_TIMING": "1",
+        "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+        "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+        "TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE": "1",
+        "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+        "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+        "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+        "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+        "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+        "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+        "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+        "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "0",
+        "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "1"
+      }
+    },
+    {
+      "case": "mtp2fastbonusinputtailcontrol",
+      "raw_directory": "seeded-mtp-3-mtp2fastbonusinputtailcontrol",
+      "wall_seconds": [
+        73.745993334,
+        80.741729
+      ],
+      "completion_tokens_per_pass": [
+        4057,
+        4057
+      ],
+      "changed_ordinary_pages": [],
+      "truncated_at_cap_outputs": 0,
+      "phases_per_pass": [
+        {
+          "draft_steps": 3206,
+          "cached_seeds": 0,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850,
+          "draft_ns": 15694865172,
+          "verify_ns": 21424949484,
+          "materialize_ns": 25322914530
+        },
+        {
+          "draft_steps": 3206,
+          "cached_seeds": 0,
+          "verify_calls": 1251,
+          "verify_rows": 2502,
+          "materializations": 1947,
+          "corrections": 1097,
+          "bonus": 850,
+          "draft_ns": 18699228293,
+          "verify_ns": 22468598131,
+          "materialize_ns": 27043147829
+        }
+      ],
+      "seven_matching_pages_seconds": [
+        61.295851082999995,
+        66.38187308199998
+      ],
+      "server_flags": {
+        "TERMITE_SERVER_GENERATE_TIMING": "1",
+        "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+        "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+        "TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE": "1",
+        "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+        "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+        "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+        "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+        "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+        "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+        "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+        "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "0",
+        "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "1",
+        "TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "0",
+        "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0"
+      }
+    }
+  ],
+  "frame_isolation": {
+    "scope": "Attention page 6, full warm page then 1 measured full generation, same frozen build and prompt",
+    "runs": [
+      {
+        "case": "mtp2fastbonusseed",
+        "seconds": [
+          11.544473374999999
+        ],
+        "completion_tokens": 701,
+        "matches_ordinary_text": false,
+        "input_frame": "0",
+        "tail_frame": "0"
+      },
+      {
+        "case": "mtp2fastbonusinputseed",
+        "seconds": [
+          12.290544083000002
+        ],
+        "completion_tokens": 701,
+        "matches_ordinary_text": false,
+        "input_frame": "1",
+        "tail_frame": "0"
+      },
+      {
+        "case": "mtp2fastbonustailseed",
+        "seconds": [
+          13.732072417000001
+        ],
+        "completion_tokens": 701,
+        "matches_ordinary_text": false,
+        "input_frame": "0",
+        "tail_frame": "1"
+      }
+    ],
+    "result": "All three seed variants omit the same paragraph (701 vs 742 tokens), including with input/tail frames both disabled. These frame changes do not explain the seeded parity failure."
+  },
+  "integration_source_revision": "7c42120025e2536f7225572c659630f62777b555",
+  "validation": {
+    "mtp_and_decoder_regressions": {
+      "selected": 48,
+      "passed": 48,
+      "skipped": 0
+    },
+    "format_license_whitespace": "passed",
+    "production_build": "ReleaseFast bench-server passed"
+  },
+  "integration_binary_sha256": "a5933613555a34a39879a76d8848bbd9190ec0ecbfaa6fb36da5d79f9acdd014"
+}

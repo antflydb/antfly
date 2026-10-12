@@ -984,6 +984,29 @@ machine timing drift prevents an additional end-to-end speed claim.
 `ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME=1` also qualifies canonical one-token
 hidden/choice recovery past the local-attention window. K=2, including bonus
 acceptance, matched the complete OCR corpus but did not pass the speed gate.
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME=1` starts the verification
+frame before token embedding and PLE preparation for dense Gemma4 suffixes of
+two to four tokens. The direct decoder adopts that frame; preparation failures
+cancel only a frame owned by this call. Existing debug/compare and direct/frame
+disable policies still apply. Pair it with the existing
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME=1` to keep prepared vocabulary
+readout and argmax in the frame too. Both options default off, and their matching
+`TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_{INPUT,TAIL}_FRAME=1` switches override
+the enables. This changes command framing, retaining the existing weights and
+arithmetic. The target vocabulary head is already Q8_0; the earlier BF16-head
+attribution was a PLE projection.
+`ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET=1` is a separate experimental opt-in for
+fixed K=2 resident greedy drafting with `ANTFLY_GEMMA4_MTP_ADAPTIVE_K=0`, final
+hidden states, default constant position and canonical recovery. Recovery
+retains the normalized target activation paired with its cached next choice;
+the next round uses that known choice as its first candidate and runs one
+assistant prediction for the second. Initial/predictor-only activations do not
+qualify, deferred recovery and other K values use existing behavior. The
+`cached_seeds` phase counter distinguishes known target choices from physical
+`draft_steps`. The total two-token verification shape and target acceptance
+remain unchanged. Full-corpus OCR qualification omits the last paragraph on
+one page with this option enabled, including with both frame opt-ins disabled;
+the seed lane has not passed the output-parity gate and defaults off.
 See the design doc below for source pins, flags and measured limits.
 
 [The OCR optimization investigation](../../../docs/design/inference/gemma4-ocr-optimization.md)

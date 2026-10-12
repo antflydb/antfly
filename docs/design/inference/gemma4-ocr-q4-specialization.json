@@ -33,7 +33,7 @@
     "id": "ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07",
     "assistant_revision": "2d874ef7d29f9a30599a1e4b3c1cbc9595f005df",
     "gguf_tied_embedding": "Q8_0, GGML type 8, [1536,262144]; no separate output.weight",
-    "antfly_prepared_head": "BF16; previously confirmed by actual dispatch tracing",
+    "antfly_prepared_head": "Q8_0; corrected by a subsequent shape/dispatch audit. The earlier BF16 attribution was the 1536x8960 PLE projection, not the 1536x262144 vocabulary head.",
     "verified_q4_ffn_dimensions": {
       "gate": [
         1536,
