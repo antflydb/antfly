@@ -587,7 +587,12 @@ const Parser = struct {
             const otherwise = if (self.keyword(.@"else")) try self.scalar(depth + 1, 0) else null;
             try self.expectKeyword(.end);
             left = try self.scalarNode(.{ .case_when = .{ .branches = try branches.toOwnedSlice(self.alloc), .otherwise = otherwise } });
-        } else if ((self.peek(.minus) or self.peek(.plus)) and !(self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number)) {
+        } else if ((self.peek(.minus) or self.peek(.plus)) and !(self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number and
+            (self.pos + 2 >= self.tokens.len or self.tokens[self.pos + 2].kind != .colon_colon)))
+        {
+            // A postfix cast binds before unary sign. Folding a signed token
+            // first would admit overflowing positive casts and erase -0.0.
+            // Plain signed literals still use value() for exact int64 minima.
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });

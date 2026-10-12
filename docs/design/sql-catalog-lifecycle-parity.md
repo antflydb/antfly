@@ -3987,3 +3987,48 @@ stopped without touching other owners. A mistyped HTTP build-step invocation
 was replaced by the successful `public-api-parity-test` run, not counted as
 qualification. Cache GC was previewed only to avoid disrupting other active
 worktrees. No remote CI or complete original-case parity claim.
+
+### Shared typed numeric function execution
+
+Query execution now delegates ABS, CEIL, FLOOR, ROUND, TRUNC, SIGN and SQRT to
+one transport-neutral numeric-function boundary. Exact NUMERIC never converts
+through float: quantization retains PostgreSQL display scale and ties-away
+rounding; float rounding retains ties-to-even and signed zero. ABS and SIGN
+can borrow pinned limbs without allocating a numeric payload. Result encoding,
+retained-memory admission, overload resolution and SQL NULL belong to callers;
+arithmetic work and cancellation use their existing invocation context.
+
+Strict numeric calls evaluate selected arguments before NULL propagation. A
+NULL first argument no longer hides division-by-zero in a scale or divisor
+expression. Context capture follows argument evaluation so nested expressions
+cannot obtain another copy of the remaining work budget.
+
+An independent PostgreSQL 18 oracle supplies 210 complete numeric/float function
+contracts, four selected-argument error contracts and eleven cast-precedence
+witnesses. Float witnesses compare float8send bits, including signed zero and
+specials; NUMERIC witnesses compare exact text, large integers and scale limits.
+Allocation-fault sweeps cover every function; cancellation checks cover every
+observed poll cut and retain sticky failure. Unary sign now binds after postfix
+casts: unparenthesized overflowing positive casts reject before negation, while
+parenthesized signed integer minima remain valid.
+
+This shared boundary is the prerequisite for durable numeric-function VM
+activation, not a claim that it has shipped. Remaining activation requires
+typed durable operations, SQL lowering, OpenAPI-generated enums/clients, a
+reader/catalog fence and generated/default/CHECK/index/restart qualification.
+JSON extraction additionally needs a typed JSON operand boundary that preserves
+SQL NULL versus JSON null and shares decoded source ownership across a prepared
+row/expression set. String aliases or per-function JSON reparsing are not that
+architecture. Original dispositions remain unchanged, with 898 unresolved.
+
+Numeric-function checkpoint qualification: the final-source full SQL Debug
+gate passed 763 main-owner and 226 linked tests, with three existing skips and
+no failures/leaks (21/21 build steps). Focused ReleaseFast passed six shared
+numeric tests. Mounted NUMERIC/expression HTTP qualification passed two tests
+(80/80 steps). Nine independently regenerated PostgreSQL oracle tests verified
+all 210 function contracts, four selected-argument failures and eleven cast
+precedence witnesses. Formatting, source-catalog freshness, inventory integrity
+and the 2,051-file Apache boundary passed. No public contract changed, so client
+generation was not required. Cache GC remains preview-only while unrelated
+worktrees have active builds. This is neither remote CI qualification nor
+durable numeric-function activation or complete original-case parity.

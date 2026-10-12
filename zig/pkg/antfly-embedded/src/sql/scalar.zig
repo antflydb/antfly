@@ -516,6 +516,13 @@ test "SQL transaction timestamp precision is demanded lazily and keeps exact pub
     try std.testing.expectError(error.SqlTypeMismatch, timestampResult(invalid, .datetime));
 }
 
+fn numericKernelFunction(function: Function) ?@import("numeric_functions.zig").Function {
+    return switch (function) {
+        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("numeric_functions.zig").Function, @tagName(tag)),
+        else => null,
+    };
+}
+
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
         .regexp_like => .regexp_like,
@@ -4291,45 +4298,28 @@ const Evaluator = struct {
 
     fn numericFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) !Datum {
         const exact = @import("numeric_value.zig");
-        const first = try self.runDatum(args[0], depth);
-        if (first.sql_null) return .{};
-        const input = try self.castDatumBuiltin(first, self.program.instructions[args[0]].type.element_type, .numeric);
-        if (function == .mod) {
-            const second = try self.runDatum(args[1], depth);
-            if (second.sql_null) return .{};
-            return self.numericArithmetic(.modulo, input, try self.castDatumBuiltin(second, self.program.instructions[args[1]].type.element_type, .numeric));
+        var selected: [2]Datum = undefined;
+        var has_null = false;
+        for (args, 0..) |arg, i| {
+            selected[i] = try self.runDatum(arg, depth);
+            has_null = has_null or selected[i].sql_null;
         }
-        const value = input.numeric.?.*;
-        if (function == .abs or function == .sign) {
-            try self.charge(@sizeOf(exact.Value));
-            const result = try self.alloc.create(exact.Value);
-            if (function == .abs) {
-                result.* = value;
-                result.negative = false;
-                if (result.kind == .negative_infinity) result.kind = .positive_infinity;
-            } else result.* = if (value.kind == .nan) .{ .kind = .nan } else if (value.isZero()) .{} else .{ .digits = &.{1}, .negative = value.negative or value.kind == .negative_infinity };
-            return Datum.typedNumeric(result);
-        }
-        const scale: i32 = if (args.len == 2) selected: {
-            const requested = try self.runDatum(args[1], depth);
-            if (requested.sql_null) return .{};
-            if (requested.value != .integer) return error.SqlTypeMismatch;
-            break :selected std.math.cast(i32, requested.value.integer) orelse return error.SqlNumericOutOfRange;
+        // Strict calls evaluate selected arguments before NULL propagation.
+        // A NULL value must not hide an error in its scale/divisor expression.
+        if (has_null) return .{};
+        const input = try self.castDatumBuiltin(selected[0], self.program.instructions[args[0]].type.element_type, .numeric);
+        if (function == .mod) return self.numericArithmetic(.modulo, input, try self.castDatumBuiltin(selected[1], self.program.instructions[args[1]].type.element_type, .numeric));
+        const scale: i32 = if (args.len == 2) requested_scale: {
+            if (selected[1].value != .integer) return error.SqlTypeMismatch;
+            break :requested_scale std.math.cast(i32, selected[1].value.integer) orelse return error.SqlNumericOutOfRange;
         } else 0;
-        // Evaluate both arguments before borrowing the remaining work budget.
-        // Nested scale expressions must not receive a second copy of it.
+        // Borrow remaining work only after argument evaluation. Nested scale
+        // expressions never receive a second copy of the invocation budget.
         var ctx = self.numericContext();
-        var result = if (function == .sqrt) try exact.squareRoot(&ctx, value) else try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
+        const functions = @import("numeric_functions.zig");
+        const operation = numericKernelFunction(function) orelse return error.InvalidSqlProgram;
+        var result = try functions.numeric(&ctx, operation, input.numeric.?.*, scale);
         errdefer result.deinit();
-        if (function == .ceil or function == .floor) {
-            const order = try exact.order(&ctx, value, result.value);
-            if ((function == .ceil and order == .gt) or (function == .floor and order == .lt)) {
-                const one: exact.Value = .{ .digits = &.{1} };
-                const adjusted = if (function == .ceil) try exact.add(&ctx, result.value, one) else try exact.subtract(&ctx, result.value, one);
-                result.deinit();
-                result = adjusted;
-            }
-        }
         try self.charge(@sizeOf(exact.Value) + result.allocation.len * 2);
         const owned = try self.alloc.create(exact.Value);
         owned.* = result.value;
@@ -4676,25 +4666,18 @@ const Evaluator = struct {
             },
             .abs => return switch (first) {
                 .integer => |v| .{ .integer = if (v < 0) std.math.negate(v) catch return error.SqlNumericOutOfRange else v },
-                .float => |v| .{ .float = @abs(v) },
+                .float => |v| .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .abs, v) },
                 else => error.SqlTypeMismatch,
             },
-            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) .{ .float = switch (function) {
-                .ceil => @ceil(first.float),
-                .floor => @floor(first.float),
-                .trunc => @trunc(first.float),
-                else => roundTiesEven(first.float),
-            } } else error.SqlTypeMismatch,
+            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), numericKernelFunction(function).?, first.float) } else error.SqlTypeMismatch,
             .sign => return switch (first) {
                 .integer => |value| .{ .integer = if (value < 0) -1 else if (value > 0) 1 else 0 },
-                .float => |value| .{ .float = if (value < 0) -1 else if (value > 0) 1 else 0 },
+                .float => |value| .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .sign, value) },
                 else => error.SqlTypeMismatch,
             },
             .sqrt => {
                 const v = if (first == .float) first.float else try asFloat(first);
-                if (v < 0) return error.SqlInvalidPowerArgument;
-                if (std.math.isNan(v) or std.math.isPositiveInf(v)) return .{ .float = v };
-                return finite(@sqrt(v));
+                return .{ .float = try @import("numeric_functions.zig").floating(self.workOwner(), .sqrt, v) };
             },
             .power => {
                 const base = try arithmeticNumber(first);
@@ -5063,14 +5046,6 @@ const Evaluator = struct {
         return j == glob.len;
     }
 };
-
-fn roundTiesEven(value: f64) f64 {
-    const magnitude = @abs(value);
-    const integral = @floor(magnitude);
-    const fraction = magnitude - integral;
-    const rounded = if (fraction > 0.5 or (fraction == 0.5 and @mod(integral, 2) != 0)) integral + 1 else integral;
-    return std.math.copysign(rounded, value);
-}
 
 fn finite(value: f64) !Json {
     if (!std.math.isFinite(value)) return error.SqlNumericOutOfRange;
@@ -5691,6 +5666,81 @@ test "SQL NUMERIC square root retains domain diagnostics strict nulls and reques
     const text = try exact.format(&context, result.numeric.?.*);
     defer a.free(text);
     try std.testing.expectEqualStrings("1.414213562373095", text);
+}
+
+test "SQL shared numeric functions preserve PostgreSQL overloads values NULLs and selected errors" {
+    const a = std.testing.allocator;
+    const Entry = struct { domain: enum { numeric, float64 }, input: ?[]const u8, sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const Strict = struct { sql: []const u8, sqlstate: []const u8 };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry, strict_errors: []const Strict }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 210), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        errdefer std.debug.print("numeric function SQL oracle: {s}\n", .{entry.sql});
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{.string}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{if (entry.input) |input| .{ .string = input } else .null}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(entry.expected == null, result.sql_null);
+        if (result.sql_null) continue;
+        if (entry.domain == .numeric) {
+            try std.testing.expectEqual(arrays.ElementType.numeric, program.output_type.element_type.?);
+            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+            try std.testing.expectEqualStrings(entry.expected.?, try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+        } else {
+            try std.testing.expectEqual(arrays.ElementType.float64, program.output_type.element_type.?);
+            var hex: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(entry.expected.?, try std.fmt.bufPrint(&hex, "{x:0>16}", .{@as(u64, @bitCast(result.value.float))}));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fixture.value.strict_errors.len);
+    for (fixture.value.strict_errors) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{.integer}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = program.evaluate(arena.allocator(), &.{}, &.{.{ .integer = 0 }}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "SQL shared numeric functions preserve PostgreSQL unary cast precedence" {
+    const a = std.testing.allocator;
+    const Entry = struct { sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const fixture = try std.json.parseFromSlice(struct { cast_precedence: []const Entry }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 11), fixture.value.cast_precedence.len);
+    for (fixture.value.cast_precedence) |entry| {
+        const sql = try std.fmt.allocPrint(a, "({s})::text", .{entry.sql});
+        defer a.free(sql);
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqualStrings(entry.expected.?, result.value.string);
+    }
 }
 
 test "SQL NUMERIC prepared literals rounding and integer array probes require no hot allocation" {
