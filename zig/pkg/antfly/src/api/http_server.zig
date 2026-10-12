@@ -7972,7 +7972,8 @@ pub const ApiHttpServer = struct {
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
-        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null)
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
+            request.trusted_principal == null)
             return .allowed;
         if (self.cfg.auth_enabled and
             self.cfg.user_manager == null and
@@ -37632,11 +37633,13 @@ test "api http server serves document lookup through mcp tool" {
                 .key = "docs/getting-started.md",
                 .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
             },
+            .{ .key = "docs/private.md", .value = "{\"title\":\"private\",\"body\":\"hidden\"}" },
         },
         .timestamp_ns = 4321,
     });
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -37674,7 +37677,7 @@ test "api http server serves document lookup through mcp tool" {
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
-        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"title":"alpha"}}}}}},"iat":{d},"exp":{d}}}
     ,
         .{ now, now + 60 },
     );
@@ -37684,19 +37687,68 @@ test "api http server serves document lookup through mcp tool" {
 
     var server = ApiHttpServer.init(
         std.testing.allocator,
-        .{
-            .auth_enabled = true,
-            .trusted_principal_secret = trusted_principal_secret,
-            .trusted_principal_issuer = "trusted-upstream",
-        },
+        .{},
         source.iface(),
         table_source.source(),
-        null,
+        table_write_source.source(),
     );
     defer server.deinit();
     const trusted_principal_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = token },
     };
+
+    // Cloud supplies this header even when the instance accidentally starts
+    // without its verifier. Neither initialization nor a retained anonymous
+    // session may turn that identity into unrestricted standalone access.
+    var missing_verifier_init = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer missing_verifier_init.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_init.status);
+
+    var anonymous_init = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer anonymous_init.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), anonymous_init.status);
+    const anonymous_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = anonymous_init.headers[0].value },
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    const batch_call = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{\"permission_probe\":{\"content\":\"Synthetic permission probe\"}}}}}";
+    var missing_verifier_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &anonymous_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer missing_verifier_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_write.status);
+    try std.testing.expect((try db.get(alloc, "permission_probe")) == null);
+
+    var missing_verifier_rest = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/db/v1/tables/docs/batch",
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"inserts\":{\"permission_probe\":{\"content\":\"Synthetic permission probe\"}}}",
+    });
+    defer missing_verifier_rest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_rest.status);
+    try std.testing.expectEqual(kernel_abi.AuthorizationDecision.unauthorized, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .read));
+
+    // A configured verifier activates authentication without requiring a
+    // local user manager or auth_enabled; valid scoped reads remain usable.
+    server.cfg.trusted_principal_secret = trusted_principal_secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
 
     var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -37737,6 +37789,100 @@ test "api http server serves document lookup through mcp tool" {
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, call_resp.body, "{\"title\":\"alpha\"}");
+
+    var hidden_read = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/private.md\"}}}",
+    });
+    defer hidden_read.deinit(alloc);
+    try mcp.testing.expectToolResultTextContains(alloc, hidden_read.body, true, "not found");
+
+    var denied_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer denied_write.deinit(alloc);
+    var parsed_denied_write = try mcp.testing.parseJsonRpcResponse(alloc, denied_write.body);
+    defer parsed_denied_write.deinit();
+    try std.testing.expect(parsed_denied_write.value.@"error" != null);
+    try std.testing.expect(parsed_denied_write.value.result == null);
+    try std.testing.expect((try db.get(alloc, "permission_probe")) == null);
+
+    var denied_scope = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"nonexistent_outside_grant\",\"queryRequest\":{\"full_text_search\":{\"match_all\":{}}}}}}",
+    });
+    defer denied_scope.deinit(alloc);
+    try mcp.testing.expectToolResultTextContains(alloc, denied_scope.body, true, "permission denied");
+
+    // Session state is transport state, not a captured principal: an admin
+    // can write, and the next read-only request cannot reuse that authority.
+    const admin_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"user:admin","tenant":"inst-1","tables":["docs"],"operations":["admin"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(admin_payload);
+    const admin_token = try encodeTrustedPrincipalToken(alloc, trusted_principal_secret, admin_payload);
+    defer alloc.free(admin_token);
+    const admin_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = admin_token },
+    };
+    var admin_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &admin_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer admin_write.deinit(alloc);
+    try mcp.testing.expectToolStructuredSubset(alloc, admin_write.body, "{\"inserted\":1}");
+    const inserted = (try db.get(alloc, "permission_probe")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(inserted);
+    try std.testing.expectEqualStrings("{\"content\":\"Synthetic permission probe\"}", inserted);
+
+    var denied_delete = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"deletes\":[\"permission_probe\"]}}}",
+    });
+    defer denied_delete.deinit(alloc);
+    var parsed_denied_delete = try mcp.testing.parseJsonRpcResponse(alloc, denied_delete.body);
+    defer parsed_denied_delete.deinit();
+    try std.testing.expect(parsed_denied_delete.value.@"error" != null);
+    try std.testing.expect(parsed_denied_delete.value.result == null);
+    const retained = (try db.get(alloc, "permission_probe")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(inserted, retained);
+
+    const invalid_token = try encodeTrustedPrincipalToken(alloc, "wrong-secret", admin_payload);
+    defer alloc.free(invalid_token);
+    const invalid_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = invalid_token },
+    };
+    var invalid_signature = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &invalid_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer invalid_signature.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), invalid_signature.status);
 }
 
 test "api http server serves fielded full-text search through mcp tools" {
