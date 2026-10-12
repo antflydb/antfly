@@ -22,7 +22,15 @@ pub const Limits = struct {
     max_packets: usize = 8192,
     max_pes_bytes: usize = 16 * 1024 * 1024,
 };
-pub const Packet = struct { offset: usize, size: usize, pts: i64, dts: i64 };
+pub const Packet = struct {
+    offset: usize,
+    size: usize,
+    pts: i64,
+    dts: i64,
+    /// PTS/DTS apply only to the first access unit commencing in this PES.
+    /// Untimed continuation PES records carry no inferred clock (numeric zeros).
+    has_timestamp: bool = true,
+};
 const Continuity = struct {
     counter: ?u4 = null,
     start: bool = false,
@@ -223,18 +231,23 @@ const Parser = struct {
         const header = @as(usize, bytes[8]) + 9;
         if (header > end) return error.TruncatedTransportPes;
         const flags = bytes[7] >> 6;
-        if (flags != 2 and flags != 3) return error.MissingTransportTimestamp;
-        if (bytes[8] < (if (flags == 3) @as(u8, 10) else 5)) return error.MalformedTransportPes;
-        const pts_raw = try timestamp(bytes[9..14], if (flags == 3) 3 else 2);
-        const dts_raw = if (flags == 3) try timestamp(bytes[14..19], 1) else pts_raw;
-        const dts = try unwrap(dts_raw, self.state.last_dts);
-        if (self.state.last_dts) |last| if (dts < last) return error.TransportTimestampRegression;
-        const pts = std.math.add(i64, dts, delta(pts_raw, dts_raw)) catch return error.ResourceLimitExceeded;
+        if (flags == 1) return error.MalformedTransportPes;
+        const timed = flags != 0;
+        var pts: i64 = 0;
+        var dts: i64 = 0;
+        if (timed) {
+            if (bytes[8] < (if (flags == 3) @as(u8, 10) else 5)) return error.MalformedTransportPes;
+            const pts_raw = try timestamp(bytes[9..14], if (flags == 3) 3 else 2);
+            const dts_raw = if (flags == 3) try timestamp(bytes[14..19], 1) else pts_raw;
+            dts = try unwrap(dts_raw, self.state.last_dts);
+            if (self.state.last_dts) |last| if (dts < last) return error.TransportTimestampRegression;
+            pts = std.math.add(i64, dts, delta(pts_raw, dts_raw)) catch return error.ResourceLimitExceeded;
+        }
         if (header == end) return error.MalformedTransportPes;
         if (self.packets.items.len >= self.limits.max_packets or end - header > self.limits.max_bytes -| self.output.items.len) return error.ResourceLimitExceeded;
-        try self.packets.append(self.allocator, .{ .offset = self.output.items.len, .size = end - header, .dts = dts, .pts = pts });
+        try self.packets.append(self.allocator, .{ .offset = self.output.items.len, .size = end - header, .dts = dts, .pts = pts, .has_timestamp = timed });
         try self.output.appendSlice(self.allocator, bytes[header..end]);
-        self.state.last_dts = dts;
+        if (timed) self.state.last_dts = dts;
         self.pes.clearRetainingCapacity();
         self.pes_started = false;
     }
@@ -418,6 +431,8 @@ fn fuzzSeed(comptime bytes: []const u8) []const u8 {
 const fuzz_seeds = .{
     fuzzSeed(@embedFile("../testdata/transport/closed.ts")),
     fuzzSeed(@embedFile("../testdata/transport/bframes.ts")),
+    fuzzSeed(@embedFile("../testdata/transport/closed-split.ts")),
+    fuzzSeed(@embedFile("../testdata/transport/bframes-split.ts")),
 };
 test "transport fuzz accepted seeds retain admitted packet bounds" {
     inline for (fuzz_seeds) |seed| {
@@ -440,7 +455,7 @@ test "transport fuzz bounded PSI PES and continuity" {
             const bytes = storage[0..length];
             var pool = admission.Pool{ .limits = .{ .host_bytes = 4 * 1024 * 1024 } };
             defer std.debug.assert(std.meta.eql(pool.snapshot(), admission.Resources{}));
-            var result = demux(std.testing.allocator, bytes, .{}, .{ .max_bytes = 256 * 1024, .max_packets = 256, .max_pes_bytes = 128 * 1024 }, .{}, &pool) catch return;
+            var result = demux(std.testing.allocator, bytes, .{}, .{ .max_bytes = 256 * 1024, .max_packets = 1024, .max_pes_bytes = 128 * 1024 }, .{}, &pool) catch return;
             defer result.deinit();
             for (result.packets) |packet| {
                 try std.testing.expect(packet.offset <= result.bytes.len);
@@ -467,4 +482,32 @@ test "transport table completeness includes every numbered section" {
     try std.testing.expect(!table.complete());
     section_bytes[7] = 1;
     try std.testing.expectError(error.MalformedTransportStream, table.accept(&section_bytes));
+}
+
+test "transport untimed continuation PES preserve original payload and timestamp anchors" {
+    const a = std.testing.allocator;
+    inline for (.{ "closed", "bframes" }) |name| {
+        var original = try demux(a, @embedFile("../testdata/transport/" ++ name ++ ".ts"), .{}, .{}, .{}, null);
+        defer original.deinit();
+        var split = try demux(a, @embedFile("../testdata/transport/" ++ name ++ "-split.ts"), .{}, .{}, .{}, null);
+        defer split.deinit();
+        try std.testing.expectEqualSlices(u8, original.bytes, split.bytes);
+        try std.testing.expect(split.packets.len > original.packets.len);
+        var clock: usize = 0;
+        for (split.packets) |packet| {
+            if (packet.has_timestamp) {
+                try std.testing.expect(clock < original.packets.len);
+                const expected = original.packets[clock];
+                try std.testing.expectEqual(expected.offset, packet.offset);
+                try std.testing.expectEqual(expected.pts, packet.pts);
+                try std.testing.expectEqual(expected.dts, packet.dts);
+                clock += 1;
+            } else {
+                try std.testing.expectEqual(@as(i64, 0), packet.pts);
+                try std.testing.expectEqual(@as(i64, 0), packet.dts);
+            }
+        }
+        try std.testing.expectEqual(original.packets.len, clock);
+        try std.testing.expectEqual(original.next_state.last_dts, split.next_state.last_dts);
+    }
 }

@@ -1556,8 +1556,8 @@ Retry, discontinuity, held leases, allocation-failure cleanup and production
 HTTP authentication are exercised. See the source/binary-bound receipts in
 `../media/testdata/transport/validation`.
 
-PES/access-unit alignment, one complete NAL sequence per PES and per-segment
-PAT/PMT are current restrictions. Durations use adjacent DTS deltas; an isolated
+Per-segment PAT/PMT and recoverable access-unit clocks remain restrictions.
+AUD-delimited NAL/access units can now span PES records, as described below. Durations use adjacent DTS deltas; an isolated
 packet needs an explicit duration (HLS can supply EXTINF). Broader VFR terminal
 policy, TS SAR/display qualification, external TS maps, NALs spanning PES and
 multiple access units per PES remain open. Raw TS/model-input integration and
@@ -1603,3 +1603,45 @@ TS/MP4 vectors are identical within each backend. Four concurrent-load requests
 per backend return 200, with disconnect/retry checks recorded; these small
 shared-host checks do not establish sustained production capacity. Corrupt PAT
 requests return preflight HTTP 400 on all three backends without embeddings.
+
+
+### AVC access units across TS PES boundaries
+
+Native TS demuxing now preserves whether a PES actually carries timestamps.
+Untimed continuation records carry no inferred PTS/DTS and do not advance the
+unwrap clock. The AVC adapter scans the concatenated elementary bytes, so start
+codes, AUD/SPS/PPS and coded slices may span any number of PES packets. AUDs
+identify complete access units independently of transport boundaries. Clock
+ownership follows the PES containing the beginning of the AUD byte-stream NAL;
+one PES timestamp cannot be reused for multiple access units, and an unowned
+clock is rejected. Annex B leading zero bytes remain accepted. Normalized reader
+packets and durations are indexed by access units rather than PES records.
+Single-access-unit HLS duration can come from EXTINF even when that unit spans
+multiple PES packets. Metadata/scratch reservations and cancellation cover the
+extra scans and access-unit index; retained readers remain independently owned.
+
+The independent repacketizer creates 480 PES records for 60 closed-GOP pictures
+and 158 for 20 B-frame pictures, deliberately splitting prefixes, parameter sets
+and coded bytes. FFprobe retains identical complete access-unit hashes and
+FFmpeg retains every NV12 picture. FFprobe's frame parser drops timestamps for
+59/19 pictures in these tiny split-prefix fixtures: the manifest records this
+limitation rather than claiming complete FFprobe clock agreement. Native checks
+verify all anchors against the original pinned independent timing oracle, and
+model producer patches match the original MP4 and aligned TS bytes exactly.
+
+This follows H.222.0 sections 2.4.3.7 and 2.14.1: AVC timestamps apply to the
+first access unit commencing in a PES and AVC carriage requires AUDs. See
+[ITU H.222.0](https://www.itu.int/rec/dologin_pub.asp?id=T-REC-H.222.0-201410-S%21%21PDF-E&lang=e&type=items).
+Legacy PES-aligned streams without AUD remain supported. Multiple access units
+sharing a PES without their own recoverable clocks still fail explicitly;
+SEI/HRD/POC timing inference, cross-segment partial-unit buffering, external TS
+maps and broader real-world/display qualification remain work. This continuation
+does not establish arbitrary transport or pretrained split-layout conformance.
+
+Final assembly gates pass 116 media tests and seven existing HTTP tests on both
+platforms, plus authenticated split-PES TS HTTP. Video gates pass 188 macOS
+tests (two skipped) and 163 actual Linux ARM64 tests (27 skipped); model gates
+pass 27 macOS and 25 Linux tests (two Metal skips). Independent fresh campaigns
+pass 103,200 demux and 110,618 normalization runs with four positive serialized
+seeds each. Source/binary/fixture/report bindings are recorded in
+`zig/lib/media/testdata/transport/assembly-validation`.

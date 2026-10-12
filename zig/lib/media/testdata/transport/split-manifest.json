@@ -1,0 +1,23 @@
+{
+  "generator_sha256": "b8414c3cdaf320580b4b53d279b2c4ecb4e86e94e546c112dc7710e97fe6f2ae",
+  "cases": {
+    "closed": {
+      "source_sha256": "00f54b524dc404758c1b0044fd6d3c86af9874be7836025f79764f28977bb185",
+      "transport_sha256": "a1266e77a9946650ffae422bf69d3baec84f5dfc2f3a2eb5a723ca5f6f22a20c",
+      "access_units": 60,
+      "pes_packets": 480,
+      "oracle_sha256": "60bb59f480aa2043e4239c2c90bd845f2bb24fddf5e2586a6640d0c434f9ae20",
+      "independent": "FFprobe complete AU bytes and FFmpeg every NV12 picture; clocks preserved from original independent oracle",
+      "ffprobe_missing_timestamp_packets": 59
+    },
+    "bframes": {
+      "source_sha256": "bdc83e969c31c267bc019d4730d47ee8cc196504e89496861a46b28982f1e941",
+      "transport_sha256": "b9670802482f244f5b74d9c718f936c4b4ee5c7a1c1b2359bece10bfc69d3487",
+      "access_units": 20,
+      "pes_packets": 158,
+      "oracle_sha256": "c118acb109171555e84f07faf372c363244d535e9e00edf35dbdb2460747078e",
+      "independent": "FFprobe complete AU bytes and FFmpeg every NV12 picture; clocks preserved from original independent oracle",
+      "ffprobe_missing_timestamp_packets": 19
+    }
+  }
+}

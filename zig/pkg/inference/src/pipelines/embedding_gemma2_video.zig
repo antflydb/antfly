@@ -1320,9 +1320,11 @@ test "embeddinggemma2 video TS producer preserves prepared MP4 patches and drain
     inline for (.{ "closed", "bframes" }) |name| {
         const original = try CapturePatches.run(@embedFile("../testdata/video/" ++ name ++ ".mp4"));
         defer std.testing.allocator.free(original);
-        const normalized = try CapturePatches.run(@embedFile("../testdata/video/" ++ name ++ ".ts"));
-        defer std.testing.allocator.free(normalized);
-        try std.testing.expect(original.len > 0);
-        try std.testing.expectEqualSlices([32]u8, original, normalized);
+        inline for (.{ ".ts", "-split.ts" }) |suffix| {
+            const normalized = try CapturePatches.run(@embedFile("../testdata/video/" ++ name ++ suffix));
+            defer std.testing.allocator.free(normalized);
+            try std.testing.expect(original.len > 0);
+            try std.testing.expectEqualSlices([32]u8, original, normalized);
+        }
     }
 }

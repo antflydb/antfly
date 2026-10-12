@@ -17,7 +17,7 @@ const std = @import("std");
 const http = @import("httpx");
 const media = @import("antfly_media");
 const video = @import("antfly_video");
-test "production HTTP TS HLS authenticates playlist and media then decodes native AVC" {
+test "production HTTP split-PES TS HLS authenticates playlist and media then decodes native AVC" {
     const a = std.testing.allocator;
     const Verify = struct {
         fn auth(request: http.testing_mod.RequestInfo) !void {
@@ -31,7 +31,7 @@ test "production HTTP TS HLS authenticates playlist and media then decodes nativ
     };
     var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
         .{ .path = "/ts/list.m3u8", .assert_request = Verify.auth, .respond = .{ .body = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:8\n#EXTINF:4,\nclosed.ts\n#EXT-X-ENDLIST\n" } },
-        .{ .path = "/ts/closed.ts", .assert_request = Verify.auth, .respond = .{ .body = @embedFile("testdata/transport/closed.ts") } },
+        .{ .path = "/ts/closed.ts", .assert_request = Verify.auth, .respond = .{ .body = @embedFile("testdata/transport/closed-split.ts") } },
     });
     defer server.deinit();
     var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });

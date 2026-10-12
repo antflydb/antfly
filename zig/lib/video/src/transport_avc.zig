@@ -24,6 +24,7 @@ pub const Options = struct {
     /// Bootstrap a continuation segment whose payload omits parameter sets.
     configuration: ?[]const u8 = null,
     last_duration_ticks: ?u32 = null,
+    single_access_unit_duration_ticks: ?u32 = null,
 };
 pub const Reader = struct {
     snapshot: *media.stream.Snapshot,
@@ -43,9 +44,12 @@ pub const Reader = struct {
 const Nals = struct {
     bytes: []const u8,
     cursor: usize = 0,
-    fn start(bytes: []const u8, offset: usize) ?struct { at: usize, payload: usize } {
+    last_start: usize = 0,
+    control: media.source.Control = .{},
+    fn start(bytes: []const u8, offset: usize, control: media.source.Control) !?struct { at: usize, payload: usize } {
         var i = offset;
         while (i + 3 <= bytes.len) : (i += 1) {
+            if (i % 4096 == 0) try control.check();
             if (bytes[i] != 0 or bytes[i + 1] != 0) continue;
             if (bytes[i + 2] == 1) return .{ .at = i, .payload = i + 3 };
             if (i + 4 <= bytes.len and bytes[i + 2] == 0 and bytes[i + 3] == 1) return .{ .at = i, .payload = i + 4 };
@@ -54,9 +58,10 @@ const Nals = struct {
     }
     fn next(self: *Nals) !?[]const u8 {
         if (self.cursor == self.bytes.len) return null;
-        const first = start(self.bytes, self.cursor) orelse return error.MalformedAnnexB;
+        const first = (try start(self.bytes, self.cursor, self.control)) orelse return error.MalformedAnnexB;
         for (self.bytes[self.cursor..first.at]) |value| if (value != 0) return error.MalformedAnnexB;
-        const following = start(self.bytes, first.payload);
+        self.last_start = first.at;
+        const following = try start(self.bytes, first.payload, self.control);
         var end = if (following) |value| value.at else self.bytes.len;
         while (end > first.payload and self.bytes[end - 1] == 0) end -= 1;
         if (end == first.payload or self.bytes[first.payload] & 128 != 0) return error.MalformedAnnexB;
@@ -67,16 +72,12 @@ const Nals = struct {
 fn configuration(a: std.mem.Allocator, demux: media.transport_stream.Demux, options: Options) ![]u8 {
     var sps: ?[]const u8 = null;
     var pps: ?[]const u8 = null;
-    for (demux.packets) |packet| {
+    var nals = Nals{ .bytes = demux.bytes, .control = options.stream.control };
+    while (try nals.next()) |nal| {
         try options.stream.control.check();
-        var nals = Nals{ .bytes = demux.bytes[packet.offset..][0..packet.size] };
-        while (try nals.next()) |nal| {
-            try options.stream.control.check();
-            if (nal[0] & 31 == 7 and sps == null) sps = nal;
-            if (nal[0] & 31 == 8 and pps == null) pps = nal;
-            if (nal[0] & 31 == 1 or nal[0] & 31 == 5) break;
-        }
-        if (sps != null and pps != null) break;
+        if (nal[0] & 31 == 7 and sps == null) sps = nal;
+        if (nal[0] & 31 == 8 and pps == null) pps = nal;
+        if (nal[0] & 31 == 1 or nal[0] & 31 == 2 or nal[0] & 31 == 5) break;
     }
     if (sps == null or pps == null) return a.dupe(u8, options.configuration orelse return error.MissingVideoParameterSet);
     if (sps.?.len < 4 or sps.?.len > 65535 or pps.?.len > 65535) return error.MalformedVideoConfig;
@@ -91,8 +92,73 @@ fn configuration(a: std.mem.Allocator, demux: media.transport_stream.Demux, opti
     @memcpy(out[offset + 2 ..], pps.?);
     return out;
 }
+const AccessUnits = struct {
+    allocator: std.mem.Allocator,
+    packets: []media.transport_stream.Packet,
+    reservation: media.admission.Token = .{},
+    fn deinit(self: *@This()) void {
+        self.allocator.free(self.packets);
+        self.reservation.deinit();
+    }
+};
+fn accessUnits(a: std.mem.Allocator, demux: media.transport_stream.Demux, options: Options) !AccessUnits {
+    var nals = Nals{ .bytes = demux.bytes, .control = options.stream.control };
+    var count: usize = 0;
+    while (try nals.next()) |nal| if (nal[0] & 31 == 9) {
+        if (nal.len != 2 or nal[0] & 0x60 != 0 or nal[1] & 31 != 16) return error.MalformedVideoPacket;
+        count += 1;
+        if (count > options.index.max_samples) return error.ResourceLimitExceeded;
+    };
+    if (count == 0) count = demux.packets.len; // Legacy PES-aligned streams without AUD.
+    if (count > options.index.max_samples) return error.ResourceLimitExceeded;
+    const bytes = try std.math.mul(usize, count, @sizeOf(media.transport_stream.Packet));
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    const packets = try a.alloc(media.transport_stream.Packet, count);
+    errdefer a.free(packets);
+    nals = .{ .bytes = demux.bytes, .control = options.stream.control };
+    var unit: usize = 0;
+    var pes: usize = 0;
+    var last_clock_pes: ?usize = null;
+    var has_vcl = false;
+    while (try nals.next()) |nal| {
+        const kind = nal[0] & 31;
+        if (kind == 9) {
+            if (unit > 0) {
+                if (!has_vcl) return error.IncompleteVideoPicture;
+                packets[unit - 1].size = nals.last_start - packets[unit - 1].offset;
+            } else {
+                // Annex B permits leading_zero_8bits before the first NAL.
+                // Other NAL payload before an AUD is not part of this AU.
+                for (demux.bytes[0..nals.last_start]) |byte| if (byte != 0) return error.MalformedAnnexB;
+            }
+            while (pes + 1 < demux.packets.len and demux.packets[pes + 1].offset <= nals.last_start) pes += 1;
+            const clock = demux.packets[pes];
+            if (!clock.has_timestamp or (last_clock_pes != null and last_clock_pes.? == pes)) return error.AmbiguousTransportPictureTiming;
+            packets[unit] = .{ .offset = if (unit == 0) 0 else nals.last_start, .size = 0, .pts = clock.pts, .dts = clock.dts };
+            unit += 1;
+            last_clock_pes = pes;
+            has_vcl = false;
+        } else if (kind == 1 or kind == 2 or kind == 5) has_vcl = true;
+    }
+    if (unit == 0) {
+        for (demux.packets, packets) |packet, *out| {
+            if (!packet.has_timestamp) return error.AmbiguousTransportPictureTiming;
+            out.* = packet;
+        }
+    } else {
+        if (!has_vcl or unit != packets.len) return error.IncompleteVideoPicture;
+        packets[unit - 1].size = demux.bytes.len - packets[unit - 1].offset;
+        var clocks: usize = 0;
+        for (demux.packets) |packet| if (packet.has_timestamp) {
+            clocks += 1;
+        };
+        if (clocks != unit) return error.AmbiguousTransportPictureTiming;
+    }
+    return .{ .allocator = a, .packets = packets, .reservation = reservation };
+}
 pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options) !Reader {
-    if (demux.packets.len == 0 or demux.packets.len > options.index.max_samples) return error.ResourceLimitExceeded;
+    if (demux.packets.len == 0 or demux.packets.len > options.transport.max_packets) return error.ResourceLimitExceeded;
     try options.stream.control.check();
     if (options.configuration) |bytes| if (bytes.len > options.stream.max_bytes) return error.ResourceLimitExceeded;
     // Two u16-length parameter sets plus AVCC overhead. Config parsing copies
@@ -101,27 +167,29 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
     const config_bound = @max(@min(@as(usize, 131081), try std.math.add(usize, demux.bytes.len, 11)), if (options.configuration) |bytes| bytes.len else 0);
     var config_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, config_bound, 12) }) else media.admission.Token{};
     defer config_reservation.deinit();
+    var units = try accessUnits(a, demux, options);
+    defer units.deinit();
     const avcc = try configuration(a, demux, options);
     defer a.free(avcc);
     const config = try h264.configParse(a, avcc);
     defer config.groups.deinit(a);
     if (config.width > options.index.max_dimension or config.height > options.index.max_dimension) return error.ResourceLimitExceeded;
     const normalized_bound = @min(options.stream.max_bytes, try std.math.add(usize, avcc.len, try std.math.add(usize, demux.bytes.len, demux.bytes.len / 4)));
-    const packet_bytes = try std.math.mul(usize, demux.packets.len, @sizeOf(media.mp4.Packet));
+    const packet_bytes = try std.math.mul(usize, units.packets.len, @sizeOf(media.mp4.Packet));
     // Normalization capacity is bounded by actual input, not a blanket stream
     // maximum. Snapshot storage has its own reservation during copy overlap.
     var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, normalized_bound, 2), 64), packet_bytes) }) else media.admission.Token{};
     errdefer reservation.deinit();
-    const packets = try a.alloc(media.mp4.Packet, demux.packets.len);
+    const packets = try a.alloc(media.mp4.Packet, units.packets.len);
     errdefer a.free(packets);
     var normalized: std.ArrayList(u8) = .empty;
     var normalized_live = true;
     defer if (normalized_live) normalized.deinit(a);
     try normalized.appendSlice(a, avcc);
-    for (demux.packets, 0..) |packet, i| {
+    for (units.packets, 0..) |packet, i| {
         try options.stream.control.check();
         const offset = normalized.items.len;
-        var nals = Nals{ .bytes = demux.bytes[packet.offset..][0..packet.size] };
+        var nals = Nals{ .bytes = demux.bytes[packet.offset..][0..packet.size], .control = options.stream.control };
         var sync = false;
         var auds: usize = 0;
         var count: usize = 0;
@@ -142,10 +210,10 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
         }
         const size = normalized.items.len - offset;
         if (size == 0 or size > options.index.max_packet_bytes) return error.ResourceLimitExceeded;
-        const duration: u32 = if (i + 1 < demux.packets.len)
-            std.math.cast(u32, @as(i128, demux.packets[i + 1].dts) - packet.dts) orelse return error.InvalidSamplingMetadata
+        const duration: u32 = if (i + 1 < units.packets.len)
+            std.math.cast(u32, @as(i128, units.packets[i + 1].dts) - packet.dts) orelse return error.InvalidSamplingMetadata
         else
-            options.last_duration_ticks orelse if (i != 0) packets[i - 1].duration else return error.MissingTransportDuration;
+            options.last_duration_ticks orelse if (i != 0) packets[i - 1].duration else options.single_access_unit_duration_ticks orelse return error.MissingTransportDuration;
         if (duration == 0) return error.InvalidSamplingMetadata;
         packets[i] = .{ .offset = offset, .size = @intCast(size), .dts = packet.dts, .media_dts = packet.dts, .pts = packet.pts, .media_pts = packet.pts, .duration = duration, .sync = sync };
     }
@@ -198,11 +266,9 @@ pub const Hls = struct {
         // decode clock differences; no extra picture timestamps are fabricated.
         var demux = try media.transport_stream.demux(self.allocator, bytes, if (reset) .{} else self.state, options.transport, control, options.stream.admission_pool);
         defer demux.deinit();
-        if (demux.packets.len == 1) {
-            const ticks = item.duration_seconds * 90000;
-            if (!std.math.isFinite(ticks) or ticks < 1 or ticks > std.math.maxInt(u32)) return error.InvalidSamplingMetadata;
-            options.last_duration_ticks = @intFromFloat(@round(ticks));
-        }
+        const ticks = item.duration_seconds * 90000;
+        if (!std.math.isFinite(ticks) or ticks < 1 or ticks > std.math.maxInt(u32)) return error.InvalidSamplingMetadata;
+        options.single_access_unit_duration_ticks = @intFromFloat(@round(ticks));
         var source = try fromDemux(self.allocator, owned_identity, demux, options);
         errdefer source.deinit();
         var configuration_reservation = if (pool) |p| try p.acquire(.{ .host_bytes = source.reader.track.avcc.len }) else media.admission.Token{};
@@ -253,7 +319,7 @@ test "native TS AVC packet adapter decodes every selected picture against indepe
         }
     };
     const a = std.testing.allocator;
-    inline for (.{ "closed", "bframes" }) |name| {
+    inline for (.{ "closed", "bframes", "closed-split", "bframes-split" }) |name| {
         const oracle = try std.json.parseFromSlice(Oracle, a, @embedFile("../testdata/transport/" ++ name ++ ".json"), .{});
         defer oracle.deinit();
         var source = try Reader.init(a, "transport-qualification", @embedFile("../testdata/transport/" ++ name ++ ".ts"), .{}, .{});
@@ -293,8 +359,8 @@ const TestHttp = struct {
             self.calls += 1;
             if (std.mem.endsWith(u8, uri, "list.m3u8")) return .{ .body = self.manifest };
             if (self.fail) return error.ConnectionReset;
-            if (std.mem.endsWith(u8, uri, "closed.ts")) return .{ .body = @embedFile("../testdata/transport/closed.ts") };
-            if (std.mem.endsWith(u8, uri, "bframes.ts")) return .{ .body = @embedFile("../testdata/transport/bframes.ts") };
+            if (std.mem.endsWith(u8, uri, "closed.ts")) return .{ .body = @embedFile("../testdata/transport/closed-split.ts") };
+            if (std.mem.endsWith(u8, uri, "bframes.ts")) return .{ .body = @embedFile("../testdata/transport/bframes-split.ts") };
             return error.UnexpectedTransportResource;
         }
     };
@@ -360,4 +426,91 @@ fn hlsAllocationRun(backing: std.mem.Allocator, pool: *media.admission.Pool) !vo
 test "native TS AVC HLS factory allocation failures reclaim both epochs and state" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, hlsAllocationRun, .{&pool});
+}
+
+test "native TS AVC rejects reused or unowned PES timestamps" {
+    const a = std.testing.allocator;
+    var demux = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed-split.ts"), .{}, .{}, .{}, null);
+    defer demux.deinit();
+    var units = try accessUnits(a, demux, .{});
+    defer units.deinit();
+    try std.testing.expect(units.packets.len < demux.packets.len);
+    demux.packets[0].has_timestamp = false;
+    try std.testing.expectError(error.AmbiguousTransportPictureTiming, accessUnits(a, demux, .{}));
+    demux.packets[0].has_timestamp = true;
+    demux.packets[1].has_timestamp = true;
+    try std.testing.expectError(error.AmbiguousTransportPictureTiming, accessUnits(a, demux, .{}));
+}
+
+fn fuzzSeed(comptime bytes: []const u8) []const u8 {
+    return comptime blk: {
+        var encoded: [4 + bytes.len]u8 = undefined;
+        std.mem.writeInt(u32, encoded[0..4], bytes.len, .little);
+        @memcpy(encoded[4..], bytes);
+        const frozen = encoded;
+        break :blk &frozen;
+    };
+}
+const fuzz_seeds = .{
+    fuzzSeed(@embedFile("../testdata/transport/closed.ts")),
+    fuzzSeed(@embedFile("../testdata/transport/bframes.ts")),
+    fuzzSeed(@embedFile("../testdata/transport/closed-split.ts")),
+    fuzzSeed(@embedFile("../testdata/transport/bframes-split.ts")),
+};
+const fuzz_options = Options{ .transport = .{ .max_bytes = 256 * 1024, .max_packets = 1024, .max_pes_bytes = 128 * 1024 }, .stream = .{ .max_bytes = 512 * 1024 }, .index = .{ .max_samples = 256 } };
+test "TS normalization fuzz seeds retain complete timed access units" {
+    inline for (fuzz_seeds) |seed| {
+        var smith = std.testing.Smith{ .in = seed };
+        var bytes: [256 * 1024]u8 = undefined;
+        const length = smith.sliceWithHash(&bytes, 0x54534101);
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+        var options = fuzz_options;
+        options.stream.admission_pool = &pool;
+        var reader = try Reader.init(std.testing.allocator, "fuzz-seed", bytes[0..length], .{}, options);
+        try std.testing.expect(reader.reader.packets.len > 0);
+        reader.deinit();
+        try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+    }
+}
+test "TS normalization fuzz bounded NAL framing clock ownership and cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var bytes: [256 * 1024]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0x54534101);
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+            defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+            var options = fuzz_options;
+            options.stream.admission_pool = &pool;
+            var reader = Reader.init(std.testing.allocator, "fuzz", bytes[0..length], .{}, options) catch return;
+            defer reader.deinit();
+            for (reader.reader.packets, 0..) |packet, index| {
+                try std.testing.expect(packet.duration > 0);
+                var lease = try reader.reader.readPacket(index);
+                defer lease.deinit();
+                try std.testing.expectEqual(@as(usize, packet.size), lease.bytes.len);
+            }
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &fuzz_seeds });
+}
+
+test "native TS AVC access units preserve Annex B leading zero bytes" {
+    const a = std.testing.allocator;
+    var demux = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed.ts"), .{}, .{}, .{}, null);
+    defer demux.deinit();
+    const prefixed = try a.alloc(u8, demux.bytes.len + 1);
+    prefixed[0] = 0;
+    @memcpy(prefixed[1..], demux.bytes);
+    a.free(demux.bytes);
+    demux.bytes = prefixed;
+    demux.packets[0].size += 1;
+    for (demux.packets[1..]) |*packet| packet.offset += 1;
+    var units = try accessUnits(a, demux, .{});
+    defer units.deinit();
+    try std.testing.expectEqual(demux.packets.len, units.packets.len);
+    try std.testing.expectEqual(@as(usize, 0), units.packets[0].offset);
+    try std.testing.expectEqual(demux.packets[0].size, units.packets[0].size);
+    var reader = try fromDemux(a, "leading-zero", demux, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(demux.packets.len, reader.reader.packets.len);
 }
