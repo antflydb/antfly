@@ -3720,3 +3720,15 @@ qualify additional original inventory cases by themselves. Original case
 accounting remains unchanged at 898 unresolved; mixed legacy document-datetime
 comparisons, clock-bearing EXECUTE argument evaluation, session timezone/input
 semantics and the remaining temporal capabilities are still unfinished.
+
+Qualification on the tree including origin/main `b467a7f19f`: full SQL Debug
+passes 21/21 build steps, with 741 main-owner and 226 additional-owner tests
+passing, three existing skips and no failures/leaks. All 11 focused clock and
+nondecimal-integer regressions pass in Debug and ReleaseFast. The public parity
+gate passes 80/80 steps and both new native HTTP/pgwire adapter tests; the broader
+API gate also passes all 117 steps. These overlapping selections are not
+additional original-case credit or a CI-green claim. Nine independent fresh
+PostgreSQL 18 oracle tests and reproducibility of all 174 temporal contracts
+pass. The control-only source catalog now exposes the same native temporal
+contracts as the physical consumer, preserving linked test ownership rather
+than dropping the failing control-boundary compilation check.

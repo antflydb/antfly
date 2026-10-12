@@ -23,6 +23,16 @@ from generate_sql_temporal_reference import contract, reference
 
 
 class TemporalReferenceTest(unittest.TestCase):
+    def test_postgres_nondecimal_integer_prefix_and_separator_contract(self):
+        for expression, expected in (("0x_6", 6), ("0o_6", 6), ("0b_110", 6), ("0x6e0", 1760), ("0XFF_FF", 65535), ("-0x_8000_0000_0000_0000", -9223372036854775808)):
+            with self.subTest(expression=expression), self.db.transaction(force_rollback=True):
+                self.assertEqual(expected, self.db.execute("SELECT " + expression).fetchone()[0])
+        for expression in ("0x", "0x_", "0x__6", "0x6_", "0b2", "0o8", "0x6.0"):
+            with self.subTest(expression=expression), self.assertRaises(psycopg.Error) as raised:
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("SELECT " + expression)
+            self.assertEqual("42601", raised.exception.sqlstate)
+
     @classmethod
     def setUpClass(cls):
         cls.server = postgres()

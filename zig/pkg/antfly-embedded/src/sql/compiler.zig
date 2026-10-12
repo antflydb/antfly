@@ -141,6 +141,31 @@ fn lexicalError(kind: lexer.LexErrorKind) Error {
     };
 }
 
+/// NUMBER tokens already have PostgreSQL separator validation from the lexer.
+/// Zig accepts separators between digits, but not immediately after a radix
+/// prefix; remove only that permitted separator without allocating a copy.
+fn parseIntegerToken(comptime T: type, text: []const u8) std.fmt.ParseIntError!T {
+    const radix: u8 = if (text.len > 2 and text[0] == '0') switch (text[1]) {
+        'x', 'X' => 16,
+        'o', 'O' => 8,
+        'b', 'B' => 2,
+        else => 0,
+    } else 0;
+    if (radix == 0) return std.fmt.parseInt(T, text, 10);
+    const start: usize = if (text[2] == '_') 3 else 2;
+    return std.fmt.parseInt(T, text[start..], radix);
+}
+
+test "SQL PostgreSQL nondecimal integer literals preserve exact signed values" {
+    const queries = [_][]const u8{ "0x_6", "0o_6", "0b_110", "0x6e0", "0XFF_FF", "-0x_8000_0000_0000_0000", "1_000" };
+    const expected = [_]i64{ 6, 6, 6, 1760, 65535, std.math.minInt(i64), 1000 };
+    for (queries, expected) |sql, value_| {
+        var compiled = try compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(value_, compiled.expression.literal.integer);
+    }
+}
+
 test "SQL transaction timestamp syntax retains labels quoted columns and unsupported warning boundaries" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "SELECT CURRENT_TIMESTAMP", "SELECT CURRENT_TIMESTAMP(6)", "SELECT CURRENT_TIMESTAMP(0x6)", "SELECT CURRENT_TIMESTAMP(0x_6)", "SELECT CURRENT_TIMESTAMP(0o6)", "SELECT CURRENT_TIMESTAMP(0b110)" }) |sql| {
@@ -404,7 +429,7 @@ const Parser = struct {
         self.pos += 1;
         const radix = t.text.len > 2 and t.text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", t.text[1]) != null;
         if (!radix and std.mem.indexOfAny(u8, t.text, ".eE") != null) return self.numericLiteral(t.text, negative);
-        const magnitude = std.fmt.parseInt(u64, t.text, 0) catch return self.numericLiteral(t.text, negative);
+        const magnitude = parseIntegerToken(u64, t.text) catch return self.numericLiteral(t.text, negative);
         if (negative) {
             if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.numericLiteral(t.text, negative);
             if (magnitude == @as(u64, std.math.maxInt(i64)) + 1) return .{ .integer = std.math.minInt(i64) };
@@ -540,7 +565,7 @@ const Parser = struct {
                 const text = self.tokens[self.pos].text;
                 const radix = text.len > 2 and text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", text[1]) != null;
                 if (!radix and std.mem.indexOfAny(u8, text, ".eE") != null) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
-                precision = std.fmt.parseInt(i64, self.tokens[self.pos].text, 0) catch return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision is outside the supported domain");
+                precision = parseIntegerToken(i64, text) catch return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision is outside the supported domain");
                 self.pos += 1;
                 try self.expect(.rparen);
                 // PostgreSQL clamps >6 with a WARNING. Do not silently omit
