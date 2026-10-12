@@ -1280,8 +1280,10 @@ test "external lake warm tie pagination distinct tuples retain sequential reads"
         defer reader.deinit();
         var cursor = try public.Cursor.init(a, &reader, "", null, null, null, false, reverse);
         defer cursor.deinit();
+        const before_reads = reader.remaining_reads;
         const page = try cursor.next(ca, count);
         try std.testing.expectEqual(@as(usize, count), page.len);
+        try std.testing.expect(before_reads - reader.remaining_reads < 4 * 1024 * 1024);
         for (page, 0..) |ref, i| try std.testing.expectEqual(@as(u64, if (reverse) count - i - 1 else i), ref.external.row_ordinal);
     }
 }

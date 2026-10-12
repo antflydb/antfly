@@ -108,3 +108,21 @@ credential refresh beyond one token lifetime, cold restart and replacement-pod
 recovery, two-table overlay/cursor correctness, feed updates/deletes, and sustained
 load. Keep source and state backups. A candidate manifest or a passing one-file
 benchmark cannot substitute for those checks.
+
+For the runtime handoff, Colony's development release overlay is
+`config/antfly-releases-development.yaml`. Add the released image digest there with
+`auto_upgrade: false` and an explicit rollback version. Keep the existing default
+runtime intact while qualifying the candidate. The managed instance update uses
+`target_antfly_image`; wait until `current_antfly_image` reports that exact digest
+and the instance is ready before issuing HN data-plane requests. Colony's
+`test/e2e/cloud_stack_e2e.py` accepts
+`COLONY_E2E_CANDIDATE_RUNTIME_IMAGE` for this candidate health gate; it requires a
+digest-pinned image. This verifies provisioning/proxy behavior separately from
+standalone query timing. HN publication, object-store credential refresh,
+historical/current composition and replacement recovery remain additional gates.
+
+The repository release-line policy maps `0.3` releases to `main` and `0.2` releases
+to `v0.2.x` (`scripts/release/release-lines.json`). Use the main-line release for
+these Zig runtime changes; an existing 0.2 development catalog entry does not
+contain them. Resolve the exact new tag from the final merged source and release
+policy rather than relabelling a local qualification binary.
