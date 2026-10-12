@@ -1132,6 +1132,19 @@ pub fn build(b: *std.Build) void {
     const install_audio_embedding_bench = b.addInstallArtifact(audio_embedding_bench, .{});
     b.step("build-audio-embedding-bench", "Build the synchronized real-model audio embedding benchmark").dependOn(&install_audio_embedding_bench.step);
 
+    if (target.result.os.tag == .macos) {
+        const pdf_ocr_bench = b.addExecutable(.{
+            .name = "antfly-pdf-ocr-comparison",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_ocr_comparison.zig"), .target = target, .optimize = optimize }),
+        });
+        pdf_ocr_bench.root_module.addImport("inference_internal", inference_internal_mod);
+        pdf_ocr_bench.root_module.addCSourceFile(.{ .file = b.path(b.fmt("{s}/lib/readers/src/apple_vision.m", .{shared_lib_root})), .flags = &.{"-fobjc-arc"} });
+        for ([_][]const u8{ "Vision", "Foundation", "CoreGraphics", "ImageIO" }) |framework| pdf_ocr_bench.root_module.linkFramework(framework, .{});
+        runtime_graph.identities.addImports(pdf_ocr_bench.root_module);
+        pdf_ocr_bench.root_module.link_libc = true;
+        b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
+    }
+
     // Standalone PDF benchmark shares image/hash identity with inference.
     // Font data belongs only to this tool, not the production inference graph.
     const pdf_fonts_files = b.addWriteFiles();
