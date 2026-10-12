@@ -64,6 +64,8 @@ pub const AddTestsOptions = struct {
 pub const AddTestsResult = struct {
     run_lib_image_tests: *std.Build.Step.Run,
     run_png_tests: *std.Build.Step.Run,
+    run_jpeg_tests: *std.Build.Step.Run,
+    run_webp_tests: *std.Build.Step.Run,
     run_jpeg2000_decode_tests: *std.Build.Step.Run,
 };
 
@@ -93,6 +95,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
     const run_png_tests = b.addRunArtifact(png_tests);
 
+    // Imported image modules do not discover internal JPEG tests either.
+    const jpeg_test_mod = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/jpeg.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jpeg_tests = b.addTest(.{ .root_module = jpeg_test_mod });
+    const run_jpeg_tests = b.addRunArtifact(jpeg_tests);
+
+    const webp_test_mod = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/webp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_webp_tests = b.addRunArtifact(b.addTest(.{ .root_module = webp_test_mod }));
+
     const jpeg2000_decode_test_mod = b.createModule(.{
         .root_source_file = options.root.path(b, "src/jpeg2000/decode.zig"),
         .target = target,
@@ -105,6 +123,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     return .{
         .run_lib_image_tests = run_lib_image_tests,
         .run_png_tests = run_png_tests,
+        .run_jpeg_tests = run_jpeg_tests,
+        .run_webp_tests = run_webp_tests,
         .run_jpeg2000_decode_tests = run_jpeg2000_decode_tests,
     };
 }

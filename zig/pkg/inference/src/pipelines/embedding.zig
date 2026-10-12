@@ -1080,7 +1080,10 @@ pub const EmbeddingPipeline = struct {
     };
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, null), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, null);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         // The batch primitive acquires the execution gate only after bounded
         // preprocessing. Fallback reuses that primitive for each item, so
@@ -1103,7 +1106,10 @@ pub const EmbeddingPipeline = struct {
     /// and never enters the encoder. Healthy rows retain their original order.
     pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
         if (errors.len != images.len) return error.InvalidInputShape;
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, errors), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, errors);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         const vectors = self.embedImagesBatchIndexed(images, errors) catch |err| {
             if (images.len <= 1 or !shouldFallbackBatchedImageError(err)) return err;

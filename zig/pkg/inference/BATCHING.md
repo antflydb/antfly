@@ -335,6 +335,509 @@ executors. Native cross-request support is not inferred merely from sharing a
 model family or provider. Observed native results and coalesced groups are
 separate broker metrics; a compatibility fallback is not called a native batch.
 
+## GPU residency for media embeddings
+
+The target is a bounded streaming pipeline whose intermediate numeric tensors
+stay on the inference device. Residency lasts for an admitted batch, rather
+than retaining an ingestion corpus in VRAM. Compressed inputs, parsing, request
+metadata and final vectors may remain on the host. Device ownership must extend
+through preprocessing and the encoder; uploading an intermediate only to export
+it again at the next layout or pooling operation defeats the intended benefit.
+
+### Transfer boundaries
+
+| Input | Initial boundary | Subsequent device work |
+| --- | --- | --- |
+| Image | CPU decode and resize/crop, then upload model-sized pixels | Patch packing, token assembly, attention, pooling and projection |
+| PDF page raster | Borrow rendered pixels and reuse image preprocessing | Same vision path as an image; avoid PNG encode/decode between rendering and inference |
+| PDF text | Extract and tokenize on CPU | Text encoder; do not rasterize text merely to obtain embeddings |
+| Audio | CPU codec decode; current implementation also prepares features on CPU | Target: upload PCM once, then resample, STFT, mel/log normalization and encode |
+
+GPU preprocessing is a throughput option, not an unconditional latency win.
+A 4000 x 3000 RGB u8 image is 36 MB; a 224 x 224 RGB f32 tensor is 602,112 bytes.
+Uploading the former to resize on GPU can lose to CPU resizing followed by a
+small upload. GPU-assisted decode from compressed bytes changes this tradeoff.
+Small batches can also lose to launch overhead, and preprocessing shares GPU
+compute and memory bandwidth with inference. Unified-memory Metal devices have
+a different transfer cost, but host exports still force materialization and
+synchronization.
+
+NVIDIA's [nvJPEG](https://docs.nvidia.com/cuda/nvjpeg/) offers hybrid and
+hardware-assisted JPEG decoding; availability depends on the GPU and encoded
+image. [nvImageCodec](https://docs.nvidia.com/cuda/nvimagecodec/codec_options.html)
+provides codec-specific accelerated and CPU backends. Neither makes every media
+format entirely GPU-only. For audio, GPU signal processing is feasible separately
+from codec decoding; for example, [DALI mel filtering](https://docs.nvidia.com/deeplearning/dali/main-user-guide/docs/operations/nvidia.dali.fn.mel_filter_bank.html)
+supports CPU and GPU execution. These are possible implementation references,
+not new runtime dependencies in the first phase.
+
+The shared CPU decoder also has a measured [WebP preparation optimization](../../../docs/design/inference/webp-preparation-performance.md):
+borrowed lossless prefix tables, short-code lookup and canonical long-code ranges.
+It covers VP8L and compressed alpha attached to VP8. Ordinary VP8 decoding and
+model resize semantics remain unchanged; codec measurements do not establish
+end-to-end embedding gains.
+
+### Implemented first phase: CLIP eager vision residency
+
+`architectures/clip.zig` exposes `visionEncoderForwardTensor`, which borrows
+normalized F32 NCHW pixels as a backend tensor and returns an owned embedding tensor
+on the same backend. The caller owns the input and frees the output with
+`ComputeBackend.free`. It uses existing reshape, transpose, row concatenation,
+row gather and embedding lookup operations for:
+
+- NCHW-to-patch packing;
+- inserting each image's CLS token and adding position embeddings;
+- token/head layout conversion around bidirectional attention;
+- gathering CLS rows before visual projection.
+
+The existing host-facing forward automatically uses this path on CUDA and
+Metal when these operations are available, exporting only the final embedding.
+Metal explicitly stages model-sized pixels into device storage because its
+ordinary F32 constructor may return a host-backed handle. CPU callers retain
+contiguous host patch extraction. Backends without the
+required operations retain compatibility assembly/layout/pooling paths; the
+explicit tensor entry point reports unsupported capability instead of silently
+exporting activations. Dense Metal patch weights use the backend's row reshape; static quantized
+patch-weight conversion remains a separate weight-materialization concern. Backend-internal compatibility fallbacks
+must still be considered when profiling residency.
+
+This phase does not change codec decoding, model-specific resize/crop semantics,
+CPU audio feature extraction, the CLAP audio encoder's host intermediates, or the
+graph-runtime vision entry point. It benefits image and PDF raster inputs that
+resolve to the eager CLIP encoder. Other vision architectures need their own
+resident handoff and qualification; this is not a claim that all multimodal
+models now run a fully resident pipeline.
+
+The regression fixture runs a complete small vision encoder with attention and
+projection at batch sizes 1, 2 and 4, compares it with the host compatibility
+path, and compares batched rows with independent forwards. Its tensor entry
+point runs with backend host exports disabled to catch intermediate readbacks.
+Hardware fixtures check Metal device-to-host accesses/download bytes and CUDA
+D2H byte counters before exporting final vectors; Metal inputs are explicitly
+device-backed. The tests also cover absent optional projection, unsupported
+capabilities, execution failures, ownership cleanup and reuse after failure.
+These are correctness and ownership checks, not hardware throughput measurements.
+
+Validation on 2026-10-11: the resident fixture passes on the local Metal GPU at
+batches 1/2/4 with no device-to-host access during the forward. The CUDA-enabled
+Linux test binary cross-compiles; CUDA hardware execution remains unqualified.
+Reproduce from `zig/pkg/inference/` with Zig 0.17:
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=clip
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='clip resident'
+```
+
+Run the CUDA parity fixture on a CUDA host with `-Dcuda=true -Dmetal=false`;
+keep the hardware failure visible rather than treating a missing device as a
+successful qualification.
+
+### Gemma 4 vision residency
+
+`architectures/gemma4_projector.zig` now retains patch projection outputs as
+backend tensors through position addition, the vision blocks, spatial pooling,
+optional standardization, RMS normalization and the final projection. GGUF
+convolution output is transposed on the backend instead of exported for CPU
+layout conversion. The HF patch-linear path retains its exact patch order.
+Static position offsets are prepared from the learned weight table on CPU and
+uploaded separately; image activations are not exported to add them.
+
+Q/K/V head RMS normalization uses backend operations. Gemma's 2D rotary layout
+pairs channels within each spatial axis; the existing GPU vision-RoPE primitive
+pairs the global halves. A device transpose converts between those layouts in
+both directions, preserving the query scale that compensates for SDPA scaling.
+Spatial pooling gathers and adds each merge offset in the original order, then
+applies the hidden-width scale. The unified direct image projector likewise
+keeps its post-projection bias, layer norms and position addition on the backend.
+CPU decode, resize, initial pixel/patch preparation and the direct projector's
+first patch norm remain on the host. Providers missing the relevant RoPE or
+pooling operations retain their host compatibility paths.
+
+This phase covers vision projector activation boundaries. The later cross-image
+batching phase below extends it; GPU codec/resize kernels remain separate work. Scalar clipping already has a
+device path; vector clipping compatibility and opt-in diagnostic stage dumps
+can still export tensors. Static weight materialization, including HF position
+tables, is a separate transfer concern. The public projected image/audio structs
+still contain host arrays, so their final export and subsequent prompt upload
+remain. The following audio phase extends Gemma 4's existing device encoder operations
+with a resident spectral/log-mel frontend.
+
+Synthetic regression fixtures compare head normalization, both query/key rotary
+scales, value normalization and spatial pooling against the existing host
+reference. They use multiple heads, rectangular grids and merge sizes 1/2.
+Patch projection and position addition are checked on native and Metal backends.
+Metal counters assert no intermediate device-to-host accesses/download bytes in
+these tested operations. Host export is also disabled during the activation
+operations to catch accidental readbacks. These checks establish numerical
+parity and residency, not an end-to-end throughput improvement or real-model
+quality qualification. Validation on 2026-10-11: native and local Metal fixtures
+pass, and the Gemma 4 regression filter reports 118 passed / 3 skipped (optional
+real-model fixtures and CUDA hardware). The CUDA-enabled Linux test binary
+cross-compiles; CUDA execution remains unqualified.
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=gemma4
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='gemma4 resident vision'
+```
+
+### Gemma 4 audio, CLAP, OCR and Qwen extensions
+
+The next phase removes additional activation exports using existing compute
+backend operations. These routes keep the same public vectors, token ordering
+and CTC text/confidence semantics. They do not introduce codec dependencies,
+CUDA-only preprocessing libraries or cross-request scheduling.
+
+| Route | Resident work added | Remaining host boundaries |
+| --- | --- | --- |
+| Gemma 4 audio | Zero-padded DFT, magnitude, mel projection, log/floor and frame masking; features feed subsampling directly; valid output rows gathered before export | Codec decode, bounded resampling, Hann-window frame packing; final projected arrays. Metal has the existing specialized conformer kernels; CUDA still uses host compatibility for conformer operations without CUDA kernels |
+| CLAP eager audio | Non-fused patch convolution/layout/norm, Swin blocks including cyclic shift/window maps, relative bias, attention masks, Q/K/V, MLP, patch merges, pooling and projection | Mel preparation, input batch norm and spectrogram image preparation; the long-audio AFF fusion frontend remains compatibility work before the resident Swin chain. Explicit graph strategies retain their existing route |
+| OCR CTC recognition | Resident session forward, batched argmax, gather winning confidence per timestep | Only O(timesteps) choices/scores downloaded for blank/repeat collapse and dictionary lookup. Image decode, crop/resize, detection/layout postprocessing and Apple-native OCR remain their existing routes |
+| Qwen 3 VL | Position addition to patch tensors and base-text/image prompt assembly | CPU interpolation of static position offsets; final visual/deepstack arrays; opt-in qualification hashes deliberately export activations |
+| Qwen 2 VL / ColQwen | Patch weight reshape without export/re-upload; spatial vision RoPE on backend tensors | CPU decode, resize/patch packing and rotary position metadata; final API outputs; unsupported attention/RoPE providers retain typed compatibility paths |
+
+Gemma's frontend uses the same 320-sample Hann windows, 160-sample hop,
+512-point zero-padded transform, **magnitudes** rather than power, mel
+filterbank, additive 1e-3 floor, natural logarithm and valid-frame mask as the
+CPU reference. Dense backend dot operations consume frame and coefficient
+matrices without treating transient DFT/filter tensors as cached model weights.
+This avoids a Metal weight-materialization readback and persistent linear slots.
+The frontend keeps the existing 480,000-sample source bound. Packed frames,
+spectrum, squared pairs, magnitudes and mel/log tensors add bounded request
+scratch; admission/peak-memory qualification must account for those live arrays
+before increasing audio concurrency. `TERMITE_GEMMA4_AUDIO_HOST_OPS=features`
+(or `all`) selects the CPU frontend for diagnosis. Decode and resampling remain
+CPU operations; this is not a PCM-only device pipeline.
+
+CLAP exposes `audioEncoderFromPatchTokensTensor`, borrowing patch tokens and
+returning an owned projected tensor. Only small index/mask metadata is assembled
+on the host; row gathers implement window shifts and patch merge ordering.
+Relative-position tables are gathered and broadcast on the backend, so Q/K/V
+and attention activations stay resident. Shifted-window bias includes the same
+mask and relative-bias terms as the original CPU attention. Explicit graph
+execution is preserved. The expanded window/head bias and attention scratch
+scale with batch size, head count and window area; qualify those bytes before
+increasing admitted batches. This phase does not add a resident CLAP text tower.
+
+OCR uses the session's admitted resident-output route when available and retains
+the host session fallback. It validates a single-image `[1, time, vocabulary]`
+CTC output, downloads argmax choices, gathers their original scores on the
+backend and downloads those scores. UTF-8 dictionary assembly, repeat/blank
+handling and mean confidence use the original CPU semantics. Cancellation and
+backend failures propagate through the controlled session permit. This change
+does not move detection maps, polygon finding or image crops onto GPU.
+
+Qwen 2's earlier device path used ordinary sequential text RoPE; the new path
+uses the spatial axes in merge-group order, matching the existing CPU vision
+reference, including repeated temporal slices. Unsupported attention operations
+may still use the CPU reference, while resource/cancellation failures propagate.
+Qwen 3 position/prompt changes preserve the existing qualification evidence path;
+hash collection is an explicit diagnostic synchronization boundary. Deepstack
+feature arrays still follow the existing host-facing API.
+
+The `media residency` fixtures cover native and Metal parity for a full CLAP
+Swin chain with shifted/unshifted attention and three patch merges at batches
+1/2, its batched patch convolution, Gemma log-mel features and invalid-frame
+masking, Qwen 2 spatial/temporal rotary ordering, Qwen 3 rectangular position
+interpolation and scaled prompt assembly, and CTC text/confidence. Metal
+counters assert zero intermediate downloads/accesses for tested numeric
+operations; CTC permits only compact O(time) downloads. An OCR session fixture
+also verifies that unsupported reductions reuse the resident forward output
+without a second inference. Gemma DFT-vs-FFT
+comparison uses the existing 2e-3 log-feature tolerance near the mel floor.
+CUDA fixtures compile into a Linux CUDA-enabled test binary and require CUDA
+hardware to execute. These tests are synthetic correctness/transfer checks;
+real-model quality and end-to-end throughput remain unmeasured. Validation on
+2026-10-11: 11 native/Metal media fixtures passed (5 CUDA hardware fixtures
+skipped); the combined regression filter passed 320 checks with 15 optional
+fixtures skipped. The CUDA-enabled Linux test binary cross-compiles.
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter='media residency'
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=clap -Dtest-filter=gemma4 -Dtest-filter=ocr -Dtest-filter=CTC -Dtest-filter=qwen -Dtest-filter=Qwen
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='media residency'
+```
+
+### Gemma 4 cross-image batches and measurement
+
+Same-grid images can now share patch projection, encoder blocks, spatial
+pooling and final projection. `encodePreparedEmbeddingGemma2Images` borrows
+normalized pixels and returns owned, image-ordered projected arrays. Rows are
+flattened in image/patch order for matrix operations; SDPA receives separate
+batch and sequence dimensions. Both spatial rotary axes restart for each image.
+Pooling gathers include the image offset, and learned position offsets repeat
+per image. The GGUF projector's multi-image entry also uses bounded cohorts;
+its direct unified projector batches patch norm/projection and positional work.
+
+Cohorts contain contiguous images with identical target grids, with no padding
+or reordering inside vision attention. Different grids, image-count limits,
+patch-token limits and scratch limits split cohorts. `ImageBatchOptions` defaults
+to four images, 10,080 patch tokens and 768 MiB of estimated scratch. The
+estimate includes dense attention scores plus widened activation intermediates;
+it is a conservative admission bound, not an exact provider peak. A singleton
+that exceeds a supplied bound returns `ImageBatchBudgetExceeded` before GPU work.
+Prepared geometry and pixel lengths are checked before allocation. APIs support
+an explicit ceiling of eight images; this does not make eight the serving default.
+
+EmbeddingGemma2's encoded-image and borrowed-PDF-raster paths now use vision
+batches before their existing embedding-encoder cohorts of up to four rows.
+CPU decode/resize and final token-array export/prompt upload remain. Raster
+admission reserves the estimated vision cohort scratch in addition to existing
+encoder workspace, capped at 2 GiB for accelerators and 512 MiB for CPU. Encoded
+images reserve host preprocessing before decoding, retain only encoded sources
+and normalized pixels while queued, then compose the run reservation under the
+model execution lock. GPU reservations are acquired after the lock, so queued
+requests do not occupy vision scratch. Native execution can split
+vision into smaller cohorts while still batching the downstream encoder. Indexed
+codec/validation failures retain original error slots; backend, memory and
+cancellation failures propagate. This phase adds no cross-request queue or
+batching delay. Existing server broker cohorts can use the new vision batching;
+client concurrency is measured separately from model batches.
+
+The new `bench-gemma4-image` executable loads a real HF EmbeddingGemma2 checkpoint
+once and supports three synchronized scopes: `projector` starts from prepared
+normalized pixels; `image` includes encoded-image decode/resize; `embedding`
+includes decode/RGBA packing, the production raster pipeline, tokenization,
+embedding encoding and vector readback. For repeated benchmark inputs the last
+scope decodes once into a shared borrowed raster, matching a PDF renderer's
+ownership boundary. File reads and model load stay outside the warm interval.
+Session-load time is reported separately. Measure a cold first forward in its own
+process with `--warmups 0 --iterations 1`; do not mix it into warm percentiles. `--batching off` executes singleton
+forwards; `on` requests bounded cohorts. Reported batch count is distinct from
+`max_projector_batch`, since the memory limit may split an offline request.
+Embedding scope uses the production ceiling of four regardless of requested
+batch size. Its projector batch counter is unavailable; it is reported as null.
+
+Reports include raw samples, p50/p95 batch latency, images/sec, final outputs,
+bounded host peak and Metal device-owned peak, runtime memory snapshots, host
+download bytes and device readback calls. Transfer/workspace counters are
+available for direct projector/image scopes; embedding scope's internally owned
+workspaces are not attributed by those counters. Runtime memory includes
+retained pools/model slots and is not equivalent to transient activation peak.
+Upload bytes and a complete synchronization count need provider instrumentation;
+device readback calls and runtime frame submissions are useful existing evidence.
+Disable intermediate stage dumps and timing diagnostics for measured campaigns.
+
+```sh
+cd zig/pkg/inference
+zig build build-gemma4-image-bench -Donnx=false -Dmetal=true -Doptimize=fast
+zig build bench-gemma4-image -Donnx=false -Dmetal=true -Doptimize=fast -- \
+  --model /path/to/embeddinggemma-2 --image /path/to/page.png \
+  --scope projector --batch 4 --batching on --warmups 10 --iterations 100 \
+  --output /tmp/gemma4-image.json
+cd ../../..
+python3 tools/embeddinggemma2/image_campaign.py \
+  --baseline /path/to/frozen-baseline --candidate /path/to/frozen-candidate \
+  --model-dir /path/to/embeddinggemma-2 --image /path/to/photo.jpg \
+  --image /path/to/page.png --output-dir /tmp/gemma4-image-campaign
+python3 tools/embeddinggemma2/image_campaign.py \
+  --url http://127.0.0.1:8090/ai/v1 --http-model embeddinggemma-2 \
+  --image /path/to/photo.jpg --output-dir /tmp/gemma4-image-concurrency
+```
+
+The campaign driver alternates baseline/candidate order, records binary,
+checkpoint/config and input hashes, checks output shape/finiteness/cosine, and
+keeps raw artifacts. `--baseline-singletons` compares each batch with singleton
+throughput and reports amortized per-image batch latency explicitly; this is not
+the latency of an individual queued request. Use `--baseline-batching on` to
+compare an older PDF path with its downstream encoder batching preserved. HTTP mode sends one image per request at concurrency
+1/2/4/8 and reports successful throughput, latency, errors and serial-vector
+parity; overload errors are retained rather than retried invisibly. Run on the
+same otherwise-idle GPU, pin backend/weights/quantization and keep binaries
+immutable. Use 10 warmups and at least 100 samples for latency distributions;
+report cold startup separately. Photos, rectangular grids and document pages
+must be compared by actual patch/projected-token counts. Residency and batching
+are separate A/B comparisons: pre-residency vs resident singleton, then resident
+singleton vs same-grid batches. Synthetic native/Metal fixtures cover distinct
+images at batches 1/2/4/8, mixed-grid splits, order, budget rejection and isolation.
+Metal fixtures assert only the final projected output downloads. CUDA fixtures
+cross-compile; executing them needs CUDA hardware.
+
+### Local Gemma 4 image measurements (2026-10-11)
+
+On an Apple M4 Max (32 GPU cores, 36 GiB unified memory), the real HF
+EmbeddingGemma2 checkpoint has BF16 tensors. Each warm case used 10 warmups
+and 100 synchronized samples. The prepared square image has 2,304 patch tokens
+and 256 projected tokens per image. Each speedup below uses its own paired
+resident singleton run, rather than the first row of the table.
+
+| Requested / actual vision batch | p50 batch seconds | p95 batch seconds | Images/sec | Paired throughput speedup | Device-owned tensor peak MiB |
+| --- | --- | --- | --- | --- | --- |
+| 1 / 1 | 1.459 | 1.517 | 0.682 | 1.015x | 155.3 |
+| 2 / 2 | 2.868 | 3.211 | 0.687 | 1.026x | 310.5 |
+| 4 / 4 | 5.287 | 5.350 | 0.755 | 1.109x | 621.0 |
+| 8 / 8 | 12.449 | 12.978 | 0.663 | 0.971x | 1242.1 |
+
+Batch four improved throughput about 11%; batch eight was about 3% slower
+than its paired singleton and used twice batch four's device-owned tensor
+memory. Keep the serving ceiling at four. These are local development results,
+not a CUDA or GGUF runtime qualification. The separate preliminary residency
+comparison measured 1.35–1.42x singleton p50 speedups across square, landscape
+and document-shaped inputs, reducing vision device readbacks from 47 to one
+final projected-token export. Outputs matched with cosine above 0.99999999999.
+Those preliminary runs overlapped some CPU builds and tiny fixture tests. Our
+benchmark processes ran sequentially. Unrelated build/test activity appeared
+during the four-image full-embedding baseline; affected later timings are local
+loaded-machine measurements, rather than controlled performance comparisons.
+
+The encoded-image scope measured about 29% higher throughput for the JPEG
+and 35% for the document-shaped PNG. Single-image full embedding throughput
+increased about 35%, with p50 falling from 2.31s to 1.73s. The four-image full
+embedding comparison observed about 32% higher throughput under resource
+contention; treat that row as contextual. Every offline pair passed output
+shape/finiteness checks and per-image cosine of at least 0.9999.
+
+| Scope / input | Batch | Baseline p50 s | Candidate p50 s | Candidate p95 s | Baseline images/sec | Candidate images/sec |
+| --- | --- | --- | --- | --- | --- | --- |
+| Image / photo.jpg | 1 | 2.038 | 1.581 | 1.742 | 0.485 | 0.626 |
+| Image / page.png | 1 | 2.511 | 1.834 | 2.246 | 0.396 | 0.533 |
+| Embedding / page.png | 1 | 2.311 | 1.735 | 1.826 | 0.424 | 0.572 |
+| Embedding / page.png (contended) | 4 | 10.147 | 8.234 | 8.598 | 0.376 | 0.495 |
+
+The HTTP sweep sent one image per request, 100 measured requests at each
+concurrency, using the dedicated Metal server and admission budgets recorded
+in the report. All 400 requests succeeded and matched the serial vector.
+These loaded-machine results show queueing latency rising without a throughput
+benefit from additional clients:
+
+| Concurrent clients | Successful requests | Images/sec | p50 s | p95 s |
+| --- | --- | --- | --- | --- |
+| 1 | 100/100 | 0.546 | 1.769 | 2.187 |
+| 2 | 100/100 | 0.560 | 3.429 | 4.438 |
+| 4 | 100/100 | 0.539 | 6.523 | 16.115 |
+| 8 | 100/100 | 0.492 | 14.002 | 37.571 |
+
+Separate cold-process image runs observed model-session load / first-forward
+seconds of 0.104 / 2.253 before residency and 0.086 / 1.563 after. These are
+single observations with existing system caches, not warm percentiles or
+machine-cold startup qualification.
+
+Real-model HTTP checks also compared four distinct same-grid images with their
+singleton vectors and verified that a valid PNG header with a truncated codec
+body retains successful indexes 0 and 2 with an indexed error at 1. Malformed
+headers are rejected during request validation before decoder execution.
+The final native/Metal regression selection passed 165 tests, with 10 optional
+skips; residency and image-batching CUDA fixtures cross-compiled successfully.
+
+[The compact results report](../../../docs/design/inference/gemma4-image-performance.json)
+records hashes, hardware, latency, throughput, memory-counter availability,
+parity, admission budgets and contention evidence. Raw samples, final vectors,
+fixtures, logs and measured-source snapshots are retained locally under
+`.benchmark-results/gemma4-image-2026-10-11/`. Host peaks cover bounded workspace,
+not model memory or RSS; device-owned tensor peaks do not include every provider
+buffer. Unavailable internal embedding/HTTP counters are not total-memory
+measurements. Relative baseline parity does not replace an independent model
+quality oracle. GPU-assisted decode/resize and cross-request scheduling remain
+separate future work; this phase reuses existing broker cohorts.
+
+### Gemma4 PDF measurement and resident embedding handoff
+
+Image-only EmbeddingGemma 2 cohorts now keep the projected Gemma4 visual rows
+resident through prompt assembly, the embedding encoder, and masked pooling.
+Metal/CUDA use backend row concatenation and copy operations to assemble the
+prompt; CPU tokenization produces only IDs and masks. Each result downloads
+its pooled vector, rather than visual soft tokens and the full encoder output.
+The CT owner retains its creating backend until cleanup. Existing model gates,
+preprocessing admission, scratch limits, geometry subdivision, cancellation,
+and original item indexes still apply. Native and backends without the required
+row operations retain the host path. `Options.resident_images = false` selects
+that path for a same-binary comparison. Mixed text/media groups and audio keep
+their existing handoff; this change covers `embedImages` and `embedRasters`.
+
+`antfly-gemma4-pdf-bench` measures actual PDF bytes through the existing parser,
+exact renderer, borrowed RGBA rasters, image processor, projector, and embedding
+encoder. It selects pages round-robin across documents and preserves explicit
+document/page IDs. A wave retains at most four pages, 256 MiB of output rasters,
+and four CPU render workers, each with a private 256 MiB scratch ceiling and
+immutable render-fork template. Pages have an eight-million-pixel ceiling and
+an adaptive DPI/dimension bound. Model loading and initial document parsing are
+reported separately from warm wave timings. No PNG/JPEG encode/decode round trip
+is introduced between rendering and inference.
+
+The accompanying Metal PDF painter is a benchmark-only prototype. It batches
+eligible pages in each bounded worker group in one command buffer; supported content is opaque, closed polygon
+fills and axis-aligned opaque nearest-sampled images. Parsing, codec decoding,
+image sample-index tables, and model-exact bicubic preprocessing remain on CPU.
+Text, strokes, groups/transparency, complex clipping, shading, patterns, rotated
+pages, and other unsupported content reject the entire page before submission
+and use the exact CPU renderer. Lossy f32 polygon coordinates also fall back.
+Page preparation uses independent render forks in the same bounded worker pool
+as CPU rendering. Classification publishes an owned scene or CPU fallback before
+fallback completes, so the GPU painter can overlap the remaining CPU work.
+Fallback uses its existing private reader instead of a fresh second fork. Parser
+scratch remains charged through worker cleanup; every exit joins workers before
+releasing scenes or rasters. This does not cache prepared pages between passes.
+
+The painter bins commands into 32x32 pixel tiles and retains original paint order
+within each tile. Conservative bounds reject irrelevant commands before polygon
+sampling. Tile lists are capped at four million references (16 MiB/page); dense
+pages use the same bounds-culled kernel without a tile list. Four synchronous
+buffer slots reuse shared Metal storage after command completion, with a 512 MiB
+cached-buffer ceiling. `gpu_cached_buffer_bytes` reports that retained storage
+separately from model tensor counters. Shared buffers still require logical input
+copies and host output copies.
+
+The prototype copies GPU raster output to host to share the existing processor;
+it does not establish a resident GPU PDF-to-model pipeline. The first iteration
+compares every GPU-painted page with native pixels, rejects any byte error above
+one, and reports both maximum error and MAE. This gate is outside measured wave
+boundaries. Warm up at least once to exclude its cache effects from measurement.
+
+The campaign compares CPU render/host handoff, CPU render/resident handoff,
+and GPU render/resident handoff, plus separate render-only runs at each batch
+size. It saves input/checkpoint/binary hashes, ordered vectors, raw samples,
+p50/p95, throughput, fallback counts, per-stage observations, retained raster
+bytes, worker scratch, and available Metal transfer/device counters. All vectors
+must be finite, have 768 dimensions, retain page identity, and match the serial
+reference at cosine >= 0.9999. Stage durations measure CPU enqueue time and may
+include implicit synchronization; only final readback closes the model timing
+boundary. They are not isolated GPU kernel times. Device-owned tensor peaks
+exclude weights and provider pools; scratch observations are not total RSS.
+
+[The PDF benchmark guide and local evidence](../../../docs/design/inference/gemma4-pdf-performance.md)
+contain commands, corpus provenance, validation, and the limits of the results.
+Production PDF rendering remains on the exact CPU path. Promote GPU rendering
+only after representative supported pages show an end-to-end benefit, adequate
+coverage, and cancellation/admission behavior with owned device rasters. A future
+resident raster interface must carry strides, device/runtime identity, completion
+events, allocation ownership and its admission lease through preprocessing.
+Benchmark an overlapped CPU-render/GPU-inference baseline before choosing it.
+
+### Further implementation and measurement
+
+1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,
+   synchronization and peak host/device bytes separately. Measure end-to-end
+   items/s and p50/p95 latency against the CPU preprocessing baseline.
+2. Reuse bounded pinned-host/device slabs, streams and scratch. Overlap preparation
+   and transfer of batch N+1 with encoding batch N using explicit completion
+   events. Cancellation must drain in-flight work before buffer reuse, and every
+   buffer must remain charged to existing admission until its last consumer ends.
+3. Add model-exact GPU resize/crop/normalize and layout packing. Choose the upload
+   boundary using source size and measured costs; keep CPU fallback for unsupported
+   formats and small workloads. Preserve interpolation, antialiasing, color,
+   scaling and crop semantics and qualify final embedding similarity.
+4. Add optional compressed-image GPU-assisted decode for qualified CUDA hardware.
+   Keep the codec implementation behind the existing image boundary; CPU formats
+   must continue to work. PDF rendering remains CPU initially, with borrowed
+   rasters rather than a compressed round trip.
+5. Extend residency through resampling/channel mixing and CLAP feature/AFF
+   fusion preparation, and add missing CUDA conformer kernels. Qualify windows,
+   FFT, filterbanks, log floors, padding and long-clip fusion against each model's
+   existing processor. Cache/reuse spectral coefficient matrices and scratch
+   after measuring the bounded frontend against the CPU FFT/BLAS baseline.
+
+The microbatch broker remains responsible for cross-request grouping and indexed
+results. Bucket images by resolved dimensions/patch count and audio by feature
+length to bound padding. Device bytes, decoded pixels, audio windows and scratch
+must limit batches alongside item count. Every overlapped buffer counts against
+the working-memory ceiling, including both batches in a double buffer. Preserve
+per-item decode errors, original input indexes and caller cancellation; do not
+retry a failed model batch merely to recover residency.
+
+Qualify batches 1/4/16/32 where admission permits, mixed resolutions and audio
+lengths, cold and warm execution, and saturated GPU workloads. Enable additional
+GPU preprocessing by default only when end-to-end evidence shows a benefit on
+the qualified backend. A faster preprocessing kernel alone is insufficient.
+
 ## Synchronous generation batch endpoint
 
 Generative LLM batching should start with a synchronous `/generate/batch`

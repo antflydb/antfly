@@ -209,6 +209,9 @@ test {
     _ = @import("graph/seeded_training_test.zig");
     _ = @import("architectures/gliner/boundary_graph_test.zig");
     _ = architectures.clipclap_format;
+    _ = @import("architectures/clip.zig");
+    _ = @import("architectures/clap.zig");
+    _ = @import("architectures/qwen2vl_vision.zig");
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
     _ = architectures.qwen3vl_projector;
@@ -217,6 +220,7 @@ test {
     _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("pipelines/embedding_gemma2.zig");
     _ = @import("embedding_trace.zig");
     _ = @import("pipelines/qwen_embedding_batch.zig");
     _ = @import("server/model_manager.zig");

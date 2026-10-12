@@ -46,6 +46,7 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
 pub const pipelines = struct {
+    pub const image = @import("pipelines/image.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
     pub const embedding = @import("pipelines/embedding.zig");
     pub const gliner = @import("pipelines/gliner.zig");
@@ -99,7 +100,10 @@ pub const finetune = struct {
     pub const runners = @import("finetune/runners.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
+pub const RunPermit = @import("backends/session.zig").RunPermit;
+pub const antfly_image = @import("antfly_image");
 pub const architectures = struct {
+    pub const gemma4_projector = @import("architectures/gemma4_projector.zig");
     pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
     pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");
     pub const gliner_boundary_head = @import("architectures/gliner/boundary_head.zig");
