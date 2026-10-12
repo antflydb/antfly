@@ -16,6 +16,8 @@
 """Independent temporal/clock semantics. Requires the declared PostgreSQL oracle."""
 import unittest
 
+import psycopg
+
 from generate_sql_postgres_reference import postgres
 from generate_sql_temporal_reference import contract, reference
 
@@ -32,7 +34,7 @@ class TemporalReferenceTest(unittest.TestCase):
 
     def test_all_domains_have_independent_binary_and_calendar_evidence(self):
         result = reference(self.db)
-        self.assertEqual(98, len(result["entries"]))
+        self.assertEqual(174, len(result["entries"]))
         self.assertEqual({"date", "time", "time_tz", "timestamp", "timestamp_tz", "interval"}, {entry["kind"] for entry in result["entries"]})
         self.assertEqual({-1, 0, 1}, {entry["infinity"] for entry in result["entries"]})
         self.assertEqual(set(range(7)), {entry["precision"] for entry in result["entries"] if "precision" in entry})
@@ -72,6 +74,13 @@ class TemporalReferenceTest(unittest.TestCase):
     def test_wall_clock_remains_a_finite_timestamp_without_monotonicity_claim(self):
         result = self.db.execute("SELECT isfinite(clock_timestamp()), pg_typeof(clock_timestamp())::oid").fetchone()
         self.assertEqual((True, 1184), result)
+
+    def test_interval_precision_overflow_is_not_wrapped_or_infinite(self):
+        for micros in (-9223372036854775808, 9223372036854775807):
+            with self.subTest(micros=micros):
+                with self.assertRaises(psycopg.errors.DatetimeFieldOverflow) as caught:
+                    self.db.execute("SELECT %s::interval(0)", (f"{micros} microseconds",))
+                self.assertEqual("22008", caught.exception.sqlstate)
 
 
 if __name__ == "__main__":

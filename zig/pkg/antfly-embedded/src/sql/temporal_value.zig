@@ -53,6 +53,19 @@ pub const Kind = enum {
 };
 pub const Error = error{ InvalidTemporalBinary, TemporalOutOfRange, TemporalPrecisionLoss, InvalidTemporalPrecision };
 
+/// Precision coercion never passes through floating point or an epoch shift.
+/// i128 intermediates preserve signed half ties and i64-min interval values.
+fn roundedMicros(micros: i64, precision: u8) Error!i64 {
+    if (precision > 6) return error.InvalidTemporalPrecision;
+    if (precision == 6) return micros;
+    const scales = [_]i64{ 1_000_000, 100_000, 10_000, 1000, 100, 10, 1 };
+    const scale = scales[precision];
+    const value: i128 = micros;
+    const magnitude = if (value < 0) -value else value;
+    const rounded = @divTrunc(magnitude + @divExact(scale, 2), scale) * scale;
+    return std.math.cast(i64, if (value < 0) -rounded else rounded) orelse error.TemporalOutOfRange;
+}
+
 /// Distinct SQL timestamp kinds share this exact signed PostgreSQL-epoch unit.
 /// +/-infinity are values; neither is SQL NULL.
 pub const Timestamp = struct {
@@ -84,12 +97,7 @@ pub const Timestamp = struct {
         _ = try init(self.micros);
         if (precision > 6) return error.InvalidTemporalPrecision;
         if (self.infinity() != 0 or precision == 6) return self;
-        const scales = [_]i64{ 1_000_000, 100_000, 10_000, 1000, 100, 10, 1 };
-        const scale = scales[precision];
-        const value: i128 = self.micros;
-        const magnitude = if (value < 0) -value else value;
-        const rounded = @divTrunc(magnitude + @divExact(scale, 2), scale) * scale;
-        return init(std.math.cast(i64, if (value < 0) -rounded else rounded) orelse return error.TemporalOutOfRange);
+        return init(try roundedMicros(self.micros, precision));
     }
 };
 pub const Date = struct {
@@ -109,6 +117,10 @@ pub const Time = struct {
         if (micros < 0 or micros > micros_per_day) return error.TemporalOutOfRange;
         return .{ .micros = micros };
     }
+    pub fn withPrecision(self: Time, precision: u8) Error!Time {
+        _ = try init(self.micros);
+        return init(try roundedMicros(self.micros, precision));
+    }
 };
 pub const TimeTz = struct {
     time: Time,
@@ -116,6 +128,10 @@ pub const TimeTz = struct {
     pub fn init(micros: i64, seconds_west: i32) Error!TimeTz {
         if (seconds_west <= -57_600 or seconds_west >= 57_600) return error.TemporalOutOfRange;
         return .{ .time = try Time.init(micros), .seconds_west = seconds_west };
+    }
+    pub fn withPrecision(self: TimeTz, precision: u8) Error!TimeTz {
+        _ = try init(self.time.micros, self.seconds_west);
+        return .{ .time = try self.time.withPrecision(precision), .seconds_west = self.seconds_west };
     }
 };
 pub const Interval = struct {
@@ -128,6 +144,11 @@ pub const Interval = struct {
         if (self.months == std.math.maxInt(i32) and self.days == std.math.maxInt(i32) and self.micros == std.math.maxInt(i64)) return 1;
         return 0;
     }
+    pub fn withPrecision(self: Interval, precision: u8) Error!Interval {
+        if (precision > 6) return error.InvalidTemporalPrecision;
+        if (self.infinity() != 0) return self;
+        return .{ .months = self.months, .days = self.days, .micros = try roundedMicros(self.micros, precision) };
+    }
 };
 pub const Value = union(Kind) {
     date: Date,
@@ -138,6 +159,16 @@ pub const Value = union(Kind) {
     interval: Interval,
     pub fn kind(self: Value) Kind {
         return std.meta.activeTag(self);
+    }
+    pub fn withPrecision(self: Value, precision: u8) Error!Value {
+        return switch (self) {
+            .date => error.InvalidTemporalPrecision,
+            .time => |v| .{ .time = try v.withPrecision(precision) },
+            .time_tz => |v| .{ .time_tz = try v.withPrecision(precision) },
+            .timestamp => |v| .{ .timestamp = try v.withPrecision(precision) },
+            .timestamp_tz => |v| .{ .timestamp_tz = try v.withPrecision(precision) },
+            .interval => |v| .{ .interval = try v.withPrecision(precision) },
+        };
     }
     pub fn infinity(self: Value) i8 {
         return switch (self) {
@@ -233,7 +264,7 @@ test "SQL temporal PostgreSQL binary fields and precision preserve full domains"
     const Entry = struct { kind: Kind, sql: []const u8, oid: u32, binary: []const u8, components: []const i64, infinity: i8, source_binary: ?[]const u8 = null, precision: ?u8 = null };
     const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_temporal_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 98), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 174), fixture.value.entries.len);
     var covered: u8 = 0;
     for (fixture.value.entries) |entry| {
         errdefer std.debug.print("temporal oracle: {s}\n", .{entry.sql});
@@ -251,13 +282,10 @@ test "SQL temporal PostgreSQL binary fields and precision preserve full domains"
         var encoded: [16]u8 = undefined;
         try std.testing.expectEqualSlices(u8, frame, try encode(value, &encoded));
         if (entry.source_binary) |source_hex| {
-            const source = try decode(entry.kind, try std.fmt.hexToBytes(&bytes, source_hex));
-            const timestamp = switch (source) {
-                .timestamp, .timestamp_tz => |v| v,
-                else => return error.UnexpectedTemporalPrecision,
-            };
-            const rounded = try timestamp.withPrecision(entry.precision.?);
-            try std.testing.expectEqual(value.components().values[0], rounded.micros);
+            var source_bytes: [16]u8 = undefined;
+            const source = try decode(entry.kind, try std.fmt.hexToBytes(&source_bytes, source_hex));
+            const rounded = try source.withPrecision(entry.precision.?);
+            try std.testing.expectEqualSlices(u8, frame, try encode(rounded, &encoded));
         }
     }
     try std.testing.expectEqual(@as(u8, 63), covered);
@@ -278,6 +306,33 @@ test "SQL temporal binary codec rejects malformed values before publishing bytes
     }
     // Precision rounding may carry out of the valid timestamp domain.
     try std.testing.expectError(error.TemporalOutOfRange, (try Timestamp.init(end_timestamp - 1)).withPrecision(0));
+}
+
+test "SQL temporal precision preserves calendar components and detects carry overflow" {
+    const t = std.testing;
+    try t.expectEqual(micros_per_day, (try (Time{ .micros = micros_per_day - 1 }).withPrecision(0)).micros);
+    const zoned = try (TimeTz{ .time = .{ .micros = micros_per_day - 1 }, .seconds_west = -20_700 }).withPrecision(0);
+    try t.expectEqual(micros_per_day, zoned.time.micros);
+    try t.expectEqual(@as(i32, -20_700), zoned.seconds_west);
+    const interval = try (Interval{ .months = -14, .days = 3, .micros = -500_000 }).withPrecision(0);
+    try t.expectEqual(@as(i32, -14), interval.months);
+    try t.expectEqual(@as(i32, 3), interval.days);
+    try t.expectEqual(@as(i64, -1_000_000), interval.micros);
+    for ([_]i64{ std.math.minInt(i64), std.math.maxInt(i64) }) |micros| {
+        const finite: Interval = .{ .micros = micros };
+        try t.expectEqual(micros, (try finite.withPrecision(6)).micros);
+        try t.expectError(error.TemporalOutOfRange, finite.withPrecision(0));
+    }
+    for ([_]Interval{
+        .{ .months = std.math.minInt(i32), .days = std.math.minInt(i32), .micros = std.math.minInt(i64) },
+        .{ .months = std.math.maxInt(i32), .days = std.math.maxInt(i32), .micros = std.math.maxInt(i64) },
+    }) |infinity| {
+        for (0..7) |precision| try t.expectEqual(infinity, try infinity.withPrecision(@intCast(precision)));
+        try t.expectError(error.InvalidTemporalPrecision, infinity.withPrecision(7));
+    }
+    try t.expectError(error.InvalidTemporalPrecision, (Time{ .micros = 0 }).withPrecision(7));
+    try t.expectError(error.TemporalOutOfRange, (TimeTz{ .time = .{ .micros = 0 }, .seconds_west = 57_600 }).withPrecision(0));
+    try t.expectError(error.InvalidTemporalPrecision, (Value{ .date = .{ .days = 0 } }).withPrecision(0));
 }
 
 test "SQL temporal full-range epoch conversion and mixed codec roundtrips allocate nothing" {

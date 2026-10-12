@@ -43,6 +43,18 @@ SAMPLES = {
     "interval": ["0", "1 month 2 days 03:04:05.123456", "-1 month 2 days -03:04:05.123456", "1 year -2 months -3 days 25 hours", "2147483647 months", "-2147483648 days", "-infinity", "infinity"],
 }
 
+# Sign transitions, large-hour intervals and decimal trimming are independent
+# protocol contracts, not expected strings derived from the native formatter.
+SAMPLES["date"] += ["1582-10-04", "1582-10-15", "0001-12-31 BC", "0001-01-01 AD"]
+SAMPLES["timestamp"] += [f"2000-01-01 00:00:00.{digits}" for digits in ("1", "01", "001", "0001", "00001")]
+SAMPLES["time_tz"] += ["01:00:00+05:00", "01:00:00+05:00:01", "01:00:00-00:00:01"]
+SAMPLES["interval"] += [
+    "-1 year 2 months 3 days 4 hours", "1 year -2 months 3 days 4 hours",
+    "-1 year -2 months 3 days 4 hours", "-1 day 2 hours",
+    "1 month -2 days 3 hours", "-12 months 3 days",
+    "-9223372036854775808 microseconds", "9223372036854775807 microseconds",
+]
+
 
 def integer(value):
     result = int(value)
@@ -84,7 +96,7 @@ def contract(db, kind, expression, source=None, precision=None):
         if kind == "time_tz":
             fields += ", -extract(timezone from v)::numeric"
         components = [integer(x) for x in db.execute(f"SELECT {fields} FROM (SELECT {expression} AS v) s").fetchone()]
-    result = {"kind": kind, "sql": expression, "oid": oid, "binary": first[0], "components": components, "infinity": infinity}
+    result = {"kind": kind, "sql": expression, "oid": oid, "binary": first[0], "text": first[3], "components": components, "infinity": infinity}
     if source is not None:
         result["source_binary"] = db.execute(f"SELECT encode(pg_catalog.{sender}({source}),'hex')").fetchone()[0]
         result["precision"] = precision
@@ -107,12 +119,23 @@ def reference(db):
             source = f"{TYPES[kind][0]} '{value}'"
             for precision in range(7):
                 entries.append(contract(db, kind, f"({source})::{TYPES[kind][0]}({precision})", source, precision))
+    for kind, values in (
+        ("time", ("00:00:00.555555", "23:59:59.999999")),
+        ("time_tz", ("00:00:00.555555+05:45", "23:59:59.999999-15:59:59")),
+        ("interval", ("0.555555 seconds", "-0.555555 seconds", "1 month -2 days 0.555555 seconds", "-0.000001 seconds")),
+    ):
+        for value in values:
+            source = f"{TYPES[kind][0]} '{value}'"
+            for precision in range(7):
+                entries.append(contract(db, kind, f"({source})::{TYPES[kind][0]}({precision})", source, precision))
     return {"reference": "PostgreSQL exact binary and extracted temporal fields", "oracle_major": db.info.server_version // 10000, "server_version": db.info.server_version, "server_build": db.execute("SELECT version()").fetchone()[0], "encoding": db.execute("SHOW server_encoding").fetchone()[0], "timezone": "UTC", "date_style": "ISO, YMD", "interval_style": "postgres", "entries": entries}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--write", action="store_true", help="Regenerate the independent checked-in fixture")
     args = parser.parse_args()
     with postgres() as db:
         result = reference(db)
@@ -121,6 +144,8 @@ def main():
         if result != expected:
             raise AssertionError("independent PostgreSQL temporal reference drift")
         print(f"Verified {len(result['entries'])} PostgreSQL temporal binary/field/precision contracts")
+    elif args.write:
+        FIXTURE.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     else:
         print(json.dumps(result, indent=2, ensure_ascii=False))
 

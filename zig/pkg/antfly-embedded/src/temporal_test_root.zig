@@ -16,5 +16,6 @@
 //! Typed temporal and execution-owned clock contracts, independent of server IO.
 test {
     _ = @import("sql/temporal_value.zig");
+    _ = @import("sql/temporal_text.zig");
     _ = @import("sql/statement_clock.zig");
 }

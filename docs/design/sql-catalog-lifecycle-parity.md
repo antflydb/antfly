@@ -3485,3 +3485,31 @@ ingress/cursor clock capture from durable transaction ownership, and capability
 barriers before persisted/public type activation. No original case receives
 credit until its unchanged query passes public execution. Counts remain
 479 implemented / 136 rejected / 73 superseded / 898 unresolved.
+
+The shared temporal text boundary now provides allocation-free canonical
+ISO/YMD output (UTC for timestamptz) and postgres-style interval output, plus
+strict canonical decoding for all six domains. Gregorian conversion spans the
+entire DATE domain, including astronomical year zero internally/SQL 1 BC
+externally; timestamp decomposition uses floor division before the epoch.
+TIME 24:00 remains distinct, while timestamp assembly normalizes it to the next
+day and checks the final timestamp bound. Named zones and general PostgreSQL
+literal spellings are explicitly not canonical-codec responsibilities.
+
+The oracle now records 174 independent text/binary/field/precision contracts,
+including mixed-sign intervals and minimum/maximum finite time components.
+All 17 native tests pass in Debug and ReleaseFast; 12,000 randomized full-domain
+text/binary roundtrips and 3,000 arbitrary-byte inputs exercise the bounded
+decoder. Six independent PostgreSQL tests and fixture regeneration checks pass.
+One local ReleaseFast sample formatted/decoded 100,000 mixed values in 19.7 ms,
+with fixed caller-owned output and no heap allocation. This microbenchmark is
+not a query-latency result or evidence of public temporal activation. The
+remaining activation work and original inventory counts above are unchanged.
+
+Exact precision coercion covers timestamp, timestamptz, time, timetz and interval
+at every precision from zero through six. Interval months/days and timetz
+offsets survive rounding unchanged; finite interval carry overflow is an error,
+not wrapping or infinity. PostgreSQL independently returns 22008 for that
+overflow; eventual SQL activation must retain that diagnostic. The native gate
+is `zig build sql-temporal-test` (also a dependency of `unit-test`); the independent
+fixture gate is `scripts/generate_sql_temporal_reference.py --check` with the
+declared psycopg runtime and owned PostgreSQL test server.
