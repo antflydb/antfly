@@ -300,6 +300,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "graph.query.",
         .skip = &.{
+            // Introducer owns physical-score read helper regressions.
+            "graph.score_read.test.",
             "storage.hot_standby.native_topology_receipt_integration_test.test.",
             "storage.backend_erased.test.",
             "storage.db.db.test.",

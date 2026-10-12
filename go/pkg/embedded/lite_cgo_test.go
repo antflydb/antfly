@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {
@@ -983,32 +984,60 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("close restored directory database: %v", err)
 	}
 
-	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
-	lockedRestore, err := Create(lockedRestorePath)
+	// Open connections reserve the writer only during operations. Replacement
+	// between calls must refresh this connection instead of retaining old pages.
+	openRestorePath := filepath.Join(t.TempDir(), "go-open-restore.aflite")
+	openRestore, err := Create(openRestorePath)
 	if err != nil {
-		t.Fatalf("open locked restore target: %v", err)
+		t.Fatalf("open restore target: %v", err)
 	}
-	if err := lockedRestore.Batch([]WriteIntent{{
-		Key:   "doc:locked-restore-target",
-		Value: []byte(`{"title":"locked restore target survives"}`),
+	t.Cleanup(func() { openRestore.Close() })
+	if err := openRestore.Batch([]WriteIntent{{
+		Key:   "doc:pre-restore-target",
+		Value: []byte(`{"title":"old restore target"}`),
 	}}, 7); err != nil {
-		t.Fatalf("write locked restore target: %v", err)
+		t.Fatalf("write restore target: %v", err)
 	}
-	if err := Restore(lockedRestorePath, backupBytes, RestoreOptions{Replace: true}); err != Busy {
-		t.Fatalf("restore into active writer = %v, want %v", err, Busy)
+	// Native idle maintenance can briefly own the actual writer lease.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := Restore(openRestorePath, backupBytes, RestoreOptions{Replace: true})
+		if err == nil {
+			break
+		}
+		if err != Busy || time.Now().After(deadline) {
+			t.Fatalf("restore between connection calls: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	lockedLookup, err := lockedRestore.LookupJSON("doc:locked-restore-target")
+	if _, err := openRestore.LookupJSON("doc:pre-restore-target"); err != NotFound {
+		t.Fatalf("old document after replacement = %v, want %v", err, NotFound)
+	}
+	assertSearchContains(openRestore, "open connection restored full-text", fullTextQuery, "go binding full text search")
+	assertSearchContains(openRestore, "open connection restored dense", denseQuery, "doc:go-search")
+	if err := openRestore.Batch([]WriteIntent{{
+		Key:   "doc:post-restore-target",
+		Value: []byte(`{"title":"new restore target"}`),
+	}}, 8); err != nil {
+		t.Fatalf("write through refreshed connection: %v", err)
+	}
+	if _, err := os.Stat(openRestorePath + ".restore-tmp.aflite"); !os.IsNotExist(err) {
+		t.Fatalf("restore left temp file behind: %v", err)
+	}
+	if err := openRestore.Close(); err != nil {
+		t.Fatalf("close refreshed restore target: %v", err)
+	}
+	refreshed, err := OpenReadonly(openRestorePath)
 	if err != nil {
-		t.Fatalf("lookup locked restore target: %v", err)
+		t.Fatalf("reopen refreshed restore target: %v", err)
 	}
-	if !bytes.Contains(lockedLookup, []byte("locked restore target survives")) {
-		t.Fatalf("locked restore target lookup JSON %q did not contain original document", lockedLookup)
+	refreshedLookup, lookupErr := refreshed.LookupJSON("doc:post-restore-target")
+	closeErr := refreshed.Close()
+	if lookupErr != nil || !bytes.Contains(refreshedLookup, []byte("new restore target")) {
+		t.Fatalf("post-restore write did not survive reopen: %q, %v", refreshedLookup, lookupErr)
 	}
-	if _, err := os.Stat(lockedRestorePath + ".restore-tmp.aflite"); !os.IsNotExist(err) {
-		t.Fatalf("locked restore left temp file behind: %v", err)
-	}
-	if err := lockedRestore.Close(); err != nil {
-		t.Fatalf("close locked restore target: %v", err)
+	if closeErr != nil {
+		t.Fatalf("close reopened restore target: %v", closeErr)
 	}
 
 	importedPath := filepath.Join(t.TempDir(), "go-imported.aflite")

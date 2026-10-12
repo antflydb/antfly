@@ -833,8 +833,13 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
             if marker >= 0:
                 document = json.loads(data[marker - 1 :])
                 if len(document["declarations"]) == 320:
+                    ids = contribution_ids(document)
+                    # Retained immutable objects include checkpoint directories
+                    # written before contribution publication completes.
+                    if len(ids) != 320:
+                        continue
                     directory_found = True
-                    old_contribution_ids = contribution_ids(document)
+                    old_contribution_ids = ids
                     break
         assert directory_found, (
             "320 declarations were not published through an immutable directory"
@@ -898,6 +903,10 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
                 document = json.loads(data[marker - 1 :])
                 if len(document["declarations"]) == 321:
                     ids = contribution_ids(document)
+                    # Both source files need every declaration. The immutable
+                    # index may also retain contributions from earlier views.
+                    if len(ids) < 2 * 321:
+                        continue
                     assert old_contribution_ids <= ids
                     reused = True
                     break

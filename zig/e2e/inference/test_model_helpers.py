@@ -50,6 +50,21 @@ from .test_generate import (
 )
 
 
+def test_server_budget_args_default_scratch_and_explicit_override(monkeypatch):
+    for suffix in (
+        "PROCESS_MEMORY_BUDGET_MB",
+        "HOST_BUDGET_MB",
+        "BACKEND_BUDGET_MB",
+        "COMBINED_BUDGET_MB",
+        "KV_BUDGET_MB",
+        "SCRATCH_BUDGET_MB",
+    ):
+        monkeypatch.delenv(f"ANTFLY_INFERENCE_{suffix}", raising=False)
+    assert _server_budget_args() == ["--scratch-budget-mb", "2048"]
+    monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "512")
+    assert _server_budget_args() == ["--scratch-budget-mb", "512"]
+
+
 def test_server_budget_args_validate_and_preserve_values(monkeypatch):
     for env_name in (
         "ANTFLY_INFERENCE_BACKEND_BUDGET_MB",
