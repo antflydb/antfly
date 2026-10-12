@@ -1,7 +1,8 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `b467a7f19f` (including #1093), with merge checkpoint `ebe475bccb`.
+at `4e1c599855` (including #1090, #1096, #1107 and #1108), with merge checkpoint
+`054e9e895a` and durable-text implementation checkpoint `4607f03833`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -3963,3 +3964,26 @@ PostgreSQL fixture checks reproduced all 42 generated and 24 index contracts.
 Go relational SDK tests, 18 Python tests, TypeScript type checking and 483 tests
 (one existing skip), formatting, OpenAPI validation and the 20 inventory tests
 passed. This is not a post-main-merge, full native-lifecycle or remote CI claim.
+
+Original-case mapping: `sql-0017`, `sql-0717` and `sql-0718` now have the native
+durable text-key foundation, but still need exact public index lifecycle and
+distributed UNIQUE/authority evidence before disposition changes. `sql-0671`
+additionally needs durable exact rounding and JSON extraction in its unchanged
+multi-column generated declaration. The document joined-mutation cases
+`sql-0960` through `sql-0966` need their document producer/index-proof contracts;
+relational VM support alone cannot certify them.
+
+Post-merge qualification at `054e9e895a`: full native lifecycle passed 210
+tests plus one linked test (50/50 build steps); full SQL Debug passed 757
+main-owner and 226 linked tests (21/21 steps), with three existing skips and no
+failures/leaks. ReleaseFast passed all 14 selected text/planning tests. Mounted
+HTTP qualification passed 19 linked and three HTTP tests (80/80 steps).
+PostgreSQL independently reproduced all 42 generated and 24 index contracts.
+Go relational SDK tests, seven Python expression tests, TypeScript type checking
+and 483 tests (one existing skip), formatting, inventory integrity and the
+2,050-file Apache boundary passed. Source-catalog freshness passed through the
+identical Python audit directly; its `uv` wrapper never launched Python and was
+stopped without touching other owners. A mistyped HTTP build-step invocation
+was replaced by the successful `public-api-parity-test` run, not counted as
+qualification. Cache GC was previewed only to avoid disrupting other active
+worktrees. No remote CI or complete original-case parity claim.
