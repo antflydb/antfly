@@ -973,3 +973,10 @@ measurements; they do not establish the new layout's regional or full-archive
 latency. Antfly still reads roughly 43 MB locally for five hits, so reducing cold
 work further remains useful. `--build-only` can prebuild and verify a publication
 without taking query timing samples while builds are active.
+
+A small separate DuckDB HTTPS scan diagnostic on the same unchanged export took
+3.58 seconds for its first `database` substring query and 236 ms for its repeat;
+`AI` took 206–209 ms after that initial access. This was unranked, used a native
+ARM client outside the storage region and included only two samples per term.
+It is recorded separately in the evidence and is not an indexed BM25 comparison
+or a production latency qualification.

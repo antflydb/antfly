@@ -578,5 +578,24 @@
       "error": null
     },
     "raw_report_sha256": "4bf24f568a384eaf9fd68bbf210826a4ba27fffdeab6c231f8e56a252518f839"
+  },
+  "remote_scan_diagnostic": {
+    "engine": "DuckDB 1.5.6",
+    "client": "macOS ARM64 outside the object-storage region",
+    "query_kind": "unranked contains(lower(body), lower(term)); metadata projection; ORDER BY hn_id LIMIT 5",
+    "same_export_verified_by_local_crc_and_size": true,
+    "samples_per_term": 2,
+    "workloads": {
+      "database": {
+        "first_ms": 3577.93,
+        "repeat_ms": 236.49
+      },
+      "AI": {
+        "first_ms": 206.48,
+        "repeat_ms": 209.38
+      }
+    },
+    "raw_report_sha256": "33fbad693dac0c9a5bb82b0654bd019f8ed4b013e63b605306cdd6d24ee89de2",
+    "limitation": "Different geography and query semantics from regional Antfly BM25; not an engine speed ranking."
   }
 }
