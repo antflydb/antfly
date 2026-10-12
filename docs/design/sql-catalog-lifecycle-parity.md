@@ -3180,7 +3180,7 @@ invent Raft replicas. Production native root/reporter observation and placement
 admission still need integration before automatic native publication. An absent
 durable store registration remains a rejection, not an implicit local grant.
 
-### Transactional visible-projection watermark (qualification pending)
+### Transactional visible-projection watermark (`d274cfbe4d`)
 
 Standalone catalog commits now retain a second durable watermark: the latest
 revision that may change the visible table/schema/name projection. It advances
@@ -3203,7 +3203,42 @@ the global revision exactly once while preserving the visible watermark. Its
 adapter deliberately loses the local epoch update; recovery has no catalog
 snapshot available, so an accidental full reload cannot pass. Storage tests
 also check empty/missing stamps, visible invalidation, corruption, future
-watermarks and abort without a partial restore-job write. Debug qualification
-is running. This bounds owner-progress recovery work; it does not split shared
+watermarks and abort without a partial restore-job write. The final Debug gate
+passed all 102 build steps and 33 component executions: five standalone, 27
+publication and one decoder-floor test, with zero skips, failures or leaks.
+Optimized validation of this exact source is running in an isolated worktree.
+This bounds owner-progress recovery work; it does not split shared
 commit/publication locks or qualify distributed activation. Original cases
 and public-production barriers are unchanged.
+
+The first combined Debug command passed the owner/standby and decoder-floor
+tests but failed the new corruption witness because its restore-job key was
+invalid before reaching the watermark check. That command is not a passing
+qualification. The corrected witness uses the real restore-job key format and
+a valid queued-job value. The final gate additionally exercises visible-table
+reload and the existing remote-apply outage/recovery contract. Only that final
+corrected command is the complete passing Debug qualification above.
+
+### Remaining native receipt authority boundary
+
+Source review confirms `requireIndexOwnerRootReceiptTxn` still requires a
+durable placement intent and replica ID even for a native sequence receipt.
+Explicit enrollment alone therefore cannot activate the standalone producer:
+its public store/placement listing is synthetic, while the physical kernel
+owner lease exposes the real applying root generation, not a Raft replica ID.
+Do not map a native sequence to a Raft watermark, use a store ID as a fabricated
+replica ID, or turn a root-possession signature into placement authority.
+
+Native activation needs an explicitly native physical-owner attestation and
+durable current-owner observation: immutable cluster/node/store/root binding,
+enrolled public key, current reporter incarnation, exact logical namespace,
+physical root generation and native source cut. Startup/report ownership must
+be durably fenced; stale reporters and replaced/restored roots cannot refresh
+the registry. The verifier must read that native authority in the same
+transaction as the progress CAS, independently of caller truth flags. Raft
+receipts must retain their actual placement/replica and observed log checks.
+The issuer must sign the root generation returned by the applying/recovering
+lease, never a later routing lookup. Codec/capability activation, provenance
+adoption and failure campaigns must precede public worker activation. These
+native authority changes remain implementation work, not claims of this
+enrollment or projection-watermark checkpoint.
