@@ -110,12 +110,7 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
             try candidates.append(a, .{ .entity_type = kind, .source = value.source.?, .probability = value.confidence });
         };
         mention_window.* = .{ .identity = try planned.identity(i), .pre_overlap_candidates = candidates.items };
-        relation_window.* = .{ .identity = try planned.identity(i), .relations = try a.dupe(pipeline.Relation, result.samples[0].relations) };
-        // Copy relation endpoints before their local arena closes.
-        for (@constCast(relation_window.relations)) |*edge| {
-            edge.head.text = try a.dupe(u8, edge.head.text);
-            edge.tail.text = try a.dupe(u8, edge.tail.text);
-        }
+        relation_window.* = .{ .identity = try planned.identity(i), .relations = try copyRelations(a, result.samples[0].relations) };
     }
     var merged = try document.mergeMentions(allocator, planned, &item.compiled, mentions, options.overlap, options.offset_unit, .{ .control = options.control });
     defer merged.deinit();
@@ -141,15 +136,11 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
     }
     var edges = try long_relations.merge(allocator, planned, &item.compiled, relations, .{ .output_unit = options.offset_unit, .merge = .{ .control = options.control } });
     defer edges.deinit();
-    const copied_edges = try a.dupe(pipeline.Relation, edges.relations);
-    for (copied_edges) |*edge| {
-        edge.head.text = try a.dupe(u8, edge.head.text);
-        edge.tail.text = try a.dupe(u8, edge.tail.text);
-    }
+    const copied_edges = try copyRelations(a, edges.relations);
     var classes: []const pipeline.Classification = &.{};
     if (item.compiled.schema.classifications.len != 0) {
-        var logits = try classificationLogits(cb, a, .{ .modern_bert = config }, item, prepared);
-        defer logits.deinit(a);
+        var logits = try classificationLogits(cb, allocator, .{ .modern_bert = config }, item, prepared);
+        defer logits.deinit(allocator);
         const rows = try a.alloc([]const f64, logits.rows.len);
         for (rows, logits.rows) |*out, row| out.* = row;
         var presented = try pipeline.presentClassifications(a, &item.compiled, rows, 1, options);
@@ -165,4 +156,36 @@ pub fn extract(cb: *const compute.ComputeBackend, allocator: A, config: @import(
     const samples = try a.alloc(pipeline.Sample, 1);
     samples[0] = .{ .entities = groups, .relations = copied_edges, .classifications = classes };
     return .{ .arena = arena, .samples = samples };
+}
+
+// A merged result must own every string after both intermediate arenas close.
+fn copyRelations(a: A, input: []const pipeline.Relation) ![]pipeline.Relation {
+    const result = try a.dupe(pipeline.Relation, input);
+    for (result) |*edge| {
+        edge.name = try a.dupe(u8, edge.name);
+        edge.head.text = try a.dupe(u8, edge.head.text);
+        edge.tail.text = try a.dupe(u8, edge.tail.text);
+    }
+    return result;
+}
+
+test "windowed relation copies own names and endpoints" {
+    var output = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer output.deinit();
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const a = source.allocator();
+    const input = [_]pipeline.Relation{.{
+        .name = try a.dupe(u8, "works_for"),
+        .head = .{ .text = try a.dupe(u8, "Alice"), .confidence = 0.9, .source = null, .token_span = null },
+        .tail = .{ .text = try a.dupe(u8, "Antfly"), .confidence = 0.8, .source = null, .token_span = null },
+        .confidence = 0.7,
+    }};
+    const copied = try copyRelations(output.allocator(), &input);
+    try std.testing.expect(copied[0].name.ptr != input[0].name.ptr);
+    try std.testing.expect(copied[0].head.text.ptr != input[0].head.text.ptr);
+    try std.testing.expect(copied[0].tail.text.ptr != input[0].tail.text.ptr);
+    source.deinit();
+    try std.testing.expectEqualStrings("works_for", copied[0].name);
+    try std.testing.expectEqualStrings("Alice", copied[0].head.text);
+    try std.testing.expectEqualStrings("Antfly", copied[0].tail.text);
 }

@@ -116,6 +116,9 @@ def test_find_library_uses_lib_dir_env_var(tmp_path: Path, monkeypatch: pytest.M
 
 def test_native_error_detail_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
         def antfly_last_error_detail(self):
             return b"MissingIndexType"
 
@@ -124,9 +127,24 @@ def test_native_error_detail_is_reported(monkeypatch: pytest.MonkeyPatch) -> Non
         errors.raise_for_code(errors.INVALID_ARGUMENT)
 
 
+def test_unrelated_native_detail_is_not_attached(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
+        def antfly_last_error_detail(self):
+            return b"MissingIndexType"
+
+    monkeypatch.setattr(_ffi, "_lib", Library())
+    with pytest.raises(errors.NotFoundError) as result:
+        errors.raise_for_code(errors.NOT_FOUND)
+    assert "MissingIndexType" not in str(result.value)
+
+
 def test_models_directory_survives_options_marshalling(monkeypatch: pytest.MonkeyPatch) -> None:
     import ctypes
     import gc
+
     import antfly_embedded
 
     class Library:

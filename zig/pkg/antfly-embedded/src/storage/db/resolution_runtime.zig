@@ -359,7 +359,7 @@ pub fn processChangedExtractionWithConfig(
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
     var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg) };
     var source_provider: SourceCandidateProvider = undefined;
-    const effective_provider = provider orelse blk: {
+    const blocked_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
         // in-store providers when the resolver declares a candidate search mode.
         if (batch_source) |src| {
@@ -380,6 +380,17 @@ pub fn processChangedExtractionWithConfig(
         if (std.mem.eql(u8, cfg.candidate_search, "prefix")) break :blk prefix_provider.provider();
         break :blk null;
     };
+
+    // Explicit minted-key redirects are independent of fuzzy blocking/top-k.
+    // Keep both providers bulk-capable so aliases do not turn document batches
+    // into a per-mention ANN or prefix scan.
+    var alias_source: SourceCandidateProvider = undefined;
+    const alias_provider = if (batch_source) |src| blk: {
+        alias_source = .{ .source = src, .resolver = &resolver, .table = cfg.table, .mode = .exact_key, .ann_index_name = "", .candidate_limit = 1 };
+        break :blk alias_source.provider();
+    } else exact_provider.provider();
+    var alias_first = AliasFirstCandidateProvider{ .exact = alias_provider, .blocked = blocked_provider };
+    const effective_provider = if (resolver.scorer != null and !std.mem.eql(u8, cfg.candidate_search, "exact_key")) alias_first.provider() else blocked_provider;
 
     // Name-embedding backfill: when the resolver declares a `name_embedding`
     // model and the runtime has an embedder, mentions without a vector get one
@@ -695,6 +706,33 @@ test "batched review decisions preserve unrelated overrides and escaped identiti
 
 /// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,
 /// binding the resolver's embedding model name and dimensionality.
+const AliasFirstCandidateProvider = struct {
+    exact: resolver_lib.CandidateProvider,
+    blocked: ?resolver_lib.CandidateProvider,
+    fn provider(self: *@This()) resolver_lib.CandidateProvider {
+        return .{ .ptr = self, .vtable = &.{ .candidates_for = candidates, .candidates_for_batch = batch } };
+    }
+    fn candidates(ptr: *anyopaque, a: Allocator, entity: resolver_lib.ExtractedEntity, out: *std.ArrayListUnmanaged(resolver_lib.Candidate)) anyerror!void {
+        var lists: [1][]const resolver_lib.Candidate = undefined;
+        try batch(ptr, a, &.{entity}, &lists);
+        try out.appendSlice(a, lists[0]);
+    }
+    fn batch(ptr: *anyopaque, a: Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.exact.candidatesForBatch(a, entities, lists);
+        if (self.blocked) |blocked| {
+            const fuzzy = try a.alloc([]const resolver_lib.Candidate, entities.len);
+            try blocked.candidatesForBatch(a, entities, fuzzy);
+            for (lists, fuzzy) |*list, other| {
+                const combined = try a.alloc(resolver_lib.Candidate, list.len + other.len);
+                @memcpy(combined[0..list.len], list.*);
+                @memcpy(combined[list.len..], other);
+                list.* = combined;
+            }
+        }
+    }
+};
+
 const DenseMentionEmbedder = struct {
     embedder: ?embedder_mod.DenseEmbedder,
     source: ?CandidateSource = null,
@@ -3969,6 +4007,7 @@ const FakeCandidateSource = struct {
     last_ann_index: []const u8 = "",
     last_ann_k: usize = 0,
     last_scan_limit: usize = 0,
+    exclude_redirects_from_nearest: bool = false,
 
     pub fn deinit(self: *FakeCandidateSource) void {
         var it = self.map.iterator();
@@ -4048,6 +4087,7 @@ const FakeCandidateSource = struct {
         var emitted: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |e| {
+            if (self.exclude_redirects_from_nearest and std.mem.indexOf(u8, e.value_ptr.*, "merged_into") != null) continue;
             if (emitted >= query.k) break;
             try consume(ctx, e.key_ptr.*, e.value_ptr.*);
             emitted += 1;
@@ -4316,6 +4356,20 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    // The explicit alias is deliberately absent from ANN results. Its exact
+    // minted-key redirect must still override unrelated fuzzy candidates.
+    remote.exclude_redirects_from_nearest = true;
+    try remote.put("person/curated", "{\"canonical_name\":\"Curated identity\",\"label\":\"person\"}");
+    try remote.put("person/a_lovelace", "{\"canonical_name\":\"A Lovelace\",\"label\":\"person\",\"merged_into\":\"person/curated\"}");
+    const alias_outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource(), null)).?;
+    defer alloc.free(alias_outcome.resolution_key);
+    const alias_raw = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(alias_raw);
+    const alias_result = try std.json.parseFromSlice(std.json.Value, alloc, alias_raw, .{});
+    defer alias_result.deinit();
+    const alias_entity = alias_result.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", alias_entity.get("decision").?.string);
+    try testing.expectEqualStrings("person/curated", alias_entity.get("doc_ref").?.object.get("key").?.string);
 }
 
 test "SourceCandidateProvider shares prefix scans and negatively caches redirect destinations across mentions" {

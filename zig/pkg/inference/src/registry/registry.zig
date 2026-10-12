@@ -1205,15 +1205,35 @@ test "boundary typed decisions require exact multi-Decide identity independent o
 /// of the same immutable artifact qualify, while changed weights fail closed.
 fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
     if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return null;
-    const weight_path = manifest.safetensors_path orelse return null;
-    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return null;
-    defer reader.deinit();
-    var all_f32 = true;
-    var tensors = reader.header.tensors.iterator();
-    while (tensors.next()) |entry| if (entry.value_ptr.dtype != .f32) {
-        all_f32 = false;
-        break;
-    };
+    var weight: decide_qualification.Digest = undefined;
+    var companion: ?decide_qualification.Digest = null;
+    var inventory: decide_qualification.TensorInventory = undefined;
+    if (manifest.gguf_path) |encoder_path| {
+        const head_path = manifest.gliner_head_gguf_path orelse return null;
+        var encoder = c_file.MmapRegion.init(allocator, encoder_path) catch return null;
+        defer encoder.deinit();
+        var head = c_file.MmapRegion.init(allocator, head_path) catch return null;
+        defer head.deinit();
+        var encoder_file = gguf_format.parse(allocator, encoder.data) catch return null;
+        defer encoder_file.deinit(allocator);
+        var head_file = gguf_format.parse(allocator, head.data) catch return null;
+        defer head_file.deinit(allocator);
+        weight = decide_qualification.Digest.of(encoder.data);
+        companion = decide_qualification.Digest.of(head.data);
+        inventory = .{ .count = encoder_file.tensors.len + head_file.tensors.len, .all_f32 = false };
+    } else {
+        const weight_path = manifest.safetensors_path orelse return null;
+        var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return null;
+        defer reader.deinit();
+        var all_f32 = true;
+        var tensors = reader.header.tensors.iterator();
+        while (tensors.next()) |entry| if (entry.value_ptr.dtype != .f32) {
+            all_f32 = false;
+            break;
+        };
+        weight = decide_qualification.Digest.of(reader.file_bytes);
+        inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 };
+    }
     const identity = decide_qualification.Identity{
         .encoder_family = switch (manifest.gliner_span_encoder_family) {
             .deberta => .deberta,
@@ -1237,8 +1257,9 @@ fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.Mo
             .sep_struct = manifest.gliner_token_sep_struct,
             .sep_text = manifest.gliner_token_sep_text,
         },
-        .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
-        .weight = decide_qualification.Digest.of(reader.file_bytes),
+        .inventory = inventory,
+        .weight = weight,
+        .weight_companion = companion,
         .sidecars = .{
             .config = manifest.gliner_span_config_digest orelse return null,
             .encoder_config = manifest.gliner_span_encoder_digest orelse return null,
@@ -1772,7 +1793,7 @@ fn synthesizePulledModelManifestJsonInternal(
     const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
     const decide_identity = decideIdentity(allocator, &manifest);
     const qualified_decide = decide_identity != null;
-    const qualified_span_extraction = qualified_decide and manifest.gliner_span_encoder_family == .modern_bert and manifest.gguf_path == null;
+    const qualified_span_extraction = if (decide_identity) |identity| decide_qualification.supportsSpanExtraction(identity) else false;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
     const known_decide_source = source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir);
@@ -1887,6 +1908,7 @@ fn synthesizePulledModelManifestJsonInternal(
         const limits = try std.json.Stringify.valueAlloc(a, .{
             .profiles = profiles.items,
             .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
+            .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) .{ .max_windows = @as(usize, 64), .max_document_bytes = @as(usize, 1024 * 1024), .max_document_words = @as(usize, 131072), .max_request_tokens = @as(usize, 65536) } else null else null,
             .runtime_revalidates_artifact = true,
         }, .{});
         try body.appendSlice(allocator, ",\"qualified_limits\":");

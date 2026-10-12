@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    source_sha256 = verify_source(args.upstream)
+    verify_source(args.upstream)
     sys.path.insert(0, str(args.upstream.resolve()))
     import torch
     from gliner2 import AutoExtractor

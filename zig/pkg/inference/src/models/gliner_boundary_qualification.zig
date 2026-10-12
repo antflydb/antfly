@@ -237,7 +237,7 @@ pub const Entry = struct {
 //
 // See zig/pkg/inference/models/gliner2/GLINER25.md for the full record,
 // evidence pointers, and how to re-qualify a wider or different artifact.
-const fastino_gliner25_base_v1 = bundle.Identity{
+pub const fastino_gliner25_base_v1 = bundle.Identity{
     .backbone = .base,
     .precision = .fp32,
     .weight = .{ .size_bytes = 774366564, .sha256 = "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a".* },
@@ -539,7 +539,7 @@ const fastino_gliner25_multi_v1 = bundle.Identity{
         .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
     },
 };
-const fastino_gliner25_multi_decide = bundle.Identity{
+pub const fastino_gliner25_multi_decide = bundle.Identity{
     .backbone = .multi,
     .precision = .fp32,
     .weight = .{ .size_bytes = 1149461028, .sha256 = "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e".* },
@@ -946,12 +946,9 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     mismatched.precision = .q8_0;
     try std.testing.expect(!hasQualifiedIdentity(mismatched));
 
-    // Requiring only .long_document is satisfied by the long-document row
-    // alone (its feature set is a superset), so this reaches geometry: the
-    // single-window row's narrower padded_sequence_tokens minimum (14) falls
-    // under the long-document row's reviewed minimum (103) -- a genuine
-    // bounded-length rejection, named accordingly, not a feature mismatch.
-    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
+    // Composed windows also admit tiny prompts below the legacy 103-token
+    // floor, including this single-window geometry.
+    try require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths);
 
     // Out-of-range geometry, unlike every identity/backend mismatch above, is
     // a bounded-length rejection: identity, backend, and features all matched

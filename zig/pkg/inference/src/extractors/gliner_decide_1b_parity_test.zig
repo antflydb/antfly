@@ -585,7 +585,7 @@ fn longContextParity(metal: bool) !void {
         if (max_tokens) |limit| if (request.encoded.input_ids.len > limit) continue;
         if (request.encoded.input_ids.len <= 198 or request.encoded.input_ids.len > 7999) return error.InvalidFamilyReference;
         const qualified_backend: qualification.Backend = if (metal) .metal else .native;
-        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, qualification.requireRequest(.decide_1b, qualified_backend, 1, 1, request.encoded.input_ids.len));
+        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, qualification.requireConservative198TokenGeometry(.decide_1b, qualified_backend, 1, 1, request.encoded.input_ids.len));
         errdefer std.debug.print("Decide-1B long-context {s}/{s}\n", .{ if (metal) "metal" else "native", request.id });
         const control = @import("../execution_control.zig").InferenceExecutionControl{
             .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,

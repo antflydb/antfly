@@ -249,6 +249,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_abi_version", [], ctypes.c_uint32),
     ("antfly_open_options_size", [], ctypes.c_uint32),
     ("antfly_last_error_detail", [], ctypes.c_char_p),
+    ("antfly_last_error_code", [], _ERR),
     ("antfly_error_code_name", [_ERR], ctypes.c_char_p),
     ("antfly_error_code_description", [_ERR], ctypes.c_char_p),
     ("antfly_open_options_init", [_OPTS_P], _ERR),

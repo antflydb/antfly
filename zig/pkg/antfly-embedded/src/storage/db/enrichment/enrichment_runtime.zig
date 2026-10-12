@@ -21836,6 +21836,10 @@ fn prepareGraphAssetForRuntime(
     defer if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation")) graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
+    // Cached artifacts retain the landed canonical endpoint mapping.
+    const endpoint_resolutions = try runtimeGraphEndpointResolutionsAlloc(runtime, request.doc_key, artifact_name);
+    defer if (endpoint_resolutions) |raw| runtime.alloc.free(raw);
+
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
         if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "accepted")) {
             if (try runtime.accepted(graph_entry)) continue;
@@ -21843,7 +21847,7 @@ fn prepareGraphAssetForRuntime(
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
-        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
+        const graph_writes = try runtimeGraphWritesWithResolutionsAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, endpoint_resolutions, graph_asset_state.hard_max_relation_items_per_artifact);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -22687,6 +22691,42 @@ fn borrowedRuntimeKeySet(
     return set;
 }
 
+fn runtimeGraphEndpointResolutionsAlloc(runtime: anytype, doc_key: []const u8, artifact_name: []const u8) !?[]u8 {
+    if (comptime !@hasField(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "resolvers")) return null;
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    var targeted = false;
+    for (runtime.index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, artifact_name)) continue;
+        targeted = true;
+        const key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
+        const raw = if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getResolutionAlloc"))
+            try runtime.getResolutionAlloc(key)
+        else
+            try storeGetOptionalAllocWithRetry(runtime, key);
+        defer if (raw) |bytes| runtime.alloc.free(bytes);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw orelse continue, .{}) catch continue;
+        if (parsed != .object) continue;
+        const entities = parsed.object.get("entities") orelse continue;
+        if (entities != .array) continue;
+        for (entities.array.items) |entity| {
+            if (entity != .object) continue;
+            const decision = entity.object.get("decision") orelse continue;
+            if (decision != .string or (!std.mem.eql(u8, decision.string, "new") and !std.mem.eql(u8, decision.string, "match"))) continue;
+            const local_id = entity.object.get("local_id") orelse continue;
+            const ref = entity.object.get("doc_ref") orelse continue;
+            if (local_id != .string or ref != .object) continue;
+            const target = ref.object.get("key") orelse continue;
+            if (target != .string or target.string.len == 0) continue;
+            try map.put(a, local_id.string, ref);
+        }
+    }
+    if (!targeted) return null;
+    return try std.json.Stringify.valueAlloc(runtime.alloc, std.json.Value{ .object = map }, .{});
+}
+
 fn runtimeGraphWritesFromArtifactValueAlloc(
     alloc: Allocator,
     index_name: []const u8,
@@ -22697,8 +22737,29 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     raw_doc: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
+    return runtimeGraphWritesWithResolutionsAlloc(alloc, index_name, doc_key, raw, source, artifact_content_type, raw_doc, null, edge_limit);
+}
+
+fn runtimeGraphWritesWithResolutionsAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
+    raw_doc: ?[]const u8,
+    endpoint_resolutions: ?[]const u8,
+    edge_limit: usize,
+) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
+    if (endpoint_resolutions) |res_raw| {
+        if (parsed.value == .object) {
+            const a = parsed.arena.allocator();
+            const resolutions = try std.json.parseFromSliceLeaky(std.json.Value, a, res_raw, .{});
+            try parsed.value.object.put(a, "_entities", resolutions);
+        }
+    }
     var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{ .parse_numbers = false }) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;

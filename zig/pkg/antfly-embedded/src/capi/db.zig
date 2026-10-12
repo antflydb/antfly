@@ -2233,9 +2233,10 @@ pub const JsonGraphNode = struct {
 };
 
 pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const path_slice = cStringSpan(path) orelse return capi.mapError(error.InvalidArgument);
     const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
@@ -2276,9 +2277,13 @@ pub export fn antfly_open_options_size() u32 {
     return @intCast(@sizeOf(capi.OpenOptions));
 }
 
-/// Most recent mapped failure on this thread; copy before another failing call.
+/// Detail for the latest ErrorCode call on this thread; copy immediately.
 pub export fn antfly_last_error_detail() [*:0]const u8 {
     return capi.lastErrorDetail();
+}
+
+pub export fn antfly_last_error_code() capi.ErrorCode {
+    return capi.lastErrorCode();
 }
 
 pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
@@ -2290,7 +2295,8 @@ pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
 }
 
 pub export fn antfly_open_options_init(options: ?*capi.OpenOptions) capi.ErrorCode {
-    const opts = options orelse return .invalid_argument;
+    capi.clearLastError();
+    const opts = options orelse return capi.mapError(error.InvalidArgument);
     opts.* = .{};
     return .ok;
 }
@@ -2471,7 +2477,7 @@ pub fn openLiteHandle(
     create: bool,
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
     out.* = null;
     const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
@@ -2679,9 +2685,9 @@ pub fn openDirectoryHandle(
     create: bool,
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
     out.* = null;
-    if (create) return .invalid_argument;
+    if (create) return capi.mapError(error.InvalidArgument);
     const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
@@ -2751,65 +2757,73 @@ pub fn cStringSpan(path: ?[*:0]const u8) ?[]const u8 {
 }
 
 pub export fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const path_slice = cStringSpan(path) orelse return capi.mapError(error.InvalidArgument);
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
     return openGenericHandle(path_slice, resolved, false, out);
 }
 
 pub export fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const path_slice = cStringSpan(path) orelse return capi.mapError(error.InvalidArgument);
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
     return openGenericHandle(path_slice, resolved, true, out);
 }
 
 pub export fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{}, false, out_handle);
 }
 
 pub export fn antfly_lite_create(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{}, true, out_handle);
 }
 
 pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{ .profile = .hosted }, false, out_handle);
 }
 
 pub export fn antfly_lite_create_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{ .profile = .hosted }, true, out_handle);
 }
 
 pub export fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, false, out_handle);
 }
 
 pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     };
     return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
 }
@@ -2821,8 +2835,9 @@ pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
 }
 
 pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -2845,8 +2860,9 @@ pub const directory_storage_status: lite_backend.StorageStatus = .{
 };
 
 pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -2880,13 +2896,14 @@ pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buf
 }
 
 pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
-    const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
     const handle = guard.handle;
 
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
@@ -2900,7 +2917,8 @@ pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) 
 }
 
 pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -2910,8 +2928,8 @@ pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slic
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
     if (!liteOpenModeCanWrite(handle.open_mode)) return capi.mapError(error.ReadOnly);
     @import("tables.zig").load(handle) catch |err| return capi.mapError(err);
-    if (backup.len == 0 or backup.ptr == null) return .invalid_argument;
-    if (handle.embedded_tables.count() != 0) return .invalid_argument;
+    if (backup.len == 0 or backup.ptr == null) return capi.mapError(error.InvalidArgument);
+    if (handle.embedded_tables.count() != 0) return capi.mapError(error.InvalidArgument);
     if (handle.sql_cursors.count() != 0 or handle.sql_sessions.count() != 0) return .busy;
     for (handle.table_handles.items) |id| {
         const child, const slot = handle_registry.enter(id) orelse continue;
@@ -2923,8 +2941,8 @@ pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slic
     if (handle.owned_lite_backend != null) {
         @import("database_backup.zig").importLite(handle, backup.bytes()) catch |err| return capi.mapError(err);
     } else {
-        if (!(handle.db.isPortableImportTargetEmpty(handle.alloc) catch |err| return capi.mapError(err))) return .invalid_argument;
-        const path = handle.embedded_path orelse return .invalid_argument;
+        if (!(handle.db.isPortableImportTargetEmpty(handle.alloc) catch |err| return capi.mapError(err))) return capi.mapError(error.InvalidArgument);
+        const path = handle.embedded_path orelse return capi.mapError(error.InvalidArgument);
         var io_impl = std.Io.Threaded.init(handle.alloc, .{});
         defer io_impl.deinit();
         // No child, session, or cursor borrows the runtime. Close its read lease
@@ -2967,10 +2985,11 @@ pub export fn antfly_restore_backup_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const path = cStringSpan(dest_path) orelse return .invalid_argument;
-    if (backup.len == 0) return .invalid_argument;
-    if (backup.ptr == null and backup.len != 0) return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const path = cStringSpan(dest_path) orelse return capi.mapError(error.InvalidArgument);
+    if (backup.len == 0) return capi.mapError(error.InvalidArgument);
+    if (backup.ptr == null and backup.len != 0) return capi.mapError(error.InvalidArgument);
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
 
     const alloc = std.heap.c_allocator;
@@ -2997,9 +3016,10 @@ pub export fn antfly_restore_backup_file_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const destination = cStringSpan(dest_path) orelse return .invalid_argument;
-    const source = cStringSpan(backup_path) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const destination = cStringSpan(dest_path) orelse return capi.mapError(error.InvalidArgument);
+    const source = cStringSpan(backup_path) orelse return capi.mapError(error.InvalidArgument);
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
 
     const alloc = std.heap.c_allocator;
@@ -3020,8 +3040,9 @@ pub export fn antfly_restore_backup_file_json(
 }
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -3032,12 +3053,13 @@ pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Bu
         out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
-    return .invalid_argument;
+    return capi.mapError(error.InvalidArgument);
 }
 
 pub export fn antfly_lite_check_file_json(path: ?[*:0]const u8, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const path_slice = cStringSpan(path) orelse return capi.mapError(error.InvalidArgument);
     const alloc = std.heap.c_allocator;
     const report = lite_backend.checkFile(alloc, path_slice) catch |err| return capi.mapError(err);
     out.* = stringifyJson(report) catch return .internal;
@@ -3050,8 +3072,9 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -3059,11 +3082,11 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
-        const dest = cStringSpan(dest_path) orelse return .invalid_argument;
+        const dest = cStringSpan(dest_path) orelse return capi.mapError(error.InvalidArgument);
         out.* = stringifyJson(backend.copyStableSnapshot(dest, replace) catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
-    return .invalid_argument;
+    return capi.mapError(error.InvalidArgument);
 }
 
 pub export fn antfly_lite_copy_stable_snapshot_file_json(
@@ -3072,7 +3095,8 @@ pub export fn antfly_lite_copy_stable_snapshot_file_json(
     replace: bool,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    _ = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    capi.clearLastError();
+    _ = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
     var handle_ptr: ?*anyopaque = null;
     const open_status = antfly_lite_open_readonly(src_path, &handle_ptr);
     if (open_status != .ok) return open_status;
@@ -3094,8 +3118,9 @@ pub fn prepareLiteCompact(handle: *Handle) !void {
 }
 
 pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -3111,12 +3136,13 @@ pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.
         out.* = stringifyJson(report) catch return .internal;
         return .ok;
     }
-    return .invalid_argument;
+    return capi.mapError(error.InvalidArgument);
 }
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -3127,7 +3153,7 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
     }
-    return .invalid_argument;
+    return capi.mapError(error.InvalidArgument);
 }
 
 pub const LiteReplayGeneratedEnrichmentsReport = struct {
@@ -3135,8 +3161,9 @@ pub const LiteReplayGeneratedEnrichmentsReport = struct {
 };
 
 pub export fn antfly_db_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
-    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -3358,7 +3385,8 @@ pub export fn antfly_db_set_readable_lease_hook(
     callback_ctx: ?*anyopaque,
     callback: ?ReadableLeaseHookFn,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4141,14 +4169,15 @@ pub export fn antfly_db_begin_transaction_with_id(
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return capi.mapError(error.InvalidArgument);
     beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4161,15 +4190,16 @@ pub export fn antfly_db_write_transaction(
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return .invalid_argument;
-    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return capi.mapError(error.InvalidArgument);
+    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapError(error.InvalidArgument);
     writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4183,14 +4213,15 @@ pub export fn antfly_db_batch(
     timestamp_ns: u64,
     sync_level: u8,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
+    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapError(error.InvalidArgument);
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4200,7 +4231,8 @@ pub export fn antfly_db_batch_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4225,19 +4257,20 @@ pub export fn antfly_db_resolve_intents(
     status: u8,
     commit_version: u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return capi.mapError(error.InvalidArgument);
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
         1 => .committed,
         2 => .aborted,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     handle.database().*.resolveTransactionIntents(txn_id.*, txn_status, commit_version) catch |err| return capi.mapError(err);
     return .ok;
@@ -4248,16 +4281,17 @@ pub export fn antfly_db_get_transaction_status(
     txn_id_ptr: ?*const [16]u8,
     out_status: ?*u8,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
-    const out = out_status orelse return .invalid_argument;
+    const out = out_status orelse return capi.mapError(error.InvalidArgument);
     out.* = 0;
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return capi.mapError(error.InvalidArgument);
     const status = handle.database().*.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
     out.* = @backingInt(status);
     return .ok;
@@ -4268,16 +4302,17 @@ pub export fn antfly_db_get_commit_version(
     txn_id_ptr: ?*const [16]u8,
     out_commit_version: ?*u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
-    const out = out_commit_version orelse return .invalid_argument;
+    const out = out_commit_version orelse return capi.mapError(error.InvalidArgument);
     out.* = 0;
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return capi.mapError(error.InvalidArgument);
     out.* = handle.database().*.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4287,7 +4322,8 @@ pub export fn antfly_db_get_timestamp(
     key: capi.Slice,
     out_timestamp: *u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4303,7 +4339,8 @@ pub export fn antfly_db_lookup_json(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4312,7 +4349,7 @@ pub export fn antfly_db_lookup_json(
     const handle = guard.handle;
     handle.prepareLookupRequest(key.bytes(), .{}) catch |err| return capi.mapError(err);
     const result = handle.database().*.getDocument(handle.alloc, key.bytes(), .{}) catch |err| return capi.mapError(err);
-    if (result == null) return .not_found;
+    if (result == null) return capi.mapError(error.NotFound);
     out_buf.* = .{
         .ptr = result.?.json.ptr,
         .len = result.?.json.len,
@@ -4325,7 +4362,8 @@ pub export fn antfly_db_get_raw(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4333,7 +4371,7 @@ pub export fn antfly_db_get_raw(
     defer guard.leave();
     const handle = guard.handle;
     const result = handle.database().*.get(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
-    if (result == null) return .not_found;
+    if (result == null) return capi.mapError(error.NotFound);
     out_buf.* = .{
         .ptr = result.?.ptr,
         .len = result.?.len,
@@ -4346,7 +4384,8 @@ pub export fn antfly_db_lookup_artifact_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4354,11 +4393,11 @@ pub export fn antfly_db_lookup_artifact_json(
     defer guard.leave();
     const handle = guard.handle;
     handle.prepareLookupRequest(artifact_id_b64.bytes(), .{}) catch |err| return capi.mapError(err);
-    const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
+    const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(artifact_id);
 
     var record = handle.database().*.getPublicArtifact(handle.alloc, artifact_id) catch |err| return capi.mapError(err);
-    if (record == null) return .not_found;
+    if (record == null) return capi.mapError(error.NotFound);
     defer record.?.deinit(handle.alloc);
 
     var payload = JsonArtifactWrite.init(handle.alloc, record.?) catch return .internal;
@@ -4372,11 +4411,12 @@ pub export fn antfly_decode_artifact_id_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    capi.clearLastError();
     const alloc = std.heap.c_allocator;
-    const artifact_id = decodeBase64Alloc(alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
+    const artifact_id = decodeBase64Alloc(alloc, artifact_id_b64.bytes()) catch return capi.mapError(error.InvalidArgument);
     defer alloc.free(artifact_id);
 
-    var artifact_ref = (db_mod.artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id) catch return .invalid_argument) orelse return .invalid_argument;
+    var artifact_ref = (db_mod.artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id) catch return capi.mapError(error.InvalidArgument)) orelse return capi.mapError(error.InvalidArgument);
     defer artifact_ref.deinit(alloc);
 
     var payload = JsonArtifactRef.init(alloc, artifact_ref) catch return .internal;
@@ -4390,7 +4430,8 @@ pub export fn antfly_db_get_schema_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4409,7 +4450,8 @@ pub export fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4421,7 +4463,8 @@ pub export fn antfly_db_set_schema_json(
 }
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4462,8 +4505,9 @@ pub export fn antfly_db_run_until_idle_json(
     handle_ptr: ?*anyopaque,
     out_buf_ptr: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out_buf = resetOutBuffer(out_buf_ptr) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4499,8 +4543,9 @@ pub export fn antfly_db_pending_work_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf_ptr: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out_buf = resetOutBuffer(out_buf_ptr) orelse return .invalid_argument;
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4516,14 +4561,14 @@ pub fn antflyDbExtractEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
+    const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return capi.mapError(error.InvalidArgument);
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
     var result = handle.database().*.extractEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
@@ -4541,14 +4586,14 @@ pub fn antflyDbComputeEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
+    const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return capi.mapError(error.InvalidArgument);
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
     var result = handle.database().*.computeEnrichments(handle.alloc, writes) catch |err| return capi.mapError(err);
@@ -4566,7 +4611,8 @@ pub export fn antfly_db_update_range(
     start: capi.Slice,
     end: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4584,7 +4630,8 @@ pub export fn antfly_db_get_range_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4601,7 +4648,8 @@ pub export fn antfly_db_get_split_state_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4609,7 +4657,7 @@ pub export fn antfly_db_get_split_state_json(
     defer guard.leave();
     const handle = guard.handle;
     const state = handle.database().*.getSplitState(handle.alloc) catch |err| return capi.mapError(err);
-    if (state == null) return .not_found;
+    if (state == null) return capi.mapError(error.NotFound);
     var payload = JsonSplitState.init(handle.alloc, state.?) catch return .internal;
     defer payload.deinit(handle.alloc);
     defer db_mod.types.freeSplitState(handle.alloc, state);
@@ -4621,7 +4669,8 @@ pub export fn antfly_db_set_split_state_json(
     handle_ptr: ?*anyopaque,
     state_json: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4635,11 +4684,11 @@ pub export fn antfly_db_set_split_state_json(
         started_at: u64,
         original_range_end_b64: []const u8,
     };
-    var parsed = std.json.parseFromSlice(ParsedState, handle.alloc, state_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(ParsedState, handle.alloc, state_json.bytes(), .{}) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
-    const split_key = decodeBase64Alloc(handle.alloc, parsed.value.split_key_b64) catch return .invalid_argument;
+    const split_key = decodeBase64Alloc(handle.alloc, parsed.value.split_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(split_key);
-    const original_range_end = decodeBase64Alloc(handle.alloc, parsed.value.original_range_end_b64) catch return .invalid_argument;
+    const original_range_end = decodeBase64Alloc(handle.alloc, parsed.value.original_range_end_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(original_range_end);
     const phase: db_mod.types.SplitPhase = switch (parsed.value.phase) {
         0 => .none,
@@ -4647,7 +4696,7 @@ pub export fn antfly_db_set_split_state_json(
         2 => .splitting,
         3 => .finalizing,
         4 => .rolling_back,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     handle.database().*.setSplitState(.{
         .phase = phase,
@@ -4660,7 +4709,8 @@ pub export fn antfly_db_set_split_state_json(
 }
 
 pub export fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4675,7 +4725,8 @@ pub export fn antfly_db_get_split_delta_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4690,7 +4741,8 @@ pub export fn antfly_db_get_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4705,7 +4757,8 @@ pub export fn antfly_db_set_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     seq: u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4717,7 +4770,8 @@ pub export fn antfly_db_set_split_delta_final_seq(
 }
 
 pub export fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4733,7 +4787,8 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
     after_seq: u64,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4759,7 +4814,8 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
 }
 
 pub export fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4774,7 +4830,8 @@ pub export fn antfly_db_list_indexes_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4802,7 +4859,8 @@ pub export fn antfly_db_list_enrichments_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4820,7 +4878,8 @@ pub export fn antfly_db_scan_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4838,12 +4897,12 @@ pub export fn antfly_db_scan_json(
         include_all_fields: bool = true,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .ignore_unknown_fields = true }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .ignore_unknown_fields = true }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
-    const from_key = decodeBase64Alloc(handle.alloc, parsed.value.from_key_b64) catch return .invalid_argument;
+    const from_key = decodeBase64Alloc(handle.alloc, parsed.value.from_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(from_key);
-    const to_key = decodeBase64Alloc(handle.alloc, parsed.value.to_key_b64) catch return .invalid_argument;
+    const to_key = decodeBase64Alloc(handle.alloc, parsed.value.to_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(to_key);
     const opts: db_mod.types.ScanOptions = .{
         .inclusive_from = parsed.value.inclusive_from,
@@ -4891,7 +4950,8 @@ pub export fn antfly_db_scan_hashes(
     request_json: capi.Slice,
     out_result: *capi.ScanHashResult,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -4908,12 +4968,12 @@ pub export fn antfly_db_scan_hashes(
         include_all_fields: bool = true,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .ignore_unknown_fields = true }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .ignore_unknown_fields = true }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
-    const from_key = decodeBase64Alloc(handle.alloc, parsed.value.from_key_b64) catch return .invalid_argument;
+    const from_key = decodeBase64Alloc(handle.alloc, parsed.value.from_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(from_key);
-    const to_key = decodeBase64Alloc(handle.alloc, parsed.value.to_key_b64) catch return .invalid_argument;
+    const to_key = decodeBase64Alloc(handle.alloc, parsed.value.to_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(to_key);
     const opts: db_mod.types.ScanOptions = .{
         .inclusive_from = parsed.value.inclusive_from,
@@ -4957,7 +5017,8 @@ pub export fn antfly_db_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5228,15 +5289,16 @@ pub fn searchPublicQueryJson(
 /// SQL over the embedded database catalog. Output is always freed by
 /// antfly_buffer_free, including structured SQL diagnostics on failure.
 pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
     out_buf.* = .{};
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return .invalid_argument;
+    if (handle.parent_id != null) return capi.mapError(error.InvalidArgument);
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return .unsupported;
     executeEmbeddedSql(handle, "default", request_json.bytes(), out_buf) catch |err| {
@@ -5384,7 +5446,8 @@ pub export fn antfly_db_search_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5453,9 +5516,9 @@ pub export fn antfly_db_search_json(
 
     if (std.mem.eql(u8, parsed.value.mode, "full_text")) {
         if (parsed.value.text_query_json.len > 0) {
-            var parsed_query = std.json.parseFromSlice(std.json.Value, query_alloc, parsed.value.text_query_json, .{}) catch return .invalid_argument;
+            var parsed_query = std.json.parseFromSlice(std.json.Value, query_alloc, parsed.value.text_query_json, .{}) catch return capi.mapError(error.InvalidArgument);
             defer parsed_query.deinit();
-            req.full_text = parseTextQueryJson(query_alloc, parsed_query.value) catch return .invalid_argument;
+            req.full_text = parseTextQueryJson(query_alloc, parsed_query.value) catch return capi.mapError(error.InvalidArgument);
         } else {
             req.full_text = if (std.mem.eql(u8, parsed.value.text_query_type, "term"))
                 .{ .term = .{ .field = parsed.value.field, .term = parsed.value.text } }
@@ -5476,7 +5539,7 @@ pub export fn antfly_db_search_json(
             .k = parsed.value.k,
         };
     } else {
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     }
 
     var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
@@ -5555,14 +5618,15 @@ pub export fn antfly_db_search_dense(
     offset: u32,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (vector_ptr == null or vector_len == 0) return .invalid_argument;
+    if (vector_ptr == null or vector_len == 0) return capi.mapError(error.InvalidArgument);
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
 
@@ -5586,14 +5650,15 @@ pub export fn antfly_db_search_dense_profile(
     offset: u32,
     out_profile: *capi.DenseSearchProfile,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (vector_ptr == null or vector_len == 0) return .invalid_argument;
+    if (vector_ptr == null or vector_len == 0) return capi.mapError(error.InvalidArgument);
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
 
     var profiled = searchDenseOwnedProfiled(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
@@ -5628,7 +5693,8 @@ pub export fn antfly_db_search_dense_profile(
 }
 
 pub export fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5642,7 +5708,8 @@ pub export fn antfly_db_dense_fixed_packed_result(
     handle_ptr: ?*anyopaque,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5661,7 +5728,8 @@ pub export fn antfly_db_search_dense_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5693,7 +5761,8 @@ pub export fn antfly_db_search_dense_wire_profile(
     out_buf: *capi.Buffer,
     out_profile: *capi.DenseWireSearchProfile,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5745,7 +5814,8 @@ pub export fn antfly_db_search_text_match(
     offset: u32,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5787,7 +5857,8 @@ pub export fn antfly_db_search_text_match_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5810,7 +5881,8 @@ pub export fn antfly_db_search_text_term_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5833,7 +5905,8 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5856,7 +5929,8 @@ pub export fn antfly_db_search_hits_json(
     request_json: capi.Slice,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -5882,11 +5956,11 @@ pub export fn antfly_db_search_hits_json(
         identity_read_generation: ?u64 = null,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
-    if (parsed.value.include_stored) return .invalid_argument;
-    if (!std.mem.eql(u8, parsed.value.return_mode, "parent")) return .invalid_argument;
+    if (parsed.value.include_stored) return capi.mapError(error.InvalidArgument);
+    if (!std.mem.eql(u8, parsed.value.return_mode, "parent")) return capi.mapError(error.InvalidArgument);
 
     var query_arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer query_arena.deinit();
@@ -5904,9 +5978,9 @@ pub export fn antfly_db_search_hits_json(
 
     if (std.mem.eql(u8, parsed.value.mode, "full_text")) {
         if (parsed.value.text_query_json.len > 0) {
-            var parsed_query = std.json.parseFromSlice(std.json.Value, query_alloc, parsed.value.text_query_json, .{}) catch return .invalid_argument;
+            var parsed_query = std.json.parseFromSlice(std.json.Value, query_alloc, parsed.value.text_query_json, .{}) catch return capi.mapError(error.InvalidArgument);
             defer parsed_query.deinit();
-            req.full_text = parseTextQueryJson(query_alloc, parsed_query.value) catch return .invalid_argument;
+            req.full_text = parseTextQueryJson(query_alloc, parsed_query.value) catch return capi.mapError(error.InvalidArgument);
         } else {
             req.full_text = if (std.mem.eql(u8, parsed.value.text_query_type, "term"))
                 .{ .term = .{ .field = parsed.value.field, .term = parsed.value.text } }
@@ -5922,12 +5996,12 @@ pub export fn antfly_db_search_hits_json(
             .k = parsed.value.k,
         };
     } else {
-        return .invalid_argument;
+        return capi.mapError(error.InvalidArgument);
     }
 
     var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
-    if (result.graph_results.len > 0) return .invalid_argument;
+    if (result.graph_results.len > 0) return capi.mapError(error.InvalidArgument);
 
     const result_alloc = std.heap.c_allocator;
     const hits = result_alloc.alloc(capi.DenseSearchHit, result.hits.len) catch return .internal;
@@ -5939,7 +6013,7 @@ pub export fn antfly_db_search_hits_json(
         result_alloc.free(hits);
     }
     for (result.hits, 0..) |hit, i| {
-        if (hit.stored_data != null or hit.chunk_hits.len > 0) return .invalid_argument;
+        if (hit.stored_data != null or hit.chunk_hits.len > 0) return capi.mapError(error.InvalidArgument);
         const id = result_alloc.dupe(u8, hit.id) catch return .internal;
         hits[i] = .{
             .id_ptr = id.ptr,
@@ -6443,7 +6517,8 @@ pub export fn antfly_db_execute_graph_queries_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -6459,19 +6534,19 @@ pub export fn antfly_db_execute_graph_queries_json(
         identity_read_generation: ?u64 = null,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
     if (parsed.value.identity_read_generation == null) {
         for (parsed.value.named_sets) |named_set| {
-            if (named_set.hit_ids_b64.len > 0) return .invalid_argument;
+            if (named_set.hit_ids_b64.len > 0) return capi.mapError(error.InvalidArgument);
         }
     }
 
-    const graph_queries = parseNamedGraphQueries(handle.alloc, parsed.value.graph_queries) catch return .invalid_argument;
+    const graph_queries = parseNamedGraphQueries(handle.alloc, parsed.value.graph_queries) catch return capi.mapError(error.InvalidArgument);
     defer freeOwnedNamedGraphQueries(handle.alloc, graph_queries);
 
-    const named_sets = parseNamedGraphInputSets(handle.alloc, parsed.value.named_sets) catch return .invalid_argument;
+    const named_sets = parseNamedGraphInputSets(handle.alloc, parsed.value.named_sets) catch return capi.mapError(error.InvalidArgument);
     defer freeOwnedNamedGraphInputSets(handle.alloc, named_sets);
 
     var req: db_mod.types.SearchRequest = .{
@@ -6518,17 +6593,18 @@ pub export fn antfly_db_aggregate_hits_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
-    if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null) return .invalid_argument;
+    if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null) return capi.mapError(error.InvalidArgument);
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, parsed.value.identity_read_generation) catch |err| return capi.mapError(err);
 
     const requests = toAggregationRequest(handle.alloc, parsed.value.aggregations) catch return .internal;
@@ -6541,7 +6617,7 @@ pub export fn antfly_db_aggregate_hits_json(
         if (hits.len > 0) handle.alloc.free(hits);
     }
     for (parsed.value.hit_ids_b64) |item| {
-        const hit_id = decodeBase64Alloc(handle.alloc, item) catch return .invalid_argument;
+        const hit_id = decodeBase64Alloc(handle.alloc, item) catch return capi.mapError(error.InvalidArgument);
         errdefer handle.alloc.free(hit_id);
         const stored = handle.database().*.get(handle.alloc, hit_id) catch |err| {
             handle.alloc.free(hit_id);
@@ -6782,7 +6858,8 @@ pub export fn antfly_db_add_index_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -6798,14 +6875,21 @@ pub export fn antfly_db_add_index_json(
     if (name != .string or name.string.len == 0) return capi.mapError(error.InvalidIndexName);
     const discriminator = value.object.get("kind") orelse value.object.get("type") orelse return capi.mapError(error.MissingIndexType);
     if (discriminator != .string) return capi.mapError(error.InvalidIndexType);
-    const kind: db_mod.types.IndexKind = if (std.mem.eql(u8, discriminator.string, "embeddings")) .dense_vector else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse
-        return capi.mapError(error.InvalidIndexType);
     const config_value = value.object.get("config_json");
     const normalized_config = if (config_value) |config| switch (config) {
         .string => config.string,
         .object => std.json.Stringify.valueAlloc(a, config, .{}) catch |err| return capi.mapError(err),
         else => return capi.mapError(error.InvalidIndexConfig),
     } else std.json.Stringify.valueAlloc(a, value, .{}) catch |err| return capi.mapError(err);
+    const kind: db_mod.types.IndexKind = if (std.mem.eql(u8, discriminator.string, "embeddings")) blk: {
+        const config = std.json.parseFromSliceLeaky(std.json.Value, a, normalized_config, .{}) catch |err| return capi.mapError(err);
+        if (config != .object) return capi.mapError(error.InvalidIndexConfig);
+        if (config.object.get("sparse")) |sparse| {
+            if (sparse != .bool) return capi.mapError(error.InvalidArgument);
+            if (sparse.bool) break :blk .sparse_vector;
+        }
+        break :blk .dense_vector;
+    } else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse return capi.mapError(error.InvalidIndexType);
     const parsed = .{ .value = .{ .name = name.string, .config_json = normalized_config } };
     // A native Lite handle also accepts the server's nested "enrichments"
     // shape on this index's own config (see `registerLiteIndexEnrichments`),
@@ -6870,13 +6954,14 @@ pub export fn antfly_db_delete_index(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
-    const out = out_deleted orelse return .invalid_argument;
+    const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
     out.* = false;
     const handle = guard.handle;
     out.* = handle.database().*.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
@@ -6887,7 +6972,8 @@ pub export fn antfly_db_add_enrichment_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -6896,7 +6982,7 @@ pub export fn antfly_db_add_enrichment_json(
     const handle = guard.handle;
     var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
         .ignore_unknown_fields = true,
-    }) catch return .invalid_argument;
+    }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
     handle.database().*.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
@@ -6909,16 +6995,17 @@ pub export fn antfly_db_delete_enrichment(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
-    const out = out_deleted orelse return .invalid_argument;
+    const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
     out.* = false;
     const handle = guard.handle;
-    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
+    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return capi.mapError(error.InvalidArgument);
     out.* = handle.database().*.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -6931,7 +7018,8 @@ pub export fn antfly_db_get_edges_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -6942,7 +7030,7 @@ pub export fn antfly_db_get_edges_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     const edges = handle.database().*.getEdges(handle.alloc, index_name.bytes(), key.bytes(), edge_type.bytes(), dir) catch |err| return capi.mapError(err);
     defer graphFreeEdges(handle.alloc, edges);
@@ -6965,7 +7053,8 @@ pub export fn antfly_db_traverse_edges_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -6985,17 +7074,17 @@ pub export fn antfly_db_traverse_edges_json(
         deduplicate_nodes: bool = true,
         include_paths: bool = false,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
-    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return capi.mapError(error.InvalidArgument);
     defer edge_filter.deinit(handle.alloc);
-    const start_key = decodeBase64Alloc(handle.alloc, parsed.value.start_key_b64) catch return .invalid_argument;
+    const start_key = decodeBase64Alloc(handle.alloc, parsed.value.start_key_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(start_key);
     const direction: db_mod.types.GraphEdgeDirection = switch (parsed.value.direction) {
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     const results = handle.database().*.traverseEdges(handle.alloc, parsed.value.index_name, start_key, .{
         .edge_types = parsed.value.edge_types,
@@ -7031,7 +7120,8 @@ pub export fn antfly_db_get_neighbors_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7042,7 +7132,7 @@ pub export fn antfly_db_get_neighbors_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     const results = handle.database().*.getNeighbors(handle.alloc, index_name.bytes(), key.bytes(), edge_type.bytes(), dir) catch |err| return capi.mapError(err);
     defer traversalFreeResults(handle.alloc, results);
@@ -7065,7 +7155,8 @@ pub export fn antfly_db_find_shortest_path_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7084,19 +7175,19 @@ pub export fn antfly_db_find_shortest_path_json(
         min_weight: f64 = 0.0,
         max_weight: f64 = 0.0,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
-    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return capi.mapError(error.InvalidArgument);
     defer edge_filter.deinit(handle.alloc);
-    const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return .invalid_argument;
+    const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(source);
-    const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return .invalid_argument;
+    const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(target);
     const direction: db_mod.types.GraphEdgeDirection = switch (parsed.value.direction) {
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     const weight_mode: db_mod.types.GraphPathWeightMode = if (std.mem.eql(u8, parsed.value.weight_mode, "min_weight"))
         .min_weight
@@ -7113,7 +7204,7 @@ pub export fn antfly_db_find_shortest_path_json(
         .min_weight = legacyGraphWeightBound(parsed.value.min_weight),
         .max_weight = legacyGraphWeightBound(parsed.value.max_weight),
     }) catch |err| return capi.mapError(err);
-    if (maybe_path == null) return .not_found;
+    if (maybe_path == null) return capi.mapError(error.NotFound);
     defer paths_mod.freePath(handle.alloc, maybe_path.?);
     var payload = JsonPath.init(handle.alloc, maybe_path.?) catch return .internal;
     defer payload.deinit(handle.alloc);
@@ -7126,7 +7217,8 @@ pub export fn antfly_db_find_k_shortest_paths_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7146,19 +7238,19 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         max_weight: f64 = 0.0,
         k: u32 = 1,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
-    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return capi.mapError(error.InvalidArgument);
     defer edge_filter.deinit(handle.alloc);
-    const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return .invalid_argument;
+    const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(source);
-    const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return .invalid_argument;
+    const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return capi.mapError(error.InvalidArgument);
     defer handle.alloc.free(target);
     const direction: db_mod.types.GraphEdgeDirection = switch (parsed.value.direction) {
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return .invalid_argument,
+        else => return capi.mapError(error.InvalidArgument),
     };
     const weight_mode: db_mod.types.GraphPathWeightMode = if (std.mem.eql(u8, parsed.value.weight_mode, "min_weight"))
         .min_weight
@@ -7195,7 +7287,8 @@ pub export fn antfly_db_match_pattern_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7227,7 +7320,7 @@ pub export fn antfly_db_match_pattern_json(
         return_aliases: []const []const u8 = &.{},
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return capi.mapError(error.InvalidArgument);
     defer parsed.deinit();
 
     var start_nodes = handle.alloc.alloc([]const u8, parsed.value.start_nodes_b64.len) catch return .internal;
@@ -7240,7 +7333,7 @@ pub export fn antfly_db_match_pattern_json(
         for (start_nodes[0..start_count]) |entry| handle.alloc.free(entry);
     }
     for (parsed.value.start_nodes_b64, 0..) |item, i| {
-        start_nodes[i] = decodeBase64Alloc(handle.alloc, item) catch return .invalid_argument;
+        start_nodes[i] = decodeBase64Alloc(handle.alloc, item) catch return capi.mapError(error.InvalidArgument);
         start_count += 1;
     }
 
@@ -7251,7 +7344,7 @@ pub export fn antfly_db_match_pattern_json(
             0 => .out,
             1 => .in,
             2 => .both,
-            else => return .invalid_argument,
+            else => return capi.mapError(error.InvalidArgument),
         };
         pattern[i] = .{
             .alias = step.alias,
@@ -7292,7 +7385,8 @@ pub export fn antfly_db_create_shadow_index_manager(
     split_key: capi.Slice,
     original_range_end: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7304,7 +7398,8 @@ pub export fn antfly_db_create_shadow_index_manager(
 }
 
 pub export fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7319,7 +7414,8 @@ pub export fn antfly_db_get_shadow_index_dir(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7327,7 +7423,7 @@ pub export fn antfly_db_get_shadow_index_dir(
     defer guard.leave();
     const handle = guard.handle;
     const dir = handle.database().*.getShadowIndexDir();
-    if (dir.len == 0) return .not_found;
+    if (dir.len == 0) return capi.mapError(error.NotFound);
     out_buf.* = dupBytes(dir) catch return .internal;
     return .ok;
 }
@@ -7336,7 +7432,8 @@ pub export fn antfly_db_find_median_key(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7358,7 +7455,8 @@ pub export fn antfly_db_split(
     dest_dir2: capi.Slice,
     prepare_only: bool,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7383,7 +7481,8 @@ pub export fn antfly_db_finalize_split(
     new_start: capi.Slice,
     new_end: capi.Slice,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -7402,7 +7501,8 @@ pub export fn antfly_db_snapshot(
     id: capi.Slice,
     out_size: *u64,
 ) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;

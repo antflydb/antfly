@@ -295,14 +295,29 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
 
 // Thread-local borrowed detail. Error names have static storage, so callers
 // can copy this immediately without allocation or lifetime races with peers.
+threadlocal var last_error_code: ErrorCode = .ok;
 threadlocal var last_error_detail: [:0]const u8 = "";
+
+pub fn clearLastError() void {
+    last_error_code = .ok;
+    last_error_detail = "";
+}
 
 pub fn lastErrorDetail() [*:0]const u8 {
     return last_error_detail.ptr;
 }
 
+pub fn lastErrorCode() ErrorCode {
+    return last_error_code;
+}
+
 pub fn mapError(err: anyerror) ErrorCode {
     last_error_detail = @errorName(err);
+    last_error_code = classifyError(err);
+    return last_error_code;
+}
+
+fn classifyError(err: anyerror) ErrorCode {
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,

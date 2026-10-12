@@ -1518,3 +1518,25 @@ test "gliner boundary qualification measures pinned base checkpoint long-documen
     _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 1024, 32, "candidate default");
     _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 4096, 128, "prior default, for comparison");
 }
+
+test "boundary qualification Gate accepts short window prompts and composed windows" {
+    var request = try wire.parseJson(std.testing.allocator,
+        \\{"schema_version":2,"model":"boundary","schema":{"entities":["person","org","model","component","decision","concept"],"relations":[{"type":"uses"},{"type":"replaces"},{"type":"about"}]},"options":{"long_document":{"mode":"window"}},"inputs":[{"content":"Use EmbeddingGemma instead of Qwen."}]}
+    , .{});
+    defer request.deinit();
+    const sample = processor.Sample{ .original_text = request.items[0].text, .schema_fingerprint = @splat(0), .input_ids = &.{ 1, 2, 3 }, .words = &.{}, .groups = &.{}, .queries = &.{}, .classification_labels = &.{}, .enum_choices = &.{}, .prefix_word_count = 7, .body_word_count = 6, .terminal_period_added = true, .is_joint_ie = false };
+    var prepared: processor.PreparedBatch = undefined;
+    prepared.samples = &.{sample};
+    prepared.sequence_length = 40;
+    for ([_]artifact.Identity{ policy.fastino_gliner25_base_v1, policy.fastino_gliner25_multi_decide }) |identity| {
+        for ([_]policy.Backend{ .native, .metal }) |backend| {
+            var gate = try Gate.init(identity, backend, &request, null);
+            try std.testing.expect(gate.single_window_candidates != null);
+            try gate.observe(sample.original_text.len, 6, 1, &prepared);
+            var windows = try Gate.init(identity, backend, &request, null);
+            try windows.observe(2048, 300, 3, &prepared);
+            try std.testing.expect(windows.single_window_candidates == null);
+            try std.testing.expect(windows.long_document_qualified);
+        }
+    }
+}

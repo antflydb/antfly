@@ -268,7 +268,8 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
 }
 
 pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    h.capi.clearLastError();
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -278,7 +279,8 @@ pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, 
     return .ok;
 }
 pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    h.capi.clearLastError();
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
@@ -288,15 +290,16 @@ pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.
     return .ok;
 }
 pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) h.capi.ErrorCode {
+    h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return .invalid_argument;
+    if (handle.parent_id != null) return h.capi.mapError(error.InvalidArgument);
     load(handle) catch |err| return h.capi.mapError(err);
     const names = handle.alloc.alloc([]const u8, handle.embedded_tables.count() + 1) catch return .internal;
     defer handle.alloc.free(names);
@@ -315,8 +318,9 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
 /// Table handles use the existing document, index, and enrichment APIs. They
 /// borrow the namespace and are invalidated safely when the database closes.
 pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) h.capi.ErrorCode {
+    h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
     if (guard.entry_error) |code| {
         guard.leave();
         return code;

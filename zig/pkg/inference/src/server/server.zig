@@ -9625,13 +9625,13 @@ pub const Node = struct {
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling, including FP32 1B's
         // 1024-token budget; Q8 retains its separate 198-token contract.
-        const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).sequence_tokens else options.processor.max_sequence_tokens;
+        const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
         options.processor.max_batch_tokens = max_sequence;
-        options.max_prompt_tokens = max_sequence;
+        options.max_prompt_tokens = if (qualified_variant == .decide_1b) max_sequence else @min(options.max_prompt_tokens, max_sequence);
         if (qualified_variant == .decide_1b) {
-            const limits = try gliner_decide_qualification.requestLimits(qualified_identity.?);
+            const limits = (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?;
             options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, limits.sequence_tokens);
             options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, limits.sequence_tokens);
             options.max_prompt_tokens = @min(options.max_prompt_tokens, limits.sequence_tokens);

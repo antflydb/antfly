@@ -228,16 +228,16 @@ test "capi Lite promotion label routes extraction graphs into entity and event d
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
     defer a.free(path);
-    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
-    defer h.closeHandle(handle);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
     try tables.create(handle, "entities", "{}", false);
     try tables.create(handle, "events", "{}", false);
-    try handle.db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
-        \\{"source":{"artifact":"kg_v1","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"metrics":{"ppr":{"kind":"pagerank","enabled":true,"damping":0.85}},"edge_types":[{"name":"mentions"},{"name":"works_at"},{"name":"participates_in"},{"name":"uses"}]}
-    });
+    const handle_id = try api.publishHandle(handle);
+    defer api.antfly_db_close(handle_id);
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg_v1","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"metrics":{"ppr":{"kind":"pagerank","enabled":true,"damping":0.85}},"edge_types":[{"name":"mentions"},{"name":"works_at"},{"name":"participates_in"},{"name":"uses"}],"resolvers":[{"name":"events","table":"events","source_artifact":"kg_v1","resolution_artifact":"events_resolution_v1","key_template":"event/{{ slug _entity.text }}","labels":["event"],"config_generation":1},{"name":"entities","table":"entities","source_artifact":"kg_v1","resolution_artifact":"entities_resolution_v1","key_template":"entity/{{ slug _entity.text }}","config_generation":1}]}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice(config)));
     try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
-    try handle.db.addResolver(.{ .name = "events", .table = "events", .source_artifact = "kg_v1", .resolution_artifact = "events_resolution_v1", .key_template = "event/{{ slug _entity.text }}", .labels = &.{"event"}, .config_generation = 1 });
-    try handle.db.addResolver(.{ .name = "entities", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "entities_resolution_v1", .key_template = "entity/{{ slug _entity.text }}", .config_generation = 1 });
     try handle.db.batch(.{ .writes = &.{.{ .key = "doc:a", .value =
         \\{"kg":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"},{"id":"v0","label":"event","text":"Write program","predicate":"write"}],"relations":[{"type":"works_at","source":"e0","target":"e1"},{"type":"participates_in","source":"e0","target":"v0"},{"type":"uses","source":{"text":"Ada Lovelace"},"target":{"text":"Antfly"}},{"type":"uses","source":{"text":"missing"},"target":{"text":"Antfly"}}]}}
     }}, .sync_level = .write });
@@ -294,18 +294,28 @@ test "capi Lite promotion graph metrics flow through shared concepts in both dir
         \\{"graph_metric":{"index":"knowledge","metric":"ppr","metric_freshness":"fresh","seed_nodes":["concept/shared"],"direction":"both","top_k":3}}
     ;
     try std.testing.expect(api.requestLooksLikePublicQueryJson(body));
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.searchPublicQueryJson(handle, "docs", .fromSlice(body), &response));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle_id, .fromSlice(body), &response));
     try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "claim:a") != null);
     api.antfly_buffer_free(&response);
     const traversal =
         \\{"full_text_search":{"match_all":{}},"limit":5,"graph_queries":{"q":{"index":"knowledge","traverse":{"start":{"result_ref":"$query_results","limit":5},"direction":"both","edge_types":["about"],"max_depth":2,"include_documents":true,"include_paths":true,"deduplicate_nodes":false,"limit":20}}}}
     ;
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.searchPublicQueryJson(handle, "docs", .fromSlice(traversal), &response));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle_id, .fromSlice(traversal), &response));
     try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "claim:b") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "path") != null);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"public_graph\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"supersedes\",\"field\":\"supersedes\"}]}")));
     try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"invalid\"}")));
     try std.testing.expectEqualStrings("MissingIndexType", std.mem.span(api.antfly_last_error_detail()));
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_db_lookup_json(handle_id, .fromSlice("missing-document"), &response));
+    try std.testing.expectEqualStrings("NotFound", std.mem.span(api.antfly_last_error_detail()));
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_last_error_code());
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"public_sparse\",\"type\":\"embeddings\",\"sparse\":true,\"external\":true,\"field\":\"sparse\"}")));
+    try std.testing.expect(handle.database().core.index_manager.sparseIndex("public_sparse") != null);
+    try std.testing.expect(handle.database().core.index_manager.denseIndex("public_sparse") == null);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"success\",\"type\":\"graph\"}")));
+    try std.testing.expectEqualStrings("", std.mem.span(api.antfly_last_error_detail()));
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_search_json(null, .fromSlice(body), &response));
+    try std.testing.expectEqualStrings("InvalidArgument", std.mem.span(api.antfly_last_error_detail()));
 }
 
 // The generator is deterministic so this exercises the full recursive replay

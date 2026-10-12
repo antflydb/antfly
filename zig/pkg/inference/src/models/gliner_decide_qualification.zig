@@ -165,11 +165,9 @@ pub fn require(identity: Identity) !QualifiedVariant {
     return qualifiedVariant(identity) orelse error.UnsupportedGlinerDecisionArtifact;
 }
 
-/// Apply only after preprocessing has produced its exact, untruncated token
-/// geometry. The 1B production proof covers one request on Native and Metal
-/// through 198 prepared tokens; its architectural 7999-token encoder ceiling
-/// and CUDA implementation are deliberately not serving qualification.
-pub fn requireRequest(variant: QualifiedVariant, backend: Backend, request_items: usize, prepared_sequences: usize, prepared_sequence_tokens: usize) !void {
+/// Historical 198-token diagnostic contract. Live serving uses
+/// requireRequestIdentity so FP32 and Q8 cannot borrow each other's limits.
+pub fn requireConservative198TokenGeometry(variant: QualifiedVariant, backend: Backend, request_items: usize, prepared_sequences: usize, prepared_sequence_tokens: usize) !void {
     switch (variant) {
         .decide_deberta => return,
         .decide_1b => {
@@ -188,9 +186,10 @@ pub const RequestLimits = struct {
 
 /// Precision-specific admission: the FP32 extraction/context proof cannot be
 /// borrowed by the separately pinned Q8 encoder/head bundle.
-pub fn requestLimits(identity: Identity) !RequestLimits {
+pub fn requestLimits(identity: Identity) !?RequestLimits {
     const variant = try require(identity);
-    if (variant == .decide_1b and identity.weight_companion == null)
+    if (variant != .decide_1b) return null;
+    if (identity.weight_companion == null)
         return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
     return .{};
 }
@@ -203,7 +202,7 @@ pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize
     const variant = try require(identity);
     if (variant != .decide_1b) return;
     if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
-    const limits = try requestLimits(identity);
+    const limits = (try requestLimits(identity)).?;
     if (items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
         return error.UnsupportedGlinerDecisionGeometry;
 }
@@ -307,13 +306,13 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
 }
 
 test "GLiNER Decide 1B serving policy stays within measured backend and geometry" {
-    try requireRequest(.decide_1b, .native, 1, 1, 198);
-    try requireRequest(.decide_1b, .metal, 1, 1, 1);
-    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequest(.decide_1b, .cuda, 1, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 2, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 2, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 1, 199));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 1, 0));
+    try requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 198);
+    try requireConservative198TokenGeometry(.decide_1b, .metal, 1, 1, 1);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireConservative198TokenGeometry(.decide_1b, .cuda, 1, 1, 198));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 2, 1, 198));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 2, 198));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 199));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 0));
     // Existing qualified DeBERTa behavior is retained by this additive gate.
-    try requireRequest(.decide_deberta, .cuda, 2, 9, 513);
+    try requireConservative198TokenGeometry(.decide_deberta, .cuda, 2, 9, 513);
 }

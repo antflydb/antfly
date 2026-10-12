@@ -32,14 +32,16 @@ Traversal depth, result and work limits still apply.
 
 The C ABI exposes `antfly_last_error_detail()` on the calling thread. Rust
 exports `last_error_detail()`, Go exports `LastErrorDetail()`, and Python appends
-the detail to raised errors. Read it immediately after a failed call. Go callers
+the detail to raised errors after checking `antfly_last_error_code()`. Native
+entry points clear retained diagnostics, including successful calls and missing
+document lookups. Read detail immediately after a failed call. Go callers
 using the separate accessor must lock their goroutine to the OS thread across
 the failed operation and accessor.
 
-GLiNER Decide-1B admits one input per request. Configure decision enrichments
-with `batch_size: 1`; batching documents into a single decisions request exceeds
-the qualified contract. Request sizes include the complete schema/question
-prompt. Requests exceeding a qualified bound fail instead of truncating.
+GLiNER Decide-1B admits one input per wire request. Decision enrichment
+`batch_size` controls concurrent one-document requests; it does not combine
+documents into a multi-input Decide request. The default batch size is supported.
+Request sizes include the complete schema/question prompt. Requests exceeding a qualified bound fail instead of truncating.
 
 Neighbor context can sample an entity table's local graph. Point a conceptualizer
 at a context graph whose sources are independent of that conceptualizer; the

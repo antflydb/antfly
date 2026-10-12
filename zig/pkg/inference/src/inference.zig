@@ -120,6 +120,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
     _ = @import("hard_cancellation_watchdog.zig");
