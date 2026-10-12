@@ -1,7 +1,7 @@
 # Native SQL regular expressions
 
 The required full-parity target and unfinished qualification work are tracked
-in [the regex parity design](../../../docs/design/sql-regex-parity.md).
+in [the regex parity design](../../../docs/design/sql/regex-parity.md).
 The validation below is a baseline, not the release-completion criterion.
 
 SQL regex functions use the capture-capable native Zig interface in
