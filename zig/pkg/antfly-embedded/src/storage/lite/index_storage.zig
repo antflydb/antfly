@@ -2088,7 +2088,9 @@ test "lite mapped artifact disk admission includes concurrent future claims" {
 test "lite mapped read only views report unavailable when directory cannot write" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    // chmod requires a real directory fd; Linux path-only (O_PATH) handles
+    // cannot be passed to fchmod.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-readonly.aflite");
     defer a.free(path);

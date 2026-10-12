@@ -2941,11 +2941,18 @@ test "SQL NUMERIC column spills preserve canonical bytes scale arrays and owners
             const restored_array = (try block.cell(0, 1)).array.?;
             var work: arrays.Budget = .{};
             try std.testing.expectEqual(std.math.Order.eq, try array.compare(restored_array.*, &work));
-            try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes[0 .. bytes.len - 1], 4096));
+            // Fault injection can fail before the decoder reaches the corrupt
+            // suffix. Preserve that allocation error for the failure harness.
+            if (decodeColumnarBlockInArena(arena.allocator(), bytes[0 .. bytes.len - 1], 4096)) |_| {
+                return error.TestExpectedError;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidSqlSpill, err);
+            }
         }
     };
     try Harness.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL native immutable column block retains the frozen v1 integer layout" {
