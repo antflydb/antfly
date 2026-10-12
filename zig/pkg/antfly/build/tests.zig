@@ -5952,6 +5952,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const v02_upgrade_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_marker_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"ensureCompatible"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_upgrade_step = b.step("antfly-v02-upgrade-test", "Verify released v0.2.1+ schema/backup fixtures and directory admission");
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_upgrade_tests).step);
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_marker_tests).step);
+    lib_storage_test_step.dependOn(v02_upgrade_step);
+
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },

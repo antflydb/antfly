@@ -28,6 +28,15 @@ pub const ScoreSink = struct {
 pub const CompleteScoreSink = struct {
     context: *anyopaque,
     write: *const fn (*anyopaque, usize, ?f64) void,
+    /// Optional synchronous delivery of a borrowed canonical batch. NaN denotes
+    /// an absent/deleted score; all other values are validated finite scores.
+    /// The receiver must not retain this slice or mutate its backing storage.
+    write_decoded: ?*const fn (*anyopaque, []const f64) void = null,
+
+    pub fn deliverDecoded(self: @This(), scores: []const f64) void {
+        if (self.write_decoded) |write_batch| return write_batch(self.context, scores);
+        for (scores, 0..) |score, i| self.write(self.context, i, if (std.math.isNan(score)) null else score);
+    }
 };
 
 /// Shared durability expectations that higher layers can reason about without

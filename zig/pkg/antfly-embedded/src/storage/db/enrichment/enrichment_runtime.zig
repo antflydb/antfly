@@ -5129,8 +5129,14 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.future != null;
     }
 
-    pub fn start(self: *EnrichmentRuntime) !void {
-        if (self.future != null) return;
+    /// Resume provider admission after a joined stop while the caller owns
+    /// synchronous replay. Restore drains must not launch a competing worker.
+    pub fn resumeInlineAfterStop(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return error.EnrichmentWorkerAlreadyRunning;
+        try self.prepareExecution();
+    }
+
+    fn prepareExecution(self: *EnrichmentRuntime) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);
@@ -5146,6 +5152,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             provider.execution.cancellation = cancellation;
             provider.execution.io = io;
         }
+    }
+
+    pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
+        try self.prepareExecution();
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.producer, self, workerStep);
     }
 

@@ -16,6 +16,23 @@
 //! Final shared-library exports belong to the public header, never to linked archives.
 const std = @import("std");
 
+/// Executor owners and provider archives must share the internal Zig callback ABI.
+pub fn llvmBackend(target: std.Target) ?bool {
+    return if (target.ofmt == .elf) true else null;
+}
+
+/// Provider archives borrow std.Io executors from the C API and Lite CLI. Internal Zig
+/// callbacks must use the same backend calling convention as their owner.
+pub fn addProviderArchive(b: *std.Build, module: *std.Build.Module, name: []const u8, max_rss: u64) *std.Build.Step.Compile {
+    return b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = module,
+        .use_llvm = llvmBackend(module.resolved_target.?.result),
+        .max_rss = max_rss,
+    });
+}
+
 pub const Library = struct {
     binary: std.Build.LazyPath,
     compile: ?*std.Build.Step.Compile,
@@ -53,7 +70,7 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         .use_lld = if (elf) true else null,
         // Zig's Debug self-hosted backend cannot link through LLD. Keep the
         // code generator compatible with the required ELF export linker.
-        .use_llvm = if (elf) true else null,
+        .use_llvm = llvmBackend(target),
         // Mach-O ReleaseSafe codegen measured 12.92 GB; match the C API
         // test estimate so fresh builds can schedule the complete archive.
         .max_rss = @as(usize, if (macho) 14 else 12) * 1024 * 1024 * 1024,
