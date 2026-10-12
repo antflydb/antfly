@@ -175,7 +175,7 @@ else:
         (self.root / "probe.zig").write_text("""
 const std = @import("std");
 extern fn antfly_private_submit(*const std.Io, *std.Io.Group, *std.atomic.Value(u32)) bool;
-export fn antfly_first() c_int {
+pub export fn antfly_first() c_int {
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -187,6 +187,12 @@ export fn antfly_first() c_int {
 }
 export fn antfly_second(argument: c_int) void { _ = argument; }
 export fn antfly_private_probe() u32 { return 2; }
+""")
+        (self.root / "cli.zig").write_text("""
+const probe = @import("probe.zig");
+pub fn main() !void {
+    if (probe.antfly_first() != 42) return error.ExecutorCallbackFailed;
+}
 """)
         (self.root / "provider.zig").write_text("""
 const std = @import("std");
@@ -221,10 +227,25 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .pic = true,
     });
-    module.linkLibrary(shared_library.addProviderArchive(b, provider_module, "provider", 512 * 1024 * 1024));
+    const provider = shared_library.addProviderArchive(b, provider_module, "provider", 512 * 1024 * 1024);
+    module.linkLibrary(provider);
     const library = shared_library.add(b, module);
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.binary, .lib, "libantfly.so").step);
+    const cli_module = b.createModule(.{
+        .root_source_file = b.path("cli.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    cli_module.linkLibrary(provider);
+    const cli = b.addExecutable(.{
+        .name = "lite-executor-probe",
+        .root_module = cli_module,
+        .use_llvm = shared_library.llvmBackend(target.result),
+    });
+    b.installArtifact(cli);
     if (native_probe) {
+        b.getInstallStep().dependOn(&b.addRunArtifact(cli).step);
         const consumer = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
         consumer.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{"-std=c11"} });
         library.link(consumer);
@@ -245,7 +266,7 @@ pub fn build(b: *std.Build) void {
             exports.check(header, library, "elf", nm)
         if platform.system() == "Linux":
             # A symbol-only link check misses mismatched backend conventions.
-            # Submit a provider's Zig callback to the library-owned executor.
+            # Submit provider callbacks to both library- and executable-owned executors.
             result = run_fixture_build(
                 [shutil.which("zig"), "build", "-Dnative-executor-probe=true"],
                 self.root,

@@ -16,11 +16,12 @@
 //! Final shared-library exports belong to the public header, never to linked archives.
 const std = @import("std");
 
-fn llvmBackend(target: std.Target) ?bool {
+/// Executor owners and provider archives must share the internal Zig callback ABI.
+pub fn llvmBackend(target: std.Target) ?bool {
     return if (target.ofmt == .elf) true else null;
 }
 
-/// Provider archives borrow std.Io executors from the C API. Internal Zig
+/// Provider archives borrow std.Io executors from the C API and Lite CLI. Internal Zig
 /// callbacks must use the same backend calling convention as their owner.
 pub fn addProviderArchive(b: *std.Build, module: *std.Build.Module, name: []const u8, max_rss: u64) *std.Build.Step.Compile {
     return b.addLibrary(.{

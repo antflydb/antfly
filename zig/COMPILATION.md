@@ -327,8 +327,8 @@ configured flag reports `inference_mode: "local_embedded"` and
 `local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
 section). There is no inference-free `libantfly` product.
 
-ELF builds select LLVM for the C API and its embedded inference and enrichment
-archives. The final export boundary requires LLD, which cannot link Zig's
+ELF builds select LLVM for the C API, both Lite CLI build definitions, and their
+embedded inference and enrichment archives. The final export boundary requires LLD, which cannot link Zig's
 self-hosted Debug output. The provider archives must use the same backend:
 borrowed `std.Io` executors exchange internal Zig callback pointers, whose
 calling convention differs between LLVM and the self-hosted backend. Mixing
