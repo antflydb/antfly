@@ -1049,18 +1049,16 @@ fn normalizeParameters(alloc: std.mem.Allocator, input: []const std.json.Value, 
     for (input, types, 0..) |value, kind, index| {
         if (kind != .datetime or value == .null or value == .string) continue;
         if (normalized == null) normalized = try alloc.dupe(std.json.Value, input);
-        normalized.?[index] = .{ .string = try storage_schema.formatDateTimeNsAlloc(alloc, try wire_values.timestampNanos(value)) };
+        normalized.?[index] = .{ .string = try @import("antfly_local_sources").datetime.formatDateTimeSignedNsAlloc(alloc, try wire_values.timestampNanos(value)) };
     }
     return normalized orelse input;
 }
 
 fn datetimeResult(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    if (value == .null) return value;
-    const nanos = if (value == .string)
-        storage_schema.parseDateTimeToNs(value.string) orelse return error.InvalidSqlBackendResponse
-    else
-        try wire_values.timestampNanos(value);
-    return wire_values.timestampValue(alloc, nanos);
+    return wire_values.timestampResult(alloc, value) catch |err| switch (err) {
+        error.InvalidResult => error.InvalidSqlBackendResponse,
+        else => err,
+    };
 }
 
 fn wireType(kind: ast.ColumnType) !wire.Type {
@@ -1709,22 +1707,22 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // Native storage accepts unsigned nanoseconds; the high case must not
-    // narrow through i64 even though the PostgreSQL wire uses signed micros.
-    for ([_]u64{ 0, 946684800000000000, 18000000000123456000, std.math.maxInt(u64) / 1000 * 1000 }) |nanos| {
+    // Exact signed time crosses the legacy native datetime adapter without
+    // narrowing, including pre-Unix values and positive values beyond i64.
+    for ([_]i128{ -1_000, -31_536_000_000_000_000, 0, 946684800000000000, 18000000000123456000, std.math.maxInt(u64) / 1000 * 1000 }) |nanos| {
         const wire_value = try wire_values.timestampValue(alloc, nanos);
         const bytes = try wire_values.encode(alloc, .datetime, 1, wire_value);
         const decoded = try wire_values.decode(alloc, 1184, 1, bytes);
         const parameters = try normalizeParameters(alloc, &.{decoded}, &.{.datetime});
         const coerced = try describe_sql.coerce(parameters[0], .datetime);
         try std.testing.expect(coerced == .string);
-        try std.testing.expectEqual(@as(?u64, nanos), storage_schema.parseDateTimeToNs(coerced.string));
+        try std.testing.expectEqual(@as(?i128, nanos), @import("antfly_local_sources").datetime.parseDateTimeToSignedNs(coerced.string));
         // The native SELECT representation is ISO; the adapter normalizes just
         // that owned cell and then produces the exact original binary micros.
         const returned = try datetimeResult(alloc, coerced);
         try std.testing.expectEqualSlices(u8, bytes, try wire_values.encode(alloc, .datetime, 1, returned));
         const text = try wire_values.encode(alloc, .datetime, 0, returned);
-        try std.testing.expectEqual(@as(?u64, nanos), storage_schema.parseDateTimeToNs(text));
+        try std.testing.expectEqual(@as(?i128, nanos), (try wire_values.timestampFromValue(.{ .string = text })).unixNanoseconds());
     }
     const text_value = std.json.Value{ .string = "2000-01-01T01:00:00+01:00" };
     const text_parameters = try normalizeParameters(alloc, &.{ text_value, .null }, &.{ .datetime, .datetime });
@@ -1735,5 +1733,5 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     const too_precise = try datetimeResult(alloc, .{ .string = "2000-01-01T00:00:00.000000001Z" });
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
-    try std.testing.expectError(error.InvalidSqlBackendResponse, datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" }));
+    try std.testing.expectEqual(@as(i128, -31_536_000_000_000_000), try wire_values.timestampNanos(try datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" })));
 }

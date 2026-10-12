@@ -3599,6 +3599,48 @@ alias for a document-datetime string, or completion of temporal SQL parity.
 The original inventory remains 479 implemented / 136 rejected / 73 superseded /
 898 unresolved.
 
+### Full-domain timestamptz wire boundary
+
+The pgwire timestamp codec no longer narrows time through unsigned Unix
+nanoseconds or unsigned epoch-day arithmetic. Binary OID 1184 now uses the
+validated native signed PostgreSQL-epoch codec; finite transport nanoseconds
+use i128, and both infinities remain explicit values rather than SQL NULL.
+Result normalization accepts canonical PostgreSQL UTC text and the existing
+native RFC3339 boundary. Precision finer than a microsecond is still rejected
+at wire encoding rather than silently rounded or truncated.
+
+Text output uses canonical PostgreSQL ISO/YMD UTC spelling across the entire
+timestamp domain, including BC and large positive years. Direct text and binary
+cell streaming use fixed caller storage with no heap allocation. Allocated
+encoding owns only its final buffer. This is a result/binary-frame boundary,
+not a general PostgreSQL timestamp input-literal parser or session-timezone
+implementation.
+
+All 36 independent PostgreSQL timestamptz entries now exercise allocated and
+direct streaming codecs, exact text/binary output, result normalization,
+truncated frames, output-byte admission and individual allocation-failure
+cleanup. Incorrect historical rejections of pre-Unix values and infinity were
+replaced by exact PostgreSQL expectations; out-of-domain finite frames and
+precision errors still fail before publishing bytes.
+
+The complete pgwire gate passes all 106 tests in Debug and ReleaseFast. A local
+ReleaseFast sample encoded 100,000 mixed values in both formats (200,000 cell
+encodes) in 13.5 ms with a 128-byte output buffer and zero heap allocation.
+This is not a query-latency comparison or a before/after speedup claim. Six
+independent PostgreSQL oracle tests, fixture reproducibility, the 2,039-file
+Apache boundary and inventory integrity pass.
+
+The focused public API gate also passes all 80 build steps and three selected
+regressions: binary datetime parameter coercion, bounded scalar pgwire execution
+and original stored-array typed reads, with no failures or leaks.
+
+The native parameter bridge now preserves signed pre-Unix nanoseconds where
+the existing document-datetime type permits them. Full-domain typed parameter
+admission, temporal schema/row/index capabilities, SQL type binding and public
+time-function activation remain open; a wire codec passing is not evidence
+that those layers accept every PostgreSQL timestamp or infinity. No additional
+original case receives disposition credit.
+
 Public result and storage boundaries continue to reject these new payloads
 explicitly until exact schema/type identities, AROW/index capability versions,
 pgwire codecs, temporal arrays, parser/binder rules and execution-owned clock
