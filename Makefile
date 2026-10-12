@@ -30,7 +30,6 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build              Build the Zig antfly binary"
-	@echo "  build-antfarm      Rebuild the antfarm frontend into zig/pkg/antfly/antfarm (also run by generate)"
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules and client SDKs"
 	@echo "  fmt                Format Zig, Go, Python, TypeScript, and Rust sources"
@@ -75,21 +74,11 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check zig-checksums-check
 
-build-antfarm: build-antfarm-main
-
-build-antfarm-main:
-	@echo "Building antfarm frontend..."
-	cd ts && node scripts/run-pinned-toolchain.mjs pnpm install --frozen-lockfile
-	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter antfarm... build
-	@echo "Copying dist files to zig/pkg/antfly/antfarm..."
-	rm -rf zig/pkg/antfly/antfarm/*
-	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
-
 # Uses the committed antfarm build in zig/pkg/antfly/antfarm; `make generate`
-# (or `make build-antfarm`) refreshes it, and repository-check verifies it.
+# refreshes it, and repository-check verifies it.
 build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
@@ -110,7 +99,11 @@ generate: graph-identifier-generate build-docs tidy zig-source-catalog-generate
 	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
 	cd ts/apps/model-explorer && node --experimental-strip-types generator/index.ts
 	$(MAKE) -C ./py/packages/sdk generate
-	$(MAKE) build-antfarm
+	@echo "Building antfarm frontend into zig/pkg/antfly/antfarm..."
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm install --frozen-lockfile
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter antfarm... build
+	rm -rf zig/pkg/antfly/antfarm/*
+	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
 
 graph-identifier-generate:
 	$(SCRIPTS_PY) scripts/generate_graph_identifier_policy.py

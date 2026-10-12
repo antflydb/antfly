@@ -63,7 +63,6 @@ Run `make help` for the full list. Key targets:
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
 | `make zig-test` | Run the Zig test aggregate |
-| `make build-antfarm` | Rebuild the Antfarm dashboard into `zig/pkg/antfly/antfarm` (also run by `make generate`); needed after changing `ts/apps/antfarm` or its dependencies |
 | `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
