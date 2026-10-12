@@ -323,7 +323,7 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    exact merge path end to end -- one against a real 37KB multi-window
 //    design-doc section (zig/VOPR.md's "Completion-Claim Audit", frozen at
 //    commit 3ce5aff4ea as testdata/gliner25/long_document_probe/
-//    vopr_completion_claim_audit.md), one
+//    vopr_completion_claim_audit.txt), one
 //    deterministically against the known repro relation -- through both the
 //    HTTP handler and the in-process provider entry, and assert the
 //    response matches zig/EXTRACT.md's canonical envelope (entities with
@@ -340,8 +340,8 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    zig/VOPR.md's "Completion-Claim Audit" (37KB), and zig/PDF.md's "Review
 //    findings and required fixes" (99KB) -- the latter two as frozen
 //    snapshots at commit 3ce5aff4ea under
-//    testdata/gliner25/long_document_probe/ (vopr_completion_claim_audit.md,
-//    pdf_review_findings.md) -- plus two synthetic documents
+//    testdata/gliner25/long_document_probe/ (vopr_completion_claim_audit.txt,
+//    pdf_review_findings.txt) -- plus two synthetic documents
 //    built by concatenating real corpus sections (zig/PDF.md's two largest
 //    real sections, per a docsaf-accurate Go-side sweep of the whole ingest
 //    corpus) up to 130KB and 182KB/28275 words, well past every individual

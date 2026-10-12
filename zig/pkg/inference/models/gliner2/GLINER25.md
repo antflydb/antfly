@@ -310,19 +310,19 @@ weights) real sections through the long executor's window planner, with
 - `zig/pkg/antfly/src/storage/lsm/LSM.md`'s "Read And Scan Work" (6,787
   bytes, ~p95): 1 window, window_words=1183, padded_sequence_tokens=1455.
 - `zig/VOPR.md`'s "Completion-Claim Audit" (37,143 bytes when measured;
-  the frozen fixture `zig/pkg/inference/testdata/gliner25/long_document_probe/vopr_completion_claim_audit.md`
+  the frozen fixture `zig/pkg/inference/testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt`
   is 37,138 bytes): 2 windows,
   window_words=[2139,4096], padded_sequence_tokens=[3131,5708].
 - `zig/PDF.md`'s "Review findings and required fixes" (99,008 bytes, the
   corpus max; frozen as
-  `zig/pkg/inference/testdata/gliner25/long_document_probe/pdf_review_findings.md`): 4 windows, window_words=[3994,4096],
+  `zig/pkg/inference/testdata/gliner25/long_document_probe/pdf_review_findings.txt`): 4 windows, window_words=[3994,4096],
   padded_sequence_tokens=[4594,4690].
 
 The VOPR.md and PDF.md sections the tests use are frozen, byte-for-byte
 snapshots taken at commit `3ce5aff4ea` (heading line up to, but excluding,
 the next line starting with `#`) under
 `zig/pkg/inference/testdata/gliner25/long_document_probe/`
-(`vopr_completion_claim_audit.md`, `pdf_review_findings.md`), so editing or
+(`vopr_completion_claim_audit.txt`, `pdf_review_findings.txt`), so editing or
 slimming those design docs never changes the long-document probe inputs.
 
 Exact observed range across all cases: `document_bytes=[26,99008]
@@ -354,7 +354,7 @@ the two real call sites of `extractWithAdmission` from section 8):
   (`server/gliner_boundary_service_test.zig`): a real HTTP `/ai/v1/extract`
   request against `zig/VOPR.md`'s "Completion-Claim Audit" (37KB, 2
   windows; now read from the frozen
-  `long_document_probe/vopr_completion_claim_audit.md` fixture), asserting every entity and relation in the response matches the
+  `long_document_probe/vopr_completion_claim_audit.txt` fixture), asserting every entity and relation in the response matches the
   canonical shape and that no `head`/`tail` key ever appears.
 - `"gliner boundary long executor provider extractDirect canonical
   schema_version 2 relations shape for a windowed request native/Metal"`:
@@ -454,9 +454,9 @@ parametrized over the bundle directory (`resolveModelDirectoryFromEnv` in
 `server/gliner_boundary_service_test.zig`) and run against
 `ANTFLY_GLINER25_BASE_FP16_MODEL_DIR`: the 37 KB `VOPR.md` "Completion-Claim
 Audit" multi-window document (frozen fixture
-`long_document_probe/vopr_completion_claim_audit.md`) through the HTTP handler and the in-process
+`long_document_probe/vopr_completion_claim_audit.txt`) through the HTTP handler and the in-process
 provider entry on native and Metal, the ~99 KB `PDF.md` corpus-maximum
-section (frozen fixture `long_document_probe/pdf_review_findings.md`) through
+section (frozen fixture `long_document_probe/pdf_review_findings.txt`) through
 both entries, and the corpus-minimum documents (the 20-byte
 `SCHEMA.md` section and a one-character document) through the provider entry
 on both backends. All pass with the canonical schema_version 2 envelope and,

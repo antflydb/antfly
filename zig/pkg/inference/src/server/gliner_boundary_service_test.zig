@@ -638,8 +638,8 @@ fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0
 // or slimming zig/VOPR.md and zig/PDF.md never changes these tests' inputs.
 // Paths are relative to the inference-test binary's working directory
 // (zig/pkg/inference, per zig/TESTING.md's build steps).
-const vopr_completion_claim_audit_fixture = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.md";
-const pdf_review_findings_fixture = "testdata/gliner25/long_document_probe/pdf_review_findings.md";
+const vopr_completion_claim_audit_fixture = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt";
+const pdf_review_findings_fixture = "testdata/gliner25/long_document_probe/pdf_review_findings.txt";
 
 // Resolves an `ANTFLY_GLINER25_*_MODEL_DIR`-style environment variable to a
 // `Node.init`-ready `models_dir`/model `name` pair, so the long-document
@@ -899,7 +899,7 @@ fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !v
 
 // Corpus-maximum-scale companion to the two windowed tests above: zig/PDF.md's
 // "Review findings and required fixes" (frozen as
-// testdata/gliner25/long_document_probe/pdf_review_findings.md at commit
+// testdata/gliner25/long_document_probe/pdf_review_findings.txt at commit
 // 3ce5aff4ea) was the largest single section
 // examples/dogfood's real docsaf.MarkdownProcessor splitting produced across the whole ingest corpus (measured directly in
 // extractors/gliner_boundary_qualification.zig's long-document geometry

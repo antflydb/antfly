@@ -1368,8 +1368,8 @@ const long_document_geometry_cases = [_]LongDocumentCase{
     // the next line starting with '#', exactly as extractHeadingSection
     // would. Frozen so editing zig/VOPR.md or zig/PDF.md never changes the
     // measured geometry.
-    .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.md" },
-    .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "testdata/gliner25/long_document_probe/pdf_review_findings.md" },
+    .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt" },
+    .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "testdata/gliner25/long_document_probe/pdf_review_findings.txt" },
     // Synthetic documents built by concatenating zig/PDF.md's two largest
     // real sections (verbatim, per a docsaf-accurate Go-side sweep of the
     // whole ingest corpus that also confirmed no single real section
