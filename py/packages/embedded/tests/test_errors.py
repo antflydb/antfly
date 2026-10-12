@@ -22,6 +22,7 @@ Mirrors go/pkg/embedded's TestErrorCodeMetadataMatchesCABI.
 from __future__ import annotations
 
 import ctypes
+from pathlib import Path
 
 import pytest
 
@@ -62,3 +63,15 @@ def test_open_options_struct_size_matches_c_abi() -> None:
     got = lib.antfly_open_options_size()
     want = ctypes.sizeof(_ffi.AntflyOpenOptions)
     assert got == want, f"C ABI open options size {got}, compiled struct size {want}"
+
+
+def test_sql_cannot_reuse_same_code_index_diagnostic(tmp_path: Path) -> None:
+    with antfly_embedded.create_hosted(tmp_path / "db.aflite") as db:
+        db.create_table("entities", {})
+        with db.open_table("entities") as table:
+            with pytest.raises(errors.InvalidArgumentError, match="MissingIndexType") as index_error:
+                db.add_index({"name": "invalid"})
+            with pytest.raises(errors.InvalidArgumentError, match="root database handle") as sql_error:
+                table.sql_session()
+            assert "MissingIndexType" not in str(sql_error.value)
+            assert "MissingIndexType" in str(index_error.value)

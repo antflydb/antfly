@@ -264,7 +264,7 @@ pub const Runtime = struct {
     }
 };
 
-test "decision functions Antfly and Jev HTTP adapters preserve payload credentials and usage" {
+test "decision functions concurrent batches preserve one input per wire request credentials and usage" {
     const a = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -277,6 +277,7 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
             defer parsed.deinit();
             try std.testing.expectEqualStrings("refund", parsed.value.object.get(if (std.mem.eql(u8, req.path, "/decisions")) "input" else "state").?.string);
             try std.testing.expectEqualStrings("test-model", parsed.value.object.get("model").?.string);
+            try std.testing.expect(!parsed.value.object.contains("inputs"));
             const questions = parsed.value.object.get("questions").?;
             if (questions == .array) {
                 try std.testing.expectEqualStrings("predicate", questions.array.items[0].object.get("type").?.string);
@@ -296,7 +297,7 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     defer client.deinit();
     var registry = registry_mod.Registry.init(a);
     defer registry.deinit();
-    try registry.registerDeciderConfig("local", .{ .provider = .antfly, .model = "test-model", .url = server.baseUrl(), .api_key = "decision-test", .max_rows = 2 });
+    try registry.registerDeciderConfig("local", .{ .provider = .antfly, .model = "test-model", .url = server.baseUrl(), .api_key = "decision-test", .max_rows = 2, .batch_size = 32 });
     try registry.registerDeciderConfig("remote", .{ .provider = .jev, .model = "test-model", .url = server.baseUrl(), .api_key = "decision-test", .max_rows = 2 });
     try registry.registerDeciderConfig("budgeted", .{ .provider = .antfly, .model = "test-model", .url = server.baseUrl(), .max_input_tokens = 1 });
     var arena = std.heap.ArenaAllocator.init(a);

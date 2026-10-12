@@ -122,6 +122,11 @@ for the full rationale.
 
 ### Embedded inference without a database
 
+Database failures retain an owned native diagnostic in `NativeError`. Use
+`errors.Is(err, lite.InvalidArgument)` (or another stable `ErrorCode`) to
+classify failures. The copied detail remains valid after later native calls;
+Go keeps each native call and diagnostic read on the same OS thread.
+
 `OpenInference` opens a standalone `*Inference` handle that runs models with
 no `DB` attached -- models load on first use and stay cached until `Close`.
 Each method sends and receives the JSON of the matching `/ai/v1` route of the
