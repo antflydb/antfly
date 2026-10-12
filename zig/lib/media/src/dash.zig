@@ -332,7 +332,7 @@ const Expansion = struct {
             const number = self.sequence + @as(u64, @intCast(index));
             const time = start + duration * @as(u64, @intCast(index));
             const address = try self.template(self.media.?, number, time);
-            try self.segments.append(self.a, .{ .uri = address, .range = null, .initialization = self.initialization.?, .sequence = number, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(duration)) / @as(f64, @floatFromInt(self.scale)), .discontinuity = false });
+            try self.segments.append(self.a, .{ .uri = address, .range = null, .initialization = self.initialization.?, .sequence = number, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(duration)) / @as(f64, @floatFromInt(self.scale)), .discontinuity = false, .dash = .{ .start_ticks = time, .duration_ticks = duration, .timescale = @intCast(self.scale), .presentation_offset = self.offset } });
         }
         self.sequence = end_sequence;
     }
@@ -347,7 +347,7 @@ pub fn parseAt(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix
     return parseAtWithSelection(a, bytes, limits, now_unix_ms, .{});
 }
 pub fn parseAtWithSelection(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64, selection: Selection) !Playlist {
-    return hierarchy.parse(a, bytes, limits, now_unix_ms, selection, parseRepresentation);
+    return hierarchy.parse(a, bytes, limits, now_unix_ms, selection, parseRepresentation, elapsed, dateTime);
 }
 fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64) !Playlist {
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
@@ -455,7 +455,8 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             try attributes(tag, &.{ "media", "mediaRange" });
             if (!tag.empty) return error.MalformedDash;
             if (state.segments.items.len >= limits.max_segments) return error.ResourceLimitExceeded;
-            try state.segments.append(a, .{ .uri = try uri(tag.get("media"), limits), .range = try byteRange(tag.get("mediaRange")), .initialization = state.initialization orelse return error.MalformedDash, .sequence = state.sequence, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(explicit_duration.?)) / @as(f64, @floatFromInt(state.scale)), .discontinuity = false });
+            const start_ticks = std.math.mul(u64, @intCast(state.segments.items.len), explicit_duration.?) catch return error.MalformedDash;
+            try state.segments.append(a, .{ .uri = try uri(tag.get("media"), limits), .range = try byteRange(tag.get("mediaRange")), .initialization = state.initialization orelse return error.MalformedDash, .sequence = state.sequence, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(explicit_duration.?)) / @as(f64, @floatFromInt(state.scale)), .discontinuity = false, .dash = .{ .start_ticks = start_ticks, .duration_ticks = explicit_duration.?, .timescale = @intCast(state.scale), .presentation_offset = state.offset } });
             state.sequence = std.math.add(u64, state.sequence, 1) catch return error.MalformedDash;
             state.target = std.math.divCeil(u64, explicit_duration.?, state.scale) catch return error.MalformedDash;
         } else if (depth == 5 and template_mode and std.mem.eql(u8, tag.name, "SegmentTimeline")) {
@@ -464,7 +465,8 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             timeline_seen = true;
         } else if (depth == 6 and template_mode and std.mem.eql(u8, tag.name, "S")) {
             try attributes(tag, &.{ "t", "d", "r" });
-            if (!tag.empty or timeline.items.len >= limits.max_segments) return error.ResourceLimitExceeded;
+            if (!tag.empty) return error.MalformedDash;
+            if (timeline.items.len >= limits.max_timeline_entries) return error.ResourceLimitExceeded;
             const repeat = tag.get("r") orelse "0";
             const duration = try integer(tag.get("d") orelse return error.MalformedDash);
             if (duration == 0) return error.MalformedDash;
@@ -483,6 +485,14 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
         period_duration = presentation_duration.? - period_start;
     }
     if (period_duration) |duration_ms| state.period_end = @as(u128, duration_ms) * state.scale;
+    if (!template_mode and state.period_end != null) {
+        var retained: usize = 0;
+        for (state.segments.items) |segment| {
+            if (@as(u128, segment.dash.?.start_ticks) * 1000 >= state.period_end.?) break;
+            retained += 1;
+        }
+        state.segments.items.len = retained;
+    }
     if (state.dynamic) state.now = (@as(i128, now_unix_ms orelse return error.DashClockRequired) - (availability_start orelse return error.MalformedDash) - period_start) * state.scale;
     if (template_mode) {
         if (timeline_seen) {
@@ -518,7 +528,7 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
     const identity = std.fmt.bufPrint(&identity_text, "dash-timing-v1/{d}/{d}/{d}/{d}", .{ state.scale, state.offset, period_start, availability_start orelse -1 }) catch unreachable;
     var timing_identity: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(identity, &timing_identity, .{});
-    return .{ .allocator = a, .segments = segments, .owned_uris = owned, .target_duration_seconds = state.target, .ended = !state.dynamic, .timing_identity = timing_identity, .reload_after_seconds = if (state.dynamic and update_period != null) @as(f64, @floatFromInt(update_period.?)) / 1000 else null };
+    return .{ .allocator = a, .segments = segments, .owned_uris = owned, .target_duration_seconds = state.target, .ended = !state.dynamic, .timing_identity = timing_identity, .reload_after_seconds = if (state.dynamic and update_period != null) @as(f64, @floatFromInt(update_period.?)) / 1000 else null, .dash_window_start_ms = if (state.dynamic and state.depth != null) @as(i128, now_unix_ms.?) - availability_start.? - state.depth.? else null };
 }
 
 const fixture = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='static'><Period><AdaptationSet mimeType='video/mp4'><Representation id='v'><SegmentList timescale='1000' duration='1500' startNumber='7'><Initialization sourceURL='video.mp4' range='0-127'/><SegmentURL media='video.mp4' mediaRange='128-511'/><SegmentURL media='next.m4s'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
@@ -669,7 +679,7 @@ test "DASH namespace prefixes and selection identity are stable across descripti
     defer a.free(changed);
     var second = try parse(a, changed, .{});
     defer second.deinit();
-    try std.testing.expect(!std.meta.eql(first.timing_identity, second.timing_identity));
+    try std.testing.expect(!std.meta.eql(first.dash_periods[0].configuration, second.dash_periods[0].configuration));
     const spoof = try std.mem.replaceOwned(u8, a, prefixed, "http://www.w3.org/2001/XMLSchema-instance", "urn:wrong");
     defer a.free(spoof);
     try std.testing.expectError(error.UnsupportedDash, parse(a, spoof, .{}));
@@ -693,6 +703,112 @@ test "DASH inherited timeline children override nearer levels and reject critica
         defer a.free(bad);
         try std.testing.expectError(error.UnsupportedDash, parse(a, bad, .{}));
     }
+}
+const periods_fixture = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' mediaPresentationDuration='PT8S'><Period id='one' duration='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' startNumber='7' initialization='init.mp4' media='one-$Number$.m4s'/></Representation></AdaptationSet></Period><Period id='two'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+test "DASH multiple periods infer timing and preserve period-local sequence resets" {
+    const a = std.testing.allocator;
+    var playlist = try parse(a, periods_fixture, .{});
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 2), playlist.dash_periods.len);
+    try std.testing.expectEqual(@as(usize, 4), playlist.segments.len);
+    try std.testing.expectEqual(@as(u64, 4000), playlist.dash_periods[1].start_ms);
+    try std.testing.expectEqual(@as(?u64, 4000), playlist.dash_periods[1].duration_ms);
+    try std.testing.expectEqual(@as(u64, 8), playlist.segments[1].sequence);
+    try std.testing.expectEqual(@as(u64, 1), playlist.segments[2].sequence);
+    try std.testing.expect(playlist.segments[1].dash.?.finishesPeriod());
+    try std.testing.expect(playlist.segments[2].dash.?.startsPeriod());
+    var second = try parseAtWithSelection(a, periods_fixture, .{}, null, .{ .period_id = "two" });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 2), second.segments.len);
+    try std.testing.expectEqual(@as(u64, 4000), second.segments[0].dash.?.period.start_ms);
+    const from_next = try std.mem.replaceOwned(u8, a, periods_fixture, "duration='PT4S'", "");
+    defer a.free(from_next);
+    const explicit_next = try std.mem.replaceOwned(u8, a, from_next, "id='two'", "id='two' start='PT4S'");
+    defer a.free(explicit_next);
+    var inferred = try parse(a, explicit_next, .{});
+    defer inferred.deinit();
+    try std.testing.expectEqual(@as(?u64, 4000), inferred.dash_periods[0].duration_ms);
+    try std.testing.expectError(error.ResourceLimitExceeded, parse(a, periods_fixture, .{ .max_segments = 3 }));
+    try std.testing.expectError(error.MalformedDash, parse(a, from_next, .{}));
+    const duplicate = try std.mem.replaceOwned(u8, a, periods_fixture, "id='two'", "id='one'");
+    defer a.free(duplicate);
+    try std.testing.expectError(error.DashSelectionAmbiguous, parse(a, duplicate, .{}));
+    const overlap = try std.mem.replaceOwned(u8, a, periods_fixture, "id='two'", "id='two' start='PT3S'");
+    defer a.free(overlap);
+    try std.testing.expectError(error.MalformedDash, parse(a, overlap, .{}));
+}
+fn periodAllocationRun(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    var playlist = try parse(no_resize.allocator(), periods_fixture, .{});
+    defer playlist.deinit();
+}
+test "DASH combined periods release every failing allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, periodAllocationRun, .{});
+}
+test "DASH announced period gaps preserve exact timing and cannot hide a skipped period" {
+    const a = std.testing.allocator;
+    const longer = try std.mem.replaceOwned(u8, a, periods_fixture, "mediaPresentationDuration='PT8S'", "mediaPresentationDuration='PT10S'");
+    defer a.free(longer);
+    const gap = try std.mem.replaceOwned(u8, a, longer, "id='two'", "id='two' start='PT6S'");
+    defer a.free(gap);
+    var playlist = try parse(a, gap, .{});
+    defer playlist.deinit();
+    const cursor = @import("dash_cursor.zig");
+    var position = cursor.Cursor.initial(playlist.segments[0]);
+    position.consumed(playlist.segments[1]);
+    try std.testing.expectEqual(@as(?usize, 2), try position.select(playlist));
+    const start_time = playlist.segments[2].dash.?.presentationStart();
+    try std.testing.expectEqual(@as(i128, 6000), @divExact(start_time.numerator, start_time.denominator));
+    var skipped = playlist;
+    var period = playlist.dash_periods[1];
+    period.start_ms = 7000;
+    skipped.dash_periods = &.{period};
+    skipped.segments = playlist.segments[2..];
+    try std.testing.expectError(error.MediaStreamGap, position.select(skipped));
+    position.consumed(playlist.segments[3]);
+    var rollback = playlist;
+    rollback.dash_periods = playlist.dash_periods[0..1];
+    rollback.segments = playlist.segments[0..2];
+    try std.testing.expectError(error.SourceVersionChanged, position.select(rollback));
+    var learned = playlist.dash_periods[0];
+    learned.duration_ms = 1000;
+    var consumed = playlist.segments[1].dash.?;
+    consumed.period.duration_ms = null;
+    const late_end = @import("dash_cursor.zig").Cursor{ .period = consumed.period, .sequence = 9, .last = consumed };
+    var expired = playlist;
+    expired.dash_periods = &.{ learned, playlist.dash_periods[1] };
+    expired.segments = &.{};
+    try std.testing.expectError(error.SourceVersionChanged, late_end.select(expired));
+    // The namespace for anonymous fallback IDs is distinct from supplied IDs.
+    const named = try std.mem.replaceOwned(u8, a, periods_fixture, "id='one'", "id='anonymous-start/0'");
+    defer a.free(named);
+    var supplied = try parse(a, named, .{});
+    defer supplied.deinit();
+    const anonymous = try std.mem.replaceOwned(u8, a, periods_fixture, "id='one'", "");
+    defer a.free(anonymous);
+    var inferred = try parse(a, anonymous, .{});
+    defer inferred.deinit();
+    try std.testing.expect(!std.meta.eql(supplied.dash_periods[0].identity, inferred.dash_periods[0].identity));
+    const fractional = hls.DashTiming{ .start_ticks = 0, .duration_ticks = 2, .timescale = 3, .presentation_offset = 1, .period = .{ .duration_ms = 333 } };
+    try std.testing.expect(fractional.startsPeriod());
+    try std.testing.expect(fractional.finishesPeriod());
+    try std.testing.expectEqual(@as(i128, -1000), fractional.presentationStart().numerator);
+    try std.testing.expectEqual(@as(i128, 1000), fractional.presentationEnd().numerator);
+}
+test "DASH future timelines keep independent metadata and aggregate segment budgets" {
+    const a = std.testing.allocator;
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z'><Period id='one' duration='PT2S'><AdaptationSet><Representation><SegmentTemplate duration='2' initialization='init.mp4' media='one-$Number$.m4s'/></Representation></AdaptationSet></Period><Period id='two' start='PT2S'><AdaptationSet><Representation><SegmentTemplate initialization='init.mp4' media='two-$Time$.m4s'><SegmentTimeline><S d='2'/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>";
+    var playlist = try parseAt(a, mpd, .{ .max_segments = 1 }, 2000);
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 1), playlist.segments.len);
+    try std.testing.expectEqual(@as(usize, 2), playlist.dash_periods.len);
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, mpd, .{ .max_segments = 1 }, 4000));
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, mpd, .{ .max_timeline_entries = 0 }, 2000));
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, mpd, .{ .max_periods = 1 }, 2000));
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, mpd, .{ .max_planning_bytes = 10 }, 2000));
+    var early = try parseAt(a, mpd, .{ .max_segments = 0 }, 0);
+    defer early.deinit();
+    try std.testing.expectEqual(@as(usize, 0), early.segments.len);
 }
 fn inheritedAllocationRun(backing: std.mem.Allocator) !void {
     var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });

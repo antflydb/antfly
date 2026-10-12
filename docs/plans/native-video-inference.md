@@ -624,9 +624,9 @@ current receipts are in `zig/lib/video/testdata/webm-validation`. Full completio
   windows are implemented; their current qualification is recorded below.
 - Cross-request scheduling and coordinated preprocessing/model resource budgets;
   final Metal pooling/normalization is implemented and qualified below.
-- DASH automatic multi-period playback, stable live period cursors and broader
-  live/HLS coverage. Inherited templates/BaseURL and representation selection
-  are implemented in the continuation below.
+- Broader live/HLS coverage. DASH inherited templates/BaseURL, representation
+  selection, automatic multi-period playback and stable live period cursors
+  are implemented and qualified in the continuations below.
 
 CUDA remains outside this execution scope. Passing one implementation gate does
 not close the other items or establish general codec conformance.
@@ -702,3 +702,39 @@ retry/origin test verifies no cross-origin fetch and preserves the next sequence
 Source hashes and logs are in
 `zig/lib/media/testdata/dash-inheritance/report.json`. These gates do not close
 the remaining multi-period/live/HLS or broader non-CUDA requirements.
+
+
+### Multi-period DASH and stable live cursors (2026-10-11)
+
+Selected Periods now form one bounded presentation while retaining period-local
+segment numbers. Start/duration inference uses declared neighboring timing and
+MPD presentation duration, following the [DASH-IF timing model](https://dashif.org/Guidelines-TimingModel/).
+Duplicate identities, ambiguous timing and overlapping Periods fail. Period
+identity is separate from the presentation clock and selected configuration, so
+older Period removal does not change the identity of retained content. Metadata
+limits for Periods and timeline entries are independent of the global available
+segment limit, including zero-segment early snapshots and future timelines.
+Each Period releases its temporary arena immediately; a separate cumulative
+planning-byte budget bounds repetition of inherited/root attributes.
+
+A transactional cursor retains the last consumed timing and learned Period end
+and successor identity. Numbering resets, announced gaps and future/incomplete
+segments are handled without renumbering live snapshots. Missing pending media,
+skipped announced Periods, rollback and configuration mutations fail explicitly.
+Dynamically learned end times survive removal of the prior Period; published
+clock formatting is normalized before identity checks. A Period transition
+reconfigures the decoder even when initialization bytes/URI are unchanged.
+Returned `dash_timing` supplies exact rational presentation milliseconds and
+Period clipping metadata; packet timestamps retain their track clock.
+
+Broader HLS, the remaining DASH extensions listed in MEDIA.md, cross-request
+scheduling, performance/reference-copy improvements and the broader codec/model
+qualification requirements remain active. This continuation does not close
+those requirements or establish general DASH/CMAF conformance.
+
+The final source-bound macOS gate passes 75 portable media tests, five production
+authenticated HTTP tests and five object-store/HTTP tests. Actual Linux ARM64
+execution passes the same 75 portable tests. The parser and live-reload campaigns
+inject every allocation failure through period combination, transactional reload
+and decoder epoch reconfiguration. Logs, source/fixture hashes and the Linux
+binary hash are in `zig/lib/media/testdata/dash-periods/report.json`.

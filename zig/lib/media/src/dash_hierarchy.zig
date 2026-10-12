@@ -207,32 +207,28 @@ fn owned(a: std.mem.Allocator, arena: std.mem.Allocator, parsed: hls.Playlist, b
     result.owned_uris = try values.toOwnedSlice(a);
     return result;
 }
-pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limits, now: ?i64, selection: Selection, comptime parse_one: anytype) !hls.Playlist {
-    var tree = try xml.Tree.init(a, bytes, .{ .max_bytes = limits.max_bytes });
-    defer tree.deinit();
-    if (!(try named(tree, 0, "MPD"))) return error.MalformedDash;
-    for (tree.nodes, 0..) |node, index| for (node.attributes) |attribute| {
-        if (std.mem.eql(u8, attribute.name, "xsi:schemaLocation") and !std.mem.eql(u8, try tree.namespace(index, attribute.name, true), "http://www.w3.org/2001/XMLSchema-instance")) return error.UnsupportedDash;
-    };
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-    var period: ?usize = null;
-    var periods: usize = 0;
-    var next = tree.nodes[0].first_child;
-    while (next) |index| : (next = tree.nodes[index].next_sibling) if (try named(tree, index, "Period")) {
-        periods += 1;
-        if (matches(tree.nodes[index], selection.period_id)) {
-            if (period != null and selection.period_id != null) return error.DashSelectionAmbiguous;
-            if (period == null) period = index;
-        }
-    };
-    if (periods > 1 and selection.period_id == null) return error.UnsupportedDash;
-    const p = period orelse return error.DashSelectionNotFound;
+const PeriodPlan = struct { node: usize, start_ms: ?u64, duration_ms: ?u64, next_start_ms: ?u64 = null, next_identity: ?[32]u8 = null };
+const Planned = struct { playlist: hls.Playlist, period: hls.DashPeriod, planning_bytes: usize };
+fn periodIdentity(a: std.mem.Allocator, node: xml.Node, start_ms: u64) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    if (node.get("id")) |id| {
+        hash.update("named/");
+        hash.update(id);
+    } else {
+        hash.update("anonymous/");
+        hash.update(try std.fmt.allocPrint(a, "{d}", .{start_ms}));
+    }
+    return hash.finalResult();
+}
+fn durationText(a: std.mem.Allocator, milliseconds: u64) ![]const u8 {
+    return std.fmt.allocPrint(a, "PT{d}.{d:0>3}S", .{ milliseconds / 1000, milliseconds % 1000 });
+}
+fn planPeriod(a: std.mem.Allocator, scratch: std.mem.Allocator, tree: xml.Tree, plan: PeriodPlan, limits: hls.Limits, now: ?i64, selection: Selection, comptime parse_one: anytype) !Planned {
+    const p = plan.node;
     var adaptation: ?usize = null;
     var representation: ?usize = null;
     var selected_bandwidth: u64 = 0;
-    next = tree.nodes[p].first_child;
+    var next = tree.nodes[p].first_child;
     while (next) |index| : (next = tree.nodes[index].next_sibling) {
         if (!(try named(tree, index, "AdaptationSet")) or !matches(tree.nodes[index], selection.adaptation_id) or !video(tree.nodes[index], tree.nodes[index])) continue;
         var child = tree.nodes[index].first_child;
@@ -267,7 +263,13 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limits, now: ?
     try output.appendSlice(scratch, "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"");
     try attrs(scratch, &output, tree.nodes[0].attributes);
     try output.append(scratch, '>');
-    try start(scratch, &output, "Period", tree.nodes[p].attributes);
+    var period_attributes: std.ArrayList(xml.Attribute) = .empty;
+    for (tree.nodes[p].attributes) |attribute| {
+        if (!std.mem.eql(u8, attribute.name, "start") and !std.mem.eql(u8, attribute.name, "duration")) try period_attributes.append(scratch, attribute);
+    }
+    try period_attributes.append(scratch, .{ .name = "start", .value = try durationText(scratch, plan.start_ms.?) });
+    if (plan.duration_ms) |duration| try period_attributes.append(scratch, .{ .name = "duration", .value = try durationText(scratch, duration) });
+    try start(scratch, &output, "Period", period_attributes.items);
     try start(scratch, &output, "AdaptationSet", tree.nodes[levels[2]].attributes);
     try start(scratch, &output, "Representation", tree.nodes[levels[3]].attributes);
     try start(scratch, &output, addressing.kind orelse return error.MalformedDash, addressing.attributes.items);
@@ -280,7 +282,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limits, now: ?
     try output.appendSlice(scratch, "</");
     try output.appendSlice(scratch, addressing.kind.?);
     try output.appendSlice(scratch, "></Representation></AdaptationSet></Period></MPD>");
-    if (output.items.len > limits.max_bytes) return error.ResourceLimitExceeded;
+    if (output.items.len > limits.max_bytes or output.items.len > limits.max_planning_bytes) return error.ResourceLimitExceeded;
     var parsed = try parse_one(a, scratch, output.items, limits, now);
     defer parsed.deinit();
     // A reordered representation list or a changed codec/configuration cannot
@@ -304,6 +306,112 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limits, now: ?
             break;
         };
     }
-    parsed.timing_identity = identity.finalResult();
-    return owned(a, scratch, parsed, base, limits);
+    const period_identity = try periodIdentity(scratch, tree.nodes[p], plan.start_ms.?);
+    const metadata = hls.DashPeriod{ .identity = period_identity, .configuration = identity.finalResult(), .start_ms = plan.start_ms.?, .duration_ms = plan.duration_ms, .next_start_ms = plan.next_start_ms, .next_identity = plan.next_identity };
+    for (parsed.segments, 0..) |*segment, index| {
+        segment.dash.?.period = metadata;
+        if (parsed.ended and plan.duration_ms == null and index + 1 == parsed.segments.len) segment.dash.?.final = true;
+    }
+    return .{ .playlist = try owned(a, scratch, parsed, base, limits), .period = metadata, .planning_bytes = output.items.len };
+}
+
+pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: hls.Limits, now: ?i64, selection: Selection, comptime parse_one: anytype, comptime elapsed: anytype, comptime utc: anytype) !hls.Playlist {
+    var tree = try xml.Tree.init(a, bytes, .{ .max_bytes = limits.max_bytes });
+    defer tree.deinit();
+    if (!(try named(tree, 0, "MPD"))) return error.MalformedDash;
+    for (tree.nodes, 0..) |node, index| for (node.attributes) |attribute| {
+        if (std.mem.eql(u8, attribute.name, "xsi:schemaLocation") and !std.mem.eql(u8, try tree.namespace(index, attribute.name, true), "http://www.w3.org/2001/XMLSchema-instance")) return error.UnsupportedDash;
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var plans: std.ArrayList(PeriodPlan) = .empty;
+    var next = tree.nodes[0].first_child;
+    var ids: std.StringHashMap(void) = .init(scratch);
+    while (next) |index| : (next = tree.nodes[index].next_sibling) if (try named(tree, index, "Period")) {
+        if (plans.items.len >= limits.max_periods) return error.ResourceLimitExceeded;
+        const node = tree.nodes[index];
+        if (node.get("id")) |id| {
+            const entry = try ids.getOrPut(id);
+            if (entry.found_existing) return error.DashSelectionAmbiguous;
+        }
+        try plans.append(scratch, .{ .node = index, .start_ms = if (node.get("start")) |value| try elapsed(value) else null, .duration_ms = if (node.get("duration")) |value| try elapsed(value) else null });
+    };
+    if (plans.items.len == 0) return error.DashSelectionNotFound;
+    const presentation_duration = if (tree.nodes[0].get("mediaPresentationDuration")) |value| try elapsed(value) else null;
+    if (plans.items[0].start_ms == null) plans.items[0].start_ms = 0;
+    // Each start follows a known preceding duration, or a following explicit
+    // start determines the preceding duration. Never infer from segment counts.
+    for (plans.items, 0..) |*plan, index| {
+        if (index != 0 and plan.start_ms == null) {
+            const previous = plans.items[index - 1];
+            plan.start_ms = std.math.add(u64, previous.start_ms.?, previous.duration_ms orelse return error.MalformedDash) catch return error.MalformedDash;
+        }
+        if (plan.duration_ms == null) {
+            if (index + 1 < plans.items.len) {
+                if (plans.items[index + 1].start_ms) |following| {
+                    if (following <= plan.start_ms.?) return error.MalformedDash;
+                    plan.duration_ms = following - plan.start_ms.?;
+                } else return error.MalformedDash;
+            } else if (presentation_duration) |end| {
+                if (end <= plan.start_ms.?) return error.MalformedDash;
+                plan.duration_ms = end - plan.start_ms.?;
+            }
+        }
+        if (plan.duration_ms) |duration| {
+            if (duration == 0) return error.MalformedDash;
+            const end = std.math.add(u64, plan.start_ms.?, duration) catch return error.MalformedDash;
+            if (presentation_duration != null and end > presentation_duration.?) return error.MalformedDash;
+            if (index + 1 < plans.items.len and plans.items[index + 1].start_ms != null and end > plans.items[index + 1].start_ms.?) return error.MalformedDash;
+        }
+    }
+    for (plans.items, 0..) |*plan, index| if (index + 1 < plans.items.len) {
+        const following = plans.items[index + 1];
+        plan.next_start_ms = following.start_ms.?;
+        plan.next_identity = try periodIdentity(scratch, tree.nodes[following.node], following.start_ms.?);
+    };
+    var planned: std.ArrayList(Planned) = .empty;
+    defer for (planned.items) |*item| item.playlist.deinit();
+    var all_segments: std.ArrayList(hls.Segment) = .empty;
+    var all_periods: std.ArrayList(hls.DashPeriod) = .empty;
+    var target: u64 = 1;
+    var reload: ?f64 = null;
+    var uri_bytes: usize = 0;
+    var planning_bytes: usize = 0;
+    const dynamic = std.mem.eql(u8, tree.nodes[0].get("type") orelse "static", "dynamic");
+    for (plans.items) |plan| {
+        if (!matches(tree.nodes[plan.node], selection.period_id)) continue;
+        var remaining = limits;
+        remaining.max_segments -= all_segments.items.len;
+        remaining.max_planning_bytes -= planning_bytes;
+        // Canonical XML and inherited addressing can repeat large MPD-level
+        // attributes. Reclaim each period's temporary storage immediately.
+        var period_arena = std.heap.ArenaAllocator.init(a);
+        defer period_arena.deinit();
+        var item = try planPeriod(a, period_arena.allocator(), tree, plan, remaining, now, selection, parse_one);
+        planned.append(scratch, item) catch |err| {
+            item.playlist.deinit();
+            return err;
+        };
+        for (item.playlist.owned_uris) |uri| {
+            uri_bytes = std.math.add(usize, uri_bytes, uri.len) catch return error.ResourceLimitExceeded;
+            if (uri_bytes > limits.max_bytes) return error.ResourceLimitExceeded;
+        }
+        planning_bytes += item.planning_bytes;
+        try all_segments.appendSlice(scratch, item.playlist.segments);
+        try all_periods.append(scratch, item.period);
+        target = @max(target, item.playlist.target_duration_seconds);
+        reload = item.playlist.reload_after_seconds;
+    }
+    if (planned.items.len == 0) return error.DashSelectionNotFound;
+    var root_identity = std.crypto.hash.sha2.Sha256.init(.{});
+    root_identity.update("dash-presentation-v2/");
+    root_identity.update(try std.fmt.allocPrint(scratch, "{d}", .{if (tree.nodes[0].get("availabilityStartTime")) |value| try utc(value) else @as(i64, -1)}));
+    root_identity.update(&.{0});
+    root_identity.update(tree.nodes[0].get("id") orelse "");
+    const joined = hls.Playlist{ .allocator = a, .segments = all_segments.items, .target_duration_seconds = target, .ended = !dynamic, .reload_after_seconds = reload, .timing_identity = root_identity.finalResult(), .dash_window_start_ms = planned.items[0].playlist.dash_window_start_ms };
+    var result = try owned(a, scratch, joined, "", limits);
+    errdefer result.deinit();
+    result.dash_periods = try a.dupe(hls.DashPeriod, all_periods.items);
+    return result;
 }

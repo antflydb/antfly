@@ -18,12 +18,18 @@ const std = @import("std");
 const hls = @import("hls.zig");
 const network = @import("http_stream.zig");
 const live = @import("live_mp4.zig");
+const dash_cursor = @import("dash_cursor.zig");
 pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{} };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range);
 }
 fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds;
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
+}
+
+fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
+    if (left.dash != null and right.dash != null) return dash_cursor.order(left, right);
+    return std.math.order(left.sequence, right.sequence);
 }
 
 /// Single consumer, borrowing a native HTTP adapter. reload() performs one
@@ -46,6 +52,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         playlist: ?hls.Playlist = null,
         ingest: ?live.Ingest = null,
         next_sequence: ?u64 = null,
+        dash_position: ?dash_cursor.Cursor = null,
+        active_dash_period: ?[32]u8 = null,
         active_initialization: ?hls.Initialization = null,
         active_discontinuity_sequence: ?u64 = null,
         pub fn init(a: std.mem.Allocator, transport: *network.Adapter(http), url: []const u8, options: ReaderOptions) !Self {
@@ -79,22 +87,32 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             if (self.playlist) |previous| {
                 if (!std.meta.eql(parsed.timing_identity, previous.timing_identity)) return error.SourceVersionChanged;
                 if (!@hasDecl(manifest_parser, "parseAt") and parsed.target_duration_seconds != previous.target_duration_seconds) return error.SourceVersionChanged;
-                // Both arrays have consecutive sequence numbers. Compare the
-                // overlap in linear time, checking cancellation during reload.
+                if (parsed.dash_periods.len != 0 or previous.dash_periods.len != 0) {
+                    var periods: std.AutoHashMap([32]u8, hls.DashPeriod) = .init(self.allocator);
+                    defer periods.deinit();
+                    for (previous.dash_periods) |period| try periods.put(period.identity, period);
+                    for (parsed.dash_periods) |period| if (periods.get(period.identity)) |old| {
+                        if (!dash_cursor.compatible(old, period)) return error.SourceVersionChanged;
+                    };
+                }
+                // DASH orders by stable period start and period-local sequence;
+                // HLS retains its consecutive global media sequence.
                 var old_index: usize = 0;
                 for (parsed.segments) |new| {
                     try self.transport.control.check();
-                    while (old_index < previous.segments.len and previous.segments[old_index].sequence < new.sequence) old_index += 1;
+                    while (old_index < previous.segments.len and segmentOrder(previous.segments[old_index], new) == .lt) old_index += 1;
                     if (old_index < previous.segments.len) {
                         const old = previous.segments[old_index];
-                        if (new.sequence == old.sequence and !sameSegment(new, old)) return error.SourceVersionChanged;
+                        if (segmentOrder(new, old) == .eq and !sameSegment(old, new)) return error.SourceVersionChanged;
                     }
                 }
                 if (previous.ended and !parsed.ended) return error.SourceVersionChanged;
                 if (previous.ended and (previous.segments.len != parsed.segments.len or
                     (previous.segments.len != 0 and previous.segments[0].sequence != parsed.segments[0].sequence))) return error.SourceVersionChanged;
             }
-            if (self.next_sequence) |expected_sequence| {
+            if (self.dash_position) |position| {
+                _ = try position.select(parsed);
+            } else if (self.next_sequence) |expected_sequence| {
                 if (parsed.segments.len != 0) {
                     const first = parsed.segments[0].sequence;
                     const last = parsed.segments[parsed.segments.len - 1].sequence;
@@ -106,12 +124,17 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             if (self.manifest) |*previous| previous.deinit();
             self.playlist = parsed;
             self.manifest = body;
-            if (self.next_sequence == null and parsed.segments.len != 0) self.next_sequence = parsed.segments[0].sequence;
+            if (self.dash_position) |*position| position.refresh(parsed);
+            if (self.next_sequence == null and parsed.segments.len != 0) {
+                self.next_sequence = parsed.segments[0].sequence;
+                if (parsed.segments[0].dash != null) self.dash_position = dash_cursor.Cursor.initial(parsed.segments[0]);
+            }
         }
         pub fn ended(self: *const Self) bool {
             const playlist = self.playlist orelse return false;
             if (!playlist.ended) return false;
             if (playlist.segments.len == 0) return true;
+            if (self.dash_position) |position| return (position.select(playlist) catch return false) == null;
             return (self.next_sequence orelse return false) > playlist.segments[playlist.segments.len - 1].sequence;
         }
         /// Caller-visible polling delay; no blocking sleeper is hidden in ingest.
@@ -120,22 +143,29 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             const target = if (self.playlist) |playlist| playlist.target_duration_seconds else 1;
             return @as(f64, @floatFromInt(target)) * (if (unchanged) @as(f64, 0.5) else 1.0);
         }
+        fn commitCursor(self: *Self, item: hls.Segment) void {
+            self.next_sequence = item.sequence + 1;
+            if (self.dash_position) |*position| position.consumed(item);
+        }
         pub fn next(self: *Self) !?live.Segment {
             try self.transport.control.check();
             const playlist = self.playlist orelse return error.MediaPlaylistRequired;
-            const sequence = self.next_sequence orelse return null;
-            const item: hls.Segment = blk: {
+            const item: hls.Segment = if (self.dash_position) |position|
+                playlist.segments[(try position.select(playlist)) orelse return null]
+            else blk: {
+                const sequence = self.next_sequence orelse return null;
                 for (playlist.segments) |segment| if (segment.sequence == sequence) break :blk segment;
                 return null;
             };
             // Failed snapshot allocation/validation retains pending input. Retry
             // that commit before any fetch; never append the same object twice.
             if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) {
-                const result = try ingest.finishSegment();
-                self.next_sequence = sequence + 1;
+                var result = try ingest.finishSegment();
+                result.dash_timing = item.dash;
+                self.commitCursor(item);
                 return result;
             };
-            const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence else true;
+            const needs_initialization = if (self.active_initialization) |active| !sameInitialization(active, item.initialization) or self.active_discontinuity_sequence.? != item.discontinuity_sequence or (if (item.dash) |timing| !std.meta.eql(self.active_dash_period, @as(?[32]u8, timing.period.identity)) else false) else true;
             if (needs_initialization) {
                 var initialization = try self.transport.fetch(self.url, item.initialization.uri, item.initialization.range, self.options.ingest.stream.max_bytes);
                 defer initialization.deinit();
@@ -152,12 +182,14 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 if (self.active_initialization) |previous| self.allocator.free(previous.uri);
                 self.active_initialization = .{ .uri = owned_uri, .range = item.initialization.range };
                 self.active_discontinuity_sequence = item.discontinuity_sequence;
+                self.active_dash_period = if (item.dash) |timing| timing.period.identity else null;
             }
             var media = try self.transport.fetch(self.url, item.uri, item.range, self.options.ingest.stream.max_bytes);
             defer media.deinit();
             try self.ingest.?.push(media.bytes);
-            const result = try self.ingest.?.finishSegment();
-            self.next_sequence = sequence + 1;
+            var result = try self.ingest.?.finishSegment();
+            result.dash_timing = item.dash;
+            self.commitCursor(item);
             return result;
         }
     };
@@ -344,4 +376,148 @@ test "live DASH inherited BaseURL keeps authenticated origin pinned and retries 
     defer result.deinit();
     try std.testing.expect(clean.ended());
     try std.testing.expectEqual(@as(usize, 0), result.epoch);
+}
+const dash_period_one = "<Period id='one' start='PT0S' duration='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='one/seg-$Number$.m4s'/></Representation></AdaptationSet></Period>";
+const dash_period_two = "<Period id='two' start='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two/seg-$Number$.m4s'/></Representation></AdaptationSet></Period>";
+const dash_dynamic_open = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z' timeShiftBufferDepth='PT4S'>";
+const DashTestClock = struct {
+    milliseconds: i64,
+    fn now(raw: ?*anyopaque) i64 {
+        return @as(*@This(), @ptrCast(@alignCast(raw.?))).milliseconds;
+    }
+};
+test "DASH period transitions reset decoder epochs with repeated init URI and local numbering" {
+    const a = std.testing.allocator;
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'>" ++ dash_period_one ++ "<Period id='two' start='PT4S' duration='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two/seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    var client = FakeHttp.Client{ .manifest = manifest };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var lease = try first.reader.readPacket(0);
+    defer lease.deinit();
+    const retained = try a.dupe(u8, lease.bytes);
+    defer a.free(retained);
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, reader.next());
+    try std.testing.expectEqual(@as(u64, 3), reader.next_sequence.?);
+    client.fail_media = false;
+    var third = (try reader.next()).?;
+    defer third.deinit();
+    try std.testing.expectEqual(@as(usize, 1), third.epoch);
+    try std.testing.expectEqual(@as(u64, 4000), third.dash_timing.?.period.start_ms);
+    try std.testing.expectEqual(@as(u64, 0), third.dash_timing.?.start_ticks);
+    var fourth = (try reader.next()).?;
+    defer fourth.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fourth.epoch);
+    try std.testing.expect(reader.ended());
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectEqualSlices(u8, retained, lease.bytes);
+    try std.testing.expectEqual(@as(usize, 8), client.calls);
+}
+test "live DASH retains learned period endings across removal and rejects skipped pending media" {
+    const a = std.testing.allocator;
+    const initial = dash_dynamic_open ++ dash_period_one ++ "</MPD>";
+    const unbounded = try std.mem.replaceOwned(u8, a, initial, " duration='PT4S'", "");
+    defer a.free(unbounded);
+    const appended = dash_dynamic_open ++ dash_period_one ++ dash_period_two ++ "</MPD>";
+    const dropped = dash_dynamic_open ++ dash_period_two ++ "</MPD>";
+    var clock = DashTestClock{ .milliseconds = 4000 };
+    var client = FakeHttp.Client{ .manifest = unbounded };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now = DashTestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expect(!reader.dash_position.?.last.?.finishesPeriod());
+    client.manifest = appended;
+    clock.milliseconds = 6000;
+    try reader.reload();
+    try std.testing.expect(reader.dash_position.?.last.?.finishesPeriod());
+    client.manifest = dropped;
+    try reader.reload();
+    var next_period = (try reader.next()).?;
+    defer next_period.deinit();
+    try std.testing.expectEqual(@as(usize, 1), next_period.epoch);
+    try std.testing.expectEqual(@as(u64, 4000), next_period.dash_timing.?.period.start_ms);
+    try std.testing.expect((try reader.next()) == null);
+    // A separate consumer still has period one's second segment pending.
+    client.manifest = initial;
+    clock.milliseconds = 4000;
+    var pending = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, reader.options);
+    defer pending.deinit();
+    try pending.reload();
+    var pending_first = (try pending.next()).?;
+    defer pending_first.deinit();
+    client.manifest = dropped;
+    clock.milliseconds = 6000;
+    try std.testing.expectError(error.MediaStreamGap, pending.reload());
+    try std.testing.expectEqual(@as(u64, 2), pending.next_sequence.?);
+    client.manifest = appended;
+    const changed = try std.mem.replaceOwned(u8, a, appended, "id='v'", "id='changed'");
+    defer a.free(changed);
+    client.manifest = changed;
+    try std.testing.expectError(error.SourceVersionChanged, pending.reload());
+    client.manifest = appended;
+    try pending.reload();
+    var pending_second = (try pending.next()).?;
+    defer pending_second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pending_second.epoch);
+}
+test "live DASH waits for incomplete periods and rejects an empty expired pending window" {
+    const a = std.testing.allocator;
+    var clock = DashTestClock{ .milliseconds = 2000 };
+    var client = FakeHttp.Client{ .manifest = dash_dynamic_open ++ dash_period_one ++ dash_period_two ++ "</MPD>" };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now = DashTestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    try std.testing.expect((try reader.next()) == null);
+    try reader.reload();
+    try std.testing.expect((try reader.next()) == null);
+    const equivalent = try std.mem.replaceOwned(u8, a, client.manifest, "00:00:00Z", "00:00:00.000Z");
+    defer a.free(equivalent);
+    client.manifest = equivalent;
+    try reader.reload();
+    // Period one remains in the MPD, but every available reference expired.
+    client.manifest = dash_dynamic_open ++ dash_period_one ++ "</MPD>";
+    clock.milliseconds = 20000;
+    try std.testing.expectError(error.SourceVersionChanged, reader.reload());
+    // Keep the previously announced successor while all media has expired.
+    client.manifest = dash_dynamic_open ++ dash_period_one ++ "<Period id='two' start='PT4S' duration='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two/seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    try std.testing.expectError(error.MediaStreamGap, reader.reload());
+    try std.testing.expectEqual(@as(u64, 2), reader.next_sequence.?);
+}
+fn dashPeriodAllocationRun(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    var clock = DashTestClock{ .milliseconds = 4000 };
+    var client = FakeHttp.Client{ .manifest = dash_dynamic_open ++ dash_period_one ++ "</MPD>" };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now = DashTestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    client.manifest = dash_dynamic_open ++ dash_period_one ++ dash_period_two ++ "</MPD>";
+    clock.milliseconds = 6000;
+    try reader.reload();
+    var transition = (try reader.next()).?;
+    defer transition.deinit();
+    try std.testing.expectEqual(@as(usize, 1), transition.epoch);
+}
+test "live DASH reload and period reconfiguration release every failing allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dashPeriodAllocationRun, .{});
 }

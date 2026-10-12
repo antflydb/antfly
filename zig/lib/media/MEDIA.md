@@ -391,7 +391,7 @@ boundary. Segment ordinals, ingested bytes and shared admission remain cumulativ
 `max_reconfigurations` bounds repeated initialization changes. Inline initialization
 boxes inside pending media still require the transport to signal the boundary.
 The native HTTP HLS reader below signals these boundaries using map and
-discontinuity changes. DASH list/template snapshots reuse the same transport, including synchronized live availability filtering. Representation selection and inherited DASH addressing are implemented below; automatic multi-period playback remains work.
+discontinuity changes. DASH list/template snapshots reuse the same transport, including synchronized live availability filtering. Representation selection, inherited DASH addressing and multi-period/live cursor support are implemented below.
 
 The media suite covers a real changed SPS/96×48 initialization, invalid replacement
 rollback, replay after discontinuity, outstanding old leases and allocation failures.
@@ -435,7 +435,7 @@ low-latency HLS and broader DASH support remain open.
 ## DASH template and live ingestion
 
 `dash.parse` accepts bounded static XML MPDs and selects one MP4 video
-representation. `dash.parseAtWithSelection` and `dash_live.Options.selection`
+representation per selected Period. `dash.parseAtWithSelection` and `dash_live.Options.selection`
 select period/adaptation/representation IDs, a bandwidth ceiling and a BaseURL
 alternative. Without selectors the first eligible video representation is used;
 with a ceiling the highest eligible bandwidth is used. Audio adaptations are
@@ -444,8 +444,16 @@ inherit from Period through AdaptationSet to Representation; nearer values
 override inherited values. BaseURL resolution follows the MPD/Period/adaptation/
 representation hierarchy. Relative BaseURLs require `selection.manifest_url`;
 live readers supply the actual manifest URL and retain authenticated origin
-pinning. Multiple Periods currently require an explicit `period_id`; automatic
-multi-period playback and inferred preceding-period timing remain unfinished.
+pinning. Without `period_id`, selected video Periods are combined in presentation
+order. Period starts follow the preceding known duration; a following explicit
+start can establish the preceding duration. The final duration can come from
+`mediaPresentationDuration`. Ambiguous timing, duplicate Period IDs and overlaps
+fail explicitly. Explicitly announced gaps retain their period timing; missing
+unconsumed periods/segments report `MediaStreamGap`. `max_segments` bounds the
+combined available references; `max_periods` and `max_timeline_entries` separately
+bound metadata, including future/expired Periods. `max_planning_bytes` bounds
+total canonical planning work (16 MiB by default); each Period releases its
+temporary arena after copying independently owned references.
 Templates expand `$RepresentationID$`, `$Bandwidth$`, `$Number$`, `$Time$`,
 `$$` escapes and bounded `%0Nd` decimal widths. `SegmentTimeline` supports
 explicit/implicit starts, nonnegative repeats and `r=-1` bounded by the next
@@ -468,13 +476,25 @@ segment descriptors remain immutable; missing unconsumed sequences report gaps.
 
 `dash_live.Reader(httpx)` reuses authenticated origin-pinned HTTP, exact ranges,
 shared admission, transactional snapshot reload and retry-safe fMP4 ingestion.
-It returns owned segments and packet leases. Parser, allocation-failure, clock
+It returns owned segments and packet leases. Period-local segment numbers may
+restart; cursors use stable Period identity and timing rather than current XML
+indices or a renumbered snapshot. Unknown live end times can become known when
+a successor appears. A consumed cursor retains that learned boundary after the
+old Period disappears; changing published configuration or an announced successor
+fails. Incomplete future segments wait; expired pending references fail even when
+the refreshed available window is empty. Every Period transition reconfigures the
+decoder epoch, including transitions with an unchanged initialization URI.
+
+Returned `live_mp4.Segment.dash_timing` exposes the Period boundary and sample/
+presentation mapping. `presentationStart()`/`presentationEnd()` return exact
+rational milliseconds (`numerator`/`denominator`); packet timestamps retain the
+native track clock. Consumers can apply Period clipping using `duration_ms`.
+Parser, allocation-failure, clock
 advancement, retry, gap and production authenticated HTTP tests cover these paths.
 It is a library API; grouped model requests still accept owned MP4/MOV bytes.
 
 This is a declared subset of [DASH addressing and timing](https://dashif.org/Guidelines-TimingModel/).
-Automatic multi-period playback, nonzero availability offsets, incomplete
-low-latency segments, UTCTiming fetching, MPD Patch, DRM, EssentialProperty,
+Nonzero availability offsets, incomplete low-latency segments, UTCTiming fetching, MPD Patch, DRM, EssentialProperty,
 SegmentBase and unsupported attributes fail explicitly. A bounded native XML
 tree supports namespace prefixes, comments, CDATA and predefined/numeric
 entities; DTDs, external/custom entities and invalid namespace bindings fail.

@@ -17,6 +17,42 @@
 const std = @import("std");
 pub const Range = struct { offset: u64, length: u64 };
 pub const Initialization = struct { uri: []const u8, range: ?Range };
+/// DASH period identity survives live-window removal and XML reordering.
+pub const DashPeriod = struct {
+    identity: [32]u8 = @splat(0),
+    configuration: [32]u8 = @splat(0),
+    start_ms: u64 = 0,
+    duration_ms: ?u64 = null,
+    next_start_ms: ?u64 = null,
+    next_identity: ?[32]u8 = null,
+};
+pub const DashTiming = struct {
+    period: DashPeriod = .{},
+    start_ticks: u64,
+    duration_ticks: u64,
+    timescale: u32,
+    presentation_offset: u64,
+    /// Explicit static lists can finish without an MPD period duration.
+    final: bool = false,
+    pub const Time = struct { numerator: i128, denominator: u32 };
+    /// Exact presentation milliseconds, avoiding float clock comparisons.
+    pub fn presentationStart(self: DashTiming) Time {
+        return .{ .numerator = @as(i128, self.period.start_ms) * self.timescale + (@as(i128, self.start_ticks) - self.presentation_offset) * 1000, .denominator = self.timescale };
+    }
+    pub fn presentationEnd(self: DashTiming) Time {
+        const start = self.presentationStart();
+        return .{ .numerator = start.numerator + @as(i128, self.duration_ticks) * 1000, .denominator = start.denominator };
+    }
+    pub fn finishesPeriod(self: DashTiming) bool {
+        if (self.final) return true;
+        const duration = self.period.duration_ms orelse return false;
+        const end = (@as(i128, self.start_ticks) + self.duration_ticks - self.presentation_offset) * 1000;
+        return end >= @as(i128, duration) * self.timescale;
+    }
+    pub fn startsPeriod(self: DashTiming) bool {
+        return self.start_ticks <= self.presentation_offset and @as(u128, self.start_ticks) + self.duration_ticks > self.presentation_offset;
+    }
+};
 pub const Segment = struct {
     uri: []const u8,
     range: ?Range,
@@ -25,8 +61,16 @@ pub const Segment = struct {
     discontinuity_sequence: u64,
     duration_seconds: f64,
     discontinuity: bool,
+    dash: ?DashTiming = null,
 };
-pub const Limits = struct { max_bytes: usize = 1024 * 1024, max_segments: usize = 4096, max_uri_bytes: usize = 4096 };
+pub const Limits = struct {
+    max_bytes: usize = 1024 * 1024,
+    max_segments: usize = 4096,
+    max_uri_bytes: usize = 4096,
+    max_periods: usize = 4096,
+    max_timeline_entries: usize = 4096,
+    max_planning_bytes: usize = 16 * 1024 * 1024,
+};
 pub const Playlist = struct {
     allocator: std.mem.Allocator,
     segments: []Segment,
@@ -34,6 +78,8 @@ pub const Playlist = struct {
     ended: bool,
     timing_identity: ?[32]u8 = null,
     reload_after_seconds: ?f64 = null,
+    dash_periods: []const DashPeriod = &.{},
+    dash_window_start_ms: ?i128 = null,
     /// Playlist-owned manifest references. HLS references borrow its input;
     /// DASH copies both explicit and expanded references into this owner.
     owned_uris: []const []u8 = &.{},
@@ -41,6 +87,7 @@ pub const Playlist = struct {
         for (self.owned_uris) |owned| self.allocator.free(owned);
         self.allocator.free(self.owned_uris);
         self.allocator.free(self.segments);
+        self.allocator.free(self.dash_periods);
         self.* = undefined;
     }
 };

@@ -1247,6 +1247,11 @@ stable across reloads, and transport failures preserve the next sequence.
 
 This extends the native streaming library rather than changing the pretrained
 model's rendering recipe. Automatic multi-period playback and stable live
-period cursors remain implementation work, along with broader HLS coverage.
+period cursors now preserve inferred timing, numbering resets, announced gaps
+and pending references as earlier Periods disappear. Decoder epochs change at
+Period boundaries even when the initialization URI is unchanged; held packet
+leases remain valid. Returned segment metadata supplies exact rational
+presentation mapping while packet timestamps retain the native track clock.
+Broader HLS coverage remains implementation work.
 See [MEDIA.md](../media/MEDIA.md#dash-template-and-live-ingestion) for selection
 options, timing requirements and unsupported addressing features.

@@ -36,6 +36,9 @@ pub const Segment = struct {
     epoch: usize,
     identity: []u8,
     identity_reservation: admission.Token,
+    /// DASH presentation mapping; packet timestamps remain in the native track
+    /// clock. Period transitions expose a new decoder epoch independently.
+    dash_timing: ?@import("hls.zig").DashTiming = null,
     pub fn deinit(self: *Segment) void {
         const allocator = self.backing.input.allocator;
         self.reader.deinit();

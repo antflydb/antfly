@@ -178,3 +178,44 @@ test "production live DASH template uses synchronized clock and authenticated fM
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 3), transport.requests);
 }
+
+test "production DASH multiple periods authenticate repeated initialization and expose exact presentation mapping" {
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period id='one' duration='PT2S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='one-$Number$.m4s'/></Representation></AdaptationSet></Period><Period id='two' duration='PT2S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    const original = @embedFile("testdata/fragmented.mp4");
+    var offset: usize = 0;
+    while (offset < original.len) {
+        const box = try media.isobmff.readBox(original, offset);
+        if (box.typ == media.isobmff.fourcc("moof")) break;
+        offset = box.end;
+    }
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/dash/manifest.mpd", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
+        .{ .path = "/dash/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..offset] } },
+        .{ .path = "/dash/one-1.m4s", .assert_request = Verify.auth, .respond = .{ .body = original[offset..11206] } },
+        .{ .path = "/dash/two-1.m4s", .assert_request = Verify.auth, .respond = .{ .body = original[offset..11206] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/dash/manifest.mpd", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.dash_live.Reader(http).init(a, &transport, url, .{});
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 5 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var lease = try first.reader.readPacket(0);
+    defer lease.deinit();
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.epoch);
+    const time = second.dash_timing.?.presentationStart();
+    try std.testing.expectEqual(@as(i128, 2000), @divExact(time.numerator, time.denominator));
+    try std.testing.expect(lease.bytes.len != 0);
+    try std.testing.expect(reader.ended());
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 5), transport.requests);
+}
