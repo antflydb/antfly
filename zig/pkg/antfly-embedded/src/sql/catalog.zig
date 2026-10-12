@@ -157,6 +157,12 @@ pub const Condition = struct {
     column: []const u8,
     op: Op,
     value: std.json.Value = .null,
+    /// Exact statement-owned operand. `value` is its lossless compatibility
+    /// encoding for tuple bounds; typed consumers must retain this identity.
+    operand: ?@import("scalar.zig").Datum = null,
+    pub fn datum(self: Condition) @import("scalar.zig").Datum {
+        return self.operand orelse @import("scalar.zig").Datum.fromJson(self.value);
+    }
 };
 pub const Scan = struct {
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
@@ -422,6 +428,9 @@ pub const Cursor = struct {
     next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
     /// Borrow immutable filter evidence before any pull; false declines it.
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
+    /// Negotiate complete key spooling before building the filter. Absent
+    /// means Bloom/domain evidence suffices; do not spill unused exact tuples.
+    wants_exact_filter: ?*const fn (*anyopaque, []const @import("dynamic_filter.zig").Column) anyerror!bool = null,
     /// Split an unopened pinned scan into disjoint work for exact associative
     /// reducers. Providers may distribute row groups dynamically; child order
     /// is not source order. Children share the snapshot and close before their parent.
@@ -526,6 +535,11 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
+    /// Optional ownership transfer before the first pull. The provider proves
+    /// one state per final recipe key, with the exact recipe slots and limits.
+    /// A successful transfer leaves close responsible only for cursor resources.
+    /// Upper key predicates and FILTER adjustments must be absent for adoption.
+    take_final_groups: ?*const fn (*anyopaque) anyerror!?*@import("operators.zig").Grouped = null,
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
     close: *const fn (*anyopaque) void,

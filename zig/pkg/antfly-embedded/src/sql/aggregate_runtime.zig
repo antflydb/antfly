@@ -259,11 +259,22 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
     }
 }
 
-fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, table: catalog.Table) !bool {
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
-    const recipe = (try @import("aggregate_materialization.zig").fromBound(context.arena, table, bound.*)) orelse return false;
+    const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
+    const recipe = reuse.recipe;
     const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
     defer cursor.close(cursor.ptr);
+    if (bound.input.predicate == null and for (bound.filters) |filter| {
+        if (filter != null) break false;
+    } else true) if (cursor.take_final_groups) |take| {
+        if (try take(cursor.ptr)) |final| {
+            grouped_owner.*.deinit();
+            grouped_owner.* = final;
+            return true;
+        }
+    };
+    const grouped = grouped_owner.*;
     var pages: usize = 0;
     var groups: usize = 0;
     while (true) {
@@ -275,9 +286,58 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
         pages += 1;
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
         groups += partials.len;
+        var merge_arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer merge_arena.deinit();
         for (partials) |partial| {
+            _ = merge_arena.reset(.free_all);
             if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
-            try grouped.importPartialMapped(partial.keys, partial.aggregates, partial.aggregate_slots, partial.ordinal);
+            const a = merge_arena.allocator();
+            const cells = try a.alloc(Datum, bound.input.columns.len);
+            @memset(cells, .{});
+            for (reuse.key_columns, partial.keys) |column, key| {
+                if (column >= cells.len) return error.InvalidSqlBackendResponse;
+                cells[column] = key;
+            }
+            if (!try bound.input.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
+            const partial_count = try @import("aggregate_partial.zig").partialCount(partial);
+            if (partial.aggregate_slots) |slots| {
+                if (slots.len != partial_count) return error.InvalidSqlBackendResponse;
+            } else if (partial_count != bound.specs.len) return error.InvalidSqlBackendResponse;
+            var typed: ?[]const operators.Aggregate = if (partial.state_reader) |reader| materialize: {
+                const states = try a.alloc(operators.Aggregate, reader.count);
+                for (states, 0..) |*state, index| {
+                    const slot = if (partial.aggregate_slots) |slots| slots[index] else index;
+                    if (slot >= bound.specs.len) return error.InvalidSqlBackendResponse;
+                    state.* = try @import("aggregate_partial.zig").read(a, partial, index, bound.specs[slot]);
+                }
+                break :materialize states;
+            } else partial.typed_states;
+            var adjusted: ?[]operators.Aggregate = null;
+            const aggregates: []Datum = if (typed != null) &.{} else try a.dupe(Datum, partial.aggregates);
+            for (0..partial_count) |i| {
+                const slot = if (partial.aggregate_slots) |slots| slots[i] else i;
+                if (slot >= bound.filters.len) return error.InvalidSqlBackendResponse;
+                if (bound.filters[slot]) |filter| {
+                    const test_value = try context.evaluate(a, bound.input.projections[filter].?, cells);
+                    if (!test_value.sql_null and test_value.value != .bool) return error.SqlTypeMismatch;
+                    if (test_value.sql_null or !test_value.value.bool) {
+                        const spec = bound.specs[slot];
+                        var empty = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+                        defer if (typed == null) empty.deinit();
+                        empty.distinct = spec.distinct;
+                        if (typed) |states| {
+                            if (adjusted == null) {
+                                adjusted = try a.dupe(operators.Aggregate, states);
+                                typed = adjusted.?;
+                            }
+                            adjusted.?[i] = empty;
+                        } else aggregates[i] = try @import("aggregate_partial.zig").cell(a, empty);
+                    }
+                }
+            }
+            if (typed) |states| {
+                try grouped.importTypedPartialMapped(partial.keys, states, partial.aggregate_slots, partial.ordinal);
+            } else try grouped.importPartialMapped(partial.keys, aggregates, partial.aggregate_slots, partial.ordinal);
         }
     }
     return true;
@@ -295,7 +355,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
-    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
+    var grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
     defer grouped.deinit();
     // Backends without an Io still support bounded in-memory execution. A
     // zero-byte manager rejects spill admission before touching the filesystem.
@@ -320,7 +380,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        var aggregate_loaded = try loadMaterialized(context, bound, grouped, table);
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table) else false;
+        collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
         } else true;

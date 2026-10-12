@@ -991,6 +991,18 @@ pub const TextProjectionBatchBuilder = struct {
         doc: TextProjectionSourceDoc,
         selected_field: ?[]const u8,
     ) !void {
+        return self.appendSourceDocForIndex(doc, selected_field, false);
+    }
+
+    /// Empty primary rows still belong to a complete default index. Retain
+    /// their identities for match_all, filters and sorting without inventing
+    /// postings. The catalog supplies this proof per source document.
+    pub fn appendSourceDocForIndex(
+        self: *TextProjectionBatchBuilder,
+        doc: TextProjectionSourceDoc,
+        selected_field: ?[]const u8,
+        retain_empty: bool,
+    ) !void {
         const has_selected_field = selected_field != null;
         const extraction_root = doc.typed_source orelse doc.root;
         const extracted = if (selected_field) |field|
@@ -999,7 +1011,7 @@ pub const TextProjectionBatchBuilder = struct {
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
-        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
+        if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         try self.text_docs.append(self.arena, .{
             .id = doc.key,
@@ -6891,4 +6903,22 @@ test "external lake mapped datetime projection sorts signed and wide instants" {
     try std.testing.expectEqual(@as(i128, -1), (try values.getDateTimeNs(0)).?);
     try std.testing.expectEqual(@as(i128, 0), (try values.getDateTimeNs(1)).?);
     try std.testing.expectEqual(@as(i128, 253402300799999999999), (try values.getDateTimeNs(2)).?);
+}
+
+test "default text projection retains empty primary identity without postings (#1095)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = (try buildTextProjectionSourceBatchFromWrites(arena, &.{.{ .key = "empty", .value = "{}" }})).docs[0];
+    var builder = TextProjectionBatchBuilder.init(arena, .{}, null, null);
+    defer builder.deinit();
+    try builder.appendSourceDocForIndex(source, null, true);
+    try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
+    try std.testing.expectEqualStrings("empty", builder.text_docs.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), builder.text_docs.items[0].text_fields.len);
+    // Partial and artifact projections retain their actual emitted population.
+    try builder.appendSourceDocForIndex(source, "body", false);
+    try builder.appendSourceDocForIndex(source, null, false);
+    try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
 }

@@ -1815,7 +1815,10 @@ pub fn executeFilter(
     defer all_ids.deinit(alloc);
 
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
@@ -1850,7 +1853,10 @@ pub fn executeFilterBitmap(
 
     var doc_offset: u32 = 0;
     var has_result = false;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1886,7 +1892,10 @@ pub fn countFilterIntersection(
 ) !usize {
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1919,7 +1928,8 @@ pub fn countFilter(
 ) !usize {
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var seg = &snap.segments[segment_idx];
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
         if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
             seg.shared.lockDeletionShared();
@@ -1930,6 +1940,9 @@ pub fn countFilter(
                 continue;
             }
         }
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 

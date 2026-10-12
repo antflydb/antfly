@@ -3989,6 +3989,7 @@ pub const ApiHttpServer = struct {
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
     lake_text_corpora: @import("lake_index_native_text_cache.zig").Cache = .{},
+    lake_navigation_warming: @import("lake_index_navigation_warming.zig").Cache = .{},
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -4001,6 +4002,7 @@ pub const ApiHttpServer = struct {
         lake_range_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.Stats = .{},
         lake_disk_cache: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats = null,
         lake_query: @import("lake_query_metrics.zig").Stats = .{},
+        lake_navigation_warming: @import("lake_index_navigation_warming.zig").Stats = .{},
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4307,6 +4309,7 @@ pub const ApiHttpServer = struct {
             .lake_range_cache = self.lake_read_cache.snapshot(),
             .lake_disk_cache = self.lake_read_cache.persistentStats(),
             .lake_query = self.lake_query_metrics.snapshot(),
+            .lake_navigation_warming = self.lake_navigation_warming.snapshot(),
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
@@ -16452,6 +16455,11 @@ pub const ApiHttpServer = struct {
             fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
                 const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
                 _ = try server.source.replaceTableDefinitionStamped(before, after);
+                // Publication is authoritative before acquiring its warmup
+                // reader lease; no future generation is pinned prematurely.
+                @import("lake_index_navigation_warming.zig").warmPublication(std.heap.smp_allocator, server, after) catch |err| {
+                    std.log.debug("native lake navigation warming deferred table={s} err={s}", .{ after.name, @errorName(err) });
+                };
             }
             fn canceled(raw: *const anyopaque) bool {
                 const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
@@ -16497,6 +16505,9 @@ pub const ApiHttpServer = struct {
             }
         }
         try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
+            std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
+        };
         if (ingested) return error.LakeIndexBuildInProgress;
     }
 

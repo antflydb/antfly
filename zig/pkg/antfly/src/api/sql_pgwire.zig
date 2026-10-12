@@ -1238,6 +1238,11 @@ const GuardedCatalog = struct {
             try self.guard.checkRead(self.table);
             return self.inner.count_rows.?(self.inner.ptr);
         }
+        fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            return self.inner.wants_exact_filter.?(self.inner.ptr, columns);
+        }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkRead(self.table);
@@ -1280,6 +1285,7 @@ const GuardedCatalog = struct {
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
+                .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,
                 .split_ordered = if (self.inner.split_ordered != null) splitOrdered else null,
             };

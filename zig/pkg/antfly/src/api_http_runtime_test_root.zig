@@ -88,3 +88,8 @@ test {
 test {
     _ = @import("api/lake_sql_integration_test.zig");
 }
+
+// Schema admission is part of the public lake SQL binding contract.
+test "external lake SQL schema cache discovery" {
+    _ = @import("api/sql_schema_cache.zig");
+}
