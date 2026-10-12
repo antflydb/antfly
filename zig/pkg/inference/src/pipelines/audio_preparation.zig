@@ -37,6 +37,7 @@ pub const Wave = struct {
     control: Control,
     kind: Kind,
     bounded: bounded_mod.BoundedAllocator,
+    allocation_exceeded_budget: bool = false,
     permit: ?@import("../backends/session.zig").RunPermit = null,
     thread: ?std.Thread = null,
     failure: ?anyerror = null,
@@ -55,11 +56,19 @@ pub const Wave = struct {
         return .{ .session = session, .clips = clips, .errors = errors, .control = control, .kind = kind, .bounded = .{ .backing = std.heap.smp_allocator, .limit = budget } };
     }
     pub fn allocator(self: *Wave) std.mem.Allocator {
+        self.bounded.failure_context = self;
+        self.bounded.allocation_failed = allocationFailed;
         return self.bounded.allocator();
+    }
+    fn allocationFailed(raw: ?*anyopaque, failure: bounded_mod.BoundedAllocator.AllocationFailure) void {
+        const self: *Wave = @ptrCast(@alignCast(raw.?));
+        // Unlike `denied`, this records the terminal allocation's cause;
+        // an earlier recoverable resize miss cannot hide a backing failure.
+        self.allocation_exceeded_budget = failure.kind == .declared_limit;
     }
     pub fn run(self: *Wave) void {
         self.prepare() catch |err| {
-            self.failure = if (err == error.OutOfMemory and self.bounded.denied) error.MemoryBudgetExceeded else err;
+            self.failure = if (err == error.OutOfMemory and self.allocation_exceeded_budget) error.MemoryBudgetExceeded else err;
         };
     }
     pub fn start(self: *Wave) bool {
@@ -109,7 +118,17 @@ pub const Wave = struct {
         if (self.kind == .gemma4) {
             for (self.clips, 0..) |clip, index| {
                 try self.control.check();
+                self.allocation_exceeded_budget = false;
                 self.gemma[self.retained] = (if (clip.pcm) |pcm| projector.prepareEmbeddingGemma2AudioPcm(self.allocator(), pcm) else projector.prepareEmbeddingGemma2Audio(self.allocator(), clip.bytes, clip.decode_options)) catch |err| {
+                    // Retained clips may occupy the space needed to decode the
+                    // next one. Finish this wave without consuming that clip;
+                    // the owner retries it after releasing the current wave.
+                    // A backing allocator failure still aborts immediately.
+                    if (err == error.OutOfMemory and self.allocation_exceeded_budget and self.retained > 0) {
+                        self.allocation_exceeded_budget = false;
+                        self.bounded.denied = false;
+                        break;
+                    }
                     try self.failItem(index, err);
                     self.consumed += 1;
                     continue;
@@ -262,4 +281,54 @@ test "audio preparation producer drains cancellation pressure and indexed codec 
     fail_fast.run();
     try std.testing.expectEqual(error.EmptyEmbeddingInput, fail_fast.failure.?);
     try std.testing.expectEqual(@as(usize, 0), fail_fast.bounded.live);
+}
+
+test "audio preparation Gemma4 splits bounded waves without consuming deferred clips or hiding allocation failures" {
+    const tensor = @import("../backends/tensor.zig");
+    const Mock = struct {
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.Unused;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, session: Session, clips: []const Clip) !void {
+            var errors: [3]?anyerror = @splat(null);
+            var offset: usize = 0;
+            while (offset < clips.len) {
+                var wave = Wave.init(session, clips[offset..], errors[offset..], .{}, .gemma4, 1024 * 1024);
+                wave.bounded.backing = a;
+                defer wave.deinit();
+                wave.run();
+                if (wave.failure) |err| return err;
+                // Every clip fits on its own; retaining one forces the next
+                // clip into a fresh wave. No input index or error is lost.
+                try std.testing.expectEqual(@as(usize, 1), wave.consumed);
+                try std.testing.expectEqual(@as(usize, 1), wave.retained);
+                try std.testing.expectEqual(@as(usize, 0), wave.indexes[0]);
+                try std.testing.expect(wave.gemma[0].tokenCount() > 0);
+                try std.testing.expect(!wave.bounded.denied);
+                offset += wave.consumed;
+            }
+            for (errors) |err| try std.testing.expect(err == null);
+        }
+    };
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close } };
+    const samples: [6400]f32 = @splat(0.1);
+    const bytes = try audio.wav.encodeInterleaved(std.testing.allocator, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer std.testing.allocator.free(bytes);
+    const clips = [_]Clip{
+        .{ .bytes = bytes },
+        .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } },
+        .{ .bytes = bytes },
+    };
+    try Runner.run(std.testing.allocator, session, &clips);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ session, &clips });
 }
