@@ -62,7 +62,9 @@ Run `make help` for the full list. Key targets:
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
-| `make zig-test` | Run the Zig test aggregate |
+| `make zig-test` | Run the Zig test aggregate (`make zig-<target>` runs any `zig/Makefile` target) |
+| `make tla-check` | Model-check the TLA+ specs (`make tla-<target>` runs any TLA+ target) |
+| `make gc` | Garbage-collect build caches across all worktrees |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
 | `make license-check` | Verify first-party license headers are present |
@@ -80,10 +82,11 @@ Run `make help` for the full list. Key targets:
 
 | Target | Description |
 |--------|-------------|
-| `make minikube-start` | Start Minikube with ingress, metrics, and registry |
-| `make minikube-deploy` | Build and deploy to Minikube |
-| `make minikube-status` | Show pods, services, and deployments |
+| `make minikube-start` | Start Minikube and deploy `devops/minikube` |
+| `make minikube-deploy` | Load the published `antfly` image and apply `devops/minikube` |
+| `make minikube-status` | Show Antfly pods, services, and StatefulSets |
 | `make minikube-restart` | Delete and recreate Minikube |
+| `make minikube-delete` | Delete the Minikube cluster |
 
 ## Running Locally
 
