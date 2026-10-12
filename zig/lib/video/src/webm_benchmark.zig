@@ -20,7 +20,7 @@ const video = @import("mod.zig");
 extern fn av_benchmark_device_create() ?*anyopaque;
 extern fn av_benchmark_device_destroy(*anyopaque) void;
 extern fn av_benchmark_peak_rss() u64;
-const Mode = enum { decode, cpu, metal, hash, dump, index, index_reconstruct, index_compare, replay_compare };
+const Mode = enum { decode, cpu, cpu_scalar, metal, hash, dump, index, index_reconstruct, index_compare, replay_compare };
 const Context = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -41,6 +41,7 @@ const Context = struct {
     native_upload_bytes: u64 = 0,
     device_bytes: u64 = 0,
     checksum: u64 = 0,
+    preparation_hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
     fn accept(self: *Context, frame: *const video.codecs.Frame) !void {
         self.decode_peak = @max(self.decode_peak, frame.decode_high_water);
         self.output_copy_bytes += frame.bytes.len;
@@ -66,7 +67,7 @@ const Context = struct {
             9 => .bt2020_ncl,
             else => return error.UnsupportedVideoColor,
         };
-        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .admission_pool = self.pool };
+        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .rgb_rounding = if (frame.width % 16 == 0) .q13_components else .q16_luma, .admission_pool = self.pool };
         const start = now(self.io);
         if (self.metal) |owner| {
             var prepared = try owner.submitHost(self.a, frame.host(), options, .{});
@@ -79,12 +80,14 @@ const Context = struct {
             self.native_upload_bytes += prepared.native_staging_bytes;
             self.device_bytes = @max(self.device_bytes, owner.deviceAllocatedBytes());
         } else {
-            const patches = try video.preparation.referenceHost(self.a, frame.host(), options, .{});
+            const patches = if (self.mode == .cpu_scalar) try video.preparation.referenceHostScalar(self.a, frame.host(), options, .{}) else try video.preparation.referenceHost(self.a, frame.host(), options, .{});
             defer self.a.free(patches);
             std.mem.doNotOptimizeAway(patches.ptr);
             self.checksum +%= @as(u32, @bitCast(patches[0]));
+            self.preparation_ns += now(self.io) - start;
+            self.preparation_hash.update(std.mem.sliceAsBytes(patches));
         }
-        self.preparation_ns += now(self.io) - start;
+        if (self.metal != null) self.preparation_ns += now(self.io) - start;
         self.prepared += 1;
     }
 };
@@ -178,7 +181,10 @@ pub fn main(init: std.process.Init) !void {
         const completed = now(init.io) - start;
         pictures = context.pictures;
         if (iteration > 0) samples[iteration - 1] = completed;
-        if (mode != .hash and mode != .dump) try writer.interface.print("{{\"kind\":\"iteration\",\"codec\":\"{s}\",\"backend\":\"{s}\",\"state\":\"{s}\",\"iteration\":{d},\"completed_ns\":{d},\"coded_packets\":{d},\"visible_pictures\":{d},\"prepared_pictures\":{d},\"preparation_ns\":{d},\"gpu_execution_ns\":{d},\"gpu_timed_commands\":{d},\"decode_live_peak_bytes\":{d},\"output_copy_bytes\":{d},\"vp8_reference_copy_bytes\":{?d},\"vp8_retained_reference_bytes\":{?d},\"device_allocated_bytes\":{d},\"process_peak_rss_bytes\":{d},\"coefficient_upload_bytes\":{d},\"native_upload_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(reader.track.codec), @tagName(mode), if (iteration == 0) "first-pass" else "warm", iteration, completed, reader.packets.len, context.pictures, context.prepared, context.preparation_ns, context.gpu_ns, context.gpu_timed_commands, context.decode_peak, context.output_copy_bytes, stats.reference_copy_bytes, stats.retained_reference_bytes, context.device_bytes, av_benchmark_peak_rss(), context.coefficient_upload_bytes, context.native_upload_bytes, context.checksum });
+        var patch_digest: [32]u8 = undefined;
+        context.preparation_hash.final(&patch_digest);
+        const patch_hex = std.fmt.bytesToHex(patch_digest, .lower);
+        if (mode != .hash and mode != .dump) try writer.interface.print("{{\"kind\":\"iteration\",\"codec\":\"{s}\",\"backend\":\"{s}\",\"state\":\"{s}\",\"iteration\":{d},\"completed_ns\":{d},\"coded_packets\":{d},\"visible_pictures\":{d},\"prepared_pictures\":{d},\"preparation_ns\":{d},\"gpu_execution_ns\":{d},\"gpu_timed_commands\":{d},\"decode_live_peak_bytes\":{d},\"output_copy_bytes\":{d},\"vp8_reference_copy_bytes\":{?d},\"vp8_retained_reference_bytes\":{?d},\"device_allocated_bytes\":{d},\"process_peak_rss_bytes\":{d},\"coefficient_upload_bytes\":{d},\"native_upload_bytes\":{d},\"checksum\":{d},\"cpu_prepared_sha256\":\"{s}\"}}\n", .{ @tagName(reader.track.codec), @tagName(mode), if (iteration == 0) "first-pass" else "warm", iteration, completed, reader.packets.len, context.pictures, context.prepared, context.preparation_ns, context.gpu_ns, context.gpu_timed_commands, context.decode_peak, context.output_copy_bytes, stats.reference_copy_bytes, stats.retained_reference_bytes, context.device_bytes, av_benchmark_peak_rss(), context.coefficient_upload_bytes, context.native_upload_bytes, context.checksum, patch_hex });
         try writer.interface.flush();
     }
     if (mode != .hash and mode != .dump) {

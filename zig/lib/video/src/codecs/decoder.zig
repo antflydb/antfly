@@ -276,3 +276,27 @@ pub const Session = struct {
         return self.decodeWebmBytes(reader, lease.bytes, packet.pts, packet.duration_ns);
     }
 };
+
+test "VP9 cancellation at a frame view boundary leaves the view valid until the next checkpoint" {
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    inline for (.{ @import("vp9/vp9_decodeframe.zig"), @import("vp9/vp9_decoder.zig") }) |core| {
+        var pool: core.BufferPool = .{};
+        var common = core.VP9_COMMON{ .buffer_pool = &pool, .new_fb_idx = 0 };
+        var owner = runtime.Owner{ .budget = .{ .backing = std.testing.allocator, .limit = 1024 }, .control = .{ .check_fn = Cancel.check }, .polls = 254 };
+        const scope = runtime.Scope.enter(&owner);
+        defer scope.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), core.antfly_codec_afz_vp9_failed());
+        try std.testing.expectEqual(@as(usize, 255), owner.polls);
+        const view = core.get_frame_new_buffer(&common);
+        try std.testing.expectEqual(@as(usize, 255), owner.polls);
+        try std.testing.expect(view != null);
+        view.*.render_width = 32;
+        try std.testing.expect(runtime.antfly_codec_afz_vp9_failed() != 0);
+        try std.testing.expectError(error.Cancelled, owner.result());
+        try std.testing.expectEqual(@as(c_int, 32), pool.frame_bufs[0].buf.render_width);
+    }
+}

@@ -97,3 +97,12 @@ samples and compare ordinals, PTS/duration, geometry, depth/chroma and colour
 metadata. Timings include selected hashing and completed decode, and exclude
 model projection/preparation. Packet counts and sequence bootstrap bytes are
 reported separately; shared-host timing does not establish capacity.
+
+
+`cpu` and `cpu_scalar` provide matched integer-RGB preparation runs. Both use
+the model's row-alignment RGB policy and the same geometry, decoding, sample
+selection and resize/patch code. The SIMD mode changes only RGB row arithmetic.
+`preparation_ns` excludes SHA256 verification; `completed_ns` includes it.
+`cpu_prepared_sha256` hashes every prepared F32 patch array in order, enabling
+exact full-output checks across modes. Metal does not populate a pixel hash
+(the empty hash does not imply GPU output verification).

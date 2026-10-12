@@ -913,3 +913,24 @@ so cached vectors cannot silently retain the older output policy. Pinned late
 window references remain unchanged and now pass on CPU, Metal and Linux ARM64,
 as do the ten existing sampling vectors and current resource/lifetime gates. Integer reference details are recorded by the fixture generator and
 [FFmpeg's RGB24 reference arithmetic](https://github.com/FFmpeg/FFmpeg/blob/n9.0.2/libswscale/yuv2rgb.c).
+
+
+### Portable integer RGB vectors
+
+CPU integer RGB preparation now processes eight pixels with Zig portable
+vectors for Q13/Q16 profiles, retaining scalar tails and fallback for rotation,
+HDR, higher depth and floating rounding. Planes retain explicit padded strides
+and monochrome/4:2:0/4:2:2/4:4:4 geometry. The scalar preparation entry point
+remains the numerical/benchmark oracle. Exact patch-array comparisons cover
+short rows, vector boundaries and tails, padded strides, all chroma layouts,
+matrices and ranges; SIMD RGB bytes also match independent Q16 fixtures.
+Matched ABBA `cpu`/`cpu_scalar` runs hash every prepared F32 byte equally.
+Four warm samples per mode/geometry show preparation medians lower by 26.9%
+at 480p and 29.0% at 1080p on this host; decoding dominates, so completed
+decode/preparation improves about 1.0% and 1.6%. Background load remains
+uncontrolled, and these observations do not establish production capacity.
+Producer-abandonment checks also exposed a VP9 getter that could poll
+cancellation after a caller guard and return null before dereference. Both
+frame-view helpers are now pure, with a discovered boundary regression that
+fails on the previous implementation. Final source-bound receipts are in
+`zig/lib/video/testdata/simd-validation`; broader non-CUDA work remains active.

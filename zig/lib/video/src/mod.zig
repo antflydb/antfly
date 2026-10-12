@@ -34,6 +34,7 @@ pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
 pub const sampling = @import("sampling.zig");
 test {
+    _ = codecs;
     _ = @import("codecs/test.zig");
     _ = webm_pictures;
     _ = h264_pictures;

@@ -462,9 +462,8 @@ pub fn init_frame_indexes(arg_cm: [*c]VP9_COMMON) callconv(.c) void {
 pub fn get_frame_new_buffer(arg_cm: [*c]VP9_COMMON) callconv(.c) [*c]YV12_BUFFER_CONFIG {
     var cm = arg_cm;
     _ = &cm;
-    if (antfly_codec_afz_vp9_failed() != 0) {
-        return null;
-    }
+    // Pure frame view: polling here can cancel between the caller guard and
+    // its dereference. The surrounding decoder checkpoints own cancellation.
     return &cm.*.buffer_pool.*.frame_bufs[@bitCast(@as(isize, @intCast(cm.*.new_fb_idx)))].buf;
 }
 pub fn get_free_fb(arg_cm: [*c]VP9_COMMON) callconv(.c) c_int {

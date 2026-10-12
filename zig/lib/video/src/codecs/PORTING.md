@@ -72,3 +72,12 @@ copy shim treats identical source/destination ranges as a no-op: the scalar
 restoration path can copy a retained parameter record to itself. Partial overlap
 still fails Zig's checked `@memcpy` contract. See the independent AOM fixtures and
 execution receipts in `../../testdata/av1-extended`.
+
+
+Frame-buffer view getters remain pure pointer accessors. A cancellation poll
+inside a getter can return null after the caller's failure guard but before its
+dereference; outer decode checkpoints handle cancellation instead. The two
+owned VP9 frame-view helpers now follow this rule. A deterministic boundary
+regression is explicitly discovered from `mod.zig`, fails with the prior getter
+and passes with the pure view. Producer-abandonment qualification also covers
+the runtime path that exposed this defect.

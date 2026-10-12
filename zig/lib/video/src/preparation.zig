@@ -166,12 +166,15 @@ fn rgbHdr(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matr
 // Q16 luma-domain quantization for the scalar RGB24 reference profile.
 // Chroma displacements are quantized before luma expansion. Evaluate the
 // integer equations directly; no external conversion library or lookup cache.
-fn rgbQ16(y: i32, u_delta: i32, v_delta: i32, full: bool, matrix: Matrix) [3]u8 {
-    const coefficients: [4]i32 = switch (matrix) {
+fn q16Coefficients(full: bool, matrix: Matrix) [4]i32 {
+    return switch (matrix) {
         .bt601 => if (full) .{ 91881, -22552, -46800, 116129 } else .{ 89830, -22049, -45756, 113537 },
         .bt709 => if (full) .{ 103206, -12275, -30678, 121608 } else .{ 100902, -12001, -29993, 118894 },
         .bt2020_ncl => if (full) .{ 96638, -10783, -37443, 123299 } else .{ 94482, -10543, -36607, 120547 },
     };
+}
+fn rgbQ16(y: i32, u_delta: i32, v_delta: i32, full: bool, matrix: Matrix) [3]u8 {
+    const coefficients = q16Coefficients(full, matrix);
     const u = u_delta + 128;
     const v = v_delta + 128;
     const offsets = [4]i32{
@@ -243,6 +246,13 @@ pub fn reference(allocator: std.mem.Allocator, surface: *const apple.Surface, op
 /// Portable borrowed NV12 boundary. Plane storage must survive the synchronous
 /// call. No Apple framework or native device is needed for the reference path.
 pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: Options, control: media.source.Control) ![]f32 {
+    return referenceHostImpl(allocator, host, options, control, true);
+}
+/// Scalar preparation oracle for numerical qualification and matched benchmarks.
+pub fn referenceHostScalar(allocator: std.mem.Allocator, host: HostSurface, options: Options, control: media.source.Control) ![]f32 {
+    return referenceHostImpl(allocator, host, options, control, false);
+}
+fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: Options, control: media.source.Control, simd: bool) ![]f32 {
     try control.check();
     const g = try geometry(host.width, host.height, options);
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
@@ -253,12 +263,79 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
     defer allocator.free(bytes);
     for (0..height) |y| {
         try control.check();
-        for (0..width) |x| {
+        var x: usize = 0;
+        if (simd and options.rotation == .none and host.bit_depth == 8 and options.tone_mapping == .none and options.rgb_rounding != .nearest) {
+            while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x, y, options);
+        }
+        while (x < width) : (x += 1) {
             const point = sourcePoint(x, y, host.width, host.height, options.rotation);
             @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding, options.tone_mapping));
         }
     }
     return prepareRgb(allocator, bytes, width, height, g, options, control);
+}
+
+fn integerRgbRow8(out: []u8, host: HostSurface, x: usize, y: usize, options: Options) void {
+    const V = @Vector(8, i32);
+    var luma_bytes: [8]u8 = undefined;
+    @memcpy(&luma_bytes, host.planes[0].bytes[y * host.planes[0].stride + x ..][0..8]);
+    const luma: V = @intCast(@as(@Vector(8, u8), luma_bytes));
+    var u: V = @splat(0);
+    var v: V = @splat(0);
+    if (host.chroma_format != 0) {
+        const cy = if (host.chroma_format == 1) y / 2 else y;
+        const start = cy * host.planes[1].stride + (if (host.chroma_format == 3) x * 2 else x);
+        if (host.chroma_format == 3) {
+            var uv_bytes: [16]u8 = undefined;
+            @memcpy(&uv_bytes, host.planes[1].bytes[start..][0..16]);
+            const uv: @Vector(16, u8) = uv_bytes;
+            u = @as(V, @intCast(@shuffle(u8, uv, undefined, @Vector(8, i32){ 0, 2, 4, 6, 8, 10, 12, 14 }))) - @as(V, @splat(128));
+            v = @as(V, @intCast(@shuffle(u8, uv, undefined, @Vector(8, i32){ 1, 3, 5, 7, 9, 11, 13, 15 }))) - @as(V, @splat(128));
+        } else {
+            var uv_bytes: [8]u8 = undefined;
+            @memcpy(&uv_bytes, host.planes[1].bytes[start..][0..8]);
+            const uv: @Vector(8, u8) = uv_bytes;
+            u = @as(V, @intCast(@shuffle(u8, uv, undefined, @Vector(8, i32){ 0, 0, 2, 2, 4, 4, 6, 6 }))) - @as(V, @splat(128));
+            v = @as(V, @intCast(@shuffle(u8, uv, undefined, @Vector(8, i32){ 1, 1, 3, 3, 5, 5, 7, 7 }))) - @as(V, @splat(128));
+        }
+    }
+    var values: [3]V = undefined;
+    const full = host.format.fullRange();
+    if (options.rgb_rounding == .q16_luma) {
+        const c = q16Coefficients(full, options.matrix);
+        const uu = u + @as(V, @splat(128));
+        const vv = v + @as(V, @splat(128));
+        const r = ((vv * @as(V, @splat(c[0]))) >> @as(@Vector(8, u5), @splat(16))) - @as(V, @splat(c[0] >> 9));
+        const gu = ((uu * @as(V, @splat(c[1]))) >> @as(@Vector(8, u5), @splat(16))) - @as(V, @splat(c[1] >> 9));
+        const gv = ((vv * @as(V, @splat(c[2]))) >> @as(@Vector(8, u5), @splat(16))) - @as(V, @splat(c[2] >> 9));
+        const b = ((uu * @as(V, @splat(c[3]))) >> @as(@Vector(8, u5), @splat(16))) - @as(V, @splat(c[3] >> 9));
+        values = .{ luma + r, luma + gu + gv, luma + b };
+        if (!full) {
+            for (&values) |*channel| channel.* = ((channel.* + @as(V, @splat(326))) * @as(V, @splat(76309)) - @as(V, @splat(400 * 65536)) + @as(V, @splat(32768))) >> @as(@Vector(8, u5), @splat(16));
+        }
+    } else {
+        const c: [4]i32 = if (options.matrix == .bt709)
+            (if (full) .{ 12901, -1534, -3835, 15201 } else .{ 14686, -1747, -4366, 17305 })
+        else
+            (if (full) .{ 11485, -2819, -5850, 14516 } else .{ 13075, -3209, -6660, 16525 });
+        const yy = ((luma - @as(V, @splat(if (full) 0 else 16))) * @as(V, @splat(if (full) 8192 else 9539))) >> @as(@Vector(8, u5), @splat(12));
+        values = .{
+            yy + ((v * @as(V, @splat(c[0]))) >> @as(@Vector(8, u5), @splat(12))),
+            yy + ((u * @as(V, @splat(c[1]))) >> @as(@Vector(8, u5), @splat(12))) + ((v * @as(V, @splat(c[2]))) >> @as(@Vector(8, u5), @splat(12))),
+            yy + ((u * @as(V, @splat(c[3]))) >> @as(@Vector(8, u5), @splat(12))),
+        };
+        for (&values) |*channel| channel.* = (channel.* + @as(V, @splat(1))) >> @as(@Vector(8, u5), @splat(1));
+    }
+    var channels: [3]@Vector(8, u8) = undefined;
+    for (values, &channels) |value, *channel| channel.* = @intCast(@min(@max(value, @as(V, @splat(0))), @as(V, @splat(255))));
+    const red: [8]u8 = channels[0];
+    const green: [8]u8 = channels[1];
+    const blue: [8]u8 = channels[2];
+    for (0..8) |lane| {
+        out[lane * 3] = red[lane];
+        out[lane * 3 + 1] = green[lane];
+        out[lane * 3 + 2] = blue[lane];
+    }
 }
 /// Portable RGBA input, including pure Zig MJPEG output. Uses the same resize
 /// coefficients/patch packing as the NV12 reference after color conversion.
@@ -588,11 +665,44 @@ test "video Q16 luma-domain RGB matches independent nonaligned RGB24 reference" 
     const expected = @embedFile("../testdata/rgb-q16-reference.bin");
     var offset: usize = 0;
     for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]apple.Format{ .nv12_video, .nv12_full }) |format| {
-        for (0..16) |row| for (0..26) |col| {
-            const actual = rgb(planes, col, row, format, matrix, 8, 1, .q16_luma, .none);
-            try std.testing.expectEqualSlices(u8, expected[offset..][0..3], &actual);
-            offset += 3;
-        };
+        for (0..16) |row| {
+            var x: usize = 0;
+            while (x + 8 <= 26) : (x += 8) {
+                var vector_rgb: [24]u8 = undefined;
+                integerRgbRow8(&vector_rgb, .{ .width = 26, .height = 16, .format = format, .planes = planes }, x, row, .{ .width = 96, .height = 48, .matrix = matrix, .rgb_rounding = .q16_luma });
+                const position = offset + x * 3;
+                try std.testing.expectEqualSlices(u8, expected[position..][0..24], &vector_rgb);
+            }
+            for (0..26) |col| {
+                const actual = rgb(planes, col, row, format, matrix, 8, 1, .q16_luma, .none);
+                try std.testing.expectEqualSlices(u8, expected[offset..][0..3], &actual);
+                offset += 3;
+            }
+        }
     };
     try std.testing.expectEqual(expected.len, offset);
+}
+
+test "video portable integer RGB SIMD matches scalar across tails strides chroma and ranges" {
+    const a = std.testing.allocator;
+    var y: [1024]u8 = undefined;
+    var uv: [1024]u8 = undefined;
+    for (&y, 0..) |*value, i| value.* = @intCast((i * 37 + 11) % 256);
+    for (&uv, 0..) |*value, i| value.* = @intCast((i * 61 + 7) % 256);
+    for ([_]u32{ 1, 7, 8, 9, 15, 16, 17, 26, 33 }) |width| for (0..4) |chroma| for ([_]bool{ false, true }) |full| for ([_]Matrix{ .bt601, .bt709 }) |matrix| for ([_]RgbRounding{ .q13_components, .q16_luma }) |rounding| {
+        const cw = if (chroma == 3) width else (width + 1) / 2;
+        const ch: u32 = if (chroma == 1) 3 else 5;
+        const ys: usize = width + 5;
+        const us: usize = cw * 2 + 7;
+        const host = HostSurface{ .width = width, .height = 5, .chroma_format = @intCast(chroma), .format = if (full) .nv12_full else .nv12_video, .planes = .{
+            .{ .bytes = y[0 .. ys * 5], .width = width, .height = 5, .stride = ys },
+            if (chroma == 0) .{ .bytes = &.{}, .width = 0, .height = 0, .stride = 0 } else .{ .bytes = uv[0 .. us * ch], .width = cw, .height = ch, .stride = us },
+        } };
+        const options = Options{ .width = 96, .height = 48, .matrix = matrix, .rgb_rounding = rounding, .torchvision = true };
+        const expected = try referenceHostScalar(a, host, options, .{});
+        defer a.free(expected);
+        const actual = try referenceHost(a, host, options, .{});
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    };
 }
