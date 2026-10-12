@@ -819,10 +819,10 @@ exposes packet-level replay divergence around Raft status publication.
 Stabilize and complete it before adding crashes inside each
 candidate/catalog/alias publication gap or managed-index disk-pressure
 overlap. The `production-cluster-managed-index-vopr-test` step's filter
-(`…managed index publication recovery exact replay`) does not match the test
-name (`…managed index publication bounded lifecycle exact replay`), so on this
-revision the step selects no test; PR #1108 (branch
-`fix/managed-index-vopr-filter`) reconciles the two.
+previously named `…managed index publication recovery exact replay` while the
+test is `…managed index publication bounded lifecycle exact replay`, so the
+step selected no test; PR #1108 fixed the filter. These production-cluster
+steps are not run by any CI job and currently fail to link locally on macOS.
 
 Contracts the production-owner modes rely on:
 
