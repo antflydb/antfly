@@ -267,12 +267,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .pic = true,
     });
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
-    const native_inference = b.addLibrary(.{
-        .name = "antfly-embedded-inference",
-        .linkage = .static,
-        .root_module = native_inference_mod,
-        .max_rss = 12 * 1024 * 1024 * 1024,
-    });
+    const native_inference = @import("shared_library.zig").addProviderArchive(
+        b,
+        native_inference_mod,
+        "antfly-embedded-inference",
+        12 * 1024 * 1024 * 1024,
+    );
     const native_enrichment_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/enrichment_compute_root.zig"),
         .target = target,
@@ -280,12 +280,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .pic = true,
     });
     antfly_imports.configureEnrichment(b, native_enrichment_mod, link_libc);
-    const native_enrichment = b.addLibrary(.{
-        .name = "antfly-embedded-enrichment",
-        .linkage = .static,
-        .root_module = native_enrichment_mod,
-        .max_rss = 8 * 1024 * 1024 * 1024,
-    });
+    const native_enrichment = @import("shared_library.zig").addProviderArchive(
+        b,
+        native_enrichment_mod,
+        "antfly-embedded-enrichment",
+        8 * 1024 * 1024 * 1024,
+    );
     const libantfly_link_mod = capi_mod;
     libantfly_link_mod.strip = strip;
     libantfly_link_mod.linkLibrary(native_inference);

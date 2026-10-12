@@ -34,6 +34,7 @@ pub const Workspace = struct {
     graph: Scratch,
     native_state: native.DocumentBatchReadState,
     resolved_scores: native.ResolvedScoreBatch = .{},
+    score_plan_borrowed: bool = false,
     score_plan: @import("../prepared_score_plan.zig").PreparedScorePlan = .{},
 
     pub fn create(backing: Allocator, manager: ?*resources.ResourceManager) !*Workspace {
@@ -70,7 +71,7 @@ pub const Workspace = struct {
     pub fn begin(self: *Workspace, query_budget: ?*resources.BudgetedAllocator) !void {
         self.query_budget = query_budget;
         self.admit(self.live) catch |err| {
-            if (self.evictOptionalScores()) {
+            if (self.evictOptionalStorage()) {
                 self.admit(self.live) catch |retry_err| {
                     self.query_budget = null;
                     return retry_err;
@@ -97,6 +98,7 @@ pub const Workspace = struct {
     }
 
     pub fn end(self: *Workspace) void {
+        self.score_plan_borrowed = false;
         if (self.allocation_failed) self.discardRetainedStorage();
         // No file or cache lease survives a query. Snapshot identity is numeric;
         // index frames retain independently owned storage and its allocator.
@@ -162,17 +164,24 @@ pub const Workspace = struct {
         const self: *Workspace = @ptrCast(@alignCast(ctx));
         const backing = self.result_backing.?;
         if (backing.rawAlloc(len, alignment, ra)) |p| return p;
-        if (!self.evictOptionalScores()) return null;
+        if (!self.evictOptionalStorage()) return null;
         return backing.rawAlloc(len, alignment, ra);
     }
     fn resultFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Workspace = @ptrCast(@alignCast(ctx));
         self.result_backing.?.rawFree(memory, alignment, ra);
     }
-    fn evictOptionalScores(self: *Workspace) bool {
-        if (self.resolved_scores.borrowed or self.resolved_scores.storage == null) return false;
-        self.resolved_scores.deinit(self.optionalAllocator());
-        return true;
+    fn evictOptionalStorage(self: *Workspace) bool {
+        var released = false;
+        if (!self.resolved_scores.borrowed and self.resolved_scores.storage != null) {
+            self.resolved_scores.deinit(self.optionalAllocator());
+            released = true;
+        }
+        if (!self.score_plan_borrowed and self.score_plan.storage != null) {
+            self.score_plan.deinit();
+            released = true;
+        }
+        return released;
     }
     fn optionalAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         return allocImpl(ctx, len, alignment, ra, false);
@@ -185,13 +194,13 @@ pub const Workspace = struct {
         for (0..2) |attempt| {
             const next = std.math.add(usize, self.live, len) catch return null;
             self.admit(next) catch {
-                if (required and attempt == 0 and self.evictOptionalScores()) continue;
+                if (required and attempt == 0 and self.evictOptionalStorage()) continue;
                 if (required) self.allocation_failed = true;
                 return null;
             };
             const p = self.heap().rawAlloc(len, alignment, ra) orelse {
                 self.restoreAdmission();
-                if (required and attempt == 0 and self.evictOptionalScores()) continue;
+                if (required and attempt == 0 and self.evictOptionalStorage()) continue;
                 if (required) self.allocation_failed = true;
                 return null;
             };
@@ -256,4 +265,27 @@ test "lite workspace optional cache evicts for required growth but protects borr
     try std.testing.expect(w.resolved_scores.storage == null);
     try std.testing.expect(!w.allocation_failed);
     try std.testing.expectEqual(@as(usize, 4096 + 8192), w.live);
+}
+
+test "lite workspace evicts idle plans and protects active plan ownership" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    const w = try Workspace.create(a, &manager);
+    defer w.destroy();
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try w.begin(&query);
+    defer w.end();
+    try std.testing.expect(try w.score_plan.prepare(w.allocator(), &.{"p/"}, &.{"a"}));
+    manager.slices[@backingInt(resources.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 128;
+    w.score_plan_borrowed = true;
+    try std.testing.expectError(error.OutOfMemory, w.allocator().alloc(u8, 1024));
+    try std.testing.expect(w.score_plan.matches(&.{"p/"}, &.{"a"}));
+    w.allocation_failed = false;
+    w.score_plan_borrowed = false;
+    const bytes = try w.allocator().alloc(u8, 1024);
+    defer w.allocator().free(bytes);
+    try std.testing.expect(w.score_plan.storage == null);
+    try std.testing.expect(!w.allocation_failed);
 }

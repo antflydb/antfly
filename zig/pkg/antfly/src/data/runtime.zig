@@ -1937,8 +1937,22 @@ const RaftTableApplyStateMachine = struct {
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
-            const descriptor = storage_owner_descriptor orelse
-                return error.MissingStorageKernelOwnerDescriptor;
+            const descriptor = storage_owner_descriptor orelse {
+                // Released v0.2.1+ Raft commands did not pin owner descriptors.
+                // Use the already-prepared resident owner, as those writers
+                // did. This never resolves metadata on the progress thread;
+                // startup/control must open it first, or apply yields. The
+                // original atomic term/index receipt still prevents replay.
+                _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    entry,
+                );
+                if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+                return;
+            };
             try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
                 self.alloc,
                 group_id,
