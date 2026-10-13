@@ -21,7 +21,7 @@ const std = h.std;
 const catalog_key = "\x00antfly/embedded/tables/v1";
 const Record = struct { name: []const u8, id: u64 };
 const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{} };
-pub const Table = struct { name: []u8, id: u64, db: h.db_mod.DB };
+pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const alloc = handle.alloc;
@@ -30,7 +30,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
     const namespace = try std.fmt.allocPrint(alloc, "embedded/tables/{d}", .{id});
-    defer alloc.free(namespace);
+    errdefer alloc.free(namespace);
     const path = if (handle.owned_lite_backend != null)
         try alloc.dupe(u8, handle.embedded_path orelse return error.UnsupportedSqlExecution)
     else
@@ -43,8 +43,9 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.prefer_existing_identity_namespace = false;
     options.online_source_authority = .native;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
-    table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
+    table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
+    @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
     return table;
@@ -53,6 +54,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
 fn destroy(handle: *h.Handle, table: *Table) void {
     if (handle.lease_snapshot) table.db.closeImmutableSnapshot() else table.db.close();
     handle.alloc.free(table.name);
+    handle.alloc.free(table.namespace);
     handle.alloc.destroy(table);
 }
 
@@ -266,37 +268,40 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
 }
 
 pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    h.capi.clearLastError();
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     create(guard.handle, name.bytes(), schema.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
 }
 pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    h.capi.clearLastError();
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     drop(guard.handle, name.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
 }
 pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) h.capi.ErrorCode {
+    h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return .invalid_argument;
+    if (handle.parent_id != null) return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": table catalog operations require a root database handle");
     load(handle) catch |err| return h.capi.mapError(err);
-    const names = handle.alloc.alloc([]const u8, handle.embedded_tables.count() + 1) catch return .internal;
+    const names = handle.alloc.alloc([]const u8, handle.embedded_tables.count() + 1) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     defer handle.alloc.free(names);
     names[0] = "default";
     var iterator = handle.embedded_tables.keyIterator();
@@ -306,18 +311,19 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
             return std.mem.lessThan(u8, a, b);
         }
     }.less);
-    out.* = api.stringifyJson(names) catch return .internal;
+    out.* = api.stringifyJson(names) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
 /// Table handles use the existing document, index, and enrichment APIs. They
 /// borrow the namespace and are invalidated safely when the database closes.
 pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) h.capi.ErrorCode {
+    h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const root = guard.handle;
@@ -333,23 +339,23 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
             _ = root.table_handles.swapRemove(i);
         }
     }
-    if (root.table_handles.items.len >= 1024) return .busy;
+    if (root.table_handles.items.len >= 1024) return h.capi.recordError(.busy, @src().fn_name ++ ": open table handle limit (1024) exceeded");
     const db = get(root, name.bytes()) catch |err| return h.capi.mapError(err);
-    const child = root.alloc.create(h.Handle) catch return .internal;
+    const child = root.alloc.create(h.Handle) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     child.* = .{ .alloc = root.alloc, .db = undefined, .selected_db = db, .parent_id = ptr, .parent_handle = root, .open_mode = root.open_mode, .lite_profile = root.lite_profile, .lite_generated_enrichment_replay = root.lite_generated_enrichment_replay };
-    child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch {
+    child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch |err| {
         root.alloc.destroy(child);
-        return .internal;
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": allocating the selected table name");
     };
     child.selected_table_id = db.core.identity_namespace.table_id;
-    const id = h.handle_registry.register(child) catch {
+    const id = h.handle_registry.register(child) catch |err| {
         root.alloc.free(child.selected_table_name.?);
         root.alloc.destroy(child);
-        return .internal;
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": registering the table handle");
     };
-    root.table_handles.append(root.alloc, id) catch {
+    root.table_handles.append(root.alloc, id) catch |err| {
         h.closeHandleId(id);
-        return .internal;
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": tracking the open table handle");
     };
     out.* = id;
     return .ok;

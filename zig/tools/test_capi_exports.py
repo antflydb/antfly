@@ -22,8 +22,11 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +35,33 @@ spec = importlib.util.spec_from_file_location(
 )
 exports = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exports)
+
+
+def run_fixture_build(command, cwd, timeout=300):
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(cwd / ".zig-cache")},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        # Stop the owned compiler group before fixture cleanup removes files
+        # its children still use. Killing only the runner leaves those alive.
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif process.poll() is None:
+            process.kill()
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class ExportPolicyTests(unittest.TestCase):
@@ -96,6 +126,39 @@ void antfly_second(
                 {"antfly_first", "__dso_handle"},
             )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX compiler process groups")
+    def test_fixture_timeout_stops_compiler_children(self):
+        # The child holds the output pipe open. A runner-only kill would wait
+        # for its five-second alarm instead of enforcing the fixture deadline.
+        child_pid = self.root / "compiler.pid"
+        command = [
+            sys.executable,
+            "-c",
+            """
+import os, signal, time
+from pathlib import Path
+pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    print("compiler child ready", flush=True)
+    time.sleep(10)
+else:
+    Path("compiler.pid").write_text(str(pid))
+    time.sleep(10)
+""",
+        ]
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run_fixture_build(command, self.root, timeout=1)
+        self.assertIn("compiler child ready", caught.exception.output.decode())
+        self.assertLess(time.monotonic() - started, 4)
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", child_pid.read_text()],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertTrue(not state or state.startswith("Z"), state)
+
     @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_production_elf_helper_links_debug_with_lld(self):
         zig_root = Path(__file__).resolve().parents[1]
@@ -109,38 +172,106 @@ void antfly_second(
         header = self.root / "pkg/antfly-embedded/include/antfly.h"
         header.parent.mkdir(parents=True)
         shutil.copyfile(self.header, header)
-        (self.root / "probe.zig").write_text(
-            "export fn antfly_first() u32 { return 1; }\n"
-            "export fn antfly_second() void {}\n"
-            "export fn antfly_private_probe() u32 { return 2; }\n"
+        (self.root / "probe.zig").write_text("""
+const std = @import("std");
+extern fn antfly_private_submit(*const std.Io, *std.Io.Group, *std.atomic.Value(u32)) bool;
+pub export fn antfly_first() c_int {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var group: std.Io.Group = .init;
+    var count: std.atomic.Value(u32) = .init(0);
+    if (!antfly_private_submit(&io, &group, &count)) return 0;
+    group.await(io) catch return 0;
+    return @intCast(count.load(.acquire));
+}
+export fn antfly_second(argument: c_int) void { _ = argument; }
+export fn antfly_private_probe() u32 { return 2; }
+""")
+        (self.root / "cli.zig").write_text("""
+const probe = @import("probe.zig");
+pub fn main() !void {
+    if (probe.antfly_first() != 42) return error.ExecutorCallbackFailed;
+}
+""")
+        (self.root / "provider.zig").write_text("""
+const std = @import("std");
+fn setCount(count: *std.atomic.Value(u32)) void { count.store(42, .release); }
+export fn antfly_private_submit(io: *const std.Io, group: *std.Io.Group, count: *std.atomic.Value(u32)) bool {
+    group.concurrent(io.*, setCount, .{count}) catch return false;
+    return true;
+}
+""")
+        (self.root / "consumer.c").write_text(
+            '#include "antfly.h"\n'
+            "int main(void) { return antfly_first() == 42 ? 0 : 1; }\n"
         )
         (self.root / "build.zig").write_text("""
 const std = @import("std");
 const shared_library = @import("build_support/embedded/shared_library.zig");
 pub fn build(b: *std.Build) void {
+    const native_probe = b.option(bool, "native-executor-probe", "Execute the borrowed executor probe") orelse false;
+    const target = if (native_probe) b.graph.host else
+        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
     const module = b.createModule(.{
         .root_source_file = b.path("probe.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+        .target = target,
         .optimize = .Debug,
+        .link_libc = true,
+        .pic = true,
     });
+    const provider_module = b.createModule(.{
+        .root_source_file = b.path("provider.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+        .pic = true,
+    });
+    const provider = shared_library.addProviderArchive(b, provider_module, "provider", 512 * 1024 * 1024);
+    module.linkLibrary(provider);
     const library = shared_library.add(b, module);
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.binary, .lib, "libantfly.so").step);
+    const cli_module = b.createModule(.{
+        .root_source_file = b.path("cli.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    cli_module.linkLibrary(provider);
+    const cli = b.addExecutable(.{
+        .name = "lite-executor-probe",
+        .root_module = cli_module,
+        .use_llvm = shared_library.llvmBackend(target.result),
+    });
+    b.installArtifact(cli);
+    if (native_probe) {
+        b.getInstallStep().dependOn(&b.addRunArtifact(cli).step);
+        const consumer = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
+        consumer.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{"-std=c11"} });
+        library.link(consumer);
+        const executable = b.addExecutable(.{ .name = "executor-probe", .root_module = consumer });
+        b.getInstallStep().dependOn(&b.addRunArtifact(executable).step);
+    }
 }
 """)
-        result = subprocess.run(
-            [shutil.which("zig"), "build"],
-            cwd=self.root,
-            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(self.root / "global-cache")},
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        # Keep source and local outputs private, but reuse the caller's Zig
+        # toolchain cache. Rebuilding the build runner and compiler runtimes
+        # in a fresh global cache can exceed two minutes on cold CI runners.
+        result = run_fixture_build([shutil.which("zig"), "build"], self.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         library = self.root / "zig-out/lib/libantfly.so"
         self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
         nm = shutil.which("llvm-nm")
         if nm or platform.system() == "Linux":
             exports.check(header, library, "elf", nm)
+        if platform.system() == "Linux":
+            # A symbol-only link check misses mismatched backend conventions.
+            # Submit provider callbacks to both library- and executable-owned executors.
+            result = run_fixture_build(
+                [shutil.which("zig"), "build", "-Dnative-executor-probe=true"],
+                self.root,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(
         platform.system() in {"Darwin", "Linux"}

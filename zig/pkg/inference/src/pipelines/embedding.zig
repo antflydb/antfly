@@ -701,7 +701,7 @@ pub const EmbeddingPipeline = struct {
             @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], all_mask[(texts.len - 1) * effective_len .. texts.len * effective_len]);
         }
 
-        // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
+        // Convert i32 token IDs to i64 (ONNX graphs expect int64 tensors)
         const ids_i64 = try alloc.alloc(i64, batch * effective_len);
         defer alloc.free(ids_i64);
         const mask_i64 = try alloc.alloc(i64, batch * effective_len);
@@ -3068,12 +3068,6 @@ test "embedding text plans backend and fixed-shape batches" {
         textSessionBatchPlan(fixed_two, 3).?,
     );
 
-    const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
-    try std.testing.expectEqual(
-        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
-        textSessionBatchPlan(external_onnx, 2).?,
-    );
-
     const dynamic_info = [_]backends.TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
     };
@@ -3126,9 +3120,6 @@ fn textSessionBatchPlanForRuntime(
         break;
     }
     if (requested_batch <= 1) return null;
-    if (backend == .onnx) {
-        return .{ .batch_size = 1, .pad_final_batch = false };
-    }
     if (imported and backend != .native and backend != .metal) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }

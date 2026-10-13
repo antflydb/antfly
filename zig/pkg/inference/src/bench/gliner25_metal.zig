@@ -45,8 +45,8 @@ const teardown_timeout_ms = 30000;
 
 comptime {
     if (builtin.mode != .fast) @compileError("GLiNER2.5 benchmark requires ReleaseFast for the complete dependency graph");
-    if (!build_options.enable_metal or build_options.enable_cuda or build_options.enable_onnx or build_options.enable_pjrt)
-        @compileError("GLiNER2.5 Metal benchmark requires -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false");
+    if (!build_options.enable_metal or build_options.enable_cuda or build_options.enable_pjrt)
+        @compileError("GLiNER2.5 Metal benchmark requires -Dmetal=true -Dcuda=false -Dpjrt=false");
 }
 
 const Pin = struct { sha256: []const u8, size_bytes: usize };

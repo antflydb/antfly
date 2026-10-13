@@ -151,7 +151,8 @@ class AntflyOpenOptions(ctypes.Structure):
         ("inference_kv_budget_mb", ctypes.c_uint32),
         ("inference_scratch_budget_mb", ctypes.c_uint32),
         ("busy_timeout_ms", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 8),
+        ("reserved", ctypes.c_uint64 * 6),
+        ("models_dir", AntflySlice),
     ]
 
 
@@ -247,6 +248,8 @@ _ERR = ctypes.c_int  # antfly_error_code (C enum, backed by `int`)
 _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_abi_version", [], ctypes.c_uint32),
     ("antfly_open_options_size", [], ctypes.c_uint32),
+    ("antfly_last_error_detail", [], ctypes.c_char_p),
+    ("antfly_last_error_code", [], _ERR),
     ("antfly_error_code_name", [_ERR], ctypes.c_char_p),
     ("antfly_error_code_description", [_ERR], ctypes.c_char_p),
     ("antfly_open_options_init", [_OPTS_P], _ERR),
@@ -324,6 +327,10 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_get_schema_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_set_schema_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_list_indexes_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_render_resolver_key_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_resolve_query_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_set_resolver_namespace_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
+    ("antfly_db_merge_resolver_keys_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_add_index_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_delete_index", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
     ("antfly_db_list_enrichments_json", [_VOID_P, _BUF_P], _ERR),

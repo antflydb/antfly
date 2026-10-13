@@ -1,0 +1,33 @@
+{
+  "release": "v0.2.5",
+  "version": "antfly 0.2.5 (zig runtime)",
+  "binary_sha256": "8900496c5a7fbd6a4d2cb0787faf49b3635f720c104745355053499f02a7582a",
+  "schema_sha256": "c458649eff917637f86dcf20283cf8f4d3d62bf60f773b9473f45236ed0b946c",
+  "archive_sha256": "0ad23cc649f9c4be700f109d43a7428c8407541cf6d9e5746373ce30a33a3eea",
+  "generated_by": "scripts/ci/qualify-v02-server-upgrade.py --seed-only; public standalone create/index/batch/backup APIs; schema extracted verbatim from metadata block",
+  "native_manifest_sha256": "be01fcbdcedc1fa59174158bf05e1ae8109ed369ea5152fd87c744816adfe9f4",
+  "release_controls": {
+    "v0.2.1": {
+      "binary_sha256": "e9b8bf12365508707568277601ba378ccbb52d760895d4f3ec06baf37be18fde",
+      "native_manifest_version": 3
+    },
+    "v0.2.2": {
+      "binary_sha256": "3e35384f72ed1bbbe4bd7602cf65320ad5ec08b41a100609e33986f05816cc65",
+      "native_manifest_version": 3
+    },
+    "v0.2.3": {
+      "binary_sha256": "485e4e7a0af207f8b9945fd4d53c08004b026eba3ec504ddb1f467b645e50264",
+      "native_manifest_version": 3
+    },
+    "v0.2.4": {
+      "binary_sha256": "143620d4cc6e9abce8c8d8e140e4ee469cb3b1e99611742566c64262d3dd0eb4",
+      "native_manifest_version": 3
+    },
+    "v0.2.5": {
+      "binary_sha256": "8900496c5a7fbd6a4d2cb0787faf49b3635f720c104745355053499f02a7582a",
+      "native_manifest_version": 3
+    }
+  },
+  "native_files": "native/ contains the unmodified complete v0.2.5 group snapshot; per-file digests are in native/native-generation.json",
+  "native_indexes_sha256": "3da01bc9fa4f1606b218768cb0191c07f23da854bab5719218b53279d0dd94e2"
+}

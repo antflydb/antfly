@@ -2014,6 +2014,8 @@ pub const StatusSource = struct {
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
+        /// Complete catalog and store capabilities without detailed inventories.
+        control_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: api_operation.RequestContext) anyerror!?metadata_api.AdminSnapshot = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
@@ -2093,6 +2095,11 @@ pub const StatusSource = struct {
     pub fn adminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.admin_snapshot orelse return null;
         return try BoundaryAbi.call("admin_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
+    }
+
+    pub fn controlSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
+        const fn_ptr = self.vtable.control_snapshot orelse return null;
+        return try BoundaryAbi.call("control_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn cachedAdminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
@@ -2446,6 +2453,10 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
+            fn controlSnapshot(ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot {
+                return try cast(ptr).controlSnapshot();
+            }
+
             fn acquireJoinPlanning(ptr: *anyopaque, budget: table_router.RouteBudget) anyerror!?*join_planning.Generation {
                 try budget.check();
                 return try cast(ptr).acquireCatalogJoinPlanning(budget);
@@ -2723,6 +2734,7 @@ pub const StatusSource = struct {
             .supports_object_tables = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
+            .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,
             .acquire_join_planning = Gen.acquireJoinPlanning,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
             .linearizable_snapshot = Gen.linearizableSnapshot,
@@ -3975,6 +3987,7 @@ pub const ApiHttpServer = struct {
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
     lake_text_corpora: @import("lake_index_native_text_cache.zig").Cache = .{},
+    lake_navigation_warming: @import("lake_index_navigation_warming.zig").Cache = .{},
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -3987,6 +4000,7 @@ pub const ApiHttpServer = struct {
         lake_range_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.Stats = .{},
         lake_disk_cache: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats = null,
         lake_query: @import("lake_query_metrics.zig").Stats = .{},
+        lake_navigation_warming: @import("lake_index_navigation_warming.zig").Stats = .{},
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4293,6 +4307,7 @@ pub const ApiHttpServer = struct {
             .lake_range_cache = self.lake_read_cache.snapshot(),
             .lake_disk_cache = self.lake_read_cache.persistentStats(),
             .lake_query = self.lake_query_metrics.snapshot(),
+            .lake_navigation_warming = self.lake_navigation_warming.snapshot(),
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
@@ -4486,8 +4501,12 @@ pub const ApiHttpServer = struct {
         if (self.cfg.deployment_mode != .distributed) {
             return self.loadClusterStatusWithSnapshot(alloc, null);
         }
-        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
-        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        var snapshot_opt = if (self.source.vtable.control_snapshot != null)
+            self.source.controlSnapshot() catch null
+        else blk: {
+            const cached = self.source.cachedAdminSnapshot() catch null;
+            break :blk cached orelse (self.source.adminSnapshot() catch null);
+        };
         if (snapshot_opt) |*snapshot| {
             defer self.source.freeAdminSnapshot(snapshot);
             return self.loadClusterStatusWithSnapshot(alloc, snapshot);
@@ -5279,7 +5298,9 @@ pub const ApiHttpServer = struct {
     fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
         const reader = self.table_reads orelse return;
         const writer = self.table_writes orelse return;
-        var snapshot = (try self.source.cachedAdminSnapshot()) orelse return;
+        // Validation must make progress on a cold owner without depending
+        // on an unrelated diagnostic request to populate a cache.
+        var snapshot = (try self.controlAdminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         if (snapshot.ranges.len == 0) return;
         const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
@@ -5700,7 +5721,7 @@ pub const ApiHttpServer = struct {
         try publication.validateShape();
         if (publication.phase == .active or
             (publication.phase == .disabled and publication.disabled_acknowledged_owners.len == publication.required_owners.len)) return error.InvalidRowPolicyPublication;
-        var snapshot = (try self.source.cachedAdminSnapshot()) orelse return error.CatalogRoutingUnavailable;
+        var snapshot = (try self.controlAdminSnapshot()) orelse return error.CatalogRoutingUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table_name = for (snapshot.tables) |table| {
             if (table.table_id == publication.table_id) break table.name;
@@ -7025,6 +7046,11 @@ pub const ApiHttpServer = struct {
         owned.items = &.{};
     }
 
+    fn controlAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
+        if (self.source.vtable.control_snapshot != null) return self.source.controlSnapshot();
+        return self.statusAdminSnapshot();
+    }
+
     pub fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
         return (try self.source.cachedAdminSnapshot()) orelse try self.source.adminSnapshot();
     }
@@ -7942,7 +7968,8 @@ pub const ApiHttpServer = struct {
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
-        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null)
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
+            request.trusted_principal == null)
             return .allowed;
         if (self.cfg.auth_enabled and
             self.cfg.user_manager == null and
@@ -9283,7 +9310,10 @@ pub const ApiHttpServer = struct {
             var store = try @import("lake_index_store.zig").Store.openNative(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer store.deinit();
             var artifacts = store.artifactStore();
-            const cut = try @import("native_retained_cut.zig").load(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none);
+            const cut = @import("native_retained_cut.zig").load(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none) catch |err| {
+                std.log.warn("retained native query capability validation failed err={s}", .{@errorName(err)});
+                return err;
+            };
             query_req.native_query_cut = .{ .id = cut.id, .table_id = cut.table_id, .expires_ms = cut.expires_ms, .cover = cut.cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json }, .create = if (resolver) |cache| if (cache.native_capture_token) |minted| std.mem.eql(u8, minted, token) else false else false, .timeout_ms = if (query_req.execution_deadline_ns) |deadline| (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms else null };
             const remaining = cut.expires_ms -| (@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             const cut_deadline = @import("antfly_platform").time.monotonicNs() +| remaining * std.time.ns_per_ms;
@@ -15092,11 +15122,10 @@ pub const ApiHttpServer = struct {
                 if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
-                    var artifacts = store.artifactStore();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
                     defer self.source.freeAdminSnapshot(&capture);
                     const cover = try @import("native_retained_cut.zig").captureCover(resolver.arena, capture, table_name, table.table_id);
-                    query_req.req.remote_snapshot = try @import("native_retained_cut.zig").saveWithCover(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(self.cfg.node_config), cover, context.cancellation);
+                    query_req.req.remote_snapshot = try @import("native_query_repository.zig").saveWithCover(alloc, &store, self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(self.cfg.node_config), cover, context.cancellation);
                     resolver.native_capture_token = query_req.req.remote_snapshot;
                 }
             }
@@ -16212,7 +16241,7 @@ pub const ApiHttpServer = struct {
         const now = platform_time.monotonicNs();
         if (now < self.lake_index_recovery_after_ns) return;
         self.lake_index_recovery_after_ns = now +| std.time.ns_per_s;
-        var snapshot = (try self.statusAdminSnapshot()) orelse return;
+        var snapshot = (try self.controlAdminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         if (snapshot.tables.len == 0) {
             self.lake_index_recovery_cursor = 0;
@@ -16419,6 +16448,11 @@ pub const ApiHttpServer = struct {
             fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
                 const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
                 _ = try server.source.replaceTableDefinitionStamped(before, after);
+                // Publication is authoritative before acquiring its warmup
+                // reader lease; no future generation is pinned prematurely.
+                @import("lake_index_navigation_warming.zig").warmPublication(std.heap.smp_allocator, server, after) catch |err| {
+                    std.log.debug("native lake navigation warming deferred table={s} err={s}", .{ after.name, @errorName(err) });
+                };
             }
             fn canceled(raw: *const anyopaque) bool {
                 const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
@@ -16464,6 +16498,9 @@ pub const ApiHttpServer = struct {
             }
         }
         try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
+            std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
+        };
         if (ingested) return error.LakeIndexBuildInProgress;
     }
 
@@ -21777,9 +21814,8 @@ pub const ApiHttpServer = struct {
                         if (!request.object.contains("remote_snapshot")) {
                             var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                             defer store.deinit();
-                            var artifacts = store.artifactStore();
                             const cover = try @import("native_retained_cut.zig").captureCover(scratch, before, binding.physical, bound.table_id);
-                            const token = try @import("native_retained_cut.zig").saveWithCover(scratch, &artifacts, try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator), runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), cover, context.cancellation);
+                            const token = try @import("native_query_repository.zig").saveWithCover(scratch, &store, runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), cover, context.cancellation);
                             try request.object.put(scratch, "remote_snapshot", .{ .string = token });
                             resolver.native_capture_token = token;
                             native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});
@@ -37598,11 +37634,13 @@ test "api http server serves document lookup through mcp tool" {
                 .key = "docs/getting-started.md",
                 .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
             },
+            .{ .key = "docs/private.md", .value = "{\"title\":\"private\",\"body\":\"hidden\"}" },
         },
         .timestamp_ns = 4321,
     });
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -37640,7 +37678,7 @@ test "api http server serves document lookup through mcp tool" {
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
-        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"title":"alpha"}}}}}},"iat":{d},"exp":{d}}}
     ,
         .{ now, now + 60 },
     );
@@ -37650,19 +37688,68 @@ test "api http server serves document lookup through mcp tool" {
 
     var server = ApiHttpServer.init(
         std.testing.allocator,
-        .{
-            .auth_enabled = true,
-            .trusted_principal_secret = trusted_principal_secret,
-            .trusted_principal_issuer = "trusted-upstream",
-        },
+        .{},
         source.iface(),
         table_source.source(),
-        null,
+        table_write_source.source(),
     );
     defer server.deinit();
     const trusted_principal_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = token },
     };
+
+    // Cloud supplies this header even when the instance accidentally starts
+    // without its verifier. Neither initialization nor a retained anonymous
+    // session may turn that identity into unrestricted standalone access.
+    var missing_verifier_init = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer missing_verifier_init.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_init.status);
+
+    var anonymous_init = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer anonymous_init.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), anonymous_init.status);
+    const anonymous_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = anonymous_init.headers[0].value },
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    const batch_call = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{\"permission_probe\":{\"content\":\"Synthetic permission probe\"}}}}}";
+    var missing_verifier_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &anonymous_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer missing_verifier_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_write.status);
+    try std.testing.expect((try db.get(alloc, "permission_probe")) == null);
+
+    var missing_verifier_rest = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/db/v1/tables/docs/batch",
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"inserts\":{\"permission_probe\":{\"content\":\"Synthetic permission probe\"}}}",
+    });
+    defer missing_verifier_rest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing_verifier_rest.status);
+    try std.testing.expectEqual(kernel_abi.AuthorizationDecision.unauthorized, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .read));
+
+    // A configured verifier activates authentication without requiring a
+    // local user manager or auth_enabled; valid scoped reads remain usable.
+    server.cfg.trusted_principal_secret = trusted_principal_secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
 
     var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -37703,6 +37790,100 @@ test "api http server serves document lookup through mcp tool" {
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
     try mcp.testing.expectToolStructuredSubset(alloc, call_resp.body, "{\"title\":\"alpha\"}");
+
+    var hidden_read = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/private.md\"}}}",
+    });
+    defer hidden_read.deinit(alloc);
+    try mcp.testing.expectToolResultTextContains(alloc, hidden_read.body, true, "not found");
+
+    var denied_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer denied_write.deinit(alloc);
+    var parsed_denied_write = try mcp.testing.parseJsonRpcResponse(alloc, denied_write.body);
+    defer parsed_denied_write.deinit();
+    try std.testing.expect(parsed_denied_write.value.@"error" != null);
+    try std.testing.expect(parsed_denied_write.value.result == null);
+    try std.testing.expect((try db.get(alloc, "permission_probe")) == null);
+
+    var denied_scope = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"nonexistent_outside_grant\",\"queryRequest\":{\"full_text_search\":{\"match_all\":{}}}}}}",
+    });
+    defer denied_scope.deinit(alloc);
+    try mcp.testing.expectToolResultTextContains(alloc, denied_scope.body, true, "permission denied");
+
+    // Session state is transport state, not a captured principal: an admin
+    // can write, and the next read-only request cannot reuse that authority.
+    const admin_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"user:admin","tenant":"inst-1","tables":["docs"],"operations":["admin"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(admin_payload);
+    const admin_token = try encodeTrustedPrincipalToken(alloc, trusted_principal_secret, admin_payload);
+    defer alloc.free(admin_token);
+    const admin_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = admin_token },
+    };
+    var admin_write = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &admin_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer admin_write.deinit(alloc);
+    try mcp.testing.expectToolStructuredSubset(alloc, admin_write.body, "{\"inserted\":1}");
+    const inserted = (try db.get(alloc, "permission_probe")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(inserted);
+    try std.testing.expectEqualStrings("{\"content\":\"Synthetic permission probe\"}", inserted);
+
+    var denied_delete = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"deletes\":[\"permission_probe\"]}}}",
+    });
+    defer denied_delete.deinit(alloc);
+    var parsed_denied_delete = try mcp.testing.parseJsonRpcResponse(alloc, denied_delete.body);
+    defer parsed_denied_delete.deinit();
+    try std.testing.expect(parsed_denied_delete.value.@"error" != null);
+    try std.testing.expect(parsed_denied_delete.value.result == null);
+    const retained = (try db.get(alloc, "permission_probe")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(inserted, retained);
+
+    const invalid_token = try encodeTrustedPrincipalToken(alloc, "wrong-secret", admin_payload);
+    defer alloc.free(invalid_token);
+    const invalid_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = invalid_token },
+    };
+    var invalid_signature = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &invalid_session_headers,
+        .content_type = "application/json",
+        .body = batch_call,
+    });
+    defer invalid_signature.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), invalid_signature.status);
 }
 
 test "api http server serves fielded full-text search through mcp tools" {
@@ -42212,12 +42393,19 @@ test "api http server reloads durable transaction sessions after restart" {
 test "api http server retries stable terminal commits without replaying writes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
-            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        // Public commit preparation requires an authoritative catalog even
+        // when this fixture's table has no relational constraints.
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
     };
     const FakeWrites = struct {
@@ -42349,11 +42537,18 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
 
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
-            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
         }
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        // Public commit preparation requires an authoritative catalog even
+        // when this fixture's table has no relational constraints.
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
     };
     const FakeWrites = struct {
@@ -42456,11 +42651,18 @@ test "api session maintenance skips live commit execution and acknowledgement" {
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
 
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
-            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
         }
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        // Public commit preparation requires an authoritative catalog even
+        // when this fixture's table has no relational constraints.
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
     };
     const FakeWrites = struct {
@@ -42962,7 +43164,9 @@ test "api http server can renew owned session leases via explicit maintenance ho
     var adopter = try ApiHttpServer.initWithConfig(
         alloc,
         .{
-            .session_store_path = session_path,
+            // Share the owned durable store; opening a second native writer
+            // to the same root is correctly forbidden by the storage engine.
+            .session_store = owner.opened_session_store.?.durableStore(),
             .session_router = adopter_router.iface(),
             .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
         },
@@ -57504,4 +57708,42 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "api http server serves status using control metadata without diagnostic transfers" {
+    const Fake = struct {
+        control_reads: usize = 0,
+        diagnostic_reads: usize = 0,
+        deny: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 9, .metrics = .{} };
+        }
+        fn control(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.control_reads += 1;
+            if (self.deny) return error.ResourceTemporarilyUnavailable;
+            return .{ .status = try status(ptr), .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn diagnostic(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.diagnostic_reads += 1;
+            return error.UnexpectedDiagnosticTransfer;
+        }
+        fn cached(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            return try diagnostic(ptr);
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .distributed }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .control_snapshot = Fake.control, .admin_snapshot = Fake.diagnostic, .cached_admin_snapshot = Fake.cached, .free_admin_snapshot = Fake.free } }, .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, .{ .ptr = &fake, .vtable = &.{ .batch = undefined } });
+    defer server.deinit();
+    var available = try server.loadClusterStatus(std.testing.allocator);
+    defer available.deinit(std.testing.allocator);
+    try std.testing.expectEqual(cluster.ArtifactSourcesCapabilityState.upgrade_pending, available.index_capabilities.artifact_sources_state);
+    try server.advanceRelationalActivationOnce();
+    fake.deny = true;
+    var denied = try server.loadClusterStatus(std.testing.allocator);
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), fake.control_reads);
+    try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
 }

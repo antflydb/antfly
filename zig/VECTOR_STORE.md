@@ -19,7 +19,14 @@ the design this implements.
 > qualification that led to this design is preserved verbatim in
 > [docs/design/vector-store/history/experiments-2026-09.md](../docs/design/vector-store/history/experiments-2026-09.md).
 > Durable decisions from it are folded into the Objective, Ownership, Table
-> setting, and Reads/updates/deletion sections below.
+> setting, and Reads/updates/deletion sections below. The source-ownership
+> migration qualification record and the 2026-09-08 correctness/design review
+> are preserved in
+> [migration-qualification-findings.md](../docs/design/vector-store/history/migration-qualification-findings.md)
+> and [review-2026-09-08.md](../docs/design/vector-store/history/review-2026-09-08.md);
+> their standing conclusions are folded into
+> [Qualification and remaining scope](#qualification-and-remaining-scope) and
+> [Correctness boundaries](#correctness-boundaries).
 
 ## Existing-table migration
 
@@ -91,6 +98,17 @@ before preparation. Resource rejection preserves progress and reports the
 reason. Before publication, cancel and start a new ID if a larger allowance is
 needed; after publication, finish draining to retire the migration allowance.
 Reads/deletes continue when preparation is backpressured.
+
+Online mutation handlers hold a per-table command slot from the standalone
+catalog owner across the DB command and catalog reconciliation, so a paused
+start cannot resume after another handler cancels or replaces its admission. A
+contending migration mutation returns retryable HTTP 503; status reads and other
+tables are unaffected. Catalog-only admission can be cancelled without starting
+the source store or passing the disk reserve: the DB writes a durable cancelled
+receipt (bound to the source identity, offline too) before admission is cleared,
+and exact retries return that receipt. Migration page commits use the WAL
+durability barrier, not a memtable flush; only ownership publication takes the
+full storage barrier.
 
 The durable phases are:
 
@@ -187,7 +205,9 @@ artifacts and ANN state; document-only export would lose required information.
 It rejects symlinks and storage configurations whose physical state is outside
 the lifecycle-owned root. The shadow replays committed derived work, runs the
 same source conversion/verifier and native ANN lifecycle, syncs, seals and
-publishes through the existing recoverable generation exchange. Repeated restart
+publishes through the existing recoverable generation exchange. Copying syncs
+the whole shadow directory chain before acknowledging a file's first chunk, and
+retries resync existing directories. Repeated restart
 or a lost publication response resolves the same selected generation. Old roots
 are retired by the generation lifecycle after their readers release them.
 
@@ -205,12 +225,23 @@ at 50K and then 1M, with fixed-count churn, restart, readiness, recall, QPS/tail
 lock waits, memory and complete disk accounting. Report retained/orphan bytes and
 reclamation separately from logical completion. A passing migration correctness
 suite is not evidence of equivalent steady-state throughput.
+[`scripts/qualify_vector_migration.py`](scripts/qualify_vector_migration.py) runs the screen. It fails if source
+collection does not reach the expected live payload count and, for corpora of at
+least 512 dimensions, if migrated primary SSTables exceed half the raw vector
+plane. Query comparisons include a matched restart in every arm so
+ingestion-time identity caches do not confound them. ANN neighbor comparisons
+wait for a clean posting-refresh certificate first (see
+[DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#status-and-metrics)).
 
-The [migration qualification findings](VECTOR_STORAGE_MIGRATION_FINDINGS.md)
-record the initial screen, the WAL-only page durability fix, and the shared
-restart cost found in both fresh and migrated tables. Page durability must not
-force one SSTable per progress update. Query comparisons include a matched
-restart in every arm so ingestion-time identity caches do not confound them.
+Current single-screen results (final binary, 768-D synthetic corpus, 1,000
+updates and deletes; not repeated ABBA): at 1M, online migration plus churn takes
+449 s and offline 531 s, and both migrated tables finish within 1% of fresh total
+disk (about 3.98 GB) once the `reclaiming` phase has run. After a matched
+restart, online semantic QPS is within about 6% of fresh and offline within about
+12%. Online migration's sampled peak RSS is about 71% above a fresh table
+(11.7 versus 6.8 GiB), so online operators need temporary memory headroom within
+normal admission. Same-index conversion preserves ordered top-10 neighbor lists
+exactly through online and offline migration and restart.
 
 Reverse migration, migration-overlap backup/restore, HA/replication and broader
 topology remain separately qualified work. Migration-overlap backups/restores
@@ -218,6 +249,12 @@ are rejected; a primary-only backup cannot capture reference closure. After
 publication, changing the setting or booting an older binary is not rollback.
 Returning to primary ownership requires a reverse conversion or a consistent
 pre-migration backup with an explicit data-loss boundary.
+
+A shared post-churn query cost affects fresh and migrated tables alike:
+live-document constraints map nonvisible document ordinals to ANN member IDs
+before search, and missing mappings fall through primary and legacy identity
+lookups without being cached as misses. Fixing it must keep generation-aware
+visibility and one-to-many chunk/multi-source behavior.
 
 ## Objective
 
@@ -237,9 +274,11 @@ reclamation. Performance improvements must be measured; physical separation
 alone does not eliminate vector WAL traffic, vector compaction, or ANN work.
 
 Repeated qualification at 1M-document scale confirms the intended benefit in
-practice: promoting the vector store as the default source-embedding owner
-reduces total disk usage by roughly 41% at comparable recall and query
-throughput.
+practice. The current same-binary comparison (two AB/BA pairs) shows 43.4% less
+total allocated disk after restart, including journals, at 0.990 recall, with
+higher peak and mixed query throughput; churn and reclamation are slower. The
+earlier pre-refinement qualification measured about 41%. Numbers and tradeoffs
+are in [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md#source-ownership-at-1m-2026-09-14).
 
 ## Ownership
 
@@ -466,9 +505,8 @@ exposing the table. Shard split, merge, and movement must transfer the same
 logical ownership and recovery evidence; no imported primary reference may
 depend on an unretained file in the old shard.
 
-## Relationship to this branch
+## Code map
 
-The branch already contains relevant machinery:
 
 - [vector_block_store.zig](pkg/antfly-embedded/src/storage/vector_block_store.zig):
   table-level exact-vector blocks, committed WAL batches, `CURRENT`
@@ -479,14 +517,38 @@ The branch already contains relevant machinery:
   vector generation metadata and coverage.
 - [artifact_codec.zig](pkg/antfly-embedded/src/storage/db/enrichment/artifact_codec.zig):
   existing embedding artifact representation and source metadata.
-- [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md): measured primary-store
-  costs, shared exact-vector experiments, and current qualification limits.
+- [artifact_payload.zig](pkg/antfly-embedded/src/storage/artifact_payload.zig)
+  and [vector_payload_store.zig](pkg/antfly-embedded/src/storage/vector_payload_store.zig):
+  reference conversion and the table-owned source store (see
+  [Ownership paths](#ownership-paths)).
+- [table_storage.zig](pkg/antfly-embedded/src/common/table_storage.zig): the
+  persisted `dense_embeddings` setting and creation policy.
+- [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md): benchmark contract,
+  reference numbers and experiment flags.
 
 Reuse and evolve this shared store rather than introducing another permanent
-exact-vector copy. Existing durable vector files and native ANN authority do
-not by themselves prove that all primary embedding payloads can be removed.
-Source ownership, transactions, repair, replication, and backup must first
-support the reference-only representation.
+exact-vector copy. Reference-only authority requires every relevant reader,
+transaction, repair, replication and backup path to support it; paths that do
+not are gated (see [Table setting](#table-setting)).
+
+## Correctness boundaries
+
+| Boundary | Mechanism | Still to prove |
+|---|---|---|
+| Artifact/model/version identity | `Reference.forArtifact` hashes the artifact key and full envelope; lookup is never keyed only by document ID | Each producer's model/index/incarnation key and stale-completion fence through update, delete, recreate and rebuild |
+| Prepare before primary commit | `Txn.commit` stages the reference epoch and prepares durable payloads before the primary commit; unresolved outcomes fence the session | Injected-failure sweeps across every allocation and durability boundary |
+| GC reachability | Primary snapshot, durable ANN references, post-cut tail and rescued preparations are retained; a newly rescued owner invalidates the complete receipt | Concurrent mark/prepare/delete/cancel/publication and repeated reopen |
+| Historical readers | Read sessions precede primary read transactions; ANN snapshots retain source blocks and WAL roots | Teardown order and borrowed directory/cache lifetimes across serving replacement and last-index drop |
+| Publication failure | Failed planning discards its mark; ambiguous publication poisons the writer and preserves files | Failure sweeps across planning, reader reopening, inventory and receipt publication |
+| Deployment scope | Source open rejects unsupported backends/HA; lifecycle operations have explicit gates | Restore, movement, split and HA ownership proofs |
+
+Collector memory is admitted before allocation: GC prepares readers and
+inventory before publication, reuses the committed WAL suffix, and keeps the
+current generation on pre-publication failure; the mark map and source leases
+are admitted against the resident ANN snapshot, and rejected setup releases its
+snapshots and retries later. As of the 2026-09-08 review, exact all-live
+reachability verification reads (CRC-checks) payload bytes; separating it from
+scrubbing must keep an explicit integrity boundary.
 
 ## Table setting
 
@@ -574,86 +636,55 @@ wherever their existing capability checks permit, including applicable
 LSM-serving paths, and do not change a persisted format or metric. Other
 experimental GC, admission, cache and read policies remain off by default.
 
-## Implementation sequence and acceptance
+## Qualification requirements
 
-### First milestone: fresh-table experiment
+The fresh-table milestone (mode threading, reference/recovery protocol,
+recovery tests before timing, per-table accounting, public A/B) and the scoped
+default promotion are complete. Broader rollout keeps these requirements:
 
-The first milestone is a small, crash-safe implementation that actually removes
-full embedding payloads from primary artifact values. Migration of existing
-tables is subsequent work.
+- Inventory every producer and consumer of primary embedding bytes, including
+  enrichment, external embeddings, artifact APIs, rebuilds, repair, backup,
+  replication and shard movement. During any transition, a dual representation
+  has explicit authority and verification rules; fallback must not mask missing
+  committed data after authority has moved.
+- Keep vector bytes out of primary memtables and SSTables. Temporary full bytes in
+  transaction/replay journals need explicit retention boundaries.
+- Correctness coverage: crash injection around prepare/commit and publication,
+  ambiguous writes, idempotent retries, stale enrichment results, old snapshots
+  across update/delete/compaction, multi-index sharing, index drop and rebuild,
+  backup/restore, replication and shard lifecycle, allocation failure and
+  admission pressure.
+- Measure primary WAL/memtable/SSTable bytes, total durable bytes across both
+  stores and journals, compression CPU, compaction read/write bytes, vector read
+  amplification, directory/cache demand, retained-version and orphan bytes, and
+  maintenance/replay lag. Report memory demand separately from cache-inclusive
+  RSS, and include overwrite/delete workloads.
 
-1. Thread the mode through public table creation, catalog persistence,
-   provisioning, and DB open. Define a common artifact payload interface for
-   both modes. Separate source-store lifetime from `IndexManager`'s ANN
-   lifecycle so a table with zero indexes can still own embeddings.
-2. Specify stable artifact-version references, source fencing, and the
-   prepare/commit recovery protocol. Reuse the shared vector store for external
-   embeddings, enrichment results, updates, deletes, artifact reads, and index
-   rebuilds. The experimental mode must commit references instead of full
-   primary artifact payloads.
-3. Prove recovery before timing the implementation. Exercise failures around
-   preparation and primary commit, ambiguous outcomes, retries, stale results,
-   retained readers, and restart. Verify that dropping the last ANN index
-   preserves artifacts and that a new index rebuilds from them. Validate or
-   explicitly gate each deployment and lifecycle path before admitting use.
-4. Add per-table accounting for both stores and transaction/replay journals.
-   Attribute physical bytes and retained buffers to their owners and record
-   retention boundaries. A dual-write diagnostic may help verify equivalence,
-   but does not qualify the reference-only design's performance.
-5. Run controlled public-API A/B qualification as described below. Only then
-   expand deployment support and implement existing-table migration.
+A/B qualification creates fresh `primary_lsm` and `vector_store` tables with the
+same binary and public API, runs them sequentially on one host in alternating
+order, records the effective persisted mode, and holds dataset/order, shard
+count, encoding, ANN settings, exact scoring, batch size, writer concurrency,
+sync level and resource limits constant. Run 50K, then 1M once correctness and
+50K regressions are understood. Compare ingest and catch-up separately, query
+throughput and tails, disk, memory, compaction/reclamation, mixed updates and
+deletes, cold and warm restart, and post-churn reclamation, with completed
+operation counts. Also exercise enrichment and mixed full-text/vector use. An
+improvement must not come from unaccounted bytes in another store, weaker
+durability or exact scoring, or deferred reclamation. The benchmark contract is
+in [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md#benchmark-contract).
 
-### Broader rollout
+## Open work
 
-1. Specify reference identity, source-version fencing, and the commit/recovery
-   protocol. Inventory every producer and consumer of primary embedding bytes,
-   including enrichment, external embeddings, artifact APIs, rebuilds, repair,
-   backup, replication, and shard movement.
-2. Add versioned resolution through the shared vector store. During transition,
-   any dual representation has explicit authority and verification rules;
-   fallback cannot mask missing committed data after authority has moved.
-3. Move artifact commits to prepared payloads plus primary references. Keep
-   vector bytes out of primary memtables and SSTables. Any temporary full bytes
-   required in transaction/replay journals have explicit retention boundaries.
-4. Gate reference-only authority on the capabilities of every relevant reader,
-   replica, backup, and recovery path. Migrate existing artifacts with a captured
-   source boundary, preserve concurrent mutations, and switch authority
-   atomically before reclaiming old primary payloads.
-5. Qualify correctness and performance before removing transitional paths.
-
-Required correctness coverage includes crash injection around prepare/commit
-and publication, ambiguous writes, idempotent retries, stale enrichment results,
-old snapshots across update/delete/compaction, multi-index sharing, index drop
-and rebuild, backup/restore, and replication/shard lifecycle recovery. Include
-allocation failures and admission pressure where ownership changes occur.
-
-Measure primary WAL/memtable/SSTable bytes, total durable bytes across both
-stores and journals, compression CPU, total compaction read/write bytes, vector
-read amplification, directory/cache demand, retained-version and orphan bytes,
-and maintenance/replay lag. Report memory demand separately from cache-inclusive
-RSS. Include overwrite/delete workloads to expose reclamation debt.
-
-### Controlled A/B qualification
-
-Create fresh `primary_lsm` and `vector_store` tables using the same binary and
-public API. Run them sequentially on the same host to avoid mutual resource
-contention, alternate run order, and repeat measurements. Record the effective
-persisted mode in each result. Hold dataset/order, shard count, vector encoding,
-ANN settings, exact scoring policy, batch size, writer concurrency, sync level,
-and resource limits constant. A change in storage ownership must not silently
-select a different search or durability configuration.
-
-Start with public 50K qualification, then run 1M after correctness and any 50K
-regressions are understood. Compare ingest and catch-up separately as well as
-total readiness; query throughput and latency tails; total disk usage; memory
-demand and RSS; and compaction/reclamation work. Include mixed updates and
-deletes, cold and warm restart, and post-churn reclamation. Report completed
-operation counts so fixed-duration runs with different write volumes are not
-treated as identical memory workloads.
-
-Also exercise normal enrichment and mixed full-text/vector use. An improvement
-must not come from moving unaccounted bytes into another store, weakening
-durability or exact scoring, or waiting indefinitely to reclaim obsolete
-payloads. Report tradeoffs and unresolved regressions explicitly before deciding
-whether the result warrants migration and broader deployment support.
-
+- Reverse migration, migration-overlap backup/restore, snapshot/backup and split
+  for `vector_store` tables, HA/replication and topology changes.
+- Small-table query variability and slower reclamation/churn before any broader
+  default promotion (see [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md#open-work)).
+- The shared post-churn identity-lookup cost above.
+- Separate foreground and idle source-GC copy budgets remain unimplemented:
+  background steps use one `ANTFLY_SOURCE_VECTOR_GC_STEP_BYTES` budget (capped at
+  8 MiB), so sparse-only fallback can still copy during foreground work, and
+  copy-set construction and sorting remain locked
+  ([history](../docs/design/vector-store/history/experiments-2026-09.md)).
+- Finish the failure/lifetime audit in [Correctness boundaries](#correctness-boundaries)
+  before adding another ownership or publication mechanism. A fully incremental
+  owner-delta collector would need primary/ANN reconciliation and restart proofs.

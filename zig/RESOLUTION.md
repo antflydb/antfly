@@ -141,7 +141,7 @@ the v1 runtime intentionally exposes one blocking strategy per resolver.
 ### 2. Scoring (comparison levels -- "Fellegi-Sunter")
 
 The scorer is the one pluggable interface. It is **implemented** today in
-`zig/lib/matcher/` and is pure, deterministic, and allocation-light so it is
+`zig/pkg/antfly-embedded/matcher/` and is pure, deterministic, and allocation-light so it is
 safe inside replay workers.
 
 A `Comparison` pairs a field on the mention (`left`) with a field on the
@@ -178,7 +178,7 @@ probability.
 }
 ```
 
-Supported comparators (see `lib/matcher/src/mod.zig`):
+Supported comparators (see `pkg/antfly-embedded/matcher/src/mod.zig`):
 
 | Comparator     | Operates on | Notes |
 |----------------|-------------|-------|
@@ -232,7 +232,7 @@ Generality lives in the comparator + level space, not in arbitrary code.
 
 ## Resolution Stage Runtime (backend_runtime)
 
-The resolution stage worker body is implemented in `lib/resolver` as
+The resolution stage worker body is implemented in `pkg/antfly-embedded/resolver` as
 `ResolutionStage`, behind two vtable seams so it stays pure and unit-testable:
 
 - `ArtifactStore` -- `get`/`put`/`delete` of artifact bytes by primary-store key.
@@ -519,13 +519,13 @@ Open/index/enrichment validation should reject:
 
 The design in this document -- deterministic resolver, promoter, fusion data
 model, and cross-shard candidate blocking -- is implemented and tested. The
-scorer and comparators live in `lib/matcher`; the resolver core, resolution
-stage, and `DocRef` type live in `lib/resolver`; the resolution and promotion
+scorer and comparators live in `pkg/antfly-embedded/matcher`; the resolver core, resolution
+stage, and `DocRef` type live in `pkg/antfly-embedded/resolver`; the resolution and promotion
 managed replay stages are `resolution_runtime.zig` and `promotion_runtime.zig`;
 cross-shard candidate blocking and the promoter's cross-shard entity sink are
 `api/distributed_candidate_source.zig`; and the resolver catalog persists
 through `resolver_catalog.zig` and `table_provisioner`. Test coverage spans
-`lib/matcher`, `lib/resolver`, and the `antfly-storage-db-test` /
+`pkg/antfly-embedded/matcher`, `pkg/antfly-embedded/resolver`, and the `antfly-storage-db-test` /
 `e2e/antfly/test_resolution.py` suites.
 
 Learned-weights resolution, a review queue/curation UI, entity merge/split, and
@@ -579,17 +579,42 @@ and both are served by the same seam:
    query can hydrate promoted entity docs across shards. Verified by db-tests and
    the live multi-node e2e.
 
-Embedding generation for ANN blocking and entity+edge atomicity are not yet
-built; see "Open work" below.
+Lite supports candidate reads and atomic promotion across named tables. A
+configured `name_embedding` is generated from each mention using the destination
+table's dense embedding index configuration, before ANN candidate blocking.
+Configure `candidate_search: "ann"`, `candidate_ann_index`, `name_embedding`,
+and `name_embedding_dims` to match that index. The entity table needs a dense
+index over its canonical name; its embeddings and the query mention must use
+the same model and dimensions. `run_until_idle_json` drains destination tables
+as well as source tables, including recursive generator/resolver pipelines.
+
+For known synonyms, write an entity document at the exact minted alias key
+with `merged_into` set to the surviving canonical key (and `merged_into_table`
+for a different table). The survivor must exist. Exact aliases are followed
+before statistical scoring, even when no scorer is configured; dangling
+redirects never authorize a match. This allows deterministic corrections such
+as `concept/qwen3` → `concept/qwen3_embedding` without embeddings.
+
+The `slug` template helper is ASCII-only for compatibility with existing keys.
+Use the opt-in `{{ uslug _entity.text }}` helper for Unicode identities. It
+normalizes with NFKC, folds case, retains Unicode letters and numbers, and
+separates runs with `_`. `Qwen3`, `qwen3` and `Ｑｗｅｎ３` become `qwen3`;
+`Straße` becomes `strasse`; `東京 大学` becomes `東京_大学`. The Unicode 16.0.0
+normalization tables are checked in, independent of the host locale. Existing
+non-empty `slug` keys retain their spelling. Both helpers reject an empty
+result with `EmptyEntityKey`, including all-CJK inputs passed to ASCII `slug`,
+so a resolver cannot silently mint `entity/`. Keep the original mention in
+`canonical_name` and `aliases` for display and search.
+
+Resolution merges mentions that extraction found; it cannot recover a missing
+subject. For short claims, use specific labels and descriptions naming the
+expected domain (for example, model or software component), and measure recall
+on representative claims while lowering the extraction threshold. Lower
+thresholds also increase false positives. Track missing main subjects separately
+from synonym resolution and keep an application-supplied subject when available.
 
 ## Open work
 
-- **Name-embedding generation for ANN blocking.** ANN candidate search needs
-  the mention `name_embedding` to be produced -- a name-embedding enrichment
-  over the extraction entities (an `embedding` artifact the resolver reads),
-  reusing the dense-embedding producer already in the enrichment runtime. This
-  is the recommended next step, since it unblocks the `ann` candidate source
-  end to end.
 - **Entity + edge atomicity.** Entity promotion is transactional across entity
   shards, but atomically coupling the entity upsert with graph-edge artifacts
   needs a graph-edge participant in `TableCommitRequest`. Until then, entity
@@ -612,3 +637,336 @@ built; see "Open work" below.
 Recommended order: (a) the name-embedding enrichment to feed the cross-shard
 `ann` source, (b) graph-edge participation in `TableCommitRequest` for optional
 entity+edge atomicity.
+
+
+### Per-mention admission and replay isolation
+
+A mention whose `slug` or `uslug` is empty is skipped before embedding or candidate
+blocking. Other mentions in the document still resolve. The resolution artifact
+records `skipped_mentions`, and the native log identifies the skipped local ID.
+Invalid templates and resource failures still fail the operation.
+
+Graph replay ignores corrupt persisted resolution entries individually, preserving
+valid siblings and logging each omission. An unparseable resolution artifact contributes
+no endpoints; it does not invent owning-document or raw-text fallback endpoints and
+does not prevent unrelated artifacts from materializing. Allocation/storage failures
+still propagate.
+
+ANN vector hydration follows the scorer's candidate field names for comparisons
+against the mention `name_embedding`. Text-only scorers consume the original stored
+JSON. A hit whose indexed vector disappeared remains a candidate with a missing
+value; it does not abort processing of the remaining hits.
+
+
+### Original two-hop request (#1089)
+
+The regression uses the original request verbatim (with the configured index name
+substituted for `<graph>`), including default node deduplication. It asserts the
+second claim is reached through a shared concept, with paths and documents enabled.
+The same request also passes on the issue's reported revision `1258e8cfcb`, returning
+the second claim at depth 2 with its document and a three-node path. This rules out
+a general unsupported-option/parser restriction at that revision. The original
+failure is not reproduced; identifying it requires the original database state or
+linked native binary rather than guessing a routing fix.
+
+The receipt and test-only patch are retained in
+`pkg/antfly-embedded/testdata/issue1089_two_hop_baseline.{json,patch}`. To reproduce,
+create a detached worktree at `1258e8cfcb`, apply the patch, then run from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py build capi-test -Dembedded-only=true \
+  '-Dtest-filter=--test-filter=capi issue1089 original revision exact two hop request' -j1
+```
+
+## Query keys, aliases, and migration (Lite native)
+
+Use `antfly_db_render_resolver_key_json(db, resolver_name, mention_json, &out)`
+with `{"text":"Qwen3","label":"concept"}`. It reads the durable resolver,
+executes its exact key template (including Unicode 16 NFKC/case folding and
+attached combining marks), and returns `minted_key`, alias-canonical `key`,
+`table`, and `config_generation`. Free the result with `antfly_buffer_free`.
+Python exposes `db.render_resolver_key("concepts", mention)`; Go exposes
+`db.RenderResolverKeyJSON("concepts", mentionJSON)`. This is a read-only render
+operation: it does not extract text, run ANN, or create documents. Extract
+mentions using `Inference.extract` first if needed, or use `resolve_query` below
+to run the configured extractor and ANN resolution together. Query callers must
+use the configured resolver name, not copy its template into application code.
+
+Inline resolvers accept aliases between **fully rendered keys**, for example:
+
+```json
+"aliases": [{"key":"concept/qwen3","target":"concept/qwen3_embedding"}]
+```
+
+These explicit aliases take precedence over fuzzy matches and require no
+canonical entity documents. Set `promote: false` and `table` to `default` to keep keys in the source
+table without creating an entity table. With `promote: false`, both minted and aliased mentions produce graph keys
+without materializing entity documents. Alias chains are followed;
+empty keys, duplicate sources, and cycles are rejected. Aliases use exact key
+bytes; use the render API when deriving either endpoint from text. Known alias
+redirects also canonicalize scorer-selected keys in the resolver's table.
+
+To merge an existing key after ingestion, call
+`antfly_db_merge_resolver_keys_json(db, resolver, {"key":"concept/old","target":"concept/new"})`,
+or Python `db.merge_resolver_keys(resolver, old, new)`, or Go
+`db.MergeResolverKeysJSON(resolver, requestJSON)`. This atomically persists the
+redirect and its corpus-backfill cursor, bumps the resolver generation, and
+returns before replay. Repeat requests are idempotent; replacing an existing
+redirect is rejected (merge its canonical target instead). `run_until_idle`
+then re-resolves stored extraction artifacts and replaces their mention and
+relation edge contributions. It retains unrelated graph contributors. Reopen
+resumes pending backfill from the durable catalog/cursor. Concurrent rendering
+may observe either complete resolver generation, not an uncommitted alias.
+
+This operation changes **resolver-owned identity**, not arbitrary manually
+supplied edges. With promotion enabled, its existing merge path updates entity
+documents and leaves redirects for prior promoted keys. With `promote: false`,
+entity documents are untouched;
+application references outside resolution artifacts need their own migration.
+Human-curated per-document overrides keep their existing precedence. Source
+artifacts must still exist for replay. Treat a template/helper change as an
+identity migration; aliases preserve old query seeds while replay converges.
+Reapplying an old inline resolver config can replace its alias list, so keep
+migration aliases in the application configuration too.
+
+## Embedding merge recipe and ordering
+
+The supported setup uses public table/index calls; it does not silently create
+or take ownership of an application's entity table. The real Qwen regression
+`TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity` executes
+this recipe through `AddIndexJSON` and tests a non-empty merged key. Set
+`ANTFLY_LITE_EMBEDDING_MODELS_DIR` to a model root containing the Qwen bundle to
+run it.
+
+1. Open Lite with profile `native`, local inference enabled, and an explicit
+   `models_dir` containing both extraction and embedding bundles. For a JSON-field
+   artifact without a model producer, also enable `generated_enrichment_replay`.
+2. Create an `entities` table and open its handle. Add this index to it:
+
+```json
+{"name":"names","type":"embeddings","dims":1024,"field":"canonical_name","metric":"cosine","embedder":{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF"}}
+```
+
+3. Add an artifact-backed graph index to the source table with this inline
+   resolver (the `kg` artifact can be produced by an extractor or a JSON field):
+
+```json
+{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":25,"name_embedding":"names","name_embedding_dims":1024,"type_must_match":true,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"name_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}
+```
+
+`name_embedding` names the destination table's configured embedding index, not
+an arbitrary model ID. The mention and candidate must use the same model and
+dimensions. The cosine floor (`0.9` above) controls semantic similarity; the
+matcher decision (`0.9`) is a separate logistic-score threshold. Calibrate both
+on actual synonyms and hard negatives. Keep `type_must_match` unless your label
+policy explicitly allows merging across types. Known aliases need no seed
+documents; optional curated ANN seeds use `canonical_name` and `entity_type`.
+
+A successful **database-root** `run_until_idle` drains all tables repeatedly,
+including embeddings queued by cross-table promotion. Entities promoted during
+that drain are ANN-visible to requests submitted **after it returns**. Candidate
+search inside a drain can precede another document's promotion/embedding;
+within-batch document order is not an ANN visibility guarantee. For deterministic
+incremental merging, submit one ingestion unit, drain the root, then submit the
+next. Batch ingestion may mint separate keys; use the explicit merge API and
+another drain to reconcile them. A failed/non-convergent drain does not provide
+the barrier. This contract avoids order-dependent claims that a replay batch
+or candidate snapshot cannot satisfy.
+
+## Comparing extraction configs
+
+`scripts/eval_extract.py` runs two or more extraction-v2 configs against the same
+labelled JSONL corpus through the public embedded inference API. Example:
+
+```sh
+PYTHONPATH=py/packages/embedded/src python scripts/eval_extract.py \
+  --models-dir "$ANTFLY_INFERENCE_MODELS_DIR" \
+  --corpus scripts/testdata/eval_extract/corpus.jsonl \
+  --config scripts/testdata/eval_extract/plain.json \
+  --config scripts/testdata/eval_extract/descriptions.json \
+  --output comparison.json
+```
+
+Set `ANTFLY_LIBRARY` if the shared library is not on its normal search path.
+The report records installed models, config/corpus SHA256s, effective configs,
+raw outputs, timings, per-label mention counts, and exact-span precision,
+recall and F1. Annotation offsets are Unicode code points, end-exclusive.
+Duplicate label/spans are counted once; repeated text at different offsets is
+counted separately. Every row needs an explicit `entities` list, including
+negative examples. Undefined denominators are `null`, not perfect scores.
+Malformed annotations, incompatible response offsets, and inference errors
+fail the run. The bundled two-document corpus is a smoke fixture, not an
+accuracy benchmark. Use held-out domain annotations before choosing a config.
+
+Descriptions are prompt/schema input, not output filters; changing them can
+change logits, token budget and which candidates cross `threshold`. Compare
+both descriptions at fixed threshold/window geometry first, then sweep
+thresholds on a development split and evaluate the selected setting on a
+held-out split. Longer windows increase context and attention cost while
+reducing window count; overlaps can recover boundary mentions and affect
+cross-window duplicate merging. Keep identical geometry when isolating the
+effect of descriptions, and inspect empty outputs as well as precision.
+
+Windowed descriptions and single-label classification are qualified for the
+FP32 base and multi-Decide bundles described in [the qualification guide](pkg/inference/models/gliner2/GLINER25.md). The fp16-encoder
+base remains qualified only for its existing feature set; windowed descriptions
+are unsupported and **not planned for this implementation**. Its measured Metal
+throughput is worse than FP32, and FP32 remains the recommended bundle. A future
+fp16 description qualification requires pinned upstream non-empty fixtures and
+reviewed parity tolerances; this change does not widen its advertised capabilities.
+
+### Resolve ad-hoc query text and mentions
+
+`antfly_db_resolve_query_json(db, resolver_name, request, out)` (Go
+`ResolveQueryJSON`, Python `Database.resolve_query`, Rust `resolve_query_json`)
+accepts exactly one of:
+
+```json
+{"text":"What did Apple announce in Cupertino?"}
+```
+
+```json
+{"extraction":{"entities":[{"id":"q0","label":"company","text":"Apple"}]}}
+```
+
+The text form invokes the extractor producer on the resolver's source asset,
+with its durable model, schema, descriptions and thresholds. The extraction form
+lets callers keep their own GLiNER extraction and still use Antfly's full
+resolution pipeline. Both return `{extraction, resolution}`; `resolution.entities`
+contains canonical `doc_ref` (table/key), decision, confidence, and mention
+identity. Empty or unkeyable mentions are reflected in `skipped_mentions`.
+
+Resolution uses the same label routing, sibling identities, explicit aliases,
+exact/prefix/ANN candidates, configured mention embeddings, and scorer as
+write-time resolution. Configure `candidate_search:"ann"`, `candidate_ann_index`,
+`name_embedding`, dimensions and the scorer as in the embedding-merge recipe
+above. Supplied mention vectors are accepted too. Existing embeddings must be
+visible before querying; drain the root after writing candidate documents.
+Explicit aliases do not require canonical documents or embedding IO.
+
+Query extraction and resolution never publish a synthetic document, resolution
+artifact, promotion, graph edge, or replay record. They also work on read-only
+handles. Read-only text queries lazily cache a foreground extractor producer on
+the handle, reusing its inference provider and loaded models across calls.
+Only cache construction holds the producer mutex; each extraction gets an
+invocation context and uses the synchronized capability cache. Native Lite
+captures an owned extractor plan and pins its root inference snapshot, then
+releases the connection, path gate and file lease during text extraction.
+Concurrent text queries and writer commits can proceed on the same database
+path. The short canonical lookup/resolution phase reacquires a current snapshot;
+a resolver or extractor config change during extraction returns a retryable busy
+error. Model execution/admission gates still apply. Named tables share their root
+snapshot's cache. Retired snapshots retain providers until their last in-flight
+query finishes; the cache is released with the snapshot.
+They use resolver-level aliases and ignore document-specific curation
+since the query has no stored document identity. Queries currently require an
+asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
+resolver is rejected rather than inventing chunk context. The text form requires
+an extractor producer; copy-only or missing source assets fail with a diagnostic.
+For callers that only need template/alias rendering, `render_resolver_key` stays
+available and avoids extraction, embeddings and candidate search.
+
+### Durable merges, config replay and compatibility
+
+API-created key merges live in `resolver_merges_v1` metadata, separately from
+inline `aliases`. The resolver catalog records their version and generation;
+merge state, generation, and backfill cursors commit in one transaction. Normal
+inline config upserts preserve merge state even when callers omit all aliases.
+Callers can keep reapplying declarative index configs on open without reading
+curated merges first. Replaying an identical native index config on an existing
+index is idempotent, including after close/reopen; a different physical config
+is rejected. Durable merges take precedence over an inline redirect of
+the same source. Removing a resolver deliberately removes its associated merge
+state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
+import validate and preserve durable merge state. Once merges exist, changes to
+`table` or `key_template` are rejected with a namespace diagnostic; callers must
+explicitly reset or migrate the identities before changing their namespace
+using `set_resolver_namespace` (C `antfly_db_set_resolver_namespace_json`, Go
+`SetResolverNamespaceJSON`, Rust `set_resolver_namespace_json`).
+The effective resolution revision advances on either a config change or merge,
+even when the incoming config generation equals the preceding merge revision.
+For example, config generation 2 → merge → config generation 3 yields effective
+revisions 2 → 3 → 4. Identical config replay leaves the revision unchanged.
+Namespace operations preserve the caller-owned `config_generation` and advance
+the internal clock, so reapplying the correctly updated inline config does not
+schedule a second replay.
+Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
+rather than silently resolving keys differently. Both mention and relation
+edges are reconciled on the root drain, including removal of old endpoints.
+
+The namespace request contains `table`, `key_template`, and exactly one of:
+
+- `reset_merges:true`: explicitly discard durable redirects and inline aliases.
+  Optional `aliases:[...]` supplies their complete replacement under the new
+  namespace; omitting it leaves no inline aliases. This is also the explicit
+  way to change aliases after a namespace fence has been installed.
+- `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
+  stored inline/durable alias source and target into the new namespace. Incomplete
+  maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
+  fail before mutation. Existing merges are transformed, preserving identity
+  relationships rather than deleting the resolver.
+
+The operation validates the destination table and commits the config, merge store,
+and replay cursors atomically. Call `run_until_idle` to reconcile resolver-owned
+mention/relation edges. Application-owned documents and references are not
+renamed. Update your declarative inline config to the new table/template and
+mapped inline aliases before reapplying it. A durable namespace fence rejects
+old table/template or alias configurations even after reset leaves zero merges.
+Further identity changes require another explicit namespace operation. Changing an existing physical index config still requires
+its normal delete/recreate lifecycle, which preserves the resolver and merges.
+Resolver identity is scoped by source table and resolver name, independently of physical
+index names: deleting index v1 and adding index v2 with the same resolver name
+and source/output artifact bindings retains merges and namespace fences. Renaming
+the resolver itself creates a new identity; removing it deliberately deletes its
+curation.
+Existing artifact/index repair APIs rebuild derived state under the declared
+identity rules; they do not infer a key migration. This namespace operation
+reuses the existing resolver replay/repair pipeline for derived reconciliation.
+
+Only material resolution changes (including an explicit `config_generation`
+bump) schedule replay; changing revision bookkeeping alone does not. A changed
+scorer, routing rule or identity rule can affect every subscribed document and
+requires scanning its source corpus. Backfill skips source artifacts whose
+subscribers already have the current internal resolution revision, avoiding
+unrelated journal writes, ANN searches and embedding generation. The internal
+clock also advances on material changes before the first merge. Stale empty
+resolutions with no currently routed mentions are skipped; nonempty previous
+decisions are always revisited to retire removed labels/edges. A global scorer
+change necessarily revisits every source with eligible mentions; it cannot
+safely infer unchanged decisions without evaluating the new scorer. Older
+catalogs acquire the internal clock on their first material change. Identical
+config reapplication incurs no backfill. Portable import cross-checks sidecar
+records against the resolver catalog before publishing destination state,
+including missing required records and orphan/duplicate records.
+
+Default resolver catalogs omit new default fields (`aliases:[]`, `promote:true`,
+and zero merge metadata), retaining the previous wire shape. The current reader
+tolerates unknown optional fields and rejects unsupported `merge_state_version`
+values explicitly. **Downgrading a database using aliases, disabled promotion,
+or durable merges to a library predating those features is unsupported.** Such
+old strict readers reject the feature metadata; this is intentional protection
+against silently losing identity rules. Keep a pre-upgrade backup for rollback,
+or export primary application documents and rebuild a separate older database.
+Do not delete merge metadata or strip feature fields to force an old open.
+Files written by interim PR builds are not a supported downgrade format.
+
+The normal native regression now ingests an extraction, promotes its first
+entity, computes its embedding through the enrichment runtime, drains the root,
+and matches a different mention through ANN. It uses a deterministic embedding
+provider for both canonical entities and mentions so the ordering contract runs
+in ordinary CI. The required public Python Qwen test downloads the SHA-pinned
+Q8 bundle from the runtime registry, exercises the same promotion/drain/second-
+mention path with real embeddings and checks ad-hoc ANN query resolution.
+The opt-in Go Qwen test also exercises this contract. Neither test writes a candidate entity
+or its vector by hand.
+
+Both base and full-validation jobs run the required real extraction and public
+Qwen embedding gates. The pinned CPU extraction CI test sets
+`ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1`: missing runtime/model support is an error,
+not a skip. CI then runs `scripts/eval_extract.py` through its real-model gate on
+`regression.jsonl`, compares plain/described schemas, checks minimum precision
+and recall and non-empty correct spans for each label, and uploads the complete
+report even on failure. This 23-document curated regression set includes six
+negative documents, repeated names, accented/Arabic/Indic text, and a document
+long enough to require windowing. It remains a regression set, not a claim of
+production-domain accuracy; domain-specific labelled evaluation is still needed.

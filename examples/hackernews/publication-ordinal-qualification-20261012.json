@@ -1,0 +1,234 @@
+{
+  "kind": "passed_one_file_ordinal_stored_source_qualification",
+  "source_revision": "048692502a97f9fbb7cd62e0cb039efef1148aa2",
+  "harness_revision": "3e583ab70dbb32486b854b4a9b3b7758cfe842e0",
+  "binary_sha256": "890816fd4c127610bf2987b66825bc120d30a00481235490af84e22bd31b697e",
+  "rows": 142577,
+  "source_format": "untouched BigQuery Parquet export",
+  "store_source": true,
+  "cold_cache_cleared_each_cycle": true,
+  "passed": true,
+  "failures": [],
+  "criteria": {
+    "warm_p95_ms": 750,
+    "concurrent_max_ms": 2000,
+    "restart_ms": 2000,
+    "cold_ms": 10000,
+    "filter_p95_ms": 2000,
+    "build_seconds": 2700,
+    "peak_rss_fraction": 0.85,
+    "cursor_min_hits": 4097,
+    "cursor_p95_ms": 2000
+  },
+  "cycles": [
+    {
+      "cycle": 1,
+      "publication_seconds": 449.62,
+      "registration_seconds": 1.64,
+      "cold_ms": 7823.93,
+      "warm_p95_ms": 280.19,
+      "concurrent_max_ms": 526.58,
+      "restart_ms": 394.52,
+      "peak_rss_bytes": 343433216,
+      "cursor": {
+        "hits": 4110,
+        "initial_ms": 2277.04,
+        "continuation_p95_ms": 1215.35,
+        "restart_ms": 411.95,
+        "samples_ms": [
+          1294.9,
+          1215.35,
+          1071.43,
+          1206.96,
+          868.47,
+          690.86,
+          894.19,
+          869.0,
+          907.1,
+          1134.61,
+          896.86,
+          851.64,
+          905.71,
+          712.59,
+          515.18,
+          541.93,
+          535.04,
+          498.21,
+          478.62,
+          483.41,
+          484.39,
+          436.04,
+          415.66,
+          485.77,
+          414.8,
+          518.11,
+          455.92,
+          463.02,
+          492.67,
+          422.38,
+          436.24,
+          301.99,
+          256.37
+        ]
+      },
+      "filter_p95_ms": {
+        "item_type": 419.28,
+        "author": 299.16,
+        "points": 346.38,
+        "created_at": 299.6,
+        "combined": 317.1
+      },
+      "workload_p95_ms": {
+        "database": 313.35,
+        "postgres": 291.88,
+        "sqlite": 290.02,
+        "antfly": 275.09,
+        "AI": 384.87,
+        "the": 238.39
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "raw_report_sha256": "544c4cfd74c22dc215eb96b85ccdee26b8bb0a719185f0b9ffa76cc7499e5c6e"
+    },
+    {
+      "cycle": 2,
+      "publication_seconds": 0.22,
+      "registration_seconds": 0,
+      "cold_ms": 6353.44,
+      "warm_p95_ms": 278.85,
+      "concurrent_max_ms": 475.25,
+      "restart_ms": 425.65,
+      "peak_rss_bytes": 56799232,
+      "cursor": {
+        "hits": 4110,
+        "initial_ms": 1974.12,
+        "continuation_p95_ms": 1203.04,
+        "restart_ms": 406.04,
+        "samples_ms": [
+          1247.66,
+          1067.84,
+          920.84,
+          1203.04,
+          859.84,
+          736.39,
+          858.41,
+          904.86,
+          921.38,
+          1014.08,
+          863.39,
+          857.05,
+          903.93,
+          719.61,
+          519.12,
+          502.86,
+          545.69,
+          516.32,
+          548.94,
+          429.47,
+          426.69,
+          411.14,
+          399.89,
+          453.38,
+          412.52,
+          477.3,
+          432.9,
+          441.68,
+          423.89,
+          402.35,
+          450.65,
+          262.71,
+          259.66
+        ]
+      },
+      "filter_p95_ms": {
+        "item_type": 437.44,
+        "author": 291.82,
+        "points": 483.36,
+        "created_at": 290.76,
+        "combined": 316.28
+      },
+      "workload_p95_ms": {
+        "database": 273.97,
+        "postgres": 265.86,
+        "sqlite": 279.58,
+        "antfly": 247.07,
+        "AI": 297.53,
+        "the": 230.8
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "raw_report_sha256": "6319e41d542f6ef145b171b00301b700fa16bdb6ee9dfb26e00b765c32f1fbe7"
+    }
+  ],
+  "cleanup": {
+    "owned_worker_deleted": true,
+    "derived_publication_retained": true,
+    "source_preserved": true
+  },
+  "transport_retry": {
+    "original_attempt": "First cycle measurements were partial; the Kubernetes exec output stream reset before a complete report was retained. They are not counted as passing evidence.",
+    "completed_attempt": "Detached singleflight jobs with short status calls completed both cycles. Same source inventory and native binary.",
+    "raw_verdict_sha256": "b545ca48a2a83780f473cdfdfa30470b2acf87d2a50c595c1ecb82aa492a0ca6"
+  },
+  "local_validation": {
+    "native_focused_tests": 11,
+    "python_passed": 67,
+    "python_environment_skips": 16,
+    "python_subtests": 28,
+    "public_native_recovery_profiles": [
+      "primary_lsm",
+      "vector_store"
+    ],
+    "logs_sha256": {
+      "focused_native": "8adc8cabeb8c0620b0cc287c7ddaedffb6a9acfcf25295e6af8368152228d5ee",
+      "public_native_http": "8ae3bdddfa637a7757703014dcc27ef1e8df9f7c3fb5bda87d851a4a638aae19",
+      "python": "395fbda90c543e816c5074764b449741f9cc6bfe3e2376df86b5548219bdcaf5",
+      "storage_audit": "b055ca3119da66de9c0aefac32a7f0f66d9e35e4de51790685b3becc649febc8"
+    }
+  },
+  "limitations": [
+    "One partition with 142,577 rows; full-archive throughput and memory remain unqualified.",
+    "Cursor latency gate measures continuation p95 and restart; initial 128-hit pages measured 1,974\u20132,277 ms.",
+    "A first postgres workload request measured 2,322 ms in cycle one; its 20-sample p95 was 292 ms.",
+    "GCS-backed regional archive reads and filesystem-backed native recovery were tested separately; this is not a managed Cloud deployment or S3 recovery qualification.",
+    "CI requires independent human maintainer approval on the final PR revision."
+  ]
+}

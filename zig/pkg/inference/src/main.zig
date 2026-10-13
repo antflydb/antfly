@@ -176,7 +176,6 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
 
 fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
@@ -205,6 +204,7 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     var backend: ?inference.backends.BackendType = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
+        if (inference.backends.isRemovedOnnxBackendName(backend_name)) return error.InvalidArguments;
         if (parseBackendType(backend_name)) |parsed_backend| {
             backend = parsed_backend;
             model_name = model_name[backend_separator + 1 ..];
@@ -235,6 +235,8 @@ test "preload model parser preserves registry variants and recognizes explicit b
     const backend = try parsePreloadModelFlag("generator:metal:owner/model:i8");
     try std.testing.expectEqualStrings("owner/model:i8", backend.name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, backend.backend.?);
+
+    try std.testing.expectError(error.InvalidArguments, parsePreloadModelFlag("generator:onnx:owner/model"));
 }
 
 fn parseAdmissionLimit(value: []const u8) !usize {
@@ -571,10 +573,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
 
     print("antfly inference v{s}\n", .{build_info.version()});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
+    print("backends: native={} onnx={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
-        build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_cuda,
     });
@@ -790,10 +791,9 @@ fn isPredictorPull(args: []const []const u8) bool {
 
 pub fn printVersion(usage_name: []const u8) void {
     print("{s} v{s}\n", .{ usage_name, build_info.version() });
-    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
+    print("backends: native={} onnx={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
-        build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_cuda,
     });

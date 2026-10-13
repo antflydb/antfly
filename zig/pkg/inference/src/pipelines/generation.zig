@@ -15,11 +15,8 @@
 
 // Text generation pipeline.
 //
-// Two pathways:
-// 1. ortgenai (ONNX Runtime GenAI) — for models with genai_config.json
-// 2. Native autoregressive decoding — for native/GPU backends using GPT arch forward pass
-//
-// The native path runs gpt_arch.forward() to get logits, samples the next token,
+// Native autoregressive decoding for native/GPU backends using the GPT arch
+// forward pass. The pipeline runs gpt_arch.forward() to get logits, samples the next token,
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
@@ -27,7 +24,6 @@ const Gemma4Projection = @import("gemma4_channels.zig").Projection;
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
-const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -2250,7 +2246,7 @@ fn wholeModelExecutionPrefillChunkSize(
     bounded_swa_prefill: bool,
 ) usize {
     // Only the Metal whole-model runtime supports incremental prefill today.
-    // ONNX and PJRT reset their runtime on every prefill call, so splitting a
+    // PJRT resets its runtime on every prefill call, so splitting a
     // prompt would discard the KV state produced by the preceding chunk.
     if (backend_kind != .metal) return @max(prompt_tokens, 1);
     if (!bounded_swa_prefill and configured_chunk == 0) return @max(prompt_tokens, 1);
@@ -3182,159 +3178,6 @@ pub fn buildOwnedMixedBatchDecodeContext(
         },
     };
 }
-
-/// Generation pipeline backed by ortgenai (ONNX Runtime GenAI).
-pub const GenerationPipeline = struct {
-    allocator: std.mem.Allocator,
-    model: if (build_options.enable_onnx) *ortgenai.GenAiModel else void,
-    chat_template: ?*const ChatTemplate = null,
-    prompt_override: ?[]const u8 = null,
-    execution_control: ?InferenceExecutionControl = null,
-
-    pub fn generate(self: *GenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
-        if (!build_options.enable_onnx) return error.OnnxNotEnabled;
-        if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
-        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
-
-        // Format messages into a prompt
-        const prompt = if (self.prompt_override) |override|
-            try self.allocator.dupe(u8, override)
-        else if (self.chat_template) |ct|
-            try ct.applyWithOptions(self.allocator, messages, .{ .enable_thinking = config.enable_thinking })
-        else
-            try formatMessages(self.allocator, messages);
-        defer self.allocator.free(prompt);
-        if (self.execution_control) |control| try control.update(.executing, 0, @intCast(@max(config.max_tokens, 1)));
-
-        const gen_opts = ortgenai.GenerateOptions{
-            .max_tokens = config.max_tokens,
-            .temperature = config.temperature,
-            .top_p = config.top_p,
-            .top_k = config.top_k,
-        };
-
-        // Check for multimodal content (images in messages)
-        if (messagesHaveImages(messages)) {
-            // Collect all image bytes across messages
-            var all_images = std.ArrayListUnmanaged([]const u8).empty;
-            defer all_images.deinit(self.allocator);
-            for (messages) |msg| {
-                if (msg.image_bytes) |imgs| {
-                    for (imgs) |img| try all_images.append(self.allocator, img);
-                }
-            }
-
-            var result = try ortgenai.generateWithImages(
-                self.allocator,
-                self.model,
-                prompt,
-                all_images.items,
-                gen_opts,
-                self.execution_control,
-            );
-            errdefer result.deinit();
-            if (self.execution_control) |control| try control.check();
-            return .{
-                .text = result.text,
-                .token_ids = null,
-                .prompt_tokens = result.prompt_tokens,
-                .tokens_used = result.tokens_used,
-                .finish_reason = result.finish_reason,
-                .allocator = result.allocator,
-            };
-        }
-
-        var result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts, self.execution_control);
-        errdefer result.deinit();
-        if (self.execution_control) |control| try control.check();
-        return .{
-            .text = result.text,
-            .token_ids = null,
-            .prompt_tokens = result.prompt_tokens,
-            .tokens_used = result.tokens_used,
-            .finish_reason = result.finish_reason,
-            .allocator = result.allocator,
-        };
-    }
-
-    /// Streaming generation: calls on_token for each decoded token fragment.
-    /// Returns the final result (full text, token count, finish reason).
-    /// Text-only; multimodal streaming not yet supported (falls back to non-streaming).
-    pub fn generateStreaming(
-        self: *GenerationPipeline,
-        messages: []const Message,
-        config: GenerationConfig,
-        on_token_ctx: *anyopaque,
-        on_token: TokenCallback,
-    ) !GenerationResult {
-        if (!build_options.enable_onnx) return error.OnnxNotEnabled;
-        if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
-        if (self.execution_control) |control| try control.check();
-
-        // Multimodal streaming not supported yet — fall back
-        if (messagesHaveImages(messages)) {
-            const result = try self.generate(messages, config);
-            _ = emitCompletedStreamingText(on_token_ctx, on_token, result.text);
-            return result;
-        }
-
-        const prompt = if (self.prompt_override) |override|
-            try self.allocator.dupe(u8, override)
-        else if (self.chat_template) |ct|
-            try ct.applyWithOptions(self.allocator, messages, .{ .enable_thinking = config.enable_thinking })
-        else
-            try formatMessages(self.allocator, messages);
-        defer self.allocator.free(prompt);
-
-        const gen_opts = ortgenai.GenerateOptions{
-            .max_tokens = config.max_tokens,
-            .temperature = config.temperature,
-            .top_p = config.top_p,
-            .top_k = config.top_k,
-        };
-
-        const ForwardingCallback = struct {
-            downstream_ctx: *anyopaque,
-            downstream: TokenCallback,
-
-            fn call(raw: *anyopaque, text: []const u8) bool {
-                const callback: *@This() = @ptrCast(@alignCast(raw));
-                return callback.downstream(callback.downstream_ctx, text);
-            }
-        };
-        var callback = ForwardingCallback{
-            .downstream_ctx = on_token_ctx,
-            .downstream = on_token,
-        };
-        var result = try ortgenai.generateStreaming(
-            self.allocator,
-            self.model,
-            prompt,
-            gen_opts,
-            @ptrCast(&callback),
-            ForwardingCallback.call,
-            self.execution_control,
-        );
-        errdefer result.deinit();
-        if (self.execution_control) |control| control.check() catch |err| {
-            return err;
-        };
-        return .{
-            .text = result.text,
-            .token_ids = null,
-            .prompt_tokens = result.prompt_tokens,
-            .tokens_used = result.tokens_used,
-            .finish_reason = result.finish_reason,
-            .allocator = result.allocator,
-        };
-    }
-
-    pub fn deinit(self: *GenerationPipeline) void {
-        if (build_options.enable_onnx) {
-            self.model.deinit();
-        }
-    }
-};
 
 const Qwen3VlParityImageJson = struct {
     source_width: usize,
@@ -13963,12 +13806,8 @@ test "whole-model prefill stays bounded and speculative width is validated" {
         @as(usize, 256),
         wholeModelExecutionPrefillChunkSize(.metal, 0, 0, 4031, true),
     );
-    // ONNX and PJRT whole-model runtimes do not retain incremental prefill
-    // state across calls, so admission geometry must not split their prompt.
-    try std.testing.expectEqual(
-        @as(usize, 4031),
-        wholeModelExecutionPrefillChunkSize(.onnx, 2048, 1024, 4031, false),
-    );
+    // PJRT whole-model runtimes do not retain incremental prefill state
+    // across calls, so admission geometry must not split their prompt.
     try std.testing.expectEqual(
         @as(usize, 4031),
         wholeModelExecutionPrefillChunkSize(.pjrt, 2048, 1024, 4031, false),

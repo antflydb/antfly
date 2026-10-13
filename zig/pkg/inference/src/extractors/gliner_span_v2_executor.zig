@@ -40,8 +40,10 @@ const decision_api = @import("antfly_decisions");
 const decide = decision_api.legacy;
 const observation = @import("extraction_observer.zig");
 const CT = compute.CT;
+const document = @import("../pipelines/gliner_boundary_long_document.zig");
 
 pub const Options = struct {
+    modern_span_extraction: bool = false,
     max_response_bytes: usize = 64 * 1024 * 1024,
     /// `max_sequence_tokens` is the hard per-sequence ceiling. It defaults to
     /// DeBERTa-v3's 512 pretraining positions, the same cap the legacy span
@@ -60,6 +62,8 @@ pub const Options = struct {
     max_sequences_per_item: usize = 8,
     /// Encoded tokens across every sequence of the request.
     max_request_tokens: usize = 64 * 1024,
+    /// Only bound for an exact qualified artifact by the serving layer.
+    long_document_limits: ?@import("../models/gliner_span_window_limits.zig").Limits = null,
     pipeline: pipeline.Options = .{},
     control: ?Control = null,
     failure: ?*wire.FailureContext = null,
@@ -81,10 +85,12 @@ pub fn preflight(request: *const wire.Request, options: Options) !void {
     for (request.items, 0..) |item, index| {
         try progress(options, index, "preflight");
         const schema = item.compiled.schema;
-        if (schema.classifications.len == 0) return error.UnsupportedGlinerSpanV2Task;
-        if (schema.entities.len != 0 or schema.entity_attributes.len != 0 or schema.structures.len != 0 or
-            schema.relations.len != 0 or schema.joint_ie != null) return error.UnsupportedGlinerSpanV2Task;
-        if (item.options.long_document.mode == .window) return error.UnsupportedGlinerSpanLongDocument;
+        const spans = schema.entities.len != 0 or schema.relations.len != 0;
+        if (schema.classifications.len == 0 and !spans) return error.UnsupportedGlinerSpanV2Task;
+        if (spans and !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+        if (schema.entity_attributes.len != 0 or schema.structures.len != 0 or schema.joint_ie != null) return error.UnsupportedGlinerSpanV2Task;
+        for (schema.entities) |entity| if (entity.validators.len != 0) return error.UnsupportedGlinerSpanV2Task;
+        for (schema.relations) |relation| if (relation.source != null or relation.target != null) return error.UnsupportedGlinerSpanV2Task;
     }
 }
 
@@ -358,6 +364,7 @@ fn preparedLength(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.
 
 /// Tokenized sequences of one item, one per contiguous task range.
 pub const PreparedItem = struct {
+    document: ?document.Plan = null,
     ranges: []TaskRange,
     batches: []processor.PreparedBatch,
     prompt_tokens: usize,
@@ -366,13 +373,24 @@ pub const PreparedItem = struct {
         for (self.batches) |*batch| batch.deinit();
         allocator.free(self.batches);
         allocator.free(self.ranges);
+        if (self.document) |*owned| owned.deinit();
         self.* = undefined;
     }
 };
 
 /// Tokenizes and splits one item. Needs no backend or model lock.
 pub fn prepareItem(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, processor_options: processor.Options, options: Options) !PreparedItem {
+    if (item.options.long_document.mode == .window) return @import("gliner_span_long_executor.zig").prepare(allocator, tokenizer, item, processor_options, options);
     const classifications = item.compiled.schema.classifications;
+    if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
+        const batches = try allocator.alloc(processor.PreparedBatch, 1);
+        errdefer allocator.free(batches);
+        batches[0] = try processor.prepare(allocator, tokenizer, &.{.{ .text = item.text, .schema = &item.compiled }}, processor_options);
+        errdefer batches[0].deinit();
+        const ranges = try allocator.alloc(TaskRange, 1);
+        ranges[0] = .{ .start = 0, .end = classifications.len };
+        return .{ .ranges = ranges, .batches = batches, .prompt_tokens = batches[0].samples[0].input_ids.len };
+    }
     var lengths = try PromptLengths.init(allocator, tokenizer, item, processor_options);
     defer lengths.deinit(allocator);
     const ranges = try planTaskRanges(allocator, classifications.len, options.max_prompt_tokens, &lengths, PromptLengths.measure);
@@ -415,6 +433,7 @@ pub fn preparedItemLogits(
     prepared_item: *const PreparedItem,
     profile: ?*Profile,
 ) !ItemLogits {
+    if (prepared_item.document != null) return @import("gliner_span_long_executor.zig").classificationLogits(cb, allocator, config, item, prepared_item);
     const classifications = item.compiled.schema.classifications;
     const rows = try allocator.alloc([]f64, classifications.len);
     var built: usize = 0;
@@ -476,6 +495,8 @@ pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
         total = try std.math.add(usize, total, try std.math.mul(usize, 3 * f * heads, try std.math.mul(usize, tokens, tokens)));
     total = try std.math.add(usize, total, try std.math.mul(usize, 4 * f, try std.math.mul(usize, buckets, h)));
     total = try std.math.add(usize, total, try std.math.mul(usize, 2 * f, try std.math.mul(usize, tokens, h)));
+    if (config == .modern_bert)
+        total = try std.math.add(usize, total, try std.math.mul(usize, 8 * 6 * f, try std.math.mul(usize, tokens, h)));
     // Allocator rounding and transient copies.
     return std.math.mul(usize, total, 2);
 }
@@ -528,7 +549,7 @@ test "gliner span v2 preserves DeBERTa 512 ceiling and admits Decide 1B context 
     try std.testing.expectEqual(@as(usize, 8192), sequenceTokenCeiling(oversized_modern, 512, true));
     const bytes = try deviceScratchUpperBound(modern, 7999);
     try std.testing.expect(bytes > 1024 * 1024 * 1024);
-    try std.testing.expect(bytes < 2 * 1024 * 1024 * 1024);
+    try std.testing.expect(bytes < 8 * 1024 * 1024 * 1024);
 }
 
 /// Tokenized, split request. Built before the model lock is taken.
@@ -579,6 +600,25 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
     for (request.items, request_plan.items, 0..) |*item, *prepared_item, index| {
         if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
         try progress(options, index, "encoder");
+        if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0) {
+            if (config != .modern_bert or !options.modern_span_extraction) return error.UnsupportedGlinerSpanV2Task;
+            var native_options = item.options.native(options.pipeline);
+            native_options.control = options.control;
+            native_options.max_output_values = remaining_values;
+            var extracted = if (prepared_item.document != null)
+                try @import("gliner_span_long_executor.zig").extract(cb, allocator, config.modern_bert, item, prepared_item, native_options)
+            else
+                try @import("gliner_span_extraction.zig").run(cb, allocator, config.modern_bert, prepared_item.batches[0].samples[0], &item.compiled, native_options);
+            defer extracted.deinit();
+            const sample = extracted.samples[0];
+            var used = sample.relations.len;
+            for (sample.entities) |entity| used += entity.values.len;
+            for (sample.classifications) |task| used += task.labels.len;
+            if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
+            remaining_values -= used;
+            try writer.append(item.*, sample);
+            continue;
+        }
         var logits = try preparedItemLogits(cb, allocator, config, item, prepared_item, null);
         defer logits.deinit(allocator);
         const const_rows = try allocator.alloc([]const f64, logits.rows.len);

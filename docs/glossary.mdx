@@ -232,9 +232,9 @@ See: [JSON Schema](https://json-schema.org/) | [Understanding JSON Schema](https
 
 ### ONNX (Open Neural Network Exchange)
 
-A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference runs local models through one of three backends: a native backend (CPU/Metal/CUDA) for GGUF and safetensors artifacts, an `onnx` backend, and an `ortgenai` backend, providing [embedding](#embeddings), [chunking](#chunking), [reranking](#rerankers), and generation without external API calls.
+A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference runs local models on its own native backends (CPU, Metal, CUDA) for GGUF, safetensors, and ONNX artifacts. It parses `.onnx` graphs itself and executes them on the same kernels, with no external ONNX runtime, providing [embedding](#embeddings), [chunking](#chunking), [reranking](#rerankers), and generation without external API calls.
 
-See: [ONNX](https://onnx.ai/) | [ONNX Runtime](https://onnxruntime.ai/)
+See: [ONNX](https://onnx.ai/)
 
 ### OpenAPI Specification
 
@@ -256,7 +256,7 @@ See: [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intri
 
 ### XLA (Accelerated Linear Algebra)
 
-A domain-specific compiler for linear algebra that optimizes TensorFlow computations. XLA can target CPUs, GPUs, and TPUs. Antfly Inference runs models through native (CPU/Metal/CUDA), [ONNX](#onnx-open-neural-network-exchange), and `ortgenai` backends; XLA represents the broader ecosystem of ML acceleration technologies.
+A domain-specific compiler for linear algebra that optimizes TensorFlow computations. XLA can target CPUs, GPUs, and TPUs. Antfly Inference runs GGUF, safetensors, and [ONNX](#onnx-open-neural-network-exchange) models on its native CPU, Metal, and CUDA backends, with an optional PJRT/XLA backend; XLA represents the broader ecosystem of ML acceleration technologies.
 
 See: [XLA Overview](https://www.tensorflow.org/xla) | [OpenXLA](https://openxla.org/)
 

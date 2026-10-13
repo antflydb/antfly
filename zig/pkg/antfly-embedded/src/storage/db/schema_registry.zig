@@ -60,7 +60,8 @@ pub const Epoch = struct {
     pub fn createCloned(alloc: Allocator, schema: schema_mod.TableSchema) !*Epoch {
         const encoded = try schema_mod.serializeSchema(alloc, schema);
         defer alloc.free(encoded);
-        const owned_schema = try schema_mod.deserializeSchema(alloc, encoded);
+        var owned_schema = try schema_mod.deserializeSchema(alloc, encoded);
+        owned_schema.decoded_format_version = schema.decoded_format_version;
         var owned = true;
         errdefer if (owned) schema_mod.freeSchema(alloc, owned_schema);
         const epoch = try createOwned(alloc, owned_schema);
@@ -353,6 +354,16 @@ pub const Registry = struct {
         }
 
         pub fn publish(self: *@This(), prepared: *Epoch) void {
+            self.publishMode(prepared, false);
+        }
+
+        /// Only the core's verified ASCH v12/public-contract binding may enrich
+        /// an epoch in place. Existing pins retain their original immutable view.
+        pub fn publishLegacyBinding(self: *@This(), prepared: *Epoch) void {
+            self.publishMode(prepared, true);
+        }
+
+        fn publishMode(self: *@This(), prepared: *Epoch, legacy_binding: bool) void {
             if (!self.active or prepared.schema.version != self.version)
                 @panic("invalid schema publication reservation");
             self.registry.mutex.lockUncancelable(self.registry.io);
@@ -363,6 +374,15 @@ pub const Registry = struct {
             self.active = false;
             if (self.registry.epochs.get(prepared.schema.version)) |existing| {
                 const previous_current = self.registry.current.load(.acquire);
+                if (legacy_binding) {
+                    std.debug.assert(existing.schema.decoded_format_version == 12 and existing.validator == null and prepared.validator != null);
+                    self.registry.epochs.getPtr(prepared.schema.version).?.* = prepared;
+                    self.registry.current.store(prepared, .release);
+                    self.registry.advanceAcquisitionGracePeriodLocked();
+                    self.registry.mutex.unlock(self.registry.io);
+                    existing.release();
+                    return;
+                }
                 self.registry.current.store(existing, .release);
                 if (previous_current != existing) self.registry.advanceAcquisitionGracePeriodLocked();
                 if (previous_current) |epoch| self.registry.touchHistoricalLocked(epoch);

@@ -79,7 +79,10 @@ pub fn validate(a: A, io: std.Io, root: []const u8, request: Request, namespace:
         else => return err,
     };
     defer a.free(bytes);
-    var parsed = try std.json.parseFromSlice(Manifest, a, bytes, .{});
+    var parsed = std.json.parseFromSlice(Manifest, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.CatalogGenerationChanged,
+    };
     defer parsed.deinit();
     const manifest = parsed.value;
     if (manifest.version != 1 or !manifest.namespace.eql(namespace) or manifest.request.table_id != request.table_id or manifest.request.expires_ms != request.expires_ms or !std.mem.eql(u8, manifest.request.id, request.id)) return error.CatalogGenerationChanged;
@@ -132,6 +135,19 @@ pub fn lock(a: A, io: std.Io, db_path: []const u8, cancellation: Cancellation) !
     }
     return .{ .io = io, .file = file };
 }
+/// Invalid local generation metadata is disposable, but active local readers
+/// still own their files. Call while holding the parent publication guard.
+fn discardInvalidCache(a: A, io: std.Io, parent: []const u8, id: []const u8, root: []const u8) !void {
+    const lease_path = try std.fmt.allocPrint(a, "{s}/{s}.lease", .{ parent, id });
+    defer a.free(lease_path);
+    const lease = try std.Io.Dir.cwd().createFile(io, lease_path, .{ .truncate = false });
+    defer lease.close(io);
+    if (!try lease.tryLock(io, .exclusive)) return error.QueryCandidateBudgetExceeded;
+    defer lease.unlock(io);
+    try std.Io.Dir.cwd().deleteTree(io, root);
+    try std.Io.Dir.cwd().deleteFile(io, lease_path);
+}
+
 /// Bounded admission and restart-safe expiry. Call under the store guard.
 /// Active readers hold a per-cut lease; GC never removes their files.
 pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, limits: Limits, cancellation: Cancellation) !void {
@@ -164,11 +180,25 @@ pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, limits: Limi
         defer a.free(root);
         const manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{root});
         defer a.free(manifest);
-        const bytes = try backup.readFileAlloc(a, io, manifest, backup.max_manifest_bytes);
+        const bytes = backup.readFileAlloc(a, io, manifest, backup.max_manifest_bytes) catch |err| switch (err) {
+            error.FileNotFound => {
+                try discardInvalidCache(a, io, parent, entry.name, root);
+                if (std.mem.eql(u8, entry.name, id)) existing = false;
+                continue;
+            },
+            else => return err,
+        };
         defer a.free(bytes);
         metadata_bytes = std.math.add(usize, metadata_bytes, bytes.len) catch return error.QueryCandidateBudgetExceeded;
         if (metadata_bytes > 64 * 1024 * 1024) return error.QueryCandidateBudgetExceeded;
-        var parsed = try std.json.parseFromSlice(Manifest, a, bytes, .{});
+        var parsed = std.json.parseFromSlice(Manifest, a, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try discardInvalidCache(a, io, parent, entry.name, root);
+                if (std.mem.eql(u8, entry.name, id)) existing = false;
+                continue;
+            },
+        };
         defer parsed.deinit();
         if (parsed.value.request.expires_ms +| 30_000 < nowMs()) {
             const lease_path = try std.fmt.allocPrint(a, "{s}/{s}.lease", .{ parent, entry.name });

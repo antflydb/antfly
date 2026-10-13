@@ -117,14 +117,27 @@ pnpm --filter @antfly/sdk generate
 ### Project Structure
 
 ```
-ts/
-├── packages/
-│   ├── sdk/           # @antfly/sdk - TypeScript API client
-│   └── components/    # @antfly/components - React search components
-├── package.json       # Root workspace config
-├── pnpm-workspace.yaml
-├── turbo.json         # Turborepo config
-└── tsconfig.base.json # Shared TypeScript config
+packages/sdk/            → @antfly/sdk (TS client for the joined public API)
+packages/components/     → @antfly/components (unstyled search primitives:
+                           QueryBox, Autosuggest, Facet, Results, AnswerResults,
+                           ChatBar, plus streaming hooks)
+packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
+                           component library: primitives, compound patterns,
+                           brand/marketing blocks, OKLCH tokens, Aeonik)
+packages/graph/          → @antfly/graph (force-directed graph component)
+packages/web/            → @antfly/web (local browser inference via Antfly WASM
+                           and WebGPU; UI in Colony)
+packages/embedded/       → @antfly/embedded (Node binding for local Antfly
+                           databases and inference over the libantfly C ABI)
+                           with platform packages embedded-darwin-arm64,
+                           embedded-linux-arm64, embedded-linux-x64
+packages/cli/            → @antfly/cli (npm wrapper that installs the antfly
+                           binary) with platform packages cli-darwin-arm64,
+                           cli-linux-arm64, cli-linux-x64
+apps/antfarm/            → dashboard (consumes sdk + components)
+apps/model-explorer/     → model registry explorer (unpublished)
+apps/playground/         → design-system gallery (unpublished; used by
+                           library authors to dogfood new primitives)
 ```
 
 ## Requirements

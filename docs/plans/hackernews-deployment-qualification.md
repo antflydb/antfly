@@ -1,6 +1,6 @@
 # Hacker News deployment qualification
 
-Status: qualification follow-up to merged PR #1025, 2026-10-10.
+Status: publication and serving qualification follow-up to merged PR #1066, 2026-10-11.
 
 The next milestone is reproducible evidence that `hn.antfly.io` can serve useful
 search over the historical archive while keeping recent data fresh. Engine
@@ -273,3 +273,389 @@ reading pages through GCS. Complete GCS publication remains unverified; this
 sample does not attribute all elapsed time or qualify regional performance.
 All 2,265 artifacts were generation-deleted after the builder stopped; the
 original archive source was preserved.
+
+
+## October 11 follow-up sequence
+
+Work starts from `origin/main` after PR #1066, in
+`.worktrees/hackernews-publication-followup` on
+`feat/hackernews-publication-followup`. The initial base is
+`26edb20271407c60e257a583453a711947b4a9ca`. Changes and diagnostics belong to
+that checkout; the main checkout contains independent work.
+
+The updated detailed billing export is captured in
+[`archive-spend-20261011.json`](../../examples/hackernews/archive-spend-20261011.json).
+The six identified qualification pods cost $0.927106 gross. All HN-labelled
+benchmark pods since October 9 cost $7.996654 gross, including those six and
+other HN work. The shared import bucket has $0.277859 in exported charges;
+this is bucket-wide, and its export only reaches October 10 at 23:00 UTC.
+Cloud-program credits cover these posted charges. Project networking is shared
+and the local October 11 storage diagnostics are not fully exported yet, so
+these figures do not establish final all-in HN spend. Account for gross charges
+rather than treating promotional credits as unlimited free usage.
+
+The prior $150 figure was conservative reservations, not actual exhausted
+spend. Preserve attempt IDs and original reservations. First add an explicit
+reconciliation workflow to the admission guard: evidence identifies each run,
+settles its exported compute charges, retains allowances for unexported storage,
+requests and networking, and records released amounts as an append-only audit.
+A reconciliation must not double-count shared bucket costs, erase failed runs,
+refund pending costs, or increase the approved $150 ceiling. Extending the retry
+limit should use reconciled exposure plus new reservations; creating a fresh
+ledger to bypass the existing one is not a valid recovery path.
+
+Then qualify one unchanged 142,577-row raw BigQuery file through the actual
+coordinator and public API in the source bucket's region, `us-central1`.
+Use a new owned artifact namespace and record the current optimized Linux
+binary digest, admitted resources, immutable source generation, stage timings,
+process memory/CPU and provider I/O. Keep the existing build deadline and
+HTTP timeouts. The earlier laptop-to-GCS run sampled statistics page reads;
+it does not establish same-region latency or a need to change engine behavior.
+If the regional run is still slow, measure summary publication, document-frequency
+reduction and final publication separately before changing the algorithm.
+Avoid repeated uploads followed by immediate remote rereads where bounded
+local streaming/spill can supply the same authenticated statistics; preserve
+replacement/removal semantics, cancellation, budgets and fenced checkpoints.
+
+After complete publication, verify SQL count, ranked results, highlights,
+metadata filters, sort/pagination and source provenance. Measure cold/warm,
+concurrent, deep-cursor and post-restart public queries with the existing
+correctness and latency gates. A one-file verdict must remain separately
+labelled; it cannot pass the full-archive gate. Only then build and qualify the
+complete 334-file / 47,717,307-row archive, including interrupted recovery and
+bounded resource use. Durable HN deployment follows those gates.
+
+The existing `antfly-dev` cluster is already Autopilot. The measured pods used
+regular general-purpose capacity, requesting 8 vCPU, 48 GiB RAM and 10 GiB
+storage, about $0.59/hour at the recorded region's list prices. Keep that
+profile for the first comparable regional check; evaluate smaller requests
+as a separately labelled profile with measured headroom, rather than changing
+resources and attributing all improvement to engine changes. Spot can reduce
+compute cost, but eviction loses the current harness's pod-local catalog and
+state directory. Use regular capacity for reproducible timing runs. Before
+using Spot for resumable construction, persist authoritative catalog/checkpoint
+ownership and prove recovery in a replacement pod; remote derived artifacts
+alone are not sufficient.
+
+
+The follow-up now implements reviewed compute reconciliation in
+`archive_budget.py`. The six deleted pods release $59.072894 of excess reserved
+compute while retaining $10 per run for noncompute, all earlier/local holds and
+the original history. Recorded exposure is $90.927106. The reconciled follow-up
+plan permits two new $20 reservations, for at most $130.927106 held or recorded,
+under the unchanged $150 ceiling. No pending storage/networking hold was refunded.
+The cursor workload now uses `AI`, with 4,110 actual analyzed matches in the
+unchanged one-file partition. The previous `the` selection was invalid because
+the standard analyzer removes it; physical substring counts cannot establish
+indexed cursor coverage. The primary query has 856 matches and cannot qualify
+the 4,097-hit depth gate by itself.
+
+The follow-up profile enables `qualify_composed_sources`. It inserts two native
+current rows under a numeric `hn_id` key and verifies union, replacement overlay,
+saved-source lookup and retained source cursors after mutations and daemon
+restart, against the unchanged historical Parquet source. This is a qualification
+assertion, not measured evidence until the actual public-API run passes. It does
+not establish a running Firebase feed, replacement-pod recovery or serving SLO.
+
+
+## First regional publication result and corrections
+
+[`publication-baseline-20261011.json`](../../examples/hackernews/publication-baseline-20261011.json)
+records the first completed regional one-file publication. The unchanged
+142,577-row file and all declared text/metadata indexes published, and SQL count
+passed. The qualification verdict failed: cold highlighted search took
+16,102 ms against the 10,000 ms gate; warm primary p95 was 323 ms. Publication
+plus queries before failure took 1,107.78 seconds; the failed harness did not
+retain an isolated publication duration, so that duration remains unknown.
+The owned pod was deleted. Full-archive qualification and deployment have not
+passed.
+
+Cold search received 55,652,318 network bytes with the stored-source projection
+disabled. The next profile explicitly enables `store_source` on the archive text
+index, retaining the complete declared relational row while indexing only body.
+Both highlights and returned HN metadata can use the authenticated sidecar. The
+v2 stored-source recipe fences older body-only projections without changing
+source-free recipe identity or the segment format. This increases sidecar storage and must be
+measured; it is not yet a qualified latency improvement. The serving candidate
+uses the same policy.
+
+The next [registration probe](../../examples/hackernews/publication-registration-20261011.json)
+stopped before publication because the public full-text allow-list omitted
+`store_source`. Its pod was deleted and its artifact prefix was empty. Public
+create-table/create-index admission and response projection now preserve the
+boolean option. The regression also rejects non-boolean values. A native stored
+source test deletes the Parquet object and verifies body plus returned metadata
+remain available from the authenticated segment. These are local contract
+checks, not regional latency measurements.
+
+The latest billing export still omits today's two pods. The
+[closed-pod evidence](../../examples/hackernews/archive-compute-bounds-20261011.json)
+replaces their excess compute reservations with two full hours each at their
+admitted resources, preserving $10 per run for pending noncompute. This is an
+explicit upper estimate, not posted spend. Exposure is $113.301782 before another
+attempt; a new $20 reservation fits the unchanged $150 ceiling. Original run
+history and allowances remain, and posted gross billing supersedes these bounds,
+including an overrun. The failed registration attempt measured no search latency.
+
+The real deployment target is an organization-owned Antfly Cloud instance.
+Colony PR #762 consolidates the optional standalone storage proposal; it is
+disabled by default. Its initial 20 GiB disk is not a Cloud storage requirement,
+and its example service-account grant does not authorize a managed tenant. The
+application renderer can omit separately provisioned prerequisites with
+`--foundation-exists`, but is not the managed provisioning path. Qualify the
+released runtime, actual tenant identity, credential refresh, replacement-pod
+recovery and authenticated managed API before public serving. See
+[deployment guidance](../../examples/hackernews/DEPLOYMENT.md). A full-archive attempt must budget GCS operations and retain partial
+catalog/checkpoint state; do not multiply a one-file timing into a proven bound
+or discard an interrupted build's catalog after its pod deadline.
+
+The composed history/current check failed with `unsupported_exact_sort` on a
+numeric native-table key filter. Exact native filter lowering now translates
+unambiguous JSON pointers and declared numeric/boolean equality. Positional
+array paths, literal dotted components and integer equality outside f64's exact
+range remain unresolved rather than producing approximate sorted results.
+Native indexed range predicates also translate safe pointer paths.
+
+Sorted page publication now admits batches of at most eight immutable uploads.
+All children finish before roots can be returned or owners released, including
+failure and cancellation. Memory admission is synchronized across workers;
+the page format, attempt scope and publication fences stay intact. Default
+32 KiB builders retain their page identities. Initial bulk ordered trees and
+text-statistics trees now target 256 KiB pages to reduce object counts, while
+keeping the existing 1 MiB page ceiling. A 1,000-row regression compares complete
+forward/reverse and bounded reads, verifies more than a fourfold reduction in
+page writes, and rejects invalid targets before reading or uploading. Neither
+batching nor this fixture establishes full archive throughput. Repeated remote reads during statistics reduction and full
+archive object-request costs remain measurement targets.
+
+The harness keeps the last nonempty deep page for restart replay, rejects
+initial duplicate IDs, preserves completed filter/publication measurements on
+failure, and continues baseline restart checks after a composed-source failure.
+Required composed coverage still fails the overall gate when unavailable.
+
+
+## Retained native cache loss
+
+A retained native generation's local directory is a cache, not a completeness
+proof. Resume validates the local manifest and sealed file identities under the
+publication guard before acquiring the local reader lease. Missing or corrupt
+local metadata, or a missing/replaced sealed file, can instead open the same
+authenticated remote generation. Table identity, original range, capability
+expiry, manifest identity, chunk scopes, lengths and checksums remain enforced.
+The engine does not capture current rows to repair an old cursor. The current
+repository opens remote pages without copying a complete generation back to disk.
+Legacy repositories can materialize a missing generation, but do not overwrite
+an invalid existing cache.
+
+Malformed or absent cache manifests also must not prevent new snapshot admission.
+Admission discards these invalid local roots only after obtaining their exclusive
+per-cut lease under the parent guard. Active local readers prevent that cleanup;
+the request fails its existing admission bound instead of deleting their files.
+Remote reader leases do not depend on the discarded local directory.
+
+The recovery regression primes the vector reader, restarts the live database,
+and then preserves the local directory while removing its manifest, corrupting
+its metadata or removing a sealed source-vector file. Each case must return the
+original row and text match from remote storage without recreating missing files.
+Removing remote commit authority must fail closed while fresh live reads still
+return the newer row. The public HTTP matrix also exercises partial cache loss
+before complete cache loss, sorted native filters and cursor restart.
+
+## Merged #1063 follow-up qualification
+
+PR #1063 adds term-directed admission, batched statistics, bounded 64-segment /
+32 MiB text windows, within-file small-run compaction, final-winner hydration and
+bounded planning warmup. PR #1081 must qualify those paths together with its
+compressed opening metadata before the next runtime release. Earlier timings
+in this document identify earlier binaries and do not qualify the combined code.
+
+Measure empty serving caches with optional planning warmup disabled, default
+readiness warmup after restart, and repeated queries separately. Record warmup
+attempts/pages/time outside query latency, provider requests/bytes, nested phase
+times and child-process peak RSS. Profiling currently selects a different planner;
+use health counters for the primary timing matrix and profile a separate diagnostic
+run. Both engines must use the same logical HN source, prebuilt indexes and native
+host execution. Keep OS-cache, HTTP, analyzer, thread-policy and shared-host limits
+explicit. Repeat at least two cycles and twenty warm samples.
+
+Qualify historical/current union and the saved replacement overlay with real sample
+rows in a native current table, alongside exact filters, highlights, cursors,
+nonmatching replacement suppression and mutation/restart retention. Include a
+fragmented publication above the 64-segment window boundary. A bounded current
+fixture and local filesystem source are diagnostic evidence, not full-archive or
+Antfly Cloud acceptance.
+
+Use the results to prioritize remaining work: publication-wide best-first traversal
+if routing or irrelevant posting reads dominate; cross-file compaction if small
+historical files/segments dominate; broader bounded execution if composed or pending
+write paths remain disproportionately expensive. These changes require the ownership,
+GC and conservative bound contracts in `zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`.
+
+Release handoff follows the verified PR, not the benchmark binary: human-approved CI
+on the final PR revision, merge, immutable runtime release/image digest, development
+runtime-catalog selection, and an Antfly Cloud instance. Verify the actual tenant's
+credential scope and refresh, both HN tables and saved source, replacement recovery,
+publication and the regional query matrix through the managed API. Keep public DNS
+routing disabled until those gates pass. Reconcile the existing shared cloud ledger
+before additional jobs; reuse the retained archive export and preserve prior spend
+and reservations. No standalone claim or engine is required for this Cloud path.
+
+The combined local matrix exposed two follow-up implementation gaps. Planning
+warmup must read declarations from an authenticated publication directory when
+inline declarations are absent, and must not memoize an unavailable lifecycle
+authority during startup as a completed warmup. Explicit leading descending score
+ordering can carry a competitive cutoff across windows while retaining equal-score
+contenders; ascending score and backward cursor pages cannot use that minimum.
+Count-only requests retain exact execution.
+
+Composed five-hit requests previously fetched/highlighted 128 hits from each source.
+Start each source with the requested page and one lookahead, bounded by 128. Grow
+fully suppressed overlay batches geometrically to preserve archive traversal;
+count, aggregation and graph consumers retain the larger streaming batches. Cursor
+identities, source authority and total normalization must remain unchanged. Qualify
+this with the same 1,000-row current fixture and mutation/restart cursor checks.
+
+Final local evidence is in
+`examples/hackernews/combined-main-search-qualification-20261012.json`. The raw
+empty-cache matrix measured 32.25–78.91 ms first-query, 7.87–9.03 ms warm p95,
+and 29.61–38.56 ms restart latency. Readiness-enabled runs measured 30.74–49.13 ms
+first-query latency and now prove positive warmup (42 planning pages before query).
+Both physical layouts preserve exact HN IDs/scores and enumerate 4,110 cursor
+matches with filters, highlights and mutable source cursors verified after restart.
+
+Provider work is the more stable comparison: raw empty-cache reads remain
+248 requests / 25.04 MB versus the earlier 295 / 43.31 MB. The composed page-size
+fix reduces measured leaf hydration and provider work, but full composed requests
+remain much slower than single-table queries. Profile retained native snapshot
+capture, binding and response/control work before selecting another optimization.
+The SQL ordered body projection still hit its statement work limit; direct Parquet
+fixture setup is outside query timing and does not qualify that SQL shape. Keep
+these findings separate from the completed local keyword/cursor correctness gates.
+
+The follow-up composed profile found repeated directory enumeration. Native
+capability creation and generation publication now leave expiry collection to
+the supervised owner. Persist namespace discovery before the capability so a
+failed physical capture remains collectible after restart or drop. Filesystem
+prefix listing starts at the appropriate subtree, preserves partial-prefix and
+pagination semantics, and skips symbolic links as the original bucket walk did.
+Use a bounded-work regression with unrelated generations, and compare live
+current, retained current, union and saved-overlay requests after rebuilding.
+
+Restart validation also exposed field-order assumptions in lazy routing:
+canonical routing names can differ from a physical segment's writer order.
+Binding must match names and verify the same field statistics and section kinds,
+without relaxing incarnation, source or checksum validation. Catalog fixtures
+must use distinct relational index names within their shared namespace.
+
+The catalog HTTP rerun traced the remaining `InvalidSegment` to masked WAL
+composition allocating through a query facade's locked allocator. Compose
+through the pinned inventory owner's allocator, whose lifetime covers shared
+physical readers and private deletion cells. Preserve the sparse read capability
+and its cancellation checks. Destroy dependent owner objects before releasing
+the base pin that owns their allocator. Keep the immutable-sharing allocator
+guard; exercise this path with restart, nullable WAL rows and private masks.
+
+Bounded composed pages can report `hits.total.relation = "gte"` until the
+remaining source relation is visited. Exact overlay cardinality is a separate
+`count: true` request. Qualification must test the bounded cursor and exact count
+independently, without forcing every first page to scan its archive.
+
+The final optimized follow-up passes 84 local Python tests and 28 subtests,
+including four filesystem/S3 fixture cursor recovery cases. All eight catalog
+HTTP cases pass after the ownership fix. The broader lake gate passes 237 other
+regressions plus the corrected incremental stored-row assertion, without leaks.
+The final raw and 67-file layouts retain exact IDs/scores, filter behavior,
+highlights, 4,110-match cursor enumeration and mutable-source restart visibility.
+Highlighted first searches measured 76.13 ms raw and 106.48 ms fragmented;
+post-restart searches measured 29.49–35.71 ms. Eight-repeat composed runs measured
+union warm p95 60.25–65.18 ms and saved-overlay warm p95 67.54–73.56 ms. A matched
+before/after diagnostic records the large reduction from removing foreground
+collection and bucket-wide enumeration. These shared-host sample measurements
+do not establish full-archive performance or a managed Cloud SLO.
+
+## Follow-up after #1081: publication traversal and cross-file serving runs
+
+Keep the canonical per-file native inventory as the incremental rebuild authority.
+An optional authenticated `compacted` root is the serving generation. It carries
+merged native runs, their own term-directory envelopes, and complete physical
+member spans referencing the original file manifests. It preserves producer IDs,
+global statistics, deleted row holes, typed filtering, highlights and public
+pagination. Source Parquet files are unchanged. Source replacement/removal retires
+the affected merged unit; unchanged units and copy-on-write directory paths are
+reused. Retained readers and GC protect both canonical and serving generations.
+
+The initial policy merges adjacent complete one-run files in groups of at most
+eight, with a 16 MiB input target, a 32 MiB output cap and a 64 MiB merge workspace.
+Larger/multi-run files retain their existing within-file policy. Workspace denial
+falls back to the original runs. Metadata version 11 and reader protocol 36 fence
+writers/readers that do not understand member mappings; historical v9/v10 roots
+remain decodable. Upgrade readers before publishing the new format.
+
+Publication-wide best-first traversal uses authenticated term-page reductions to
+prioritize promising segments. It skips only bounds strictly below the current
+competitive score, keeps equal bounds for ID ties, and reports a lower-bound total
+when pruning. Exact counts, backward/non-score ordering, unsupported query proofs,
+and exhausted optional planning retain the exact existing traversal. The initial
+query coordinator accepts single terms and single-token analyzed matches with
+explicit leading `_score DESC`; broader query shapes remain supported through
+that fallback. Frontier memory and object reads are bounded and cancellation is
+checked even on cache hits. Health counters distinguish completed best-first
+queries, admitted segments and pruned nodes from the profiling planner.
+
+The reported SQLSTATE 54000 for `ORDER BY created_at ... LIMIT 1000` was a response
+budget mismatch: HTTP SQL defaults to 128 rows unless its request `limit` is set.
+Local probes with `limit: 1000` return 1,000 rows in both directions, including body
+projection and `created_at IS NOT NULL`. The HN qualifier now seeds current rows
+through Antfly SQL for both filesystem and remote sources, sets its explicit row
+budget, and bounds that fixture to the supported 4,096-row response maximum. It
+no longer substitutes a local PyArrow projection for this SQL path.
+
+Development checks on the 142,577-row, 67-file sample produce a serving generation
+with **9 runs**, while retaining the 67-file canonical inventory. The debug runtime
+preserves the previously recorded top HN IDs/scores and passes exact filters,
+highlights, union/overlay composition, SQL seeding, pagination and restart checks.
+Debug timings are correctness evidence; optimized matched timings must be recorded
+separately before treating them as a performance comparison.
+
+
+### Optimized 1,024-file local comparison, October 13
+
+[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+compares the retained optimized #1081 executable with the follow-up implementation
+on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
+ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
+continuations. This preserves the canonical 1,024 runs and serves **128 compacted
+runs**, exercising publication-wide traversal above the 64-run threshold.
+
+| Measurement | Retained #1081 qualifier | Follow-up |
+|---|---:|---:|
+| First highlighted `database` search | 327–407 ms | 136–240 ms |
+| Warm highlighted search p95 | 77–92 ms | 51–55 ms |
+| First highlighted search after restart | 172–183 ms | 95–102 ms |
+| Provider object reads during first search | 1,461 | 405 |
+| Provider bytes during first search | 50.85 MB | 24.33 MB |
+
+Both follow-up cycles visit 58 serving segments and prune 70 term-directory nodes.
+Top-five public row IDs and exact floating-point scores match both baseline cycles;
+highlights, exact filter comparison, empty filters, cursor continuation and restart
+checks pass. Priority candidates are admitted in windows of up to eight, and
+highlight locations follow the admitted snapshot's canonical segment order.
+The full lake gate passes 155 local and 242 integration tests with no leaks; the
+final optimized runtime also passes seven native gateway tests and nine subtests.
+
+Cursor p95 and metadata-filter timings are mixed across cycles: cursor p95 is
+178–224 ms versus 213–218 ms on the baseline; some filter cases vary or regress.
+No general filter/cursor speedup is claimed. OS file caches were not flushed,
+readiness warming remains enabled, and other local builds shared the development
+host. These small normalized-data runs establish correctness and reduced query
+I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
+
+The 1,024-file **cold composed search still returns HTTP 422
+`query_candidate_budget_exceeded` on both executables**. The composed stream
+requires exact leaf totals, while large ranked pages can return lower-bound totals.
+This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
+1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
+fails. The smaller 67-file development composition check passes, but it does not
+qualify this larger cold composed workload. Fixing that leaf-count contract and
+full-archive/cloud qualification remain follow-ups. No cloud job or deployment was
+launched for this comparison.

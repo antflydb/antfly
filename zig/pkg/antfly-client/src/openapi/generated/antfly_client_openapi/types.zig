@@ -18430,6 +18430,8 @@ pub const GraphMetricProfile = struct {
 
 /// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
 pub const GraphMetricQuery = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Optional result key. Defaults to the metric name.
     name: ?[]const u8 = null,
     /// Graph index that owns the published metric.
@@ -18447,6 +18449,7 @@ pub const GraphMetricQuery = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "name", "name", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
@@ -18466,6 +18469,10 @@ pub const GraphMetricQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         if (self.name) |value| {
             try jw.objectField("name");
             try jw.write(value);
@@ -18496,6 +18503,8 @@ pub const GraphMetricQuery = struct {
 
 /// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
 pub const GraphMetricRerank = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Graph index that owns the published metric.
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
@@ -18519,6 +18528,7 @@ pub const GraphMetricRerank = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
         .{ "candidate_count", "candidate_count", true },
@@ -18541,6 +18551,10 @@ pub const GraphMetricRerank = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         try jw.objectField("index");
         try jw.write(self.index);
         try jw.objectField("metric");
@@ -19953,6 +19967,10 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Materialize canonical entity documents. False resolves graph keys without promotion.
+    promote: ?bool = null,
+    /// Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution.
+    aliases: ?[]const std.json.Value = null,
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
@@ -19980,6 +19998,8 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "promote", "promote", true },
+        .{ "aliases", "aliases", true },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
@@ -20021,6 +20041,14 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.promote) |value| {
+            try jw.objectField("promote");
+            try jw.write(value);
+        }
+        if (self.aliases) |value| {
+            try jw.objectField("aliases");
+            try jw.write(value);
+        }
         if (self.labels) |value| {
             try jw.objectField("labels");
             try jw.write(value);
@@ -20564,6 +20592,8 @@ pub const GraphTraversal = struct {
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
+    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
@@ -20591,6 +20621,7 @@ pub const GraphTraversal = struct {
         .{ "max_depth", "max_depth", true },
         .{ "edge_weight", "edge_weight", true },
         .{ "limit", "limit", true },
+        .{ "deduplicate_nodes", "deduplicate_nodes", true },
         .{ "include_paths", "include_paths", true },
         .{ "include_documents", "include_documents", true },
         .{ "fields", "fields", true },
@@ -20636,6 +20667,10 @@ pub const GraphTraversal = struct {
         }
         if (self.limit) |value| {
             try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
             try jw.write(value);
         }
         if (self.include_paths) |value| {
@@ -22402,15 +22437,13 @@ pub const InferenceAudioContext = enum {
     }
 };
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const InferenceBackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const InferenceBackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
     native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
@@ -22423,7 +22456,6 @@ pub const InferenceBackendRuntimes = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "native", "native", true },
-        .{ "onnx", "onnx", true },
         .{ "metal", "metal", true },
         .{ "cuda", "cuda", true },
         .{ "xla", "xla", true },
@@ -22442,10 +22474,6 @@ pub const InferenceBackendRuntimes = struct {
         try jw.beginObject();
         if (self.native) |value| {
             try jw.objectField("native");
-            try jw.write(value);
-        }
-        if (self.onnx) |value| {
-            try jw.objectField("onnx");
             try jw.write(value);
         }
         if (self.metal) |value| {
@@ -25036,7 +25064,7 @@ pub const InferenceGenerateRequest = struct {
     frequency_penalty: ?f32 = null,
     /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
     presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
     response_format: ?InferenceGenerateResponseFormat = null,
     /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
     grammar: ?[]const u8 = null,
@@ -25441,7 +25469,6 @@ pub const InferenceMediaContentPart = MediaContentPart;
 pub const InferenceModelBackend = enum {
     auto,
     native,
-    onnx,
     metal,
     cuda,
     xla,
@@ -25452,7 +25479,6 @@ pub const InferenceModelBackend = enum {
         const s = switch (self) {
             .auto => "auto",
             .native => "native",
-            .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
             .xla => "xla",
@@ -25470,7 +25496,6 @@ pub const InferenceModelBackend = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "auto", .auto },
             .{ "native", .native },
-            .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
             .{ "xla", .xla },
@@ -25515,6 +25540,8 @@ pub const InferenceModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const InferenceModelInfo = struct {
+    /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -25522,6 +25549,7 @@ pub const InferenceModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -25536,6 +25564,10 @@ pub const InferenceModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
         if (self.capabilities) |value| {
             try jw.objectField("capabilities");
             try jw.write(value);

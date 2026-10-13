@@ -19,6 +19,7 @@ package embedded
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -100,7 +101,7 @@ func TestConcurrentCallsOnOneHandle(t *testing.T) {
 					errs <- fmt.Errorf("scan: %w", err)
 					return
 				}
-				if _, err := db.LookupJSON("doc:w0:0"); err != nil && err != NotFound {
+				if _, err := db.LookupJSON("doc:w0:0"); err != nil && !errors.Is(err, NotFound) {
 					errs <- fmt.Errorf("lookup: %w", err)
 					return
 				}
@@ -198,7 +199,7 @@ func TestCloseRacesInFlightCalls(t *testing.T) {
 	if closedSeen.Load() != 8 {
 		t.Fatalf("%d of 8 readers observed the closed handle", closedSeen.Load())
 	}
-	if _, err := db.StatsJSON(); err != InvalidArgument {
+	if _, err := db.StatsJSON(); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("call after close = %v, want %v", err, InvalidArgument)
 	}
 }

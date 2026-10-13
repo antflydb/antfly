@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -214,6 +215,23 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
                 {
                     "num_shards": 1,
                     "schema": {"storage_mode": "relational", "base_source": source},
+                    "indexes": {
+                        "region_stats": {
+                            "type": "algebraic",
+                            "derive_from_schema": True,
+                            "aggregates": [
+                                {"name": "rows", "op": "count", "group_by": ["region"]},
+                                {
+                                    "name": "total",
+                                    "op": "sum",
+                                    "measure": "id",
+                                    "group_by": ["region"],
+                                },
+                            ],
+                        }
+                    }
+                    if name == "ice_events"
+                    else {},
                 },
             )
 
@@ -237,6 +255,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert time.monotonic() < deadline, response.text + server.debug_logs()
             time.sleep(0.1)
 
+        deadline = time.monotonic() + 60
+        while True:
+            response = requests.get(
+                server.api_url + "/tables/ice_events/indexes/region_stats",
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            resource = response.json()
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+
         for cold in (False, True):
             if cold:
                 server.restart()
@@ -250,6 +282,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert sql(
                 "SELECT COUNT(*), SUM(id) FROM ice_events WHERE region = 'west'"
             ) == [["3", "9"]]
+            assert sql(
+                "SELECT region, SUM(id) FILTER (WHERE region='west'), "
+                "COUNT(*) FILTER (WHERE region='east') FROM ice_events "
+                "GROUP BY region ORDER BY region"
+            ) == [["east", None, "2"], ["west", "9", "0"]]
+            assert sql(
+                "SELECT region, SUM(id), COUNT(*) FILTER (WHERE region='east') "
+                "FROM ice_events WHERE region='west' GROUP BY region"
+            ) == [["west", "9", "0"]]
+            assert sql(
+                "SELECT l.region, COUNT(*), SUM(l.id) FROM ice_events l "
+                "JOIN (VALUES ('west'),('west'),('east')) r(region) "
+                "ON l.region=r.region GROUP BY l.region ORDER BY l.region"
+            ) == [["east", "2", "10"], ["west", "6", "18"]]
             assert sql("SELECT id, label FROM ice_pinned ORDER BY id") == [
                 ["1", "one"],
                 ["2", "two"],
@@ -661,6 +707,294 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
                         ),
                     )
                     assert before["hits"]["hits"] == hits[:1]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+@pytest.mark.parametrize("layout", ["files", "segments"])
+def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
+    tmp_path, source_format, layout
+):
+    """Exercise file pruning and precise native segments inside one real file."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / source_format
+    parts, rows = (65, 64) if layout == "files" else (1, 196609)
+    expected = {3 * 64, 31 * 64, 64 * 64} if layout == "files" else {0, 65536, 196608}
+    batches = [
+        pa.table(
+            {
+                "amount": range(part * rows, (part + 1) * rows),
+                "body": [
+                    "common phrase quasar"
+                    if part * rows + row in expected
+                    else "common phrase"
+                    for row in range(rows)
+                ],
+            }
+        )
+        for part in range(parts)
+    ]
+    if source_format == "iceberg":
+        pytest.importorskip("fastavro")
+        pytest.importorskip("pyiceberg")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+
+        catalog = SqlCatalog(
+            "fragmented",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("fragmented")
+        table = catalog.create_table(
+            "fragmented.items",
+            schema=Schema(
+                NestedField(1, "amount", LongType(), required=False),
+                NestedField(2, "body", StringType(), required=False),
+            ),
+        )
+        for batch in batches:
+            table.append(batch)
+        assert len(table.inspect.files()) == parts
+        _export_table(table, root)
+    else:
+        objects = root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        for ordinal, batch in enumerate(batches):
+            output = io.BytesIO()
+            pq.write_table(batch, output, compression="snappy")
+            payload = output.getvalue()
+            (objects / f"part-{ordinal:02}.parquet").write_bytes(
+                b"AFOBJ001"
+                + struct.pack("<QI", len(payload), 0)
+                + hashlib.sha256(payload).hexdigest().encode()
+                + payload
+            )
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/fragmented",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "fragmented",
+                        "format": source_format,
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 300
+        while True:
+            resource = call("GET", "/tables/fragmented/indexes/body_text")
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+
+        def query(text):
+            return call(
+                "POST",
+                "/tables/fragmented/query",
+                {"full_text_search": text, "fields": ["amount"], "limit": 10},
+            )["hits"]["hits"]
+
+        rare = {"term": "quasar", "field": "body"}
+        nested = {
+            "conjuncts": [
+                {"term": "common", "field": "body"},
+                {"disjuncts": [rare, {"term": "missing", "field": "body"}]},
+            ]
+        }
+        phrase = {
+            "conjuncts": [
+                {"match_phrase": "common phrase", "field": "body"},
+                rare,
+            ]
+        }
+        # An absent term may fit the native summary key while exceeding only
+        # the optional escaped directory key. Exact refinement must fall back.
+        large = call(
+            "POST",
+            "/tables/fragmented/query",
+            {
+                "full_text_search": {
+                    "disjuncts": [rare, {"term": "x" * 262112, "field": "body"}]
+                },
+                "fields": ["amount"],
+                "limit": 10,
+            },
+        )["hits"]["hits"]
+        assert large == query(rare)
+        baseline = None
+        for restart in (False, False, True):
+            if restart:
+                server.restart()
+            for text in (nested, phrase):
+                hits = query(text)
+                assert {hit["_source"]["amount"] for hit in hits} == expected
+                assert all(hit["_score"] > 0 for hit in hits)
+            hits = query(nested)
+            filtered = call(
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 10,
+                    "filter_query": {
+                        "range": {"path": "/amount", "gte": max(expected)}
+                    },
+                },
+            )["hits"]["hits"]
+            assert [hit["_source"]["amount"] for hit in filtered] == [max(expected)]
+            highlighted = call(
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 10,
+                    "highlight": {"fields": ["body"]},
+                },
+            )["hits"]["hits"]
+            assert {hit["_source"]["amount"] for hit in highlighted} == expected
+            assert all(
+                hit["_highlights"]["body"] and "body" not in hit["_source"]
+                for hit in highlighted
+            )
+            top = call(
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 1,
+                },
+            )["hits"]["hits"]
+            assert top == hits[:1]
+            # Unknown/broad optional sets and prohibitions must retain the full
+            # inventory, even when the positive rare term has exact candidates.
+            broad = query({"disjuncts": [{"term": "common", "field": "body"}, rare]})
+            assert len(broad) == 10
+            assert expected <= {h["_source"]["amount"] for h in broad}
+            excluded = query({"must_not": {"disjuncts": [rare]}})
+            assert len(excluded) == 10
+            assert not (expected & {h["_source"]["amount"] for h in excluded})
+            if baseline is None:
+                baseline = hits
+            else:
+                assert hits == baseline
+            for boost in (0, -1):
+                signed = query({"conjuncts": [dict(rare, boost=boost)]})
+                assert {hit["_source"]["amount"] for hit in signed} == expected
+                assert all(
+                    hit["_score"] == 0 if boost == 0 else hit["_score"] < 0
+                    for hit in signed
+                )
+        if layout == "files":
+            pages = {}
+            roots = []
+            for path in (server.root / "artifacts").rglob("*"):
+                if not path.is_file():
+                    continue
+                payload = path.read_bytes()
+                begin = payload.find(b"AFGPT003")
+                if begin >= 0:
+                    page = payload[begin:]
+                    pages[hashlib.sha256(page).digest()] = (path, page)
+                begin = payload.find(b'{"version":')
+                if begin >= 0:
+                    try:
+                        document = json.loads(payload[begin:])
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if document.get("inventory_version") == 3:
+                        roots.append(document)
+            assert roots
+            root_document = roots[-1]
+            assert all(
+                root_document.get(key) is None
+                for key in ("serving_inventory", "serving_routes", "segment_files")
+            )
+
+            def leaves(ref):
+                path, page = pages[bytes(ref["digest"])]
+                count = struct.unpack_from("<I", page, 12)[0]
+                offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                records = []
+                for _ in range(count):
+                    key_size, value_size = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    key = page[offset : offset + key_size]
+                    offset += key_size
+                    value = page[offset : offset + value_size]
+                    offset += value_size
+                    records.append((key, value))
+                if ref["height"]:
+                    for _, value in records:
+                        yield from leaves(
+                            {"digest": list(value[:32]), "height": value[36]}
+                        )
+                else:
+                    yield path, records
+
+            # A rare query must never read an unrelated routing leaf. Restart
+            # clears in-memory admission and decoded page caches first.
+            required = {
+                key[-32:]
+                for _, records in leaves(root_document["term_directory"]["leaves"])
+                for key, _ in records
+                if b"quasar" in key
+            }
+            assert len(required) == 3
+            unrelated = [
+                path
+                for path, records in leaves(root_document["directories"]["segments"])
+                if all(key[:32] not in required for key, _ in records)
+            ]
+            assert unrelated, (
+                "Fixture must have a leaf outside the necessary segment set"
+            )
+            server.pause()
+            for cache_root in server.root.rglob("lake-ranges"):
+                if cache_root.is_dir():
+                    shutil.rmtree(cache_root)
+            originals = [(path, path.read_bytes()) for path in unrelated]
+            try:
+                for path, _ in originals:
+                    path.unlink()
+                server.resume()
+                assert query(nested) == baseline
+            finally:
+                server.pause()
+                for path, payload in originals:
+                    path.write_bytes(payload)
+                server.resume()
         failed = False
     finally:
         server.stop(test_failed=failed)

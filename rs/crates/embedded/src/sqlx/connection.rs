@@ -158,14 +158,15 @@ impl Worker {
             .spawn(move || {
                 let database = match Database::open(&thread_path, &native_options) {
                     Ok(db) => Ok(db),
-                    Err(crate::Error::NotFound) => Database::create(&thread_path, &native_options)
-                        .or_else(|error| {
+                    Err(error) if error.kind() == crate::Error::NotFound => {
+                        Database::create(&thread_path, &native_options).or_else(|error| {
                             if thread_path.exists() {
                                 Database::open(&thread_path, &native_options)
                             } else {
                                 Err(error)
                             }
-                        }),
+                        })
+                    }
                     Err(e) => Err(e),
                 };
                 match database {

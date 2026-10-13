@@ -3790,7 +3790,8 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
+            ctx.header(http_server_mod.trusted_principal_header) == null) return null;
         return self.api_server.authenticateRequest(.{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
@@ -3803,7 +3804,8 @@ pub const AntflyApiHandler = struct {
     }
 
     fn requireAuth(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
+            ctx.header(http_server_mod.trusted_principal_header) == null) return null;
         const identity = (try self.authenticate(ctx)) orelse {
             return error.Unauthorized;
         };
@@ -3946,8 +3948,14 @@ pub const AntflyApiHandler = struct {
 
     fn authorizeRequest(self: *AntflyApiHandler, ctx: *httpx.Context, identity: *?AuthenticatedIdentity) !?httpx.Response {
         identity.* = null;
-        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
-        if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
+        // A supplied trusted identity must be verified, even on an otherwise
+        // anonymous standalone server. Missing verifier configuration is not
+        // permission to execute that principal's request anonymously.
+        const trusted_principal = ctx.header(http_server_mod.trusted_principal_header);
+        if (trusted_principal == null) {
+            if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+            if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
+        }
 
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         if (ctx.getData(authenticated_identity_context_key)) |raw| {

@@ -422,6 +422,62 @@ class Database:
     def list_indexes(self, *, raw: bool = False) -> Any:
         return self._json_read(self._lib.antfly_db_list_indexes_json, raw=raw)
 
+    def render_resolver_key(self, resolver: str, mention: JSONInput, *, raw: bool = False) -> Any:
+        """Render a durable resolver template and follow its explicit key aliases.
+
+        Returns minted_key, key, table and config_generation. No writes or ANN search.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(mention))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_render_resolver_key_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolve_query(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Extract {"text": "..."}, or resolve {"extraction": {"entities": [...]}}.
+
+        Uses the durable extractor and resolver, including alias/ANN matching.
+        Returns extraction and resolution (canonical doc_refs and decisions),
+        without publishing documents, resolution artifacts or graph edges.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolve_query_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def merge_resolver_keys(self, resolver: str, key: str, target: str) -> None:
+        """Persist a key redirect; run_until_idle re-keys existing resolution edges."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input({"key": key, "target": target}))
+            errors.raise_for_code(self._lib.antfly_db_merge_resolver_keys_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
+    def set_resolver_namespace(self, resolver: str, request: JSONInput) -> None:
+        """Reset or explicitly migrate aliases/merges into a new table/template; drain afterward."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            errors.raise_for_code(self._lib.antfly_db_set_resolver_namespace_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
     def add_index(self, config: JSONInput) -> None:
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 

@@ -114,3 +114,34 @@ fn open_options_struct_sizes_match_library() {
     let got = std::mem::size_of::<sys::antfly_open_options>();
     assert_eq!(got, want);
 }
+
+#[test]
+fn native_diagnostics_are_owned_and_sql_cannot_reuse_same_code_detail() {
+    std::thread::Builder::new()
+        .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+        .spawn(|| {
+            use antfly_embedded::Database;
+            let path = std::env::temp_dir().join(format!(
+                "antfly-native-errors-{}.aflite",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let db = Database::create_hosted(&path).unwrap();
+            db.create_table_json("entities", b"{}").unwrap();
+            let table = db.open_table("entities").unwrap();
+            let index_error = db.add_index_json(br#"{"name":"invalid"}"#).unwrap_err();
+            assert_eq!(index_error.kind(), Error::InvalidArgument);
+            assert!(index_error.detail().unwrap().contains("MissingIndexType"));
+            let sql_error = table.sql_session_open().unwrap_err();
+            assert_eq!(sql_error.kind(), Error::InvalidArgument);
+            assert!(!sql_error.detail().unwrap().contains("MissingIndexType"));
+            assert!(sql_error.detail().unwrap().contains("root database handle"));
+            assert!(index_error.detail().unwrap().contains("MissingIndexType"));
+            drop(table);
+            drop(db);
+            std::fs::remove_file(path).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

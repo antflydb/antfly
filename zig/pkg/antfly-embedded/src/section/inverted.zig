@@ -9163,6 +9163,20 @@ pub const RangeInvertedIndexReader = struct {
         return stats;
     }
 
+    /// Small disjoint ranges needed to reopen this reader, excluding postings,
+    /// dictionary blocks and norms. Publishers may bundle them without changing
+    /// the section's native bytes or payload validation contract.
+    pub fn initialMetadataViews(self: *const RangeInvertedIndexReader) ![4]?@import("../segment_source.zig").View {
+        const View = @import("../segment_source.zig").View;
+        const dictionary = self.blocks_offset - term_dict_header_size;
+        return .{
+            try View.init(self.view.source, self.view.offset, v7_header_size),
+            try View.init(self.view.source, self.view.offset + dictionary, term_dict_header_size),
+            if (self.term_bloom) |filter| try View.init(self.view.source, self.view.offset + filter.bytes_offset - (bloom.magic.len + 13), bloom.magic.len + 13) else null,
+            if (self.norms_length != 0) try View.init(self.view.source, self.view.offset + self.norms_offset, 5) else null,
+        };
+    }
+
     pub fn docLength(self: *const RangeInvertedIndexReader, doc: u32) !u32 {
         if (doc >= self.norm_count or self.norms_length < 5) return 0;
         const count = self.norm_count;
@@ -10231,12 +10245,15 @@ test "append merge uses fixed scratch for sparse document spaces and deletion ra
     var deleted = roaring.RoaringBitmap.init(a);
     defer deleted.deinit();
     try deleted.add(7);
+    // Compare allocate/copy/free peaks independently of whether the backing
+    // heap can grow or relocate a particular allocation in place.
+    var stable = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
     var peaks: [2]usize = undefined;
     for ([_]u32{ 1024, 100_000 }, 0..) |space, case| {
         var output = @import("../segment.zig").MemorySegmentSink.init(a);
         defer output.deinit();
         var sink = output.sink();
-        var budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 256 * 1024 };
+        var budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = stable.allocator(), .limit = 256 * 1024 };
         try writeMergedInvertedSectionSlotsWithDeletes(budget.allocator(), &sink, @as([]const ?[]const u8, &.{ bytes, null, bytes }), &.{ space, 7, space }, &.{ deleted, null, deleted }, productionIndexConfig());
         peaks[case] = budget.peak;
         var reader = try ScopedInvertedIndexReader.initContiguous(a, output.out.items);

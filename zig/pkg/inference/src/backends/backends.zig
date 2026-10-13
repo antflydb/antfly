@@ -21,7 +21,6 @@ const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
-const backend_runtime_mod = @import("backend_runtime.zig");
 const execution_control = @import("../execution_control.zig");
 const Interruption = execution_control.Interruption;
 
@@ -35,17 +34,13 @@ pub const activations = @import("activations.zig");
 pub const session_pool = @import("session_pool.zig");
 pub const SessionPool = session_pool.SessionPool;
 
-pub const onnx = if (build_options.enable_onnx) @import("onnx.zig") else struct {};
-pub const ortgenai = if (build_options.enable_onnx) @import("ortgenai.zig") else struct {};
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
-pub const OnnxExecutionProvider = backend_runtime_mod.OnnxExecutionProvider;
 
 const session_factory = @import("../architectures/session_factory.zig");
 
 pub const BackendType = enum {
     native,
-    onnx,
     metal,
     cuda,
     pjrt,
@@ -53,7 +48,6 @@ pub const BackendType = enum {
 
     pub fn parse(value: []const u8) ?BackendType {
         if (std.mem.eql(u8, value, "native")) return .native;
-        if (std.mem.eql(u8, value, "onnx")) return .onnx;
         if (std.mem.eql(u8, value, "metal")) return .metal;
         if (std.mem.eql(u8, value, "cuda")) return .cuda;
         if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
@@ -70,7 +64,6 @@ pub const BackendType = enum {
     pub fn available(self: BackendType) bool {
         return switch (self) {
             .native => build_options.enable_native,
-            .onnx => build_options.enable_onnx,
             .metal => build_options.enable_metal,
             .cuda => build_options.enable_cuda,
             .pjrt => build_options.enable_pjrt,
@@ -80,7 +73,6 @@ pub const BackendType = enum {
 
     pub fn priority(self: BackendType) u8 {
         return switch (self) {
-            .onnx => 10,
             .metal => 15,
             .cuda => 25,
             .pjrt => 35,
@@ -113,37 +105,32 @@ pub const BackendType = enum {
     pub fn executionInterruption(self: BackendType) Interruption {
         return switch (self) {
             .native, .wasm => .cooperative,
-            .onnx => .native_terminable,
             .metal, .cuda, .pjrt => .process_required,
         };
     }
 
-    /// Model/session construction does not have the per-call termination
-    /// handle that ONNX execution exposes. Any constructor which enters a
-    /// native runtime or device driver therefore belongs to the replaceable
-    /// worker, even when later execution can be terminated in-process.
+    /// Any model/session constructor which enters a device driver or native
+    /// runtime belongs to the replaceable worker.
     pub fn loadInterruption(self: BackendType) Interruption {
         return switch (self) {
             .native, .wasm => .cooperative,
-            .onnx, .metal, .cuda, .pjrt => .process_required,
+            .metal, .cuda, .pjrt => .process_required,
         };
     }
 
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .onnx, .metal, .cuda, .wasm => true,
+            .native, .metal, .cuda, .wasm => true,
             .pjrt => false,
         };
     }
 };
 
-/// A backend plus the concrete execution provider that determines its resource
-/// domain. In particular, external ONNX Runtime sessions are not inherently
-/// CPU: an automatically selected CUDA provider must be admitted as GPU work.
+/// The backend that determines a session's resource domain and interruption
+/// policy.
 pub const BackendRuntime = struct {
     backend: BackendType,
-    onnx_execution_provider: OnnxExecutionProvider = .cpu,
 
     pub fn requiresProcessIsolation(self: BackendRuntime) bool {
         return self.loadInterruption() == .process_required or
@@ -161,14 +148,11 @@ pub const BackendRuntime = struct {
     pub fn usesGpuHostedSession(self: BackendRuntime) bool {
         return switch (self.backend) {
             .metal, .cuda => true,
-            .onnx => self.onnx_execution_provider == .cuda,
             else => false,
         };
     }
 
     pub fn executionInterruption(self: BackendRuntime) Interruption {
-        if (self.backend == .onnx and self.onnx_execution_provider == .cuda)
-            return .process_required;
         return self.backend.executionInterruption();
     }
 
@@ -177,37 +161,15 @@ pub const BackendRuntime = struct {
     }
 };
 
-test "backend runtime classifies external ONNX CUDA as GPU hosted" {
-    try std.testing.expect(!(BackendRuntime{
-        .backend = .onnx,
-        .onnx_execution_provider = .cpu,
-    }).usesGpuHostedSession());
-    try std.testing.expectEqual(
-        Interruption.native_terminable,
-        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).executionInterruption(),
-    );
-    try std.testing.expectEqual(
-        Interruption.process_required,
-        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cuda }).executionInterruption(),
-    );
-    try std.testing.expect((BackendRuntime{
-        .backend = .onnx,
-        .onnx_execution_provider = .cuda,
-    }).usesGpuHostedSession());
-}
-
 test "backend runtime process placement covers loading and execution" {
     try std.testing.expect(!(BackendRuntime{ .backend = .native }).requiresProcessIsolation());
     try std.testing.expect(!(BackendRuntime{ .backend = .wasm }).requiresProcessIsolation());
-    // CPU ONNX execution is terminable, but runtime construction is not.
-    try std.testing.expect((BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).requiresProcessIsolation());
     inline for (.{ BackendType.metal, BackendType.cuda, BackendType.pjrt }) |backend|
         try std.testing.expect((BackendRuntime{ .backend = backend }).requiresProcessIsolation());
 }
 
 test "backend interruption policy isolates unabortable driver calls" {
     try std.testing.expectEqual(Interruption.cooperative, BackendType.native.executionInterruption());
-    try std.testing.expectEqual(Interruption.native_terminable, BackendType.onnx.executionInterruption());
     try std.testing.expectEqual(Interruption.process_required, BackendType.metal.executionInterruption());
     try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.executionInterruption());
     try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.executionInterruption());
@@ -215,13 +177,8 @@ test "backend interruption policy isolates unabortable driver calls" {
 
 test "backend load policy isolates native runtime construction" {
     try std.testing.expectEqual(Interruption.cooperative, BackendType.native.loadInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.onnx.loadInterruption());
     try std.testing.expectEqual(Interruption.process_required, BackendType.metal.loadInterruption());
     try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.loadInterruption());
-    try std.testing.expectEqual(
-        Interruption.process_required,
-        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).loadInterruption(),
-    );
 }
 
 test "embedded session policy fails before selecting an uninterruptible backend" {
@@ -258,13 +215,6 @@ pub const SessionManager = struct {
     gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     /// Per-manager qualification override, absent from production builds.
     test_allow_unqualified_gliner_cuda_precision: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
-    /// Provider preference for the external ONNX Runtime backend. Automatic is
-    /// resolved before admission; candidate SessionManagers then carry only
-    /// the resolved CPU/CUDA value through construction.
-    onnx_execution_provider: OnnxExecutionProvider = .automatic,
-    /// Per-session CUDA allocation ceiling. ModelManager sets this to the
-    /// model-residency plus pre-admitted workspace reservation.
-    onnx_cuda_memory_limit_bytes: usize = std.math.maxInt(usize),
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -319,6 +269,7 @@ pub const SessionManager = struct {
     /// contract used by the inference runtime. PJRT is intentionally rejected
     /// until the runtime has a consistent compiled-only loading path.
     pub fn validateRequiredBackendPolicy(self: *const SessionManager) !void {
+        try validateBackendEnvironment();
         if (self.required_backend_invalid) return error.InvalidRequiredBackend;
         const backend = self.required_backend orelse return;
         if (!backend.available() or !backend.supportsDirectSessionLoad())
@@ -420,7 +371,7 @@ pub const SessionManager = struct {
                 continue;
             }
             const effective_model_path = switch (backend) {
-                .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
+                .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
             };
             if (self.kernel_jit.qualified_profile_path != null and
@@ -431,17 +382,6 @@ pub const SessionManager = struct {
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
 
             const session = switch (backend) {
-                .onnx => if (comptime build_options.enable_onnx) blk: {
-                    if (!isOnnxFilePath(effective_model_path)) continue;
-                    break :blk onnx.createSessionWithOptions(self.allocator, effective_model_path, .{
-                        .execution_provider = backend_runtime.onnx_execution_provider,
-                        .cuda_memory_limit_bytes = self.onnx_cuda_memory_limit_bytes,
-                    }) catch |err| {
-                        std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        first_err = first_err orelse err;
-                        continue;
-                    };
-                } else continue,
                 .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
@@ -594,11 +534,6 @@ pub const SessionManager = struct {
         return isOnnxFilePath(model_path);
     }
 
-    fn shouldUseExternalOnnxRuntime(self: *const SessionManager, model_path: []const u8) bool {
-        _ = self;
-        return build_options.enable_onnx and isOnnxFilePath(model_path);
-    }
-
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
         if (self.required_backend_invalid) return null;
         if (self.required_backend) |backend| {
@@ -628,16 +563,8 @@ pub const SessionManager = struct {
         self: *const SessionManager,
         backend: BackendType,
     ) !BackendRuntime {
-        return .{
-            .backend = backend,
-            .onnx_execution_provider = if (backend == .onnx)
-                if (comptime build_options.enable_onnx)
-                    try onnx.resolveExecutionProvider(self.onnx_execution_provider)
-                else
-                    return error.BackendUnavailable
-            else
-                .cpu,
-        };
+        _ = self;
+        return .{ .backend = backend };
     }
 };
 
@@ -651,12 +578,11 @@ fn configuredPreferredBackends() []const BackendType {
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
     return switch (backend) {
-        .onnx => &.{ .onnx, .metal, .native },
-        .metal => if (build_options.enable_metal) &.{ .metal, .onnx, .native } else &.{ .native, .onnx },
-        .cuda => if (build_options.enable_cuda) &.{ .cuda, .onnx, .metal, .native } else &.{ .native, .onnx, .metal },
-        .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .native } else &.{ .onnx, .metal, .native },
-        .native => &.{ .native, .onnx, .metal },
-        .wasm => &.{ .onnx, .metal, .native },
+        .metal => if (build_options.enable_metal) &.{ .metal, .native } else &.{.native},
+        .cuda => if (build_options.enable_cuda) &.{ .cuda, .metal, .native } else &.{ .native, .metal },
+        .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .metal, .native } else &.{ .metal, .native },
+        .native => &.{ .native, .metal },
+        .wasm => &.{ .metal, .native },
     };
 }
 
@@ -708,14 +634,12 @@ test "explicit A4B requests select GPU backends without generic fallback" {
 
 test "CUDA-first automatic backend order is fail-closed before CPU" {
     try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .native }));
-    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .onnx, .native }));
+    try std.testing.expect(backendOrderSelectsCudaBeforeCpu(&.{ .cuda, .metal, .native }));
     try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .native, .cuda }));
     try std.testing.expect(!backendOrderSelectsCudaBeforeCpu(&.{ .metal, .native }));
 }
 
-test "onnx backend availability follows linked onnx runtime" {
-    try std.testing.expectEqual(build_options.enable_onnx, BackendType.onnx.available());
-    try std.testing.expect(BackendType.onnx.supportsDirectSessionLoad());
+test "imported ONNX graphs default to the native or wasm backend" {
     if (build_options.enable_wasm) {
         try std.testing.expectEqual(BackendType.wasm, configuredPreferredBackends()[0]);
         try std.testing.expectEqual(BackendType.wasm, defaultImportedOnnxBackend());
@@ -726,19 +650,15 @@ test "onnx backend availability follows linked onnx runtime" {
 }
 
 test "preferred backend override keeps fallback backends" {
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .native }, preferredBackendsForOverride(.onnx));
-    try std.testing.expectEqualSlices(BackendType, &.{ .native, .onnx, .metal }, preferredBackendsForOverride(.native));
+    try std.testing.expectEqualSlices(BackendType, &.{ .native, .metal }, preferredBackendsForOverride(.native));
 }
 
-test "explicit graph runtime is independent from onnx runtime backend availability" {
+test "ONNX files always use the imported graph runtime" {
     var manager = SessionManager.init(std.testing.allocator);
     try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
-    try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     manager.graph_runtime_strategy = .partitioned;
     try std.testing.expect(manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
-    try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
-    try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
 }
 
 test "A4B request rejects imported ONNX Metal artifact before session creation" {
@@ -757,7 +677,7 @@ test "required runtime kernel JIT accepts only direct GPU session backends" {
     try std.testing.expect(BackendType.metal.supportsKernelJitSession());
     try std.testing.expect(BackendType.cuda.supportsKernelJitSession());
     try std.testing.expect(!BackendType.native.supportsKernelJitSession());
-    try std.testing.expect(!BackendType.onnx.supportsKernelJitSession());
+    try std.testing.expect(!BackendType.wasm.supportsKernelJitSession());
 
     var manager = SessionManager.init(std.testing.allocator);
     manager.kernel_jit.mode = .required;
@@ -777,7 +697,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     };
     source.kernel_jit_load_context = .startup_preload;
     source.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 };
-    const preferred = [_]BackendType{.onnx};
+    const preferred = [_]BackendType{.native};
 
     const cloned = source.withPreferredBackends(std.testing.allocator, &preferred);
     try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
@@ -791,11 +711,54 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
-test "auto backend order keeps external onnx runtime opt-in" {
+test "auto backend order prefers Metal then native" {
     if (!build_options.enable_wasm) {
         try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, configuredPreferredBackends());
     }
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .native }, preferredBackendsForOverride(.onnx));
+}
+
+/// The ONNX Runtime backend was removed. `onnx` is rejected by name so a stale
+/// configuration fails with an explanation instead of silently falling back.
+pub const removed_onnx_backend_message =
+    "the onnx backend (ONNX Runtime) has been removed; ONNX models run on Antfly's native ONNX implementation, so use auto, native, metal, or cuda";
+
+pub fn isRemovedOnnxBackendName(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "onnx");
+}
+
+const backend_environment_variables = [_][:0]const u8{
+    "ANTFLY_INFERENCE_PREFERRED_BACKEND",
+    "TERMITE_PREFERRED_BACKEND",
+    "ANTFLY_INFERENCE_REQUIRED_BACKEND",
+};
+
+/// Reject backend environment settings that name the removed `onnx` backend.
+pub fn validateBackendEnvironment() !void {
+    if (build_options.enable_wasm or !build_options.link_libc) return;
+    for (backend_environment_variables) |name| {
+        const raw = std.c.getenv(name) orelse continue;
+        try validateBackendEnvironmentValue(name, std.mem.span(raw));
+    }
+}
+
+fn validateBackendEnvironmentValue(name: []const u8, value: []const u8) !void {
+    if (!isRemovedOnnxBackendName(value)) return;
+    if (!builtin.is_test) std.log.err("{s}={s}: {s}", .{ name, value, removed_onnx_backend_message });
+    return error.OnnxBackendRemoved;
+}
+
+test "backend environment rejects the removed onnx backend" {
+    try std.testing.expectError(
+        error.OnnxBackendRemoved,
+        validateBackendEnvironmentValue("ANTFLY_INFERENCE_PREFERRED_BACKEND", "onnx"),
+    );
+    try std.testing.expectError(
+        error.OnnxBackendRemoved,
+        validateBackendEnvironmentValue("TERMITE_PREFERRED_BACKEND", "ONNX"),
+    );
+    try validateBackendEnvironmentValue("ANTFLY_INFERENCE_PREFERRED_BACKEND", "native");
+    try std.testing.expectEqual(@as(?BackendType, null), parseBackendName("onnx", true));
+    try std.testing.expect(requiredBackendConfigForValue("onnx").invalid);
 }
 
 fn preferredBackendOverride() ?BackendType {
@@ -822,7 +785,6 @@ fn requiredBackendConfigForValue(value: []const u8) RequiredBackendConfig {
 
 fn parseBackendName(value: []const u8, allow_auto: bool) ?BackendType {
     if (allow_auto and std.ascii.eqlIgnoreCase(value, "auto")) return null;
-    if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
     if (std.ascii.eqlIgnoreCase(value, "pjrt")) return .pjrt;
     if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
@@ -866,7 +828,7 @@ test "required backend replaces every fallback candidate" {
     manager.required_backend = .cuda;
     manager.required_backend_invalid = false;
     var required_buf: [1]BackendType = undefined;
-    const fallback = [_]BackendType{ .native, .onnx, .metal };
+    const fallback = [_]BackendType{ .native, .metal };
     try std.testing.expectEqualSlices(
         BackendType,
         &.{.cuda},
@@ -885,15 +847,15 @@ test "required backend gates backend-specific fast paths" {
     manager.required_backend = .cuda;
     manager.required_backend_invalid = false;
     try std.testing.expect(try manager.allowsDirectBackend(.cuda));
-    try std.testing.expect(!try manager.allowsDirectBackend(.onnx));
+    try std.testing.expect(!try manager.allowsDirectBackend(.native));
     try std.testing.expect(try manager.allowsBackend(.cuda));
-    try std.testing.expect(!try manager.allowsBackend(.onnx));
+    try std.testing.expect(!try manager.allowsBackend(.native));
 
     manager.required_backend = null;
-    try std.testing.expect(try manager.allowsDirectBackend(.onnx));
+    try std.testing.expect(try manager.allowsDirectBackend(.native));
 
     manager.required_backend_invalid = true;
-    try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.onnx));
+    try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.native));
 }
 
 test "required backend policy rejects unavailable and compiled-only backends" {
@@ -1025,13 +987,13 @@ fn effectiveBackendOrder(
     const prefer_blas_before_gpu = shouldPreferBlasBeforeGpu(allocator, manifest);
     if (manifest) |man| {
         if (shouldPreferNativeBgeM3(man)) {
-            return reorderNativeAheadOfOnnx(scratch, preferred, true);
+            return reorderNativeAheadOfOtherBackends(scratch, preferred, true);
         }
         if (shouldPreferNativeTextEncoder(man)) {
-            return reorderNativeAheadOfOnnx(scratch, preferred, true);
+            return reorderNativeAheadOfOtherBackends(scratch, preferred, true);
         }
         if (man.native_arch_hint == .layoutlmv3 and man.safetensors_path != null) {
-            return reorderNativeAheadOfOnnx(scratch, preferred, prefer_blas_before_gpu);
+            return reorderNativeAheadOfOtherBackends(scratch, preferred, prefer_blas_before_gpu);
         }
     }
     return effectiveBackendOrderForPreference(scratch, preferred, prefer_blas_before_gpu);
@@ -1069,7 +1031,7 @@ fn effectiveBackendOrderForPreference(
     return scratch[0..idx];
 }
 
-fn reorderNativeAheadOfOnnx(
+fn reorderNativeAheadOfOtherBackends(
     scratch: *[backend_order_capacity]BackendType,
     preferred: []const BackendType,
     prefer_blas_before_gpu: bool,
@@ -1120,7 +1082,7 @@ test "shouldPreferBlasBeforeGpuForBytes prefers native only above eager dense th
 }
 
 test "effective backend order keeps gpu before native for large gguf generators" {
-    const preferred = [_]BackendType{ .onnx, .metal, .native };
+    const preferred = [_]BackendType{ .pjrt, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
@@ -1132,21 +1094,21 @@ test "effective backend order keeps gpu before native for large gguf generators"
 }
 
 test "effective backend order handles four backend preference lists" {
-    const preferred = [_]BackendType{ .cuda, .onnx, .metal, .native };
+    const preferred = [_]BackendType{ .cuda, .pjrt, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .cuda, .metal, .native }, effective);
+    try std.testing.expectEqualSlices(BackendType, &.{ .pjrt, .cuda, .metal, .native }, effective);
 }
 
 test "effective backend order preserves gpu preference for small gguf generators" {
-    const preferred = [_]BackendType{ .onnx, .metal, .native };
+    const preferred = [_]BackendType{ .pjrt, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, false);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
 }
 
 test "effective backend order preserves order for non-gguf models" {
-    const preferred = [_]BackendType{ .onnx, .metal, .native };
+    const preferred = [_]BackendType{ .pjrt, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
@@ -1177,8 +1139,8 @@ test "unqualified BGE-M3 prefers native ahead of Metal" {
     try std.testing.expectEqualSlices(BackendType, &.{ .native, .metal }, effective);
 }
 
-test "effective backend order prefers native layoutlmv3 before onnx" {
-    const preferred = [_]BackendType{ .onnx, .metal, .native };
+test "effective backend order prefers native layoutlmv3 before other backends" {
+    const preferred = [_]BackendType{ .pjrt, .metal, .native };
     var scratch: [backend_order_capacity]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
@@ -1186,15 +1148,16 @@ test "effective backend order prefers native layoutlmv3 before onnx" {
         .safetensors_path = "dummy",
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
-    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native, .onnx }, effective);
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native, .pjrt }, effective);
 }
 
 test "backend names parse canonical values aliases and optional auto" {
-    inline for (.{ "native", "onnx", "metal", "cuda", "pjrt", "wasm" }) |name|
+    inline for (.{ "native", "metal", "cuda", "pjrt", "wasm" }) |name|
         try std.testing.expectEqual(std.meta.stringToEnum(BackendType, name).?, BackendType.parse(name).?);
     try std.testing.expectEqual(BackendType.pjrt, BackendType.parse("xla").?);
     try std.testing.expectEqual(BackendType.wasm, BackendType.parse("webgpu").?);
     try std.testing.expect(BackendType.parse("unknown") == null);
+    try std.testing.expect(BackendType.parse("onnx") == null);
     try std.testing.expect(try BackendType.parseOptional(null) == null);
     try std.testing.expect(try BackendType.parseOptional("auto") == null);
     try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));

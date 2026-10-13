@@ -1,0 +1,146 @@
+{
+  "source_revision": "1258e8cfcb83a638d69e869234bfa747e52f0029",
+  "platform": "aarch64-macos",
+  "zig_version": "0.17.0",
+  "product_source_changes": false,
+  "probe_patch": "issue1089_two_hop_baseline.patch",
+  "request": {
+    "full_text_search": {
+      "match": {
+        "field": "search_text",
+        "text": "embedder"
+      }
+    },
+    "limit": 5,
+    "graph_queries": {
+      "q": {
+        "index": "knowledge",
+        "traverse": {
+          "start": {
+            "result_ref": "$query_results",
+            "limit": 5
+          },
+          "direction": "both",
+          "edge_types": [
+            "about"
+          ],
+          "max_depth": 2,
+          "include_documents": true,
+          "include_paths": true,
+          "limit": 20
+        }
+      }
+    }
+  },
+  "result_code": "ok",
+  "response": {
+    "responses": [
+      {
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "exact"
+          },
+          "hits": [
+            {
+              "_id": "claim:a",
+              "_score": 0.4919109046459198,
+              "_source": {
+                "about": [
+                  "concept/shared"
+                ],
+                "search_text": "embedder"
+              }
+            }
+          ],
+          "max_score": 0.4919109046459198
+        },
+        "took": 0,
+        "status": 200,
+        "table": "docs",
+        "graph_results": {
+          "q": {
+            "kind": "nodes",
+            "nodes": [
+              {
+                "key": "concept/shared",
+                "depth": 1,
+                "path": [
+                  {
+                    "key": "claim:a"
+                  },
+                  {
+                    "key": "concept/shared"
+                  }
+                ],
+                "path_edges": [
+                  {
+                    "from": {
+                      "key": "claim:a"
+                    },
+                    "to": {
+                      "key": "concept/shared"
+                    },
+                    "direction": "out",
+                    "type": "about",
+                    "weight": 1
+                  }
+                ]
+              },
+              {
+                "key": "claim:b",
+                "depth": 2,
+                "document": {
+                  "about": [
+                    "concept/shared"
+                  ]
+                },
+                "path": [
+                  {
+                    "key": "claim:a"
+                  },
+                  {
+                    "key": "concept/shared"
+                  },
+                  {
+                    "key": "claim:b"
+                  }
+                ],
+                "path_edges": [
+                  {
+                    "from": {
+                      "key": "claim:a"
+                    },
+                    "to": {
+                      "key": "concept/shared"
+                    },
+                    "direction": "out",
+                    "type": "about",
+                    "weight": 1
+                  },
+                  {
+                    "from": {
+                      "key": "concept/shared"
+                    },
+                    "to": {
+                      "key": "claim:b"
+                    },
+                    "direction": "in",
+                    "type": "about",
+                    "weight": 1
+                  }
+                ]
+              }
+            ],
+            "stats": {
+              "returned_items": 2,
+              "truncated": false
+            }
+          }
+        }
+      }
+    ]
+  },
+  "conclusion": "The exact request succeeds with a shared-concept graph at the reported original revision. This does not reproduce or explain the original environment-specific failure.",
+  "profile": "native"
+}
