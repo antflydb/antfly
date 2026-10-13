@@ -144,7 +144,7 @@ pub const Repository = struct {
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
-        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference };
+        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference, .can_evict = canEvict };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
     }
     fn from(raw: *anyopaque) *Repository {
@@ -371,6 +371,26 @@ pub const Repository = struct {
         const expected_domain = try self.domain(a, namespace);
         return marked.version == 1 and marked.namespace.eql(namespace) and marked.request.table_id == request.table_id and marked.request.expires_ms == request.expires_ms and std.mem.eql(u8, marked.request.id, request.id) and std.mem.eql(u8, &marked.domain, &expected_domain);
     }
+    fn canEvict(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        const self = from(raw);
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (!try self.localCommit(a, io, root, request, namespace)) return false;
+        const bytes = self.readManifest(a, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return false,
+            else => return err,
+        };
+        const manifest = checkedManifest(a, bytes, request, namespace) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return false,
+            else => return err,
+        };
+        if (manifest.sequence != sequence) return false;
+        _ = try self.validateManifestAuthority(a, manifest, request, namespace);
+        try cancellation.check();
+        return true;
+    }
     fn markCommitted(self: *Repository, a: A, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace) !void {
         const path = try std.fmt.allocPrint(a, "{s}/query-remote.json", .{root});
         const bytes = try std.json.Stringify.valueAlloc(a, LocalCommit{ .domain = try self.domain(a, namespace), .request = request, .namespace = namespace }, .{});
@@ -553,6 +573,16 @@ pub const Repository = struct {
             };
         };
     }
+    fn validateManifestAuthority(self: *Repository, a: A, manifest: Manifest, request: cut.Request, namespace: Namespace) ![32]u8 {
+        const expected_domain = try self.domain(a, namespace);
+        // Publication may reuse the adjacent warmer epoch (one additional
+        // hour) beyond its ordinary two-window chunk horizon.
+        for (manifest.files) |file| for (file.chunks) |ref| {
+            const scope = (try artifacts.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms) return error.CatalogGenerationChanged;
+        };
+        return expected_domain;
+    }
     fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -566,13 +596,7 @@ pub const Repository = struct {
             std.log.warn("retained native manifest validation failed err={s}", .{@errorName(err)});
             return err;
         };
-        const expected_domain = try self.domain(a, namespace);
-        // Publication may reuse the adjacent warmer epoch (one additional
-        // hour) beyond its ordinary two-window chunk horizon.
-        for (manifest.files) |file| for (file.chunks) |ref| {
-            const scope = (try artifacts.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.CatalogGenerationChanged;
-            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms) return error.CatalogGenerationChanged;
-        };
+        const expected_domain = try self.validateManifestAuthority(a, manifest, request, namespace);
         const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
         const reader = try port.remote_storage.Reader.create(self.a, io, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
@@ -990,4 +1014,61 @@ test "external lake native cut admission counts shared extents and rejects exist
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, cut.admit(a, io, db_path, &ids[0], .{ .max_cuts = 1, .max_bytes = 6 }, .none));
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, cut.admit(a, io, db_path, &ids[0], .{ .max_cuts = 2, .max_bytes = 5 }, .none));
     try cut.validate(a, io, first_root, .{ .id = &ids[0], .table_id = 7, .expires_ms = expires }, namespace, .none);
+}
+
+test "external lake native cache evicts durable idle generations and recovers retained cursors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-durable-cache-eviction");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    repository.limits.max_cuts = 1;
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }} });
+    const old_id: [64]u8 = @splat('a');
+    const new_id: [64]u8 = @splat('b');
+    const last_id: [64]u8 = @splat('c');
+    const expires = cut.nowMs() + 300_000;
+    var old: cut.Request = .{ .id = &old_id, .table_id = 7, .expires_ms = expires, .create = true };
+    const next: cut.Request = .{ .id = &new_id, .table_id = 7, .expires_ms = expires, .create = true };
+    var original = try db.openQueryCut(old, .none);
+    var original_open = true;
+    defer if (original_open) original.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }} });
+    // An active local reader must retain its files even with durable authority.
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(next, .none));
+    original.close();
+    original_open = false;
+    {
+        var current = try db.openQueryCut(next, .none);
+        defer current.close();
+        const old_root = try cut.pathAlloc(a, root, &old_id);
+        defer a.free(old_root);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, old_root, .{}));
+    }
+    // The original cursor reads the exact old generation through the repository.
+    old.create = false;
+    {
+        var recovered = try db.openQueryCut(old, .none);
+        defer recovered.close();
+        const value = (try recovered.get(a, "doc")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{\"amount\":1}", value);
+    }
+    // Missing durable authority must protect the only surviving local copy.
+    const key = try repository.key(a, next, namespace);
+    defer a.free(key);
+    try repository.store.opened.client.deleteObject(repository.store.opened.bucket, key, .{});
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(.{ .id = &last_id, .table_id = 7, .expires_ms = expires, .create = true }, .none));
+    const current_root = try cut.pathAlloc(a, root, &new_id);
+    defer a.free(current_root);
+    try std.Io.Dir.accessAbsolute(io, current_root, .{});
 }

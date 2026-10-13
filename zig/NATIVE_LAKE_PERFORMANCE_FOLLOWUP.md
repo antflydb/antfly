@@ -2815,7 +2815,11 @@ checks pass. Cache storage follows the newly merged worktree policy. These
 checks establish correctness and bounded-work contracts; they do not replace
 representative archive-scale latency, RSS and provider-request measurements.
 
-### Remaining physical compaction format
+### Original physical compaction requirements (superseded by #1117)
+
+The following records the original requirements. The bounded implementation and
+its remaining scope are described in the deployment qualification plan linked
+above; the statements that these features are unimplemented are historical.
 
 Cross-source-file compaction remains unimplemented. The current serving record
 owns one file's physical rank directory, so concatenating bytes across files
@@ -3472,3 +3476,30 @@ These are functional and bounded-work qualifications. Live-provider retention
 policy enforcement and representative archive-scale latency/RSS/request-count
 benchmarks are deferred, as requested. Certificate-based audit bypass remains
 opt-in and defaults off.
+
+### Composed ranked pages with lower-bound cardinality
+
+Publication traversal can prove a top-k ordered window without visiting every
+matching posting, so a ranked leaf total may be `gte`. Composition must consume
+that full window without requiring an archive-wide exact count. Keep unknown
+cardinality separate from catalog binding and serving-token validation. Do not
+sum fluctuating full/remaining lower bounds or infer exhaustion from them. A short
+unknown-count page must carry exact exhaustion evidence; otherwise fail closed.
+Explicit counts and bounded replacement lookups retain exactness requirements.
+Version 3 continuations retain the independent identity binding; version 2 exact
+continuations remain readable. Recheck exhaustion after refill before reading a
+candidate from a terminal empty page. Regression coverage must include changing
+bounds, full and remaining terminal counts, identity changes, legacy cursors,
+masked overlays and million-row relations with bounded page work.
+
+
+### Durable native cuts and local cache admission
+
+Repeated composed searches must not exhaust a local generation-cache limit merely
+because their retained capabilities remain valid. Evict idle copies under the
+parent guard and exclusive per-cut lease only after a repository adapter confirms
+a matching durable manifest and its authority/retention horizons. Keep active
+readers, the requested generation and unpublished/undurable copies protected.
+Recompute shared physical extents after eviction before granting the byte budget.
+Never delete durable cursor authority to make room for a local cache. Recovery
+reads the same remote generation; it cannot recapture current native rows.
