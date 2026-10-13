@@ -3211,3 +3211,36 @@ Real-provider retention qualification was deferred by the operator on October
 13: GCS and R2 are immediately available; a credentialed AWS S3 target is not yet
 selected. No bucket retention policy or production certificate capability was
 changed.
+
+#### October 13 qualification
+
+Source `d08a0e97bd`, including main `f3fd4d3525`, is qualified on macOS arm64
+with Zig 0.17.0:
+
+- The final Debug server/integration/public-HTTP command completes 95/95 build
+  steps. Its two lake roots pass 156 and 249 tests (405 total), and all 33
+  public HTTP contracts pass, with no failures or leaks.
+- All 13 focused regressions pass in Debug and ReleaseFast. They cover exact
+  combined-corpus/window score parity, recent-first tie ordering, private masks,
+  global DF additions, recent-index byte exhaustion, physical masks across high
+  row bits and selected gaps, original range-capability preservation and
+  cancellation, metadata lookahead, and transform dependency planning.
+- All eight real Parquet/Iceberg E2Es pass against the final Debug binary copied
+  into the worktree's ignored cache. The new native-writer test uses 67 files
+  written independently by PyIceberg, imports their real manifests through the
+  managed catalog, accepts CDC replacements/deletes/inserts, checks bounded
+  frontier selection, and verifies archive/recent predicates, hidden highlights,
+  exact counts and identical retained results after restart. It belongs to the
+  existing Iceberg module included in `e2e-full`.
+- The 201-row wide-source fixture verifies narrow transform success, controlled
+  rejection of a genuinely wide dependency and survivor-only full output across
+  restart. No RSS threshold is inferred from these deterministic checks.
+- The embedded production boundary (872 sources), its 20 audit tests, Apache
+  product boundary (2,030 sources), changed Zig/Python formatting, unresolved
+  Python-name checks and `git diff --check` pass.
+
+These checks qualify correctness and bounded admission. They do not establish
+representative archive latency or cloud request-count improvements. The storage
+format migrations and broader accepted vector/hybrid shapes remain outstanding
+as described above. Required cache GC ran; its 55-second guard stopped the
+unresponsive uv prune after Zig/Go cleanup, preserving active build caches.
