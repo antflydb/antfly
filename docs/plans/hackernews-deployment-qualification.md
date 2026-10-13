@@ -453,6 +453,25 @@ per-cut lease under the parent guard. Active local readers prevent that cleanup;
 the request fails its existing admission bound instead of deleting their files.
 Remote reader leases do not depend on the discarded local directory.
 
+The configured `max_native_cuts` and `max_native_retained_bytes` bound the hot
+local generation cache. When admission reaches either bound, it may evict an idle
+copy only after confirming its local publication receipt against the current
+repository's immutable manifest: incarnation/namespace, ID, expiry, sequence,
+chunk authority and retention horizons must match. The parent guard and exclusive
+per-cut lease protect against concurrent local readers. Admission preserves the
+requested generation, recomputes shared-extent accounting after each deletion,
+and honors cancellation before deleting. Missing durable authority, active
+readers and repository adapters without this capability retain the hard bound.
+Eviction deletes local cache files, never durable manifests or chunks; an old
+cursor resumes the same remote generation without recapturing live rows.
+
+Repeated first-page searches previously filled the 64-cut default even when they
+referred to unchanged native rows. Qualification must exceed a deliberately small
+local cache capacity and resume old cursors after mutation, eviction and restart.
+The native HTTP matrix uses a two-cut cache for this purpose, for both primary-LSM
+and vector-store tables with filesystem and local S3 artifact providers. GCS is
+an explicit separate opt-in qualification.
+
 The recovery regression primes the vector reader, restarts the live database,
 and then preserves the local directory while removing its manifest, corrupting
 its metadata or removing a sealed source-vector file. Each case must return the
@@ -716,7 +735,44 @@ promote the development catalog or deploy a tenant.
 
 The final count-normalization guard also rejects an exact count smaller than the
 returned window after earlier lower-bound pages. The final local regression run
-passes 155 core plus 246 API lake tests without skips/leaks; all thirteen composed
+passes 157 core plus 247 API lake tests without skips/leaks; all thirteen composed
 regressions pass, and the qualification/budget/transport/recovery Python checks
 pass 47 tests and 25 subtests. These are engine/harness checks; the optimized HTTP
-matrix remains a separate evidence gate.
+matrix results follow below.
+
+### Rebuilt composed-query qualification, October 13
+
+[Recorded local evidence](../../examples/hackernews/composed-lake-qualification-20261013.json)
+binds production revision `37fa71b50d` and the optimized executable's digest to two
+complete cycles on the same 142,577-row, 1,024-file fixture with 128 serving runs.
+Both cycles pass filters, highlights, composition, retained pagination and
+restart correctness. Table/ID/score results match across all repeated composed
+queries and both cycles. A prior executable exhausted its default 64-cut native
+local cache during the second cycle; both rebuilt cycles complete after durable
+cache eviction was added.
+
+| Measurement | Cycle 1 | Cycle 2 |
+|---|---:|---:|
+| Cold historical/current union | 280 ms | 342 ms |
+| Union warm p95, 20 samples | 269 ms | 168 ms |
+| Cold saved replacement overlay | 345 ms | 299 ms |
+| Overlay warm p95, 20 samples | 199 ms | 162 ms |
+| Single-table first search after restart | 142 ms | 4,385 ms |
+| Retained cursor after restart | 2,583 ms | 768 ms |
+
+Finite `sqlite` pagination returns 167 union hits and 166 overlay hits over eleven
+pages each, without duplicate table/ID pairs. Both begin with lower-bound totals
+and end with exact totals matching independent explicit counts. The native HTTP
+matrix passes eleven tests and nine subtests with a two-cut cache, covering
+filesystem and local S3 repositories under both native vector-storage modes,
+mutation, restart, local-cache loss and missing/corrupt authority. Two real-GCS
+cases are excluded; these results do not qualify actual cloud providers.
+
+The 4,385 ms restart search exceeds the 2,000 ms target. Its measured ranking
+phase is 87 ms; the available phase counters do not explain the full delay, so
+its cause remains unproven. Five isolated restart probes return identical results
+in 237–774 ms. Keep the original search and cursor outliers in the evidence rather
+than replacing them with the diagnostic probes. Correctness and cache-pressure
+qualification pass; the two-cycle restart-latency criterion does not. OS caches
+are not flushed, readiness warming is enabled, and these normalized local data
+measurements do not establish full-archive or managed Cloud latency.
