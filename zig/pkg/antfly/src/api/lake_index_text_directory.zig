@@ -79,7 +79,7 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
         ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
-    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows }, token);
+    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
     store: stores.ArtifactStore,

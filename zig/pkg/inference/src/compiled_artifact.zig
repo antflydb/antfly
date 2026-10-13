@@ -32,10 +32,6 @@ pub const Manifest = struct {
     raw_prompt: bool,
     chat_template_applied: bool,
     attention_bindings: []AttentionBindingMeta = &.{},
-    onnx_input_node_ids: []u32 = &.{},
-    onnx_input_names: [][]u8 = &.{},
-    onnx_output_node_ids: []u32 = &.{},
-    onnx_output_names: [][]u8 = &.{},
     pjrt_parameter_mode: []const u8 = pjrt_parameter_mode_embedded,
     pjrt_input_bindings: []PjrtInputBindingMeta = &.{},
     pjrt_output_node_ids: []u32 = &.{},
@@ -464,26 +460,26 @@ test "modelArtifactNamespace falls back to basename for single-component paths" 
 }
 
 test "resolveManifestPath accepts artifact or sidecar path" {
-    const direct = try resolveManifestPath(std.testing.allocator, "/tmp/model.onnx");
+    const direct = try resolveManifestPath(std.testing.allocator, "/tmp/model.exec");
     defer std.testing.allocator.free(direct);
-    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", direct);
+    try std.testing.expectEqualStrings("/tmp/model.exec.inference.json", direct);
 
-    const sidecar = try resolveManifestPath(std.testing.allocator, "/tmp/model.onnx.inference.json");
+    const sidecar = try resolveManifestPath(std.testing.allocator, "/tmp/model.exec.inference.json");
     defer std.testing.allocator.free(sidecar);
-    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", sidecar);
+    try std.testing.expectEqualStrings("/tmp/model.exec.inference.json", sidecar);
 }
 
 test "isPackageManifestPath detects package sidecars" {
     try std.testing.expect(isPackageManifestPath("/tmp/model.xla.antfly-inference-package.json"));
-    try std.testing.expect(!isPackageManifestPath("/tmp/model.onnx.inference.json"));
+    try std.testing.expect(!isPackageManifestPath("/tmp/model.exec.inference.json"));
 }
 
 test "matchesRequest matches exact artifact shape and backend" {
     const manifest: Manifest = .{
-        .kind = "onnx_graph",
-        .backend = "onnx",
+        .kind = "pjrt_executable",
+        .backend = "xla",
         .model_dir = "/tmp/model",
-        .artifact_path = "/tmp/model.onnx",
+        .artifact_path = "/tmp/model.exec",
         .partition_signature = "abc123",
         .prompt_tokens = 128,
         .seq_len = 128,
@@ -493,22 +489,22 @@ test "matchesRequest matches exact artifact shape and backend" {
         .chat_template_applied = true,
     };
     try std.testing.expect(matchesRequest(manifest, .{
-        .backend = "onnx",
+        .backend = "xla",
         .model_dir = "/tmp/model",
         .seq_len = 128,
         .query_seq_len = 1,
         .attention_mode = "paged_decode",
     }));
     try std.testing.expect(!matchesRequest(manifest, .{
-        .backend = "onnx",
+        .backend = "xla",
         .model_dir = "/tmp/model",
         .seq_len = 128,
         .query_seq_len = 128,
         .attention_mode = "paged_prefill",
     }));
     try std.testing.expect(matchesRequest(manifest, .{
-        .backend = "onnx",
-        .kind = "onnx_graph",
+        .backend = "xla",
+        .kind = "pjrt_executable",
         .artifact_role = artifact_role_prefill,
         .model_dir = "/tmp/model",
         .seq_len = 128,
@@ -516,8 +512,8 @@ test "matchesRequest matches exact artifact shape and backend" {
         .attention_mode = "paged_decode",
     }));
     try std.testing.expect(!matchesRequest(manifest, .{
-        .backend = "onnx",
-        .kind = "onnx_debug_graph",
+        .backend = "xla",
+        .kind = "pjrt_debug_executable",
         .artifact_role = artifact_role_decode,
         .model_dir = "/tmp/model",
         .seq_len = 128,
@@ -525,7 +521,7 @@ test "matchesRequest matches exact artifact shape and backend" {
         .attention_mode = "paged_decode",
     }));
     try std.testing.expect(matchesRequest(manifest, .{
-        .backend = "onnx",
+        .backend = "xla",
         .model_dir = "/tmp/model",
         .seq_len = 128,
         .query_seq_len = 1,
@@ -533,7 +529,7 @@ test "matchesRequest matches exact artifact shape and backend" {
         .partition_signature = "abc123",
     }));
     try std.testing.expect(!matchesRequest(manifest, .{
-        .backend = "onnx",
+        .backend = "xla",
         .model_dir = "/tmp/model",
         .seq_len = 128,
         .query_seq_len = 1,
@@ -566,12 +562,12 @@ test "PJRT binding helpers classify semantic input and KV bindings" {
 
 test "defaultArtifactDirForModel uses ~/.antfly/inference/artifacts layout when HOME is set" {
     if (platform.env.getenv("HOME")) |home| {
-        const path = try defaultArtifactDirForModel(std.testing.allocator, "/tmp/ggml-org/gemma-4-e2b-it-gguf", "onnx");
+        const path = try defaultArtifactDirForModel(std.testing.allocator, "/tmp/ggml-org/gemma-4-e2b-it-gguf", "xla");
         defer std.testing.allocator.free(path);
         const expected_prefix = try std.fs.path.join(std.testing.allocator, &.{ home, ".antfly", "inference", "artifacts" });
         defer std.testing.allocator.free(expected_prefix);
         try std.testing.expect(std.mem.startsWith(u8, path, expected_prefix));
-        try std.testing.expect(std.mem.endsWith(u8, path, "ggml-org/gemma-4-e2b-it-gguf/onnx"));
+        try std.testing.expect(std.mem.endsWith(u8, path, "ggml-org/gemma-4-e2b-it-gguf/xla"));
     }
 }
 
@@ -585,10 +581,10 @@ test "writeManifest and readManifest roundtrip" {
     defer allocator.free(manifest_path);
 
     const manifest: Manifest = .{
-        .kind = "onnx_graph",
-        .backend = "onnx",
+        .kind = "pjrt_executable",
+        .backend = "xla",
         .model_dir = "/tmp/model",
-        .artifact_path = "/tmp/model.onnx",
+        .artifact_path = "/tmp/model.exec",
         .prompt_tokens = 64,
         .seq_len = 64,
         .query_seq_len = 64,
@@ -600,8 +596,8 @@ test "writeManifest and readManifest roundtrip" {
 
     var parsed = try readManifest(allocator, io, manifest_path);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("onnx_graph", parsed.value.kind);
-    try std.testing.expectEqualStrings("onnx", parsed.value.backend);
+    try std.testing.expectEqualStrings("pjrt_executable", parsed.value.kind);
+    try std.testing.expectEqualStrings("xla", parsed.value.backend);
     try std.testing.expectEqual(@as(usize, 64), parsed.value.seq_len);
     try std.testing.expect(parsed.value.raw_prompt);
     try std.testing.expect(!parsed.value.chat_template_applied);
@@ -661,10 +657,10 @@ test "writeManifest and readManifest support absolute paths" {
     defer allocator.free(manifest_path);
 
     const manifest: Manifest = .{
-        .kind = "onnx_graph",
-        .backend = "onnx",
+        .kind = "pjrt_executable",
+        .backend = "xla",
         .model_dir = "/tmp/model",
-        .artifact_path = "/tmp/model.onnx",
+        .artifact_path = "/tmp/model.exec",
         .prompt_tokens = 8,
         .seq_len = 8,
         .query_seq_len = 8,
@@ -676,8 +672,8 @@ test "writeManifest and readManifest support absolute paths" {
 
     var parsed = try readManifest(allocator, io, manifest_path);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("onnx_graph", parsed.value.kind);
-    try std.testing.expectEqualStrings("/tmp/model.onnx", parsed.value.artifact_path);
+    try std.testing.expectEqualStrings("pjrt_executable", parsed.value.kind);
+    try std.testing.expectEqualStrings("/tmp/model.exec", parsed.value.artifact_path);
 }
 
 test "writePackageManifest and readPackageManifest support absolute paths" {
@@ -723,13 +719,13 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "good.onnx.inference.json" });
+    const match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "good.exec.inference.json" });
     defer allocator.free(match_manifest_path);
     try writeManifest(allocator, io, match_manifest_path, .{
-        .kind = "onnx_graph",
-        .backend = "onnx",
+        .kind = "pjrt_executable",
+        .backend = "xla",
         .model_dir = "/tmp/model",
-        .artifact_path = "/tmp/model.good.onnx",
+        .artifact_path = "/tmp/model.good.exec",
         .prompt_tokens = 64,
         .seq_len = 64,
         .query_seq_len = 1,
@@ -738,13 +734,13 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
         .chat_template_applied = true,
     });
 
-    const non_match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "other.onnx.inference.json" });
+    const non_match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "other.exec.inference.json" });
     defer allocator.free(non_match_manifest_path);
     try writeManifest(allocator, io, non_match_manifest_path, .{
-        .kind = "onnx_graph",
-        .backend = "onnx",
+        .kind = "pjrt_executable",
+        .backend = "xla",
         .model_dir = "/tmp/model",
-        .artifact_path = "/tmp/model.prefill.onnx",
+        .artifact_path = "/tmp/model.prefill.exec",
         .prompt_tokens = 64,
         .seq_len = 64,
         .query_seq_len = 64,
@@ -754,7 +750,7 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
     });
 
     var found = (try findMatchingArtifactPath(allocator, io, base_dir, .{
-        .backend = "onnx",
+        .backend = "xla",
         .model_dir = "/tmp/model",
         .seq_len = 64,
         .query_seq_len = 1,
@@ -762,8 +758,8 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
     })).?;
     defer found.deinit(allocator);
 
-    try std.testing.expectEqualStrings("/tmp/model.good.onnx", found.artifact_path);
-    try std.testing.expect(std.mem.endsWith(u8, found.manifest_path, "good.onnx.inference.json"));
+    try std.testing.expectEqualStrings("/tmp/model.good.exec", found.artifact_path);
+    try std.testing.expect(std.mem.endsWith(u8, found.manifest_path, "good.exec.inference.json"));
 }
 
 test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
@@ -776,13 +772,13 @@ test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
     defer allocator.free(base_dir);
 
     inline for (.{ "a", "b" }) |name| {
-        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".onnx.inference.json" });
+        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".exec.inference.json" });
         defer allocator.free(manifest_path);
         try writeManifest(allocator, io, manifest_path, .{
-            .kind = "onnx_graph",
-            .backend = "onnx",
+            .kind = "pjrt_executable",
+            .backend = "xla",
             .model_dir = "/tmp/model",
-            .artifact_path = "/tmp/model." ++ name ++ ".onnx",
+            .artifact_path = "/tmp/model." ++ name ++ ".exec",
             .prompt_tokens = 64,
             .seq_len = 64,
             .query_seq_len = 1,
@@ -793,8 +789,8 @@ test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
     }
 
     try std.testing.expectError(error.AmbiguousCompiledArtifact, findUniqueMatchingArtifactPath(allocator, io, base_dir, .{
-        .backend = "onnx",
-        .kind = "onnx_graph",
+        .backend = "xla",
+        .kind = "pjrt_executable",
         .artifact_role = artifact_role_prefill,
         .model_dir = "/tmp/model",
         .seq_len = 64,

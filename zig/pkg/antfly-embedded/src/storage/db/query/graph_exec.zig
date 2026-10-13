@@ -3935,12 +3935,13 @@ fn compilePatternFieldPath(
     return .{ .dotted = compiled };
 }
 
-fn decodePatternJsonPointerSegmentAlloc(
+pub fn decodePatternJsonPointerSegmentAlloc(
     alloc: Allocator,
     encoded: []const u8,
 ) ![]const u8 {
     if (std.mem.indexOfScalar(u8, encoded, '~') == null) return encoded;
     const decoded = try alloc.alloc(u8, encoded.len);
+    errdefer alloc.free(decoded);
     var read: usize = 0;
     var written: usize = 0;
     while (read < encoded.len) {
@@ -3959,7 +3960,7 @@ fn decodePatternJsonPointerSegmentAlloc(
         read += 2;
         written += 1;
     }
-    return decoded[0..written];
+    return try alloc.realloc(decoded, written);
 }
 
 fn extractPatternField(filter_query: std.json.Value) !PatternFieldSpec {

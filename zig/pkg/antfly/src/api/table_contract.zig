@@ -1774,6 +1774,36 @@ test "table contract treats nullable nested index fields as omitted" {
     );
 }
 
+test "external lake public table contract preserves boolean stored text source" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "true", "false" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        var request = try parseCreateTableRequest(a, body);
+        defer request.deinit(a);
+        var indexes = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+        defer indexes.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), indexes.value.object.get("body_text").?.object.get("store_source").?.bool);
+        const index = try parseCreateIndexRequest(a, "body_text", config);
+        defer a.free(index);
+        const public = try indexes_api.encodeCreatedIndexConfig(a, "body_text", index);
+        defer a.free(public);
+        var response = try std.json.parseFromSlice(std.json.Value, a, public, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), response.value.object.get("store_source").?.bool);
+    }
+    for ([_][]const u8{ "1", "\"true\"", "[]", "{}" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "body_text", config));
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(a, body));
+    }
+}
+
 test "table contract rejects unsupported index kinds before admission" {
     const supported = [_][]const u8{
         "{\"indexes\":{\"search\":{\"type\":\"full_text\"}}}",

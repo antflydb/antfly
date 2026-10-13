@@ -43,20 +43,6 @@ const addFilteredTestRunArtifact = antfly_tests_build.addFilteredTestRunArtifact
 const addRuntimeTestFilters = antfly_tests_build.addRuntimeTestFilters;
 const dependOnAll = antfly_tests_build.dependOnAll;
 
-fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
-    const platform_str = switch (target.result.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        else => "unknown",
-    };
-    const arch_str = switch (target.result.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "amd64",
-        else => "unknown",
-    };
-    return b.fmt("pkg/inference/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
-}
-
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -84,7 +70,6 @@ pub const Shared = struct {
     sanitize_thread: bool,
     runtime_artifact_role: ?RuntimeArtifactRole,
     antfly_bin_name: []const u8,
-    inference_enable_onnx: bool,
     inference_enable_metal: bool,
     inference_enable_cuda: bool,
     antfly_version: []const u8,
@@ -183,13 +168,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const inference_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
-    const inference_enable_onnx = if (link_libc)
-        inference_onnx_option orelse false
-    else
-        false;
-    const inference_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
-    const inference_onnx_root = inference_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const inference_enable_metal = if (link_libc)
         b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse (target.result.os.tag == .macos)
     else
@@ -749,8 +727,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .shared_lib_root = "",
         },
         .backend = .{
-            .enable_onnx = inference_enable_onnx,
-            .onnx_root = inference_onnx_root,
             .enable_metal = inference_enable_metal,
             .enable_cuda = inference_enable_cuda,
             .cuda_artifacts = inference_cuda_artifacts,
@@ -1318,7 +1294,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .sanitize_thread = sanitize_thread,
         .runtime_artifact_role = runtime_artifact_role,
         .antfly_bin_name = antfly_bin_name,
-        .inference_enable_onnx = inference_enable_onnx,
         .inference_enable_metal = inference_enable_metal,
         .inference_enable_cuda = inference_enable_cuda,
         .build_info = build_info,

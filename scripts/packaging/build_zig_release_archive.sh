@@ -213,7 +213,6 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dantfly-version="$version"
-  -Donnx=false
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"

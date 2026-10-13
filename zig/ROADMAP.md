@@ -281,13 +281,11 @@ file's own title and a one-line description taken from its first paragraph.
   mutable AKNN index without prematurely replacing the current HBC
   implementation.
 - [VECTOR_STORE.md](VECTOR_STORE.md) — Separate Vector Store: Intended Design:
-  an experimental separate vector store with reference-based source payload
-  handling.
-- [VECTOR_STORE_REVIEW.md](VECTOR_STORE_REVIEW.md) — Vector store correctness
-  and design review — 2026-09-08: dated investigation log for vector-store
-  memory/recovery correctness work.
+  table-owned source-embedding store with reference-based payloads; the
+  creation default for fresh local single-shard standalone tables.
 - [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md) — VectorDBBench
-  Findings: the working evidence log for 50K/1M VectorDBBench investigation.
+  Findings: benchmark contract, confirmed rules, current reference numbers,
+  and the dense experiment-flag inventory.
 - [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md) — Dense Indexing
   Lifecycle: core implementation complete, with remaining rollout-gate
   qualification runs tracked in the file.
@@ -302,6 +300,12 @@ file's own title and a one-line description taken from its first paragraph.
 - [RESOLUTION.md](RESOLUTION.md) — Entity Resolution Design (Resolver,
   Promoter, Fusion): turning per-document extraction artifacts into canonical
   entities and an entity graph.
+- [LITE_KNOWLEDGE_GRAPH.md](LITE_KNOWLEDGE_GRAPH.md) — Embedded Lite knowledge
+  graphs: promoting resolved entity documents into named tables through an
+  atomic cross-table commit in a writable Lite database.
+- [AUTOSCHEMA.md](AUTOSCHEMA.md) — AutoSchema Knowledge Graphs: proposal for
+  schema-free knowledge-graph construction in the autograph pipeline, with
+  entity/event triple extraction and emergent `is_a` schema induction.
 - [ALGEBRAIC.md](ALGEBRAIC.md) — Algebraic Sparse-Token Database Theory: a
   database design sketch representing records as sparse symbolic tokens.
 - [VISIBILITY.md](VISIBILITY.md) — Visibility Masks: how query execution
@@ -327,8 +331,16 @@ file's own title and a one-line description taken from its first paragraph.
   by default, with schema optional and soft.
 - [LAKES.md](LAKES.md) — Lake Query Mode: querying user-owned object-storage
   files (Parquet, Iceberg, later Lance) through the relational row-plan API.
+- [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md) — Remote table indexes,
+  caching, and materialized execution: the serving contract for snapshot-bound
+  indexes, materializations, and a bounded local cache over Parquet/Iceberg.
+- [NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) —
+  Native lake performance follow-up: native sparse predicate intersection and
+  related lake execution contracts; representative archive benchmarks pending.
 - [EXTRACT.md](EXTRACT.md) — Extraction API: the one public extraction
   endpoint Antfly exposes.
+- [FUNCTIONS.md](FUNCTIONS.md) — Functions in the query DSL and SQL: typed
+  expressions shared by JSON queries and SQL, starting with decision functions.
 
 ### Inference
 
@@ -336,6 +348,11 @@ file's own title and a one-line description taken from its first paragraph.
   has three cooperating process services.
 - [INFERENCE_CACHING.md](INFERENCE_CACHING.md) — Inference caching: the two
   materially different inference caches Antfly uses.
+- [DECIDE.md](DECIDE.md) — Decision API implementation: standalone
+  `POST /decisions` and `/ai/v1/decisions` for choice, score, and predicate
+  questions.
+- [CHATGPT.md](CHATGPT.md) — ChatGPT plan integration for Antfly and Antfarm:
+  a personal ChatGPT inference connection for locally hosted Antfly.
 - [PDF.md](PDF.md) — Bounded document preparation and multimodal inference:
   the shared PDF window scheduler and precommit/replay document-preparation
   pipeline.
@@ -365,6 +382,9 @@ file's own title and a one-line description taken from its first paragraph.
   Antfly-specific HTTP adapters.
 - [A2A.md](A2A.md) — Antfly Native Agents And A2A Integration: the two native
   bounded-agent APIs in the Zig implementation.
+- [DEEP_RESEARCH.md](DEEP_RESEARCH.md) — Deep Research Agent: the
+  `POST /agents/research` agent that plans, researches, reflects, and writes a
+  cited long-form report.
 - [ARD.md](ARD.md) — Antfly Agentic Resource Discovery Design: support for
   Google's Agentic Resource Discovery (ARD) specification.
 - [WEBSEARCH.md](WEBSEARCH.md) — Web Search: the long-run web-search provider
@@ -388,6 +408,8 @@ file's own title and a one-line description taken from its first paragraph.
 
 - [TESTING.md](TESTING.md) — Testing: the default test aggregate plus
   package-scoped and special-purpose test tiers.
+- [CI.md](CI.md) — CI approval and test selection: per-commit human approval
+  for PR CI and label-selected optional suites.
 - [VOPR.md](VOPR.md) — VOPR: Deterministic Autonomous Testing for Antfly: the
   common VOPR engine and deterministic `std.Io` runtime integration.
 - [FLAKES.md](FLAKES.md) — Zig runtime flakes: table of flakes seen, where,
