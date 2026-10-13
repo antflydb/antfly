@@ -3048,7 +3048,8 @@ wall-clock benchmarks improve.
 
 ### PR #1112 refinement: cumulative work and coordinator transforms
 
-The refinement merges main through `543203fbefc3878fad1eea9a7abda201e1802941`.
+The refinement merges main through `e8666a5b75` (#1115), including main's
+narrow API-kernel resolver import and formatting corrections.
 It corrects the frontier's read accounting: `PageStore.streaming` previously
 reset the nominal cumulative allowance on every page miss. The frontier now
 owns one non-replenishing 256 MiB allowance for global DF preparation,
@@ -3092,10 +3093,17 @@ Its byte-bounded batches grow independently of competitive cutoffs, since every
 possible match must be visited.
 It rejects a set larger than the declared evaluation budget before source
 hydration. Its limit error has an appended stable status in both runtime error
-registries, so compiled query/callback boundaries preserve the public 422
-`decision_limit_exceeded` response. Exhausted cumulative navigation reads map to
-the existing query candidate budget response. WAL overlays retain their existing
-complete planner and statistics.
+registries and the typed public-query error contract. The query adapter and
+HTTP handler preserve the public 422 `decision_limit_exceeded` response.
+Exhausted cumulative navigation reads map to the existing query candidate budget
+response. WAL overlays retain their existing complete planner and statistics.
+
+Sort admission now selects physical coverage ownership from the authoritative
+table binding. Remote indexes are validated by the leased native publication
+reader, while local indexes continue through local observation and cold-handle
+preflight. Public schema and cursor checks run for both. This avoids intermittent
+`IndexNotFound` failures from preparing a nonexistent resident index for a remote
+table, even when an active read schema contains only the field mappings.
 
 Regression coverage includes monotonic and exhausted budgets with a warm shared
 cache, failed-preparation accounting, range-summary reuse, size-bounded carried

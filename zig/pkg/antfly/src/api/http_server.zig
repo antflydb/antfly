@@ -9349,7 +9349,13 @@ pub const ApiHttpServer = struct {
 
         const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
         defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
-        const can_observe_physical_coverage = if (self.table_reads) |source|
+        // External indexes belong to the leased native publication, not to a
+        // resident local DB. Its reader validates typed sort coverage during
+        // admission. Local observation can otherwise try to prepare a cold DB
+        // index which does not exist for this table.
+        var external_binding = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+        defer if (external_binding) |*binding| binding.deinit(self.alloc);
+        const can_observe_physical_coverage = external_binding == null and if (self.table_reads) |source|
             source.supportsObservedDynamicFieldCapabilitySets()
         else
             false;
@@ -14079,6 +14085,7 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.DecisionLimitExceeded => return error.DecisionLimitExceeded,
             error.RerankRateLimited => return error.RerankRateLimited,
             error.RerankTransientFailure => return error.RerankTransientFailure,
             error.RerankUpstreamFailure => return error.RerankUpstreamFailure,
@@ -28649,7 +28656,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
-    if (err == error.MetricNotReady or err == error.MetricStale) return err;
+    if (err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
@@ -32358,6 +32365,58 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"join\":{}}",
     ));
+}
+
+test "external lake exact segment admission defers sort coverage to publication readers" {
+    const alloc = std.testing.allocator;
+    const ColdReads = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn observed(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_reads.DynamicFieldObservationQuery) !?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        fn preflight(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?db_mod.RuntimePreflightSummary {
+            return error.IndexNotFound;
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = ColdReads.status } }, .{
+        .ptr = undefined,
+        .vtable = &.{ .lookup = ColdReads.lookup, .scan = ColdReads.scan, .query = ColdReads.query, .observed_dynamic_field_capability_sets = ColdReads.observed, .preflight_query = ColdReads.preflight },
+    }, null);
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var resolver: ApiHttpServer.CatalogQueryResolver = .{ .arena = a };
+    const local_schema =
+        \\{"storage_mode":"relational","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    const external_schema =
+        \\{"storage_mode":"relational","default_type":"doc","base_source":{"kind":"external","table_id":"lake","format":"parquet","uri":"file:///unused.parquet","schema_fingerprint":"schema"},"document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    for ([_][]const u8{ "local", "remote" }, [_][]const u8{ local_schema, external_schema }) |name, schema_json| {
+        try resolver.definitions.put(a, name, .{ .table_id = 1, .schema_json = schema_json, .read_schema_json = local_schema, .indexes_json = "{}" });
+    }
+    const order = [_]db_mod.types.SortField{.{ .field = "amount" }};
+    const req: db_mod.types.SearchRequest = .{ .order_by = &order, .primary_text_index_name = "all_text" };
+    // Local coverage still performs the owning DB's observation/preflight.
+    try std.testing.expectError(error.IndexNotFound, server.validateQuerySortWithResolver("local", req, &resolver));
+    try server.validateQuerySortWithResolver("remote", req, &resolver);
+    // Deferring physical coverage must retain schema and cursor validation.
+    var invalid = req;
+    const cursor = [_]std.json.Value{ .{ .string = "invalid-number" }, .{ .string = "id" } };
+    invalid.search_after = &cursor;
+    try std.testing.expectError(error.InvalidQueryRequest, server.validateQuerySortWithResolver("remote", invalid, &resolver));
 }
 
 test "api http exact sort observation selects only unique physical fields" {

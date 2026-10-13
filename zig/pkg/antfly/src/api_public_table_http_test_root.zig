@@ -18,6 +18,7 @@ const public_table_http = @import("api/public_table_http.zig");
 // Filtered contract targets must discover their fixtures even when the named
 // module smoke test is excluded by the compiler's test filter.
 test {
+    _ = public_table_http;
     _ = @import("api/relational_rows.zig");
     _ = @import("api/tables.zig");
     _ = @import("api/fk_generation_publication_coordinator.zig");

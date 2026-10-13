@@ -16,6 +16,7 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("api/http_server.zig");
     _ = @import("api/lake_index_text_frontier.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("antfly_local_sources").search_search;
