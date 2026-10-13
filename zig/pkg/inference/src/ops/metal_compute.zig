@@ -26736,6 +26736,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         if (metal_runtime.hasActiveFrame(runtime)) return false;
         const differential = getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL");
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL") and (differential or getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP"))) return error.NativeBatchedDecodeUnavailable;
         const profile = getenvBool("ANTFLY_GEMMA4_OCR_PROFILE");
         const before = if (profile) metal_runtime.runtimeMemorySnapshot(runtime) else undefined;
         var cb = self.computeBackend();
@@ -26971,24 +26972,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             hidden = next_hidden;
             self.timing_stats.active_decode_layers += rows;
         }
-        var tail_scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
-        defer self.endActivePlannedComputeScope(tail_scope);
         const hidden_ct = try retainedCtFromMetalTensor(self, &hidden);
         defer freeOp(ctx, hidden_ct);
-        const canonical_tail = getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL");
-        var tail_norm: ?MetalTensor = null;
-        defer if (tail_norm) |*tensor| tensor.deinit();
-        var tail_logits: ?MetalTensor = null;
-        defer if (tail_logits) |*tensor| tensor.deinit();
-        const final_hidden = if (canonical_tail) blk: {
-            tail_norm = try ocrRowwisePrepared(ctx, self, hidden, request.final_norm_slot, request.hidden_size, request.hidden_size, request.norm_eps);
-            break :blk try retainedCtFromMetalTensor(self, &tail_norm.?);
-        } else (try decoderRuntimeApplyRmsNormOp(ctx, &.{ .slot = request.final_norm_slot, .input = hidden_ct, .hidden_size = request.hidden_size, .eps = request.norm_eps })) orelse return error.NativeBatchedDecodeUnavailable;
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL")) {
+            // Use the actual fused canonical singleton tail, after completing
+            // the backbone frame. Generic row norm/linear packing within the
+            // planned tail is not a canonical reference and failed OCR parity.
+            try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
+            for (0..rows) |row| {
+                const view = try sliceRows2DOp(ctx, hidden_ct, row, 1, request.hidden_size);
+                defer freeOp(ctx, view);
+                const token = (try decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx, &.{
+                    .norm_slot = request.final_norm_slot,
+                    .linear_slot = request.final_lm_head_slot,
+                    .input = view,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.norm_eps,
+                    .out_dim = request.vocab_size,
+                    .suppress_token_ids = request.suppress_token_ids,
+                })) orelse return error.NativeBatchedDecodeUnavailable;
+                if (token >= request.vocab_size) return error.InvalidModelOutput;
+                request.output_token_ids[row] = @intCast(token);
+            }
+            if (profile) {
+                const after = metal_runtime.runtimeMemorySnapshot(runtime);
+                // This counter covers the backbone frame; scalar tail command
+                // buffers are included in wall time, not these frame counters.
+                std.log.info("metal_ocr_matrix_frame: rows={d} submits={d} wait_ns={d} gpu_ns={d} canonical_tail=1", .{ rows, after.frame_submit_count - before.frame_submit_count, after.frame_wait_nanos - before.frame_wait_nanos, after.frame_gpu_nanos - before.frame_gpu_nanos });
+            }
+            self.timing_stats.active_decode_frame_successes += 1;
+            return true;
+        }
+        var tail_scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(tail_scope);
+        const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{ .slot = request.final_norm_slot, .input = hidden_ct, .hidden_size = request.hidden_size, .eps = request.norm_eps })) orelse return error.NativeBatchedDecodeUnavailable;
         defer freeOp(ctx, final_hidden);
-        const logits = if (canonical_tail) blk: {
-            tail_logits = try ocrRowwisePrepared(ctx, self, tail_norm.?, request.final_lm_head_slot, request.hidden_size, request.vocab_size, null);
-            break :blk try retainedCtFromMetalTensor(self, &tail_logits.?);
-        } else (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = request.final_lm_head_slot, .input = final_hidden, .in_dim = request.hidden_size, .out_dim = request.vocab_size })) orelse return error.NativeBatchedDecodeUnavailable;
+        const logits = (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = request.final_lm_head_slot, .input = final_hidden, .in_dim = request.hidden_size, .out_dim = request.vocab_size })) orelse return error.NativeBatchedDecodeUnavailable;
         defer freeOp(ctx, logits);
         const choices = (try decoderRuntimeArgmaxRowsSuppressOp(ctx, logits, 0, rows, request.vocab_size, request.suppress_token_ids, self.allocator)) orelse return error.NativeBatchedDecodeUnavailable;
         defer self.allocator.free(choices);
