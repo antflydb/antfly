@@ -112812,7 +112812,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         },
     );
     try byte_only_runtime.start();
-    try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1));
+    // The byte budget bounds heap-resident pending segment bytes. These
+    // segments are file-backed, so their debt does not block byte admission.
+    var byte_only_permit = try byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1);
+    byte_only_permit.release();
     byte_only_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
@@ -113363,10 +113366,10 @@ test "db text merge producer admission isolates quarantined dimensions" {
         },
     );
     defer byte_runtime.deinit();
-    try std.testing.expectError(
-        error.TextMergeBackpressureUnavailable,
-        byte_runtime.acquireProducerPermit("healthy", 0, 1),
-    );
+    // The byte budget bounds heap-resident pending segment bytes. The
+    // quarantined segments are file-backed, so they do not block byte admission.
+    var byte_permit = try byte_runtime.acquireProducerPermit("healthy", 0, 1);
+    byte_permit.release();
 }
 
 test "db text kernel admits natural segments below hard segment limit" {
