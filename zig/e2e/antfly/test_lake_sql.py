@@ -4333,7 +4333,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             value = response.json() if response.content else None
             return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
 
-        call("POST", "/tables/paged_text", {"num_shards": 1, "schema": {
+        definition = {"num_shards": 1, "schema": {
             "storage_mode": "relational", "default_type": "doc",
             "document_schemas": {"doc": {"schema": {"type": "object", "properties": {
                 "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
@@ -4342,7 +4342,15 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             }}}}, "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount"}], "include_columns": ["body"]}], "base_source": {
                 "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
             }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}, "stored_text": {"type": "full_text", "field": "body", "store_source": True},
-            "sparse_native": {"type": "embeddings", "external": True, "sparse": True}}})
+            "sparse_native": {"type": "embeddings", "external": True, "sparse": True}}}
+        call("POST", "/tables/paged_text", definition)
+        # One text index allows direct retrieval, exposing the native profile
+        # separately from the named-component fusion profile below.
+        profile_definition = json.loads(json.dumps(definition))
+        profile_definition["schema"]["base_source"]["table_id"] = "profile-text"
+        profile_definition["schema"]["relational_indexes"] = []
+        profile_definition["indexes"] = {"body_text": {"type": "full_text", "field": "body"}}
+        call("POST", "/tables/profile_text", profile_definition)
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
@@ -4354,7 +4362,9 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             assert stored["status"]["readiness"]["state"] != "failed", str(stored) + server.debug_logs()
             sparse = call("GET", "/tables/paged_text/indexes/sparse_native")
             assert sparse["status"]["readiness"]["state"] != "failed", str(sparse) + server.debug_logs()
-            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored, sparse)):
+            profile_index = call("GET", "/tables/profile_text/indexes/body_text")
+            assert profile_index["status"]["readiness"]["state"] != "failed", str(profile_index) + server.debug_logs()
+            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored, sparse, profile_index)):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
@@ -4374,6 +4384,13 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
         def check():
             result = call("POST", "/tables/paged_text/query", dict(request, limit=19, offset=61))
             assert [(h["_id"], h["_score"], h["_source"]["amount"]) for h in result["hits"]["hits"]] == expected[61:80]
+            # Direct retrieval exposes its native profile. Named components
+            # retain the parent's fusion profile instead.
+            direct = dict(request, limit=19, offset=61, profile=True)
+            del direct["full_text_index"]
+            profiled = call("POST", "/tables/profile_text/query", direct)
+            assert [(h["_score"], h["_source"]["amount"]) for h in profiled["hits"]["hits"]] == [(score, amount) for _, score, amount in expected[61:80]]
+            assert profiled["profile"]["sort"]["selection_reason"] == "bounded_global_text_frontier", profiled
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
             assert total["value"] <= 201
