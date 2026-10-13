@@ -26664,7 +26664,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (snapshot.enabled == 0 or snapshot.decode.sampled_frames <= self.ocr_last_stage_samples) return;
         self.ocr_last_stage_samples = snapshot.decode.sampled_frames;
         const d = snapshot.decode;
-        std.log.info("metal_ocr_gpu_stages: scope=sampled_backbone_frames complete={d} frames={d} gpu_ns={d} attention_ns={d} ffn_ns={d} ple_ns={d} tail_ns={d} embedding_ns={d} other_ns={d}", .{
+        std.log.info("metal_ocr_gpu_stages: scope=sampled_decode_frames complete={d} frames={d} gpu_ns={d} attention_ns={d} ffn_ns={d} ple_ns={d} tail_ns={d} embedding_ns={d} other_ns={d}", .{
             snapshot.complete, d.sampled_frames,  d.whole_frame_gpu_nanos,
             d.bucket_nanos[0], d.bucket_nanos[1], d.bucket_nanos[2],
             d.bucket_nanos[3], d.bucket_nanos[4], d.bucket_nanos[5],
@@ -26731,6 +26731,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer result.second.deinit();
         result.third = try v.retainedCopy();
         return result;
+    }
+
+    // Keep checkpoint/full-logit singleton norm and head dispatches, then
+    // publish all page choices with one frame wait and token-only readback.
+    // Dense heads can change their arithmetic on frame admission; leave them
+    // on the original route. This deliberately avoids the transformed head.
+    fn ocrCanonicalHeadFrame(self: *MetalCompute, hidden: MetalTensor, norm_slot: usize, linear_slot: usize, width: usize, vocab: usize, eps: f32, suppress: []const i32, tokens: []i64) !bool {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (tokens.len < 2 or tokens.len > 4 or hidden.ndim() != 2 or
+            hidden.dim(0) != @as(i32, @intCast(tokens.len)) or hidden.dim(1) != @as(i32, @intCast(width)) or
+            metal_runtime.hasActiveFrame(runtime) or linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+            self.provider_impl.raw_linear_slot_kinds[linear_slot] != .quantized) return false;
+        var active = try self.beginPreparedDecoderRuntimeFrame(runtime);
+        if (!active) return false;
+        defer if (active) metal_runtime.cancelFrame(runtime) catch {};
+        var normed = try ocrRowwisePrepared(self, self, hidden, norm_slot, width, width, eps);
+        defer normed.deinit();
+        var logits = try ocrRowwisePrepared(self, self, normed, linear_slot, width, vocab, null);
+        defer logits.deinit();
+        var choices: [4]u32 = undefined;
+        if (!try metal_runtime.argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(self.provider_impl, logits, 0, vocab, suppress, choices[0..tokens.len]))
+            return error.NativeBatchedDecodeUnavailable;
+        active = false;
+        for (choices[0..tokens.len]) |token| if (token >= vocab) return error.InvalidModelOutput;
+        for (choices[0..tokens.len], tokens) |token, *output| output.* = @intCast(token);
+        return true;
     }
 
     // Scoped PLE rollback: preserve matrix attention/FFN while using the
@@ -27148,7 +27174,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // planned tail is not a canonical reference and failed OCR parity.
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
             const heads_started = if (profile) monotonicNowNs() else 0;
-            for (0..rows) |row| {
+            const framed_heads = getenvBool("ANTFLY_GEMMA4_METAL_OCR_HEAD_FRAME") and
+                try self.ocrCanonicalHeadFrame(hidden, request.final_norm_slot, request.final_lm_head_slot, request.hidden_size, request.vocab_size, request.norm_eps, request.suppress_token_ids, request.output_token_ids);
+            if (!framed_heads) for (0..rows) |row| {
                 const view = try sliceRows2DOp(ctx, hidden_ct, row, 1, request.hidden_size);
                 defer freeOp(ctx, view);
                 const token = (try decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx, &.{
@@ -27162,13 +27190,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 })) orelse return error.NativeBatchedDecodeUnavailable;
                 if (token >= request.vocab_size) return error.InvalidModelOutput;
                 request.output_token_ids[row] = @intCast(token);
-            }
+            };
             if (profile) {
                 const after = metal_runtime.runtimeMemorySnapshot(runtime);
-                // This counter covers the backbone frame; scalar tail command
-                // buffers are included in wall time, not these frame counters.
+                // The optional head frame contributes to frame counters.
+                // Standalone scalar head buffers contribute only to wall time.
                 self.logOcrStages(runtime);
-                std.log.info("metal_ocr_cohort_overhead: rows={d} canonical_heads_wall_ns={d} carrier_allocations={d} carrier_reuses={d}", .{ rows, monotonicNowNs() - heads_started, self.ocr_carrier_allocations, self.ocr_carrier_reuses });
+                std.log.info("metal_ocr_cohort_overhead: rows={d} canonical_heads_wall_ns={d} head_frame={d} carrier_allocations={d} carrier_reuses={d}", .{ rows, monotonicNowNs() - heads_started, @intFromBool(framed_heads), self.ocr_carrier_allocations, self.ocr_carrier_reuses });
                 std.log.info("metal_ocr_matrix_frame: rows={d} submits={d} wait_ns={d} gpu_ns={d} canonical_tail=1", .{ rows, after.frame_submit_count - before.frame_submit_count, after.frame_wait_nanos - before.frame_wait_nanos, after.frame_gpu_nanos - before.frame_gpu_nanos });
             }
             self.timing_stats.active_decode_frame_successes += 1;
@@ -42234,4 +42262,72 @@ test "Metal OCR carrier cache preserves shapes roles and retained growth views" 
     try std.testing.expectEqual(@as(usize, 3), compute.ocr_carrier_allocations);
     try std.testing.expectEqual(@as(usize, 1), compute.ocr_carrier_reuses);
     try std.testing.expectError(error.InvalidTensorShape, compute.ocrCachedCarrier(.query, &.{ 5, 64 }));
+}
+
+test "Metal OCR canonical quantized head frame matches singleton logits and suppressed tokens" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const rows = 3;
+    const width = 256;
+    const vocab = 2051; // Partial output tile and parallel argmax path.
+    inline for (.{ false, true }) |q6| {
+        var store = testMetalWeightStoreInit(allocator);
+        defer store.lazy_weights.deinit(allocator);
+        var compute = try MetalCompute.init(allocator, &store, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        const provider = compute.provider_impl;
+        const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+        const weights = try allocator.alloc(f32, width * vocab);
+        defer allocator.free(weights);
+        for (weights, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + i / width * 7) % 97)) - 48)) / 128;
+        const raw = if (q6) try quant_codec.quantizeQ6_KFromF32(allocator, weights) else try quant_codec.quantizeQ4_0FromF32(allocator, weights);
+        defer allocator.free(raw);
+        const shape = [_]i64{ vocab, width };
+        const storage = QuantizedStorage{ .tensor_type = .{ .known = if (q6) .Q6_K else .Q4_0 }, .raw_bytes = raw, .shape = &shape, .raw_owned = false, .allocator = allocator };
+        var dummy_value = [_]f32{0};
+        const dummy = MetalTensor.borrowed(&dummy_value, 1, &.{0});
+        var bias = try MetalTensor.ownedCloneFrom(&@as([vocab]f32, @splat(0)), &.{vocab});
+        defer bias.deinit();
+        var prep: ops.NativeQuantTimingStats = .{};
+        try std.testing.expect(try metal_runtime.decoderRuntimePrepareLinear(provider, .{ .slot = 0, .weight = dummy, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .in_dim = width, .out_dim = vocab, .retain_dense_fallback = false }, &prep));
+        var norm: [width]f32 = undefined;
+        for (&norm, 0..) |*v, i| v.* = 0.75 + @as(f32, @floatFromInt(i % 9)) / 32;
+        const norm_ct = try cb.fromFloat32Shape(&norm, &.{width});
+        defer cb.free(norm_ct);
+        try std.testing.expect(try cb.decoderRuntimePrepareRmsNorm(&.{ .slot = 0, .weight = norm_ct, .hidden_size = width }));
+        var inputs: [rows * width]f32 = undefined;
+        for (&inputs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + i / width * 19) % 53)) - 26)) / 16;
+        const input_ct = try cb.fromFloat32Shape(&inputs, &.{ rows, width });
+        defer cb.free(input_ct);
+        var input = try compute.ownedDeviceMetalTensorFromCt(input_ct);
+        defer input.deinit();
+        var reference_logits: [rows * vocab]f32 = undefined;
+        var reference_tokens: [rows]i64 = undefined;
+        for (0..rows) |row| {
+            var view = try input.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
+            defer view.deinit();
+            var norm_stats: ops.NativeQuantTimingStats = .{};
+            var n = (try metal_runtime.decoderRuntimeApplyRmsNorm(provider, .{ .slot = 0, .input = view, .hidden_size = width, .eps = @as(f32, 1e-6) }, &norm_stats)) orelse return error.TestUnexpectedResult;
+            defer n.deinit();
+            var logits = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{ .slot = 0, .input = n, .in_dim = width, .out_dim = vocab })) orelse return error.TestUnexpectedResult;
+            defer logits.deinit();
+            @memcpy(reference_logits[row * vocab ..][0..vocab], try logits.toHostSlice());
+            reference_tokens[row] = @intCast((try metal_runtime.argmaxLogitsSuppressDevice(provider, logits, vocab, &.{ 0, 1, 2048 })) orelse return error.TestUnexpectedResult);
+        }
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var n = try MetalCompute.ocrRowwisePrepared(&compute, &compute, input, 0, width, width, 1e-6);
+        defer n.deinit();
+        var logits = try MetalCompute.ocrRowwisePrepared(&compute, &compute, n, 0, width, vocab, null);
+        defer logits.deinit();
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const values = try logits.toHostSlice();
+        for (reference_logits, values) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        const before = metal_runtime.runtimeMemorySnapshot(runtime);
+        var tokens: [rows]i64 = undefined;
+        try std.testing.expect(try compute.ocrCanonicalHeadFrame(input, 0, 0, width, vocab, 1e-6, &.{ 0, 1, 2048 }, &tokens));
+        try std.testing.expectEqualSlices(i64, &reference_tokens, &tokens);
+        try std.testing.expectEqual(before.frame_submit_count + 1, metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count);
+        try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
+    }
 }

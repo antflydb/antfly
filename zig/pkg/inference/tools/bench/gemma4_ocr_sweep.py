@@ -65,7 +65,7 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(
-        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant|invariantprofile|share|tails|pool|fused|reuse|optimized|optimizedprofile)?",
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant|invariantprofile|share|tails|pool|head|headprofile|fused|reuse|optimized|optimizedprofile)?",
         case,
     )
     if cohort or case in {
@@ -99,6 +99,8 @@ def flags_for(case):
             "share",
             "tails",
             "pool",
+            "head",
+            "headprofile",
             "fused",
             "reuse",
             "optimized",
@@ -108,7 +110,7 @@ def flags_for(case):
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
-        if variant in {"invariantprofile", "optimizedprofile"}:
+        if variant in {"invariantprofile", "headprofile", "optimizedprofile"}:
             flags["TERMITE_METAL_STAGE_TIMING"] = "1"
             flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"] = "0"
         if variant in {"share", "fused", "reuse", "optimized", "optimizedprofile"}:
@@ -116,6 +118,8 @@ def flags_for(case):
         if variant in {
             "tails",
             "pool",
+            "head",
+            "headprofile",
             "fused",
             "reuse",
             "optimized",
@@ -123,8 +127,17 @@ def flags_for(case):
         }:
             flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"] = "1"
-        if variant in {"pool", "reuse", "optimized", "optimizedprofile"}:
+        if variant in {
+            "pool",
+            "head",
+            "headprofile",
+            "reuse",
+            "optimized",
+            "optimizedprofile",
+        }:
             flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"] = "1"
+        if variant in {"head", "headprofile"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_HEAD_FRAME"] = "1"
         if variant in {"qkv", "canonical", "strict", "qkvtrace"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
         if variant in {"ple", "canonical", "reduceall", "strict"}:
