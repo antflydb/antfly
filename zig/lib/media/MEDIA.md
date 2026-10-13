@@ -1182,3 +1182,42 @@ decoding, repeated model planning, cross-window projection reuse and full-pipeli
 performance remain required by the full active non-CUDA scope.
 
 See [qualification receipts](../video/testdata/live/metadata-reuse-validation/README.md).
+
+
+### Content-bound live model selection
+
+`embedding_gemma2.ReaderSelection` owns sampled transport selectors derived from
+a validated logical-picture index. Its SHA-256 binding covers all track metadata,
+packet descriptors, encoded packet bytes and the complete sampling policy using
+explicit value serialization. It does not depend on source URLs, addresses or
+caller read counters. Changed bytes, timing, display geometry or policy reject
+reuse. The caller retains immutable reader metadata/storage and the selection
+until synchronous encoding completes or `Prefetch.deinit` joins the producer.
+The logical index passed to construction is trusted validated library metadata;
+this is an SDK object, not an untrusted serialized client hint.
+
+The typed live adapter constructs one admitted selection from its independently
+owned coordinator snapshot. Model preflight, asynchronous preparation and the
+synchronous fallback reuse those selectors after checking the binding. They no
+longer reconstruct logical pictures just to select frames. Parameter-set/display
+qualification and actual selected-frame decoding remain in their existing paths;
+this does not add borrowed-reader projection caching or incremental decoder state.
+Selector admission covers temporary metadata/selection construction and shrinks
+to retained selector bytes after temporary owners are released.
+
+Final ReleaseSafe tests pass 45 CPU/Metal model checks on macOS and 40 on actual
+Linux ARM64 (five Metal skips). Native and Metal prepared field-patch hashes match
+the ordinary selection path. Tests reject mutated packet bytes, PTS, display aspect
+and sampling policy, verify caller read counters are unchanged, and exhaustively
+check construction allocation failures and reservation cleanup. A field planning
+regression succeeds with 256 KiB admission headroom while the ordinary logical
+walk fails admission, proving the decode walk is avoided.
+
+Fresh pinned pretrained CPU, Metal and actual Linux live vectors still match
+complete-clip source-time inference exactly for three real Sintel windows with
+246 tokens each. Pinned PyTorch score/ranking/top-k gates pass. Timings remain
+shared-host diagnostics; this change has no throughput claim. Broader pretrained
+field/dynamic stream parity, repeated parameter planning, incremental append
+decoding, cross-window projection reuse and the full non-CUDA scope remain active.
+
+See [qualification receipts](../video/testdata/live/reader-selection-validation/README.md).

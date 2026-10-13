@@ -40,6 +40,105 @@ pub const Encoded = struct {
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
+/// Owned selection from a validated logical index. Input and policy are
+/// content-bound; this owner must outlive all Prefetch workers borrowing it.
+pub const ReaderSelection = struct {
+    allocator: std.mem.Allocator,
+    selected: []const usize,
+    binding: [32]u8,
+    reservation: media.admission.Token = .{},
+    pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control) !ReaderSelection {
+        if (reader.track.codec != .avc or logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale or logical.pictures.len > 8192) return error.InvalidVideoReaderSelection;
+        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize));
+        var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const binding = try readerBinding(reader, sampling, control);
+        const selected = try selectLogical(a, logical.*, sampling, control);
+        errdefer a.free(selected);
+        if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
+        for (selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
+        try reservation.resize(.{ .host_bytes = selected.len * @sizeOf(usize) });
+        return .{ .allocator = a, .selected = selected, .binding = binding, .reservation = reservation };
+    }
+    pub fn deinit(self: *ReaderSelection) void {
+        self.allocator.free(self.selected);
+        self.reservation.deinit();
+        self.* = undefined;
+    }
+    pub fn select(self: *const ReaderSelection, a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![]usize {
+        const binding = try readerBinding(reader, sampling, control);
+        if (!std.mem.eql(u8, &binding, &self.binding) or self.selected.len == 0 or self.selected.len > 32) return error.InvalidVideoReaderSelection;
+        for (self.selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
+        return a.dupe(usize, self.selected);
+    }
+};
+fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int => |info| {
+            var bytes: [8]u8 = undefined;
+            const word: u64 = if (info.signedness == .signed) @bitCast(@as(i64, @intCast(value))) else @intCast(value);
+            std.mem.writeInt(u64, &bytes, word, .little);
+            hash.update(&bytes);
+        },
+        .bool => hashValue(hash, @as(u8, @intFromBool(value))),
+        .@"enum" => hashValue(hash, @as(u64, @backingInt(value))),
+        .@"struct" => inline for (@typeInfo(T).@"struct".field_names) |name| hashValue(hash, @field(value, name)),
+        .array => for (value) |item| hashValue(hash, item),
+        .pointer => |pointer| {
+            if (pointer.size != .slice) @compileError("reader binding requires value metadata");
+            hashValue(hash, @as(u64, value.len));
+            if (pointer.child == u8) hash.update(value) else for (value) |item| hashValue(hash, item);
+        },
+        .optional => {
+            hashValue(hash, value != null);
+            if (value) |item| hashValue(hash, item);
+        },
+        else => @compileError("unsupported reader binding metadata"),
+    }
+}
+fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![32]u8 {
+    try control.check();
+    const bytes = try packetBytes(reader);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-reader-selection-v1");
+    hashValue(&hash, reader.track);
+    hashValue(&hash, @as(u8, @backingInt(std.meta.activeTag(sampling))));
+    switch (sampling) {
+        .reference => {},
+        .timestamps, .source_timestamps => |policy_value| hashValue(&hash, policy_value),
+    }
+    hashValue(&hash, @as(u64, reader.packets.len));
+    for (reader.packets) |packet| {
+        try control.check();
+        hashValue(&hash, packet);
+        hash.update(bytes[@intCast(packet.offset)..][0..packet.size]);
+    }
+    return hash.finalResult();
+}
+fn selectLogical(a: std.mem.Allocator, logical: video.h264_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
+    if (sampling == .source_timestamps) if (logical.pending_pts) |pts| {
+        const end = sampling.source_timestamps.end_ns orelse return error.InvalidLiveWatermark;
+        if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * logical.timescale) return error.InvalidLiveWatermark;
+    };
+    if (sampling == .reference) {
+        const owned = try logical.select();
+        defer logical.allocator.free(owned);
+        return a.dupe(usize, owned);
+    }
+    const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
+    defer a.free(metadata);
+    for (logical.pictures, metadata) |picture, *item| {
+        try control.check();
+        item.* = .{ .pts = picture.pts, .duration = picture.duration };
+    }
+    const selected = try timestampSelect(a, metadata, logical.timescale, sampling, control);
+    for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
+    return selected;
+}
+fn selectReader(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control, selection: ?*const ReaderSelection) ![]usize {
+    return if (selection) |bound| bound.select(a, reader, sampling, control) else selectWithSampling(a, reader, sampling);
+}
 fn timestampSelect(a: std.mem.Allocator, metadata: []const video.sampling.TimedPicture, scale: u32, sampling: Sampling, control: media.source.Control) ![]usize {
     return switch (sampling) {
         .timestamps => |interval| video.sampling.cappedTimestamps(a, metadata, scale, interval, control),
@@ -285,12 +384,15 @@ pub fn packetBytes(reader: *const media.mp4.Reader) ![]const u8 {
     return bytes;
 }
 pub fn inspectReaderPlan(a: std.mem.Allocator, borrowed: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
+    return inspectReaderPlanWithSelection(a, borrowed, control, sampling, pool, metal, null);
+}
+pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool, selection: ?*const ReaderSelection) !Plan {
     const bytes = try packetBytes(borrowed);
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = borrowed.input.identity, .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     var reader = borrowed.*;
     reader.input = &source;
-    return inspectPacketPlan(a, &reader, control, sampling, metal);
+    return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
 pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
@@ -312,12 +414,12 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     }
     var input = try PacketInput.init(a, &source, bytes);
     defer input.deinit();
-    return inspectPacketPlan(a, &input.reader, control, sampling, metal);
+    return inspectPacketPlan(a, &input.reader, control, sampling, metal, null);
 }
-fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool) !Plan {
+fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool, selection: ?*const ReaderSelection) !Plan {
     // AVC combines VUI and container declarations in parameterSession below.
     if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
-    const selected = try selectWithSampling(a, reader, sampling);
+    const selected = try selectReader(a, reader, sampling, reader.input.control, selection);
     defer a.free(selected);
     const configurations = try parameterSession(a, reader);
     defer if (configurations) |session| session.deinit();
@@ -355,6 +457,7 @@ pub const Prefetch = struct {
     io: std.Io,
     bytes: []const u8,
     packet_reader: ?*const media.mp4.Reader = null,
+    reader_selection: ?*const ReaderSelection = null,
     control: Control,
     sampling: Sampling,
     pool: ?*media.admission.Pool,
@@ -374,16 +477,19 @@ pub const Prefetch = struct {
         return startCached(a, io, device, bytes, control, sampling, pool, null);
     }
     pub fn startCached(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, bytes, null, control, sampling, pool, cache);
+        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null);
     }
     pub fn startReader(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
-        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, null);
+        return startReaderWithSelection(a, io, device, reader, control, sampling, pool, null);
     }
-    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
+    pub fn startReaderWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection) !*Prefetch {
+        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, null, selection);
+    }
+    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !*Prefetch {
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .control = control, .sampling = sampling, .pool = pool, .cache = cache };
+        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .control = control, .sampling = sampling, .pool = pool, .cache = cache };
         if (cache != null and bytes.len <= 64 * 1024 * 1024) std.crypto.hash.sha2.Sha256.hash(bytes, &self.clip_hash, .{});
         self.queue = .init(&self.storage);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
@@ -461,7 +567,7 @@ pub const Prefetch = struct {
         defer if (webm) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
         var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
         defer if (webm_index) |*index| index.deinit();
-        const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
+        const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectReader(a, &reader, sampling, source.control, self.reader_selection);
         self.selected = selected;
         const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
         const configurations = if (webm) null else try parameterSession(a, &reader);
@@ -609,12 +715,15 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     return encodeCached(a, cb, bytes, control, sampling, pool, null);
 }
 pub fn encodeCached(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !Encoded {
-    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache);
+    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache, null);
 }
 pub fn encodeReader(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !Encoded {
-    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, null);
+    return encodeReaderWithSelection(a, cb, reader, control, sampling, pool, null);
 }
-fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !Encoded {
+pub fn encodeReaderWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection) !Encoded {
+    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, null, selection);
+}
+fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -634,7 +743,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     defer if (webm) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
     var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
     defer if (webm_index) |*index| index.deinit();
-    const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
+    const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectReader(a, &reader, sampling, source.control, selection);
     defer a.free(selected);
     const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
     const configurations = if (webm) null else try parameterSession(a, &reader);
@@ -1710,4 +1819,120 @@ test "embeddinggemma2 video source sampling excludes unfinished future fields" {
         checked = true;
     }
     try std.testing.expect(checked);
+}
+
+test "embeddinggemma2 video bound selection reuses logical metadata without decoder admission" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "bound-reader", .admission_pool = &pool };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    const sampling = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    const expected = try selectWithSampling(a, &reader, sampling);
+    defer a.free(expected);
+    const before = pool.snapshot();
+    pool.limits.host_bytes = before.host_bytes + 256 * 1024;
+    var selection = try ReaderSelection.init(a, &reader, sampling, &logical, &pool, .{});
+    defer selection.deinit();
+    const reads = source.reads;
+    const selected = try selection.select(a, &reader, sampling, .{});
+    defer a.free(selected);
+    try std.testing.expectEqualSlices(usize, expected, selected);
+    const planned = try inspectReaderPlanWithSelection(a, &reader, .{}, sampling, &pool, false, &selection);
+    try std.testing.expect(planned.pixels > 0);
+    try std.testing.expectEqual(reads, source.reads);
+    try std.testing.expectEqual(before.host_bytes + selected.len * @sizeOf(usize), pool.snapshot().host_bytes);
+    try std.testing.expectError(error.SharedAdmissionExceeded, inspectReaderPlan(a, &reader, .{}, sampling, &pool, false));
+}
+
+test "embeddinggemma2 video bound selection rejects payload timing geometry and policy changes" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4"));
+    defer a.free(bytes);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "selection-binding" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    const sampling = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    var selection = try ReaderSelection.init(a, &reader, sampling, &logical, null, .{});
+    defer selection.deinit();
+    const at: usize = @intCast(reader.packets[0].offset + reader.packets[0].size - 1);
+    bytes[at] ^= 1;
+    try std.testing.expectError(error.InvalidVideoReaderSelection, selection.select(a, &reader, sampling, .{}));
+    bytes[at] ^= 1;
+    reader.packets[0].pts += 1;
+    try std.testing.expectError(error.InvalidVideoReaderSelection, selection.select(a, &reader, sampling, .{}));
+    reader.packets[0].pts -= 1;
+    reader.track.pixel_aspect.horizontal += 1;
+    try std.testing.expectError(error.InvalidVideoReaderSelection, selection.select(a, &reader, sampling, .{}));
+    reader.track.pixel_aspect.horizontal -= 1;
+    const other = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 2 } };
+    try std.testing.expectError(error.InvalidVideoReaderSelection, selection.select(a, &reader, other, .{}));
+    const restored = try selection.select(a, &reader, sampling, .{});
+    defer a.free(restored);
+    try std.testing.expect(restored.len > 0);
+    try std.testing.expectError(error.Timeout, inspectReaderPlanWithSelection(a, &reader, .{ .deadline_ns = 0 }, sampling, null, false, &selection));
+}
+
+fn selectionPreparationParity(a: std.mem.Allocator, device: ?*anyopaque) !void {
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "selection-patches" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = 256 * 1024 * 1024, .commands = 4 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+    const sampling = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    var selection = try ReaderSelection.init(a, &reader, sampling, &logical, &pool, .{});
+    defer selection.deinit();
+    const original = try Prefetch.startReader(a, std.testing.io, device, &reader, .{}, sampling, &pool);
+    const expected = preparedReaderHash(a, original) catch |err| {
+        original.deinit();
+        return err;
+    };
+    original.deinit();
+    const bound = try Prefetch.startReaderWithSelection(a, std.testing.io, device, &reader, .{}, sampling, &pool, &selection);
+    defer bound.deinit();
+    try std.testing.expectEqual(expected, try preparedReaderHash(a, bound));
+}
+test "embeddinggemma2 video source bound preparation preserves native field patches" {
+    try selectionPreparationParity(std.testing.allocator, null);
+}
+test "embeddinggemma2 Metal video source bound preparation preserves field patches" {
+    const metal = @import("../ops/metal_compute.zig");
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    try selectionPreparationParity(a, try MetalCompute.videoDevice(&cb));
+}
+fn selectionAllocationRun(a: std.mem.Allocator) !void {
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "selection-failure" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    var selection = try ReaderSelection.init(a, &reader, .{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } }, &logical, &pool, .{});
+    defer selection.deinit();
+}
+test "embeddinggemma2 video source bound selection releases admission on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, selectionAllocationRun, .{});
 }
