@@ -12211,7 +12211,15 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const existing = self.getResolver(cfg.name) orelse return false;
-        return existing.eql(cfg);
+        var effective = cfg;
+        if (effective.merge_generation == 0) {
+            effective.merges = existing.merges;
+            effective.merge_generation = existing.merge_generation;
+            effective.merge_state_version = existing.merge_state_version;
+        }
+        effective.resolution_generation = existing.resolution_generation;
+        effective.namespace_generation = existing.namespace_generation;
+        return existing.eql(effective);
     }
 
     fn resolverLabelSetsEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -12243,7 +12251,10 @@ pub const IndexManager = struct {
     }
 
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
-        return !std.mem.eql(u8, existing.table, next.table) or
+        return existing.promote != next.promote or
+            !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
+            !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
+            !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
             !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or
@@ -12281,18 +12292,53 @@ pub const IndexManager = struct {
     /// are immutable for an existing resolver; material resolver/scorer config
     /// changes ask the caller to re-resolve existing extraction artifacts because
     /// their incremental replay hints will not fire on their own.
-    pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
+    pub fn upsertResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
+        return self.upsertResolverWithNamespaceMigration(store, input_cfg, false);
+    }
+
+    pub fn upsertResolverWithNamespaceMigration(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig, migrate_namespace: bool) !ResolverUpsertResult {
+        var cfg = input_cfg;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (cfg.merge_generation == 0 and !migrate_namespace) {
+                cfg.merges = entry.merges;
+                cfg.merge_generation = entry.merge_generation;
+                cfg.merge_state_version = entry.merge_state_version;
+            }
+            cfg.resolution_generation = entry.resolution_generation;
+            cfg.namespace_generation = entry.namespace_generation;
+            if (migrate_namespace) cfg.namespace_generation = try std.math.add(u64, entry.namespace_generation, 1);
+            try cfg.validate();
+            if (!migrate_namespace and entry.namespace_generation > 0 and
+                (!std.mem.eql(u8, entry.table, cfg.table) or
+                    !std.mem.eql(u8, entry.key_template, cfg.key_template) or
+                    !resolver_catalog.ResolverConfig.aliasesEqual(entry.aliases, cfg.aliases)))
+                return error.ResolverMergeNamespaceChange;
+            if (!migrate_namespace and entry.merges.len > 0 and
+                (!std.mem.eql(u8, entry.table, cfg.table) or !std.mem.eql(u8, entry.key_template, cfg.key_template)))
+                return error.ResolverMergeNamespaceChange;
             if (entry.eql(cfg)) return .updated_no_backfill;
+            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
+            if (material_changed) cfg.resolution_generation = @max(try std.math.add(u64, entry.effectiveGeneration(), 1), cfg.effectiveGeneration());
+            // Once curated identities exist, merge_generation is the combined
+            // revision clock. A config bump can equal a previous merge revision;
+            // every change must still invalidate older resolution artifacts.
+            if (material_changed and entry.merges.len > 0) {
+                const revision = try std.math.add(u64, entry.effectiveGeneration(), 1);
+                if (cfg.merges.len == 0) {
+                    // The internal clock above invalidates resolutions without
+                    // rewriting the caller-owned declarative config generation.
+                    cfg.merge_generation = 0;
+                    cfg.merge_state_version = 0;
+                } else cfg.merge_generation = @max(revision, @max(cfg.config_generation, cfg.merge_generation));
+            } else if (!material_changed) cfg.merge_generation = entry.merge_generation;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
-            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
             self.persistResolverCatalog(store, if (material_changed) .mark_reresolve_dirty else .catalog_only) catch |err| {
@@ -21945,6 +21991,9 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, enrichment_data);
         try txn.put(resolver_catalog_key, resolver_data);
+        const merge_data = try resolver_catalog.serializeMergeState(self.alloc, self.resolvers.items);
+        defer self.alloc.free(merge_data);
+        try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         try @import("../artifact_inventory.zig").refresh(&txn);
         try @import("../artifact_inventory.zig").invalidateOrdered(&txn);
         try txn.commit();
@@ -21967,6 +22016,11 @@ pub const IndexManager = struct {
             for (configs) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(configs);
         }
+        const merge_data = txn.get(resolver_catalog.merge_catalog_key) catch |err| switch (err) {
+            error.NotFound => "[]",
+            else => return err,
+        };
+        try resolver_catalog.applyMergeState(self.alloc, configs, merge_data);
         for (configs) |cfg| {
             try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
         }
@@ -21986,6 +22040,10 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
+        const merge_data = try resolver_catalog.serializeMergeState(self.alloc, self.resolvers.items);
+        defer self.alloc.free(merge_data);
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         try @import("../artifact_inventory.zig").refresh(&txn);
         if (mode == .mark_reresolve_dirty) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");

@@ -84,7 +84,10 @@ then close the database after the drain.
 The implementation lives directly under `src/`: `storage/` contains the local
 DB, `api/` its operations and contracts, `metadata/` local catalog contracts, and
 `inference/` provider integration. SQL, search, graph, lake readers and C API
-implementations share this Apache owner. `src/root.zig` and the configured
+implementations share this Apache owner. Entity matching and key resolution are
+owned by `matcher/` and `resolver/`, including the versioned Unicode slug tables.
+Their module imports remain `antfly_matcher` and `antfly_resolver`; embedded C API
+tests include both pure suites and focused replay tests. `src/root.zig` and the configured
 `src/engine/` modules expose the public Zig API; `src/source_catalog.zig` is an
 internal bridge for server consumers. See the [ownership design](../../../docs/design/embedded-source-ownership.md)
 for the embedded/server boundary.

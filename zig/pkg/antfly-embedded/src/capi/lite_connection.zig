@@ -137,6 +137,15 @@ const Owner = struct {
             previous.owned_lite_backend.?.native_docstore.?.read_only = true;
             previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
         }
+        // Child table handles outlive snapshots. Drop borrowed producers before
+        // collectRetired releases their old provider (even if addresses are reused).
+        for (self.connections.items) |connection| {
+            for (connection.table_handles.items) |id| {
+                const child, const slot = api.handle_registry.enter(id) orelse continue;
+                defer api.HandleRegistry.leave(slot);
+                h.invalidateQueryProducer(child);
+            }
+        }
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -153,6 +162,7 @@ const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
+                if (retired.query_borrows > 0) break :retained true;
                 for (self.connections.items) |connection| {
                     var cursors = connection.sql_cursors.valueIterator();
                     while (cursors.next()) |cursor| {

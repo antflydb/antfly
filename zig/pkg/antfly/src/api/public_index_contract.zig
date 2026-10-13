@@ -566,13 +566,22 @@ fn edgeTypeFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "aliases")) {
+        if (value != .array) return false;
+        for (value.array.items) |alias| {
+            if (alias != .object or alias.object.count() != 2) return false;
+            if (!isNonEmptyString(alias.object.get("key") orelse return false) or
+                !isNonEmptyString(alias.object.get("target") orelse return false)) return false;
+        }
+        return true;
+    }
     if (std.mem.eql(u8, field, "scorer")) return value == .object;
     if (std.mem.eql(u8, field, "labels")) {
         if (value != .array) return false;
         for (value.array.items) |item| if (!isNonEmptyString(item)) return false;
         return true;
     }
-    if (std.mem.eql(u8, field, "type_must_match")) return isBool(value);
+    if (std.mem.eql(u8, field, "type_must_match") or std.mem.eql(u8, field, "promote")) return isBool(value);
     if (std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding_dims") or
         std.mem.eql(u8, field, "config_generation")) return isInteger(value);
@@ -752,6 +761,8 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "source_artifact_kind") or
         std.mem.eql(u8, field, "resolution_artifact") or
         std.mem.eql(u8, field, "key_template") or
+        std.mem.eql(u8, field, "aliases") or
+        std.mem.eql(u8, field, "promote") or
         std.mem.eql(u8, field, "labels") or
         std.mem.eql(u8, field, "type_must_match") or
         std.mem.eql(u8, field, "scorer") or

@@ -62,6 +62,8 @@ pub const Options = struct {
     max_sequences_per_item: usize = 8,
     /// Encoded tokens across every sequence of the request.
     max_request_tokens: usize = 64 * 1024,
+    /// Only bound for an exact qualified artifact by the serving layer.
+    long_document_limits: ?@import("../models/gliner_span_window_limits.zig").Limits = null,
     pipeline: pipeline.Options = .{},
     control: ?Control = null,
     failure: ?*wire.FailureContext = null,

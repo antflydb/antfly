@@ -624,6 +624,26 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
     var planned = try prepareTokenizedDocument(backend, allocator, config, tokenizer, item, quiet);
     defer planned.document.deinit();
     const used = try admitWindows(backend, allocator, config, tokenizer, item, &planned, receiver);
+    // Execution batches compatible windows. Workspace admission must include
+    // their padded physical rows, rather than only individual window lengths.
+    if (comptime @hasDecl(@TypeOf(receiver.*), "observeWindowGroup")) {
+        const batchable = item.compiled.schema.joint_ie == null and
+            (item.compiled.schema.classifications.len == 0 or backend == .cuda);
+        var start: usize = 0;
+        while (start < planned.document.windows.len) {
+            const n = if (batchable) @max(1, @min(planned.options.limits.window_batch_size, planned.document.windows.len - start)) else 1;
+            const inputs = try allocator.alloc(processor.Item, n);
+            defer allocator.free(inputs);
+            for (planned.document.windows[start..][0..n], inputs) |window, *input| {
+                input.* = .{ .text = try planned.document.windowText(window.index), .schema = &item.compiled };
+            }
+            var prepared = try processor.prepare(allocator, tokenizer, inputs, planned.process_options);
+            defer prepared.deinit();
+            receiver.observeWindowGroup(&prepared);
+            start += n;
+        }
+    }
+
     try check(quiet);
     return used;
 }

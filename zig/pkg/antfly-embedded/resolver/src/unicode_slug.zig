@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Locale-independent NFKC/case-folded Unicode letter and digit slugs.
 const std = @import("std");
 const data = @import("unicode_slug_data.zig");
@@ -54,6 +67,10 @@ fn letterOrDigit(cp: u21) bool {
     const i = find("last", &data.letters_digits, cp);
     return i < data.letters_digits.len and data.letters_digits[i].first <= cp;
 }
+fn mark(cp: u21) bool {
+    const i = find("last", &data.marks, cp);
+    return i < data.marks.len and data.marks[i].first <= cp;
+}
 pub fn append(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
     const view = try std.unicode.Utf8View.init(text);
     var iter = view.iterator();
@@ -86,7 +103,7 @@ pub fn append(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []co
     var wrote = false;
     var separator = false;
     for (units.items[0..written]) |unit| {
-        if (!letterOrDigit(unit.cp)) {
+        if (!letterOrDigit(unit.cp) and !(wrote and !separator and mark(unit.cp))) {
             if (wrote) separator = true;
             continue;
         }
