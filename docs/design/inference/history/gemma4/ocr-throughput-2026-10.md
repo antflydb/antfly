@@ -230,4 +230,3 @@ GiB, overlapping resources; probe timing excluded. Diagnostic counts reached
 experiment-enabled tests, 101 default compiled tests and nine sweep tests.
 The earlier six-case repeated-page campaign's varying load invalidated its
 timings; correctness evidence was retained. [Final evidence](../../gemma4-ocr-shared-batching.json).
-
