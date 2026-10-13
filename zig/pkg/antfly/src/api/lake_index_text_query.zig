@@ -147,7 +147,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer arena.deinit();
     const ca = arena.allocator();
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, ca, table.schema_json, table.table_id, table.name);
-    sql_table.external_indexes = .{ .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
+    sql_table.external_indexes = .{ .object_generation = table.object_storage_generation, .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
         defer server.lake_query_metrics.record(.publication, publication_started);
@@ -708,7 +708,7 @@ const Execution = struct {
                 var excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
                 defer excluded.bitmap.deinit();
                 if (!excluded.exact) return error.UnsupportedQueryRequest;
-                var recent_pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, self.source.inventory.source_id, self.schema_json, root.config_json, selected.name, overlay), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
+                var recent_pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
                 defer recent_pin.deinit();
                 // Saturation can return a private pin; sharing gives the composed
                 // owner the same lifetime contract as a cache hit.
@@ -1314,7 +1314,7 @@ const Execution = struct {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
             const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime);
-            var pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, self.source.inventory.source_id, self.schema_json, root.config_json, selected.name, overlay), overlay, selected.name, analysis, runtime, field, self.context);
+            var pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), overlay, selected.name, analysis, runtime, field, self.context);
             errdefer pin.deinit();
             recent = try pin.share(std.heap.page_allocator);
         }

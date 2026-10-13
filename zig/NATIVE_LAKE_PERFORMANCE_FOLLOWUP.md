@@ -3634,7 +3634,8 @@ root under 16 KiB, resumes the paged inventory and verifies that replacement and
 removal preserve the earlier immutable cut.
 
 Accepted-WAL native text snapshots are now reused by the server. Cache keys bind
-credential/store identity, table identity, source, schema, index name/config and
+credential/store identity, table identity and object generation, source and
+baseline snapshot, schema, index name/config and
 both ends of the immutable WAL range. Four admission lanes single-flight equal
 cuts. Cached snapshots retain no request metadata or authority; callers supply
 current analysis/schema metadata and private visibility masks. A 256 MiB shared
@@ -3646,7 +3647,7 @@ The cache joins the full-text residency accounting owner during lake preparation
 and closes after requests have quiesced. Physical shared cells now remember their
 own allocator, so private visibility cells can safely reference an immutable
 corpus allocated by a different owner. Tests cover concurrent equal-cut admission,
-eviction with live pins, cache pressure, different coverage cuts, cancellation,
+eviction with live pins, cache pressure, different coverage cuts, reset WAL generations and legacy baseline snapshots, cancellation,
 foreign allocator destruction and private masks.
 
 Stored-source highlights hydrate final winners in physical segment/document

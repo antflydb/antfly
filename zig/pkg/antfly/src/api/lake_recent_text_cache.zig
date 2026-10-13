@@ -53,13 +53,14 @@ pub const Cache = struct {
         std.debug.assert(self.heap.live == 0);
         if (self.managed) |*budget| budget.deinit();
     }
-    pub fn key(scope: [32]u8, table_id: u64, source: []const u8, schema: []const u8, config: []const u8, name: []const u8, overlay: *const overlay_api.Overlay) [32]u8 {
+    pub fn key(scope: [32]u8, table_id: u64, object_generation: u64, source: []const u8, snapshot: []const u8, schema: []const u8, config: []const u8, name: []const u8, overlay: *const overlay_api.Overlay) [32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&scope);
-        var table: [8]u8 = undefined;
-        std.mem.writeInt(u64, &table, table_id, .little);
+        var table: [16]u8 = undefined;
+        std.mem.writeInt(u64, table[0..8], table_id, .little);
+        std.mem.writeInt(u64, table[8..16], object_generation, .little);
         hash.update(&table);
-        for ([_][]const u8{ source, schema, config, name }) |part| {
+        for ([_][]const u8{ source, snapshot, schema, config, name }) |part| {
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, part.len, .little);
             hash.update(&length);
@@ -165,7 +166,11 @@ test "external lake global frontier recent corpora share exact cuts and own no r
     try overlay.rows.put(sa, "wal1:row", try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"body\":\"shared recent text\"}", .{}));
     var cache: Cache = .{};
     defer cache.deinit();
-    const identity = Cache.key(@splat(1), 7, "table", "schema", "recipe", "text", &overlay);
+    const identity = Cache.key(@splat(1), 7, 0, "table", "snapshot", "schema", "recipe", "text", &overlay);
+    const reset_queue = Cache.key(@splat(1), 7, 1, "table", "snapshot", "schema", "recipe", "text", &overlay);
+    const different_base = Cache.key(@splat(1), 7, 0, "table", "other-snapshot", "schema", "recipe", "text", &overlay);
+    try std.testing.expect(!std.mem.eql(u8, &identity, &reset_queue));
+    try std.testing.expect(!std.mem.eql(u8, &identity, &different_base));
     var first = try cache.acquire(identity, &overlay, "text", .{}, null, "body", .{ .io = std.testing.io });
     defer first.deinit();
     var second = try cache.acquire(identity, &overlay, "different borrowed name", .{}, null, "body", .{ .io = std.testing.io });
@@ -173,15 +178,29 @@ test "external lake global frontier recent corpora share exact cuts and own no r
     try std.testing.expect(first.snapshot == second.snapshot);
     try std.testing.expectEqual(@as(usize, 1), cache.builds);
     try std.testing.expectEqualStrings("different borrowed name", second.name);
+    // A reset queue may reuse the same LSNs and stable keys for different
+    // accepted images. Verify that a new generation builds its own corpus.
+    var reset: overlay_api.Overlay = .{ .pending = overlay.pending, .key_filter = "" };
+    try reset.rows.put(sa, "wal1:row", try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"body\":\"changed state\"}", .{}));
+    var reset_pin = try cache.acquire(reset_queue, &reset, "text", .{}, null, "body", .{ .io = std.testing.io });
+    defer reset_pin.deinit();
+    try std.testing.expect(first.snapshot != reset_pin.snapshot);
+    const query: local.search_search.SearchQuery = .{ .match = .{ .field = "body", .text = "shared" } };
+    var old_matches = try local.search_search.execute(a, first.snapshot, .{ .query = query, .k = 10, .include_stored = false });
+    defer old_matches.deinit();
+    var reset_matches = try local.search_search.execute(a, reset_pin.snapshot, .{ .query = query, .k = 10, .include_stored = false });
+    defer reset_matches.deinit();
+    try std.testing.expectEqual(@as(usize, 1), old_matches.hits.len);
+    try std.testing.expectEqual(@as(usize, 0), reset_matches.hits.len);
     overlay.pending.base_lsn = 5;
-    const other = Cache.key(@splat(1), 7, "table", "schema", "recipe", "text", &overlay);
+    const other = Cache.key(@splat(1), 7, 0, "table", "snapshot", "schema", "recipe", "text", &overlay);
     try std.testing.expect(!std.mem.eql(u8, &identity, &other));
     var third = try cache.acquire(other, &overlay, "text", .{}, null, "body", .{ .io = std.testing.io });
     defer third.deinit();
     try std.testing.expect(third.snapshot != first.snapshot);
     for (0..6) |i| {
         overlay.pending.lsn = 10 + i;
-        const next = Cache.key(@splat(1), 7, "table", "schema", "recipe", "text", &overlay);
+        const next = Cache.key(@splat(1), 7, 0, "table", "snapshot", "schema", "recipe", "text", &overlay);
         var pin = try cache.acquire(next, &overlay, "text", .{}, null, "body", .{ .io = std.testing.io });
         pin.deinit();
     }
@@ -200,7 +219,7 @@ test "external lake global frontier concurrent recent admissions single flight a
     for (0..1000) |i| try overlay.rows.put(sa, try std.fmt.allocPrint(sa, "wal1:{d}", .{i}), row);
     var cache: Cache = .{};
     defer cache.deinit();
-    const identity = Cache.key(@splat(2), 7, "source", "schema", "recipe", "text", &overlay);
+    const identity = Cache.key(@splat(2), 7, 0, "source", "snapshot", "schema", "recipe", "text", &overlay);
     const Worker = struct {
         fn run(shared: *Cache, key_: [32]u8, suffix: *const overlay_api.Overlay, context: Context) anyerror!Source {
             return shared.acquire(key_, suffix, "text", .{}, null, "body", context);
