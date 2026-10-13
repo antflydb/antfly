@@ -2049,3 +2049,27 @@ skips. CPU/Metal model and shared media/HTTP gates pass. The original non-CUDA
 scope remains active.
 
 See [qualification receipts](testdata/core-admission-validation/README.md).
+
+
+### Reuse reader-backed frame projections
+
+Validated logical pictures now retain their completion packet alongside the first
+packet. Reader selections own visual keys over track/display values and all
+available coded dependencies through completion. Appending future packets keeps
+earlier keys stable; changed dependencies/display values invalidate them. Preroll
+eviction conservatively misses. Field/partition and separate-plane assemblies
+retain complete dependency identity when metadata is cloned and rebased.
+
+Synchronous encoding and asynchronous preparation use the bounded CPU/Metal
+FrameCache for borrowed readers. `embedNextLiveCached` accepts a caller-owned
+request-local cache tied to one immutable model session. Keep its control/watchdog
+alive through all calls and producer joins; close the cache before its session.
+Tickets, admission, eviction and cancellation retain their existing contracts.
+
+Fresh real-clip CPU, Metal and actual Linux overlap each record a cache hit and
+exact cached/uncached 246-token vector equality. Ordinary live windows remain
+exact against complete-clip inference and pass pinned PyTorch retrieval gates.
+47 macOS model checks and 42 actual Linux checks pass, with platform skips. The
+full goal remains active; this does not add incremental live decoder state.
+
+See [qualification receipts](testdata/live/reader-cache-validation/README.md).

@@ -24,6 +24,7 @@ const build_options = @import("build_options");
 const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const FrameCache = @import("embedding_gemma2_video_cache.zig").Cache;
+const CacheKey = @import("embedding_gemma2_video_cache.zig").Key;
 const CacheTicket = @import("embedding_gemma2_video_cache.zig").Ticket;
 pub const Encoded = struct {
     embeddings: []f32,
@@ -45,11 +46,12 @@ pub const Sampling = union(enum) { reference, timestamps: video.sampling.Timesta
 pub const ReaderSelection = struct {
     allocator: std.mem.Allocator,
     selected: []const usize,
+    projection_keys: []const CacheKey,
     binding: [32]u8,
     reservation: media.admission.Token = .{},
     pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control) !ReaderSelection {
         if (reader.track.codec != .avc or logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale or logical.pictures.len > 8192) return error.InvalidVideoReaderSelection;
-        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize));
+        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
         errdefer reservation.deinit();
         const binding = try readerBinding(reader, sampling, control);
@@ -57,21 +59,65 @@ pub const ReaderSelection = struct {
         errdefer a.free(selected);
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         for (selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
-        try reservation.resize(.{ .host_bytes = selected.len * @sizeOf(usize) });
-        return .{ .allocator = a, .selected = selected, .binding = binding, .reservation = reservation };
+        const keys = try readerProjectionKeys(a, reader, logical, selected, control);
+        errdefer a.free(keys);
+        try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
+        return .{ .allocator = a, .selected = selected, .projection_keys = keys, .binding = binding, .reservation = reservation };
     }
     pub fn deinit(self: *ReaderSelection) void {
         self.allocator.free(self.selected);
+        self.allocator.free(self.projection_keys);
         self.reservation.deinit();
         self.* = undefined;
     }
     pub fn select(self: *const ReaderSelection, a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![]usize {
         const binding = try readerBinding(reader, sampling, control);
-        if (!std.mem.eql(u8, &binding, &self.binding) or self.selected.len == 0 or self.selected.len > 32) return error.InvalidVideoReaderSelection;
+        if (!std.mem.eql(u8, &binding, &self.binding) or self.selected.len == 0 or self.selected.len > 32 or self.projection_keys.len != self.selected.len) return error.InvalidVideoReaderSelection;
         for (self.selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
         return a.dupe(usize, self.selected);
     }
 };
+/// A conservative visual key includes every available coded dependency through
+/// completion. Appending future packets preserves it; evicting preroll may miss.
+fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: *const video.h264_pictures.Index, selected: []const usize, control: media.source.Control) ![]CacheKey {
+    const bytes = try packetBytes(reader);
+    const keys = try a.alloc(CacheKey, selected.len);
+    errdefer a.free(keys);
+    var ends: [32]usize = undefined;
+    var maximum: usize = 0;
+    for (selected, 0..) |id, slot| {
+        var found = false;
+        for (logical.pictures) |picture| if (picture.first_packet == id) {
+            const end = picture.last_packet orelse reader.packets.len - 1;
+            if (end < id or end >= reader.packets.len) return error.InvalidVideoReaderSelection;
+            ends[slot] = end;
+            maximum = @max(maximum, end);
+            found = true;
+            break;
+        };
+        if (!found) return error.InvalidVideoReaderSelection;
+    }
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-reader-projection-prefix-v1");
+    hashValue(&hash, reader.track);
+    for (reader.packets[0 .. maximum + 1], 0..) |packet, index| {
+        try control.check();
+        if (packet.offset > bytes.len or packet.size > bytes.len - packet.offset) return error.InvalidVideoReaderSelection;
+        hashValue(&hash, packet);
+        hashValue(&hash, bytes[@intCast(packet.offset)..][0..packet.size]);
+        for (selected, 0..) |id, slot| if (ends[slot] == index) {
+            var snapshot = hash;
+            hashValue(&snapshot, index + 1);
+            var digest: [32]u8 = undefined;
+            snapshot.final(&digest);
+            keys[slot] = .{ .clip = digest, .picture = id };
+        };
+    }
+    return keys;
+}
+fn projectionKey(selection: ?*const ReaderSelection, clip: [32]u8, selected: []const usize, slot: usize) CacheKey {
+    return if (selection) |owner| owner.projection_keys[slot] else .{ .clip = clip, .picture = selected[slot] };
+}
 fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
@@ -483,14 +529,22 @@ pub const Prefetch = struct {
         return startReaderWithSelection(a, io, device, reader, control, sampling, pool, null);
     }
     pub fn startReaderWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection) !*Prefetch {
-        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, null, selection);
+        return startReaderCachedWithSelection(a, io, device, reader, control, sampling, pool, selection, null);
+    }
+    pub fn startReaderCachedWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !*Prefetch {
+        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, cache, selection);
     }
     fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !*Prefetch {
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
         self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .control = control, .sampling = sampling, .pool = pool, .cache = cache };
-        if (cache != null and bytes.len <= 64 * 1024 * 1024) std.crypto.hash.sha2.Sha256.hash(bytes, &self.clip_hash, .{});
+        if (cache != null and bytes.len <= 64 * 1024 * 1024) {
+            if (reader) |input| {
+                const adapter = control.imageWorkControl();
+                self.clip_hash = try readerBinding(input, .reference, .{ .context = adapter.context, .check_fn = adapter.check_fn });
+            } else std.crypto.hash.sha2.Sha256.hash(bytes, &self.clip_hash, .{});
+        }
         self.queue = .init(&self.storage);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
@@ -589,7 +643,7 @@ pub const Prefetch = struct {
         var missing: usize = 0;
         for (selected, 0..) |id, slot| {
             if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
-            if (self.cache) |cache| if (cache.take(.{ .clip = self.clip_hash, .picture = id })) |ticket| {
+            if (self.cache) |cache| if (cache.take(projectionKey(self.reader_selection, self.clip_hash, selected, slot))) |ticket| {
                 self.put(.{ .cached = .{ .slot = slot, .ticket = ticket } }) catch |err| {
                     cache.restore(ticket);
                     return err;
@@ -636,7 +690,7 @@ pub const Prefetch = struct {
         };
         if (resident) |tensors| @memset(tensors, null);
         const adapter = self.control.imageWorkControl();
-        var capture = Capture{ .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash };
+        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash };
         defer capture.discardNativePending();
         var jobs: [2]Job = undefined;
         while (true) {
@@ -721,7 +775,10 @@ pub fn encodeReader(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *co
     return encodeReaderWithSelection(a, cb, reader, control, sampling, pool, null);
 }
 pub fn encodeReaderWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection) !Encoded {
-    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, null, selection);
+    return encodeReaderCachedWithSelection(a, cb, reader, control, sampling, pool, selection, null);
+}
+pub fn encodeReaderCachedWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !Encoded {
+    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, cache, selection);
 }
 fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
@@ -775,8 +832,10 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     };
     if (resident) |tensors| @memset(tensors, null);
     var clip_hash: [32]u8 = @splat(0);
-    if (cache != null) std.crypto.hash.sha2.Sha256.hash(bytes, &clip_hash, .{});
-    var capture = Capture{ .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    if (cache != null) {
+        if (borrowed) |input_reader| clip_hash = try readerBinding(input_reader, .reference, source.control) else std.crypto.hash.sha2.Sha256.hash(bytes, &clip_hash, .{});
+    }
+    var capture = Capture{ .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -796,7 +855,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     var missing: usize = 0;
     for (selected, 0..) |id, slot| {
         if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
-        if (cache) |shared| if (shared.take(.{ .clip = clip_hash, .picture = id })) |ticket| {
+        if (cache) |shared| if (shared.take(projectionKey(selection, clip_hash, selected, slot))) |ticket| {
             defer shared.restore(ticket);
             try capture.loadCached(slot, ticket);
             continue;
@@ -931,6 +990,7 @@ const Capture = struct {
     cb: *const ComputeBackend,
     cache: ?*FrameCache = null,
     clip_hash: [32]u8 = @splat(0),
+    reader_selection: ?*const ReaderSelection = null,
     decode_slots: ?[]const usize = null,
     track: media.mp4.Track,
     webm_track: ?media.webm.Track = null,
@@ -964,7 +1024,7 @@ const Capture = struct {
         };
     }
     fn storeDevice(self: *Capture, slot: usize, tensor: CT, tokens: usize) void {
-        if (self.cache) |cache| cache.storeDevice(.{ .clip = self.clip_hash, .picture = self.selected[slot] }, tensor, tokens);
+        if (self.cache) |cache| cache.storeDevice(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot), tensor, tokens);
     }
     fn finishDuplicates(self: *Capture) !void {
         for (self.selected, 0..) |id, slot| {
@@ -1058,7 +1118,7 @@ const Capture = struct {
     }
     fn save(self: *Capture, slot: usize, encoded: anytype) !void {
         if (encoded.tokens == 0 or encoded.tokens > 140 or encoded.embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
-        if (self.cache) |cache| cache.storeCpu(.{ .clip = self.clip_hash, .picture = self.selected[slot] }, encoded.embeddings, encoded.tokens);
+        if (self.cache) |cache| cache.storeCpu(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot), encoded.embeddings, encoded.tokens);
         @memcpy(self.output[slot * 140 * 512 ..][0..encoded.embeddings.len], encoded.embeddings);
         self.frame_tokens[slot] = encoded.tokens;
     }
@@ -1845,7 +1905,7 @@ test "embeddinggemma2 video bound selection reuses logical metadata without deco
     const planned = try inspectReaderPlanWithSelection(a, &reader, .{}, sampling, &pool, false, &selection);
     try std.testing.expect(planned.pixels > 0);
     try std.testing.expectEqual(reads, source.reads);
-    try std.testing.expectEqual(before.host_bytes + selected.len * @sizeOf(usize), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(before.host_bytes + selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)), pool.snapshot().host_bytes);
     try std.testing.expectError(error.SharedAdmissionExceeded, inspectReaderPlan(a, &reader, .{}, sampling, &pool, false));
 }
 
@@ -1935,4 +1995,80 @@ fn selectionAllocationRun(a: std.mem.Allocator) !void {
 }
 test "embeddinggemma2 video source bound selection releases admission on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, selectionAllocationRun, .{});
+}
+
+test "embeddinggemma2 video reader projection prefixes survive append and bind field completion" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    const owned = try a.dupe(u8, bytes);
+    defer a.free(owned);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = owned }, .identity = "prefix-fields" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    const picture = logical.pictures[0];
+    const complete = picture.last_packet orelse return error.TestUnexpectedResult;
+    try std.testing.expect(complete > picture.first_packet and complete + 1 < reader.packets.len);
+    var prefix = reader;
+    prefix.packets = reader.packets[0 .. complete + 1];
+    var prefix_index = logical;
+    prefix_index.pictures = logical.pictures[0..1];
+    prefix_index.packet_count = prefix.packets.len;
+    prefix_index.pending_pts = null;
+    prefix_index.pending_first_packet = null;
+    const prefix_sampling = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    var early = try ReaderSelection.init(a, &prefix, prefix_sampling, &prefix_index, null, .{});
+    defer early.deinit();
+    var later = try ReaderSelection.init(a, &reader, prefix_sampling, &logical, null, .{});
+    defer later.deinit();
+    try std.testing.expectEqualSlices(usize, early.selected, later.selected);
+    try std.testing.expectEqual(early.projection_keys[0], later.projection_keys[0]);
+    try std.testing.expect(!std.mem.eql(u8, &early.binding, &later.binding));
+    const at = @as(usize, @intCast(reader.packets[complete].offset));
+    owned[at + reader.packets[complete].size - 1] ^= 1;
+    var changed = try ReaderSelection.init(a, &reader, prefix_sampling, &logical, null, .{});
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &later.projection_keys[0].clip, &changed.projection_keys[0].clip));
+    owned[at + reader.packets[complete].size - 1] ^= 1;
+    reader.track.pixel_aspect.horizontal *= 2;
+    var display = try ReaderSelection.init(a, &reader, prefix_sampling, &logical, null, .{});
+    defer display.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &later.projection_keys[0].clip, &display.projection_keys[0].clip));
+}
+test "embeddinggemma2 video cached borrowed reader producer skips native reconstruction and restores tickets" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "cached-reader" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    const sampling = Sampling{ .source_timestamps = .{ .end_ns = std.time.ns_per_s, .max_frames = 1 } };
+    var selection = try ReaderSelection.init(a, &reader, sampling, &logical, null, .{});
+    defer selection.deinit();
+    var marker: u8 = 0;
+    const session = @import("../backends/session.zig").Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = undefined } };
+    var cache = FrameCache{ .allocator = a, .session = session };
+    defer cache.deinit();
+    const values: [512]f32 = @splat(0.125);
+    cache.storeCpu(selection.projection_keys[0], &values, 1);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 } };
+    {
+        const producer = try Prefetch.startReaderCachedWithSelection(a, std.testing.io, null, &reader, .{}, sampling, &pool, &selection, &cache);
+        defer producer.deinit();
+        var job: [1]Prefetch.Job = undefined;
+        _ = try producer.queue.getUncancelable(std.testing.io, &job, 1);
+        try std.testing.expect(job[0] == .header);
+        _ = try producer.queue.getUncancelable(std.testing.io, &job, 1);
+        try std.testing.expect(job[0] == .cached);
+        cache.restore(job[0].cached.ticket);
+        producer.join();
+        try std.testing.expect(producer.failure == null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats.hits);
+    const ticket = cache.take(selection.projection_keys[0]) orelse return error.TestUnexpectedResult;
+    defer cache.restore(ticket);
+    try std.testing.expectEqualSlices(f32, &values, ticket.entry.value.cpu);
 }

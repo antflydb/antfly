@@ -20,7 +20,7 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const factory = internal.architectures.session_factory;
 const pipeline = internal.pipelines.embedding_gemma2;
-const Case = struct { id: []const u8, path: []const u8, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s };
+const Case = struct { id: []const u8, path: []const u8, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s, qualify_reader_cache: bool = false };
 const Query = struct { id: []const u8, text: []const u8 };
 const Suite = struct { cases: []const Case, queries: []const Query = &.{} };
 const QueryResult = struct { id: []const u8, vector: []f32 };
@@ -40,6 +40,7 @@ const Measurement = struct {
     vector: []f32,
     baseline_vector: []f32,
 };
+const CacheMeasurement = struct { case: []const u8, hits: usize, stored: usize, max_abs: f32, exact: bool, tokens: usize, cached_seconds: f64, uncached_seconds: f64 };
 const Reader = struct {
     ingest: *media.live_mp4.Ingest,
     bytes: []const u8,
@@ -102,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
     const tokenizer = try internal.server.model_manager.loadHuggingFaceTokenizerFromDir(a, model_path);
     defer tokenizer.deinitSelf();
     var results = std.ArrayList(Measurement).empty;
+    var cache_results = std.ArrayList(CacheMeasurement).empty;
     for (parsed.value.cases) |case| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, case.path, a, .limited(64 * 1024 * 1024));
         if (case.init_end == 0 or case.init_end >= bytes.len or case.fragment_ends.len == 0 or case.fragment_ends.len > 256) return error.InvalidFixture;
@@ -147,6 +149,43 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("live {s}/{d}: tokens={d} max_abs={d} seconds={d}\n", .{ case.id, event.ordinal, result.input_tokens, max_abs, stream_seconds });
         }
         if (windows == 0 or !reader.ended()) return error.IncompleteStream;
+        if (case.qualify_reader_cache) {
+            const ca = std.heap.c_allocator;
+            var input = media.source.Source{ .allocator = ca, .storage = .{ .borrowed = bytes }, .identity = case.id };
+            var complete = try media.mp4.Reader.init(ca, &input, .{});
+            defer complete.deinit();
+            var logical = try video.h264_pictures.streaming(ca, &complete, .{});
+            defer logical.deinit();
+            const begin = try media.timeline.rescale(logical.pictures[0].pts, logical.timescale, std.time.ns_per_s);
+            const first_sampling = @TypeOf(@as(pipeline.SampledVideo, undefined).sampling){ .source_timestamps = .{ .start_ns = begin, .end_ns = begin + 2 * std.time.ns_per_s } };
+            const next_sampling = @TypeOf(@as(pipeline.SampledVideo, undefined).sampling){ .source_timestamps = .{ .start_ns = begin + std.time.ns_per_s, .end_ns = begin + 3 * std.time.ns_per_s } };
+            var first_selection = try pipeline.ReaderSelection.init(ca, &complete, first_sampling, &logical, null, .{});
+            defer first_selection.deinit();
+            var next_selection = try pipeline.ReaderSelection.init(ca, &complete, next_sampling, &logical, null, .{});
+            defer next_selection.deinit();
+            var cache = pipeline.FrameCache{ .allocator = ca, .session = session, .control = control };
+            defer cache.deinit();
+            const first_group = [_]pipeline.Part{.{ .sampled_video = .{ .reader = &complete, .sampling = first_sampling, .selection = &first_selection } }};
+            const next_group = [_]pipeline.Part{.{ .sampled_video = .{ .reader = &complete, .sampling = next_sampling, .selection = &next_selection } }};
+            const primed = try pipeline.embedCached(ca, session, tokenizer.tokenizer(), .{ .content = &first_group }, .{}, null, control, &cache);
+            defer ca.free(primed.vector);
+            const cached_start = now();
+            const cached = try pipeline.embedCached(ca, session, tokenizer.tokenizer(), .{ .content = &next_group }, .{}, null, control, &cache);
+            defer ca.free(cached.vector);
+            const cached_seconds = seconds(cached_start);
+            const baseline_start = now();
+            const uncached = try pipeline.embed(ca, session, tokenizer.tokenizer(), .{ .content = &next_group }, .{}, null, control);
+            defer ca.free(uncached.vector);
+            const uncached_seconds = seconds(baseline_start);
+            if (cached.input_tokens != uncached.input_tokens or cache.stats.hits == 0) return error.ReaderCacheParityFailed;
+            var max_abs: f32 = 0;
+            for (cached.vector, uncached.vector) |x, y| {
+                if (!std.math.isFinite(x) or !std.math.isFinite(y)) return error.NonFiniteVector;
+                max_abs = @max(max_abs, @abs(x - y));
+            }
+            if (max_abs > 0.00001) return error.ReaderCacheParityFailed;
+            try cache_results.append(a, .{ .case = case.id, .hits = cache.stats.hits, .stored = cache.stats.stored, .max_abs = max_abs, .exact = std.mem.eql(f32, cached.vector, uncached.vector), .tokens = cached.input_tokens, .cached_seconds = cached_seconds, .uncached_seconds = uncached_seconds });
+        }
     }
     var queries = std.ArrayList(QueryResult).empty;
     for (parsed.value.queries) |query| {
@@ -154,6 +193,6 @@ pub fn main(init: std.process.Init) !void {
         defer std.heap.c_allocator.free(result.vector);
         try queries.append(a, .{ .id = query.id, .vector = try a.dupe(f32, result.vector) });
     }
-    const report = try std.json.Stringify.valueAlloc(a, .{ .status = "pass", .backend = if (metal) "metal" else "native", .timing_scope = "completed live adapter and complete-clip baseline; diagnostic shared-host timing", .cases = results.items, .queries = queries.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .status = "pass", .backend = if (metal) "metal" else "native", .timing_scope = "completed live adapter and complete-clip baseline; diagnostic shared-host timing", .cases = results.items, .queries = queries.items, .reader_cache = cache_results.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
 }

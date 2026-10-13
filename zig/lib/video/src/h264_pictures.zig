@@ -56,6 +56,10 @@ pub const Index = struct {
             if (picture.first_packet < base) continue;
             owned[at] = picture;
             owned[at].first_packet -= base;
+            if (picture.last_packet) |last| {
+                if (last < picture.first_packet or last >= end) return error.InvalidLivePictureIndex;
+                owned[at].last_packet = last - base;
+            }
             at += 1;
         }
         return .{ .allocator = a, .pictures = owned, .timescale = self.timescale, .packet_count = packet_count, .pending_pts = self.pending_pts, .pending_first_packet = if (self.pending_first_packet) |pending| pending - base else null, .reservation = reservation };
@@ -102,6 +106,7 @@ const Collector = struct {
             for (self.pictures.items, self.planes.items, 0..) |existing, seen, i| {
                 if (existing.first_packet != picture.first_packet) continue;
                 if (seen & mask != 0 or existing.pts != picture.pts or existing.duration != picture.duration or existing.width != picture.width or existing.height != picture.height or existing.bit_depth != picture.bit_depth) return error.MixedVideoPictures;
+                if (picture.last_packet) |last| self.pictures.items[i].last_packet = @max(existing.last_packet orelse last, last);
                 self.planes.items[i] |= mask;
                 return;
             }

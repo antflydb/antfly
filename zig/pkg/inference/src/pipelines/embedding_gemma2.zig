@@ -98,8 +98,13 @@ pub const LiveResult = struct {
 /// Null means explicit reload is required unless the transport has ended.
 /// Failed inference/commit preserves the coordinator's retry cursor.
 pub fn embedNextLive(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, reader: anytype, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !?LiveResult {
+    return embedNextLiveCached(out, session, tokenizer, coordinator, reader, caption, options, lock, control, null);
+}
+/// Cache belongs to this immutable model session and outlives each joined producer.
+pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, reader: anytype, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !?LiveResult {
     const effective = control orelse Control{};
     try effective.check();
+    if (cache) |owner| if (owner.session.ptr != session.ptr or owner.session.vtable != session.vtable) return error.InvalidVideoCacheSession;
     if (coordinator.options.window.stream.max_bytes > 64 * 1024 * 1024 or coordinator.options.window.max_packets > 8192) return error.ResourceLimitExceeded;
     var window_permit = try session.admitHostPreprocess(512 * 1024 * 1024);
     defer window_permit.deinit();
@@ -113,7 +118,7 @@ pub fn embedNextLive(out: std.mem.Allocator, session: Session, tokenizer: Tokeni
     var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) try @import("embedding_gemma2_video.zig").ReaderSelection.init(out, &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control) else null;
     defer if (selection) |*owner| owner.deinit();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = sampling, .selection = if (selection) |*owner| owner else null } }, .{ .text = caption orelse "" } };
-    const result: ?Result = if (prepared.has_pictures) try embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control) else null;
+    const result: ?Result = if (prepared.has_pictures) try embedCached(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control, cache) else null;
     errdefer if (result) |value| out.free(value.vector);
     try coordinator.commit(&prepared);
     return .{ .result = result, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing };
@@ -196,7 +201,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
                     const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                     const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
-                    prefetched = if (packet_reader) |reader| try @import("embedding_gemma2_video.zig").Prefetch.startReaderWithSelection(a, io, context.device, reader, effective, sampling, &video_budget, selection) else try @import("embedding_gemma2_video.zig").Prefetch.startCached(a, io, context.device, bytes, effective, sampling, &video_budget, cache);
+                    prefetched = if (packet_reader) |reader| try @import("embedding_gemma2_video.zig").Prefetch.startReaderCachedWithSelection(a, io, context.device, reader, effective, sampling, &video_budget, selection, cache) else try @import("embedding_gemma2_video.zig").Prefetch.startCached(a, io, context.device, bytes, effective, sampling, &video_budget, cache);
                     break;
                 },
                 else => {},
@@ -296,7 +301,7 @@ fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.z
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encode(cb);
-                } else if (if (@TypeOf(payload) == SampledVideo) payload.reader else null) |reader| try @import("embedding_gemma2_video.zig").encodeReaderWithSelection(a, cb, reader, effective, sampling, video_budget, if (@TypeOf(payload) == SampledVideo) payload.selection else null) else try @import("embedding_gemma2_video.zig").encodeCached(a, cb, bytes, effective, sampling, video_budget, cache);
+                } else if (if (@TypeOf(payload) == SampledVideo) payload.reader else null) |reader| try @import("embedding_gemma2_video.zig").encodeReaderCachedWithSelection(a, cb, reader, effective, sampling, video_budget, if (@TypeOf(payload) == SampledVideo) payload.selection else null, cache) else try @import("embedding_gemma2_video.zig").encodeCached(a, cb, bytes, effective, sampling, video_budget, cache);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {

@@ -107,6 +107,8 @@ pub const Config = struct {
 /// Completed presentation picture metadata; no decoded pixel ownership escapes.
 pub const Picture = struct {
     first_packet: usize,
+    /// Packet that completed every reconstructed member; absent on caller-built metadata.
+    last_packet: ?usize = null,
     pts: i64,
     duration: u32,
     width: u32,
@@ -1551,7 +1553,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
             if (options.picture_observer) |observer| {
                 const pts = workspace.pts.?;
                 const duration = std.math.cast(u32, std.math.sub(i64, workspace.end, pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
-                try observer.accept(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = pts, .duration = duration, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null });
+                try observer.accept(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .last_packet = partition_span.last + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = pts, .duration = duration, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null });
             }
             if (selected) {
                 output_packet.pts = workspace.pts.?;
