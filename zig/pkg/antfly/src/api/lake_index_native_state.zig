@@ -187,6 +187,7 @@ pub const Tracker = struct {
         var store = self.store.*;
         store.allocator = self.out;
         const ref = try store.putWithCancellation(self.pending.items, self.cancellation);
+        defer if (ref.provider_version) |version| store.allocator.free(version);
         try self.refs[self.active.?].append(self.a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
         self.pending.clearRetainingCapacity();
     }

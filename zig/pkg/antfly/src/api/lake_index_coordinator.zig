@@ -122,6 +122,8 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
     if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
     const directory = ready.directory orelse return false;
+    var cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, &store.implementation, ready, cancellation);
+    defer if (cloud_binding) |*held| held.deinit();
     var handle = store.artifactStore();
     handle.allocator = a;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -531,13 +533,13 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer a.free(healthy_catalog);
     try @import("lake_index_directory.zig").hydrateLazy(refreshed.arena.allocator(), artifacts, &refreshed.value.published.?, .none, null);
     const healthy_ref = refreshed.value.published.?.declarations[0].artifact;
-    const healthy_root = try @import("lake_index_native_text.zig").loadRoot(refreshed.arena.allocator(), artifacts, healthy_ref, .none, null);
+    const healthy_root = try @import("lake_index_native_text.zig").loadServing(refreshed.arena.allocator(), artifacts, healthy_ref, .none, null);
     const healthy_segment = try @import("lake_index_seekable_text.zig").loadDirectory(refreshed.arena.allocator(), .{ .store = artifacts, .cache = null, .context = .{}, .cancellation = .none }, healthy_root.file_groups[0].segments[0]);
     for ([_]@import("lake_index_aggregate_artifact.zig").ChunkRef{
         .{ .artifact_id = healthy_ref.artifact_id, .checksum = healthy_ref.checksum, .byte_len = healthy_ref.byte_len },
         healthy_segment.blocks[0].retainedArtifact(),
         healthy_root.file_groups[0].descriptors[0],
-        healthy_root.file_groups[0].physical_manifest.?,
+        healthy_root.file_groups[0].sources[0].physical,
     }) |target| {
         const saved_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, target, .none, null);
         defer a.free(saved_bytes);

@@ -213,6 +213,7 @@ pub const Identities = struct {
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
     offsets: []const u32,
+    segment_ids: []const [32]u8 = &.{},
     tie_rank: ?local.search_scorer.TieRank = null,
     pub fn init(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot) !Identities {
         if (root.version != corpus.metadata_version or (root.file_groups.len == 0 and snapshot.segments.len != 0)) return error.InvalidNativeLakeTextCorpus;

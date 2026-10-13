@@ -139,7 +139,7 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
 pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo) ![]u8 {
     return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, true) catch |err| {
         switch (err) {
-            error.LakeIndexArtifactUnavailable, error.ArtifactIntegrityMismatch => {},
+            error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => {},
             else => return err,
         }
         try context.ensureActive();
@@ -188,7 +188,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     const cloud_api = @import("lake_cloud_publication.zig");
     const maps = @import("../serverless/artifacts/cloud_generations.zig");
     const cloud_object = artifact_store.providerStore();
-    const cloud_seed = if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
+    const cloud_seed = if (!reuse) @as(?catalog.Publication, null) else if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
     var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation) else null;
     defer if (cloud_binding) |*held| held.deinit();
     // Fresh/checkpoint artifacts may not belong to the previous closure. A

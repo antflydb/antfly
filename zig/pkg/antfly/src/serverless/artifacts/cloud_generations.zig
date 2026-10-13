@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Publication-owned persistent radix map. Every routing edge pins its provider
 //! generation, including edges between map pages. Updates rewrite only touched
@@ -131,25 +143,30 @@ pub const Reader = struct {
         try ref.validate();
         try token.check();
         if (ref.byte_len > max_page_bytes) return error.InvalidCloudGenerationMap;
-        lock(&self.mu);
-        defer self.mu.unlock();
-        self.clock +|= 1;
-        for (&self.cache) |*entry| if (entry.*) |*cached| {
-            if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) {
-                if (cached.ref.byte_len != ref.byte_len or !std.mem.eql(u8, cached.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
-                cached.used = self.clock;
-                const node = try std.json.parseFromSliceLeaky(Node, a, cached.bytes, .{ .allocate = .alloc_always });
-                try node.validate(depth);
-                try self.validateDomain(node, ref);
-                return node;
-            }
-        };
-        try api.chargeReadBudget(&self.remaining_bytes, ref.byte_len);
+        {
+            lock(&self.mu);
+            defer self.mu.unlock();
+            self.clock +|= 1;
+            for (&self.cache) |*entry| if (entry.*) |*cached| {
+                if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) {
+                    if (cached.ref.byte_len != ref.byte_len or !std.mem.eql(u8, cached.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
+                    cached.used = self.clock;
+                    const node = try std.json.parseFromSliceLeaky(Node, a, cached.bytes, .{ .allocate = .alloc_always });
+                    try node.validate(depth);
+                    try self.validateDomain(node, ref);
+                    return node;
+                }
+            };
+            try api.chargeReadBudget(&self.remaining_bytes, ref.byte_len);
+        }
         const path = try key(a, self.prefix, ref.artifact_id);
         defer a.free(path);
         var client = self.client;
         client.allocator = a;
-        var result = try client.getObject(self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = remote(token) });
+        var result = client.getObject(self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = remote(token) }) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound => return error.CloudGenerationMapUnavailable,
+            else => return err,
+        };
         defer result.deinit(a);
         if (result.body.len != ref.byte_len) return error.ArtifactIntegrityMismatch;
         try api.validatePayloadSha256WithCancellation(result.body, ref.checksum, token);
@@ -157,6 +174,14 @@ pub const Reader = struct {
         try node.validate(depth);
         try self.validateDomain(node, ref);
         if (result.body.len > self.cache_limit) return node;
+        // Distinct cold leaves can use the shared I/O scheduler concurrently.
+        // Cache bookkeeping stays serialized; no network request holds its lock.
+        lock(&self.mu);
+        defer self.mu.unlock();
+        self.clock +|= 1;
+        for (self.cache) |entry| if (entry) |cached| {
+            if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) return node;
+        };
         const ca = self.cache_allocator;
         const owned = try ca.dupe(u8, result.body);
         errdefer ca.free(owned);
@@ -191,8 +216,11 @@ pub const Reader = struct {
         for (self.alternatives) |reader| if (try reader.lookup(a, id, token)) |record| return record;
         var ref = self.root orelse return null;
         const digest = hash(id);
-        var arena = std.heap.ArenaAllocator.init(a);
+        var memory: local.sql_memory_budget = .{ .backing = self.cache_allocator, .limit = 8 * 1024 * 1024 };
+        var arena = std.heap.ArenaAllocator.init(memory.allocator());
         defer arena.deinit();
+        var owned_ref: ?Ref = null;
+        defer if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
         var depth: u8 = 0;
         while (true) : (depth += 1) {
             const node = try self.read(arena.allocator(), ref, depth, token);
@@ -202,12 +230,17 @@ pub const Reader = struct {
                 return null;
             }
             const wanted = slot(digest, depth);
-            ref = for (node.children) |child| {
+            const next = for (node.children) |child| {
                 if (child.slot == wanted) break child.ref;
             } else {
                 if (self.complete) return error.CloudGenerationMissing;
                 return null;
             };
+            const retained = try cloneRef(std.heap.page_allocator, next);
+            if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
+            owned_ref = retained;
+            ref = retained;
+            _ = arena.reset(.free_all);
         }
     }
     /// Map pages are reachability roots themselves; records describe versions
@@ -265,6 +298,18 @@ pub const Writer = struct {
         }
         var record: Record = .{ .id = id, .bytes = bytes, .generation = version };
         try record.validate();
+        const payload_scope = (try api.uploadScopeFromArtifactId(id)) orelse return error.InvalidCloudGenerationMap;
+        if (!std.mem.eql(u8, &payload_scope.domain, &self.scope.domain)) return error.InvalidCloudGenerationMap;
+        for (self.pending.items) |prior| if (std.mem.eql(u8, prior.id, id) and std.mem.eql(u8, prior.generation, version)) {
+            if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
+            return;
+        };
+        if (try self.reader.lookup(self.a, id, token)) |previous| {
+            var prior = previous;
+            defer prior.deinit(self.a);
+            if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
+            if (std.mem.eql(u8, prior.generation, version)) return;
+        }
         if (self.qualified_retention) {
             const path = try key(self.a, self.reader.prefix, id);
             defer self.a.free(path);

@@ -39,6 +39,7 @@ const Checkpoint = struct {
     marked: u64 = 0,
     sweep_after: ?[]const u8 = null,
     enumeration: ?[]const u8 = null,
+    deferred_retention: bool = false,
 };
 pub const Job = union(enum) {
     publication: local.metadata_lake_index_catalog.Publication,
@@ -190,10 +191,59 @@ pub const Progress = struct {
         self.value.work = try tree.apply(self.work_a, self.page_cache.store(), self.value.work, self.queued.items);
         const bytes = try std.json.Stringify.valueAlloc(self.a, self.value, .{});
         const upload = try self.pages.artifacts.putScoped(.{ .domain = self.pages.domain, .attempt = self.pages.attempt }, bytes, self.collector.cancellation());
+        defer if (upload.provider_version) |version| self.pages.artifacts.allocator.free(version);
         return .{ .kind = .external_base_source, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
     }
 };
+/// Once a store has no serving, reader or builder roots, cleanup needs no
+/// immutable mark checkpoint. Otherwise retention on GC's own checkpoints can
+/// create a permanent chain of protected bookkeeping objects after table drop.
+fn sweepEmptyStore(collector: *gc.Collector, state: lifecycle.State) !?gc.Result {
+    const object = collector.store.providerStore() orelse return null;
+    if (object.fs_client != null or object.client.vtable.list_object_versions == null) return null;
+    if (state.collection.?.progress != null) return null;
+    if (state.pending) |pending| if (std.mem.eql(u8, &pending.signature.store, &collector.identity)) return null;
+    const roots = try state.gcPublications(collector.a);
+    defer collector.a.free(roots);
+    for (roots) |root| {
+        if (!std.mem.eql(u8, &root.signature.store, &collector.identity) or !std.meta.eql(root.namespace, collector.namespace)) continue;
+        const retired = for (state.collection.?.retired) |generation| {
+            if (generation == root.generation) break true;
+        } else false;
+        if (!retired) return null;
+    }
+    const Visitor = struct {
+        collector: *gc.Collector,
+        deferred: bool = false,
+        fn visit(raw: *anyopaque, scope: stores.UploadScope, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const c = self.collector;
+            try c.check();
+            if (scope.fencingToken() < c.upload_floor or scope.fencingToken() >= c.upload_cutoff) return;
+            c.result.eligible += 1;
+            c.store.deleteWithCancellation(id, c.cancellation()) catch |err| switch (err) {
+                error.ArtifactRetentionActive, error.ArtifactVersionDeletionPaused => {
+                    self.deferred = true;
+                    return;
+                },
+                error.FileNotFound => {},
+                else => return err,
+            };
+            c.result.deleted += 1;
+        }
+    };
+    var visitor: Visitor = .{ .collector = collector };
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(collector.table, collector.identity, collector.namespace);
+    collector.store.visitScopedUploads(domain, .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_floor = collector.upload_floor, .fencing_cutoff = collector.upload_cutoff, .max_entries = @max(1, @min(128, collector.options.max_deleted)) }, collector.cancellation()) catch |err| switch (err) {
+        error.ArtifactEnumerationPaused => visitor.deferred = true,
+        else => return err,
+    };
+    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = visitor.deferred } });
+    collector.result.complete = true;
+    return collector.result;
+}
 pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
+    if (try sweepEmptyStore(collector, state)) |result| return result;
     // Background callers commonly use an arena. Own the backing here so
     // releasing page/job scratch actually frees memory during a bounded pass.
     var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 128 * 1024 * 1024 };
@@ -302,7 +352,10 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         if (live) continue;
         collector.result.eligible += 1;
         collector.store.deleteWithCancellation(id, collector.cancellation()) catch |err| switch (err) {
-            error.ArtifactRetentionActive => continue,
+            error.ArtifactRetentionActive => {
+                progress.value.deferred_retention = true;
+                continue;
+            },
             else => return err,
         };
         collector.result.deleted += 1;
@@ -320,7 +373,8 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.authority.apply(collector.table, .{ .checkpoint_collection = .{ .token = collector.token, .previous = progress.previous, .progress = next, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
         return collector.result;
     }
-    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
+    const cloud_checkpoints = if (collector.store.providerStore()) |object| object.fs_client == null and object.client.vtable.list_object_versions != null else false;
+    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints } });
     // Legacy nonce staging predates journal-discoverable pending-v2 files.
     // Its advisory migration cleanup must never gate collection completion.
     collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation()) catch |err| {
@@ -347,4 +401,52 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     };
     collector.result.complete = true;
     return collector.result;
+}
+
+test "external lake global frontier cloud retirement keeps locked stores and drains without protected checkpoint chains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native");
+    defer object.deinit();
+    var store = object.artifactStore();
+    const identity: [32]u8 = @splat(5);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(7, identity, namespace);
+    const scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var orphan = try store.putScoped(scope, "retired protected payload", .none);
+    defer orphan.deinit(a);
+    const Harness = struct {
+        a: A,
+        state: lifecycle.State,
+        fn read(raw: *anyopaque, alloc: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return lifecycle.encode(alloc, @as(*@This(), @ptrCast(@alignCast(raw))).state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, mutation: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.state.revision != revision) return error.CatalogGenerationChanged;
+            self.state = try mutation.apply(self.a, self.state);
+        }
+    };
+    var harness: Harness = .{ .a = ca, .state = .{ .generation = 2, .reader_upload_floor = 1, .namespace = namespace, .dropped = true, .stores = &.{.{ .identity = identity, .locator = .{ .protocol = .gcs, .connection = "cloud", .bucket = "bucket", .prefix = "native", .root = "https://storage.googleapis.com" } }} } };
+    var collector: gc.Collector = .{ .a = a, .table = 7, .authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate }, .store = store, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .options = .{ .dry_run = false } };
+    const serial = provider.serial;
+    const protected = try collector.run();
+    try std.testing.expect(protected.complete);
+    try std.testing.expectEqual(@as(usize, 0), protected.deleted);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.stores.len);
+    try std.testing.expectEqual(serial, provider.serial);
+    provider.now_ms = provider.until_ms;
+    collector.token = @splat(2);
+    const drained = try collector.run();
+    try std.testing.expect(drained.complete);
+    try std.testing.expectEqual(@as(usize, 1), drained.deleted);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.stores.len);
+    try std.testing.expectEqual(serial, provider.serial);
 }

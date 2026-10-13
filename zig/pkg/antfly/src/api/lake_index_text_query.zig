@@ -223,6 +223,14 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     owner.hydration_fields = try owner.planHydration(retrievalRequest(effective));
     owner.typed_delivery = canDeliverTypedSource(retrievalRequest(effective));
     var execution_req = effective;
+    if (owner.typed_delivery and local.storage_db_query_control_contract.requestHasPostprocessPageTransforms(effective)) {
+        // Candidate admission is independent of whether packing fits one native
+        // window. The coordinator owns transforms and final output pagination.
+        const paging = local.storage_db_query_control_contract.componentPaging(effective);
+        execution_req = retrievalRequest(effective);
+        execution_req.offset = paging.offset;
+        execution_req.limit = paging.limit;
+    }
     if (effective.hasHitEvaluation()) {
         execution_req.offset = 0;
         execution_req.limit = effective.evaluation_limit;
@@ -599,16 +607,16 @@ const Execution = struct {
     }
     fn textDeclaration(self: *Execution, name: ?[]const u8) !?local.serverless_segment_sidecar_manifest.DeclaredArtifact {
         var count: usize = 0;
-        for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version) {
+        for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version)) {
             count += 1;
         };
         return for (self.declarations) |declaration| {
-            if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
+            if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else {
             // A known text index awaiting a format refresh is rebuilding,
             // rather than an invalid user-supplied index name.
             for (self.declarations) |declaration| {
-                if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != corpus.metadata_version and (name == null or std.mem.eql(u8, name.?, declaration.name))) return error.ExternalLakeIndexUnavailable;
+                if (declaration.artifact.kind == .text_segment and !corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and (name == null or std.mem.eql(u8, name.?, declaration.name))) return error.ExternalLakeIndexUnavailable;
             }
             return if (name == null) null else error.IndexNotFound;
         };
@@ -1221,11 +1229,11 @@ const Execution = struct {
         }
         if (self.overlay != null and req.distributed_text_stats.len != 0) return null;
         var indexes: usize = 0;
-        for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version) {
+        for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version)) {
             indexes += 1;
         };
         const selected = for (self.declarations) |declaration| {
-            if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version and
+            if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and
                 (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
@@ -2747,7 +2755,10 @@ const StoredHighlightLocation = struct { segment: [32]u8, document: u32 };
 fn storedHighlightLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredHighlightLocation {
     if (pin.snapshot.segments.len != ids.len) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
-    for (pin.snapshot.segments, ids) |segment, id| {
+    const admitted = if (pin.provider_metadata) |raw| @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(raw))).segment_ids else &.{};
+    if (admitted.len != 0 and admitted.len != ids.len) return error.InvalidNativeLakeTextCorpus;
+    for (pin.snapshot.segments, ids, 0..) |segment, supplied, ordinal| {
+        const id = if (admitted.len != 0) admitted[ordinal] else supplied;
         const upper = try std.math.add(u32, lower, segment.reader.doc_count);
         if (document >= lower and document < upper) return .{ .segment = id, .document = document - lower };
         lower = upper;

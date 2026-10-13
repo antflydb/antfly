@@ -918,11 +918,17 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 )
         if layout == "files":
             pages = {}
+            objects = {}
+            documents = {}
             roots = []
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
+                if payload.startswith(b"AFOBJ001"):
+                    payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
+                digest = hashlib.sha256(payload).hexdigest()
+                objects[digest] = path
                 begin = payload.find(b"AFGPT003")
                 if begin >= 0:
                     page = payload[begin:]
@@ -933,10 +939,14 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                         document = json.loads(payload[begin:])
                     except (ValueError, UnicodeDecodeError):
                         continue
+                    documents[digest] = document
                     if document.get("inventory_version") == 3:
                         roots.append(document)
             assert roots
-            root_document = roots[-1]
+            root_document = max(roots, key=lambda item: item.get("file_count", 0))
+            serving = root_document.get("serving") or root_document.get("compacted")
+            if serving:
+                root_document = documents[serving["checksum"]]
             assert all(
                 root_document.get(key) is None
                 for key in ("serving_inventory", "serving_routes", "segment_files")
@@ -963,23 +973,30 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 else:
                     yield path, records
 
-            # A rare query must never read an unrelated routing leaf. Restart
-            # clears in-memory admission and decoded page caches first.
+            # A rare query must never admit unrelated native descriptors.
+            # Packed routing can fit one shared leaf; descriptor payloads still
+            # provide independently removable evidence of selective admission.
+            # Restart clears in-memory admission and decoded page caches first.
             required = {
                 key[-32:]
                 for _, records in leaves(root_document["term_directory"]["leaves"])
                 for key, _ in records
                 if b"quasar" in key
             }
-            assert len(required) == 3
-            unrelated = [
-                path
-                for path, records in leaves(root_document["directories"]["segments"])
-                if all(key[:32] not in required for key, _ in records)
-            ]
-            assert unrelated, (
-                "Fixture must have a leaf outside the necessary segment set"
-            )
+            assert 1 <= len(required) <= 3
+            segments = {}
+            for _, records in leaves(root_document["directories"]["segments"]):
+                for key, value in records:
+                    segments.setdefault(key[:32], []).append(
+                        (struct.unpack_from(">I", key, 32)[0], value)
+                    )
+            unrelated = []
+            for identity, chunks in segments.items():
+                if identity in required:
+                    continue
+                record = json.loads(b"".join(value for _, value in sorted(chunks)))
+                unrelated.append(objects[record["route"]["descriptor"]["checksum"]])
+            assert unrelated, "Fixture must have an unrelated serving descriptor"
             server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
@@ -1252,10 +1269,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         }
         first = call("POST", "/tables/wal_windows/query", query)
         hits = first["hits"]["hits"]
-        assert (
-            first["profile"]["sort"]["selection_reason"]
-            == "bounded_global_text_frontier"
-        ), first
+        assert first["profile"]["sort"]["plan"] == "score_top_k", first
         assert len(hits) == 201, first
         rows = {h["_source"]["id"]: h["_source"]["body"] for h in hits}
         assert 1 not in rows and rows[0] == "quasar replacement"

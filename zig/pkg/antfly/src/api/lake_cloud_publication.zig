@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Generation maps and certificates are catalog authority, never mutable
 //! advisory sidecars. Bind once per query owner; nested maintenance views restore
@@ -105,7 +117,9 @@ pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog
     try roots.append(a, digestRoot(publication.inventory.artifact_id));
     if (publication.directory) |directory| try roots.append(a, digestRoot(directory.artifact_id));
     for (declarations) |declaration| try roots.append(a, digestRoot(declaration.artifact.artifact_id));
-    if (roots.items.len > 4096) return;
+    // Keep optional inline proof evidence comfortably inside the catalog and
+    // lifecycle envelopes. Larger root sets retain complete maps and auditing.
+    if (roots.items.len > 1024) return;
     std.mem.sort([32]u8, roots.items, {}, struct {
         fn less(_: void, l: [32]u8, r: [32]u8) bool {
             return std.mem.order(u8, &l, &r) == .lt;
@@ -300,4 +314,108 @@ test "external lake global frontier cloud GC retains pinned generations and does
     const live = try artifacts.getVerifiedAllocWithCancellation(second.artifact_id, second.byte_len, second.checksum, .none);
     defer a.free(live);
     try std.testing.expectEqualStrings("second inventory", live);
+}
+
+test "external lake global frontier wrapped publication builds real Parquet packs durable checkpoints and cloud certificates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("cloud-publication-adapter");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var source_client = fs.client();
+    try source_client.makeBucket("antfly");
+    const parquet = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "first quasar", "second quasar" } }});
+    defer a.free(parquet);
+    var put = try source_client.putObject("antfly", "part.parquet", parquet, .{});
+    put.deinit(a);
+    const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
+    defer a.free(schema);
+    var base = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer base.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = base }, .{});
+    defer source.deinit();
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try Object.initWithClient(a, client, "bucket", "native");
+    defer object.deinit();
+    object.cloud_retention_qualified = true;
+    var reads = @import("lake_index_artifact_recovery.zig").Reads.init(object.artifactStore());
+    var store = reads.store();
+    try std.testing.expectEqual(&object, store.providerStore().?);
+    const publication_api = @import("lake_index_publication.zig");
+    const identity: [32]u8 = @splat(4);
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true}}" };
+    const pending = try publication_api.begin(a, std.testing.io, table, &source, identity, .{}, 100, 1000);
+    defer a.free(pending);
+    table.lake_index_catalog_json = pending;
+    const Harness = struct {
+        table: local.common_topology_records.TableRecord,
+        checkpoints: usize = 0,
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+        fn snapshot(raw: *anyopaque, alloc: A) !local.common_topology_records.TableRecord {
+            var result = @as(*@This(), @ptrCast(@alignCast(raw))).table;
+            result.lake_index_catalog_json = try alloc.dupe(u8, result.lake_index_catalog_json);
+            return result;
+        }
+        fn save(raw: *anyopaque, saved: catalog.Publication) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try saved.validate();
+            const cloud = saved.cloud_generations orelse return error.MissingCheckpointGenerationMap;
+            try std.testing.expect(!cloud.complete and cloud.certificate == null);
+            self.checkpoints += 1;
+        }
+    };
+    var harness: Harness = .{ .table = table };
+    const encoded = try publication_api.buildWithLease(a, &store, table, &source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now }, .{ .ptr = &harness, .snapshot = Harness.snapshot, .save_checkpoint = Harness.save });
+    defer a.free(encoded);
+    var published = try catalog.parse(a, encoded);
+    defer published.deinit();
+    const selected = published.value.published.?;
+    try std.testing.expect(harness.checkpoints != 0);
+    try std.testing.expect(selected.cloud_generations.?.complete);
+    try std.testing.expect(selected.cloud_generations.?.certificate != null);
+    var reopened = try Object.initWithClient(a, client, "bucket", "native");
+    defer reopened.deinit();
+    reopened.cloud_retention_qualified = true;
+    var binding = (try Binding.init(a, &reopened, selected, .none)).?;
+    defer binding.deinit();
+    var artifacts = reopened.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var owned = selected;
+    try @import("lake_index_directory.zig").hydrate(ca, artifacts, &owned, .none, null);
+    const corpus = @import("lake_index_native_text.zig");
+    const declaration = for (owned.declarations) |entry| {
+        if (entry.artifact.kind == .text_segment) break entry;
+    } else return error.MissingTextPublication;
+    const root = try corpus.loadServing(ca, artifacts, declaration.artifact, .none, null);
+    try std.testing.expectEqual(@as(u32, 1), root.segment_count);
+    try std.testing.expect(root.file_groups[0].sources.len != 0);
+    var writer = try corpus.loadWriter(a, artifacts, root, .none, null, null);
+    defer writer.deinit();
+    const hits = try writer.snapshot().search(a, "body", &.{"quasar"}, 10);
+    defer a.free(hits.hits);
+    try std.testing.expectEqual(@as(u32, 2), hits.total_count);
+    try std.testing.expect(try artifacts.retainedClosure(declaration.artifact.artifact_id, .none));
+    // Derived map loss after protection expires must rebuild from Parquet,
+    // without re-installing the unavailable map in the fresh recovery attempt.
+    provider.now_ms = provider.until_ms;
+    var raw_artifacts = object.artifactStore();
+    try raw_artifacts.delete(selected.cloud_generations.?.root.artifact_id);
+    table.lake_index_catalog_json = encoded;
+    const rebuilding = try publication_api.begin(a, std.testing.io, table, &source, identity, .{}, 101, 1000);
+    defer a.free(rebuilding);
+    table.lake_index_catalog_json = rebuilding;
+    const recovered = try publication_api.build(a, &store, table, &source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now });
+    defer a.free(recovered);
+    var restored = try catalog.parse(a, recovered);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u64, 2), restored.value.published.?.generation);
+    try std.testing.expect(restored.value.published.?.cloud_generations.?.complete);
 }

@@ -261,6 +261,9 @@ pub const State = struct {
         return next;
     }
     pub fn finishCollection(self: State, a: A, token: catalog.Token, now: u64) !State {
+        return self.finishCollectionRetainingStore(a, token, now, false);
+    }
+    pub fn finishCollectionRetainingStore(self: State, a: A, token: catalog.Token, now: u64, retain_store: bool) !State {
         const collection = self.collection orelse return error.LakeIndexCollectionFenceChanged;
         if (now == 0 or now >= collection.expires_ms or !std.mem.eql(u8, &collection.token, &token)) return error.LakeIndexCollectionFenceChanged;
         var retained: std.ArrayList(catalog.Publication) = .empty;
@@ -280,7 +283,7 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (!std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
+            if (retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
@@ -293,7 +296,7 @@ pub const Mutation = union(enum) {
     release: catalog.Token,
     begin_collection: struct { token: catalog.Token, store: catalog.Digest, now_ms: u64 },
     checkpoint_collection: struct { token: catalog.Token, previous: ?[]const u8 = null, progress: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, now_ms: u64 },
-    finish_collection: struct { token: catalog.Token, now_ms: u64 },
+    finish_collection: struct { token: catalog.Token, now_ms: u64, retain_store: bool = false },
     /// Receipt observation may see a later reader mutation. Unique tokens and
     /// monotonic deadlines prove this command's effect without replaying it.
     pub fn observed(self: Mutation, state: State) bool {
@@ -320,7 +323,7 @@ pub const Mutation = union(enum) {
             .release => |token| state.release(a, token),
             .begin_collection => |m| state.beginCollection(a, m.token, m.store, m.now_ms),
             .checkpoint_collection => |m| state.checkpointCollection(a, m.token, m.previous, m.progress, m.now_ms),
-            .finish_collection => |m| state.finishCollection(a, m.token, m.now_ms),
+            .finish_collection => |m| state.finishCollectionRetainingStore(a, m.token, m.now_ms, m.retain_store),
         };
     }
     /// Admission runs before any command is appended. A publication race is
@@ -443,7 +446,11 @@ test "external lake collection retains failed upload stores through DROP and rot
     state = try state.beginCollection(a, @splat(7), @splat(4), 3);
     try std.testing.expectEqual(@as(u64, 1), state.collection.?.upload_floor);
     try std.testing.expectEqual(@as(u64, 3), state.collection.?.upload_cutoff);
-    state = try state.finishCollection(a, @splat(7), 4);
+    state = try state.finishCollectionRetainingStore(a, @splat(7), 4, true);
+    try std.testing.expectEqual(@as(usize, 2), state.stores.len);
+    state = try parse(a, try encode(a, state));
+    state = try state.beginCollection(a, @splat(9), @splat(4), 4);
+    state = try state.finishCollection(a, @splat(9), 4);
     try std.testing.expectEqual(@as(usize, 1), state.stores.len);
     try std.testing.expectEqual(rotated_signature.store, state.stores[0].identity);
     state = try state.beginCollection(a, @splat(6), @splat(5), 5);

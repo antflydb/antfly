@@ -31,8 +31,8 @@ pub const statistics = @import("lake_index_text_statistics.zig");
 pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
-// Paged canonical inventories, term directories and pending DF runs require
-// a new wire identity. Catalog protocol 34 fences older workers before decode.
+// V11 authenticates independent serving packs and original-source spans.
+// Protocol 37 fences older workers before admitting the new publication.
 pub const metadata_version: u16 = 11;
 pub fn supportsBuildMetadata(version: u16) bool {
     return version == 9 or version == 10 or version == metadata_version;
@@ -361,7 +361,7 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
     if (group.members.len != 0) {
         if (group.sources.len != 0 or group.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
         group.sources = try source_spans.fromMembers(a, group.members, domain);
-        group.members = &.{};
+        group.physical_manifest = null;
     }
     try group.validate(domain);
     return group;
@@ -545,12 +545,19 @@ fn appendServingGroup(a: A, directory: Root, bytes: []const u8, groups: *std.Arr
     try segments.appendSlice(a, group.segments);
 }
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    return loadRootView(a, store, ref, cancellation, cache, false);
+}
+pub fn loadServing(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    return loadRootView(a, store, ref, cancellation, cache, true);
+}
+fn loadRootView(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead, serving: bool) !Root {
     // Legacy/maintenance callers own the returned plain descriptors in their
     // allocator. Bound parse allocations (including unreclaimed arena scratch)
     // without imposing an unrelated sum of encoded artifact lengths.
     var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024, .monotonic = true };
     const bounded = budget.allocator();
-    var root = try servingRoot(bounded, store, try loadRootDirectory(bounded, store, ref, cancellation, cache), cancellation, cache);
+    var root = try loadRootDirectory(bounded, store, ref, cancellation, cache);
+    if (serving) root = try servingRoot(bounded, store, root, cancellation, cache);
     root = try text_directory.withManifests(bounded, root, store, cache, cancellation);
     if (root.manifests.len != 0) {
         var groups: std.ArrayList(FileGroup) = .empty;
@@ -978,6 +985,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var upload = store.*;
         upload.allocator = ca;
         const uploaded = try upload.putWithCancellation(bytes, cancellation);
+        defer if (uploaded.provider_version) |version| upload.allocator.free(version);
         store.inheritClosure(uploaded.artifact_id, seed_artifact, cancellation) catch {
             try provider.context.ensureActive();
             try cancellation.check();
@@ -1236,6 +1244,7 @@ pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: Fi
     var upload = store.*;
     upload.allocator = out;
     const ref = try upload.putWithCancellation(bytes, cancellation);
+    defer if (ref.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, root: Root, cancellation: Cancellation) !Declared {

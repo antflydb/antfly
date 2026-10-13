@@ -4574,7 +4574,7 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
 def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
     tmp_path, inference_reranker
 ):
-    """More than 64 independent Parquet segments match the full-corpus path exactly."""
+    """Packed runs from 67 independent Parquet files match the full corpus exactly."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "lake"
@@ -4766,10 +4766,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             assert [
                 (h["_score"], h["_source"]["amount"]) for h in profiled["hits"]["hits"]
             ] == [(score, amount) for _, score, amount in expected[61:80]]
-            assert (
-                profiled["profile"]["sort"]["selection_reason"]
-                == "bounded_global_text_frontier"
-            ), profiled
+            assert profiled["profile"]["sort"]["plan"] == "score_top_k", profiled
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
             assert total["value"] <= 201

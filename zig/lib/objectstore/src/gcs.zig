@@ -2436,3 +2436,44 @@ test "gcs generation inventory returns exact generations and opaque continuation
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     try std.testing.expectError(error.InvalidListVersionsResponse, parseVersionList(std.testing.allocator, "{\"items\":[{\"name\":\"key\",\"generation\":\"0\"}]}"));
 }
+
+test "gcs version listing qualifies opaque pagination bounded responses and transport cancellation" {
+    const a = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, cancellation: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), limit);
+            try std.testing.expect(cancellation != null);
+            try std.testing.expect(!cancellation.?.isCancelled());
+            try std.testing.expect(std.mem.indexOf(u8, url, "prefix=native%2F") != null);
+            try std.testing.expect(std.mem.indexOf(u8, url, "maxResults=2") != null);
+            try std.testing.expect(std.mem.endsWith(u8, url, "&versions=true"));
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.indexOf(u8, url, "pageToken=") == null);
+                return .{ .status = 200, .body = try alloc.dupe(u8, "{\"items\":[{\"name\":\"native/key\",\"generation\":\"1\"},{\"name\":\"native/key\",\"generation\":\"2\"}],\"nextPageToken\":\"token+2\"}") };
+            }
+            try std.testing.expect(std.mem.indexOf(u8, url, "pageToken=token%2B2") != null);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"items\":[{\"name\":\"native/other\",\"generation\":\"3\"}]}") };
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, try jsonApiClientConfigAlloc(a), &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const token = types.CancellationToken.fromAtomic(&canceled);
+    var first = try client.listObjectVersions("bucket", .{ .prefix = "native/", .max_keys = 2, .cancellation = token });
+    defer first.deinit(a);
+    try std.testing.expectEqualStrings("1", first.entries[0].version_id);
+    try std.testing.expectEqualStrings("2", first.entries[1].version_id);
+    var second = try client.listObjectVersions("bucket", .{ .prefix = "native/", .max_keys = 2, .continuation_token = first.next_continuation_token, .cancellation = token });
+    defer second.deinit(a);
+    try std.testing.expect(!second.is_truncated);
+    try std.testing.expectEqualStrings("3", second.entries[0].version_id);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, client.listObjectVersions("bucket", .{ .cancellation = token }));
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}

@@ -252,7 +252,9 @@ pub const ObjectStore = struct {
     }
 
     fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
-        const a = self.alloc;
+        // Range reads may borrow an arena-owned store. Reclaim selectors after
+        // every request rather than retaining one parse per posting block.
+        const a = std.heap.page_allocator;
         var record = if (self.cloud_writer) |writer| try writer.lookup(a, id, token) else null;
         if (record == null) if (self.cloud_reader) |reader| {
             record = try reader.lookup(a, id, token);
@@ -350,7 +352,7 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| self.alloc.free(value);
+        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -371,7 +373,7 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| self.alloc.free(value);
+        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var client = self.client;
@@ -408,7 +410,7 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| self.alloc.free(value);
+        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -449,7 +451,7 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| self.alloc.free(value);
+        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
@@ -493,7 +495,7 @@ pub const ObjectStore = struct {
     ) !artifact_store.ArtifactMetadata {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| self.alloc.free(value);
+        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
@@ -535,7 +537,7 @@ pub const ObjectStore = struct {
         remaining: ?*u64,
     ) !void {
         const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |selected| self.alloc.free(selected);
+        defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);

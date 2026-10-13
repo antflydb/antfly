@@ -20,6 +20,7 @@ test {
     _ = @import("api/lake_generation_envelope.zig");
     _ = @import("api/lake_index_serving_compaction.zig");
     _ = @import("api/lake_cloud_publication.zig");
+    _ = @import("api/lake_index_gc_progress.zig");
     _ = @import("api/http_server.zig");
     _ = @import("api/lake_text_window_ahead.zig");
     _ = @import("api/lake_search_overlay.zig");

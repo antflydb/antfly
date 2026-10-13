@@ -202,6 +202,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     var upload = self.store.*;
                     upload.allocator = scratch_alloc;
                     const ref = try upload.putScoped(self.scope, payload, self.cancellation);
+                    defer if (ref.provider_version) |version| upload.allocator.free(version);
                     var encoded: [52]u8 = undefined;
                     @memcpy(encoded[0..32], &try stores.sha256DigestFromChecksum(ref.checksum));
                     @memcpy(encoded[32..48], &self.scope.attempt);

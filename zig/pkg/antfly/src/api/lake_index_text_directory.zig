@@ -83,6 +83,7 @@ fn put(a: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) 
     var upload = store.*;
     upload.allocator = a;
     const ref = try upload.putWithCancellation(bytes, token);
+    defer if (ref.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 /// Descriptor payloads contain one segment's admission, and physical metadata

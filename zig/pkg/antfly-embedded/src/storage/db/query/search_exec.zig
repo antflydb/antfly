@@ -12434,7 +12434,7 @@ pub fn searchTextQuery(
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
         } else if ((late_visibility_paginate or group_chunk_parents or executor.filter_candidate_presence) and !effective_req.count_only) {
-            try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
+            try paginateSearchResultInPlace(&out, paging.offset, paging.limit);
         }
         // This is population-exhaustion evidence, independently of corpus
         // totals (which include matches before a cursor). Preserve it through

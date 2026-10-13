@@ -7,9 +7,11 @@ navigation, adaptive native batches, shared query preparation, and bounded
 profiling/composed/pruner/reranker/evaluation admission are implemented
 in the active follow-up. Eligible accepted-WAL text queries also use bounded
 windows with combined global statistics and recent-first cutoff seeding.
-Cross-source-file compaction, durable cloud generation proofs, broader accepted
-vector/hybrid admission, and representative archive benchmarks remain pending;
-their requirements and current qualification are recorded at the end.
+Cross-source-file serving packs and durable publication-bound cloud generation
+maps/certificates are implemented, as are eligible accepted vector/hybrid shapes.
+Real-provider retention enforcement qualification and representative archive
+benchmarks remain deferred; the final implementation notes distinguish these
+from deterministic contract tests.
 
 ## Native sparse predicate intersection
 
@@ -3331,3 +3333,106 @@ including main `f3fd4d3525`:
 These checks qualify the implemented delivery and provider contracts. They do
 not qualify live-provider retention enforcement or complete either persisted
 format migration identified above.
+
+
+## Cross-file serving packs and durable cloud publications (protocol 37)
+
+This section supersedes the earlier pending migration notes. Native text root v11
+separates canonical per-source-file maintenance state from an independent packed
+serving root. Roots v9/v10, including main's v10 `compacted`/`members` layout,
+remain readable for recovery and retained requests. Builders advertise v11 and
+refresh older publications; older workers cannot admit protocol-37 publications.
+`loadRoot` retains its maintenance-reader contract, while query directory loading
+resolves the authenticated serving root.
+
+Each serving run authenticates compact source spans: original immutable file and
+physical-hole manifest, original file row count/rank, packed offset and count.
+Predicate translation and result/highlight hydration share these spans. Native
+score collectors accept a borrowed logical tie-rank function, so equal scores and
+cursor boundaries retain file-identity/original-rank order despite physical
+repacking, parallel scoring or accepted-WAL composition. Conservative equal-score
+block bounds cannot prune a better logical tie using a physical document number.
+
+Serving construction has eight-input fan-in, a 16 MiB input target, a 32 MiB
+output cap, a 64 MiB merge workspace and at most 64 source spans per run. Oversized
+optional merges split into smaller batches. A durable paged source-to-pack
+ownership index locates packs touched by replacement/removal; up to seven small
+open tails are explicit in the root. Unchanged closed historical packs are reused
+without opening their posting payloads. Small appends consolidate current tails;
+source removal drops only that source's native ranges from affected packs.
+Publication atomically binds serving runs, ownership and collection statistics.
+
+Canonical file manifests and per-file signed DF contributions remain maintenance
+units. GC retains their physical-hole metadata/statistics without retaining a
+second copy of original postings or obsolete admission/opening artifacts. Packed
+runs retain the physical manifests needed for their source spans. Retained reader
+publications mark their own older serving roots before sweeping. The deterministic
+regression packs 16 files into two runs, preserves both runs on append, checks
+replacement/removal and logical score/cursor ordering, deletes original posting
+payloads, and verifies restart and subsequent updates still work.
+
+Cloud publications persist an immutable hash-radix generation map. Every payload
+record pins its exact S3 version/GCS generation, and every map edge—including the
+publication root—pins the map page's own provider generation. Incremental updates
+rewrite changed radix paths. Maps use at most 128 records/leaf and 1 MiB/page;
+readers have an 8 MiB raw-page cache and reclaim bounded lookup scratch after each
+range request. Query owners never rebind a shared store to another publication.
+Native runtime caches charge map storage to their existing memory budgets.
+
+Generation maps travel with durable builder checkpoints, accepted recent vector
+jobs and retained text/vector/SQL cuts. Versioned opaque envelopes pin the envelope
+object itself, so restart does not depend on a process-local verification cache or
+mutable live names. Legacy envelopes retain their original wire identity and
+verification path. R2/unversioned backends that return no usable version safely
+retain ordinary content-verified reads and cannot issue generation certificates.
+
+A cloud retention certificate binds reader protocol, backend/credentials identity,
+namespace, publication generation/token, source/inventory/directory, generation-map
+root/completeness, certified root set and a conservative expiry. A complete
+migration audit establishes the live closure; fresh incremental uploads extend
+only a valid inherited proof. Proof expiry is bounded by both payload and map-page
+retention evidence. Fresh provider time with a 60-second margin is required before
+skipping a closure audit. Missing, unsupported or expired evidence keeps normal
+verification/auditing. The final metadata CAS resamples the lease clock after map
+construction/auditing, so a long audit cannot publish using stale lease time.
+
+`lake_indexes.cloud_generations.qualified_retention` defaults to `false`. Exact
+version reads and durable maps work independently of this switch; operators must
+qualify actual provider retention enforcement before enabling certificate-based
+audit bypass. S3 requires exact non-null versions with COMPLIANCE retention; GCS
+requires positive generations with Locked retention. Scripted wire and memory
+providers qualify selection, expiry/replay checks, pagination, cancellation,
+restart/live-name replacement and eventual version reclamation. These tests do
+not substitute for the live S3/GCS qualification explicitly deferred by the user;
+GCS/R2 availability alone does not qualify either backend's retention guarantees.
+
+Cloud GC enumerates historical versions, including names hidden by newer versions
+or delete markers, using S3 marker pairs or GCS opaque pagination. It deletes only
+exact versions of artifact IDs absent from every live closure. Map pages are
+reachability roots; their stale payload records do not retain orphan payloads.
+Provider retention defers deletion without forgetting the authorized store locator.
+Once no serving/reader/builder roots remain, bounded cleanup uses no new immutable
+mark checkpoints, allowing locked bookkeeping objects to drain after expiry instead
+of producing an endless chain. Provider requests and between-version work honor
+cancellation. Collection progress remains durable while live roots exist.
+
+Real Parquet/Iceberg E2Es continue to cover native filters, scoring, projections,
+hidden highlights, accepted text/dense/sparse/hybrid visibility, retained tokens,
+sorted pagination and cold restart. A compacted 67-file corpus can now fit a
+single native window; the fixture checks native execution rather than requiring
+fragmentation to force the global-frontier profile label. Archive-scale latency,
+RSS and provider request benchmarks remain separate work.
+
+The coordinator recovery adapter forwards provider-generation and retained-closure
+capabilities. Readiness probes and startup warming bind the publication map before
+loading its directory. A real-Parquet publication regression runs through that
+adapter, checks durable checkpoint maps, reopens the packed corpus with a fresh
+cloud owner, and rebuilds after a map disappears following retention expiry.
+Upload consumers release provider selectors when transferring only content refs.
+
+Compaction also exposed a small-corpus transform edge: final pagination could
+shrink a reranker's candidate window before the coordinator saw it. Typed delivery
+now selects the coordinator candidate window explicitly before dispatch, for both
+compact and multi-window corpora. Native late-visibility paging respects the same
+component window. The existing broad real-Parquet E2E requires all 31 requested
+rerank candidates and checks offsets, evaluation, pruning and hidden inputs.

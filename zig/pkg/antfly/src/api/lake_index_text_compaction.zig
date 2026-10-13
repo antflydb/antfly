@@ -13,8 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Immutable cross-file serving runs retain canonical per-file rebuild state.
-//! Changed members invalidate their small unit; unrelated units keep their bytes.
+//! Frozen v10 producer for historical-format compatibility qualification.
+//! Production publication uses lake_index_serving_compaction and v11 spans.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const corpus = @import("lake_index_native_text.zig");
@@ -29,7 +29,7 @@ const Ref = artifacts.ChunkRef;
 const fan_in = 8;
 const target_bytes = 16 * 1024 * 1024;
 
-pub fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root, prior: ?corpus.Root, token: Cancellation, context: local.serverless_query_lake_read_context.Context) !?Ref {
+fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root, prior: ?corpus.Root, token: Cancellation, context: local.serverless_query_lake_read_context.Context) !?Ref {
     try context.ensureActive();
     const io = context.io orelse return error.UnsupportedSqlExecution;
     if (canonical.file_count < 2) return null;
@@ -136,6 +136,7 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root,
     var upload = store.*;
     upload.allocator = out;
     const ref = try upload.putWithCancellation(bytes, token);
+    defer if (ref.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 fn reusable(group: corpus.FileGroup, files: []const directory.FileRecord) usize {

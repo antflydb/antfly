@@ -105,7 +105,7 @@ const Builder = struct {
         var group: corpus.FileGroup = undefined;
         if (reuse) {
             const input = inputs[0];
-            group = .{ .file = undefined, .sources = sources.items, .segments = &.{input.ref}, .admissions = &.{input.admission}, .summaries = &.{input.summary} };
+            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{input.ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{input.admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{input.summary}) };
         } else {
             const encoded = self.merge(a, inputs) catch |err| switch (err) {
                 error.OutOfMemory => {
@@ -130,7 +130,7 @@ const Builder = struct {
             defer reader.deinit();
             const admission = try reader.admission(out);
             if (admission.doc_count != count) return error.InvalidNativeLakeTextCorpus;
-            group = .{ .file = undefined, .sources = sources.items, .segments = &.{ref}, .admissions = &.{admission}, .summaries = &.{try corpus.statistics.publishSegmentWithIo(a, self.store, encoded, self.token, self.context.io)} };
+            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{try corpus.statistics.publishSegmentWithIo(a, self.store, encoded, self.token, self.context.io)}) };
         }
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
@@ -183,6 +183,7 @@ fn put(a: A, out: A, store: *stores.ArtifactStore, value: anytype, token: Cancel
     var writer = store.*;
     writer.allocator = out;
     const ref = try writer.putWithCancellation(bytes, token);
+    defer if (ref.provider_version) |version| writer.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root, previous: ?corpus.Root, plan: *const state.Plan, context: local.serverless_query_lake_read_context.Context, token: Cancellation) !Chunk {
@@ -294,7 +295,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
     defer fs.deinit();
     var store = fs.artifactStore();
-    store.upload_scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    store.upload_scope = try stores.UploadScope.forPublication(@import("lake_index_publication.zig").uploadDomain(7, @splat(5)), 1, std.testing.io);
     const Helper = struct {
         fn file(a_: A, store_: *stores.ArtifactStore, index: usize, digest: u8) !Chunk {
             const id = try std.fmt.allocPrint(a_, "source-{d}", .{index});
@@ -311,7 +312,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             return put(a_, a_, store_, group, .none);
         }
         fn root(a_: A, store_: *stores.ArtifactStore, refs: []const Chunk) !corpus.Root {
-            return .{ .domain = store_.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .seekable = true, .inventory_version = 3, .file_count = @intCast(refs.len), .segment_count = @intCast(refs.len), .collection = .{ .documents = @intCast(refs.len * 2), .fields = try a_.dupe(corpus.Collection.Field, &.{.{ .name = "body", .total_length = refs.len * 2 }}) }, .directories = try corpus.text_directory.publishManifests(a_, store_, refs, &.{}, .{}, store_.upload_scope.?.domain, .none, std.testing.io) };
+            return .{ .domain = store_.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .statistics_version = 2, .seekable = true, .inventory_version = 3, .file_count = @intCast(refs.len), .segment_count = @intCast(refs.len), .collection = .{ .documents = @intCast(refs.len * 2), .fields = try a_.dupe(corpus.Collection.Field, &.{.{ .name = "body", .total_length = refs.len * 2 }}) }, .directories = try corpus.text_directory.publishManifests(a_, store_, refs, &.{}, .{}, store_.upload_scope.?.domain, .none, std.testing.io) };
         }
         fn plan(a_: A, root_: corpus.Root, store_: stores.ArtifactStore, changed: ?[]const u8) !state.Plan {
             const files = try corpus.text_directory.fileRecords(a_, root_, store_, null, .none);
@@ -325,7 +326,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         }
         fn reopen(a_: A, store_: *stores.ArtifactStore, root_: corpus.Root) !corpus.Root {
             const ref = try put(a_, a_, store_, root_, .none);
-            return corpus.loadRoot(a_, store_.*, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
+            return corpus.loadServing(a_, store_.*, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
         }
         fn verify(a_: A, store_: stores.ArtifactStore, root_: corpus.Root, expected: usize) !void {
             var writer = try corpus.loadWriter(a_, store_, root_, .none, null, null);
@@ -365,6 +366,25 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     const first = try corpus.servingRoot(ca, store, current, .none, null);
     try std.testing.expectEqual(@as(u32, 2), first.segment_count);
     const first_packs = try corpus.text_directory.fileRecords(ca, first, store, null, .none);
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 32);
+    // A serving publication retains canonical maintenance metadata, without
+    // retaining a second full copy of every original posting payload.
+    const root_ref = try put(ca, ca, &store, current, .none);
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 7, .authority = undefined, .store = store, .identity = @splat(5), .context = .{ .io = std.testing.io }, .token = @splat(1), .audit_only = true, .remaining_reads = 64 * 1024 * 1024 };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key_| a.free(key_.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = root_ref.artifact_id, .checksum = root_ref.checksum, .byte_len = root_ref.byte_len });
+    for (refs[0..16]) |ref| {
+        const group = try corpus.loadFileManifest(ca, store, ref, current.domain, .none, null);
+        try std.testing.expect(collector.marked.contains(group.physical_manifest.?.artifact_id));
+        for (group.segments) |segment| {
+            try std.testing.expect(!collector.marked.contains(segment.artifact_id));
+            try store.delete(segment.artifact_id);
+        }
+    }
     try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 32);
     refs[16] = try Helper.file(ca, &store, 16, 17);
     var appended = try Helper.root(ca, &store, refs);
