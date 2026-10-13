@@ -1463,7 +1463,9 @@ jobs:
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
@@ -1505,11 +1507,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -1538,6 +1542,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   embedded-sdk-native:
     if: >-
@@ -2110,7 +2121,9 @@ jobs:
       github.event.schedule == '0 8 * * *') }}
     name: e2e-full / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
@@ -2146,11 +2159,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2179,6 +2194,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   e2e-full-tests:
     if: >-
