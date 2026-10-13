@@ -1496,7 +1496,8 @@ jobs:
       # this artifact bounded; release, scale, and GPU workflows qualify their
       # optimized artifacts separately.
       ANTFLY_CI_ZIG_OPTIMIZE: debug
-      ANTFLY_CI_ZIG_STRIP: "true"
+      # Retain source locations for runtime panics in functional qualification.
+      ANTFLY_CI_ZIG_STRIP: "false"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2135,9 +2136,9 @@ jobs:
       # without recompiling every storage/SQL owner through LLVM optimization.
       # Release, scale, and GPU workflows qualify their optimized builds.
       ANTFLY_CI_ZIG_OPTIMIZE: debug
-      # Match release artifact symbol handling without disabling safe
-      # checks or std.debug.assert invariants.
-      ANTFLY_CI_ZIG_STRIP: "true"
+      # Runtime failures must retain actionable stack traces. Optimized
+      # release workflows qualify stripped release artifacts separately.
+      ANTFLY_CI_ZIG_STRIP: "false"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

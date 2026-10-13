@@ -20658,6 +20658,8 @@ pub const DB = struct {
             };
         };
         try cancellation.check();
+        if (purpose == .historical_table)
+            try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         // A table-local historical image cannot certify references owned by
@@ -75780,18 +75782,27 @@ test "graph relation endpoints canonicalize through injected resolutions" {
         try std.testing.expectEqualStrings("person/ada_lovelace", parsed.source_node.?);
     }
 
-    // A legacy inline endpoint object that matches no extraction entity keeps
-    // the owning document as the source (historical extraction_relation
-    // contract), with no owner split.
+    // An inline mention that matches no extraction entity has no canonical
+    // identity. It must not manufacture an edge from the owning document.
     {
         const legacy_raw =
             \\{"relations":[{"type":"mentions","source":{"id":"inline","label":"person","text":"Ada"},"target":"ext-node"}]}
         ;
         const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", legacy_raw, source, "application/json", null, null, 100);
         defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+    // An explicit document reference is already canonical and remains usable
+    // even when it is absent from the extraction entity list.
+    {
+        const explicit_raw =
+            \\{"relations":[{"type":"mentions","source":{"document_id":"person/ada"},"target":"ext-node"}]}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", explicit_raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
         try std.testing.expectEqual(@as(usize, 1), writes.len);
-        try std.testing.expectEqualStrings("doc:a", writes[0].source);
-        try std.testing.expectEqual(@as(usize, 0), writes[0].owner.len);
+        try std.testing.expectEqualStrings("person/ada", writes[0].source);
+        try std.testing.expectEqualStrings("doc:a", writes[0].owner);
     }
 }
 
