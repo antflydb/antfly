@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -151,10 +152,45 @@ class BudgetReconciliationTest(unittest.TestCase):
         (origin / "verdict.json").write_text(
             json.dumps({"passed": False, "engine_failures": []})
         )
-        (origin / "regional/indexed-1.log").write_text(
+        # No worker log was copied after repeated controller polling failures.
+        job = {"directory": "/workspace/job", "command_sha256": "a" * 64}
+        (origin / "regional/indexed-1-job.json").write_text(json.dumps(job))
+        record = dict(
+            job,
+            version=1,
+            kind="benchmark_transport_failure",
+            terminal=True,
+            pod=worker["metadata"]["name"],
+            pod_uid=worker["metadata"]["uid"],
+            events=[{"stage": "poll", "reason": "connection_reset"}] * 5,
+        )
+        record_path = origin / "regional/indexed-1-transport-failure.json"
+        record_path.write_text(json.dumps(record))
+        before = self.ledger.read_bytes()
+        # A log match must not override a nonterminal or mismatched new record.
+        legacy_log = origin / "regional/indexed-1.log"
+        legacy_log.write_text(
             "error: error reading from error stream: connection reset by peer"
         )
-        before = self.ledger.read_bytes()
+        for patch in (
+            {"pod_uid": "replacement"},
+            {"terminal": False},
+            {"events": [{"stage": "poll", "reason": "unclassified"}] * 5},
+            {"command_sha256": "b" * 64},
+        ):
+            record_path.write_text(json.dumps(dict(record, **patch)))
+            with self.assertRaises(ValueError):
+                budget.admit_transport_resume(
+                    self.ledger,
+                    origin,
+                    self.config,
+                    "binary",
+                    "inventory",
+                    origin / "replacement",
+                )
+            self.assertEqual(self.ledger.read_bytes(), before)
+        record_path.write_text(json.dumps(record))
+        legacy_log.unlink()
         with self.assertRaises(ValueError):
             budget.admit_transport_resume(
                 self.ledger,
@@ -180,6 +216,12 @@ class BudgetReconciliationTest(unittest.TestCase):
         self.assertEqual(updated["runs"], self.original["runs"])
         self.assertEqual(updated["budget"], self.original["budget"])
         self.assertEqual(budget.exposure(updated), budget.exposure(self.original))
+        self.assertEqual(
+            updated["transport_resumes"][0]["transport_evidence_sha256"][
+                record_path.name
+            ],
+            hashlib.sha256(record_path.read_bytes()).hexdigest(),
+        )
         self.assertLessEqual(
             updated["transport_resumes"][0]["maximum_aggregate_pod_seconds"], 7200
         )

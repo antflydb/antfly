@@ -847,6 +847,14 @@ stay intact; an append-only resume admission bounds the aggregate lifetime of
 both pods to two hours, including scheduling, copy and termination allowance.
 It cannot add another reservation, refund exposure, bypass a settled attempt or
 repeat a consumed replacement. The failed original evidence remains available.
+Repeated launch/poll failures also retain an atomic `*-transport-failure.json`
+record before the controller exits, even when it cannot copy the worker log.
+It contains classified reasons and pod/job identity, without raw stderr, command
+arguments or credentials. Resume verifies terminal transport evidence against
+the retained job descriptor and pod incarnation, and records its digest in the
+existing reservation audit. Recovered errors and unclassified failures cannot
+admit a replacement. Older attempts without structured records retain their
+original connection-reset log admission.
 
 The ordinal/lookahead binary completed local public recovery checks for both
 storage profiles. Its first regional cold search measured 7.0 seconds and early

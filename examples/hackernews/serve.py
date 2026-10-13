@@ -17,7 +17,10 @@
 """Read-only HN search gateway. Run beside a private Antfly API."""
 
 import argparse
+import base64
+import hashlib
 import json
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -37,17 +40,11 @@ def search_request(value):
     term = value.get("q")
     if not isinstance(term, str) or not 1 <= len(term.strip()) <= 256:
         raise ValueError("Search must contain 1–256 characters")
-    sources = {
-        "all": {"saved": "hackernews"},
-        "history": {"table": "hn_archive"},
-        "recent": {"table": "hn_current"},
-    }
+    tables = {"history": "hn_archive", "recent": "hn_current"}
     view = value.get("view", "all")
-    if not isinstance(view, str) or view not in sources:
+    if not isinstance(view, str) or view not in ("all", *tables):
         raise ValueError("Unknown search view")
     query = {
-        "source": sources[view],
-        "source_ranking": "rrf",
         "full_text_search": {"match": term.strip(), "field": "body"},
         "full_text_index": "body_text",
         "fields": [
@@ -63,6 +60,10 @@ def search_request(value):
         "order_by": [{"field": "_score", "desc": True}],
         "limit": 20,
     }
+    if view == "all":
+        query.update(source={"saved": "hackernews"}, source_ranking="rrf")
+    else:
+        query["table"] = tables[view]
     cursor = value.get("cursor")
     if view == "recent":
         since = value.get("recent_since")
@@ -78,8 +79,64 @@ def search_request(value):
     if cursor is not None:
         if not isinstance(cursor, str) or not 1 <= len(cursor) <= 65536:
             raise ValueError("Invalid cursor")
-        query["source_cursor"] = cursor
+        if view == "all":
+            query["source_cursor"] = cursor
+        else:
+            try:
+                page = json.loads(
+                    base64.b64decode(cursor, altchars=b"-_", validate=True)
+                )
+                if not isinstance(page, dict) or set(page) != {
+                    "query",
+                    "snapshot",
+                    "after",
+                }:
+                    raise ValueError("Invalid cursor")
+                after = page["after"]
+                if (
+                    page["query"] != cursor_query_key(query)
+                    or not isinstance(page["snapshot"], str)
+                    or not 1 <= len(page["snapshot"]) <= 65536
+                    or not isinstance(after, list)
+                    or not 1 <= len(after) <= 4
+                    or any(
+                        not (
+                            (isinstance(item, str) and len(item) <= 8192)
+                            or (type(item) in (int, float) and math.isfinite(item))
+                        )
+                        for item in after
+                    )
+                ):
+                    raise ValueError("Invalid cursor")
+            except (ValueError, TypeError, OverflowError) as error:
+                raise ValueError("Invalid cursor") from error
+            query.update(remote_snapshot=page["snapshot"], search_after=after)
     return query
+
+
+def cursor_query_key(query):
+    # Bind continuation to the fixed table, term and original recent cutoff.
+    body = {
+        k: v for k, v in query.items() if k not in ("remote_snapshot", "search_after")
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def next_cursor(query, result):
+    if "source" in query:
+        return result.get("next_source_cursor")
+    hits = result["hits"]["hits"]
+    if len(hits) < query["limit"]:
+        return None
+    page = {
+        "query": cursor_query_key(query),
+        "snapshot": result["remote_snapshot"],
+        "after": hits[-1]["_sort"],
+    }
+    cursor = base64.urlsafe_b64encode(json.dumps(page).encode()).decode()
+    if len(cursor) > 65536:
+        raise ValueError("Cursor too large")
+    return cursor
 
 
 class Gateway(BaseHTTPRequestHandler):
@@ -157,8 +214,9 @@ class Gateway(BaseHTTPRequestHandler):
             )
         try:
             request = Request(
-                self.server.backend + "/query",
-                json.dumps(query).encode(),
+                self.server.backend
+                + (f"/tables/{query['table']}/query" if "table" in query else "/query"),
+                json.dumps({k: v for k, v in query.items() if k != "table"}).encode(),
                 {"Content-Type": "application/json"},
             )
             with urlopen(request, timeout=15) as response:
@@ -168,7 +226,7 @@ class Gateway(BaseHTTPRequestHandler):
             result = json.loads(raw)["responses"][0]
             output = {
                 "hits": result["hits"],
-                "cursor": result.get("next_source_cursor"),
+                "cursor": next_cursor(query, result),
             }
             if "filter_query" in query:
                 output["recent_since"] = query["filter_query"]["range"]["gte"]

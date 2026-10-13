@@ -22,6 +22,7 @@ The pod is removed in finally and has a hard lifetime if the caller disconnects.
 """
 
 import argparse
+import errno
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -33,6 +34,34 @@ import time
 import uuid
 
 SDK_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9"
+
+
+def transport_reason(error):
+    """Classify locally; never persist stderr, commands, credentials or endpoints."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(error, OSError):
+        return {
+            errno.ECONNRESET: "connection_reset",
+            errno.ECONNREFUSED: "connection_refused",
+            errno.ETIMEDOUT: "timeout",
+            errno.EPIPE: "broken_pipe",
+        }.get(error.errno, "unclassified")
+    diagnostic = error.stderr or error.stdout or ""
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode(errors="replace")
+    diagnostic = diagnostic.lower()
+    for marker, reason in (
+        ("connection reset by peer", "connection_reset"),
+        ("connection refused", "connection_refused"),
+        ("i/o timeout", "timeout"),
+        ("tls handshake timeout", "timeout"),
+        ("unexpected eof", "unexpected_eof"),
+        ("broken pipe", "broken_pipe"),
+    ):
+        if marker in diagnostic:
+            return reason
+    return "unclassified"
 
 
 def compare_runs(reports):
@@ -126,12 +155,38 @@ def remote_job(
     *,
     now=time.monotonic,
     sleep=time.sleep,
+    failure_record=None,
+    pod_uid=None,
 ):
     """Short control-plane calls cannot terminate the owned benchmark process."""
     expected = hashlib.sha256(json.dumps(command).encode()).hexdigest()
     launched = False
     failures = 0
+    events = []
+
+    def persist(terminal):
+        if failure_record is None:
+            return
+        record = {
+            "version": 1,
+            "kind": "benchmark_transport_failure",
+            "pod": pod_name,
+            "pod_uid": pod_uid,
+            "directory": directory,
+            "command_sha256": expected,
+            "terminal": terminal,
+            "events": events,
+        }
+        temporary = failure_record.with_suffix(".tmp")
+        with temporary.open("w") as file:
+            json.dump(record, file, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(failure_record)
+
     while now() < deadline:
+        stage = "launch" if not launched else "poll"
         try:
             if not launched:
                 run(
@@ -153,6 +208,7 @@ def remote_job(
                     timeout=30,
                 )
                 launched = True
+            stage = "poll"
             code = "import json,sys; from pathlib import Path; p=Path(sys.argv[1])/'exit.json'; print(p.read_text() if p.exists() else 'null')"
             result = run(
                 kubectl + ["exec", pod_name, "--", "python3", "-c", code, directory],
@@ -162,12 +218,21 @@ def remote_job(
             )
             status = json.loads(result.stdout)
             failures = 0
+            if events:
+                events = []
+                persist(False)
             if status is not None:
                 if status.get("command_sha256") != expected:
                     raise ValueError("Worker completion authority differs")
                 return status["exit_code"]
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as error:
             failures += 1
+            events.append({"stage": stage, "reason": transport_reason(error)})
+            persist(failures >= 5)
             if failures >= 5:
                 raise RuntimeError("Benchmark control plane unavailable") from None
             # Retrying launch is safe: the supervisor's lock prevents duplicate
@@ -453,7 +518,15 @@ def main():
                     - (datetime.now(timezone.utc) - worker_start).total_seconds(),
                 )
                 exit_code = remote_job(
-                    run, kubectl, pod_name, worker_command, token, directory, deadline
+                    run,
+                    kubectl,
+                    pod_name,
+                    worker_command,
+                    token,
+                    directory,
+                    deadline,
+                    failure_record=args.output / (label + "-transport-failure.json"),
+                    pod_uid=worker["metadata"]["uid"],
                 )
                 copy_result(
                     run,

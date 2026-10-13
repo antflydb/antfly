@@ -24,6 +24,7 @@ from pathlib import Path
 import unittest
 import hashlib
 import subprocess
+import tempfile
 
 spec = importlib.util.spec_from_file_location(
     "hn_regional", Path(__file__).parents[1] / "regional.py"
@@ -33,7 +34,59 @@ spec.loader.exec_module(regional)
 
 
 class DetachedControlTests(unittest.TestCase):
+    def test_terminal_poll_failures_persist_redacted_bound_evidence(self):
+        command = ["python3", "/workspace/poc.py", "--bearer-stdin"]
+        clock = [0]
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "indexed-1-transport-failure.json"
+
+            def run(argv, **kwargs):
+                if "launch" in argv:
+                    return subprocess.CompletedProcess(argv, 0, "{}")
+                raise subprocess.CalledProcessError(
+                    1,
+                    argv,
+                    stderr=b"Bearer SECRET gs://private-bucket error: error reading from error stream: connection reset by peer",
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "control plane"):
+                regional.remote_job(
+                    run,
+                    ["kubectl"],
+                    "owned",
+                    command,
+                    "SECRET",
+                    "/workspace/job",
+                    30,
+                    now=lambda: clock[0],
+                    sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+                    failure_record=record,
+                    pod_uid="owned-uid",
+                )
+            raw = record.read_text()
+            self.assertNotIn("SECRET", raw)
+            self.assertNotIn("private-bucket", raw)
+            result = json.loads(raw)
+            self.assertTrue(result["terminal"])
+            self.assertEqual(result["pod_uid"], "owned-uid")
+            self.assertEqual(
+                result["command_sha256"],
+                hashlib.sha256(json.dumps(command).encode()).hexdigest(),
+            )
+            self.assertEqual(
+                result["events"], [{"stage": "poll", "reason": "connection_reset"}] * 5
+            )
+            self.assertEqual(
+                regional.transport_reason(
+                    subprocess.CalledProcessError(1, [], stderr="Forbidden")
+                ),
+                "unclassified",
+            )
+
     def test_lost_launch_reply_and_poll_reset_do_not_change_the_job(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        record = Path(directory.name) / "transport-failure.json"
         command = ["python3", "/workspace/poc.py", "--bearer-stdin"]
         digest = hashlib.sha256(json.dumps(command).encode()).hexdigest()
         clock = [0]
@@ -67,11 +120,15 @@ class DetachedControlTests(unittest.TestCase):
                 20,
                 now=lambda: clock[0],
                 sleep=sleep,
+                failure_record=record,
+                pod_uid="owned-uid",
             ),
             0,
         )
         self.assertEqual(launched[0], 2)
         self.assertEqual(polls[0], 2)
+        self.assertEqual(json.loads(record.read_text())["events"], [])
+        self.assertFalse(json.loads(record.read_text())["terminal"])
 
     def test_wrong_completion_authority_and_expired_deadline_fail(self):
         def run(argv, **kwargs):

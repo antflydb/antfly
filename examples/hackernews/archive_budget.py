@@ -372,11 +372,57 @@ def admit_transport_resume(
     cleanup = json.loads(cleanup_path.read_text())
     worker = json.loads((origin / "regional" / "worker.json").read_text())
     verdict = json.loads((origin / "verdict.json").read_text())
+    # Controller stderr need not be available in a worker log. Admit only a
+    # terminal, classified control failure bound to this pod and launch record.
+    evidence = []
+    records = sorted((origin / "regional").glob("*-transport-failure.json"))
+    for path in records:
+        record = json.loads(path.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("Invalid transport failure evidence")
+        job_path = path.with_name(
+            path.name.replace("-transport-failure.json", "-job.json")
+        )
+        if not job_path.exists():
+            continue
+        job = json.loads(job_path.read_text())
+        events = record.get("events")
+        if (
+            record.get("version") == 1
+            and record.get("kind") == "benchmark_transport_failure"
+            and record.get("terminal") is True
+            and record.get("pod") == worker["metadata"]["name"]
+            and record.get("pod_uid") == worker["metadata"]["uid"]
+            and record.get("command_sha256") == job.get("command_sha256")
+            and isinstance(record.get("command_sha256"), str)
+            and len(record["command_sha256"]) == 64
+            and record.get("directory") == job.get("directory")
+            and isinstance(events, list)
+            and len(events) == 5
+            and all(
+                isinstance(event, dict)
+                and event.get("stage") in ("launch", "poll")
+                and event.get("reason")
+                in (
+                    "connection_reset",
+                    "connection_refused",
+                    "timeout",
+                    "unexpected_eof",
+                    "broken_pipe",
+                )
+                for event in events
+            )
+        ):
+            evidence.append(path)
+    # Keep already-retained attempts readable, but new runs use structured data.
     logs = list((origin / "regional").glob("*-*.log"))
-    transport_failure = any(
-        "error: error reading from error stream:" in p.read_text()
-        and "connection reset by peer" in p.read_text()
-        for p in logs
+    transport_failure = bool(evidence) or (
+        not records
+        and any(
+            "error: error reading from error stream:" in p.read_text()
+            and "connection reset by peer" in p.read_text()
+            for p in logs
+        )
     )
     if (
         plan["config"] != config
@@ -476,6 +522,10 @@ def admit_transport_resume(
                         ("cleanup", "regional/cleanup.json"),
                         ("verdict", "verdict.json"),
                     )
+                },
+                "transport_evidence_sha256": {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in (evidence or logs)
                 },
             }
         )
