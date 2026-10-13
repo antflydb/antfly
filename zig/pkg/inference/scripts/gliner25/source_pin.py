@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Bind independent captures to the complete reviewed upstream Python tree."""
+
 import hashlib
 
 SOURCE_SHA256 = "70f7b5084c98a420558be740b726de8ef86edb2882f93cba8af6946db914e6d4"
