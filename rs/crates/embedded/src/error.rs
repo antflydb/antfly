@@ -57,7 +57,7 @@ pub enum Error {
     /// The operation was cancelled, including a pending replacement or a
     /// progress/stream callback returning `false`.
     Cancelled,
-    /// A replacement failed after exhausting consecutive transient retries,
+    /// A replacement exhausted its consecutive or lifetime retry budget,
     /// or encountered a permanent error. Inspect its pending-work diagnostics.
     ReplacementFailed,
     /// The requested operation conflicts with a pending replacement.

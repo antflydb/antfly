@@ -498,7 +498,11 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
  * pending_work_stats_json reports progress, retry_count, retry_after_ns and
  * last_error. Consecutive transient failures retry four times with persisted
- * backoff; durable forward progress resets the budget. */
+ * backoff; durable forward progress resets the consecutive budget. A separate
+ * lifetime ceiling permits at most 64 retries (total_retry_count/max_total_retries
+ * in status). Backward-clock deadlines are clamped to at most 3.2 seconds.
+ * ANTFLY_CANCELLED also covers interrupted IO/mutex admission; interruption of
+ * a call does not cancel accepted work. Inspect state if completion raced it. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 /* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);

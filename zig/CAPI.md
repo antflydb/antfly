@@ -526,7 +526,10 @@ PostgreSQL driver matrix in `scripts/test_pgwire_drivers.py`.
 
 Replacement `retry_count` counts consecutive transient failures since the last
 acknowledged source/replay checkpoint. A durable forward step resets the count
-and backoff; volatile progress does not. Explicit resource exhaustion, full-disk
+and backoff; volatile progress does not. `total_retry_count` never resets and
+bounds each accepted job to 64 lifetime retries; status exposes that count and
+`max_total_retries`. Persisted deadlines more than 3.2 seconds ahead of the
+scheduler's wall clock are clamped and saved once, including after reopen. Explicit resource exhaustion, full-disk
 and temporary remote failures retry up to four times. Unclassified
 `Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
 rather than assuming storage corruption is transient. A failure after a newer
@@ -544,8 +547,12 @@ bounded rounds; the old graph remains available until activation commits.
 A successful replacement wait observes the catalog under the publication read
 lease. The write lease spans the atomic catalog transaction and old-index
 retirement, so an entry appended provisionally during installation cannot make
-wait return success before commit. `ANTFLY_CANCELLED` also covers cancellation of
-a pending replacement, in addition to progress/stream callbacks returning false.
+wait return success before commit. If a missing job races publication, wait
+checks the committed catalog again before returning cancellation.
+`ANTFLY_CANCELLED` describes the operation: it covers replacement cancellation,
+progress/stream callbacks returning false, and IO/mutex interruption. Interrupting
+an owner preserves accepted work and its durable checkpoint rather than marking
+the job failed. Completion may have raced interruption; inspect current state.
 
 
 Pending replacements temporarily require reader version 2, because an older

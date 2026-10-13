@@ -4599,6 +4599,8 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
             .target_sequence = database.core.nextDerivedSequence(),
             .last_error = job.last_error,
             .retry_count = job.retry_count,
+            .total_retry_count = job.total_retry_count,
+            .max_total_retries = db_mod.DB.replacement_total_retry_limit,
             .retry_after_ns = job.retry_after_ns,
             .activation_attempts = job.activation_attempts,
         }, .{});

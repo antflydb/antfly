@@ -122,6 +122,7 @@ pub const GraphReplacementBuild = struct {
     tail_source_cursor: usize = 0,
     last_error: ?[]const u8 = null,
     retry_count: u32 = 0,
+    total_retry_count: u32 = 0,
     retry_after_ns: u64 = 0,
     activation_attempts: u32 = 0,
 };

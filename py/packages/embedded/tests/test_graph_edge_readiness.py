@@ -1072,6 +1072,9 @@ def test_replacement_registration_and_optional_wait(tmp_path, storage):
         assert progress[0]["name"] == "new"
         assert progress[0]["replaces"] == "old"
         assert progress[0]["last_error"] is None
+        assert progress[0]["retry_count"] == 0
+        assert progress[0]["total_retry_count"] == 0
+        assert progress[0]["max_total_retries"] == 64
         db.add_index(request)
         names = {i["name"] for i in db.list_indexes()}
         if "old" in names:

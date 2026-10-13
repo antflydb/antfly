@@ -1066,9 +1066,10 @@ existing maintenance owner builds bounded source pages and catches up replay,
 saving its cursor and applied sequence after projection durability. The old
 index serves until the final bounded tail and atomic catalog swap. Field-backed
 changes re-process their changed sources rather than abandoning the build.
-Catch-up coalesces each journal window by source key, so repeated updates to a
-hot document rebuild its latest projection once per round.
-Replay retention advances after each round; it does not pin the entire journal.
+Catch-up coalesces bounded journal windows by source key; larger activation
+windows resume per entry. Repeated updates to a hot document can share one
+reconstruction per window. Replay retention advances after durable checkpoints;
+it does not pin the entire journal.
 Restart resumes the durable marker/checkpoints, without rebuilding completed
 pages. Background construction retains its private manager across rounds, shares
 a source snapshot across each page, and checkpoints its resumable progress.
@@ -1087,10 +1088,21 @@ unacknowledged work. Checkpoint fsync remains required before the durable cursor
 advances. The scan excludes unrelated metadata/journal keys, and replay begins
 strictly after the last consumed sequence.
 
-Transient storage/resource/network failures retry four times with persisted
-50 ms, 200 ms, 800 ms and 3200 ms backoff. `retry_count`, `retry_after_ns` (Unix
-nanoseconds) and `last_error` are visible in replacement status. Backoff survives
-reopen, and waiting jobs yield to later replacements and ordinary maintenance.
+Explicit transient resource, disk-full and remote/network failures retry at most
+four consecutive times with persisted 50 ms, 200 ms, 800 ms and 3200 ms backoff.
+A durable source/replay checkpoint resets the consecutive count and backoff;
+volatile work does not. Each accepted job also has a lifetime ceiling of 64
+retries, which progress never resets. `retry_count`, `total_retry_count`,
+`max_total_retries`, `retry_after_ns` (Unix nanoseconds) and `last_error` are visible
+in replacement status. Generic `Unexpected`, `InputOutput`, `ReadFailed`,
+`WriteFailed` and `UnexpectedReadFailure` errors fail immediately, rather than
+presuming ambiguous storage failures are transient. Failure recording reloads the
+latest durable checkpoint so it cannot undo progress from the failed turn.
+Backoff survives reopen. When the scheduler reads a deadline more than 3.2 seconds
+in the future, it persistently clamps it to that horizon; a backward wall-clock
+step cannot impose an hours-long stall. Persisting the clamp once prevents it
+sliding forward on every poll. Waiting jobs yield to later replacements and
+ordinary maintenance.
 A permanent failure or exhausted retry budget enters terminal `phase: "failed"`,
 exposes `last_error`, releases its
 journal retention pin and retires any inline execution owned only by that shadow.
@@ -1107,18 +1119,19 @@ Plain `add_index` with the identical pending config joins its shadow even withou
 The final write fence consumes and durably checkpoints a bounded tail even when
 the gap exceeds 1024. An intra-entry source cursor also permits yielding within a
 large journal batch. Each pause advances completed sources rather than restarting
-the tail; its 100 ms work budget includes the current indivisible source, followed
-by the required durability checkpoint. After eight yielding activation attempts,
-the background owner escalates to a fixed-target cutover barrier: primary writes
-queue while it drains the already-admitted finite journal tail and swaps. This
-prevents starvation even when producers continually outpace ordinary catch-up.
-The escalated pause lasts for the remaining tail work and durability IO; it does
-not have a 100 ms wall-clock bound. Explicit wait callers retain their deadline;
-the maintenance owner performs escalation. `activation_attempts` persists across
-reopen and is reported with replacement progress.
-Cutover coalesces complete journal windows by source key before rebuilding,
-including during escalation, so repeated writes to a hot document cost one
-reconstruction per window. Partial large entries retain a durable source ordinal.
+the tail. Ordinary activation uses a 100 ms cooperative work budget, followed by
+the required durability checkpoint. After eight yielding attempts, the budget
+increases to at most one second, still capped by an explicit wait deadline.
+Escalation always has a finite deadline: it yields and persists its cursor when
+that budget expires. A current batch (up to 32 sources), storage operation or
+fsync may overrun the cooperative budget, so this is not a hard wall-clock bound
+on writer latency. Sustained producers can require further bounded rounds; the
+old index keeps serving until the atomic swap. `activation_attempts` persists
+across reopen and is reported with replacement progress.
+Cutover coalesces windows containing at most 32 unique sources. Larger windows
+use resumable per-entry batches, including during escalation. Repeated writes to
+a hot document can coalesce within a window; the entire tail is not promised to
+finish in one pass. Partial large entries retain a durable source ordinal.
 Tail rebuilds share a source snapshot and write plan across batches of 32
 sources. Graph owner cleanup also pins one coherent outgoing/reverse snapshot
 pair for each batch, instead of reopening both stores for every document/prefix. Full document rebuilds cover their owned artifacts, so those artifacts
@@ -1129,13 +1142,24 @@ endpoints once after all mention resolutions are applied.
 Identical in-progress requests are no-ops. `replaces` and optional
 `"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
 Waiting cooperatively advances the same work, releasing handle/path locks between
-quanta so another caller can cancel or write. Cancellation returns `ANTFLY_CANCELLED`
-promptly, storage/admission errors propagate, and a manual runtime sleeps through
+quanta so another caller can cancel or write. A missing job record triggers a
+second committed-catalog check, so a racing successful swap returns success.
+`ANTFLY_CANCELLED` describes cancellation of the call: it includes an explicitly
+cancelled replacement, callback cancellation, or interrupted IO/mutex admission.
+Interrupting a worker or a call does not cancel or fail accepted durable work;
+volatile work is discarded and the checkpoint remains resumable. If interruption
+races completion, inspect the index/job state. Storage/admission errors propagate, and a manual runtime sleeps through
 its control IO rather than spinning. Replacement precondition errors have distinct
 codes in C, Python, Go and Rust: `ANTFLY_REPLACEMENT_FAILED`,
 `ANTFLY_REPLACEMENT_PENDING` and `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`.
-Plain graph replacement does not upgrade the minimum reader version; only actual
-authoritative resolver catalog features require version 2.
+A pending plain replacement temporarily raises the minimum reader version to 2
+and publishes a versioned resolver envelope. The envelope fences pre-epoch
+writers whose replay cleanup ignores shadow retention, including already-open
+Lite writers when they refresh before mutation or maintenance. Once the last
+active shadow swaps, fails or is cancelled, its catalog transaction removes the
+temporary fence. A separate baseline preserves permanent resolver-feature
+requirements: a plain completed replacement returns to version 1, while actual
+authoritative resolver features retain version 2.
 Deadline Busy means registration
 was accepted and the shadow continues in the background. Without wait, Busy is
 limited to bounded registration admission. Drain with `run_until_idle` to await
@@ -1157,18 +1181,21 @@ graph contributions. Explicitly delete canonical rows only after checking other
 resolvers and application references; shared destination rows have no single
 resolver owner. Index deletion only retires last-owner identities.
 
-The capabilities/status JSON reports a durable `minimum_reader_version` feature
-epoch independent of package release: 1 for the baseline catalog, 2 whenever
+The capabilities/status JSON reports the effective `minimum_reader_version`
+compatibility guard independently of package release: 1 for the baseline catalog,
+2 whenever
 extended identity/ownership/cache-policy catalog fields are present, including
-`inline_managed` or `retired`. Catalog transactions stamp this monotonically,
-and opening checks the epoch before parsing resolver definitions. Extended
-catalogs also use a versioned object envelope, which pre-epoch array readers
+`inline_managed` or `retired`. The authoritative feature epoch is monotonic;
+a pending replacement can temporarily raise its effective guard as described
+above. Opening checks the effective epoch before parsing resolver definitions.
+Extended catalogs also use a versioned object envelope, which pre-epoch array readers
 reject even if they ignore unknown resolver fields. Older unstamped
 catalogs infer their epoch on load; the next mutation stamps it. Status polling
 uses cached epochs under a read guard. Plain table creation/drop preserves the
 original table catalog format and reader epoch 1; actual resolver format changes
-stamp the aggregate requirement in separate metadata. Existing durable epoch
-stamps remain monotonic. Open loads the lightweight table catalog,
+stamp the aggregate requirement in separate metadata. Authoritative feature
+epochs remain monotonic; removing a temporary replacement guard restores
+its authoritative baseline. Open loads the lightweight table catalog,
 then opens each table on demand. Named-table catalogs durably summarize the reader
 epoch. Background discovery isolates an unavailable table and reports its error
 in `unavailable_tables`; unrelated root/table reads remain available. Portable
