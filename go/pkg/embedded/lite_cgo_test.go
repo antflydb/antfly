@@ -67,6 +67,9 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 		Unsupported,
 		Stalled,
 		Cancelled,
+		ReplacementFailed,
+		ReplacementPending,
+		ReplacementConfigurationMismatch,
 		Internal,
 		ErrorCode(127),
 	}
@@ -2768,5 +2771,62 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 	}
 	if len(result.Resolution.Entities) != 1 || result.Resolution.Entities[0].DocRef.Key != "concept/the_approval_reviewer" || result.Resolution.Entities[0].DocRef.Table != "entities" || result.Resolution.Entities[0].Decision != "match" {
 		t.Fatalf("query embedding/ANN resolution = %s", query)
+	}
+}
+
+func TestResolverIdentityManagement(t *testing.T) {
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "identities.aflite"), OpenOptions{Profile: ProfileNative, NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if cancelled, err := db.CancelReplacement("missing"); err != nil || cancelled {
+		t.Fatalf("cancel missing: %v %v", cancelled, err)
+	}
+	if archive, err := db.BackupJSON([]byte(`{"tables":["default"]}`)); err != nil || len(archive) == 0 {
+		t.Fatalf("scoped backup: %v", err)
+	}
+
+	config := []byte(`{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}`)
+	if err := db.AddIndexJSON(config); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := db.ResolverIdentitiesJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var active []struct {
+		Config struct {
+			Name    string `json:"name"`
+			Retired bool   `json:"retired"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &active); err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].Config.Name != "concepts" || active[0].Config.Retired {
+		t.Fatalf("identities: %s", raw)
+	}
+	if _, err := db.DropResolverIdentity("concepts"); err == nil {
+		t.Fatal("active identity drop succeeded")
+	}
+	if deleted, err := db.DeleteIndex("knowledge"); err != nil || !deleted {
+		t.Fatalf("delete: %v %v", deleted, err)
+	}
+	raw, err = db.ResolverIdentitiesJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &active); err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || !active[0].Config.Retired {
+		t.Fatalf("retired identities: %s", raw)
+	}
+	if deleted, err := db.DropResolverIdentity("concepts"); err != nil || !deleted {
+		t.Fatalf("drop: %v %v", deleted, err)
+	}
+	if deleted, err := db.DropResolverIdentity("concepts"); err != nil || deleted {
+		t.Fatalf("repeat drop: %v %v", deleted, err)
 	}
 }

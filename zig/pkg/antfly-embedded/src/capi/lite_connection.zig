@@ -164,7 +164,12 @@ const Owner = struct {
             const retained = retained: {
                 if (retired.query_borrows > 0) break :retained true;
                 for (self.connections.items) |connection| {
-                    var cursors = connection.sql_cursors.valueIterator();
+                    // attach moves this connection's registry onto the current
+                    // root. Inspect its actual owner during query resume too.
+                    var cursors = if (connection.attached)
+                        connection.current.?.sql_cursors.valueIterator()
+                    else
+                        connection.sql_cursors.valueIterator();
                     while (cursors.next()) |cursor| {
                         if (cursor.*.adapter.handle == retired) break :retained true;
                     }
@@ -187,6 +192,7 @@ const Owner = struct {
     }
 
     fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
+        if (database.hasPendingGraphReplacements()) return true;
         const runtime = database.enrichment_runtime orelse return false;
         return database.core.hasGeneratedEnrichmentTargets() and
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
@@ -213,7 +219,7 @@ const Owner = struct {
             // every table under the lease, including namespaces not yet used
             // by a foreground call. Keep writer_no_replay's explicit policy.
             if (self.options.open_mode == .writer) {
-                @import("tables.zig").load(root) catch continue;
+                @import("tables.zig").loadAvailable(root) catch continue;
                 if (hasPendingGeneratedEnrichment(&root.db)) self.maintenance_pending = true;
                 var tables = root.embedded_tables.valueIterator();
                 while (tables.next()) |table| {
@@ -229,6 +235,7 @@ const Owner = struct {
                     self.maintenance_pending = (table.*.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 }
             }
+            @import("entity_sink.zig").collectEmbeddingCache(root, false) catch {};
             if (!self.stopping.load(.acquire)) {
                 const now = std.Io.Clock.awake.now(io).nanoseconds;
                 if (now >= self.next_ttl_ns) {

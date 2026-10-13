@@ -373,6 +373,14 @@ impl Database {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_backup(h, out) })
     }
 
+    /// Export with optional {"tables":[...]} scope; default is always included.
+    /// Full backups fail closed if any table is unavailable.
+    pub fn backup_json(&self, options: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(options.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_backup_json(h, input, out)
+        })
+    }
+
     /// Imports a portable Antfly backup archive into this empty database.
     /// [`Error::OutcomeUnknown`] means the live handle adopted the imported
     /// generation, but crash durability could not be confirmed; inspect the
@@ -547,7 +555,30 @@ impl Database {
         })
     }
 
+    /// List active and retired identities, including durable merges.
+    pub fn resolver_identities_json(&self) -> Result<Vec<u8>> {
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_list_resolver_identities_json(h, out) })
+    }
+
+    /// Discard retired identity metadata; artifacts and canonical rows remain.
+    /// Delete source documents for artifact cleanup, then explicitly delete
+    /// unused canonical rows. Busy is retryable.
+    pub fn drop_resolver_identity(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_drop_resolver_identity(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
+            })?;
+            Ok(deleted)
+        })
+    }
+
     /// Atomically reset or migrate resolver identities; drain afterward.
+    /// Retry the identical request on Busy.
     pub fn set_resolver_namespace_json(
         &self,
         resolver: &str,
@@ -558,6 +589,11 @@ impl Database {
         })
     }
 
+    /// Add or replace an index; retry the identical request on Busy.
+    /// A graph replaces command registers a resumable background shadow. The
+    /// old index serves until activation; absent old indexes behave like add.
+    /// Optional wait:{timeout_ms:N} waits for activation. A deadline Busy leaves
+    /// the accepted shadow running; pending work stats expose its progress.
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(config.as_ref(), |h, input| unsafe {
             sys::antfly_db_add_index_json(h, input)
@@ -565,11 +601,27 @@ impl Database {
     }
 
     /// Deletes an index by name and reports whether it existed.
+    /// Retire an index, returning whether it existed. Busy is retryable.
     pub fn delete_index(&self, name: &str) -> Result<bool> {
         self.with_handle(|handle| {
             let mut deleted = false;
             check(unsafe {
                 sys::antfly_db_delete_index(handle, borrow_slice(name.as_bytes()), &mut deleted)
+            })?;
+            Ok(deleted)
+        })
+    }
+
+    /// Cancel a running or failed shadow by its new name; idempotent.
+    pub fn cancel_replacement(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_cancel_replacement(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
             })?;
             Ok(deleted)
         })

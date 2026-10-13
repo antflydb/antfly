@@ -54,10 +54,16 @@ pub enum Error {
     /// Derived work stalled or a derived worker failed. Inspect pending-work
     /// diagnostics and repair or reopen the database.
     Stalled,
-    /// The caller cancelled the call by returning `false` from its progress
-    /// or stream callback (e.g. [`crate::Inference::pull`]'s progress
-    /// callback or [`crate::Inference::generate_stream`]'s chunk callback).
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning `false`, or an IO interruption.
     Cancelled,
+    /// A replacement exhausted its consecutive or lifetime retry budget,
+    /// or encountered a permanent error. Inspect its pending-work diagnostics.
+    ReplacementFailed,
+    /// The requested operation conflicts with a pending replacement.
+    ReplacementPending,
+    /// The requested configuration differs from the pending replacement.
+    ReplacementConfigurationMismatch,
     /// An internal error occurred.
     Internal,
     /// A C ABI error code this binding does not recognize, carrying the raw
@@ -101,6 +107,9 @@ impl Error {
             7 => Error::OutcomeUnknown,
             8 => Error::Unsupported,
             9 => Error::Stalled,
+            11 => Error::ReplacementFailed,
+            12 => Error::ReplacementPending,
+            13 => Error::ReplacementConfigurationMismatch,
             10 => Error::Cancelled,
             255 => Error::Internal,
             other => Error::Unknown(other),
@@ -120,6 +129,9 @@ impl Error {
             Error::OutcomeUnknown => 7,
             Error::Unsupported => 8,
             Error::Stalled => 9,
+            Error::ReplacementFailed => 11,
+            Error::ReplacementPending => 12,
+            Error::ReplacementConfigurationMismatch => 13,
             Error::Cancelled => 10,
             Error::Internal => 255,
             Error::Unknown(code) => *code,
@@ -138,6 +150,9 @@ impl Error {
             Error::OutcomeUnknown => "ANTFLY_OUTCOME_UNKNOWN",
             Error::Unsupported => "ANTFLY_UNSUPPORTED",
             Error::Stalled => "ANTFLY_STALLED",
+            Error::ReplacementFailed => "ANTFLY_REPLACEMENT_FAILED",
+            Error::ReplacementPending => "ANTFLY_REPLACEMENT_PENDING",
+            Error::ReplacementConfigurationMismatch => "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
             Error::Cancelled => "ANTFLY_CANCELLED",
             Error::Internal => "ANTFLY_INTERNAL",
             Error::Unknown(_) => "ANTFLY_UNKNOWN_ERROR",
@@ -170,6 +185,13 @@ impl Error {
             Error::Stalled => {
                 "derived work stalled or failed; inspect pending-work diagnostics and \
                  repair or reopen the database"
+            }
+            Error::ReplacementFailed => {
+                "replacement failed after its retry budget; inspect diagnostics and cancel before retrying"
+            }
+            Error::ReplacementPending => "index name is reserved by a pending replacement",
+            Error::ReplacementConfigurationMismatch => {
+                "replacement configuration differs from the reserved request"
             }
             Error::Cancelled => "the caller cancelled the operation",
             Error::Internal => "an internal error occurred",

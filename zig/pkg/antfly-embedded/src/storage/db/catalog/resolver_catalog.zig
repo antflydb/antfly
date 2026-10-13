@@ -61,6 +61,40 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
     return out;
 }
 
+/// Monotonic feature epoch, published with catalog mutations and checked before parsing.
+pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
+pub const supported_reader_version: u32 = 2;
+
+pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    const rows = try catalogRows(parsed.value);
+    if (parsed.value == .object) return 2;
+    for (rows.array.items) |entry| {
+        if (entry != .object) return error.InvalidResolverConfig;
+        for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
+            if (entry.object.contains(field)) return 2;
+        }
+    }
+    return 1;
+}
+
+pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
+    const raw = txn.get(minimum_reader_key) catch |err| switch (err) {
+        error.NotFound => return 1,
+        else => return err,
+    };
+    const version = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidResolverConfig;
+    if (version > supported) return error.UnsupportedDatabaseReaderVersion;
+    return version;
+}
+
+pub fn stampMinimumReaderVersion(a: Allocator, txn: anytype, catalog: []const u8) !u32 {
+    const version = @max(try readMinimumReaderVersion(txn, supported_reader_version), try catalogReaderVersion(a, catalog));
+    try txn.put(minimum_reader_key, if (version == 1) "1" else "2");
+    return version;
+}
+
 pub const ResolverSourceArtifactKind = enum {
     /// Root and unit-scoped asset artifacts. This is the legacy default.
     asset,
@@ -71,6 +105,11 @@ pub const ResolverSourceArtifactKind = enum {
 
     pub fn matches(self: ResolverSourceArtifactKind, actual: ResolverSourceArtifactKind) bool {
         return self == .any or self == actual;
+    }
+
+    /// Whether two resolver scopes can consume the same artifact kind.
+    pub fn overlaps(self: ResolverSourceArtifactKind, other: ResolverSourceArtifactKind) bool {
+        return self.matches(other) or other.matches(self);
     }
 };
 
@@ -101,8 +140,15 @@ pub const ResolverConfig = struct {
     /// Explicit namespace operations fence subsequent declarative replacements,
     /// including resets with no remaining merge records.
     namespace_generation: u64 = 0,
+    /// Inline declarations own execution, while retired definitions retain identity
+    /// state for re-add/rename. These fields are catalog-owned, never public config.
+    inline_managed: ?bool = null,
+    retired: bool = false,
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
+    /// Optional work is bounded independently of authoritative resolutions.
+    retain_work: resolver_lib.WorkRetention = .full,
+    max_work_bytes: usize = 1024 * 1024,
     /// Mention labels this resolver consumes. Empty means all labels
     /// (catch-all). Labeled resolvers sharing a source artifact must claim
     /// disjoint label sets (admission-enforced), and catch-alls skip labels
@@ -199,7 +245,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -256,7 +302,11 @@ pub const ResolverConfig = struct {
             .merge_state_version = cfg.merge_state_version,
             .resolution_generation = cfg.resolution_generation,
             .namespace_generation = cfg.namespace_generation,
+            .inline_managed = cfg.inline_managed,
+            .retired = cfg.retired,
             .promote = cfg.promote,
+            .retain_work = cfg.retain_work,
+            .max_work_bytes = cfg.max_work_bytes,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
@@ -308,7 +358,8 @@ pub const ResolverConfig = struct {
     pub fn validate(self: ResolverConfig) !void {
         try resolver_lib.validateAliases(self.aliases);
         try resolver_lib.validateAliases(self.merges);
-        if (self.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
+        if (self.max_work_bytes > 16 * 1024 * 1024) return error.InvalidResolverConfig;
+        if (self.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
         const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(effective);
         try resolver_lib.validateAliases(effective);
@@ -361,12 +412,32 @@ pub const ResolverConfig = struct {
     }
 };
 
+/// Extended catalogs carry an explicit envelope. Pre-epoch readers parse only
+/// arrays, so they reject this shape even when they ignore unknown row fields.
+fn catalogRows(value: std.json.Value) !std.json.Value {
+    if (value == .array) return value;
+    if (value != .object) return error.InvalidResolverConfig;
+    const version = value.object.get("version") orelse return error.InvalidResolverConfig;
+    if (version != .integer or version.integer != supported_reader_version) return error.UnsupportedResolverCatalogVersion;
+    const rows = value.object.get("resolvers") orelse return error.InvalidResolverConfig;
+    if (rows != .array) return error.InvalidResolverConfig;
+    return rows;
+}
+
 pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
+    const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
+    errdefer alloc.free(rows);
+    if (try catalogReaderVersion(alloc, rows) == 1) return rows;
+    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
+    alloc.free(rows);
+    return wrapped;
 }
 
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
-    const parsed = try std.json.parseFromSlice([]ResolverConfig, alloc, data, .{
+    const root = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer root.deinit();
+    const rows = try catalogRows(root.value);
+    const parsed = try std.json.parseFromValue([]ResolverConfig, alloc, rows, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
@@ -379,11 +450,33 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
         alloc.free(out);
     }
     for (parsed.value, 0..) |cfg, i| {
-        if (cfg.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
+        if (cfg.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
+        if (cfg.retired and cfg.inline_managed != true) return error.InvalidResolverConfig;
         out[i] = try ResolverConfig.clone(alloc, cfg);
         initialized += 1;
     }
     return out;
+}
+
+/// Execution plans exclude retired identities; backups and catalog comparisons
+/// use deserializeCatalog so durable merges and namespace fences remain intact.
+pub fn deserializeActiveCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
+    const all = try deserializeCatalog(alloc, data);
+    defer alloc.free(all);
+    var active: std.ArrayList(ResolverConfig) = .empty;
+    errdefer {
+        for (active.items) |*cfg| cfg.deinit(alloc);
+        active.deinit(alloc);
+    }
+    // Allocate before transferring ownership so failure frees every definition.
+    active.ensureTotalCapacity(alloc, all.len) catch |err| {
+        for (all) |*cfg| cfg.deinit(alloc);
+        return err;
+    };
+    for (all) |*cfg| {
+        if (cfg.retired) cfg.deinit(alloc) else active.appendAssumeCapacity(cfg.*);
+    }
+    return try active.toOwnedSlice(alloc);
 }
 
 pub const merge_catalog_key = "\x00\x00__metadata__:resolver_merges_v1";
@@ -416,7 +509,7 @@ pub fn applyMergeState(alloc: Allocator, configs: []ResolverConfig, data: []cons
         var found = false;
         for (configs) |*cfg| {
             if (!std.mem.eql(u8, cfg.name, state.name)) continue;
-            if (cfg.merges.len > 0 or cfg.merge_state_version != 1 or cfg.merge_generation == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
+            if (cfg.merges.len > 0 or (cfg.merge_state_version == 0 or cfg.merge_state_version > 2) or cfg.merge_generation == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
             cfg.merges = try ResolverConfig.cloneAliases(alloc, state.aliases);
             try cfg.validate();
             found = true;
@@ -424,7 +517,7 @@ pub fn applyMergeState(alloc: Allocator, configs: []ResolverConfig, data: []cons
         }
         if (!found) return error.InvalidResolverMergeState;
     }
-    for (configs) |cfg| if ((cfg.merge_generation > 0 or cfg.merge_state_version > 0) and cfg.merges.len == 0) return error.MissingResolverMergeState;
+    for (configs) |cfg| if ((cfg.merge_generation > 0 or cfg.merge_state_version == 1) and cfg.merges.len == 0) return error.MissingResolverMergeState;
 }
 
 test "resolver catalog round trip" {
@@ -679,6 +772,8 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
     cfg.merge_state_version = 1;
     const catalog = try serializeCatalog(alloc, &.{cfg});
     defer alloc.free(catalog);
+    const old_reader = std.json.parseFromSlice([]ResolverConfig, alloc, catalog, .{ .ignore_unknown_fields = true });
+    try std.testing.expectError(error.UnexpectedToken, old_reader);
     const sidecar = try serializeMergeState(alloc, &.{cfg});
     defer alloc.free(sidecar);
     const restored = try deserializeCatalog(alloc, catalog);
@@ -696,6 +791,70 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
         for (forward) |*entry| entry.deinit(alloc);
         alloc.free(forward);
     }
-    const unsupported = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"merge_state_version\":2}]";
+    const unsupported = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"merge_state_version\":3}]";
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, deserializeCatalog(alloc, unsupported));
+}
+
+test "capi retired resolver identities retain merges without entering execution catalogs" {
+    const a = std.testing.allocator;
+    var cfg: ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .inline_managed = true, .retired = true };
+    const encoded = try serializeCatalog(a, &.{cfg});
+    defer a.free(encoded);
+    const active = try deserializeActiveCatalog(a, encoded);
+    defer a.free(active);
+    try std.testing.expectEqual(@as(usize, 0), active.len);
+    const identities = try deserializeCatalog(a, encoded);
+    defer {
+        for (identities) |*entry| entry.deinit(a);
+        a.free(identities);
+    }
+    try applyMergeState(a, identities, "[]");
+    try std.testing.expect(identities[0].retired);
+    cfg.merges = &.{.{ .key = "a", .target = "b" }};
+    cfg.merge_generation = 1;
+    cfg.merge_state_version = 1;
+    const merged = try serializeCatalog(a, &.{cfg});
+    defer a.free(merged);
+    const sidecar = try serializeMergeState(a, &.{cfg});
+    defer a.free(sidecar);
+    const restored = try deserializeCatalog(a, merged);
+    defer {
+        for (restored) |*entry| entry.deinit(a);
+        a.free(restored);
+    }
+    try applyMergeState(a, restored, sidecar);
+    try std.testing.expectEqualStrings("b", restored[0].merges[0].target);
+}
+
+test "capi resolver source artifact scopes overlap symmetrically" {
+    const kinds = [_]ResolverSourceArtifactKind{ .asset, .chunk, .any };
+    for (kinds) |left| {
+        for (kinds) |right| {
+            const expected = left == right or left == .any or right == .any;
+            try std.testing.expectEqual(expected, left.overlaps(right));
+            try std.testing.expectEqual(left.overlaps(right), right.overlaps(left));
+        }
+    }
+}
+
+test "capi resolver reader epochs fence older readers and remain monotonic" {
+    const Txn = struct {
+        value: ?[]const u8 = null,
+        pub fn get(self: *@This(), _: []const u8) anyerror![]const u8 {
+            return self.value orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), _: []const u8, value: []const u8) !void {
+            self.value = value;
+        }
+    };
+    const a = std.testing.allocator;
+    var txn: Txn = .{};
+    try std.testing.expectEqual(@as(u32, 1), try readMinimumReaderVersion(&txn, 1));
+    try std.testing.expectEqual(@as(u32, 1), try stampMinimumReaderVersion(a, &txn, "[]"));
+    try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[{\"inline_managed\":true}]"));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 1));
+    try std.testing.expectEqual(@as(u32, 2), try readMinimumReaderVersion(&txn, 2));
+    try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[]"));
+    txn.value = "3";
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 2));
 }
