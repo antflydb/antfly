@@ -744,3 +744,11 @@ metadata 9/10 stays readable. Best-first traversal consumes authenticated score
 envelopes with strictly losing pruning, bounded frontier/read admission, equal-score
 tie preservation and explicit lower-bound count semantics. Unsupported proofs and
 exact counts keep the existing exact traversal.
+
+Priority traversal admits up to eight candidates together to amortize schema,
+statistics and native-reader setup. Newly raised cutoffs can leave at most seven
+extra candidates in the already selected window; losing hits are still rejected
+by exact ranking. Existing corpus/read/memory admission remains enforced and an
+unaffordable optional batch falls back to exact physical windows. Deferred
+highlights use the admitted snapshot's canonical segment identities, since
+priority arrival order can differ from its native document ordinal order.

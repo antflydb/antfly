@@ -1272,16 +1272,27 @@ const Execution = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         var visited: u64 = 0;
-        while (reader.next(winners.cutoff()) catch |err| switch (err) {
-            error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.BestFirstBudgetExceeded => return null,
-            else => return err,
-        }) |identity| {
-            visited += 1;
+        while (true) {
+            // Amortize schema/statistics/admission work across a small priority
+            // window. The current cutoff still excludes strictly losing nodes;
+            // at most seven extra candidates can survive a newly raised cutoff.
+            var ids: [8][32]u8 = undefined;
+            var count: usize = 0;
+            while (count < ids.len) {
+                const identity = (reader.next(winners.cutoff()) catch |err| switch (err) {
+                    error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.BestFirstBudgetExceeded => return null,
+                    else => return err,
+                }) orelse break;
+                ids[count] = identity;
+                count += 1;
+            }
+            if (count == 0) break;
+            const identities = ids[0..count];
+            visited += count;
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const wa = scratch.allocator();
-            const identities = [_][32]u8{identity};
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &identities };
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = identities };
             defer child.deinit();
             var request = req;
             request.offset = 0;
@@ -1289,12 +1300,15 @@ const Execution = struct {
             request.include_stored = false;
             request.highlight = null;
             request.minimum_competitive_score = winners.cutoff();
-            var page = try searchText(&child, wa, request, text);
+            var page = searchText(&child, wa, request, text) catch |err| switch (err) {
+                error.OutOfMemory, error.NativeLakeTextCacheBusy, error.NativeLakeTextCorpusTooLarge, error.ArtifactReadBudgetExceeded => return null,
+                else => return err,
+            };
             defer page.deinit();
             if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
             total +|= page.total_hits;
             for (page.hits) |hit| {
-                const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, &identities, hit.native_text_doc_id.?) else null;
+                const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, identities, hit.native_text_doc_id.?) else null;
                 try winners.addLocated(hit, 0, location);
             }
         }
@@ -2460,7 +2474,12 @@ const StoredHighlightLocation = struct { segment: [32]u8, document: u32 };
 fn storedHighlightLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredHighlightLocation {
     if (pin.snapshot.segments.len != ids.len) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
-    for (pin.snapshot.segments, ids) |segment, id| {
+    // Selected admission sorts candidates into canonical physical order. Its
+    // retained identities, rather than priority arrival order, own doc ordinals.
+    const admitted = if (pin.provider_metadata) |raw| @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(raw))).segment_ids else &.{};
+    if (admitted.len != 0 and admitted.len != ids.len) return error.InvalidNativeLakeTextCorpus;
+    for (pin.snapshot.segments, ids, 0..) |segment, supplied, ordinal| {
+        const id = if (admitted.len != 0) admitted[ordinal] else supplied;
         const upper = try std.math.add(u32, lower, segment.reader.doc_count);
         if (document >= lower and document < upper) return .{ .segment = id, .document = document - lower };
         lower = upper;
@@ -2640,4 +2659,30 @@ test "external lake paged stored highlights retain only returned winner location
     try std.testing.expectEqual(@as(usize, 1), locations.count());
     try std.testing.expectEqual(@as(u32, 8), locations.get("b").?.document);
     try std.testing.expect(locations.get("a") == null and locations.get("c") == null);
+}
+
+test "external lake priority batches retain admitted segment order for highlights" {
+    const refs = [_]@import("lake_index_aggregate_artifact.zig").ChunkRef{
+        .{ .artifact_id = "canonical-first", .checksum = "", .byte_len = 1 },
+        .{ .artifact_id = "canonical-second", .checksum = "", .byte_len = 1 },
+    };
+    const first = corpus.term_directory.identity(refs[0].artifact_id);
+    const second = corpus.term_directory.identity(refs[1].artifact_id);
+    const priority = [_][32]u8{ second, first };
+    var segments: [2]local.index.SegmentEntry = undefined;
+    segments[0].reader.doc_count = 2;
+    segments[1].reader.doc_count = 3;
+    var snapshot: local.index.IndexSnapshot = undefined;
+    snapshot.segments = &segments;
+    const admitted = [_][32]u8{ first, second };
+    var metadata: @import("lake_index_text_predicate.zig").Identities = .{ .offsets = &.{ 0, 2, 5 }, .segment_ids = &admitted };
+    var pin: search.PinnedTextSource = undefined;
+    pin.snapshot = &snapshot;
+    pin.provider_metadata = &metadata;
+    const location = try storedHighlightLocation(pin, &priority, 3);
+    try std.testing.expectEqualSlices(u8, &second, &location.segment);
+    try std.testing.expectEqual(@as(u32, 1), location.document);
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, storedHighlightLocation(pin, &priority, 5));
+    metadata.segment_ids = admitted[0..1];
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, storedHighlightLocation(pin, &priority, 0));
 }
