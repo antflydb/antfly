@@ -2948,6 +2948,8 @@ Qualification of native code at `c4897c9e94` and the final E2E fixture at
   regressions. The deterministic frontier test covers 8,192 segments, a
   competitive late segment, required-clause absence, equal bounds, cancellation,
   and a one-entry priority queue under pressure.
+- `zig build lake-integration-test -Doptimize=Debug -j2 --summary all`:
+  the same 386 integration tests pass with safety checks, no failures or leaks.
 - `zig build antfly -Doptimize=Debug -j2 --summary all`: the complete standalone
   server builds successfully. Real-file E2Es use a fixed copy of that binary so
   another build cannot replace it between restart assertions.
