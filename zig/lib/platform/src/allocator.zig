@@ -25,6 +25,22 @@ pub fn processAllocator(fallback: std.mem.Allocator) std.mem.Allocator {
     return cOrFallback(fallback);
 }
 
+/// Give synchronous temporary work an independently reclaimable allocator.
+/// Unwrap only standard arenas; quota, failure and other allocator wrappers
+/// remain the boundary so temporary and retained allocations share accounting.
+pub fn reclaimingScratch(alloc: std.mem.Allocator) std.mem.Allocator {
+    var probe = std.heap.ArenaAllocator.init(alloc);
+    var current = alloc;
+    for (0..16) |_| {
+        if (current.vtable != probe.allocator().vtable) break;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
+        const next = arena.child_allocator;
+        if (next.ptr == current.ptr and next.vtable == current.vtable) break;
+        current = next;
+    }
+    return current;
+}
+
 /// Return unused libc heap pages to the operating system after a coarse
 /// process-lifetime teardown boundary. glibc normally retains freed arenas for
 /// reuse, which is efficient for steady allocation shapes but can preserve the
