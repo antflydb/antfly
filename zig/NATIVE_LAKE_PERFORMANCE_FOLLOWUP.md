@@ -5,9 +5,11 @@ and reader leases are implemented on top of PR #1006. The contracts below descri
 implemented refinements and their validation. Publication-wide best-first text
 navigation, adaptive native batches, shared query preparation, and bounded
 profiling/composed/pruner/reranker/evaluation admission are implemented
-in the active follow-up. Cross-source-file compaction, durable cloud generation
-proofs, WAL overlay admission, and representative archive benchmarks remain
-pending; their requirements are recorded at the end.
+in the active follow-up. Eligible accepted-WAL text queries also use bounded
+windows with combined global statistics and recent-first cutoff seeding.
+Cross-source-file compaction, durable cloud generation proofs, broader accepted
+vector/hybrid admission, and representative archive benchmarks remain pending;
+their requirements and current qualification are recorded at the end.
 
 ## Native sparse predicate intersection
 
@@ -3157,3 +3159,55 @@ between restart assertions.
 These are correctness and bounded-work checks. They do not qualify archive-scale
 latency, RSS or provider-request savings, and they do not complete the three
 pending storage/visibility migrations above.
+
+### PR #1112: dependency hydration, prepared membership and accepted-WAL windows
+
+Transform candidate admission now plans physical dependencies before loading
+source. Expression plans supply their required fields; direct-field rerankers
+supply their field; highlight dependencies join that set. Free-form templates
+retain the conservative complete-source path. Both paths share a 64 MiB limit
+covering live hydration scratch, retained candidate JSON and transfer copies.
+If final output needs additional columns, only surviving result rows load them.
+Evaluation exhaustion preserves the public `decision_limit_exceeded` contract.
+
+Immutable query preparation now includes membership and global term frequencies
+for complete-admission, count and ordered windows, alongside ranked routing.
+Bounded window lookahead submits at most one metadata task to the shared I/O
+scheduler, reserving 8 MiB. Saturation falls back to inline required work.
+Cancellation joins the worker before publication, analyzer and navigation owners
+are released. This overlaps navigation with scoring; it does not preload a
+second window of payload readers.
+
+Accepted-WAL text execution builds the recent index once under a separate
+64 MiB bound covering index construction and retained recent readers. Global
+collection counters and term frequencies add recent rows to authenticated base
+statistics exactly once. This preserves the existing immutable BM25 contract:
+masked base rows remain in base scoring statistics. Physical tombstones resolve
+once into compressed file/group/row sets and lower only into admitted windows.
+The translation handles deleted holes, selected segment gaps and high row bits.
+
+Recent rows score first to establish a useful cutoff. Metadata frontier bounds
+use the combined collection statistics; archive payloads enter only when their
+bound remains competitive. Equal-score ordering still places archive rows before
+recent rows and preserves original file/rank order within the archive. Recent
+metadata predicates evaluate against their accepted row images; archive
+predicates retain the published native index path. Final projection and
+highlights use authoritative source rows, including fields hidden from output.
+The reader facade preserves the original range capability separately from its
+global statistics interface. Their opaque pointers have different types and
+must not be substituted for one another.
+
+Standalone accepted text visibility now uses the same durable filesystem WAL
+fallback as CDC admission and SQL. An absent cloud artifact connection no longer
+silently bypasses locally acknowledged changes. Retained cut descriptors retain
+both the archive publication and accepted row images across restart.
+
+The current bounded overlay path covers eligible text queries and composed text
+components. Existing fallbacks remain for unsupported early-source/hierarchy
+shapes, small/legacy inventories and accepted vector/hybrid requests. Cross-file
+serving compaction and durable provider-generation reference/certificate
+migration remain outstanding; these changes do not claim to implement them.
+Real-provider retention qualification was deferred by the operator on October
+13: GCS and R2 are immediately available; a credentialed AWS S3 target is not yet
+selected. No bucket retention policy or production certificate capability was
+changed.

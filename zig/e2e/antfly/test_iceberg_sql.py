@@ -998,3 +998,257 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
+    tmp_path, monkeypatch
+):
+    """Real independent files, native CDC visibility and a durable search cut."""
+    if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
+        pytest.importorskip("pyiceberg")
+        pytest.importorskip("fastavro")
+        pytest.importorskip("pyarrow")
+    import conftest
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import LongType, NestedField, StringType
+
+    catalog = SqlCatalog(
+        "e2e",
+        uri=f"sqlite:///{tmp_path}/catalog.db",
+        warehouse=(tmp_path / "warehouse").as_uri(),
+    )
+    catalog.create_namespace("e2e")
+    table = catalog.create_table(
+        "e2e.events",
+        schema=Schema(
+            NestedField(1, "id", LongType(), required=False),
+            NestedField(2, "body", StringType(), required=False),
+        ),
+    )
+    for part in range(67):
+        table.append(
+            pa.table(
+                {
+                    "id": pa.array(range(part * 3, part * 3 + 3), type=pa.int64()),
+                    "body": [
+                        "quasar " * (i % 4 + 1) for i in range(part * 3, part * 3 + 3)
+                    ],
+                }
+            )
+        )
+    lake = tmp_path / "lake"
+    _export_table(table, lake)
+    payload = (lake / "buckets/antfly/objects/metadata/v1.metadata.json").read_bytes()
+    metadata = json.loads(payload[84:])
+    snapshot = next(
+        s
+        for s in metadata["snapshots"]
+        if s["snapshot-id"] == metadata["current-snapshot-id"]
+    )
+    snapshot.pop("parent-snapshot-id", None)
+    original_config = conftest._write_remote_content_e2e_config
+
+    def configured(root, **kwargs):
+        path = original_config(root, **kwargs)
+        config = json.loads(path.read_text())
+        config["deployment_mode"] = "standalone"
+        config["storage"] = {"engine": "local", "local": {"base_dir": str(root)}}
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(conftest, "_write_remote_content_e2e_config", configured)
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/wal_windows",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {"name": "id_lookup", "keys": [{"column": "id"}]}
+                    ],
+                    "base_source": {
+                        "kind": "external",
+                        "format": "iceberg",
+                        "uri": lake.as_uri(),
+                        "table_id": "events",
+                        "schema_fingerprint": "auto",
+                        "write_policy": "iceberg_writer",
+                        "catalog": {"type": "managed"},
+                    },
+                },
+                "indexes": {
+                    "body_text": {
+                        "type": "full_text",
+                        "field": "body",
+                        "store_source": True,
+                    }
+                },
+            },
+        )
+        initial = call(
+            "POST",
+            "/tables/wal_windows/lake/catalog",
+            {
+                "commit_id": "initialize",
+                "schema": metadata["schemas"][0],
+            },
+        )
+        call(
+            "POST",
+            "/tables/wal_windows/lake/commits",
+            {
+                "commit_id": "independent-archive",
+                "expected_metadata_location": initial["metadata_location"],
+                "requirements": [],
+                "updates": [
+                    {"action": "add-snapshot", "snapshot": snapshot},
+                    {
+                        "action": "set-snapshot-ref",
+                        "ref-name": "main",
+                        "type": "branch",
+                        "snapshot-id": snapshot["snapshot-id"],
+                    },
+                ],
+            },
+        )
+        deadline = time.monotonic() + 120
+        while True:
+            index = call("GET", "/tables/wal_windows/indexes/body_text")
+            if index["status"]["readiness"]["queryable"]:
+                probe = call(
+                    "POST",
+                    "/tables/wal_windows/query",
+                    {
+                        "full_text_search": {"match": "quasar", "field": "body"},
+                        "limit": 201,
+                    },
+                )
+                if len(probe["hits"]["hits"]) == 201:
+                    break
+            assert time.monotonic() < deadline, index
+            time.sleep(0.1)
+        accepted = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "recent",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "1",
+                "key_fields": ["id"],
+                "changes": [
+                    {"op": "delete", "row": {"id": 1}},
+                    {"op": "upsert", "row": {"id": 0, "body": "quasar replacement"}},
+                    {
+                        "op": "upsert",
+                        "row": {"id": 1000, "body": "quasar recent recent"},
+                    },
+                ],
+            },
+        )
+        query = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "fields": ["id", "body"],
+            "limit": 201,
+            "profile": True,
+            "lake_read": {
+                "visibility": "accepted",
+                "through": accepted["read_receipt"],
+            },
+            "highlight": {"fields": ["body"]},
+        }
+        first = call("POST", "/tables/wal_windows/query", query)
+        hits = first["hits"]["hits"]
+        assert (
+            first["profile"]["sort"]["selection_reason"]
+            == "bounded_global_text_frontier"
+        ), first
+        assert len(hits) == 201, first
+        rows = {h["_source"]["id"]: h["_source"]["body"] for h in hits}
+        assert 1 not in rows and rows[0] == "quasar replacement"
+        assert rows[1000] == "quasar recent recent"
+        assert all(h.get("_highlights") for h in hits), first
+        pinned = dict(query, remote_snapshot=first["remote_snapshot"])
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            repeated = call("POST", "/tables/wal_windows/query", pinned)
+            assert repeated["hits"] == first["hits"]
+            filtered = call(
+                "POST",
+                "/tables/wal_windows/query",
+                dict(
+                    pinned,
+                    fields=["id"],
+                    filter_query={"term": {"path": "/id", "value": 1000}},
+                ),
+            )
+            assert [h["_source"] for h in filtered["hits"]["hits"]] == [{"id": 1000}]
+            assert filtered["hits"]["hits"][0].get("_highlights"), filtered
+            archive = call(
+                "POST",
+                "/tables/wal_windows/query",
+                dict(
+                    pinned,
+                    fields=["id"],
+                    filter_query={"term": {"path": "/id", "value": 2}},
+                ),
+            )
+            assert [h["_source"] for h in archive["hits"]["hits"]] == [{"id": 2}]
+            recent_only = call(
+                "POST",
+                "/tables/wal_windows/query",
+                dict(
+                    pinned,
+                    full_text_search={"term": "recent", "field": "body"},
+                    fields=["id"],
+                ),
+            )
+            assert [h["_source"] for h in recent_only["hits"]["hits"]] == [{"id": 1000}]
+            counted = call("POST", "/tables/wal_windows/query", dict(pinned, limit=0))
+            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

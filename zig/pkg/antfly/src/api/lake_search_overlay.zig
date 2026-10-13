@@ -57,10 +57,32 @@ pub const Overlay = struct {
     /// immutable statistics are added to published base statistics, matching
     /// compose's existing BM25 contract (tombstones do not subtract statistics).
     pub fn recent(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+        return self.recentBounded(a, name, analysis, schema, field, context, 64 * 1024 * 1024);
+    }
+    const RecentOwner = struct {
+        a: A,
+        budget: local.sql_memory_budget,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.budget.live == 0);
+            self.a.destroy(self);
+        }
+    };
+    fn recentBounded(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context, limit: usize) !search.PinnedTextSource {
+        const owner = try a.create(RecentOwner);
+        errdefer a.destroy(owner);
+        owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = limit } };
+        return self.buildRecent(owner, name, analysis, schema, field, context) catch |err| {
+            if (owner.budget.exhausted) return error.LakeOverlayTooLarge;
+            return err;
+        };
+    }
+    fn buildRecent(self: *const Overlay, owner: *RecentOwner, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+        const a = owner.budget.allocator();
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
         try self.appendRecent(a, &writer, analysis, schema, field, context);
-        return .{ .snapshot = writer.acquireSnapshot(), .name = name, .text_analysis = analysis, .runtime_schema = schema, .selected_field = field };
+        return .{ .snapshot = writer.acquireSnapshot(), .name = name, .text_analysis = analysis, .runtime_schema = schema, .selected_field = field, .owner = owner, .release_owner = RecentOwner.release };
     }
     fn appendRecent(self: *const Overlay, a: A, writer: *local.index.IndexWriter, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !void {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -101,9 +123,17 @@ pub const Overlay = struct {
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .base = base, .preparation = preparation, .context = context };
-        const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = owner, .check = Owner.check, .io = context.io });
+        // Range binders interpret the opaque capability using their own type.
+        // Preserve the exact admitted base capability; the statistics owner is
+        // a separate interface and must never replace the reader's context.
+        const snapshot = if (base.snapshot.read_context_check) |check|
+            try writer.acquireSnapshotWithReadCapability(.{ .ptr = base.snapshot.read_context.?, .check = check, .io = base.snapshot.read_context_io })
+        else if (base.read_context) |read_context|
+            try writer.acquireSnapshotWithReadContext(read_context)
+        else
+            try writer.acquireSnapshotWithReadCapability(.{ .ptr = owner, .check = Owner.check, .io = context.io });
         snapshot.text_statistics = .{ .ptr = owner, .check = Owner.check, .frequencies = Owner.frequencies, .summary = Owner.summary };
-        return .{ .snapshot = snapshot, .read_context = owner, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .provider_metadata = base.provider_metadata, .owner = owner, .release_owner = Owner.release };
+        return .{ .snapshot = snapshot, .read_context = snapshot.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .provider_metadata = base.provider_metadata, .owner = owner, .release_owner = Owner.release };
     }
     fn shareMasked(a: A, writer: *local.index.IndexWriter, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !void {
         const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, base.snapshot.segments.len);
@@ -306,6 +336,7 @@ test "external lake bounded WAL windows preserve composed BM25 and private masks
     var totals = reference.snapshot.global_total_field_len.iterator();
     while (totals.next()) |field| try collection_fields.append(sa, .{ .name = field.key_ptr.*, .total_length = field.value_ptr.* });
     const collection: @import("lake_index_native_text.zig").Collection = .{ .documents = reference.snapshot.scoringDocCount(), .fields = collection_fields.items };
+    try std.testing.expectError(error.LakeOverlayTooLarge, changes.recentBounded(a, "text", .{}, null, "body", .{}, 1024));
     var recent_pin = try (try changes.recent(a, "text", .{}, null, "body", .{})).share(a);
     defer recent_pin.deinit();
     const queries = [_]local.search_search.SearchQuery{
@@ -403,4 +434,69 @@ test "external lake masked overlays retain physical allocation ownership and que
     try std.testing.expect(control.checks > 0);
     control.cancelled = true;
     try std.testing.expectError(error.Canceled, joined.snapshot.checkScoringReadContext());
+}
+
+test "external lake bounded WAL windows retain the range reader capability type" {
+    const a = std.testing.allocator;
+    var segment = local.segment.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("one", "{}");
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    const Control = struct {
+        binds: usize = 0,
+        cancelled: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancelled) return error.Canceled;
+        }
+    };
+    const Source = struct {
+        bytes: []const u8,
+        expected: *Control,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn bind(raw: *anyopaque, _: A, context: *anyopaque) !local.index.SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (context != @as(*anyopaque, @ptrCast(self.expected))) return error.InvalidReadCapabilityType;
+            try Control.check(context);
+            self.expected.binds += 1;
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } };
+        }
+    };
+    var control: Control = .{};
+    var source: Source = .{ .bytes = bytes, .expected = &control };
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    var replacements = [_]local.index.ReplacementSegmentData{.{ .id = 1, .data = .fromNative(.{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = Source.read, .close = Source.close, .bind_read_context = Source.bind } }) }};
+    try writer.replaceSegmentsManyData(&.{}, &replacements);
+    var base: search.PinnedTextSource = .{ .snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &control, .check = Control.check }), .read_context = &control, .name = "text", .text_analysis = .{}, .runtime_schema = null };
+    var transferred = false;
+    defer if (!transferred) base.deinit();
+    const Stats = struct {
+        fn average(_: *anyopaque, _: []const u8) f32 {
+            return 1;
+        }
+        fn frequencies(_: *anyopaque, _: A, _: []const u8, _: []const []const u8, out: []u32) !void {
+            @memset(out, 0);
+        }
+    };
+    const prepared = (try local.search_search.TextNavigationPlan.prepare(a, .match_all, .{ .ptr = &control, .count = 1, .average = Stats.average, .frequencies = Stats.frequencies }, .{})).?;
+    defer prepared.deinit();
+    var mask = Bitmap.init(a);
+    defer mask.deinit();
+    var window = try Overlay.window(base, &mask, .{ .documents = 1, .fields = &.{} }, prepared, .{});
+    transferred = true;
+    defer window.deinit();
+    var lease = try window.snapshot.leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expectEqual(@as(usize, 1), control.binds);
+    const id = (try window.snapshot.storedIdScoped(a, 0)).?;
+    defer a.free(id);
+    try std.testing.expectEqualStrings("one", id);
+    control.cancelled = true;
+    try std.testing.expectError(error.Canceled, window.snapshot.checkScoringReadContext());
 }

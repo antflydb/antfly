@@ -79,6 +79,9 @@ pub fn createObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cach
 pub fn prepareObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics) !?*Self {
     return initialize(a, root, store, cached, token, text, analysis, schema, metrics, false, null);
 }
+pub fn createRecentObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics, recent: *const local.index.IndexSnapshot) !?*Self {
+    return initialize(a, root, store, cached, token, text, analysis, schema, metrics, true, recent);
+}
 pub fn prepareRecentObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics, recent: *const local.index.IndexSnapshot) !?*Self {
     return initialize(a, root, store, cached, token, text, analysis, schema, metrics, false, recent);
 }
@@ -448,6 +451,10 @@ test "external lake global frontier reaches late competitive segments and comple
     try prepared_recent.plan.?.preparedFrequencies("body", &.{ "common", "rare", "novel" }, &dfs);
     try std.testing.expectEqualSlices(u32, &.{ 8193, 4, 1 }, &dfs);
     try std.testing.expectError(error.UnpreparedTextTerm, prepared_recent.plan.?.preparedFrequencies("body", &.{"unknown"}, dfs[0..1]));
+    const recent_frontier = (try createRecentObserved(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{}, null, recent.snapshot)).?;
+    defer recent_frontier.deinit();
+    try std.testing.expectEqual(last, (try recent_frontier.next(null)).?);
+    try std.testing.expectEqual(prepared_recent.root.collection.?.documents, recent_frontier.root.collection.?.documents);
     // Cancellation never turns a partial frontier into a successful result.
     const Cancel = struct {
         fn yes(_: *const anyopaque) bool {

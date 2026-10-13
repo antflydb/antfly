@@ -94,7 +94,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (schema.binding.write_policy != .iceberg_writer) return error.UnsupportedQueryRequest;
         if (read.through) |receipt| {
             if (receipt.table_id != table.table_id or receipt.object_generation != table.object_storage_generation) return error.CatalogGenerationChanged;
-            if (server.cfg.node_config == null or server.cfg.node_config.?.storage.artifacts.connection == null) return error.UnsupportedQueryRequest;
+            if (server.cfg.node_config == null) return error.UnsupportedQueryRequest;
         }
     }
     if (retained) |cut| {
@@ -103,7 +103,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (cut.pending.changes.len != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
     }
     if (published_only or retained != null) try pinPublishedSource(&source_schema.binding, publication.base_source);
-    if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
+    // The configured queue supports durable standalone filesystem fallback as
+    // well as cloud connections. Accepted visibility must follow that same
+    // authority rather than silently ignoring locally acknowledged WAL rows.
+    if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null) {
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
         defer current.deinit(a);
@@ -1272,11 +1275,14 @@ const Execution = struct {
         }
         const frontier_mod = @import("lake_index_text_frontier.zig");
         var frontier: ?*frontier_mod = null;
-        if (self.overlay == null and ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
+        if (ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
-            frontier = frontier_mod.createObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics) catch |err| switch (err) {
+            frontier = (if (recent) |pin|
+                frontier_mod.createRecentObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics, pin.snapshot)
+            else
+                frontier_mod.createObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics)) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.NativeLakeTermDirectoryKeyTooLarge => null,
                 else => return err,
             };
@@ -1298,7 +1304,7 @@ const Execution = struct {
         if (self.overlay) |overlay| {
             // Unsupported prepared syntax retains the independent complete
             // corpus path; window-local frequencies are never a substitute.
-            if (preparation == null) return null;
+            if (frontier == null and preparation == null) return null;
             if (overlay.physical == null) {
                 const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
                 const excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
@@ -1357,17 +1363,22 @@ const Execution = struct {
             // Full-match evaluation must establish complete membership before
             // evaluating any source; a competitive top-K cannot prove it.
             const competitive_cutoff = if (req.evaluation_matches) null else winners.cutoff();
-            const pulled = try ahead.next(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
-            const recent_window = pulled == null;
-            if (recent_window and (recent == null or recent_scored)) break;
+            // Recent rows seed the competitive cutoff, but retain their logical
+            // position after all archive rows when equal scores are compared.
+            const recent_window = recent != null and !recent_scored;
+            const pulled = if (recent_window) null else try ahead.next(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
+            if (pulled == null and !recent_window) break;
             var window: @import("lake_index_text_directory.zig").RoutingCursor.Window = .{ .identities = &.{}, .doc_offset = root.collection.?.documents };
             if (pulled) |value| {
                 // Copy worker-owned output before the single lookahead reuses it.
                 @memcpy(ids[0..value.identities.len], value.identities);
                 window = .{ .identities = ids[0..value.identities.len], .doc_offset = value.doc_offset };
                 ahead.prefetch(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
-            } else recent_scored = true;
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
+            } else {
+                recent_scored = true;
+                ahead.prefetch(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
+            }
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
             var request = retrievalRequest(req);
             request.offset = 0;
@@ -1407,9 +1418,14 @@ const Execution = struct {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
                 const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
                 if (frontier != null) {
-                    const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
-                    const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
-                    try winners.addPositioned(hit, try identities.logicalPosition(hit.native_text_doc_id.?), location);
+                    const position: @import("lake_index_text_directory.zig").Position = if (recent_window)
+                        .{ .file = @splat(0), .rank = hit.native_text_doc_id.?, .recent = true }
+                    else archive: {
+                        const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
+                        const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
+                        break :archive try identities.logicalPosition(hit.native_text_doc_id.?);
+                    };
+                    try winners.addPositioned(hit, position, location);
                 } else try winners.addLocated(hit, ordinal, location);
             }
             // Raise cutoff promptly while winners improve; amortize setup when
@@ -2762,6 +2778,7 @@ const PagedWinners = struct {
             if (order != .eq) return order;
             if (l.position) |left| {
                 const right = r.position.?;
+                if (left.recent != right.recent) return if (left.recent) .lt else .gt;
                 const file = std.mem.order(u8, &right.file, &left.file);
                 return if (file == .eq) std.math.order(right.rank, left.rank) else file;
             }
@@ -2952,6 +2969,22 @@ test "external lake global frontier winners keep logical file rank ties after ar
     try std.testing.expectEqualStrings("best", hits[0].id);
     try std.testing.expectEqualStrings("first", hits[1].id);
     try std.testing.expectEqualStrings("second", hits[2].id);
+}
+
+test "external lake bounded WAL frontier ties retain archive order when recent is scored first" {
+    const a = std.testing.allocator;
+    var winners = PagedWinners.init(a, 2);
+    defer winners.deinit();
+    try winners.addPositioned(.{ .id = @constCast("recent"), .score = 1 }, .{ .file = @splat(0), .rank = 0, .recent = true }, null);
+    try winners.addPositioned(.{ .id = @constCast("archive-late"), .score = 1 }, .{ .file = @splat(255), .rank = 2 }, null);
+    try winners.addPositioned(.{ .id = @constCast("archive-first"), .score = 1 }, .{ .file = @splat(255), .rank = 1 }, null);
+    const hits = try winners.finish(0);
+    defer {
+        for (hits) |*hit| hit.deinit(a);
+        a.free(hits);
+    }
+    try std.testing.expectEqualStrings("archive-first", hits[0].id);
+    try std.testing.expectEqualStrings("archive-late", hits[1].id);
 }
 
 test "external lake bounded window profiles sum work and preserve actual peaks" {

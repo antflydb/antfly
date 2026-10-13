@@ -1065,4 +1065,4 @@ pub const RoutingCursor = struct {
 /// Logical position stays independent of admission/traversal order. This compact
 /// pair has the same order as a full immutable routing walk, without summing all
 /// earlier files' documents or admitting their inventories.
-pub const Position = struct { file: Id, rank: u32 };
+pub const Position = struct { file: Id, rank: u32, recent: bool = false };
