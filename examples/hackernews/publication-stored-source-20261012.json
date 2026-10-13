@@ -1,0 +1,243 @@
+{
+  "status": "failed_one_file_qualification",
+  "scope": "142577-row unchanged raw BigQuery Parquet partition; full archive and managed Cloud deployment not qualified",
+  "source_revision": "9663fe3bdcf2b2fb57643cc753fb76a3b66926f7",
+  "binary_sha256": "d3653a392408cd8e179ec1b890507be5131346981323b0c0ab6e0a8d2a082bc6",
+  "region": "us-central1",
+  "store_source": true,
+  "cycles": [
+    {
+      "cycle": 1,
+      "publication_seconds": 424.38,
+      "registration_seconds": 0.63,
+      "sql_count": 142577,
+      "peak_rss_bytes": 310849536,
+      "cold_ms": 17969.42,
+      "cold_io_profile": {
+        "phase": "cold",
+        "elapsed_ms": 17969.42,
+        "took_ms": 17857,
+        "filter": null,
+        "network_rx_bytes": 70749666,
+        "network_tx_bytes": 8283890,
+        "cpu_ms": 5450.0
+      },
+      "warm_p95_ms": 295.34,
+      "concurrent_max_ms": 777.11,
+      "restart_ms": 712.42,
+      "cursor_depth": {
+        "hits": 4110,
+        "samples_ms": [
+          2395.13,
+          2251.96,
+          2111.78,
+          2462.22,
+          1234.27,
+          1254.07,
+          1320.83,
+          1472.42,
+          1530.45,
+          1398.69,
+          952.39,
+          1039.11,
+          1187.13,
+          773.23,
+          513.54,
+          599.84,
+          649.92,
+          501.33,
+          512.91,
+          504.53,
+          521.49,
+          535.33,
+          467.27,
+          495.03,
+          463.5,
+          551.38,
+          587.94,
+          496.09,
+          488.87,
+          468.96,
+          477.42,
+          375.53,
+          364.92
+        ],
+        "term": "AI",
+        "initial_ms": 4933.67,
+        "restart_ms": 1288.55
+      },
+      "cursor_p95_ms": 2395.13,
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "cache_bytes": 127338744,
+      "cache_files": 1693,
+      "metadata_filter_p95_ms": {
+        "item_type": 372.81,
+        "author": 553.15,
+        "points": 434.76,
+        "created_at": 271.92,
+        "combined": 267.08
+      },
+      "metadata_filter_restart_ms": {
+        "item_type": 610.66,
+        "author": 287.48,
+        "points": 627.4,
+        "created_at": 353.27,
+        "combined": 273.06
+      }
+    },
+    {
+      "cycle": 2,
+      "publication_seconds": 0.2,
+      "registration_seconds": 0,
+      "sql_count": 142577,
+      "peak_rss_bytes": 55894016,
+      "cold_ms": 15930.83,
+      "cold_io_profile": {
+        "phase": "cold",
+        "elapsed_ms": 15930.83,
+        "took_ms": 15783,
+        "filter": null,
+        "network_rx_bytes": 67288282,
+        "network_tx_bytes": 978578,
+        "cpu_ms": 4100.0
+      },
+      "warm_p95_ms": 297.42,
+      "concurrent_max_ms": 764.52,
+      "restart_ms": 702.98,
+      "cursor_depth": {
+        "hits": 4110,
+        "samples_ms": [
+          2272.27,
+          2175.62,
+          2009.71,
+          2284.24,
+          1277.38,
+          1231.03,
+          1312.16,
+          1354.13,
+          1569.86,
+          1433.32,
+          913.77,
+          1001.98,
+          1202.34,
+          802.41,
+          536.26,
+          587.19,
+          634.01,
+          520.15,
+          537.74,
+          531.93,
+          488.85,
+          480.14,
+          447.76,
+          518.75,
+          494.52,
+          528.94,
+          507.03,
+          513.44,
+          478.31,
+          485.65,
+          521.98,
+          372.65,
+          345.48
+        ],
+        "term": "AI",
+        "initial_ms": 4668.78,
+        "restart_ms": 1329.15
+      },
+      "cursor_p95_ms": 2272.27,
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "cache_bytes": 127863224,
+      "cache_files": 1695,
+      "metadata_filter_p95_ms": {
+        "item_type": 349.09,
+        "author": 262.33,
+        "points": 432.01,
+        "created_at": 276.53,
+        "combined": 269.09
+      },
+      "metadata_filter_restart_ms": {
+        "item_type": 620.11,
+        "author": 294.01,
+        "points": 626.71,
+        "created_at": 344.58,
+        "combined": 309.49
+      }
+    }
+  ],
+  "verdict": {
+    "passed": false,
+    "failures": [
+      "indexed/1: cold_ms=17969.42 exceeds 10000",
+      "indexed/1: deep cursor latency/restart gate failed",
+      "indexed/2: cold_ms=15930.83 exceeds 10000",
+      "indexed/2: deep cursor latency/restart gate failed"
+    ],
+    "scope": "Single-table archive engine qualification. Current/history ingestion and public deployment are separate gates.",
+    "cleanup": {
+      "pod": "hackernews-benchmark-5368a5a56002",
+      "created": true,
+      "deleted": true
+    }
+  },
+  "cleanup": {
+    "pod_deleted": true,
+    "artifacts": {
+      "prefix": "hn-poc/archive-qualification/5d73fd603c1b4f90bdba7b283afff5fb",
+      "deleted": 7429,
+      "bytes": 469480849,
+      "generation_conditioned": true,
+      "source_preserved": true
+    }
+  },
+  "budget": {
+    "original_ceiling_usd": 150,
+    "held_or_recorded_exposure_usd": 124.48912,
+    "not_posted_billing": true
+  },
+  "limitations": [
+    "Pod-wide network counters do not attribute traffic to a query phase.",
+    "Early deep cursor pages and first cold queries exceeded latency gates.",
+    "Passing correctness and restart gates does not establish archive performance."
+  ]
+}

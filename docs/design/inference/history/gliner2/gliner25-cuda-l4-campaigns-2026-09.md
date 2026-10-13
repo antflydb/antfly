@@ -16,7 +16,9 @@ gate from update 33, so its faster timings remain diagnostic. V38 subsequently c
 that eager full/B8 gap: 35.51 versus 33.69 examples/s, 5.7% lower paired native
 latency, and raw-bit equality for weights/moments through 100 updates. Its
 training-only 2 GiB idle-cache default keeps physical allocation limits and
-pressure eviction; other CUDA owners keep their 1 GiB default. The v38 suite
+pressure eviction; other CUDA owners keep their 1 GiB default
+(`cudaTempCacheBudgetBytes` in `zig/pkg/inference/src/ops/cuda/cuda_compute.zig`,
+overridable with `ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB`). The v38 suite
 passes 107 regressions with three Metal-only skips. The other rows have also been refreshed on v38: heads/B2 is 48.09 versus 14.74
 examples/s, heads/B8 86.34 versus 51.54, and full/B2 15.43 versus 9.04. All four
 100-update rows have raw-bit equality at all 48 sampled states, and all paired

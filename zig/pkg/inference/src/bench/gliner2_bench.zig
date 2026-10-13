@@ -40,7 +40,6 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    onnx,
     cuda,
 };
 
@@ -341,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    if (opts.format == .text and model.session.backend() != .onnx) {
+    if (opts.format == .text) {
         var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
         defer debug_backend.deinit();
         const provider_stats = debug_backend.debugTimingSnapshot().provider;
@@ -652,7 +651,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
         .auto => &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
-        .onnx => &.{backends.BackendType.onnx},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
@@ -759,7 +757,6 @@ fn parseBackend(value: []const u8) ?BackendChoice {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
     return null;
 }
@@ -945,7 +942,7 @@ fn printCsv(writer: *std.Io.Writer, opts: Options, result: Result) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT | --text-file PATH | --text-batch-file PATH] [--text-repeat N] [--print-encoder-seq-len] [--expect-encoder-seq-len N] [--batch-size N] [--ragged] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT | --text-file PATH | --text-batch-file PATH] [--text-repeat N] [--print-encoder-seq-len] [--expect-encoder-seq-len N] [--batch-size N] [--ragged] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\  --text-batch-file reads one non-empty input per line and derives batch size unless --batch-size is supplied and matches.
         \\  --ragged applies only to a single repeated text source.
         \\  Profile capture selects shadow mode unless a conflicting mode is explicit.

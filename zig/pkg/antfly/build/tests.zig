@@ -1436,6 +1436,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native doc values plan rejects runtime value kind mismatch",
         "required native sort fails on absent physical doc value section",
         "required native sort fails on sparse doc value entry miss",
+        "pattern native pointer scalar filters",
         "pattern typed structured filters accept explicit path alias",
         "pattern typed structured filters reject ambiguous field and path aliases",
         "pattern typed structured filters reject malformed and unbounded ranges",
@@ -2570,6 +2571,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
+    b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -6607,6 +6610,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.artifact_footprint.",
             "storage.artifact_input_capture.",
             "storage.artifact_publication_dispatch.",
+            "storage.prepared_score_plan.",
             "storage.projection_seal.",
             "storage.retained_frame.",
             "storage.admission_waiter.",

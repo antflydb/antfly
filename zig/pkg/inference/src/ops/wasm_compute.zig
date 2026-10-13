@@ -1515,7 +1515,10 @@ pub const WasmCompute = struct {
     fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
-        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu)
+        // DeBERTa also produces GPU-resident FFN activations. Keep exact
+        // (erf-based) GELU on device instead of downloading every layer to WASM.
+        if ((build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu) or
+            shouldPreferGpuElementwise(self, inp, null, inp.len))
             return self.modernGpuOp(inp, 0, inp.len, 1, 0, 0, 0, 0, 0);
         try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
@@ -4264,7 +4267,8 @@ pub const WasmCompute = struct {
             @intCast(head_dim),
         );
 
-        out_buf.downloadF32(out);
+        // The caller returns a device-authoritative WasmBuf. Its next linear
+        // consumes this buffer directly; host consumers use ensureHostData().
         wasm_extern.freeBuffer(mask_buf);
         return out_buf;
     }

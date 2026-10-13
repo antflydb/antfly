@@ -34,8 +34,8 @@ const timing_boundary = "schema_parse_compile+processor+encoder+heads+decode+tem
 
 comptime {
     if (builtin.mode != .fast) @compileError("GLiNER2.5 benchmark requires -Doptimize=fast for the complete dependency graph");
-    if (build_options.enable_metal or build_options.enable_onnx or build_options.enable_pjrt)
-        @compileError("GLiNER2.5 CPU benchmark requires -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false");
+    if (build_options.enable_metal or build_options.enable_pjrt)
+        @compileError("GLiNER2.5 CPU benchmark requires -Dmetal=false -Dcuda=false -Dpjrt=false");
 }
 
 const Pin = struct { sha256: []const u8, size_bytes: usize };

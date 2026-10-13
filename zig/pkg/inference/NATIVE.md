@@ -119,12 +119,12 @@ Non-macOS native acceleration is configured with:
 - `-Dblas-root=/path`
 - `-Dblas=linked`
 
-This configures include/library/runtime search paths without making ONNX Runtime bundles part of the native backend contract.
+This configures include/library/runtime search paths for the linked BLAS library only.
 
 ## Constraints
 
 - Do not regress WASM portability.
-- Do not make the native CPU backend depend on ONNX Runtime packaging details.
+- Do not make the native CPU backend depend on an external inference runtime; ONNX models run on the native ONNX importer.
 - Prefer narrow, verified refactors over a one-shot rename across the whole tree.
 
 ## Quantized GGUF Dispatch Policy

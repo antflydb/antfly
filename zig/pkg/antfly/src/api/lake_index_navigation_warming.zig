@@ -150,12 +150,17 @@ pub fn warmPublication(a: A, server: *@import("http_server.zig").ApiHttpServer, 
     return warmPublicationWithin(a, server, table, .{});
 }
 pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
+    if (server.cfg.node_config) |config| if (!config.lake_indexes.navigation_warming.enabled) return;
+    // Initialization may reconcile before lifecycle callbacks are installed.
+    // Do not memoize that absence as a completed warmup for this generation.
+    if (server.source.lakeIndexLifecycleAuthority(caller) == null) return;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return;
     if (publication.reader_protocol != local.metadata_lake_index_catalog.native_reader_protocol) return;
     var store = try @import("lake_index_store.zig").Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
+    if (!std.mem.eql(u8, &publication.signature.store, &store.identity)) return error.ExternalLakeIndexStoreChanged;
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update(&store.identity);
     var table_bytes: [8]u8 = undefined;
@@ -200,9 +205,17 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     context = lease.readContext();
     try server.prepareLakeCache();
     const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
+    // Published metadata can hold only the directory reference. Read the small
+    // authenticated declaration document; never expand maintenance contributions.
+    const declarations = if (publication.directory != null and publication.declarations.len == 0) blk: {
+        const ref = publication.directory.?;
+        const document = try @import("lake_index_directory.zig").loadDocument(state.arena.allocator(), store.artifactStore(), .{ .kind = .external_base_source, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+        if (document.declarations.len != ref.count) return error.InvalidLakeIndexCatalog;
+        break :blk document.declarations;
+    } else publication.declarations;
     var roots: [max_pages]Navigation = undefined;
     var count: usize = 0;
-    for (publication.declarations) |declaration| {
+    for (declarations) |declaration| {
         try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();

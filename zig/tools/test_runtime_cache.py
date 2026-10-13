@@ -544,32 +544,6 @@ class RuntimeCacheTest(unittest.TestCase):
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
 
-    def test_optional_onnx_dependencies(self):
-        source = self.own("zig/lib/audio/src/mod.zig")
-        source.write_bytes(
-            source.read_bytes()
-            + b'\npub const cache_test_profile = @import("builtin").mode;\n'
-        )
-        settings = ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}")
-        for standalone in (False, True):
-            with self.subTest(standalone=standalone):
-                if standalone:
-                    self.use_standalone()
-                self.build("--help", settings=settings)
-                self.assertIn(
-                    "BENCH_PROFILE debug debug",
-                    self.build("cache-antfly-inference-audio-bench", settings=settings),
-                )
-                if not standalone:
-                    self.build("lib-hash-test", settings=settings)
-                target = "cache-inference" if standalone else "cache-probe"
-                self.build(target)
-                failure = self.build(target, settings=settings, succeeds=False)
-                self.assertIn("onnxruntime", failure)
-                self.assertNotIn("panic:", failure)
-                self.assertIn("Build Summary:", failure)
-                self.build(target)
-
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
             path = self.own(source)
@@ -635,10 +609,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(*targets, backend=backend, settings=settings),
@@ -715,10 +685,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -882,10 +848,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -1285,7 +1247,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         ("-Dskip-openapi=true",),
                     ]
                 else:
-                    settings_to_check += [("-Donnx=true",), ("-Dpjrt=true",)]
+                    settings_to_check += [("-Dpjrt=true",)]
                 for settings in settings_to_check:
                     output = self.build(
                         "cache-inference-wasm", settings=base + settings

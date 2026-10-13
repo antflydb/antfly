@@ -106,7 +106,6 @@ pub fn addGliner(ctx: Context) void {
     // metal_kernels.m. Linking it again at the executable root produces
     // duplicate Metal symbols in these standalone benchmark tools.
     gliner2_bench_exe.root_module.link_libc = true;
-    runtime_build.configureOnnxRuntime(b, gliner2_bench_exe.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     const run_gliner2_bench = ctx.addRunArtifact(gliner2_bench_exe);
     run_gliner2_bench.addPassthruArgs();
     const gliner2_bench_step = ctx.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
@@ -154,7 +153,6 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .optimize = ctx.optimize,
     });
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
-        .c_bindings = ctx.graph.c_bindings,
         .build_info_mod = ctx.graph.build_info_mod,
         .identities = ctx.graph.identities,
         .build_options_mod = ctx.graph.build_options_mod,
@@ -199,7 +197,6 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         artifact.root_module.addImport("onnx_data", ctx.graph.onnx.data);
         artifact.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
         ctx.configureNativeTool(artifact, ctx.backend.enable_metal);
-        runtime_build.configureOnnxRuntime(b, artifact.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     }
     return .{
         .bge_m3_e2e_bench_exe = bge_m3_e2e_bench_exe,

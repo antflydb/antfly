@@ -44,6 +44,27 @@ class ConstructionRecoveryTests(unittest.TestCase):
         )
         return result, observed, polls
 
+    def test_flat_source_is_staged_without_mutating_input(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, state = root / "input", root / "state"
+            (source / "archive").mkdir(parents=True)
+            parquet = source / "archive" / "part.parquet"
+            parquet.write_bytes(b"unchanged input")
+            staged = poc.prepare_filesystem_source(source, state)
+            target = (
+                staged / "archive" / "buckets" / "antfly" / "objects" / parquet.name
+            )
+            self.assertEqual(target.read_bytes()[:8], b"AFOBJ001")
+            self.assertEqual(target.read_bytes()[84:], parquet.read_bytes())
+            self.assertFalse((source / "archive" / "buckets").exists())
+            self.assertEqual(poc.prepare_filesystem_source(source, state), staged)
+            parquet.write_bytes(b"changed input")
+            with self.assertRaisesRegex(ValueError, "Staged source changed"):
+                poc.prepare_filesystem_source(source, state)
+
     def test_timeout_recovers_under_original_deadline(self):
         failed = {"status": {"readiness": {"state": "failed"}, "error": "Timeout"}}
         pending = {"status": {"readiness": {"state": "pending"}}}

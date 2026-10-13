@@ -96,7 +96,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const sanitize_thread = shared.sanitize_thread;
     const runtime_artifact_role = shared.runtime_artifact_role;
     const antfly_bin_name = shared.antfly_bin_name;
-    const inference_enable_onnx = shared.inference_enable_onnx;
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
@@ -856,7 +855,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
-        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,

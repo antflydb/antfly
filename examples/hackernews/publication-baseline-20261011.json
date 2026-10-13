@@ -1,0 +1,76 @@
+{
+  "status": "failed_one_file_qualification",
+  "scope": "one unchanged raw BigQuery Parquet file; not the full archive",
+  "source_revision": "f129ce117639806e95046fab9e9714d77cda8dbf",
+  "binary_sha256": "ecc35ab99dd4f7271e074fc3e8c0219b10f11f7688dbbc4bed238e9bdb5d986a",
+  "region": "us-central1",
+  "pod": "hackernews-benchmark-472a66302d5d",
+  "resources": {
+    "cpu": 8,
+    "memory_gib": 48,
+    "disk_gib": 10
+  },
+  "rows": 142577,
+  "source_generation": "1791748034027621",
+  "source_bytes": 61797036,
+  "publication": "completed before the SQL count and query checks",
+  "publication_seconds": null,
+  "elapsed_until_later_failure_seconds": 1107.78,
+  "store_source": false,
+  "cold": {
+    "phase": "cold",
+    "elapsed_ms": 16102.41,
+    "took_ms": 13767,
+    "filter": null,
+    "network_rx_bytes": 55652318,
+    "network_tx_bytes": 1382021,
+    "cpu_ms": 3670.0
+  },
+  "warm_primary_p95_ms": 323.13,
+  "warm_primary_samples_ms": [
+    290.73,
+    286.97,
+    296.03,
+    323.01,
+    305.9,
+    296.01,
+    299.8,
+    323.13,
+    295.22,
+    291.09,
+    289.61,
+    291.88,
+    347.59,
+    302.92,
+    284.81,
+    291.84,
+    295.45,
+    295.92,
+    311.62,
+    285.56
+  ],
+  "failure_phase": "composed_sources",
+  "composed_sources": "HTTP 422 unsupported_exact_sort on numeric native-key filter",
+  "deep_cursor": {
+    "hits": 0,
+    "samples_ms": [],
+    "term": "the",
+    "initial_ms": 241.72
+  },
+  "corrected_cursor_term": "AI",
+  "corrected_cursor_exact_matches": 4110,
+  "restart": "not measured; earlier composed failure aborted run",
+  "cleanup": {
+    "pod_deleted": true,
+    "artifacts": {
+      "prefix": "hn-poc/archive-qualification/245412afa2ca4b7c8f247128d5c7e047",
+      "deleted": 11129,
+      "bytes": 370058845,
+      "generation_conditioned": true,
+      "source_preserved": true
+    }
+  },
+  "passed": false,
+  "build_peak_rss_bytes": 283549696,
+  "registration_seconds": 4.5
+}

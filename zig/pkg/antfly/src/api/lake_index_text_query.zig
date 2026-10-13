@@ -287,6 +287,7 @@ const Execution = struct {
     vector_include: ?@import("lake_index_physical_set.zig").Set = null,
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
+    ordinal_live_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
     predicate_exclusion_json: []const u8 = "",
     predicate_allow_partial: bool = true,
     delivery_request: ?types.SearchRequest = null,
@@ -494,6 +495,7 @@ const Execution = struct {
         return true;
     }
     fn deinit(self: *Execution) void {
+        self.ordinal_live_rows.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
         self.highlight_locations.deinit(self.arena);
@@ -508,6 +510,16 @@ const Execution = struct {
         const self: *Execution = @ptrCast(@alignCast(@constCast(raw)));
         self.context.ensureActive() catch return true;
         return false;
+    }
+    fn publicDocNum(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, doc: u32) !?[]u8 {
+        const self = from(raw);
+        try self.context.ensureActive();
+        // Recent/enriched documents retain the ordinary stored-identity path.
+        if (self.overlay != null or self.active_recent) return null;
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        if (identities.spans.len == 0) return null;
+        const row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        return try local.storage_rowsource_identity.allocId(a, row);
     }
     fn publicKey(raw: ?*anyopaque, a: A, member_key: []const u8) ![]u8 {
         const units = @import("lake_enrichment_units.zig");
@@ -864,8 +876,11 @@ const Execution = struct {
         }
         var hydrator = projection.Hydrator.init(a);
         defer hydrator.deinit();
-        if (stored_fields.len != 0) for (hits, values) |hit, *value| {
+        if (stored_fields.len != 0) for (hits, values, 0..) |hit, *value, position| {
             try self.context.ensureActive();
+            // Keep a small lookahead through the current snapshot's bounded
+            // source queue. Required reads still authenticate and report errors.
+            for (hits[position..@min(hits.len, position + 4)]) |upcoming| try pin.?.snapshot.prefetchStoredDoc(upcoming.native_text_doc_id.?);
             const key = try nativeKey(self, a, hit.id);
             defer a.free(key);
             if (value.*) |*row| try hydrator.append(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
@@ -1223,7 +1238,7 @@ const Execution = struct {
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
             request.highlight = null;
-            if (ordering == null and !req.count_only) request.minimum_competitive_score = winners.cutoff();
+            if (!req.count_only) request.minimum_competitive_score = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
             if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
@@ -1255,7 +1270,7 @@ const Execution = struct {
             self.predicate_exclusion_json = previous_exclusion;
             self.predicate_allow_partial = previous_allow_partial;
         }
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
@@ -1893,12 +1908,15 @@ test "external lake stored highlights read authenticated native source without P
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } }});
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } },
+        .{ .column_id = "label", .field_id = 2, .converted_type = 0, .values = &.{ "returned metadata", "other metadata" } },
+    });
     defer a.free(data);
     var put = try client.putObject("antfly", "part.parquet", data, .{});
     put.deinit(a);
     const schema_json = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"label":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
     , .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
@@ -1962,6 +1980,9 @@ test "external lake stored highlights read authenticated native source without P
     var parsed = try std.json.parseFromSlice(std.json.Value, a, values[0].?, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("a needle in the haystack", parsed.value.object.get("body").?.string);
+    // Selecting only body for indexing must not discard projected metadata.
+    // The Parquet object is already gone, so this is durable source coverage.
+    try std.testing.expectEqualStrings("returned metadata", parsed.value.object.get("label").?.string);
     const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
     owner.highlight_queries = &.{.{ .query = query, .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" }};
     var result: types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1, .graph_results = &.{} };
@@ -2420,7 +2441,14 @@ const PagedWinners = struct {
         return .{ .a = a, .limit = limit, .heap = .initContext(ordering) };
     }
     fn cutoff(self: *const PagedWinners) ?f32 {
-        if (self.limit == 0 or self.heap.items.len < self.limit or self.heap.context != null) return null;
+        if (self.limit == 0 or self.heap.items.len < self.limit) return null;
+        if (self.heap.context) |order| {
+            const req = order.effective.req;
+            // Lower score cannot outrank a leading descending score. Keep equal
+            // scores for secondary/tie ordering; backward pages have another cutoff.
+            if (req.search_before.len != 0 or req.order_by.len == 0 or
+                !std.mem.eql(u8, req.order_by[0].field, "_score") or !req.order_by[0].desc) return null;
+        }
         return self.heap.peek().?.hit.score orelse 0;
     }
     fn deinit(self: *PagedWinners) void {
@@ -2519,6 +2547,29 @@ test "external lake paged native text winners share typed ordering and backward 
         try std.testing.expectEqual(@as(usize, 2), hits.len);
         try std.testing.expectEqualStrings(if (backward) "b" else "a", hits[0].id);
         try std.testing.expectEqualStrings(if (backward) "c" else "b", hits[1].id);
+        try std.testing.expect(heap.cutoff() == null);
+    }
+}
+
+test "external lake paged explicit score cutoff preserves ties and rejects ascending or backward pages" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |descending| {
+        const fields = [_]types.SortField{.{ .field = "_score", .desc = descending }};
+        var order = try local.storage_db_query_search_exec.SearchHitOrder.init(a, .{ .order_by = &fields }, null);
+        defer order.deinit(a);
+        var heap = PagedWinners.initOrdered(a, 1, &order);
+        defer heap.deinit();
+        var values = try a.alloc(std.json.Value, order.effective.req.order_by.len);
+        defer a.free(values);
+        for (values, order.effective.req.order_by) |*value, field| value.* = if (std.mem.eql(u8, field.field, "_score")) .{ .float = 2 } else .{ .string = "z" };
+        try heap.add(.{ .id = @constCast("z"), .score = 2, .sort_values = values }, 0);
+        if (descending) {
+            try std.testing.expectEqual(@as(?f32, 2), heap.cutoff());
+            values[values.len - 1] = .{ .string = "a" };
+            try heap.add(.{ .id = @constCast("a"), .score = 2, .sort_values = values }, 1);
+            try std.testing.expectEqualStrings("a", heap.heap.peek().?.hit.id);
+        } else try std.testing.expect(heap.cutoff() == null);
+        order.effective.req.search_before = values;
         try std.testing.expect(heap.cutoff() == null);
     }
 }

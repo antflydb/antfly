@@ -21,7 +21,7 @@
 // only the path is stored, and the server fetches files at enrichment time.
 //
 // Prerequisites:
-// - Antfly running with inference and ONNX Runtime
+// - Antfly running with inference
 // - CLIP model: antfly inference pull openai/clip-vit-base-patch32
 //
 // Run: go run main.go [folder] [query...]
