@@ -2360,12 +2360,31 @@ const GraphNodeAdmissionContext = struct {
     incoming_probe_options: IncomingProbeOptions = .{},
     tables: std.StringArrayHashMapUnmanaged(GraphAdmissionTableState) = .empty,
     filter_scratch: ?relationship_filter.EvaluationScratch = null,
+    step_memory: ?CanonicalStepMemory = null,
     prepared_edge_allocator: ?graph_work_budget.RetainedAllocator = null,
     prepared_edges: ?struct { path: OwnedGraphTensorAccessPath, program: query_contract.OwnedAlgebraicTensorProgramEnvelope } = null,
 
-    fn matchesEdge(self: *@This(), filter: relationship_filter.Filter, edge: graph_mod.Edge) !bool {
+    fn evaluateEdge(self: *@This(), filter: relationship_filter.Filter, edge: graph_mod.Edge, tables: *graph_traversal_mod.MetadataScratch) !relationship_filter.Evaluation {
         if (self.filter_scratch == null) self.filter_scratch = .{ .tracked = .{ .backing = self.alloc, .budget = self.incoming_probe_options.work_budget } };
-        return self.filter_scratch.?.matches(filter, edge);
+        return self.filter_scratch.?.evaluateWithTables(filter, edge, tables);
+    }
+    fn acquireStepMemory(self: *@This(), alloc: std.mem.Allocator, budget: *graph_pattern_mod.WorkBudget) !*CanonicalStepMemory {
+        if (self.incoming_probe_options.work_budget == budget) {
+            if (self.step_memory == null) self.step_memory = .{ .tracked = .{ .backing = self.alloc, .budget = budget } };
+            if (!self.step_memory.?.busy) {
+                const memory = &self.step_memory.?;
+                memory.busy = true;
+                memory.tracked.denied = false;
+                return memory;
+            }
+        }
+        // Nested steps and legacy callers with shorter-lived budgets own their
+        // storage, rather than leaving a budget pointer in the query cache.
+        var lease = try graph_work_budget.RetainedLease.init(budget, @sizeOf(CanonicalStepMemory));
+        errdefer lease.deinit();
+        const memory = try alloc.create(CanonicalStepMemory);
+        memory.* = .{ .tracked = .{ .backing = alloc, .budget = budget }, .busy = true, .owner = alloc, .struct_lease = lease };
+        return memory;
     }
 
     fn preparedEdges(self: *@This()) !void {
@@ -2415,6 +2434,7 @@ const GraphNodeAdmissionContext = struct {
     }
 
     pub fn deinit(self: *GraphNodeAdmissionContext) void {
+        if (self.step_memory) |*memory| memory.deinit();
         if (self.filter_scratch) |*scratch| scratch.deinit();
         if (self.prepared_edge_allocator) |*tracked| {
             if (self.prepared_edges) |*prepared| {
@@ -2955,9 +2975,59 @@ fn executeSingleCrossRange(
 
 // Optional bounded prefetch for traversals that must visit the full candidate
 // frontier. Early-stop queries retain demand-driven single-key reads.
+// Each async request owns a private bounded allocator. Only the coordinator
+// reserves/refunds the shared budget; response arenas stay alive in the cache.
+const CanonicalBatchSlot = struct {
+    owner: std.mem.Allocator,
+    budget: *graph_pattern_mod.WorkBudget,
+    group_id: u64,
+    request: GraphEdgesRequest,
+    local_budget: graph_work_budget.WorkBudget = undefined,
+    tracked: graph_work_budget.RetainedAllocator = undefined,
+    arena: ?std.heap.ArenaAllocator = null,
+    held: graph_work_budget.RetainedLease = .{},
+    physical_allowance: usize = 0,
+    physical_settled: bool = false,
+    started: bool = false,
+    result: ?GraphEdgesResponse = null,
+    err: ?anyerror = null,
+
+    fn reserve(self: *@This(), bytes: usize, scans: usize) !void {
+        self.held = try graph_work_budget.RetainedLease.init(self.budget, bytes);
+        try self.budget.consumePhysicalEdges(scans);
+        self.physical_allowance = scans;
+        self.local_budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = bytes });
+        self.tracked = .{ .backing = std.heap.page_allocator, .budget = &self.local_budget };
+        self.arena = std.heap.ArenaAllocator.init(self.tracked.allocator());
+    }
+    fn settle(self: *@This(), scans: usize) void {
+        std.debug.assert(!self.physical_settled and scans <= self.physical_allowance);
+        self.budget.remaining_physical_edges += self.physical_allowance - scans;
+        self.physical_settled = true;
+    }
+    fn run(self: *@This(), worker: Worker, table_name: []const u8, consistency: raft_mod.ReadConsistency) void {
+        self.started = true;
+        self.result = worker.executeGraphGetEdgesBatch(self.arena.?.allocator(), self.group_id, table_name, self.request, consistency) catch |err| {
+            self.err = if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+            return;
+        };
+    }
+    fn deinit(self: *@This()) void {
+        if (!self.started and !self.physical_settled) self.settle(0);
+        if (self.arena) |*arena| {
+            if (self.result) |*result| result.deinit(arena.allocator());
+            arena.deinit();
+            std.debug.assert(self.tracked.live_bytes == 0);
+        }
+        self.held.deinit();
+        const owner = self.owner;
+        owner.destroy(self);
+    }
+};
+
 const CanonicalEdgeBatch = struct {
     const Table = struct { logical: []const u8, physical: []const u8 = "", groups_loaded: bool = false, key_bytes: usize = 0, keys: std.ArrayListUnmanaged([]const u8) = .empty, groups: []u64 = &.{} };
-    const Shard = struct { table: usize, group: u64, result: GraphEdgesResponse };
+    const Shard = struct { table: usize, group: u64, result: GraphEdgesResponse, memory: ?*CanonicalBatchSlot = null };
     tracked: graph_work_budget.RetainedAllocator,
     tables: std.ArrayListUnmanaged(Table) = .empty,
     shards: std.ArrayListUnmanaged(Shard) = .empty,
@@ -2965,7 +3035,12 @@ const CanonicalEdgeBatch = struct {
 
     fn clear(self: *@This()) void {
         const a = self.tracked.allocator();
-        for (self.shards.items) |*shard| shard.result.deinit(a);
+        for (self.shards.items) |*shard| {
+            if (shard.memory) |memory| {
+                shard.result.deinit(memory.arena.?.allocator());
+                memory.deinit();
+            } else shard.result.deinit(a);
+        }
         self.shards.clearRetainingCapacity();
         for (self.tables.items) |*entry| {
             entry.keys.deinit(a);
@@ -3011,6 +3086,105 @@ const CanonicalEdgeBatch = struct {
         if (reader.worker.vtable.execute_graph_get_edges_batch == null or params.direction == .in) return;
         self.prepareOwned(reader, frontier, max_depth, params) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
     }
+    fn validatePrefix(result: GraphEdgesResponse, key_count: usize, scan_cap: usize) !void {
+        if (result.key_offsets.len != result.key_scanned_rows.len + 1 or result.key_scanned_rows.len > key_count or result.key_offsets[0] != 0 or result.key_offsets[result.key_offsets.len - 1] != result.edges.len or result.scanned_rows > scan_cap) return error.InvalidGraphEdgesResponse;
+        var scans: usize = 0;
+        for (result.key_scanned_rows, 0..) |counted, i| {
+            if (result.key_offsets[i + 1] < result.key_offsets[i] or result.key_offsets[i + 1] - result.key_offsets[i] > counted) return error.InvalidGraphEdgesResponse;
+            scans = try std.math.add(usize, scans, counted);
+        }
+        if (scans > result.scanned_rows) return error.InvalidGraphEdgesResponse;
+    }
+    fn parallelPrefix(self: *@This(), reader: DistributedEdgeReader, entry: *Table, table_index: usize, state: *GraphAdmissionTableState, prepared: anytype, params: graph_query_mod.QueryParams, io: std.Io, width: usize) !usize {
+        const a = self.tracked.allocator();
+        const budget = reader.physical_work_budget.?;
+        const overhead = (entry.key_bytes + entry.keys.items[0].len) * 6 + 64 * 1024;
+        var cursor: usize = 0;
+        while (cursor < entry.groups.len) {
+            const wave_bound = @min(width, entry.groups.len - cursor);
+            const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+            if (available < wave_bound * (@sizeOf(CanonicalBatchSlot) + overhead + 128 * 1024) or budget.remaining_physical_edges < wave_bound * 8192) return cursor;
+            var slots: [4]?*CanonicalBatchSlot = @splat(null);
+            defer for (slots) |slot| if (slot) |memory| memory.deinit();
+            var count: usize = 0;
+            var end = cursor;
+            while (end < entry.groups.len and count < width) : (end += 1) {
+                const group_id = entry.groups[end];
+                if (self.unsupported.contains(group_id)) continue;
+                const generation = try state.generationForGroup(group_id);
+                const memory = try a.create(CanonicalBatchSlot);
+                slots[count] = memory;
+                memory.* = .{ .owner = a, .budget = budget, .group_id = group_id, .request = .{
+                    .index_name = @constCast(reader.index_name),
+                    .key = @constCast(entry.keys.items[0]),
+                    .keys = entry.keys.items,
+                    .edge_types = @constCast(params.edge_types),
+                    .direction = params.direction,
+                    .tensor_access_path = prepared.path,
+                    .tensor_program = prepared.program,
+                    .topology_epoch = state.topology_epoch,
+                    .identity_read_generation = generation,
+                    .ttl_now_ns = reader.ttl_now_ns,
+                } };
+                count += 1;
+            }
+            if (count == 0) {
+                cursor = end;
+                continue;
+            }
+            try self.shards.ensureUnusedCapacity(a, count);
+            const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+            const per_memory = room / count;
+            // Small or nearly exhausted budgets keep demand-driven serial
+            // reads. A scan allowance includes one native overflow probe.
+            if (per_memory < overhead + 128 * 1024 or budget.remaining_physical_edges < count * 8192) return cursor;
+            const per_scans = @min(budget.remaining_physical_edges / count, graph_pattern_mod.default_max_explored_edges + 1);
+            for (slots[0..count]) |slot| {
+                const memory = slot.?;
+                memory.request.max_edges = 4096;
+                memory.request.max_owned_bytes = @intCast(@min(@as(usize, 1024 * 1024), (per_memory - overhead) / 32));
+                memory.request.max_scanned_rows = @intCast(per_scans - 1);
+                try reader.worker.ensureActive();
+                // Keep logical work charging in deterministic dispatch order.
+                if (reader.worker.work_cost_port) |port| try port.charge(memory.group_id, .get_edges, 1);
+                try memory.reserve(per_memory, per_scans);
+            }
+            var worker = reader.worker;
+            worker.work_cost_port = null;
+            var group: std.Io.Group = .init;
+            for (slots[0..count]) |slot| group.async(io, CanonicalBatchSlot.run, .{ slot.?, worker, entry.physical, reader.consistency });
+            try group.await(io);
+            // Refund unused reservations before installing responses. Actual
+            // response arena capacity remains charged until cache retirement.
+            for (slots[0..count]) |slot| {
+                const memory = slot.?;
+                try memory.held.resize(memory.tracked.live_bytes);
+                if (memory.result) |result| {
+                    try validatePrefix(result, entry.keys.items.len, memory.request.max_scanned_rows);
+                    memory.settle(result.scanned_rows);
+                } else if (memory.err) |err| {
+                    if (err == error.GraphEdgesBatchUnsupported) memory.settle(0);
+                }
+            }
+            for (slots[0..count], 0..) |slot, si| {
+                const memory = slot.?;
+                if (memory.err) |err| {
+                    if (err == error.GraphEdgesBatchUnsupported) {
+                        try self.unsupported.put(a, memory.group_id, {});
+                        continue;
+                    }
+                    if (err == error.GraphWorkBudgetExceeded and memory.tracked.denied) return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+                    return err;
+                }
+                const result = memory.result.?;
+                self.shards.appendAssumeCapacity(.{ .table = table_index, .group = memory.group_id, .result = result, .memory = memory });
+                memory.result = null;
+                slots[si] = null;
+            }
+            cursor = end;
+        }
+        return cursor;
+    }
     fn prepareOwned(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
         const a = self.tracked.allocator();
         const budget = reader.physical_work_budget orelse return;
@@ -3037,7 +3211,9 @@ const CanonicalEdgeBatch = struct {
             if (!state.allowed or !(try reader.admission.graphIndexAvailable(state, reader.index_name))) continue;
             entry.groups = try table_catalog.resolveGroupsForSpanPinnedUntil(a, reader.catalog, entry.physical, "", "", state.topology_epoch, reader.worker.routingDeadline(reader.catalog));
             entry.groups_loaded = true;
-            for (entry.groups) |group| {
+            const plan = planGraphFanout(reader.worker.fanoutIo() != null, reader.worker.fanoutWidthCap(), entry.groups.len);
+            const dispatched = if (plan.parallel) try self.parallelPrefix(reader, entry, ti, state, prepared, params, reader.worker.fanoutIo().?, plan.width) else 0;
+            for (entry.groups[dispatched..]) |group| {
                 if (self.unsupported.contains(group)) continue;
                 if (budget.remaining_physical_edges == 0) return;
                 const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
@@ -3069,13 +3245,7 @@ const CanonicalEdgeBatch = struct {
                     return err;
                 };
                 errdefer result.deinit(a);
-                if (result.key_offsets.len != result.key_scanned_rows.len + 1 or result.key_scanned_rows.len > entry.keys.items.len or result.key_offsets[0] != 0 or result.key_offsets[result.key_offsets.len - 1] != result.edges.len or result.scanned_rows > request.max_scanned_rows) return error.InvalidGraphEdgesResponse;
-                var scans: usize = 0;
-                for (result.key_scanned_rows, 0..) |counted, i| {
-                    if (result.key_offsets[i + 1] < result.key_offsets[i] or result.key_offsets[i + 1] - result.key_offsets[i] > counted) return error.InvalidGraphEdgesResponse;
-                    scans = try std.math.add(usize, scans, counted);
-                }
-                if (scans > result.scanned_rows) return error.InvalidGraphEdgesResponse;
+                try validatePrefix(result, entry.keys.items.len, request.max_scanned_rows);
                 try budget.consumePhysicalEdges(result.scanned_rows);
                 self.shards.appendAssumeCapacity(.{ .table = ti, .group = group, .result = result });
             }
@@ -3599,9 +3769,52 @@ const DistributedEdgeReader = struct {
 /// One coordinator-owned adjacency expansion. GraphEdges RPCs return the
 /// winning contribution for each physical identity before a graph query's
 /// weight predicate, node admission, or path cost is applied.
+const CanonicalStepMemory = struct {
+    const Row = struct { edge_index: usize, endpoint: @import("antfly_local_sources").graph_metadata_tables.Endpoint };
+    tracked: graph_work_budget.RetainedAllocator,
+    descriptors: std.ArrayListUnmanaged(Row) = .empty,
+    nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
+    paths: std.ArrayListUnmanaged(graph_query_mod.PathEdgeInfo) = .empty,
+    groups: std.ArrayListUnmanaged(u64) = .empty,
+    busy: bool = false,
+    owner: ?std.mem.Allocator = null,
+    struct_lease: graph_work_budget.RetainedLease = .{},
+
+    fn freeBuffers(self: *@This()) void {
+        const a = self.tracked.allocator();
+        self.descriptors.deinit(a);
+        self.descriptors = .empty;
+        self.nodes.deinit(a);
+        self.nodes = .empty;
+        self.paths.deinit(a);
+        self.paths = .empty;
+        self.groups.deinit(a);
+        self.groups = .empty;
+    }
+    fn deinit(self: *@This()) void {
+        std.debug.assert(!self.busy);
+        self.freeBuffers();
+        std.debug.assert(self.tracked.live_bytes == 0);
+    }
+    fn release(self: *@This()) void {
+        std.debug.assert(self.busy);
+        self.descriptors.clearRetainingCapacity();
+        self.nodes.clearRetainingCapacity();
+        self.paths.clearRetainingCapacity();
+        self.groups.clearRetainingCapacity();
+        self.busy = false;
+        if (self.owner) |a| {
+            self.deinit();
+            self.struct_lease.deinit();
+            a.destroy(self);
+        } else if (self.tracked.live_bytes > 64 * 1024) self.freeBuffers();
+    }
+};
+
 const CanonicalGraphStep = struct {
     edges: []graph_mod.Edge,
     edge_ownership: []bool = &.{},
+    memory: ?*CanonicalStepMemory = null,
     nodes: []graph_query_mod.GraphResultNode,
     path_edges: []graph_query_mod.PathEdgeInfo,
     group_ids: []u64,
@@ -3620,15 +3833,18 @@ const CanonicalGraphStep = struct {
             for (node.metrics) |*metric| metric.deinit(alloc);
             if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
         }
-        alloc.free(self.nodes);
+        if (self.memory == null) alloc.free(self.nodes);
         if (self.metric_columns) |owner| owner.deinit(alloc);
-        alloc.free(self.path_edges);
-        alloc.free(self.group_ids);
+        if (self.memory == null) {
+            alloc.free(self.path_edges);
+            alloc.free(self.group_ids);
+        }
         var selection = SelectedGraphEdges{ .edges = self.edges, .owned = self.edge_ownership };
         selection.deinit(alloc);
         self.metrics_lease.deinit();
         self.table_scratch.deinit();
         self.array_lease.deinit();
+        if (self.memory) |memory| memory.release();
         self.* = undefined;
     }
 };
@@ -3641,6 +3857,24 @@ fn canonicalGraphStepAlloc(
     key: []const u8,
     params: graph_query_mod.QueryParams,
     work_budget: *graph_pattern_mod.WorkBudget,
+) !CanonicalGraphStep {
+    const memory = try reader.admission.acquireStepMemory(alloc, work_budget);
+    return canonicalGraphStepInMemory(alloc, reader, expansion_table, current_table, key, params, work_budget, memory) catch |err| {
+        const denied = memory.tracked.denied;
+        memory.release();
+        return if (err == error.OutOfMemory and denied) error.GraphWorkBudgetExceeded else err;
+    };
+}
+
+fn canonicalGraphStepInMemory(
+    alloc: std.mem.Allocator,
+    reader: DistributedEdgeReader,
+    expansion_table: []const u8,
+    current_table: []const u8,
+    key: []const u8,
+    params: graph_query_mod.QueryParams,
+    work_budget: *graph_pattern_mod.WorkBudget,
+    memory: *CanonicalStepMemory,
 ) !CanonicalGraphStep {
     var selection = try reader.getEdgeSelection(
         alloc,
@@ -3656,64 +3890,49 @@ fn canonicalGraphStepAlloc(
     errdefer selection.deinit(alloc);
     const edges = selection.edges;
 
-    const capacity = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
-    const array_bytes = std.math.mul(
-        usize,
-        capacity,
-        @sizeOf(graph_query_mod.GraphResultNode) + @sizeOf(graph_query_mod.PathEdgeInfo) + @sizeOf(u64),
-    ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
-    var array_lease = try graph_work_budget.RetainedLease.init(work_budget, array_bytes);
-    errdefer array_lease.deinit();
-    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, capacity);
-    errdefer alloc.free(nodes);
-    const path_edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, capacity);
-    errdefer alloc.free(path_edges);
-    const group_ids = try alloc.alloc(u64, capacity);
-    errdefer alloc.free(group_ids);
-    var node_count: usize = 0;
-    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    const limit = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
+    const scratch_alloc = memory.tracked.allocator();
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(scratch_alloc, null);
     errdefer table_scratch.deinit();
     var edge_bytes: usize = 0;
-    for (edges) |edge| {
+    for (edges, 0..) |edge, edge_index| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
             return work_budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
-        if (!(try reader.admission.matchesEdge(params.edge_filter, edge))) continue;
+        const evaluated = try reader.admission.evaluateEdge(params.edge_filter, edge, &table_scratch);
+        if (!evaluated.matched) continue;
         if (params.min_weight) |minimum| if (edge.weight < minimum) continue;
         if (params.max_weight) |maximum| if (edge.weight > maximum) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
-        const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
+        const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table, evaluated.source_table orelse expansion_table, evaluated.target_table orelse expansion_table, params.direction);
         if (!endpoint.connected) continue;
-        if (node_count == capacity) {
+        if (memory.descriptors.items.len == limit) {
             if (work_budget.remaining_nodes <= work_budget.remaining_edges)
                 return work_budget.exhaust(.explored_nodes, work_budget.max_nodes);
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
-        const adjacent = endpoint.key;
-        const declared_table = endpoint.table;
-        path_edges[node_count] = .{
-            .source = edge.source,
-            .target = edge.target,
-            .edge_type = edge.edge_type,
-            .edge_id = edge.edge_id,
-            .owner_document = edge.owner_document,
-            .weight = edge.weight,
-            .metadata = edge.metadata,
-            .traversal_direction = endpoint.direction,
-        };
-        nodes[node_count] = .{
-            .key = adjacent,
-            .table = declared_table,
-            .depth = 1,
-            .distance = edge.weight,
-            .path_edges = path_edges[node_count .. node_count + 1],
-        };
-        group_ids[node_count] = edge.origin_group_id;
-        node_count += 1;
+        if (memory.descriptors.items.len == memory.descriptors.capacity) {
+            const next = @min(limit, @max(memory.descriptors.items.len + 1, memory.descriptors.capacity *| 2));
+            try memory.descriptors.ensureTotalCapacityPrecise(scratch_alloc, next);
+        }
+        memory.descriptors.appendAssumeCapacity(.{ .edge_index = edge_index, .endpoint = endpoint });
     }
+    const node_count = memory.descriptors.items.len;
+    // Count once, then allocate only survivor output. Route strings have already
+    // moved into step-owned scratch; no metadata needs to be decoded again.
+    try memory.nodes.ensureTotalCapacityPrecise(scratch_alloc, node_count);
+    try memory.paths.ensureTotalCapacityPrecise(scratch_alloc, node_count);
+    try memory.groups.ensureTotalCapacityPrecise(scratch_alloc, node_count);
+    for (memory.descriptors.items) |row| {
+        const edge = edges[row.edge_index];
+        memory.paths.appendAssumeCapacity(.{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document, .weight = edge.weight, .metadata = edge.metadata, .traversal_direction = row.endpoint.direction });
+        memory.nodes.appendAssumeCapacity(.{ .key = row.endpoint.key, .table = row.endpoint.table, .depth = 1, .distance = edge.weight });
+        memory.groups.appendAssumeCapacity(edge.origin_group_id);
+    }
+    for (memory.nodes.items, 0..) |*node, i| node.path_edges = memory.paths.items[i .. i + 1];
     try work_budget.consumeEdgeBytes(edge_bytes);
     try work_budget.consumeNodes(node_count);
     try work_budget.consumeEdges(node_count);
-    return .{ .edges = edges, .edge_ownership = selection.owned, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
+    return .{ .edges = edges, .edge_ownership = selection.owned, .memory = memory, .nodes = memory.nodes.items, .path_edges = memory.paths.items, .group_ids = memory.groups.items, .node_count = node_count, .array_lease = .{}, .table_scratch = table_scratch };
 }
 
 // Keep discovery serial while a bounded window groups independent score reads.
@@ -16842,10 +17061,41 @@ test "distributed graph metric post processing applies max results after filter 
         fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
-    const TestState = struct { graph: *graph_mod.GraphIndex, score_calls: usize = 0, status_calls: usize = 0, score_keys: usize = 0, largest_cells: usize = 0, fail_scores: bool = false, edge_calls: usize = 0, batch_edge_calls: usize = 0, unsupported_batch: bool = false, batch_edge_cap: ?u32 = null, batch_byte_cap: ?u32 = null };
+    const TestState = struct {
+        graph: *graph_mod.GraphIndex,
+        score_calls: usize = 0,
+        status_calls: usize = 0,
+        score_keys: usize = 0,
+        largest_cells: usize = 0,
+        fail_scores: bool = false,
+        edge_calls: usize = 0,
+        batch_edge_calls: usize = 0,
+        unsupported_batch: bool = false,
+        batch_edge_cap: ?u32 = null,
+        batch_byte_cap: ?u32 = null,
+        io_impl: ?*std.Io.Threaded = null,
+        active: std.atomic.Value(u32) = .init(0),
+        max_active: std.atomic.Value(u32) = .init(0),
+        parallel_calls: std.atomic.Value(u32) = .init(0),
+        port_calls: usize = 0,
+        fail_batch: bool = false,
+        cancellation: ?*std.atomic.Value(bool) = null,
+        fn updateMax(self: *@This(), current: u32) void {
+            var prior = self.max_active.load(.monotonic);
+            while (current > prior) prior = self.max_active.cmpxchgWeak(prior, current, .monotonic, .monotonic) orelse return;
+        }
+    };
     const FakeWorker = struct {
         fn iface(state: *TestState) Worker {
-            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = batchEdges } };
+            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = batchEdges, .fanout_io = fanoutIo }, .work_cost_port = .{ .ptr = state, .charge_fn = charge }, .cancellation = if (state.cancellation) |flag| CancellationToken.fromAtomic(flag) else null };
+        }
+        fn fanoutIo(ptr: *anyopaque) ?std.Io {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            return if (state.io_impl) |impl| impl.io() else null;
+        }
+        fn charge(ptr: *anyopaque, _: u64, kind: WorkKind, _: u64) !void {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            if (kind == .get_edges) state.port_calls += 1;
         }
         fn expand(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
             return error.TestUnexpectedResult;
@@ -16858,7 +17108,16 @@ test "distributed graph metric post processing applies max results after filter 
         }
         fn batchEdges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.batch_edge_calls += 1;
+            defer if (state.io_impl != null) {
+                _ = state.active.fetchSub(1, .monotonic);
+            };
+            if (state.io_impl) |impl| {
+                _ = state.parallel_calls.fetchAdd(1, .monotonic);
+                const current = state.active.fetchAdd(1, .monotonic) + 1;
+                state.updateMax(current);
+                try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromNanoseconds(if (group == 11) 10 * std.time.ns_per_ms else std.time.ns_per_ms) }, impl.io());
+            } else state.batch_edge_calls += 1;
+            if (state.fail_batch and group == 22) return error.TopologyChanged;
             if (state.unsupported_batch) return error.GraphEdgesBatchUnsupported;
             try std.testing.expect(request.keys.len <= 64);
             try std.testing.expectEqual(@as(?u64, 12345), request.identity_read_generation);
@@ -16866,7 +17125,9 @@ test "distributed graph metric post processing applies max results after filter 
                 var limited = request;
                 if (state.batch_edge_cap) |cap| limited.max_edges = cap;
                 if (state.batch_byte_cap) |cap| limited.max_owned_bytes = cap;
-                return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(a, state.graph, limited, 1);
+                const result = try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(a, state.graph, limited, 1);
+                if (state.cancellation) |flag| flag.store(true, .release);
+                return result;
             }
             const offsets = try a.alloc(u32, request.keys.len + 1);
             errdefer a.free(offsets);
@@ -16966,6 +17227,107 @@ test "distributed graph metric post processing applies max results after filter 
         try std.testing.expectEqual(@as(u8, 'x'), cached_edge.metadata[0]);
     }
 
+    // Survivor scratch reserves no output arrays for a rejected adjacency,
+    // and repeated small steps reuse their output buffers without heap calls.
+    {
+        var fixture = TestState{ .graph = &graph };
+        var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        gate.incoming_probe_options.work_budget = &work;
+        defer gate.deinit();
+        var measured = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = alloc };
+        gate.step_memory = .{ .tracked = .{ .backing = measured.allocator(), .budget = &work } };
+        try gate.preparedEdges();
+        const reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = FakeWorker.iface(&fixture), .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &gate, .physical_work_budget = &work };
+        const original_cap = work.max_retained_state_bytes;
+        work.max_retained_state_bytes = work.retained_state_bytes + 128;
+        var rejected = try canonicalGraphStepAlloc(alloc, reader, "docs", "docs", roots[0], .{ .min_weight = 2 }, &work);
+        try std.testing.expectEqual(@as(usize, 0), rejected.node_count);
+        rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), measured.alloc_calls);
+        work.max_retained_state_bytes = original_cap;
+        var first = try canonicalGraphStepAlloc(alloc, reader, "docs", "docs", roots[0], .{}, &work);
+        first.deinit(alloc);
+        const cold_calls = measured.alloc_calls;
+        for (0..300) |_| {
+            var step = try canonicalGraphStepAlloc(alloc, reader, "docs", "docs", roots[0], .{}, &work);
+            try std.testing.expectEqual(@as(usize, 2), step.node_count);
+            step.deinit(alloc);
+        }
+        try std.testing.expectEqual(cold_calls, measured.alloc_calls);
+        try std.testing.expect(measured.live <= 64 * 1024);
+        std.debug.print("SURVIVOR_STEP rejected_allocations=0 warm_steps=300 warm_allocations={d} retained={d}\n", .{ measured.alloc_calls - cold_calls, measured.live });
+    }
+    // The real typed worker runs two independent callbacks at once, merges in
+    // discovery order, and returns every memory reservation on success/failure.
+    {
+        var impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+        defer impl.deinit();
+        var baseline_work = graph_work_budget.WorkBudget.initWithLimits(.{});
+        {
+            var baseline_state = TestState{ .graph = &graph };
+            var baseline_gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&baseline_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+            baseline_gate.incoming_probe_options.work_budget = &baseline_work;
+            defer baseline_gate.deinit();
+            var full = query;
+            full.query.params.max_results = 0;
+            var output = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&baseline_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, full, .read_index, &baseline_gate, &baseline_work);
+            output.deinit(alloc);
+        }
+        // Delivered output retains its consumptive query charge. Compare that
+        // charge with serial execution to detect leaked parallel reservations.
+        const delivered_bytes = baseline_work.retained_state_bytes;
+        for (0..5) |mode| {
+            var canceled: std.atomic.Value(bool) = .init(false);
+            var fixture = TestState{ .graph = &graph, .io_impl = &impl, .unsupported_batch = mode == 1, .fail_batch = mode == 2, .cancellation = if (mode == 4) &canceled else null };
+            var work = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = if (mode == 3) 128 else graph_pattern_mod.default_max_explored_edges });
+            {
+                var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+                gate.incoming_probe_options.work_budget = &work;
+                defer gate.deinit();
+                var full = query;
+                full.query.params.max_results = 0;
+                const expected_nodes: usize = if (mode == 3) 64 else n;
+                full.query.start_nodes = .{ .keys = roots[0..expected_nodes] };
+                full.query.target_nodes = .{ .keys = targets[0..expected_nodes] };
+                const executed = executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, full, .read_index, &gate, &work);
+                if (mode == 2) {
+                    try std.testing.expectError(error.TopologyChanged, executed);
+                } else if (mode == 4) {
+                    try std.testing.expectError(error.Cancelled, executed);
+                } else {
+                    var output = try executed;
+                    defer output.deinit(alloc);
+                    try std.testing.expectEqual(expected_nodes, output.nodes.len);
+                    for (output.nodes, 0..) |node, row| try std.testing.expectEqualStrings(targets[row], node.key);
+                    try std.testing.expectEqual(expected_nodes * 2, work.max_edges - work.remaining_physical_edges);
+                    try std.testing.expectEqual(@as(u32, if (mode == 0) 10 else 2), fixture.parallel_calls.load(.monotonic));
+                    try std.testing.expectEqual(@as(usize, if (mode == 1) 602 else if (mode == 3) 2 else 10), fixture.port_calls);
+                }
+                try std.testing.expectEqual(@as(u32, 0), fixture.active.load(.monotonic));
+                try std.testing.expectEqual(@as(u32, if (mode == 3) 1 else 2), fixture.max_active.load(.monotonic));
+                std.debug.print("CONCURRENT_EDGE_BATCH mode={d} max_active={d} calls={d} work_charges={d}\n", .{ mode, fixture.max_active.load(.monotonic), fixture.parallel_calls.load(.monotonic), fixture.port_calls });
+            }
+            var expected_bytes = if (mode == 2 or mode == 4) @as(usize, 0) else delivered_bytes;
+            if (mode == 3) {
+                var serial_work = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 128 });
+                {
+                    var serial_state = TestState{ .graph = &graph };
+                    var serial_gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&serial_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+                    serial_gate.incoming_probe_options.work_budget = &serial_work;
+                    defer serial_gate.deinit();
+                    var small = query;
+                    small.query.params.max_results = 0;
+                    small.query.start_nodes = .{ .keys = roots[0..64] };
+                    small.query.target_nodes = .{ .keys = targets[0..64] };
+                    var output = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&serial_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, small, .read_index, &serial_gate, &serial_work);
+                    output.deinit(alloc);
+                }
+                expected_bytes = serial_work.retained_state_bytes;
+            }
+            try std.testing.expectEqual(expected_bytes, work.retained_state_bytes);
+        }
+    }
     // Compare with the former per-frontier hydration using the same source,
     // pinned reader, and transport fixture, excluding graph construction.
     {
@@ -17101,8 +17463,8 @@ test "distributed graph metric post processing applies max results after filter 
     }
     try std.testing.expectEqual(@as(usize, 0), denied_budget.retained_state_bytes);
     const FailureRunner = struct {
-        fn run(a: std.mem.Allocator, source: *graph_mod.GraphIndex, starts: []const []const u8, ends: []const []const u8) !void {
-            var worker_state = TestState{ .graph = source };
+        fn run(a: std.mem.Allocator, source: *graph_mod.GraphIndex, starts: []const []const u8, ends: []const []const u8, io_impl: ?*std.Io.Threaded) !void {
+            var worker_state = TestState{ .graph = source, .io_impl = io_impl };
             const request = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
             const topology = try table_catalog.topologyEpoch(a, FakeCatalog.iface(), "docs");
             var gate = GraphNodeAdmissionContext.init(a, FakeCatalog.iface(), FakeWorker.iface(&worker_state), "docs", "graph_idx", topology, request, null, &.{}, .{}, .read_index);
@@ -17131,13 +17493,17 @@ test "distributed graph metric post processing applies max results after filter 
             for (output.nodes, 0..) |node, row| try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
         }
     };
-    try FailureRunner.run(alloc, &graph, roots[0..3], targets[0..3]);
+    try FailureRunner.run(alloc, &graph, roots[0..3], targets[0..3], null);
     // Enumerating thousands of failures does not need a stack trace for every
     // successful allocation. Keep SafeAllocator's leak, double-free and
     // write-after-free checks; FailingAllocator records the injected failure.
     var fault_allocator = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.testing.expectEqual(@as(usize, 0), fault_allocator.deinit()) catch @panic("failure inventory leaked");
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(fault_allocator.allocator(), FailureRunner.run, .{ &graph, roots[0..3], targets[0..3] });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(fault_allocator.allocator(), FailureRunner.run, .{ &graph, roots[0..3], targets[0..3], @as(?*std.Io.Threaded, null) });
+    var fault_io = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+    defer fault_io.deinit();
+    try FailureRunner.run(alloc, &graph, roots[0..3], targets[0..3], &fault_io);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(fault_allocator.allocator(), FailureRunner.run, .{ &graph, roots[0..3], targets[0..3], @as(?*std.Io.Threaded, &fault_io) });
 }
 
 test "distributed graph metric post processing applies max results after filter and order decoder ownership failures" {
@@ -17566,4 +17932,116 @@ test "distributed graph metric post processing applies max results after filter 
     defer denied.deinit();
     try std.testing.expectError(error.GraphWorkBudgetExceeded, denied.matches(filter, input));
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed graph metric post processing applies max results after filter and order fused metadata semantics" {
+    const a = std.testing.allocator;
+    const metadata = @import("antfly_local_sources").graph_metadata_tables;
+    const filters = [_]relationship_filter.Filter{
+        .{},
+        .{ .properties = &.{.{ .field = "/weight", .op = .gte, .value_json = "0" }} },
+        .{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "\"value\"" }} },
+        .{ .properties = &.{.{ .field = "/metadata/source_table", .op = .is_not_null }} },
+        .{ .known_at_ns = 1 },
+    };
+    const fixtures = [_][]const u8{
+        "",                                                                           "{}",                                                                                     "malformed",                                                                                                 "null",                                                                                 "[]",
+        "{\"source_table\":\"docs\",\"target_table\":\"other\",\"value\":\"value\"}", "{\"source_table\":\"d\\u006fcs\",\"target_table\":\"other\",\"value\":\"v\\u0061lue\"}", "{\"source_table\":\"bad\",\"source_\\u0074able\":\"docs\",\"target_table\":\"other\",\"value\":\"value\"}", "{\"source_table\":null,\"target_table\":\"other\",\"value\":\"value\"}",               "{\"source_table\":\"\",\"target_table\":\"other\",\"value\":\"value\"}",
+        "{\"source_table\":\"\\n\",\"target_table\":\"other\",\"value\":\"value\"}",  "{\"source_table\":\"docs\",\"value\":\"value\",\"value\":\"value\"}",                    "{\"source_table\":\"docs\",\"target_table\":\"other\"} trailing",                                           "{\"source_table\":{\"ignored\":true},\"target_table\":\"other\",\"value\":\"value\"}",
+    };
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, f: relationship_filter.Filter, raw: []const u8) !void {
+            const edge = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "R", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = raw };
+            const expected = try f.matches(alloc, edge);
+            var legacy = metadata.Scratch.init(alloc, null);
+            defer legacy.deinit();
+            var tables = metadata.Scratch.init(alloc, null);
+            defer tables.deinit();
+            var scratch = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = alloc, .budget = null } };
+            defer scratch.deinit();
+            const actual = try scratch.evaluateWithTables(f, edge, &tables);
+            try std.testing.expectEqual(expected, actual.matched);
+            if (actual.matched) {
+                const source = try legacy.table(raw, "source_table");
+                const target = try legacy.table(raw, "target_table");
+                try std.testing.expectEqual(source != null, actual.source_table != null);
+                try std.testing.expectEqual(target != null, actual.target_table != null);
+                if (source) |value| try std.testing.expectEqualStrings(value, actual.source_table.?);
+                if (target) |value| try std.testing.expectEqualStrings(value, actual.target_table.?);
+                // Reusing the projection must not invalidate retained escapes.
+                const again = try scratch.evaluateWithTables(f, edge, &tables);
+                if (again.source_table) |value| try std.testing.expectEqualStrings(value, actual.source_table.?);
+            }
+        }
+    };
+    for (filters) |f| for (fixtures) |raw| try Runner.run(a, f, raw);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ filters[2], fixtures[6] });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ filters[2], fixtures[7] });
+}
+
+test "distributed graph metric post processing applies max results after filter and order fused metadata measurement" {
+    const a = std.testing.allocator;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"source_table\":\"docs\",\"target_table\":\"other\",\"value\":\"v\\u0061lue\",\"evidence\":\"");
+    try body.appendNTimes(a, 'x', 16 * 1024);
+    try body.appendSlice(a, "\"}");
+    const edge = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "R", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = body.items };
+    const f = relationship_filter.Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "\"value\"" }} };
+    var before = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = a, .budget = null } };
+    defer before.deinit();
+    var counter = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = a };
+    var after = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = counter.allocator(), .budget = null } };
+    defer after.deinit();
+    var tables = graph_traversal_mod.MetadataScratch.init(a, null);
+    defer tables.deinit();
+    try std.testing.expect(try before.matches(f, edge));
+    try std.testing.expect((try after.evaluateWithTables(f, edge, &tables)).matched);
+    const warm_calls = counter.alloc_calls;
+    var times_before: [7]u64 = undefined;
+    var times_after: [7]u64 = undefined;
+    for (0..7) |pair| {
+        for (0..2) |turn| {
+            const fused = (pair + turn) % 2 == 1;
+            const started = platform_time.monotonicNs();
+            for (0..64) |_| {
+                if (fused) {
+                    const result = try after.evaluateWithTables(f, edge, &tables);
+                    try std.testing.expect(result.matched);
+                    try std.testing.expectEqualStrings("docs", result.source_table.?);
+                    try std.testing.expectEqualStrings("other", result.target_table.?);
+                } else {
+                    try std.testing.expect(try before.matches(f, edge));
+                    try std.testing.expectEqualStrings("docs", (try tables.table(edge.metadata, "source_table")).?);
+                    try std.testing.expectEqualStrings("other", (try tables.table(edge.metadata, "target_table")).?);
+                }
+            }
+            const elapsed = platform_time.monotonicNs() - started;
+            if (fused) times_after[pair] = elapsed else times_before[pair] = elapsed;
+        }
+    }
+    std.mem.sort(u64, &times_before, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &times_after, {}, std.sort.asc(u64));
+    try std.testing.expectEqual(warm_calls, counter.alloc_calls);
+    std.debug.print("FUSED_METADATA rows=64 payload_bytes={d} before_median_ns={d} after_median_ns={d} warm_allocations={d}\n", .{ body.items.len, times_before[3], times_after[3], counter.alloc_calls - warm_calls });
+}
+
+test "distributed graph metric post processing applies max results after filter and order intrinsic rejection avoids routing scratch" {
+    const a = std.testing.allocator;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"source_table\":\"");
+    for (0..80_000) |_| try body.appendSlice(a, "\\u0061");
+    try body.appendSlice(a, "\"}");
+    const edge = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "R", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = body.items };
+    const f = relationship_filter.Filter{ .properties = &.{.{ .field = "/weight", .op = .eq, .value_json = "0" }} };
+    var work = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 4096 });
+    var scratch = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = a, .budget = &work } };
+    defer scratch.deinit();
+    var tables = graph_traversal_mod.MetadataScratch.init(a, &work);
+    defer tables.deinit();
+    try std.testing.expect(!(try scratch.evaluateWithTables(f, edge, &tables)).matched);
+    try std.testing.expect(!scratch.routing);
+    try std.testing.expectEqual(@as(usize, 0), tables.strings.items.len);
+    try std.testing.expect(scratch.tracked.live_bytes < 4096);
 }
