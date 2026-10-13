@@ -17188,7 +17188,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: []const u8,
+        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
         options: types.ArtifactRepairRunOptions,
@@ -17338,7 +17338,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: []const u8,
+        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         sequence: u64,
     ) !void {
@@ -27443,7 +27443,7 @@ pub const DB = struct {
 
     const PreparedGraphReplacement = struct {
         manager: *index_manager_mod.IndexManager,
-        checkpoint: []const u8,
+        checkpoint: ?[]const u8,
         source_guard: @import("artifact_source_gap.zig").Guard,
         sequence: u64,
         stable_source_floor: ?u64 = null,
@@ -27487,8 +27487,13 @@ pub const DB = struct {
         defer private.deinit();
         private.source_payload_store = self.core.index_manager.source_payload_store;
         private.setIo(self.backend_runtime.io());
-        const checkpoint = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/replacement-applied", .{ self.core.index_manager.base_path, cfg.name });
-        defer self.alloc.free(checkpoint);
+        // Embedded/external backends persist replay checkpoints in their own
+        // primary store. Their virtual base path is not a filesystem namespace.
+        const checkpoint: ?[]const u8 = if (self.physical_root_mode == .filesystem_managed)
+            try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/replacement-applied", .{ self.core.index_manager.base_path, cfg.name })
+        else
+            null;
+        defer if (checkpoint) |path| self.alloc.free(path);
         private.setAppliedSequenceCheckpointPath(checkpoint);
         try private.registerReplacementIndex(self.core.store, stored);
         var source_snapshot = try self.core.store.beginReadTxn();

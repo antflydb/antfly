@@ -852,9 +852,11 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         db.add_index(config)
         assert db.capabilities()["minimum_reader_version"] == 2
         before = db.list_resolver_identities()
-        # The target exists, but the old index is the default full-text index.
+        # Existing-target replacement must reject non-graph old indexes before
+        # registering changed inline resolver config, for either storage mode.
+        db.add_index({"name": "text_target", "type": "full_text"})
         bad = json.loads(json.dumps(config))
-        bad["replaces"] = next(i["name"] for i in db.list_indexes() if i["name"] != "knowledge_v2")
+        bad["replaces"] = "text_target"
         bad["resolvers"][0]["min_confidence"] = 0
         with pytest.raises(antfly_embedded.InvalidArgumentError):
             db.add_index(bad)
@@ -949,3 +951,23 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False)]:
         lib.antfly_db_close(handle)
 """
     subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity)], check=True, timeout=60)
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_atomic_replacement_rebuilds_changed_graph_field_mapping(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("fields.aflite" if storage == antfly_embedded.Storage.LITE else "fields")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {"a": {"links": ["b"], "new_links": ["c"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("old", "a", "R", 0)] == ["b"]
+        db.add_index(
+            {"name": "new", "type": "graph", "replaces": "old", "edge_types": [{"name": "R", "field": "new_links"}]}
+        )
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["c"]
+        db.batch_json({"inserts": {"a": {"links": ["b"], "new_links": ["d"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]
+    with _open_graph_test(path, options) as db:
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]

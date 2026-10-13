@@ -68,8 +68,9 @@ pub const supported_reader_version: u32 = 2;
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidResolverConfig;
-    for (parsed.value.array.items) |entry| {
+    const rows = try catalogRows(parsed.value);
+    if (parsed.value == .object) return 2;
+    for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
             if (entry.object.contains(field)) return 2;
@@ -411,12 +412,32 @@ pub const ResolverConfig = struct {
     }
 };
 
+/// Extended catalogs carry an explicit envelope. Pre-epoch readers parse only
+/// arrays, so they reject this shape even when they ignore unknown row fields.
+fn catalogRows(value: std.json.Value) !std.json.Value {
+    if (value == .array) return value;
+    if (value != .object) return error.InvalidResolverConfig;
+    const version = value.object.get("version") orelse return error.InvalidResolverConfig;
+    if (version != .integer or version.integer != supported_reader_version) return error.UnsupportedResolverCatalogVersion;
+    const rows = value.object.get("resolvers") orelse return error.InvalidResolverConfig;
+    if (rows != .array) return error.InvalidResolverConfig;
+    return rows;
+}
+
 pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
+    const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
+    errdefer alloc.free(rows);
+    if (try catalogReaderVersion(alloc, rows) == 1) return rows;
+    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
+    alloc.free(rows);
+    return wrapped;
 }
 
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
-    const parsed = try std.json.parseFromSlice([]ResolverConfig, alloc, data, .{
+    const root = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer root.deinit();
+    const rows = try catalogRows(root.value);
+    const parsed = try std.json.parseFromValue([]ResolverConfig, alloc, rows, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
@@ -751,6 +772,8 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
     cfg.merge_state_version = 1;
     const catalog = try serializeCatalog(alloc, &.{cfg});
     defer alloc.free(catalog);
+    const old_reader = std.json.parseFromSlice([]ResolverConfig, alloc, catalog, .{ .ignore_unknown_fields = true });
+    try std.testing.expectError(error.UnexpectedToken, old_reader);
     const sidecar = try serializeMergeState(alloc, &.{cfg});
     defer alloc.free(sidecar);
     const restored = try deserializeCatalog(alloc, catalog);

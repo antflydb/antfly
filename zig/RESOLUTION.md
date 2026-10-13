@@ -1017,8 +1017,9 @@ identity, dimensions and a hash of the exact input string, independently of the
 source or destination table. Local capabilities expose identity before weights
 load: managed downloads hash sorted relative artifact paths and pinned receipt
 SHA-256 digests. Copying or restoring identical files preserves that identity.
-Models without complete receipts fall back to resolved weight, shard, ONNX
-external tensor, tokenizer and processor file generations (inode/size/mtime/ctime).
+Managed receipts without digests use memoized streaming content hashes. Only
+unmanaged local models fall back to resolved weight, shard, ONNX external tensor,
+tokenizer and processor file generations (inode/size/mtime/ctime).
 Model construction cross-checks file generations to reject mid-load changes, and
 an already-loaded model retains its immutable identity. Unattested providers
 conservatively re-embed. Runtime adapters without complete candidate revisions
@@ -1084,7 +1085,9 @@ The capabilities/status JSON reports a durable `minimum_reader_version` feature
 epoch independent of package release: 1 for the baseline catalog, 2 whenever
 extended identity/ownership/cache-policy catalog fields are present, including
 `inline_managed` or `retired`. Catalog transactions stamp this monotonically,
-and opening checks the epoch before parsing resolver definitions. Older unstamped
+and opening checks the epoch before parsing resolver definitions. Extended
+catalogs also use a versioned object envelope, which pre-epoch array readers
+reject even if they ignore unknown resolver fields. Older unstamped
 catalogs infer their epoch on load; the next mutation stamps it. Status polling
 uses cached epochs under a read guard, with table catalogs loaded during open,
 rather than opening every table under an exclusive polling guard. Portable

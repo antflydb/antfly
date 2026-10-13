@@ -2332,6 +2332,47 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
     return componentDependencySignature(io, paths.items);
 }
 
+// Legacy managed receipts may lack a digest. Hash those files once per local
+// file generation, keeping the resulting identity content-based across copies.
+const LegacyArtifactDigestCache = struct {
+    const Entry = struct { signature: [32]u8, digest: [32]u8 };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var entries: [256]?Entry = @splat(null);
+    var next: usize = 0;
+
+    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
+        const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
+        spinLock(&mutex);
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) {
+                mutex.unlock();
+                return entry.digest;
+            }
+        };
+        mutex.unlock();
+        var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+        defer file.close(io);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            hasher.update(buffer[0..count]);
+        }
+        var result: [32]u8 = undefined;
+        hasher.final(&result);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        spinLock(&mutex);
+        defer mutex.unlock();
+        entries[next] = .{ .signature = signature, .digest = result };
+        next = (next + 1) % entries.len;
+        return result;
+    }
+};
+
 /// Stable identity before loading weights. Managed receipts use relative paths
 /// and pinned content digests, so copying/restoring a model preserves reuse.
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
@@ -2346,24 +2387,21 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
             }
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        var complete = true;
         for (artifacts) |artifact| {
-            const digest = artifact.sha256 orelse {
-                complete = false;
-                break;
-            };
-            if (digest.len != 64) return error.InvalidManagedDownload;
             var decoded: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
+            } else {
+                decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            }
             hash.update(artifact.path);
             hash.update(&.{0});
             hash.update(&decoded);
         }
-        if (complete) {
-            var result: [32]u8 = undefined;
-            hash.final(&result);
-            return result;
-        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
     }
     return resolutionModelRevision(a, io, manifest);
 }
@@ -13575,6 +13613,12 @@ test "capi resolver model identity uses receipt digests before load and survives
     const original = try modelIdentity(a, io, first_path, manifest);
     const copied = try modelIdentity(a, io, second_path, manifest);
     try std.testing.expectEqualSlices(u8, &original, &copied);
+    const legacy = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{.{ .path = "model.safetensors", .size = body.len }} }, .{});
+    defer a.free(legacy);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = legacy });
+    const legacy_identity = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &legacy_identity);
+    try std.testing.expectEqualSlices(u8, &legacy_identity, &try modelIdentity(a, io, second_path, manifest));
     // Invalid weight bytes deliberately prove identity lookup does not load a model.
     const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
     defer a.free(changed);
