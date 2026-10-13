@@ -59,7 +59,18 @@ pub const CandidateSource = struct {
         candidates: ?[32]u8 = null,
         embedding: ?[32]u8 = null,
     };
+    pub const CacheBatch = struct {
+        pub const Write = struct { key: []const u8, value: []const u8 };
+        ptr: *anyopaque,
+        writes: []const Write,
+        deletes: []const []const u8,
+        finish: *const fn (*anyopaque, bool) void,
+    };
     pub const VTable = struct {
+        /// Root-source caches join the resolution transaction. Other physical
+        /// stores flush one optional shared-cache batch after resolution commit.
+        embedding_cache_prepare: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!?CacheBatch = null,
+        embedding_cache_flush: ?*const fn (*anyopaque) anyerror!void = null,
         embedding_cache_get: ?*const fn (*anyopaque, std.mem.Allocator, [32]u8) anyerror!?[]const f32 = null,
         embedding_cache_put: ?*const fn (*anyopaque, [32]u8, []const f32) anyerror!void = null,
         load_vector: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_resolver").VectorReference) anyerror!?[]const f32 = null,

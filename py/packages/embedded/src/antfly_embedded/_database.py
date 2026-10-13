@@ -502,7 +502,10 @@ class Database:
     def add_index(self, config: JSONInput) -> None:
         """Add or replace an index; retry the identical request on BusyError.
 
-        A graph's ``replaces`` command also works when the old index is absent.
+        A graph's ``replaces`` registers a resumable background shadow; the old
+        index serves until activation. It also works when the old index is absent.
+        Optional ``wait: {timeout_ms: N}`` waits for activation. A wait timeout
+        leaves the accepted shadow running; inspect ``pending_work_stats()``.
         """
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 

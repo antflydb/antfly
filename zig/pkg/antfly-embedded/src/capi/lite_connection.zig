@@ -192,6 +192,7 @@ const Owner = struct {
     }
 
     fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
+        if (database.hasPendingGraphReplacements()) return true;
         const runtime = database.enrichment_runtime orelse return false;
         return database.core.hasGeneratedEnrichmentTargets() and
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
@@ -218,7 +219,7 @@ const Owner = struct {
             // every table under the lease, including namespaces not yet used
             // by a foreground call. Keep writer_no_replay's explicit policy.
             if (self.options.open_mode == .writer) {
-                @import("tables.zig").load(root) catch continue;
+                @import("tables.zig").loadAvailable(root) catch continue;
                 if (hasPendingGeneratedEnrichment(&root.db)) self.maintenance_pending = true;
                 var tables = root.embedded_tables.valueIterator();
                 while (tables.next()) |table| {

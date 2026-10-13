@@ -107,8 +107,19 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
-const graph_replacement_build_prefix = "\x00\x00__metadata__:graph_replacement_build_v1/";
-const GraphReplacementBuild = struct { name: []const u8, generation: u64 };
+pub const graph_replacement_build_prefix = "\x00\x00__metadata__:graph_replacement_build_v1/";
+pub const GraphReplacementBuild = struct {
+    name: []const u8,
+    generation: u64,
+    old: []const u8 = "",
+    config: ?types.IndexConfig = null,
+    request_hash: u64 = 0,
+    phase: enum { building, catching_up } = .building,
+    resume_key_b64: ?[]const u8 = null,
+    scanned: u64 = 0,
+    applied_sequence: u64 = 0,
+    last_error: ?[]const u8 = null,
+};
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic_v1 = "antfly-active-index-root-v1\n";
@@ -11910,19 +11921,33 @@ pub const IndexManager = struct {
 
     /// Reserve only the unpublished physical namespace. Corpus construction
     /// happens in a separate manager while the serving replay workers continue.
-    pub fn prepareGraphReplacementConfig(self: *IndexManager, store: anytype, old: []const u8, cfg: types.IndexConfig) !types.IndexConfig {
+    pub fn prepareGraphReplacementConfig(self: *IndexManager, store: anytype, old: []const u8, cfg: types.IndexConfig, floor: u64) !types.IndexConfig {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        const pending = try self.graphReplacementBuildsAlloc(store, self.alloc);
+        defer pending.deinit();
+        for (pending.value) |job| {
+            if (std.mem.eql(u8, job.name, cfg.name)) {
+                if (!std.mem.eql(u8, job.old, old) or job.request_hash != types.indexConfigHash(cfg)) return error.IndexReplacementConfigurationMismatch;
+                return types.IndexConfig.clone(self.alloc, job.config orelse return error.InvalidIndexConfig);
+            }
+            if (std.mem.eql(u8, job.old, old)) return error.IndexReplacementConfigurationMismatch;
+        }
         const previous = self.get(old) orelse return error.NotFound;
         if (previous.kind != .graph or cfg.kind != .graph) return error.UnsupportedOperation;
+        var validated = try parseGraphConfig(self.alloc, cfg.config_json);
+        defer validated.deinit(self.alloc);
+        for (validated.artifact_sources) |source| {
+            _ = self.getEnrichmentByName(source.artifact_name) orelse return error.InvalidIndexConfig;
+        }
         var stored = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         errdefer stored.deinit(self.alloc);
         try self.prepareStorageForFreshCatalogEntry(store, stored);
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
         defer self.alloc.free(key);
-        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation }, .{});
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor }, .{});
         defer self.alloc.free(value);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -11933,20 +11958,47 @@ pub const IndexManager = struct {
         return stored;
     }
 
-    /// The durable build marker precedes the source snapshot, so retaining the
-    /// journal while it exists closes the capture/truncation race. Normal replay
-    /// continues; activation or recovery removes this temporary retention pin.
-    pub fn clampReplayForGraphReplacementBuilds(self: *IndexManager, store: anytype, effective: u64) !u64 {
+    pub fn graphReplacementBuildsAlloc(self: *IndexManager, store: anytype, alloc: Allocator) !std.json.Parsed([]GraphReplacementBuild) {
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        var jobs: std.ArrayList(GraphReplacementBuild) = .empty;
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
-        if (try cursor.seekAtOrAfter(graph_replacement_build_prefix)) |row| {
-            if (std.mem.startsWith(u8, row.key, graph_replacement_build_prefix)) return 0;
+        var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
+        while (row) |kv| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
+            try jobs.append(arena.allocator(), try std.json.parseFromSliceLeaky(GraphReplacementBuild, arena.allocator(), kv.value, .{ .allocate = .alloc_always }));
         }
-        return effective;
+        const owner = try alloc.create(std.heap.ArenaAllocator);
+        owner.* = arena;
+        return .{ .arena = owner, .value = jobs.items };
+    }
+
+    pub fn saveGraphReplacementBuild(self: *IndexManager, store: anytype, job: GraphReplacementBuild) !void {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, job.name });
+        defer self.alloc.free(key);
+        const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
+        defer self.alloc.free(value);
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(key, value);
+        try txn.commit();
+    }
+
+    /// Retain only journal records not consumed by a shadow. Each bounded
+    /// build/catch-up round advances this pin, allowing ordinary truncation.
+    pub fn clampReplayForGraphReplacementBuilds(self: *IndexManager, store: anytype, effective: u64) !u64 {
+        const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
+        defer jobs.deinit();
+        var floor = effective;
+        for (jobs.value) |job| floor = @min(floor, job.applied_sequence);
+        return floor;
     }
 
     /// Turn interrupted unpublished builds into the existing bounded cleanup
@@ -11970,6 +12022,7 @@ pub const IndexManager = struct {
             }
         }
         for (builds.items) |item| {
+            if (item.build.config != null) continue; // durable resumable shadow
             var cleanup = try self.prepareGeneratedArtifactCleanupPlan(item.build.name, .graph, item.build.generation, null, null, &.{});
             defer cleanup.deinit();
             var txn = try runtime_store.store.beginWrite();

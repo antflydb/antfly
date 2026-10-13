@@ -31,7 +31,7 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
 }
 
 fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
@@ -59,32 +59,31 @@ fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, 
     };
 }
 
-const embedding_cache_prefix = "\x00antfly/cache/mention_embeddings/v1/";
+const embedding_cache_prefix = "\x00antfly/cache/mention_embeddings/v2/";
+const embedding_cache_bytes_key = "\x00antfly/cache/mention_embeddings/bytes_v2";
+const embedding_cache_limit: usize = 256 * 1024 * 1024;
+var embedding_cache_limit_for_test: ?usize = null;
+const embedding_cache_pending_limit: usize = 16 * 1024 * 1024;
+const embedding_cache_retention_ns: i64 = 30 * std.time.ns_per_day;
 const embedding_cache_sweep_key = "\x00antfly/cache/mention_embeddings/last_sweep_ns";
 
 fn embeddingCacheKey(a: std.mem.Allocator, digest: [32]u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}{s}", .{ embedding_cache_prefix, std.fmt.bytesToHex(digest, .lower) });
 }
 
-fn embeddingCacheGet(ptr: *anyopaque, a: std.mem.Allocator, digest: [32]u8) anyerror!?[]const f32 {
-    const root: *h.Handle = @ptrCast(@alignCast(ptr));
-    const key = try embeddingCacheKey(a, digest);
-    defer a.free(key);
-    var read = try root.db.core.store.beginReadTxn();
-    defer read.abort();
-    const raw = read.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    if (raw.len < 40 or !std.mem.eql(u8, raw[0..4], "ECF1")) return null;
+fn decodeCachedVector(a: std.mem.Allocator, raw: []const u8) !?[]const f32 {
+    if (raw.len < 48 or !std.mem.eql(u8, raw[0..4], "ECF2")) return null;
+    const now: i64 = @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds);
+    const created = std.mem.readInt(i64, raw[40..48], .little);
+    if (now >= created and now - created > embedding_cache_retention_ns) return null;
     const count = std.mem.readInt(u32, raw[4..8], .little);
-    if (count == 0 or count > 4 * 1024 * 1024 or raw.len != 40 + @as(usize, count) * 4) return null;
+    if (count == 0 or raw.len != 48 + @as(usize, count) * 4) return null;
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw[40..], &hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(raw[48..], &hash, .{});
     if (!std.mem.eql(u8, &hash, raw[8..40])) return null;
     const vector = try a.alloc(f32, count);
     for (vector, 0..) |*value, i| {
-        value.* = @bitCast(std.mem.readInt(u32, raw[40 + i * 4 ..][0..4], .little));
+        value.* = @bitCast(std.mem.readInt(u32, raw[48 + i * 4 ..][0..4], .little));
         if (!std.math.isFinite(value.*)) {
             a.free(vector);
             return null;
@@ -93,22 +92,166 @@ fn embeddingCacheGet(ptr: *anyopaque, a: std.mem.Allocator, digest: [32]u8) anye
     return vector;
 }
 
+fn embeddingCacheGet(ptr: *anyopaque, a: std.mem.Allocator, digest: [32]u8) anyerror!?[]const f32 {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    lockCache(&root.embedding_cache_mutex);
+    if (root.embedding_cache_pending.get(digest)) |raw| {
+        defer root.embedding_cache_mutex.unlock();
+        return decodeCachedVector(a, raw);
+    }
+    root.embedding_cache_mutex.unlock();
+    const key = try embeddingCacheKey(a, digest);
+    defer a.free(key);
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const raw = read.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return decodeCachedVector(a, raw);
+}
+
+fn lockCache(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+}
+
 fn embeddingCachePut(ptr: *anyopaque, digest: [32]u8, vector: []const f32) anyerror!void {
     const root: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(root.open_mode) or vector.len == 0 or vector.len > 4 * 1024 * 1024) return;
-    const key = try embeddingCacheKey(root.alloc, digest);
-    defer root.alloc.free(key);
-    const raw = try root.alloc.alloc(u8, 40 + vector.len * 4);
-    defer root.alloc.free(raw);
-    @memcpy(raw[0..4], "ECF1");
+    const raw = try root.alloc.alloc(u8, 48 + vector.len * 4);
+    errdefer root.alloc.free(raw);
+    @memcpy(raw[0..4], "ECF2");
     std.mem.writeInt(u32, raw[4..8], @intCast(vector.len), .little);
+    std.mem.writeInt(i64, raw[40..48], @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds), .little);
     for (vector, 0..) |value, i| {
-        if (!std.math.isFinite(value)) return;
-        std.mem.writeInt(u32, raw[40 + i * 4 ..][0..4], @bitCast(value), .little);
+        if (!std.math.isFinite(value)) {
+            root.alloc.free(raw);
+            return;
+        }
+        std.mem.writeInt(u32, raw[48 + i * 4 ..][0..4], @bitCast(value), .little);
     }
-    std.crypto.hash.sha2.Sha256.hash(raw[40..], raw[8..40], .{});
-    // Cache keys never enter the authoritative replay stream or portable exports.
-    try root.db.core.store.put(key, raw);
+    std.crypto.hash.sha2.Sha256.hash(raw[48..], raw[8..40], .{});
+    lockCache(&root.embedding_cache_mutex);
+    defer root.embedding_cache_mutex.unlock();
+    if (root.embedding_cache_pending.contains(digest) or root.embedding_cache_pending_bytes + raw.len > embedding_cache_pending_limit) {
+        root.alloc.free(raw);
+        return;
+    }
+    try root.embedding_cache_pending.put(root.alloc, digest, raw);
+    root.embedding_cache_pending_bytes += raw.len;
+}
+
+const PreparedEmbeddingCache = struct {
+    root: *h.Handle,
+    arena: std.heap.ArenaAllocator,
+    writes: []const callbacks.CandidateSource.CacheBatch.Write,
+    deletes: []const []const u8,
+    keys: []const [32]u8,
+    fn finish(ptr: *anyopaque, committed: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const root = self.root;
+        if (committed) {
+            lockCache(&root.embedding_cache_mutex);
+            for (self.keys) |key| if (root.embedding_cache_pending.fetchRemove(key)) |entry| {
+                root.embedding_cache_pending_bytes -= entry.value.len;
+                root.alloc.free(entry.value);
+            };
+            root.embedding_cache_mutex.unlock();
+        }
+        self.arena.deinit();
+        root.alloc.destroy(self);
+        root.embedding_cache_commit_mutex.unlock();
+    }
+};
+
+fn prepareEmbeddingCache(root: *h.Handle) !callbacks.CandidateSource.CacheBatch {
+    lockCache(&root.embedding_cache_commit_mutex);
+    errdefer root.embedding_cache_commit_mutex.unlock();
+    const state = try root.alloc.create(PreparedEmbeddingCache);
+    errdefer root.alloc.destroy(state);
+    state.* = .{ .root = root, .arena = std.heap.ArenaAllocator.init(root.alloc), .writes = &.{}, .deletes = &.{}, .keys = &.{} };
+    errdefer state.arena.deinit();
+    const a = state.arena.allocator();
+    var writes: std.ArrayList(callbacks.CandidateSource.CacheBatch.Write) = .empty;
+    var deletes: std.ArrayList([]const u8) = .empty;
+    var keys: std.ArrayList([32]u8) = .empty;
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const old_usage = read.get(embedding_cache_bytes_key) catch "0";
+    var usage = std.fmt.parseInt(usize, old_usage, 10) catch 0;
+    lockCache(&root.embedding_cache_mutex);
+    {
+        defer root.embedding_cache_mutex.unlock();
+        var it = root.embedding_cache_pending.iterator();
+        while (it.next()) |entry| {
+            const key = try embeddingCacheKey(a, entry.key_ptr.*);
+            const old = read.get(key) catch "";
+            usage -|= if (old.len > 0) old.len + key.len else 0;
+            usage +|= entry.value_ptr.*.len + key.len;
+            try writes.append(a, .{ .key = key, .value = try a.dupe(u8, entry.value_ptr.*) });
+            try keys.append(a, entry.key_ptr.*);
+        }
+    }
+    // Bound the complete shared cache, independent of mention/document/table
+    // count. Eviction touches only cache keys; live references may recompute.
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    const limit = if (@import("builtin").is_test) embedding_cache_limit_for_test orelse embedding_cache_limit else embedding_cache_limit;
+    while (usage > limit) {
+        const kv = row orelse break;
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        var replaced = false;
+        for (writes.items) |write| if (std.mem.eql(u8, write.key, kv.key)) {
+            replaced = true;
+            break;
+        };
+        if (!replaced) {
+            try deletes.append(a, try a.dupe(u8, kv.key));
+            usage -|= kv.key.len + kv.value.len;
+        }
+        row = try cursor.next();
+    }
+    while (usage > limit and writes.items.len > 0) {
+        const dropped = writes.pop().?;
+        usage -|= dropped.key.len + dropped.value.len;
+        if (read.get(dropped.key)) |old| {
+            try deletes.append(a, dropped.key);
+            _ = old;
+        } else |_| {}
+    }
+    try writes.append(a, .{ .key = embedding_cache_bytes_key, .value = try std.fmt.allocPrint(a, "{d}", .{usage}) });
+    state.writes = writes.items;
+    state.deletes = deletes.items;
+    state.keys = keys.items;
+    return .{ .ptr = state, .writes = state.writes, .deletes = state.deletes, .finish = PreparedEmbeddingCache.finish };
+}
+
+fn embeddingCachePrepare(ptr: *anyopaque, _: std.mem.Allocator, store: *anyopaque) anyerror!?callbacks.CandidateSource.CacheBatch {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    if (store != @as(*anyopaque, @ptrCast(root.db.core.store))) return null;
+    lockCache(&root.embedding_cache_mutex);
+    const pending = root.embedding_cache_pending.count();
+    root.embedding_cache_mutex.unlock();
+    if (pending == 0) return null;
+    return try prepareEmbeddingCache(root);
+}
+
+fn embeddingCacheFlush(ptr: *anyopaque) anyerror!void {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    lockCache(&root.embedding_cache_mutex);
+    const pending = root.embedding_cache_pending.count();
+    root.embedding_cache_mutex.unlock();
+    if (pending == 0) return;
+    const batch = try prepareEmbeddingCache(root);
+    var committed = false;
+    defer batch.finish(batch.ptr, committed);
+    var txn = try root.db.core.store.beginWriteTxn();
+    errdefer txn.abort();
+    for (batch.deletes) |key| try txn.delete(key);
+    for (batch.writes) |write| try txn.put(write.key, write.value);
+    try txn.commit();
+    committed = true;
 }
 
 fn loadVector(ptr: *anyopaque, a: std.mem.Allocator, ref: @import("antfly_resolver").VectorReference) anyerror!?[]const f32 {
@@ -151,10 +294,68 @@ fn loadVector(ptr: *anyopaque, a: std.mem.Allocator, ref: @import("antfly_resolv
     return vector;
 }
 
+const embedding_cache_cursor_key = "\x00antfly/cache/mention_embeddings/sweep_cursor";
+
+/// Incremental expiration scans cache keys only, never documents/artifacts.
+fn sweepEmbeddingCachePage(root: *h.Handle) !void {
+    const now: i64 = @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds);
+    lockCache(&root.embedding_cache_commit_mutex);
+    defer root.embedding_cache_commit_mutex.unlock();
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const resume_key = read.get(embedding_cache_cursor_key) catch "";
+    const stamp = read.get(embedding_cache_sweep_key) catch "0";
+    const previous = std.fmt.parseInt(i64, stamp, 10) catch 0;
+    if (resume_key.len == 0 and now >= previous and now - previous < 15 * std.time.ns_per_min) return;
+    var usage = std.fmt.parseInt(usize, read.get(embedding_cache_bytes_key) catch "0", 10) catch 0;
+    const prefix = "\x00antfly/cache/mention_embeddings/v";
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(if (resume_key.len == 0) prefix else resume_key);
+    if (row != null and resume_key.len != 0 and std.mem.eql(u8, row.?.key, resume_key)) row = try cursor.next();
+    var write = try root.db.core.store.beginWriteTxn();
+    errdefer write.abort();
+    var count: usize = 0;
+    var last: []const u8 = "";
+    defer root.alloc.free(last);
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) {
+            row = null;
+            break;
+        }
+        if (count == 256) break;
+        count += 1;
+        const owned_key = try root.alloc.dupe(u8, kv.key);
+        root.alloc.free(last);
+        last = owned_key;
+        const current = std.mem.startsWith(u8, kv.key, embedding_cache_prefix);
+        const expired = !current or kv.value.len < 48 or !std.mem.eql(u8, kv.value[0..4], "ECF2") or
+            now -| std.mem.readInt(i64, kv.value[40..48], .little) > embedding_cache_retention_ns;
+        if (expired) {
+            try write.delete(kv.key);
+            if (current) usage -|= kv.key.len + kv.value.len;
+        }
+    }
+    if (row == null) {
+        try write.delete(embedding_cache_cursor_key);
+        const text = try std.fmt.allocPrint(root.alloc, "{d}", .{now});
+        defer root.alloc.free(text);
+        try write.put(embedding_cache_sweep_key, text);
+    } else try write.put(embedding_cache_cursor_key, last);
+    const bytes = try std.fmt.allocPrint(root.alloc, "{d}", .{usage});
+    defer root.alloc.free(bytes);
+    try write.put(embedding_cache_bytes_key, bytes);
+    try write.commit();
+}
+
 /// Opportunistic periodic mark/sweep. Artifacts own references, never cache
 /// entries; races with an unfinished artifact only cause harmless recomputation.
 pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
     if (!h.liteOpenModeCanWrite(root.open_mode)) return;
+    if (!force) return sweepEmbeddingCachePage(root);
+    try embeddingCacheFlush(root);
+    lockCache(&root.embedding_cache_commit_mutex);
+    defer root.embedding_cache_commit_mutex.unlock();
     const now = std.math.cast(i64, std.Io.Clock.real.now(h.handleLockIo()).nanoseconds) orelse return;
     if (!force) {
         var read = try root.db.core.store.beginReadTxn();
@@ -204,12 +405,16 @@ pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
     var write = try root.db.core.store.beginWriteTxn();
     errdefer write.abort();
     var deleted: usize = 0;
+    var retained_bytes: usize = 0;
     var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
     while (row) |kv| : (row = try cursor.next()) {
         if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
         var digest: [32]u8 = undefined;
         const parsed = if (kv.key.len == embedding_cache_prefix.len + 64) std.fmt.hexToBytes(&digest, kv.key[embedding_cache_prefix.len..]) catch null else null;
-        if (parsed != null and live.contains(digest)) continue;
+        if (parsed != null and live.contains(digest)) {
+            retained_bytes += kv.key.len + kv.value.len;
+            continue;
+        }
         try write.delete(kv.key);
         deleted += 1;
         if (deleted % 1024 == 0) {
@@ -220,6 +425,9 @@ pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
     const stamp = try std.fmt.allocPrint(root.alloc, "{d}", .{now});
     defer root.alloc.free(stamp);
     try write.put(embedding_cache_sweep_key, stamp);
+    const usage = try std.fmt.allocPrint(root.alloc, "{d}", .{retained_bytes});
+    defer root.alloc.free(usage);
+    try write.put(embedding_cache_bytes_key, usage);
     try write.commit();
 }
 
@@ -762,12 +970,14 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
         model_revision: u8 = 1,
         mention_calls: usize = 0,
         entity_calls: usize = 0,
+        forbid_model_load: bool = false,
         fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?[32]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return @as([32]u8, @splat(self.model_revision));
         }
         fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, _: []const u8, dims: u32) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbid_model_load) return error.UnexpectedModelLoad;
             if (std.mem.eql(u8, name, "mention_names")) self.mention_calls += 1 else self.entity_calls += 1;
             if (dims != 3) return error.InvalidArgument;
             return try alloc.dupe(f32, &.{ 1, 0, 0 });
@@ -801,6 +1011,17 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:duplicate", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
     try runUntilIdle(handle);
     try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
+    try tables.create(handle, "second_source", "{}", false);
+    var second_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("second_source"), &second_id));
+    defer api.antfly_db_close(second_id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(second_id, .fromSlice(config)));
+    const second = try tables.get(handle, "second_source");
+    try second.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    second.setResolutionEmbedder(fake_embedder);
+    try second.batch(.{ .writes = &.{.{ .key = "claim:other_table", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
     const private_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:duplicate", "resolved");
     defer a.free(private_key);
     const private_bytes = try handle.db.core.store.get(a, private_key);
@@ -812,6 +1033,12 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     const mention = work_json.object.get("mentions").?.array.items[0];
     try std.testing.expect(mention.object.get("embedding").? == .null);
     const embedding_key = (try std.json.parseFromValueLeaky(?[32]u8, private_arena.allocator(), mention.object.get("embedding_key").?, .{})).?;
+    try std.testing.expectEqual(@as(usize, 0), handle.embedding_cache_pending.count());
+    const persisted_cache_key = try embeddingCacheKey(a, embedding_key);
+    defer a.free(persisted_cache_key);
+    const persisted_vector = try handle.db.core.store.get(a, persisted_cache_key);
+    defer a.free(persisted_vector);
+    try std.testing.expect(std.mem.startsWith(u8, persisted_vector, "ECF2"));
     const wire_candidate = work_json.object.get("candidates").?.array.items[0];
     const refs = try std.json.parseFromValueLeaky([]const @import("antfly_resolver").VectorReference, private_arena.allocator(), wire_candidate.object.get("vector_refs").?, .{});
     try std.testing.expect(refs.len > 0 and refs[0].vector_id != null);
@@ -876,6 +1103,8 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     // Reapply a public inline config with a changed scorer. A real config
     // replay must reuse mention embeddings, including across canonical writes.
     const before_replay = embed_context.mention_calls;
+    const before_entity_replay = embed_context.entity_calls;
+    embed_context.forbid_model_load = true;
     var updated = try std.json.parseFromSlice(std.json.Value, a, config, .{});
     defer updated.deinit();
     try updated.value.object.put(a, "name", .{ .string = "knowledge_updated" });
@@ -888,6 +1117,8 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(new_config)));
     try runUntilIdle(handle);
     try std.testing.expectEqual(before_replay, embed_context.mention_calls);
+    try std.testing.expectEqual(before_entity_replay, embed_context.entity_calls);
+    embed_context.forbid_model_load = false;
     // A candidate/index revision changes independently of the embedding model.
     const before_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
     try entities.batch(.{ .writes = &.{.{ .key = "concept/new", .value = "{\"canonical_name\":\"New candidate\"}" }} });
@@ -1569,4 +1800,68 @@ test "capi resolver concurrent source promotions preserve shared destination ali
     try std.testing.expectEqual(@as(usize, 2), json.value.object.get("aliases").?.array.items.len);
     const canonical = json.value.object.get("canonical_name").?.string;
     try std.testing.expect(std.mem.eql(u8, canonical, "Ada") or std.mem.eql(u8, canonical, "ADA"));
+}
+
+test "capi resolver embedding cache batches writes bounds size and expires pages" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("mention-cache-pages");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    for (0..300) |i| {
+        var digest: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        try embeddingCachePut(handle, digest, &.{1});
+    }
+    try std.testing.expectEqual(sequence, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try embeddingCacheFlush(handle);
+    try std.testing.expectEqual(sequence + 1, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 0), handle.embedding_cache_pending.count());
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var txn = try handle.db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+        while (row) |kv| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+            const expired = try a.dupe(u8, kv.value);
+            defer a.free(expired);
+            std.mem.writeInt(i64, expired[40..48], 0, .little);
+            try txn.put(kv.key, expired);
+        }
+        try txn.commit();
+    }
+    try collectEmbeddingCache(handle, false);
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try read.get(embedding_cache_cursor_key)).len > 0);
+        const bytes = try read.get(embedding_cache_bytes_key);
+        try std.testing.expect(try std.fmt.parseInt(usize, bytes, 10) > 0);
+    }
+    try collectEmbeddingCache(handle, false);
+    embedding_cache_limit_for_test = 512;
+    defer embedding_cache_limit_for_test = null;
+    for (0..10) |i| try embeddingCachePut(handle, @splat(@intCast(i)), &.{ 1, 2, 3 });
+    try embeddingCacheFlush(handle);
+    var read = try handle.db.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    var total: usize = 0;
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        total += kv.key.len + kv.value.len;
+    }
+    try std.testing.expect(total <= 512);
+    try std.testing.expectEqual(total, try std.fmt.parseInt(usize, try read.get(embedding_cache_bytes_key), 10));
 }

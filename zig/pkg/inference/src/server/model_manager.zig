@@ -2339,6 +2339,7 @@ const LegacyArtifactDigestCache = struct {
     var mutex: std.atomic.Mutex = .unlocked;
     var entries: [256]?Entry = @splat(null);
     var next: usize = 0;
+    var forbid_hashing_for_test: bool = false;
 
     fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
@@ -2350,6 +2351,23 @@ const LegacyArtifactDigestCache = struct {
             }
         };
         mutex.unlock();
+        const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
+        defer std.heap.page_allocator.free(memo_path);
+        const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
+        defer if (memo_bytes) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo_bytes) |bytes| {
+            if (std.json.parseFromSlice(Entry, std.heap.page_allocator, bytes, .{})) |memo| {
+                defer memo.deinit();
+                if (std.mem.eql(u8, &signature, &memo.value.signature)) {
+                    spinLock(&mutex);
+                    defer mutex.unlock();
+                    entries[next] = memo.value;
+                    next = (next + 1) % entries.len;
+                    return memo.value.digest;
+                }
+            } else |_| {}
+        }
+        if (builtin.is_test and forbid_hashing_for_test) return error.UnexpectedModelRehash;
         var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
         defer file.close(io);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -2365,6 +2383,9 @@ const LegacyArtifactDigestCache = struct {
         var result: [32]u8 = undefined;
         hasher.final(&result);
         if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        const memo = std.json.Stringify.valueAlloc(std.heap.page_allocator, Entry{ .signature = signature, .digest = result }, .{}) catch null;
+        defer if (memo) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo) |bytes| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = memo_path, .data = bytes }) catch {};
         spinLock(&mutex);
         defer mutex.unlock();
         entries[next] = .{ .signature = signature, .digest = result };
@@ -2388,12 +2409,12 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
-            var decoded: [32]u8 = undefined;
+            const decoded = try LegacyArtifactDigestCache.digest(io, artifact);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
-                _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-            } else {
-                decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
             }
             hash.update(artifact.path);
             hash.update(&.{0});
@@ -13613,6 +13634,11 @@ test "capi resolver model identity uses receipt digests before load and survives
     const original = try modelIdentity(a, io, first_path, manifest);
     const copied = try modelIdentity(a, io, second_path, manifest);
     try std.testing.expectEqualSlices(u8, &original, &copied);
+    LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process
+    LegacyArtifactDigestCache.forbid_hashing_for_test = true;
+    defer LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    try std.testing.expectEqualSlices(u8, &original, &try modelIdentity(a, io, second_path, manifest));
+    LegacyArtifactDigestCache.forbid_hashing_for_test = false;
     const legacy = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{.{ .path = "model.safetensors", .size = body.len }} }, .{});
     defer a.free(legacy);
     try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = legacy });
@@ -13623,6 +13649,9 @@ test "capi resolver model identity uses receipt digests before load and survives
     const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
     defer a.free(changed);
     try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = changed });
-    const new_identity = try modelIdentity(a, io, second_path, manifest);
-    try std.testing.expect(!std.mem.eql(u8, &original, &new_identity));
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+    // A stale pinned receipt must also reject in-place weight replacement.
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
 }

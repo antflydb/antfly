@@ -2301,11 +2301,11 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
-    handle.database().*.startQuarantineRetryWorkerIfNeeded();
-    @import("tables.zig").load(handle) catch |err| {
+    @import("tables.zig").loadCatalog(handle) catch |err| {
         alloc.free(handle.embedded_path.?);
         return err;
     };
+    handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
 
@@ -2633,6 +2633,7 @@ pub fn openLiteHandleAllocWithRuntime(
     opts.start_resolver_workers = false;
     if (resolved.externally_locked) {
         // The connection worker drives maintenance while holding its path lease.
+        opts.start_independent_maintenance = false;
         opts.executor = .{ .backend = .manual };
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
@@ -2705,7 +2706,7 @@ pub fn openLiteHandleAllocWithRuntime(
         return err;
     };
     @import("entity_sink.zig").attach(handle, &handle.db);
-    @import("tables.zig").load(handle) catch |err| {
+    @import("tables.zig").loadCatalog(handle) catch |err| {
         stopLiteEmbeddedInference(handle);
         alloc.free(handle.embedded_path.?);
         return err;
@@ -2767,11 +2768,11 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = options,
     };
-    handle.database().*.startQuarantineRetryWorkerIfNeeded();
-    @import("tables.zig").load(handle) catch |err| {
+    @import("tables.zig").loadCatalog(handle) catch |err| {
         alloc.free(handle.embedded_path.?);
         return err;
     };
+    handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
 
@@ -4558,26 +4559,53 @@ pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
 
 /// A root Lite connection drains every namespace. Report that same scope,
 /// retaining per-table snapshots so callers can identify failed producers.
+fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Value {
+    const bytes = try std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{});
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const jobs = try database.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    var rows: std.ArrayList(std.json.Value) = .empty;
+    for (jobs.value) |job| {
+        const status = try std.json.Stringify.valueAlloc(a, .{
+            .name = job.name,
+            .replaces = job.old,
+            .phase = @tagName(job.phase),
+            .scanned_keys = job.scanned,
+            .applied_sequence = job.applied_sequence,
+            .target_sequence = database.core.nextDerivedSequence(),
+            .last_error = job.last_error,
+        }, .{});
+        try rows.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, status, .{}));
+    }
+    try value.object.put(a, "replacements", .{ .array = .fromOwnedSlice(a, rows.items) });
+    return value;
+}
+
 pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
-    var stats = handle.database().pendingWorkStats();
-    if (handle.selected_table_name != null or handle.embedded_tables.count() == 0) return stringifyJson(stats);
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    var aggregate = handle.database().pendingWorkStats();
+    var output = try pendingNamespaceStatsValue(a, handle.database());
+    if (handle.selected_table_name != null) return stringifyJson(output);
     var snapshots: std.json.ObjectMap = .empty;
     var iterator = handle.embedded_tables.iterator();
     while (iterator.next()) |entry| {
-        const child = entry.value_ptr.*.db.pendingWorkStats();
-        const bytes = try std.json.Stringify.valueAlloc(a, child, .{});
-        try snapshots.put(a, entry.key_ptr.*, try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}));
-        stats.enrichment.enabled = stats.enrichment.enabled or child.enrichment.enabled;
-        stats.enrichment.error_count +|= child.enrichment.error_count;
-        stats.enrichment.retryable_error_count +|= child.enrichment.retryable_error_count;
-        stats.enrichment.fatal_error_count +|= child.enrichment.fatal_error_count;
-        if (child.enrichment.last_error_code.len > 0) stats.enrichment.last_error_code = child.enrichment.last_error_code;
+        const child = try pendingNamespaceStatsValue(a, &entry.value_ptr.*.db);
+        try snapshots.put(a, entry.key_ptr.*, child);
+        const child_stats = entry.value_ptr.*.db.pendingWorkStats();
+        aggregate.enrichment.enabled = aggregate.enrichment.enabled or child_stats.enrichment.enabled;
+        aggregate.enrichment.error_count +|= child_stats.enrichment.error_count;
+        aggregate.enrichment.retryable_error_count +|= child_stats.enrichment.retryable_error_count;
+        aggregate.enrichment.fatal_error_count +|= child_stats.enrichment.fatal_error_count;
+        if (child_stats.enrichment.last_error_code.len > 0) aggregate.enrichment.last_error_code = child_stats.enrichment.last_error_code;
     }
-    const bytes = try std.json.Stringify.valueAlloc(a, stats, .{});
-    var output = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const enrichment = try std.json.Stringify.valueAlloc(a, aggregate.enrichment, .{});
+    try output.object.put(a, "enrichment", try std.json.parseFromSliceLeaky(std.json.Value, a, enrichment, .{}));
+    var unavailable: std.json.ObjectMap = .empty;
+    var errors = handle.embedded_table_errors.iterator();
+    while (errors.next()) |entry| try unavailable.put(a, entry.key_ptr.*, .{ .string = entry.value_ptr.* });
+    try output.object.put(a, "unavailable_tables", .{ .object = unavailable });
     try output.object.put(a, "tables", .{ .object = snapshots });
     return stringifyJson(output);
 }
@@ -7238,7 +7266,16 @@ pub export fn antfly_db_add_index_json(
     const discriminator = value.object.get("kind") orelse value.object.get("type") orelse return capi.mapError(error.MissingIndexType);
     if (discriminator != .string) return capi.mapError(error.InvalidIndexType);
     const replacement = value.object.get("replaces");
+    const wait = value.object.get("wait");
+    var wait_ms: ?u64 = null;
+    if (wait) |request| {
+        if (request != .object) return capi.mapError(error.InvalidArgument);
+        const timeout = request.object.get("timeout_ms") orelse return capi.mapError(error.InvalidArgument);
+        if (timeout != .integer or timeout.integer < 0) return capi.mapError(error.InvalidArgument);
+        wait_ms = @intCast(timeout.integer);
+    }
     var index_value = value;
+    _ = index_value.object.swapRemove("wait");
     _ = index_value.object.swapRemove("replaces");
     const config_value = index_value.object.get("config_json");
     const normalized_config = if (config_value) |config| switch (config) {
@@ -7350,6 +7387,8 @@ pub export fn antfly_db_add_index_json(
         }
     }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
+    @import("tables.zig").noteReaderVersion(handle) catch |err| return capi.mapError(err);
+    if (wait_ms) |timeout| handle.database().waitGraphReplacement(name.string, timeout) catch |err| return capi.mapError(err);
     return .ok;
 }
 

@@ -1013,11 +1013,15 @@ Native Lite candidate revisions include the physical table binding, committed
 source/enrichment sequences, selected index configuration and its applied replay
 sequence. This covers canonical inserts/deletes, table recreation and vectors
 becoming visible after an ANN drain. Mention embedding keys combine the model
-identity, dimensions and a hash of the exact input string, independently of the
+identity, dimensions, effective provider settings (including input type,
+instruction and truncation), and a hash of the exact input string, independently of the
 source or destination table. Local capabilities expose identity before weights
 load: managed downloads hash sorted relative artifact paths and pinned receipt
 SHA-256 digests. Copying or restoring identical files preserves that identity.
-Managed receipts without digests use memoized streaming content hashes. Only
+Receipt digests are verified against file content. Verified digests are memoized
+in memory and in disposable file-generation sidecars; inode, size, mtime and ctime
+changes invalidate verification. Legacy managed receipts use the same persistent
+content-hash memo, avoiding full rehash on every process reopen. Only
 unmanaged local models fall back to resolved weight, shard, ONNX external tensor,
 tokenizer and processor file generations (inode/size/mtime/ctime).
 Model construction cross-checks file generations to reject mid-load changes, and
@@ -1051,21 +1055,26 @@ including empty candidate sets, even if it ultimately changes no matches.
 ### Embedded upgrade and identity management
 
 Prefer `add_index({..., "replaces":"knowledge_v1"})` for graph index versioning.
-It privately constructs the replacement and commits the new index catalog,
-last-owner retirement, routing revisions and cleanup debt together. A construction
-or pre-commit failure leaves the old index serving. Private snapshot construction
-and journal catch-up use the existing repair helpers while resolution/promotion
-workers continue. Only the final bounded catch-up and catalog swap take their
-gates. A durable unpublished-build marker temporarily retains replay; interrupted
-builds become the existing bounded cleanup debt on recovery. Field-backed
-replacement aborts with Busy if primary writes advance during its build, because
-the old logical index's field deltas cannot certify the new projection. The old
-index remains serving; retry after the source stabilizes.
-`replaces` is a command field,
-not stored declarative configuration. Retrying the same request is idempotent;
-reopening may reapply the identical new config without `replaces`. When both names
-are absent, it behaves like ordinary add, so callers can always send the command.
-Currently atomic replacement supports graph-to-graph upgrades with distinct names.
+Registration validates the request, reserves a hidden shadow and returns. The
+existing maintenance owner builds bounded source pages and catches up replay,
+saving its cursor and applied sequence after projection durability. The old
+index serves until the final bounded tail and atomic catalog swap. Field-backed
+changes re-process their changed sources rather than abandoning the build.
+Catch-up coalesces each journal window by source key, so repeated updates to a
+hot document rebuild its latest projection once per round.
+Replay retention advances after each round; it does not pin the entire journal.
+Restart resumes the durable marker/checkpoints, without rebuilding completed
+pages. Failed background work retains its checkpoint and exposes `last_error`
+in the per-index `replacements` array of `pending_work_stats_json`.
+
+Identical in-progress requests are no-ops. `replaces` and optional
+`"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
+Waiting cooperatively advances the same work; deadline Busy means registration
+was accepted and the shadow continues in the background. Without wait, Busy is
+limited to bounded registration admission. Drain with `run_until_idle` to await
+all replacements. When both names are absent, the command behaves like ordinary
+add. Atomic replacement currently supports graph-to-graph upgrades with distinct
+names; other index kinds are rejected before inline configuration is changed.
 
 The separate-call recipe is add v2 first, then delete v1. When changing identity
 rules, migrate/reset the resolver namespace first and submit v2 with the new
@@ -1089,8 +1098,10 @@ and opening checks the epoch before parsing resolver definitions. Extended
 catalogs also use a versioned object envelope, which pre-epoch array readers
 reject even if they ignore unknown resolver fields. Older unstamped
 catalogs infer their epoch on load; the next mutation stamps it. Status polling
-uses cached epochs under a read guard, with table catalogs loaded during open,
-rather than opening every table under an exclusive polling guard. Portable
+uses cached epochs under a read guard. Open loads the lightweight table catalog,
+then opens each table on demand. Named-table catalogs durably summarize the reader
+epoch. Background discovery isolates an unavailable table and reports its error
+in `unavailable_tables`; unrelated root/table reads remain available. Portable
 exports retain the stamp; imports validate it against supported versions and
 catalog requirements before publication. CI checks a real pinned pre-PR reader
 against both a plain database and one containing inline ownership fields.
@@ -1112,9 +1123,16 @@ on an absent vector. Scorer inputs remain lossless f32.
 
 Public artifact lookup and raw resolution lookup strip `_resolution_work`.
 Artifact deletion/replay own the reference lifetime. The mention side store is
-strictly expendable, excluded from portable backups and swept periodically by
-embedded maintenance (also on drain/vacuum): mark live artifact references, then
-delete unmarked entries in bounded write batches. Losing it only costs inference.
+strictly expendable and excluded from portable backups. Inserts queue in a bounded
+16 MiB buffer. Root-source resolutions include the shared-cache writes in their
+resolution transaction; named sources flush one optional shared-cache transaction
+per resolution window after source commit, since Directory tables have distinct
+physical stores. No inference result commits independently per mention. A durable
+byte counter and eviction bound the shared store to 256 MiB across all tables.
+Periodic expiration visits at most 256 cache entries per page, never document
+keys, and expires entries after 30 days. Explicit vacuum can additionally mark
+live artifact references and discard unreferenced entries. Losing cache entries
+only costs inference.
 Portable artifacts may retain cache references; restore safely recomputes misses.
 
 Candidate epochs must advance on every visible destination insert, update,

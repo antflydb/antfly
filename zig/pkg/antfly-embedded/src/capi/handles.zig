@@ -61,7 +61,14 @@ pub const Handle = struct {
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},
     embedded_tables: std.StringHashMapUnmanaged(*@import("tables.zig").Table) = .empty,
+    embedding_cache_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_commit_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_pending: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+    embedding_cache_pending_bytes: usize = 0,
+    embedded_table_open_mutex: std.Io.Mutex = .init,
     embedded_catalog_loaded: bool = false,
+    embedded_table_records: std.StringHashMapUnmanaged(u64) = .empty,
+    embedded_table_errors: std.StringHashMapUnmanaged([]const u8) = .empty,
     embedded_next_table_id: u64 = 2,
     sql_cursors: std.AutoHashMapUnmanaged(u64, *@import("sql_cursor.zig").Cursor) = .empty,
     next_sql_cursor_id: u64 = 1,
@@ -227,6 +234,9 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.db_live) {
         if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
     }
+    var cached = handle.embedding_cache_pending.valueIterator();
+    while (cached.next()) |value| handle.alloc.free(value.*);
+    handle.embedding_cache_pending.deinit(handle.alloc);
     stopLiteEmbeddedInference(handle);
     if (handle.server_cleanup) |cleanup| cleanup(handle);
     if (handle.owned_lite_backend) |*backend| {

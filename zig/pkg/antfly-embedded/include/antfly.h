@@ -481,7 +481,11 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
 /* Schema admission (add, replaces, delete, namespace changes and identity drop)
  * may return ANTFLY_BUSY before mutation when replay/promotion is active for
  * approximately 100 ms. Retry the identical request with bounded backoff.
- * replaces is idempotent and acts as add when the old index is absent. */
+ * replaces registers a hidden resumable shadow and returns; the old graph
+ * serves until background activation. Identical requests are idempotent.
+ * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
+ * waits for activation; deadline BUSY leaves the accepted shadow running.
+ * pending_work_stats_json reports per-index progress and the last error. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 /* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);

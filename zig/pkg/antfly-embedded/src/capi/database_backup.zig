@@ -62,6 +62,9 @@ pub fn exportDatabase(handle: *h.Handle, out: *std.ArrayList(u8)) !void {
         owner.* = &table.db;
         name.* = table.name;
     }
+    // Portable exports include serving catalogs, never an unpublished shadow.
+    // Finish accepted replacements before freezing the logical image.
+    for (owners) |owner| if (owner.hasPendingGraphReplacements()) try owner.runUntilIdle();
     // Reserve all native capture leases before exporting any table. API
     // serialization excludes embedded commits; these leases also exclude
     // background mutations. Native intents are excluded from the image.

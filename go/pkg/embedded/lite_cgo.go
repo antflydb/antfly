@@ -763,7 +763,10 @@ func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 }
 
 // AddIndexJSON adds or replaces an index. Retry the identical request on Busy.
-// A graph replaces command also works when its old index is absent.
+// A graph replaces command registers a resumable background shadow; the old
+// index serves until activation. It also works when the old index is absent.
+// Optional wait:{timeout_ms:N} waits for activation. Deadline Busy leaves the
+// accepted shadow running; PendingWorkStatsJSON reports progress and last error.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_db_add_index_json((*C.antfly_db)(handle), input)

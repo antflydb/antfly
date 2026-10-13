@@ -1510,7 +1510,14 @@ pub const ManagedEmbedder = struct {
             error.OutOfMemory => return err,
             else => return null,
         };
-        return capabilities.model_revision;
+        const model = capabilities.model_revision orelse return null;
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        return try @import("antfly_resolver").fingerprint(a, .{
+            model,                   entry.input_type,                                 entry.query_input_type, entry.document_input_type,
+            entry.query_instruction, entry.model_identity,                             entry.truncate,         @tagName(entry.bedrock_request_format),
+            entry.dimensions,        EmbeddingTaskType.retrieval_document.canonical(),
+        });
     }
 
     fn sparseCacheRevision(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?[32]u8 {
@@ -10250,6 +10257,15 @@ pub fn testSparseCacheRevision() !void {
     var context: u8 = 0;
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}", .{ .ptr = &context, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .model_capabilities = Local.capabilities });
     defer managed.deinit();
+    const dense_port = managed.denseInterface();
+    const initial = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    inline for (.{ "truncate", "query_instruction", "input_type", "document_input_type", "model_identity" }) |field| {
+        @field(managed.entries[0], field) = try std.testing.allocator.dupe(u8, "different-setting");
+        const changed = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+        try std.testing.expect(!std.mem.eql(u8, &initial, &changed));
+        std.testing.allocator.free(@field(managed.entries[0], field));
+        @field(managed.entries[0], field) = "";
+    }
     managed.entries[0].sparse = true;
     const sparse = managed.sparseInterface();
     const revision = (try sparse.cache_revision_fn.?(sparse.ptr, std.testing.allocator, "semantic_idx")).?;

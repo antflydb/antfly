@@ -963,7 +963,13 @@ def test_atomic_replacement_rebuilds_changed_graph_field_mapping(tmp_path, stora
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("old", "a", "R", 0)] == ["b"]
         db.add_index(
-            {"name": "new", "type": "graph", "replaces": "old", "edge_types": [{"name": "R", "field": "new_links"}]}
+            {
+                "name": "new",
+                "type": "graph",
+                "replaces": "old",
+                "wait": {"timeout_ms": 10000},
+                "edge_types": [{"name": "R", "field": "new_links"}],
+            }
         )
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["c"]
         db.batch_json({"inserts": {"a": {"links": ["b"], "new_links": ["d"]}}})
@@ -971,3 +977,127 @@ def test_atomic_replacement_rebuilds_changed_graph_field_mapping(tmp_path, stora
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]
     with _open_graph_test(path, options) as db:
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_registration_and_optional_wait(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("shadow.aflite" if storage == antfly_embedded.Storage.LITE else "shadow")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+        db.run_until_idle()
+        request = {
+            "name": "new",
+            "type": "graph",
+            "replaces": "old",
+            "edge_types": [{"name": "R", "field": "next_links"}],
+        }
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(request, wait={"timeout_ms": 0}))
+        # The timeout follows accepted registration; it must preserve the job.
+        progress = db.pending_work_stats()["replacements"]
+        assert progress[0]["name"] == "new"
+        assert progress[0]["replaces"] == "old"
+        assert progress[0]["last_error"] is None
+        db.add_index(request)
+        names = {i["name"] for i in db.list_indexes()}
+        if "old" in names:
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("old", "source:0000", "R", 0)] == [
+                "old"
+            ]
+        db.add_index(dict(request, wait={"timeout_ms": 10000}))
+        assert not db.pending_work_stats()["replacements"]
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["new"]
+        db.add_index(dict(request, wait={"timeout_ms": 0}))
+
+
+def test_directory_open_does_not_open_broken_named_table(tmp_path):
+    options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.DIRECTORY)
+    path = tmp_path / "lazy"
+    with _open_graph_test(path, options) as db:
+        db.create_table("bad", {})
+        db.batch_json({"inserts": {"healthy": {"text": "available"}}})
+    table_path = path / "embedded" / "tables" / "2"
+    table_path.rename(path / "saved-table")
+    table_path.write_bytes(b"not a table directory")
+    with _open_graph_test(path, options) as db:
+        assert "bad" in db.list_tables()
+        assert db.lookup("healthy")["text"] == "available"
+        db.status()
+        db.capabilities()
+        with pytest.raises(antfly_embedded.AntflyError):
+            db.open_table("bad")
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_background_replacement_finishes_under_concurrent_writes(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("busy-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "busy-shadow")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(500)}})
+        db.run_until_idle()
+        stop = threading.Event()
+        started = threading.Event()
+
+        def write():
+            revisions = 0
+            started.set()
+            while not stop.is_set():
+                db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": [f"v{revisions}"]}}})
+                revisions += 1
+                time.sleep(0.002)
+            return revisions
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(write)
+            try:
+                assert started.wait(timeout=5)
+                request = {
+                    "name": "new",
+                    "type": "graph",
+                    "replaces": "old",
+                    "edge_types": [{"name": "R", "field": "next_links"}],
+                }
+                db.add_index(request)
+                db.add_index(request)
+                deadline = time.monotonic() + 30
+                while "new" not in {i["name"] for i in db.list_indexes()}:
+                    assert time.monotonic() < deadline, db.pending_work_stats()
+                    time.sleep(0.01)
+            finally:
+                stop.set()
+            assert future.result(timeout=10) > 1
+        db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": ["final"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_recovers_after_process_exit(tmp_path, storage):
+    path = tmp_path / ("crash-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "crash-shadow")
+    script = r"""
+import os, sys
+import antfly_embedded as af
+options = af.OpenOptions(storage=af.Storage(int(sys.argv[2])))
+opener = af.create_with_options if options.storage == af.Storage.LITE else af.open_with_options
+db = opener(sys.argv[1], options)
+db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+db.run_until_idle()
+try:
+    db.add_index({"name": "new", "type": "graph", "replaces": "old",
+                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 0}})
+except af.BusyError:
+    pass
+else:
+    raise AssertionError("expected the registered shadow to remain pending")
+os._exit(0)  # Deliberately bypass all handle close/flush hooks.
+"""
+    subprocess.run([sys.executable, "-c", script, str(path), str(int(storage))], check=True, timeout=60)
+    with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
+        db.run_until_idle()
+        assert "old" not in {i["name"] for i in db.list_indexes()}
+        for key in ("source:0000", "source:0299"):
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]

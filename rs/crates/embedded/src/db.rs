@@ -582,7 +582,10 @@ impl Database {
     }
 
     /// Add or replace an index; retry the identical request on Busy.
-    /// A graph replaces command also works when the old index is absent.
+    /// A graph replaces command registers a resumable background shadow. The
+    /// old index serves until activation; absent old indexes behave like add.
+    /// Optional wait:{timeout_ms:N} waits for activation. A deadline Busy leaves
+    /// the accepted shadow running; pending work stats expose its progress.
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(config.as_ref(), |h, input| unsafe {
             sys::antfly_db_add_index_json(h, input)
