@@ -37478,7 +37478,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     }
     if (invariant) {
         // One fused gate/up dispatch for the entire cohort, not rows singleton
-        // dispatches disguised as batching. The canonical down tail is per row.
+        // dispatches disguised as batching. The tail may use the invariant cohort route.
         if (after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce)
             try std.testing.expectEqual(before_direct.q4_0_pair_activation_reduce + 1, after_direct.q4_0_pair_activation_reduce);
         std.debug.print("invariant-fixture rows={d} stage=ffn\n", .{rows});

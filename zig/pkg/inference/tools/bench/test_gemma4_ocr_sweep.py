@@ -105,6 +105,12 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"], "1")
             if variant in {"reuse", "optimized", "optimizedprofile"}:
                 self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"], "1")
+        for variant in ["tails", "pool"]:
+            flags, _, _ = sweep.flags_for("cohort4w8" + variant)
+            self.assertNotIn("TERMITE_METAL_Q4_0_BATCH_SHARED", flags)
+            self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"], "1")
+        flags, _, _ = sweep.flags_for("cohort4w8pool")
+        self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"], "1")
         flags, _, _ = sweep.flags_for("cohort4w8optimizedprofile")
         self.assertEqual(flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"], "0")
         parsed = sweep.profile(

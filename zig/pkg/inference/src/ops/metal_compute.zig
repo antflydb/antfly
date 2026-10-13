@@ -30145,6 +30145,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn resetDebugTimingStatsOp(ctx: *anyopaque) void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         metal_runtime.resetStageTiming(self.provider_impl.raw_decode_runtime) catch {};
+        self.ocr_last_stage_samples = 0;
         self.timing_stats = .{};
         if (self.a4b_projected_arena_telemetry) |telemetry| telemetry.reset();
         self.captureRuntimeFrameBaselines();

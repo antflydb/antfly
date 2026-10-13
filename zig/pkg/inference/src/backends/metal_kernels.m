@@ -24288,7 +24288,8 @@ static int termite_metal_encode_q4_0_linear_rms_add_rows(
     id<MTLBuffer> output, size_t output_offset, float eps,
     size_t source, size_t region
 ) {
-    if (rows < 2 || rows > 8 || !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS")) ||
+    if (!termite_metal_q4_0_batch_invariant_enabled(rows) ||
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS")) ||
         termite_metal_q4_0_linear_rms_add_f16_project_enabled() ||
         runtime->active_frame_cb != command_buffer ||
         runtime->rms_norm_add_rows_canonical_pipeline == nil) return 1;
@@ -53041,8 +53042,8 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
     }
 }
 
-// Canonical row-one projection + sumsq + norm + residual for an OCR cohort.
-// Keep this tail per row; gate/up remains a single batched dispatch.
+// Preserve the singleton projection/norm/residual family for an OCR cohort.
+// Eligible invariant rows use a cohort tail; unsupported policies replay per row.
 int termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(
     termite_metal_decode_runtime *runtime,
     size_t linear_slot, size_t norm_slot,
