@@ -1,8 +1,8 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `4e1c599855` (including #1090, #1096, #1107 and #1108), with merge checkpoint
-`054e9e895a` and durable-text implementation checkpoint `4607f03833`.
+at `553e58317f` in merge checkpoint `7a724db894`. Earlier implementation and
+qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -4195,3 +4195,40 @@ that emission contract without depending on the host Unicode version. All six
 license workflow commands passed locally, including 35 boundary, 12 header,
 three provenance and six asset tests. Python formatting and diff checks passed.
 This is CI hygiene, not SQL-case activation or new original-case credit.
+
+### Shared composite-expression execution admission
+
+Physical-row and column-batch tuple evaluation now use one execution identity
+for all component expressions, source conversion and key encoding. Explicit
+appendWithExecution entry points let an enclosing row/program retain work and
+cancellation across tuple bindings instead of granting each expression a new
+CPU budget. Existing convenience entry points own one context per tuple.
+Schema/layout fences, NULL-before-dictionary-addressing, borrowed canonical
+coefficients and tuple-length rollback remain intact.
+
+Expression output admission uses the exact encoded size before output
+allocation, sharing the encoding pass's already-validated numeric source.
+This replaces the physical path's fixed nine-byte NUMERIC reservation and the
+batch path's separate estimate without a second coefficient decode. External
+numeric conversion charges retained allocator capacity and inherits the same
+work, cancellation, input/output byte and coefficient limits.
+
+Regression contracts cover every CPU cut through a mixed direct/expression
+tuple in physical and batch form, sticky byte exhaustion, exact NUMERIC
+output admission with a failing coefficient allocator, and every observed
+external-conversion cancellation poll. These are execution-boundary contracts,
+not durable JSON activation. JSON provenance, public capability/lowering and
+generated/default/CHECK/index lifecycle qualification remain open, as do all
+898 original unresolved dispositions.
+
+Final-source native Debug qualification passed all 222 main-owner tests and
+one linked test (50/50 steps), including all three new admission regressions,
+with no failures or leaks. Complete formatting, source-catalog freshness,
+inventory integrity, repository headers and the 2,053-file product-license
+boundary passed. Cache GC was previewed only; no cache data was deleted.
+
+The exact-final-source SQL Debug confirmation also passed: 792 main-owner
+tests and 226 linked tests, three existing skips, zero failures/leaks and
+21/21 build steps. This rerun followed the last inherited-limit edit; the
+earlier SQL run is not substituted for final-source qualification. No public
+schema or generated SDK contract changed in this checkpoint.
