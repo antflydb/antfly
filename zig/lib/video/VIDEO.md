@@ -2349,3 +2349,30 @@ runs, source/fixture/binary identities and independent format evidence. These
 shared-host measurements are diagnostic; they make no performance claim.
 Expanded-format pretrained parity, scalable-layer model policy and fresh Linux
 model execution remain unfinished, alongside the broader active non-CUDA scope.
+
+### Monochrome pretrained RGB policy correction
+
+Software WebM monochrome SDR pictures now use an explicit gray-sample policy on
+CPU and Metal: repeat 8-bit code values directly; round higher-depth code values
+to RGB8 and saturate the top code. This preserves the pinned reference's gray
+conversion independently of coded full/limited range. Color and HDR conversion
+policies retain their existing behavior. The implementation is native Zig and
+Metal with no runtime reference-library dependency.
+
+A maintained offline generator supplies exhaustive independent RGB vectors for
+every 8/10/12-bit code under both range declarations. CPU tests compare every
+channel; Metal tests cover all three depths, both ranges and quarter-turn display.
+ReleaseSafe macOS passes 246 video checks (two skips) and 49 model policy/lifetime
+checks. The exhaustive oracle executes successfully on actual Linux ARM64; this
+is pixel-policy execution, not expanded-format pretrained Linux qualification.
+
+Both corrected monochrome pretrained vectors pass the existing 1e-4 gate on
+native CPU and Metal. The other seven expanded AV1 color-format cases still fail;
+full-corpus retrieval parity remains unfinished. The initial simultaneous Metal
+run and automatic retry were denied by live-memory admission. A bounded 4 GiB
+run completed every corpus vector but its later cancellation/retry check was
+also denied; all attempts remain in the receipts. These stress checks do not
+pass. Shared-host timings support no throughput claim. See
+[correction receipts](testdata/av1-gray-model-validation/README.md). Chroma
+reconstruction, high-depth color quantization, layer-model policy and all broader
+active non-CUDA requirements remain work.

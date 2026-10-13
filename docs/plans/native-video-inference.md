@@ -1782,3 +1782,12 @@ conversion policies through independent pixel oracles, then rerun pretrained
 CPU/Metal and actual Linux. Existing successful 8-bit 4:2:0 qualification cannot
 be generalized to these formats. Layer model policy and all other active scope
 remain required. See `zig/lib/video/testdata/av1-model-validation/README.md`.
+
+The monochrome preparation defect now has an explicit gray-sample policy in
+native CPU/Metal software WebM inference. Exhaustive independent pixel oracles
+pass, as do both monochrome pretrained vectors. Seven color-format vector cases
+and full-corpus rankings still fail. Next work remains independent chroma
+reconstruction and high-depth color quantization, followed by complete pretrained
+CPU/Metal/Linux qualification; this fix does not establish expanded-format parity.
+The retained capacity-denial/retry reports and correction receipts are in
+`zig/lib/video/testdata/av1-gray-model-validation`.

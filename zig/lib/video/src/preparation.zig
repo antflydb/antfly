@@ -38,7 +38,7 @@ extern fn av_prepared_destroy(*anyopaque) void;
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
 pub const ToneMapping = @import("tone.zig").Policy;
-pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma };
+pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples };
 pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
     width: u32,
@@ -52,6 +52,7 @@ pub const Options = struct {
     /// Explicit integer RGB profiles: Q13 floors component products; Q16
     /// quantizes chroma in the luma domain before expansion. Model policy
     /// selects by reference row alignment, independently of host dispatch.
+    /// Gray samples repeat the rounded unexpanded code value for SDR monochrome.
     rgb_rounding: RgbRounding = .nearest,
     /// Rescale to [0,1], then center for HF vision patch linear inputs if requested.
     centered: bool = true,
@@ -114,6 +115,13 @@ fn hostSample(bytes: []const u8, offset: usize, bit_depth: u8) u16 {
 }
 fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8, rounding: RgbRounding, tone_mapping: ToneMapping) [3]u8 {
     if (tone_mapping != .none) return rgbHdr(planes, x, y, format, matrix, bit_depth, chroma_format, tone_mapping);
+    if (rounding == .gray_samples and chroma_format == 0) {
+        const sample = hostSample(planes[0].bytes, y * planes[0].stride + x * @as(usize, if (bit_depth == 8) 1 else 2), bit_depth) >> format.sampleShift();
+        const shift: u4 = @intCast(bit_depth - 8);
+        const rounded = (@as(u32, sample) + (if (shift == 0) @as(u32, 0) else @as(u32, 1) << (shift - 1))) >> shift;
+        const value: u8 = @intCast(@min(rounded, 255));
+        return .{ value, value, value };
+    }
     const bytes: usize = if (bit_depth == 8) 1 else 2;
     const scale: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(bit_depth - 8)));
     var luma: f32 = @as(f32, @floatFromInt((hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth) >> format.sampleShift()))) / scale;
@@ -274,7 +282,7 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     for (0..height) |y| {
         try control.check();
         var x: usize = 0;
-        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and options.rgb_rounding != .nearest) {
+        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and (options.rgb_rounding == .q13_components or options.rgb_rounding == .q16_luma)) {
             while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x + options.crop.left, y + options.crop.top, options);
         }
         while (x < width) : (x += 1) {
@@ -753,4 +761,27 @@ test "video cropped preparation preserves coded chroma coordinates before quarte
     }
     try std.testing.expectError(error.InvalidVideoGeometry, geometry(26, 16, .{ .width = 96, .height = 48, .matrix = .bt601, .crop = .{ .left = 26 } }));
     try std.testing.expectError(error.InvalidVideoGeometry, croppedSize(26, 16, .{ .left = std.math.maxInt(u32), .right = std.math.maxInt(u32) }));
+}
+
+test "video monochrome sample rounding matches exhaustive independent RGB oracle" {
+    const expected = @embedFile("../testdata/gray-rgb-reference.bin");
+    var at: usize = 0;
+    for ([_]u8{ 8, 10, 12 }) |depth| {
+        const count: usize = @as(usize, 1) << @as(u4, @intCast(depth));
+        const bytes: usize = if (depth == 8) 1 else 2;
+        const plane = try std.testing.allocator.alloc(u8, count * bytes);
+        defer std.testing.allocator.free(plane);
+        for (0..count) |i| {
+            if (depth == 8) plane[i] = @intCast(i) else std.mem.writeInt(u16, plane[i * 2 ..][0..2], @intCast(i), .little);
+        }
+        const planes = [2]apple.Plane{ .{ .bytes = plane, .width = 64, .height = @intCast(count / 64), .stride = 64 * bytes }, .{ .bytes = &.{}, .width = 0, .height = 0, .stride = 0 } };
+        for ([_]bool{ false, true }) |full| {
+            for (0..count) |i| {
+                const actual = rgb(planes, i % 64, i / 64, if (full) .nv12_full else .nv12_video, .bt601, depth, 0, .gray_samples, .none);
+                try std.testing.expectEqualSlices(u8, expected[at..][0..3], &actual);
+                at += 3;
+            }
+        }
+    }
+    try std.testing.expectEqual(expected.len, at);
 }

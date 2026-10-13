@@ -127,6 +127,12 @@ kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *o
 
 float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
     uint2 xy = source_point(point, p);
+    if (p.rounding == 3 && p.chroma == 0 && p.tone == 0) {
+        uint shift = p.depth - 8;
+        uint sample = yplane.read(xy).r >> p.sample_shift;
+        uint rounded = (sample + (shift == 0 ? 0u : 1u << (shift - 1))) >> shift;
+        return float3(min(rounded, 255u));
+    }
     float scale = float(1u << (p.depth - 8));
     float y = float(yplane.read(xy).r >> p.sample_shift) / scale;
     float2 uv = float2(0.0f);

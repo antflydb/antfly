@@ -27,3 +27,8 @@ decoded plane agreement does **not** imply pretrained embedding agreement.
 The corpus does not cover Annex B model ingestion, scalable layers, HDR,
 rotation, Linux execution or real application quality. Those remain separate
 requirements in the active design.
+
+The subsequent gray-sample policy correction is recorded in
+`zig/lib/video/testdata/av1-gray-model-validation`: monochrome vectors now pass
+on CPU/Metal, while the seven color-format cases and full-corpus rankings remain
+unqualified. The earlier failing reports remain historical reproduction evidence.

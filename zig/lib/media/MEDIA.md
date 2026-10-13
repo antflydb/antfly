@@ -1564,3 +1564,13 @@ retains retrieval comparisons even when vector gates fail. See the
 [video qualification record](../video/testdata/av1-model-validation/README.md).
 Rendering parity, layer-model policy, fresh expanded-format Linux qualification
 and the remaining non-CUDA design scope stay active.
+
+### Monochrome model preparation correction
+
+The software WebM model path now selects explicit unexpanded gray-sample RGB8
+rounding for monochrome SDR input. Native CPU and Metal share this policy, tested
+against exhaustive independent 8/10/12-bit reference code values under both range
+declarations. The two monochrome AV1 pretrained cases pass the unchanged vector
+gate; the remaining seven expanded color-format cases and full-corpus retrieval
+still fail. Actual Linux ARM64 executes the pixel oracle, with pretrained Linux
+qualification still required. See the [correction receipts](../video/testdata/av1-gray-model-validation/README.md).

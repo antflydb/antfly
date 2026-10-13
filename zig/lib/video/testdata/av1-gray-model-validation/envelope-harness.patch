@@ -1,0 +1,36 @@
+--- parent/video_compare.py
++++ envelope/video_compare.py
+@@ -549,6 +549,11 @@
+                 str(args.model_dir.parent.resolve()),
+                 "--port",
+                 str(port),
++                *(
++                    ["--process-memory-budget-mb", str(args.process_memory_budget_mb)]
++                    if getattr(args, "process_memory_budget_mb", 0)
++                    else []
++                ),
+                 "--host-budget-mb",
+                 "6144",
+                 "--backend-budget-mb",
+@@ -805,6 +810,12 @@
+     parser.add_argument("--corpus", type=Path, required=True)
+     parser.add_argument("--model-dir", type=Path, required=True)
+     parser.add_argument("--binary", type=Path)
++    parser.add_argument(
++        "--process-memory-budget-mb",
++        type=int,
++        default=0,
++        help="Explicit whole-process envelope for the owned native server; 0 uses automatic policy",
++    )
+     parser.add_argument("--url")
+     parser.add_argument("--reference", type=Path)
+     parser.add_argument("--output", type=Path, required=True)
+@@ -828,6 +839,8 @@
+         parser.error("invalid bounded measurement controls")
+     if args.backend in ("native", "metal") and not (args.binary or args.url):
+         parser.error("native/metal requires --binary or --url")
++    if not 0 <= args.process_memory_budget_mb <= 65536:
++        parser.error("process memory budget must be between 0 and 65536 MiB")
+     data = corpus(args.corpus)
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+     result = {

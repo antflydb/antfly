@@ -390,3 +390,37 @@ test "video Metal crop precedes rotation for native host and RGBA staging" {
         for (rgba_expected, rgba_actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
     }
 }
+
+test "video Metal monochrome code samples preserve independent CPU RGB policy" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try prep.Metal.init(device);
+    defer metal.deinit();
+    for ([_]u8{ 8, 10, 12 }) |depth| {
+        const bytes: usize = if (depth == 8) 1 else 2;
+        const samples = try a.alloc(u8, 48 * 48 * bytes);
+        defer a.free(samples);
+        for (0..48 * 48) |i| {
+            const value: u16 = @intCast((i * 37 + 11) % (@as(usize, 1) << @as(u4, @intCast(depth))));
+            if (depth == 8) samples[i] = @intCast(value) else std.mem.writeInt(u16, samples[i * 2 ..][0..2], value, .little);
+        }
+        for ([_]bool{ false, true }) |full| {
+            const host = prep.HostSurface{ .width = 48, .height = 48, .bit_depth = depth, .chroma_format = 0, .format = if (full) .nv12_full else .nv12_video, .planes = .{
+                .{ .bytes = samples, .width = 48, .height = 48, .stride = 48 * bytes }, .{ .bytes = &.{}, .width = 0, .height = 0, .stride = 0 },
+            } };
+            for ([_]prep.Rotation{ .none, .clockwise90 }) |rotation| {
+                const options = prep.Options{ .width = 96, .height = 48, .matrix = .bt601, .rgb_rounding = .gray_samples, .torchvision = true, .rotation = rotation };
+                const expected = try prep.referenceHost(a, host, options, .{});
+                defer a.free(expected);
+                var prepared = try metal.submitHost(a, host, options, .{});
+                defer prepared.deinit();
+                try prepared.wait(std.testing.io, .{});
+                const actual = try prepared.readback(a);
+                defer a.free(actual);
+                try std.testing.expectEqual(expected.len, actual.len);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+            }
+        }
+    }
+}
