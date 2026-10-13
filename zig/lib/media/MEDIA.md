@@ -1062,3 +1062,28 @@ window staging, validation and decode work. Automatic field/dynamic frontiers,
 pretrained streamed-window parity, projection reuse and reduction of repeated
 frontier decoding remain open. Receipts are in
 `../video/testdata/live/coordinator-validation`.
+
+### Pretrained live-window reference preservation
+
+The typed live adapter now executes successfully with pinned pretrained weights
+on native CPU, Metal and actual Linux ARM64. Three two-second windows from the
+same six-second real Sintel excerpt match complete-clip source-time inference
+exactly, including 246 encoder tokens per window. Two text queries preserve
+pinned PyTorch cosine scores, rankings and top-1/top-3 overlap; maximum score
+drift is below 5e-7 on this fixture. Pinned PyTorch MPS also passes F32 vector
+gates against the CPU oracle and supplies completed diagnostic timing. This
+measures reference preservation rather
+than application relevance.
+
+The qualification executable uses the existing supervised worker and request
+hard-cancellation watchdog, retaining protection through model load/close. The
+Python driver verifies checkpoint identity, exact window coverage, encoder
+counts, finite normalized vectors, baseline equality and pinned PyTorch gates.
+Source, fixture, binary and oracle receipts live in
+`zig/lib/video/testdata/live/pretrained-validation`. Timings cover completed
+adapter/complete-clip inference on a shared host; file acquisition/model load,
+peak memory and sustained throughput are outside this timing scope.
+
+Broader field/dynamic layouts, automatic frontiers for those layouts, larger
+stream corpora, cross-window projection reuse and reducing repeated frontier
+decode work remain required by the full active non-CUDA objective.

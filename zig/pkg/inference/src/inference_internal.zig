@@ -18,6 +18,7 @@ pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
+pub const hard_cancellation_watchdog = @import("hard_cancellation_watchdog.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;

@@ -1,0 +1,7 @@
+test_exact_windows_queries_scores_and_rankings (test_video_live_qualification.LiveQualificationTests) ... ok
+test_incomplete_reports_and_baseline_or_interval_drift_fail (test_video_live_qualification.LiveQualificationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.001s
+
+OK

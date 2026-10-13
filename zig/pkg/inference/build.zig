@@ -1103,6 +1103,14 @@ pub fn build(b: *std.Build) void {
     embeddinggemma2_bench.root_module.link_libc = true;
     const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
     b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const live_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-live", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_live.zig"), .target = target, .optimize = optimize }) });
+    live_bench.root_module.addImport("build_options", build_options_mod);
+    live_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    live_bench.root_module.addImport("antfly_media", inference_internal_mod.import_table.get("antfly_media").?);
+    live_bench.root_module.addImport("antfly_video", inference_internal_mod.import_table.get("antfly_video").?);
+    runtime_graph.identities.addImports(live_bench.root_module);
+    live_bench.root_module.link_libc = true;
+    b.step("build-embeddinggemma2-live", "Build pretrained live adapter/complete-clip parity qualification").dependOn(&b.addInstallArtifact(live_bench, .{}).step);
     const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
