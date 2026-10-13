@@ -776,3 +776,39 @@ than replacing them with the diagnostic probes. Correctness and cache-pressure
 qualification pass; the two-cycle restart-latency criterion does not. OS caches
 are not flushed, readiness warming is enabled, and these normalized local data
 measurements do not establish full-archive or managed Cloud latency.
+
+### Restart outlier investigation after #1121
+
+[Investigation evidence](../../examples/hackernews/restart-latency-investigation-20261013.json)
+retains the original failures and records 35 isolated restart probes and four
+additional full sequences on the unchanged merged executable. The 4,385 ms
+single-search stall did not recur. Two sequences used process-local filesystem
+tracing: none of the traced `fsync`/file-lock operations exceeded 7 ms. The final
+two untraced sequences measured restart searches at 194–196 ms and retained cursor
+resumes at 899–932 ms. These observations do not prove the original stall's cause
+or erase the failed original latency criterion.
+
+The original request reports 4,377 ms inside the server versus 4,385 ms over HTTP,
+so transport does not explain it. Ranking took 87 ms and hydration 7 ms. The
+discarded aggregate phases prevent distinguishing admission/preparation from
+post-search retention/delivery for that historical sample.
+
+The original 2,583 ms cursor sample has more complete attribution: its retained
+counters record 802 ms ranking and 1,688 ms hydration. This identifies the work
+that dominated that request, but does not establish why those phases were slower
+on that shared-host run.
+
+The qualifier had dropped the engine's labeled aggregate phase counters while
+parsing Prometheus output, then would also drop labeled counters during delta
+capture. Preserve the fixed `total`, `publication`, `search`, `hydration` and
+`delivery` labels. The report now includes `lake_phase_profile`: pre-search
+includes reader admission, cache setup and metadata preparation; post-search
+includes durable cursor publication and response delivery. Hydration overlaps
+other phases and must not be added to them. Time outside the measured lake phases
+also includes native/composed work and transport; concurrent lake leaves can
+make the difference negative. Older runtimes without these counters report no
+phase profile rather than fabricated zero timings.
+
+The instrumentation regression tests and qualification/recovery tests pass 25
+tests and nine subtests. This follow-up fixes missing diagnostic evidence. It does
+not claim an engine performance fix for the unreproduced single-search stall.
