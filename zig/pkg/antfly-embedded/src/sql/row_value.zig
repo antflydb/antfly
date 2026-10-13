@@ -43,8 +43,7 @@ pub const Json = struct {
         if (depth > 64) return if (work.shared) |context| context.limit() else error.SqlProgramLimitExceeded;
         return switch (value) {
             inline .string, .number_string => |bytes, tag| blk: {
-                try work.consume(bytes.len);
-                break :blk @unionInit(std.json.Value, @tagName(tag), try alloc.dupe(u8, bytes));
+                break :blk @unionInit(std.json.Value, @tagName(tag), try copyBytes(alloc, bytes, work));
             },
             .array => |items| blk: {
                 var output = std.json.Array.init(alloc);
@@ -56,13 +55,28 @@ pub const Json = struct {
                 var output: std.json.ObjectMap = .empty;
                 try output.ensureTotalCapacity(alloc, @intCast(items.count()));
                 for (items.keys(), items.values()) |key, item| {
-                    try work.consume(key.len);
-                    try output.put(alloc, try alloc.dupe(u8, key), try cloneNode(item, alloc, work, depth + 1));
+                    try output.put(alloc, try copyBytes(alloc, key, work), try cloneNode(item, alloc, work, depth + 1));
                 }
                 break :blk .{ .object = output };
             },
             else => value,
         };
+    }
+
+    fn copyBytes(alloc: std.mem.Allocator, bytes: []const u8, work: *json_order.Budget) ![]u8 {
+        // Admit once before allocation, then poll the same owner while copying.
+        // Polling cannot renew or double-charge the admitted byte allowance.
+        try work.consume(bytes.len);
+        const output = try alloc.alloc(u8, bytes.len);
+        errdefer alloc.free(output);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const end = offset + @min(bytes.len - offset, 256);
+            if (work.shared) |owner| try owner.pollCheckpoint(end - offset);
+            @memcpy(output[offset..end], bytes[offset..end]);
+            offset = end;
+        }
+        return output;
     }
 };
 

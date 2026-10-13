@@ -153,16 +153,22 @@ pub const Emission = struct {
 
     pub fn init(self: *Emission, original: *arrays.Budget, amount: usize) !void {
         try original.consume(amount);
+        self.initPrepaid(original.shared, amount);
+    }
+
+    /// Bind credit already charged by an immutable envelope inspection.
+    /// Callers must not reuse that admission or enlarge the local credit.
+    pub fn initPrepaid(self: *Emission, owner: ?*numeric.Context, amount: usize) void {
         self.* = .{
-            .owner = original.shared,
+            .owner = owner,
             .context = .{ .alloc = A.failing, .remaining = amount, .checkpoint = poll, .ptr = self },
             .work = .{ .remaining = amount },
         };
         self.work.shared = &self.context;
-        if (original.shared) |owner| {
-            self.context.max_input_bytes = owner.max_input_bytes;
-            self.context.max_output_bytes = owner.max_output_bytes;
-            self.context.max_groups = owner.max_groups;
+        if (owner) |enclosing| {
+            self.context.max_input_bytes = enclosing.max_input_bytes;
+            self.context.max_output_bytes = enclosing.max_output_bytes;
+            self.context.max_groups = enclosing.max_groups;
         }
     }
     fn poll(ptr: ?*anyopaque) anyerror!void {

@@ -4825,3 +4825,57 @@ distributed activation proofs and the remaining exact original cases still
 need implementation. Original accounting remains 479 implemented / 136 rejected /
 73 superseded / 898 unresolved; these component contracts grant no original
 case credit.
+
+### Cooperative retained array envelopes and clone credit
+
+Array-envelope counting now uses the same bounded, buffered writer as SQL wire
+emission. It polls and charges in 256-byte chunks and stops at the wire/work
+bound while counting, rather than performing an uninterruptible serialization
+before checking the limit. Actual encoding prepays its complete emission cost
+before touching the caller's destination. Allocated encoding no longer treats
+post-allocation cancellation as unreachable.
+
+Retained envelope construction, owned decoding and borrowed decoding share
+that original admission. A private inspection charges bounded materialization
+credit; the immediate materializer binds a local prepaid context which can poll
+the original owner but cannot renew or double-spend its work allowance.
+NUMERIC parsing/formatting continues to charge its actual numeric subkernel
+work separately. Validation is not an externally reusable trust token.
+
+JSON payload materialization reuses the row owner's structural clone rather
+than the generic uncooperative datum clone. Arrays retain the destination
+allocator, and strings, exact numeric tokens and object keys are copied in
+bounded chunks after admitting their bytes once. No source DOM, allocator or
+borrowed text survives retirement through this retained boundary. Ordinary
+primitive encoding still needs no heap allocation or per-cell serialization
+buffer. No physical format or PostgreSQL output golden changed.
+
+The fault matrix covers JSONB, exact NUMERIC and large integer values across
+borrowed output, allocated output, retained API envelopes, owned decoding and
+borrowed decoding. It verifies every observed cancellation cut, every allocation
+failure, exact parent/local quota accounting, one-unit-short rejection,
+unchanged destinations on quota rejection, genuine OOM without poisoning the
+owner, and sticky failures followed by malformed input with a failing allocator.
+This found and fixed allocation-before-owner-check in the NUMERIC decode owner.
+All 13 focused Debug contracts passed, including the existing independent
+PostgreSQL text/binary fixture comparisons and source-retirement tests.
+
+Four interleaved local Debug runs of the unchanged streaming benchmark produced
+135–139 ms before and 119–122 ms after for 262,144 cells / 3,439,056 bytes, with
+zero encoding allocations in both versions. This is cached-binary operator
+evidence under concurrent build load, not an end-to-end production latency claim.
+Five isolated PostgreSQL 18.6 oracle tests reverified text/binary arrays, JSONB
+physical display and input-domain diagnostics without regenerating goldens.
+
+Final-source Debug qualification passed all 1,041 SQL tests (three existing
+skips), 111 protocol tests, 249 native relational tests and 113 transaction
+tests, with no failures or leaks (85/85 build steps). Both mounted public
+stored-array and joined source-RETURNING contracts passed (80/80 steps).
+Formatting, the 2,048-file Apache boundary/license checks and inventory
+integrity passed. Cache GC was previewed only; nothing was deleted.
+
+The full SQL parity objective is still incomplete. Generic raw JSON codec
+cooperation, public JSON program/schema identity and lowering, typed projected
+consumers, distributed activation proofs and remaining original cases still
+need work. Component ownership/fault proofs do not change the original
+479 implemented / 136 rejected / 73 superseded / 898 unresolved dispositions.
