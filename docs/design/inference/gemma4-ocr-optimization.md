@@ -89,6 +89,11 @@ after packing before argmax, so the frame owns the actual readout. Bitwise
 Q4/Q6 full-logit fixtures check partial tiles, suppression, choices and ownership.
 No CUDA, audio generation or PDF-rendering gain follows from this OCR campaign.
 
+The sweep's `pool`/`head` cases explicitly enter the matrix research lane but
+add invariant Q4 dispatch and canonical QKV/PLE/tail overrides before enabling
+the optimized scratch/tail/head controls. Use those complete pinned cases;
+enabling only the matrix or head flag does not reproduce their qualification.
+
 ### Current whole-request result
 
 Frozen runtime `7f4d7fa577`, Apple M4 Max (32 GPU cores, 36 GiB), Q4_0 E2B
