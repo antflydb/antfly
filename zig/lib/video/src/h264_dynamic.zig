@@ -21,6 +21,7 @@ const h264 = @import("h264.zig");
 const Bits = @import("h264_bits.zig").Bits;
 const Budget = @import("decode_budget.zig").Budget;
 const PPS = struct { bytes: []u8, sps: usize };
+const Parameter = struct { at: ?usize, kind: u8, id: usize, bytes: []u8, original: bool };
 pub const Entry = struct { avcc: []u8, config: h264.Config, sps_hash: [32]u8 };
 pub const Epoch = struct { start: usize, end: usize, entry: usize, independent: bool = false, max_refs: usize };
 pub const Context = struct { session: *Session, base: usize, independent_start: bool = false, max_refs: usize };
@@ -28,6 +29,7 @@ pub const Session = struct {
     backing: std.mem.Allocator,
     budget: Budget,
     reader: *media.mp4.Reader,
+    length_bytes: u3,
     options: h264.Options,
     reservation: media.admission.Token = .{},
     sequence: [32]?[]u8 = @splat(null),
@@ -37,11 +39,14 @@ pub const Session = struct {
     packet_configs: []usize = &.{},
     probe_packets: usize = 0,
     probe_bytes: u64 = 0,
+    active: ?usize = null,
+    valid: bool = true,
+    history: std.ArrayList(Parameter) = .empty,
     pub fn init(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
         if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
         if (reader.packets.len > options.max_parameter_packets) return error.ResourceLimitExceeded;
         const self = try allocator.create(Session);
-        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .options = options };
+        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .length_bytes = reader.track.nal_length_bytes, .options = options };
         errdefer self.deinit();
         self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, options.max_parameter_bytes, @sizeOf(Session)) }) else media.admission.Token{};
         self.scan() catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
@@ -55,13 +60,15 @@ pub const Session = struct {
         }
         self.entries.deinit(allocator);
         self.epochs.deinit(allocator);
-        for (self.sequence) |set| if (set) |bytes| allocator.free(bytes);
-        for (self.picture) |set| if (set) |value| allocator.free(value.bytes);
+        for (self.history.items) |parameter| allocator.free(parameter.bytes);
+        self.history.deinit(allocator);
         allocator.free(self.packet_configs);
-        self.reservation.deinit();
-        self.backing.destroy(self);
+        var reservation = self.reservation;
+        const backing = self.backing;
+        backing.destroy(self);
+        reservation.deinit();
     }
-    fn install(self: *Session, nal: []const u8) !void {
+    fn install(self: *Session, nal: []const u8, at: ?usize) !void {
         if (nal.len > std.math.maxInt(u16)) return error.ResourceLimitExceeded;
         const allocator = self.budget.allocator();
         var bits = try Bits.initControlled(allocator, nal, self.reader.input.control);
@@ -71,14 +78,16 @@ pub const Session = struct {
             const id = try bits.ue();
             if (id >= self.sequence.len) return error.MalformedVideoConfig;
             const owned = try allocator.dupe(u8, nal);
-            if (self.sequence[id]) |old| allocator.free(old);
+            errdefer allocator.free(owned);
+            try self.history.append(allocator, .{ .at = at, .kind = 7, .id = id, .bytes = owned, .original = at == null });
             self.sequence[id] = owned;
         } else if (nal[0] & 31 == 8) {
             const id = try bits.ue();
             const sps = try bits.ue();
             if (id >= self.picture.len or sps >= self.sequence.len) return error.MalformedVideoConfig;
             const owned = try allocator.dupe(u8, nal);
-            if (self.picture[id]) |old| allocator.free(old.bytes);
+            errdefer allocator.free(owned);
+            try self.history.append(allocator, .{ .at = at, .kind = 8, .id = id, .bytes = owned, .original = at == null });
             self.picture[id] = .{ .bytes = owned, .sps = sps };
         } else return error.MalformedVideoConfig;
     }
@@ -87,11 +96,11 @@ pub const Session = struct {
         try @import("avc.zig").validatePortableConfig(bytes);
         var cursor: usize = 6;
         for (0..bytes[5] & 31) |_| {
-            try self.install(try nalSet(bytes, &cursor));
+            try self.install(try nalSet(bytes, &cursor), null);
         }
         const count = bytes[cursor];
         cursor += 1;
-        for (0..count) |_| try self.install(try nalSet(bytes, &cursor));
+        for (0..count) |_| try self.install(try nalSet(bytes, &cursor), null);
     }
     fn entry(self: *Session, id: usize) !usize {
         if (id >= self.picture.len) return error.MalformedVideoConfig;
@@ -123,11 +132,15 @@ pub const Session = struct {
     }
     fn scan(self: *Session) !void {
         try self.initial();
+        try self.scanFrom(0);
+    }
+    fn scanFrom(self: *Session, begin: usize) !void {
         const allocator = self.budget.allocator();
-        self.packet_configs = try allocator.alloc(usize, self.reader.packets.len);
-        @memset(self.packet_configs, std.math.maxInt(usize));
-        var active: ?usize = null;
-        for (self.reader.packets, 0..) |packet, i| {
+        self.packet_configs = try allocator.realloc(self.packet_configs, self.reader.packets.len);
+        @memset(self.packet_configs[begin..], std.math.maxInt(usize));
+        if (self.epochs.items.len != 0) self.epochs.items[self.epochs.items.len - 1].end = self.reader.packets.len;
+        for (begin..self.reader.packets.len) |i| {
+            const packet = self.reader.packets[i];
             if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
             var lease = try self.reader.readPacket(i);
             defer lease.deinit();
@@ -144,7 +157,7 @@ pub const Session = struct {
                 const nal = lease.bytes[cursor..][0..size];
                 cursor += size;
                 switch (nal[0] & 31) {
-                    7, 8 => try self.install(nal),
+                    7, 8 => try self.install(nal, i),
                     1, 2, 5 => {
                         var bits = try Bits.initSlice(allocator, nal, self.reader.input.control, true);
                         defer bits.deinit();
@@ -153,27 +166,107 @@ pub const Session = struct {
                         const index = try self.entry(try bits.ue());
                         if (selected) |previous| if (previous != index) return error.MixedVideoPictures;
                         selected = index;
-                        const changed = active == null or !std.mem.eql(u8, &self.entries.items[active.?].sps_hash, &self.entries.items[index].sps_hash);
-                        const compatible = active != null and layoutCompatible(self.entries.items[active.?].config, self.entries.items[index].config);
-                        if (changed and (active == null or nal[0] & 31 == 5 or !compatible)) {
-                            const independent = active != null and nal[0] & 31 != 5;
+                        const changed = self.active == null or !std.mem.eql(u8, &self.entries.items[self.active.?].sps_hash, &self.entries.items[index].sps_hash);
+                        const compatible = self.active != null and layoutCompatible(self.entries.items[self.active.?].config, self.entries.items[index].config);
+                        if (changed and (self.active == null or nal[0] & 31 == 5 or !compatible)) {
+                            const independent = self.active != null and nal[0] & 31 != 5;
                             // Qualified non-IDR extension: incompatible storage starts
                             // with a complete I picture and an empty prediction DPB.
                             if (independent and slice_type % 5 != 2) return error.UnsupportedDynamicGeometry;
                             if (self.epochs.items.len != 0) self.epochs.items[self.epochs.items.len - 1].end = i;
                             try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
-                            self.epochs.appendAssumeCapacity(.{ .start = if (active == null) 0 else i, .end = self.reader.packets.len, .entry = index, .independent = independent, .max_refs = self.entries.items[index].config.max_refs });
+                            self.epochs.appendAssumeCapacity(.{ .start = if (self.active == null) 0 else i, .end = self.reader.packets.len, .entry = index, .independent = independent, .max_refs = self.entries.items[index].config.max_refs });
                         }
                         const epoch = &self.epochs.items[self.epochs.items.len - 1];
                         epoch.max_refs = @max(epoch.max_refs, self.entries.items[index].config.max_refs);
-                        active = index;
+                        self.active = index;
                     },
                     else => {},
                 }
             }
-            self.packet_configs[i] = selected orelse active orelse std.math.maxInt(usize);
+            self.packet_configs[i] = selected orelse self.active orelse std.math.maxInt(usize);
         }
         if (self.epochs.items.len == 0) return error.EmptyVideoTrack;
+    }
+    /// Append only to an immutable prefix. A scan failure invalidates this owner.
+    /// Caller content-bindings verify the prefix before invoking this method.
+    pub fn append(self: *Session, reader: *media.mp4.Reader) !void {
+        if (!self.valid) return error.InvalidVideoDecoder;
+        if (reader.packets.len <= self.packet_configs.len or reader.packets.len > self.options.max_parameter_packets) return error.ResourceLimitExceeded;
+        self.reader = reader;
+        const begin = self.packet_configs.len;
+        errdefer self.valid = false;
+        self.scanFrom(begin) catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
+    }
+    /// Parameter NALs effective immediately before a retained packet. Initial
+    /// avcC entries are already present in the reader and need no duplication.
+    pub fn bootstrapBefore(self: *Session, a: std.mem.Allocator, index: usize) ![]u8 {
+        if (!self.valid or index > self.packet_configs.len) return error.InvalidPacketIndex;
+        var sequence: [32]?Parameter = @splat(null);
+        var picture: [256]?Parameter = @splat(null);
+        for (self.history.items) |parameter| {
+            if (parameter.at) |at| if (at >= index) continue;
+            if (parameter.kind == 7) sequence[parameter.id] = parameter else picture[parameter.id] = parameter;
+        }
+        var size: usize = 0;
+        const length = self.length_bytes;
+        for (sequence) |item| if (item) |parameter| if (!parameter.original) {
+            if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
+            size = try std.math.add(usize, size, length + parameter.bytes.len);
+        };
+        for (picture) |item| if (item) |parameter| if (!parameter.original) {
+            if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
+            size = try std.math.add(usize, size, length + parameter.bytes.len);
+        };
+        if (size > self.options.max_parameter_bytes) return error.ResourceLimitExceeded;
+        const bytes = try a.alloc(u8, size);
+        var cursor: usize = 0;
+        for (sequence) |item| if (item) |parameter| if (!parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
+        for (picture) |item| if (item) |parameter| if (!parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
+        return bytes;
+    }
+    /// Allocate the new selector table before changing any retained state.
+    pub fn rebase(self: *Session, removed: usize) !void {
+        if (!self.valid or removed > self.packet_configs.len) return error.InvalidPacketIndex;
+        const allocator = self.budget.allocator();
+        const selectors = try allocator.dupe(usize, self.packet_configs[removed..]);
+        var last_sequence: [32]?usize = @splat(null);
+        var last_picture: [256]?usize = @splat(null);
+        for (self.history.items, 0..) |parameter, i| {
+            if (parameter.at) |at| if (at >= removed) continue;
+            if (parameter.kind == 7) last_sequence[parameter.id] = i else last_picture[parameter.id] = i;
+        }
+        var keep: usize = 0;
+        for (self.history.items, 0..) |parameter, i| {
+            const before = parameter.at == null or parameter.at.? < removed;
+            const last = if (parameter.kind == 7) last_sequence[parameter.id] else last_picture[parameter.id];
+            if (before and last != i) {
+                allocator.free(parameter.bytes);
+                continue;
+            }
+            self.history.items[keep] = parameter;
+            self.history.items[keep].at = if (before) null else parameter.at.? - removed;
+            keep += 1;
+        }
+        self.history.items.len = keep;
+        keep = 0;
+        for (self.epochs.items) |epoch| {
+            if (epoch.end <= removed) continue;
+            var rebased = epoch;
+            rebased.start -|= removed;
+            rebased.end -= removed;
+            self.epochs.items[keep] = rebased;
+            keep += 1;
+        }
+        self.epochs.items.len = keep;
+        if (keep == 0) if (self.active) |active| {
+            // A decoder may retain references after all transport packets are
+            // evicted. Preserve an empty current epoch for subsequent appends.
+            self.epochs.items.len = 1;
+            self.epochs.items[0] = .{ .start = 0, .end = 0, .entry = active, .max_refs = self.entries.items[active].config.max_refs };
+        };
+        allocator.free(self.packet_configs);
+        self.packet_configs = selectors;
     }
     pub fn configAt(self: *const Session, index: usize) !h264.Config {
         if (index >= self.packet_configs.len or self.packet_configs[index] == std.math.maxInt(usize)) return error.MissingVideoParameterSet;
@@ -265,4 +358,11 @@ pub fn layoutCompatible(a: h264.Config, b: h264.Config) bool {
         a.poc_bits == b.poc_bits and a.poc_zero == b.poc_zero and a.poc_nonref == b.poc_nonref and
         a.poc_bottom == b.poc_bottom and a.poc_cycle == b.poc_cycle and
         std.mem.eql(i32, a.poc_offsets[0..a.poc_cycle], b.poc_offsets[0..b.poc_cycle]);
+}
+
+fn writeParameter(bytes: []u8, cursor: *usize, length: u3, nal: []const u8) void {
+    for (0..length) |i| bytes[cursor.* + i] = @intCast((nal.len >> @intCast(8 * (length - i - 1))) & 255);
+    cursor.* += length;
+    @memcpy(bytes[cursor.*..][0..nal.len], nal);
+    cursor.* += nal.len;
 }

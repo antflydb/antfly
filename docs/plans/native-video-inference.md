@@ -1635,3 +1635,40 @@ passes 101,170 coverage-guided H.264 fuzz runs; this does not qualify sustained
 persistent-owner fuzzing. Source, binary and fixture receipts bind the scope.
 
 See [qualification receipts](../../zig/lib/video/testdata/live/incremental-validation/README.md).
+
+
+### Persistent dynamic-AVC library state
+
+`h264_pictures.Stream` now accepts in-band configuration readers. Its stable
+parameter registry scans appended packets only, retains effective SPS/PPS history
+and configuration epochs, and supplies the same decoder loop with per-packet
+configuration contexts. Compatible PPS/SPS changes preserve references; storage
+changes replace admitted native owners after checking unfinished assemblies.
+Independent colour-plane lanes and native integer depths remain available.
+
+`parameterBootstrap` returns independently owned length-prefixed parameter NALs
+effective before a retained packet. Initial avcC entries need no duplication.
+Registry rebasing prunes obsolete parameter history, keeps the last pre-boundary
+value of each ID and rebases future events/epoch selectors. Allocation precedes
+mutation; an empty current epoch remains after complete packet eviction. The
+bootstrap establishes parameter availability, not coded-picture independence:
+ordinary I-picture suffixes still fail without required prior references.
+
+Differential checks compare every appended prefix against fresh registry planning
+and full reconstruction for dynamic geometry/depth/chroma and PPS changes. Each
+packet is parameter-scanned and reconstructed once. Allocation-failure campaigns
+cover replacement owners, registry/history growth, snapshots, bootstraps and
+rebasing. A PAFF reset suffix independently reconstructs with its owned bootstrap;
+a non-IDR suffix retains its reference error. Prefix bindings now hash byte slices
+in bulk rather than encoding every payload byte as an integer.
+
+ReleaseSafe passes 237 video tests (two skips), 20 live checks and 49 CPU/Metal
+model checks on macOS. Actual Linux ARM64 passes 212 video tests (27 platform
+skips) and 20 live checks. This phase does not add fresh pretrained inference or
+persistent-owner fuzz claims. Automatic live coordination still selects replay
+for dynamic streams: independently owned bootstrap checkpoints must be carried
+through prepared-window construction, preroll eviction and decoder-failure retry
+before enabling the new library path there. That integration, bounded retained
+configuration-entry compaction and the full original non-CUDA scope remain active.
+
+See [qualification receipts](../../zig/lib/video/testdata/live/dynamic-library-validation/README.md).

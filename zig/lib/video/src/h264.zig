@@ -1372,7 +1372,20 @@ pub const Incremental = struct {
             .wide => |*lanes| for (lanes[0..count]) |*lane| lane.rebase(removed),
         }
     }
+    pub fn hasPending(self: *const Incremental) bool {
+        return switch (self.lanes) {
+            inline else => |lanes| pending: {
+                for (lanes) |lane| for (lane.workspaces) |slot| if (slot) |workspace| {
+                    if (workspace.active and !workspace.complete) break :pending true;
+                };
+                break :pending false;
+            },
+        };
+    }
     pub fn advance(self: *Incremental, reader: *media.mp4.Reader, observer: PictureObserver) !Statistics {
+        return self.advanceWithConfigurations(reader, observer, null);
+    }
+    pub fn advanceWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, observer: PictureObserver, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
         if (!self.valid) return error.InvalidVideoDecoder;
         try reader.input.control.check();
         if (self.cursor() >= reader.packets.len) return error.InvalidPacketIndex;
@@ -1386,7 +1399,7 @@ pub const Incremental = struct {
                 const Sample = if (kind == .eight) u8 else u16;
                 for (lanes[0..count], 0..) |*lane, plane| {
                     const cfg = if (self.cfg.?.separate_planes) self.cfg.?.independent(@intCast(plane)) else self.cfg.?;
-                    var frame = decodeConfiguredState(Sample, cfg, &self.config_reservation, &self.budget, reader, &.{}, options, null, null, reader.packets.len - 1, 0, null, lane) catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
+                    var frame = decodeConfiguredState(Sample, cfg, &self.config_reservation, &self.budget, reader, &.{}, options, null, null, reader.packets.len - 1, 0, configurations, lane) catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
                     defer frame.deinit();
                     result.decoded_packets += frame.decoded_packets;
                     result.payload_bytes += frame.payload_bytes;
