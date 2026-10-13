@@ -616,3 +616,46 @@ preserves the previously recorded top HN IDs/scores and passes exact filters,
 highlights, union/overlay composition, SQL seeding, pagination and restart checks.
 Debug timings are correctness evidence; optimized matched timings must be recorded
 separately before treating them as a performance comparison.
+
+
+### Optimized 1,024-file local comparison, October 13
+
+[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+compares the retained optimized #1081 executable with the follow-up implementation
+on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
+ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
+continuations. This preserves the canonical 1,024 runs and serves **128 compacted
+runs**, exercising publication-wide traversal above the 64-run threshold.
+
+| Measurement | Retained #1081 qualifier | Follow-up |
+|---|---:|---:|
+| First highlighted `database` search | 327–407 ms | 136–240 ms |
+| Warm highlighted search p95 | 77–92 ms | 51–55 ms |
+| First highlighted search after restart | 172–183 ms | 95–102 ms |
+| Provider object reads during first search | 1,461 | 405 |
+| Provider bytes during first search | 50.85 MB | 24.33 MB |
+
+Both follow-up cycles visit 58 serving segments and prune 70 term-directory nodes.
+Top-five public row IDs and exact floating-point scores match both baseline cycles;
+highlights, exact filter comparison, empty filters, cursor continuation and restart
+checks pass. Priority candidates are admitted in windows of up to eight, and
+highlight locations follow the admitted snapshot's canonical segment order.
+The full lake gate passes 155 local and 242 integration tests with no leaks; the
+final optimized runtime also passes seven native gateway tests and nine subtests.
+
+Cursor p95 and metadata-filter timings are mixed across cycles: cursor p95 is
+178–224 ms versus 213–218 ms on the baseline; some filter cases vary or regress.
+No general filter/cursor speedup is claimed. OS file caches were not flushed,
+readiness warming remains enabled, and other local builds shared the development
+host. These small normalized-data runs establish correctness and reduced query
+I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
+
+The 1,024-file **cold composed search still returns HTTP 422
+`query_candidate_budget_exceeded` on both executables**. The composed stream
+requires exact leaf totals, while large ranked pages can return lower-bound totals.
+This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
+1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
+fails. The smaller 67-file development composition check passes, but it does not
+qualify this larger cold composed workload. Fixing that leaf-count contract and
+full-archive/cloud qualification remain follow-ups. No cloud job or deployment was
+launched for this comparison.

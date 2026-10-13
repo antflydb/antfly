@@ -1118,3 +1118,15 @@ for supported descending-score terms; ties remain eligible and pruned totals are
 lower bounds. Exact counts and other query shapes keep the exact fallback. Upgrade
 readers before publishing this format. See the deployment qualification plan for
 bounds and separate correctness/performance evidence.
+
+
+The [October 13 optimized local comparison](lake-scalability-qualification-20261013.json)
+uses 1,024 source files and 128 serving runs. Two cycles preserve exact ranked
+IDs/scores and reduce first-search provider reads from 1,461 to 405 and bytes from
+50.85 MB to 24.33 MB. First highlighted search is 136–240 ms, warm p95 51–55 ms,
+and post-restart search 95–102 ms on this fixture. Filter/cursor results are mixed;
+these are local normalized-data checks, not archive/cloud SLO qualification.
+The large cold composed-query count contract still rejects lower-bound leaf totals
+on both the baseline and follow-up. SQL fixture seeding itself passes with the
+explicit response budget. See the qualification plan for retained raw samples,
+provenance, query bounds and this remaining limitation.
