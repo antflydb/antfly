@@ -51,7 +51,15 @@ pub const CandidateSource = struct {
         if (self.vtable.bound_table) |f| return f(self.ptr, table);
         return null;
     }
+    /// Revisions must cover the complete candidate universe (including newly
+    /// inserted records, table rebinding, index rebuilds and ANN visibility),
+    /// and the selected embedding producer. Null disables cross-run reuse.
+    pub const Revisions = struct {
+        candidates: ?[32]u8 = null,
+        embedding: ?[32]u8 = null,
+    };
     pub const VTable = struct {
+        revisions: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!Revisions = null,
         /// Bulk point candidates. Missing keys are omitted. Values are borrowed
         /// during consume; this optional capability must preserve point-read semantics.
         get_many: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const []const u8, *anyopaque, Consume) anyerror!void = null,

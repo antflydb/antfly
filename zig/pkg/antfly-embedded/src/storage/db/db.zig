@@ -27549,7 +27549,7 @@ pub const DB = struct {
             // An unchanged catalog observation does not mutate resolver state.
             // Do not wait for distributed callbacks, rewrite the catalog, or
             // retire a serving owner just because replay is currently active.
-            if (self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
+            if (!options.migrate_namespace and self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
             var activity = try self.acquireResolverCatalogActivity(options.drain_backfill);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();

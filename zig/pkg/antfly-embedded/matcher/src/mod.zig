@@ -212,6 +212,21 @@ pub const ParseError = error{
 } || std.mem.Allocator.Error || std.json.ParseError(std.json.Scanner);
 
 /// A parsed, reusable scorer. Owns its config in an arena; `deinit` frees it.
+/// Raw comparator values, independent of thresholds, weights and decisions.
+/// Input digests prevent reuse after canonical fields or mention vectors change.
+pub const Feature = struct {
+    left: []const u8,
+    right: []const u8,
+    comparator: Comparator,
+    input: [32]u8,
+    value: f64,
+};
+
+pub const FeatureStats = struct {
+    computed: usize = 0,
+    reused: usize = 0,
+};
+
 pub const Scorer = struct {
     arena: std.heap.ArenaAllocator,
     comparisons: []const Comparison,
@@ -291,6 +306,63 @@ pub const Scorer = struct {
         else
             .no_match;
         return .{ .score = sum, .probability = probability, .outcome = outcome };
+    }
+
+    /// Materialize only the raw similarities needed by the current scorer.
+    /// A condition/weight/bias/decision edit reuses these values; a field or
+    /// comparator edit computes just its missing dependencies.
+    pub fn featuresAlloc(self: *const Scorer, alloc: std.mem.Allocator, left: Record, right: Record, previous: []const Feature, stats: ?*FeatureStats) ![]const Feature {
+        var out: std.ArrayListUnmanaged(Feature) = .empty;
+        for (self.comparisons) |cmp| {
+            const inputs = try std.json.Stringify.valueAlloc(alloc, .{ left.get(cmp.left), right.get(cmp.right) }, .{});
+            defer alloc.free(inputs);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(inputs, &digest, .{});
+            for (cmp.levels) |level| {
+                const threshold = switch (level.condition) {
+                    .otherwise => continue,
+                    .threshold => |t| t,
+                };
+                var duplicate = false;
+                for (out.items) |f| if (f.comparator == threshold.comparator and std.mem.eql(u8, f.left, cmp.left) and std.mem.eql(u8, f.right, cmp.right)) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate) continue;
+                const cached: ?f64 = found: {
+                    for (previous) |f| if (f.comparator == threshold.comparator and std.mem.eql(u8, f.left, cmp.left) and std.mem.eql(u8, f.right, cmp.right) and std.mem.eql(u8, &f.input, &digest) and std.math.isFinite(f.value)) break :found f.value;
+                    break :found null;
+                };
+                if (stats) |st| {
+                    if (cached != null) st.reused += 1 else st.computed += 1;
+                }
+                try out.append(alloc, .{ .left = cmp.left, .right = cmp.right, .comparator = threshold.comparator, .input = digest, .value = cached orelse similarity(alloc, threshold.comparator, left.get(cmp.left), right.get(cmp.right)) });
+            }
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    /// Consume prepared features without running comparators. Preparation above
+    /// is the validation boundary; missing features conservatively score zero.
+    pub fn scoreFeatures(self: *const Scorer, features: []const Feature) ScoreResult {
+        var sum = self.bias;
+        for (self.comparisons) |cmp| {
+            for (cmp.levels) |level| {
+                const holds = switch (level.condition) {
+                    .otherwise => true,
+                    .threshold => |t| found: {
+                        for (features) |f| if (f.comparator == t.comparator and std.mem.eql(u8, f.left, cmp.left) and std.mem.eql(u8, f.right, cmp.right)) break :found t.op.holds(f.value, t.value);
+                        break :found false;
+                    },
+                };
+                if (holds) {
+                    sum += level.weight;
+                    break;
+                }
+            }
+        }
+        const probability = logistic(sum);
+        return .{ .score = sum, .probability = probability, .outcome = if (probability >= self.match_threshold) .match else if (probability >= self.review_threshold) .review else .no_match };
     }
 
     /// Per-comparison breakdown of a score. The returned slice is owned by the

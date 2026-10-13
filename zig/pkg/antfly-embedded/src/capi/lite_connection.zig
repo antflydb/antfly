@@ -164,7 +164,12 @@ const Owner = struct {
             const retained = retained: {
                 if (retired.query_borrows > 0) break :retained true;
                 for (self.connections.items) |connection| {
-                    var cursors = connection.sql_cursors.valueIterator();
+                    // attach moves this connection's registry onto the current
+                    // root. Inspect its actual owner during query resume too.
+                    var cursors = if (connection.attached)
+                        connection.current.?.sql_cursors.valueIterator()
+                    else
+                        connection.sql_cursors.valueIterator();
                     while (cursors.next()) |cursor| {
                         if (cursor.*.adapter.handle == retired) break :retained true;
                     }

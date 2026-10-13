@@ -501,6 +501,13 @@ def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
         changed["resolvers"][0]["min_confidence"] = 0.2
         db.add_index(changed)
         assert db.render_resolver_key("concepts", mention)["config_generation"] == 4
+        # An explicit reset must clear merges even when namespace and aliases
+        # exactly match the current declarative config.
+        db.set_resolver_namespace(
+            "concepts", {"table": "default", "key_template": "concept/{{ uslug _entity.text }}", "reset_merges": True}
+        )
+        assert db.render_resolver_key("concepts", mention)["key"] == "concept/qwen3"
+        db.merge_resolver_keys("concepts", "concept/qwen3", "concept/qwen")
         db.set_resolver_namespace(
             "concepts", {"table": "default", "key_template": "topic/{{ uslug _entity.text }}", "reset_merges": True}
         )

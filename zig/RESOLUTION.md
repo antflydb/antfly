@@ -970,3 +970,47 @@ report even on failure. This 23-document curated regression set includes six
 negative documents, repeated names, accented/Arabic/Indic text, and a document
 long enough to require windowing. It remains a regression set, not a claim of
 production-domain accuracy; domain-specific labelled evaluation is still needed.
+
+## Incremental resolution work
+
+Resolution artifacts contain an optional, versioned `_resolution_work` cache.
+Each extraction-local mention records its embedding dependencies, candidate
+universe revision, candidate records and raw comparator features. This is
+reusable work, not authoritative identity state: old artifacts without it work
+normally, and malformed or unknown cache versions are discarded and recomputed.
+Public `resolve_query` responses omit the private cache.
+
+| Change | Repeated work |
+| --- | --- |
+| Match/review threshold, scorer weights or bias | Recombine cached features and classify candidates |
+| Comparator, comparison fields or similarity cutoff | Reuse raw similarities with matching input digests; compute missing comparisons |
+| Mention text or vector | Recompute that mention's dependent work |
+| Mention label/confidence or sibling routing | Readmit mentions and recompute affected candidate/decision dependencies |
+| Key template | Render keys again, refresh exact/blocked candidates, reuse embeddings and unchanged comparisons |
+| Blocking strategy, ANN index, candidate limit or hydrated vector fields | Fetch the new candidate set; reuse comparisons whose inputs still match |
+| Embedding producer or dimensions | Regenerate mention embeddings and dependent candidates/comparisons |
+| Alias/merge or human review | Apply current redirects/overrides to freshly classified decisions |
+
+Native Lite candidate revisions include the physical table binding, committed
+source/enrichment sequences, selected index configuration and its applied replay
+sequence. This covers canonical inserts/deletes, table recreation and vectors
+becoming visible after an ANN drain. Embedding revisions cover the destination's
+embedding configuration independently of table mutations. Runtime adapters that
+cannot provide a complete revision return null: candidate fetching and/or
+embedding generation then run again rather than trust incomplete dependencies.
+The distributed adapter currently takes this conservative path.
+
+The work cache is part of the resolution artifact, so the existing atomic
+artifact/replay commit, portable backup/import, source deletion and bounded
+crash-resumable replay own its lifetime. Resolver catalog changes mark the
+existing durable source-index cursors dirty in the same transaction. Replay
+loads the current configuration, so a superseding change does not install old
+cached decisions. Cache/revision-only refreshes with identical identity payloads
+publish a graph-only handoff and completion marker; they do not repeat canonical
+entity promotion. Changes to the promotion setting use the full handoff.
+
+A global scorer/template change still visits eligible source artifacts and
+mentions. It no longer requires rerunning extraction, embeddings, candidate
+search or comparisons whose dependencies are unchanged. Reuse is deliberately
+conservative: a destination mutation invalidates the table's candidate revision,
+including empty candidate sets, even if it ultimately changes no matches.

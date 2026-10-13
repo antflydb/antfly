@@ -246,6 +246,9 @@ pub const ProcessOutcome = struct {
     resolution_key: []u8,
     /// Deferred artifact bytes for an atomic artifact + replay commit.
     resolution_value: ?[]u8 = null,
+    /// Revision/cache-only refresh: reconcile graph confidence/config, but do
+    /// not republish unchanged canonical documents to the entity sink.
+    graph_only: bool = false,
 };
 
 pub const PersistenceMode = enum { immediate, deferred };
@@ -373,7 +376,12 @@ pub fn resolveQueryExtractionAlloc(
     }
     const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse return error.InvalidArgument;
     defer gpa.free(outcome.resolution_key);
-    return outcome.resolution_value orelse error.InvalidArgument;
+    const value = outcome.resolution_value orelse return error.InvalidArgument;
+    defer gpa.free(value);
+    var result = try std.json.parseFromSlice(std.json.Value, gpa, value, .{});
+    defer result.deinit();
+    _ = result.value.object.orderedRemove("_resolution_work");
+    return try std.json.Stringify.valueAlloc(gpa, result.value, .{});
 }
 
 pub fn processChangedExtractionWithConfig(
@@ -487,9 +495,18 @@ pub fn processChangedExtractionWithConfig(
     const sibling_resolutions = try siblingResolutionsJsonAlloc(gpa, resolvers, cfg, store, parsed, pending_overlay);
     defer if (sibling_resolutions) |raw| gpa.free(raw);
 
+    const revisions: CandidateSource.Revisions = if (batch_source) |source|
+        if (source.vtable.revisions) |read| try read(source.ptr, gpa, cfg.table, annIndexName(cfg), cfg.name_embedding) else .{}
+    else
+        .{};
+    const vector_fields = try resolver.candidateVectorFields(gpa);
+    defer gpa.free(vector_fields);
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.effectiveGeneration(),
+        .promotion_enabled = cfg.promote,
+        .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding, cfg.name_embedding_dims }) else null,
+        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, cfg.candidate_search, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
         .embedder = stage_embedder,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,
@@ -507,10 +524,10 @@ pub fn processChangedExtractionWithConfig(
         return .{ .result = result, .resolution_key = resolution_key };
     }
 
-    var computed = try stage.computeAlloc(gpa, store, effective_provider, changed_key);
-    defer if (computed) |bytes| gpa.free(bytes);
     const existing = try store.get(gpa, resolution_key);
     defer if (existing) |bytes| gpa.free(bytes);
+    var computed = try stage.computeCachedAlloc(gpa, store, effective_provider, changed_key, existing);
+    defer if (computed) |bytes| gpa.free(bytes);
 
     if (computed == null) {
         const stale_handoff = try resolution_handoff.exists(gpa, store, resolution_key);
@@ -533,13 +550,40 @@ pub fn processChangedExtractionWithConfig(
         }
     }
 
+    const graph_only = if (existing) |bytes|
+        (try resolution_handoff.matches(gpa, store, resolution_key, bytes)) and
+            (try sameResolutionDecisions(gpa, bytes, computed.?))
+    else
+        false;
     const resolution_value = computed.?;
     computed = null;
     return .{
         .result = .written,
         .resolution_key = resolution_key,
         .resolution_value = resolution_value,
+        .graph_only = graph_only,
     };
+}
+
+fn sameResolutionDecisions(gpa: Allocator, left: []const u8, right: []const u8) !bool {
+    var a = try std.json.parseFromSlice(std.json.Value, gpa, left, .{});
+    defer a.deinit();
+    var b = try std.json.parseFromSlice(std.json.Value, gpa, right, .{});
+    defer b.deinit();
+    if (a.value != .object or b.value != .object) return false;
+    const aw = a.value.object.get("_resolution_work") orelse return false;
+    const bw = b.value.object.get("_resolution_work") orelse return false;
+    if (aw != .object or bw != .object) return false;
+    const ap = aw.object.get("promotion_enabled") orelse return false;
+    const bp = bw.object.get("promotion_enabled") orelse return false;
+    if (ap != .bool or bp != .bool or ap.bool != bp.bool) return false;
+    const ae = a.value.object.get("entities") orelse return false;
+    const be = b.value.object.get("entities") orelse return false;
+    const av = try std.json.Stringify.valueAlloc(gpa, ae, .{});
+    defer gpa.free(av);
+    const bv = try std.json.Stringify.valueAlloc(gpa, be, .{});
+    defer gpa.free(bv);
+    return std.mem.eql(u8, av, bv);
 }
 
 fn processChangedExtractionForAllResolvers(
@@ -563,16 +607,18 @@ fn processChangedExtractionForAllResolvers(
         switch (outcome.result) {
             .written => {
                 const value = outcome.resolution_value.?;
-                pending.full_keys.append(gpa, outcome.resolution_key) catch |err| {
+                const keys = if (outcome.graph_only) &pending.graph_only_keys else &pending.full_keys;
+                const writes = if (outcome.graph_only) &pending.refresh_writes else &pending.artifact_writes;
+                keys.append(gpa, outcome.resolution_key) catch |err| {
                     gpa.free(outcome.resolution_key);
                     gpa.free(value);
                     return err;
                 };
-                pending.artifact_writes.append(gpa, .{
+                writes.append(gpa, .{
                     .key = outcome.resolution_key,
                     .value = value,
                 }) catch |err| {
-                    _ = pending.full_keys.pop();
+                    _ = keys.pop();
                     gpa.free(outcome.resolution_key);
                     gpa.free(value);
                     return err;
@@ -608,11 +654,14 @@ const PendingRecordCommit = struct {
     graph_only_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     artifact_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
     artifact_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    refresh_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
 
     pub fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
         for (self.full_keys.items) |key| alloc.free(@constCast(key));
         for (self.graph_only_keys.items) |key| alloc.free(@constCast(key));
         for (self.artifact_writes.items) |write| alloc.free(@constCast(write.value));
+        for (self.refresh_writes.items) |write| alloc.free(@constCast(write.value));
+        self.refresh_writes.deinit(alloc);
         self.full_keys.deinit(alloc);
         self.graph_only_keys.deinit(alloc);
         self.artifact_writes.deinit(alloc);
@@ -1375,6 +1424,8 @@ pub fn processRecordKeys(
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
             .batch = .{ .changed_artifact_keys = pending.graph_only_keys.items },
+            .artifact_writes = pending.refresh_writes.items,
+            .publish_resolution_handoff = pending.refresh_writes.items.len > 0,
             .target_hints = &.{.graph},
         });
     }
@@ -4643,4 +4694,45 @@ test "resolver backfill skips stale empty resolutions without routed mentions" {
     cfg.labels = &.{"person"};
     try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[{}]}");
     try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+}
+
+test "incremental resolution replay commits refreshes atomically without unchanged promotion" {
+    const a = std.testing.allocator;
+    var memory: MapStore = .{ .alloc = a };
+    defer memory.deinit();
+    const source = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(source);
+    const resolved = try internal_keys.resolutionArtifactKeyAlloc(a, "doc", "resolved");
+    defer a.free(resolved);
+    try memory.store().put(source, "{\"entities\":[{\"id\":\"e\",\"label\":\"person\",\"text\":\"Ada\"}]}");
+    var configs = [_]ResolverConfig{.{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .config_generation = 1 }};
+    var writer: CaptureWriter = .{ .alloc = a, .store = memory.store() };
+    defer writer.deinit();
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    configs[0].config_generation = 2;
+    // Failure before the atomic refresh leaves old work and generation intact.
+    try std.testing.expectError(error.InjectedRecordWriteFailure, reresolveAll(a, memory.store(), &configs, null, null, &writer, FailingWriter.writeFn));
+    const old = (try memory.store().get(a, resolved)).?;
+    defer a.free(old);
+    try std.testing.expect(std.mem.indexOf(u8, old, "\"config_generation\":1") != null);
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
+    const current = (try memory.store().get(a, resolved)).?;
+    defer a.free(current);
+    try std.testing.expect(std.mem.indexOf(u8, current, "\"config_generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current, "_resolution_work") != null);
+    try std.testing.expect(try resolution_handoff.matches(a, memory.store(), resolved, current));
+    // A superseding template change uses current extraction and replaces real
+    // decisions via the full promotion/graph handoff, never old pending work.
+    configs[0].config_generation = 3;
+    configs[0].key_template = "person/{{ uslug _entity.text }}";
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    const changed = (try memory.store().get(a, resolved)).?;
+    defer a.free(changed);
+    var decoded = try resolver_lib.parseResolution(a, changed);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("person/ada", decoded.entities[0].doc_ref.key);
 }

@@ -31,7 +31,26 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions } };
+}
+
+fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    // Directory handles permit concurrent writes; without a pinned candidate
+    // snapshot they must refetch. Native calls own the database path gate.
+    if (handle.embedded_path == null) return .{};
+    const database = try tables.get(handle, table);
+    const physical = try boundTable(ptr, table);
+    const index_config = database.core.index_manager.get(index);
+    var producer = try database.getEnrichment(a, .embedding, embedding);
+    defer if (producer) |*config| config.deinit(a);
+    const hash = @import("antfly_resolver").fingerprint;
+    var applied = try database.core.loadAppliedSequence(a, index);
+    if (database.executor.appliedSequence(index)) |live| applied = @max(applied, live);
+    return .{
+        .candidates = try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
+        .embedding = try hash(a, .{ physical, embedding, producer, index_config }),
+    };
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
@@ -611,6 +630,28 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, alias_edges);
     try std.testing.expectEqual(@as(usize, 1), alias_edges.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", alias_edges[0].target);
+
+    // Reapply a public inline config with a changed scorer. A real config
+    // replay must reuse mention embeddings, including across canonical writes.
+    const before_replay = embed_context.mention_calls;
+    var updated = try std.json.parseFromSlice(std.json.Value, a, config, .{});
+    defer updated.deinit();
+    try updated.value.object.put(a, "name", .{ .string = "knowledge_updated" });
+    const scorer_value = updated.value.object.get("resolvers").?.array.items[0].object.getPtr("scorer_json").?;
+    const scorer = try std.mem.replaceOwned(u8, a, scorer_value.string, "0.9", "0.8");
+    defer a.free(scorer);
+    scorer_value.* = .{ .string = scorer };
+    const new_config = try std.json.Stringify.valueAlloc(a, updated.value, .{});
+    defer a.free(new_config);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(new_config)));
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_replay, embed_context.mention_calls);
+    // A candidate/index revision changes independently of the embedding model.
+    const before_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try entities.batch(.{ .writes = &.{.{ .key = "concept/new", .value = "{\"canonical_name\":\"New candidate\"}" }} });
+    const after_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &before_revision.candidates.?, &after_revision.candidates.?));
+    try std.testing.expectEqualSlices(u8, &before_revision.embedding.?, &after_revision.embedding.?);
 }
 
 test "capi Lite models_dir loads a real extractor for graph enrichment" {
@@ -966,6 +1007,14 @@ test "capi resolver config merge config advances revisions and protects key name
 }
 
 test "capi native text queries overlap writer commits and retain retired providers" {
+    try testNativeTextQueryConcurrentCommit(false);
+}
+
+test "capi native text queries return busy after a concurrent merge" {
+    try testNativeTextQueryConcurrentCommit(true);
+}
+
+fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     const api = @import("db.zig");
     const extracting = @import("antfly_extracting");
     const managed = @import("../inference/managed_embedder.zig");
@@ -1002,11 +1051,15 @@ test "capi native text queries overlap writer commits and retain retired provide
     const Writer = struct {
         id: ?*anyopaque,
         state: *State,
+        change_config: bool,
         code: h.capi.ErrorCode = .internal,
         fn run(self: *@This()) void {
             var result: h.capi.Buffer = .{};
             defer api.antfly_buffer_free(&result);
-            self.code = api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"probe\":{\"body\":\"committed\"}}}"), &result);
+            self.code = if (self.change_config)
+                api.antfly_db_merge_resolver_keys_json(self.id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/antfly\",\"target\":\"concept/canonical\"}"))
+            else
+                api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"probe\":{\"body\":\"committed\"}}}"), &result);
             self.state.committed.set(h.handleLockIo());
         }
     };
@@ -1022,11 +1075,27 @@ test "capi native text queries overlap writer commits and retain retired provide
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly","model":"test-extractor","schema":{"entities":["company"]}}}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(writer, .fromSlice(config)));
+    var sql_output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&sql_output);
+    for ([_][]const u8{
+        \\{"statement":"CREATE TABLE numbers (n BIGINT)"}
+        ,
+        \\{"statement":"INSERT INTO numbers (_id,n) VALUES ('row',7)"}
+        ,
+    }) |request| {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(writer, .fromSlice(request), &sql_output));
+        api.antfly_buffer_free(&sql_output);
+    }
     var readonly = options;
     readonly.open_mode = h.capi.open_mode_readonly;
     var reader: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &reader));
     defer api.antfly_db_close(reader);
+    const sql_cursor = @import("sql_cursor.zig");
+    var cursor: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_open_cursor_json(reader, .fromSlice("{\"statement\":\"SELECT n FROM numbers\"}"), &cursor, &sql_output));
+    api.antfly_buffer_free(&sql_output);
+    defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
     var state: State = .{};
     const setup = api.enterHandle(reader, .read).?;
     const snapshot = setup.handle;
@@ -1043,7 +1112,7 @@ test "capi native text queries overlap writer commits and retain retired provide
     defer second_thread.join();
     defer state.release.set(h.handleLockIo());
     try state.both_entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
-    var write: Writer = .{ .id = writer, .state = &state };
+    var write: Writer = .{ .id = writer, .state = &state, .change_config = change_config };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
     defer writer_thread.join();
     defer state.release.set(h.handleLockIo());
@@ -1058,8 +1127,18 @@ test "capi native text queries overlap writer commits and retain retired provide
     state.release.set(h.handleLockIo());
     try first.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try second.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, second.code);
+    try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, first.code);
+    try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, second.code);
+    const pinned = api.enterHandle(reader, .read).?;
+    // resumeQuery collected while this registry was attached to the new root.
+    // The cursor must still pin the original root after both queries finish.
+    try std.testing.expectEqual(@as(usize, 1), pinned.connection.?.owner.retired.items.len);
+    try std.testing.expect(pinned.connection.?.owner.retired.items[0] == snapshot);
+    pinned.leave();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_fetch_cursor_json(reader, cursor, 10, &sql_output));
+    try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);
+    api.antfly_buffer_free(&sql_output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_close_cursor(reader, cursor));
     const finished = api.enterHandle(reader, .read).?;
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
     finished.leave();

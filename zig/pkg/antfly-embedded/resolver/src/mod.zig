@@ -83,6 +83,8 @@ pub const Candidate = struct {
     record: matcher.Record,
     resolved_doc_ref: ?DocRef = null,
     resolved_record: ?matcher.Record = null,
+    /// Validated raw comparison features for this mention/candidate pair.
+    features: ?[]const matcher.Feature = null,
 };
 
 pub const Decision = enum {
@@ -119,6 +121,7 @@ pub const Resolution = struct {
     config_generation: u64,
     entities: []const ResolvedEntity,
     skipped_mentions: usize = 0,
+    work: ?WorkCache = null,
 
     pub fn deinit(self: *Resolution) void {
         self.arena.deinit();
@@ -166,7 +169,14 @@ pub const Resolution = struct {
             }
             try out.append(allocator, '}');
         }
-        try out.appendSlice(allocator, "]}");
+        try out.append(allocator, ']');
+        if (self.work) |work| {
+            try out.appendSlice(allocator, ",\"_resolution_work\":");
+            const encoded = try work.toJson(allocator);
+            defer allocator.free(encoded);
+            try out.appendSlice(allocator, encoded);
+        }
+        try out.append(allocator, '}');
         return out.toOwnedSlice(allocator);
     }
 };
@@ -504,7 +514,7 @@ pub const Resolver = struct {
                 var best_outcome: matcher.Outcome = .no_match;
                 for (candidates, 0..) |cand, ci| {
                     if (self.type_must_match and !std.mem.eql(u8, cand.label, entity.label)) continue;
-                    const r = scorer.score(scratch, mention, cand.record);
+                    const r = if (cand.features) |features| scorer.scoreFeatures(features) else scorer.score(scratch, mention, cand.record);
                     if (r.probability > best_prob) {
                         best_prob = r.probability;
                         best = ci;
@@ -1255,6 +1265,113 @@ pub const RunResult = enum {
     source_missing,
 };
 
+/// Dependency records live inside the resolution artifact, so the existing
+/// atomic artifact/replay commit, deletion and portable backup own them too.
+/// Unknown versions and damaged cache data are discarded, never decisions.
+pub const WorkCache = struct {
+    version: u32 = 1,
+    promotion_enabled: ?bool = null,
+    mentions: []const MentionWork,
+
+    const Use = struct { candidate: usize, features: ?[]const matcher.Feature = null };
+    const Mention = struct {
+        local_id: []const u8,
+        embedding_input: [32]u8,
+        embedding_dependency: ?[32]u8 = null,
+        embedding: ?[]const f32 = null,
+        candidate_dependency: ?[32]u8 = null,
+        candidates: []const Use,
+    };
+    const Wire = struct {
+        version: u32,
+        promotion_enabled: ?bool = null,
+        mentions: []const Mention,
+        candidates: []const Candidate = &.{},
+    };
+
+    fn toJson(self: WorkCache, gpa: std.mem.Allocator) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pool: std.ArrayListUnmanaged(Candidate) = .empty;
+        var indices: std.AutoHashMapUnmanaged([32]u8, usize) = .empty;
+        const mentions = try a.alloc(Mention, self.mentions.len);
+        for (self.mentions, mentions) |entry, *mention| {
+            const uses = try a.alloc(Use, entry.candidates.len);
+            for (entry.candidates, uses) |candidate, *use| {
+                var row = candidate;
+                row.features = null;
+                const digest = try fingerprint(a, row);
+                const slot = try indices.getOrPut(a, digest);
+                if (!slot.found_existing) {
+                    slot.value_ptr.* = pool.items.len;
+                    try pool.append(a, row);
+                }
+                use.* = .{ .candidate = slot.value_ptr.*, .features = candidate.features };
+            }
+            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = entry.embedding, .candidate_dependency = entry.candidate_dependency, .candidates = uses };
+        }
+        // Large canonical vectors are stored once per work unit, not once per
+        // mention/candidate pair. Each pair retains just its comparison features.
+        return try std.json.Stringify.valueAlloc(gpa, Wire{ .version = self.version, .promotion_enabled = self.promotion_enabled, .mentions = mentions, .candidates = pool.items }, .{});
+    }
+
+    fn parseValue(a: std.mem.Allocator, value: std.json.Value) !?WorkCache {
+        const wire = try std.json.parseFromValueLeaky(Wire, a, value, .{ .ignore_unknown_fields = true });
+        if (wire.version != 1) return null;
+        const mentions = try a.alloc(MentionWork, wire.mentions.len);
+        for (wire.mentions, mentions) |entry, *mention| {
+            const candidates = try a.alloc(Candidate, entry.candidates.len);
+            for (entry.candidates, candidates) |use, *candidate| {
+                if (use.candidate >= wire.candidates.len) return error.InvalidResolutionCache;
+                candidate.* = wire.candidates[use.candidate];
+                candidate.features = use.features;
+            }
+            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = entry.embedding, .candidate_dependency = entry.candidate_dependency, .candidates = candidates };
+        }
+        return .{ .version = wire.version, .promotion_enabled = wire.promotion_enabled, .mentions = mentions };
+    }
+};
+
+pub const MentionWork = struct {
+    local_id: []const u8,
+    embedding_input: [32]u8,
+    embedding_dependency: ?[32]u8 = null,
+    embedding: ?[]const f32 = null,
+    candidate_dependency: ?[32]u8 = null,
+    candidates: []const Candidate = &.{},
+};
+
+pub const WorkStats = struct {
+    embeddings: usize = 0,
+    reused_embeddings: usize = 0,
+    candidate_mentions: usize = 0,
+    reused_candidate_mentions: usize = 0,
+    features: matcher.FeatureStats = .{},
+};
+
+pub fn fingerprint(alloc: std.mem.Allocator, value: anytype) ![32]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+fn sameDependency(left: ?[32]u8, right: ?[32]u8) bool {
+    return left != null and right != null and std.mem.eql(u8, &left.?, &right.?);
+}
+
+fn mentionRecord(entity: ExtractedEntity, fields: *[4]matcher.Field) matcher.Record {
+    fields.* = .{
+        .{ .name = "label", .value = .{ .text = entity.label } },
+        .{ .name = "text", .value = .{ .text = entity.text } },
+        .{ .name = "canonical_text", .value = .{ .text = entity.text } },
+        .{ .name = "name_embedding", .value = if (entity.embedding) |v| .{ .vector = v } else .none },
+    };
+    return .{ .fields = fields[0..if (entity.embedding != null) @as(usize, 4) else 3] };
+}
+
 /// One resolution replay stage: read a changed extraction artifact, resolve its
 /// mentions, and persist the resolution artifact idempotently. This is the body
 /// the managed worker runs per changed extraction artifact key.
@@ -1267,6 +1384,13 @@ pub const ResolutionStage = struct {
     doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
+    /// A destination/model revision and blocking/index revision supplied by the
+    /// runtime. Null forbids reuse for that stage (remote sources may lack a
+    /// snapshot-wide revision). Neither is the resolver generation.
+    embedding_dependency: ?[32]u8 = null,
+    candidate_dependency: ?[32]u8 = null,
+    stats: ?*WorkStats = null,
+    promotion_enabled: bool = true,
     /// Optional name-embedding backfill: when set, each mention lacking an
     /// `embedding` gets one from its text before blocking/scoring, so `ann`
     /// candidate search and cosine comparisons have a query vector.
@@ -1294,6 +1418,17 @@ pub const ResolutionStage = struct {
         store: ArtifactStore,
         provider: ?CandidateProvider,
         extraction_key: []const u8,
+    ) !?[]u8 {
+        return self.computeCachedAlloc(gpa, store, provider, extraction_key, null);
+    }
+
+    pub fn computeCachedAlloc(
+        self: ResolutionStage,
+        gpa: std.mem.Allocator,
+        store: ArtifactStore,
+        provider: ?CandidateProvider,
+        extraction_key: []const u8,
+        existing: ?[]const u8,
     ) !?[]u8 {
         const extraction = try store.get(gpa, extraction_key);
         defer if (extraction) |e| gpa.free(e);
@@ -1328,13 +1463,51 @@ pub const ResolutionStage = struct {
         }
         parsed.entities = parsed.entities[0..kept];
 
+        const arena = parsed.arena.allocator();
+        const previous: ?WorkCache = cache: {
+            const raw = existing orelse break :cache null;
+            const root = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => break :cache null,
+            };
+            if (root != .object) break :cache null;
+            const work = root.object.get("_resolution_work") orelse break :cache null;
+            const decoded = WorkCache.parseValue(arena, work) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    std.log.warn("resolver discarded malformed incremental work: {s}", .{@errorName(err)});
+                    break :cache null;
+                },
+            };
+            break :cache decoded;
+        };
+        var previous_mentions: std.StringHashMapUnmanaged(?MentionWork) = .empty;
+        if (previous) |cache| for (cache.mentions) |entry| {
+            const slot = try previous_mentions.getOrPut(arena, entry.local_id);
+            // Duplicate ids cannot establish an unambiguous dependency.
+            slot.value_ptr.* = if (slot.found_existing) null else entry;
+        };
+        const work = try arena.alloc(MentionWork, kept);
+        const prior = try arena.alloc(?MentionWork, kept);
+        for (parsed.entities, 0..) |entity, i| {
+            prior[i] = previous_mentions.get(entity.local_id) orelse null;
+            work[i] = .{ .local_id = entity.local_id, .embedding_input = try fingerprint(arena, entity.text), .embedding_dependency = self.embedding_dependency };
+        }
+
         // Backfill name embeddings for mentions that arrived without one, using
         // the parse arena so the vectors outlive scoring. Embedding failures are
         // non-fatal: the mention simply scores without a vector.
         if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
-            const arena = parsed.arena.allocator();
             for (parsed.entities, 0..) |*entity, i| {
                 if (alias_mask[i] or entity.embedding != null or entity.text.len == 0) continue;
+                if (prior[i]) |entry| {
+                    if (sameDependency(entry.embedding_dependency, self.embedding_dependency) and std.mem.eql(u8, &entry.embedding_input, &work[i].embedding_input) and entry.embedding != null) {
+                        entity.embedding = entry.embedding;
+                        if (self.stats) |stats| stats.reused_embeddings += 1;
+                        continue;
+                    }
+                }
+                if (self.stats) |stats| stats.embeddings += 1;
                 entity.embedding = embedder.embed(arena, entity.text) catch null;
             }
         }
@@ -1350,7 +1523,17 @@ pub const ResolutionStage = struct {
             var pending: std.ArrayListUnmanaged(ExtractedEntity) = .empty;
             var indices: std.ArrayListUnmanaged(usize) = .empty;
             for (parsed.entities, 0..) |entity, i| {
+                work[i].embedding = entity.embedding;
                 if (alias_mask[i]) continue;
+                if (self.candidate_dependency) |dep| work[i].candidate_dependency = try fingerprint(a, .{ dep, entity });
+                if (prior[i]) |entry| {
+                    if (sameDependency(entry.candidate_dependency, work[i].candidate_dependency)) {
+                        lists[i] = entry.candidates;
+                        if (self.stats) |stats| stats.reused_candidate_mentions += 1;
+                        continue;
+                    }
+                }
+                if (self.stats) |stats| stats.candidate_mentions += 1;
                 try pending.append(a, entity);
                 try indices.append(a, i);
             }
@@ -1361,6 +1544,30 @@ pub const ResolutionStage = struct {
             }
         }
 
+        // Refetched candidates can still reuse features: only their consumed
+        // input fields participate in a feature digest. New/deleted candidates
+        // and changed vectors cannot borrow another candidate's work.
+        for (parsed.entities, 0..) |entity, i| {
+            const candidates = try a.dupe(Candidate, lists[i]);
+            if (self.resolver.scorer) |*scorer| {
+                var fields: [4]matcher.Field = undefined;
+                const mention = mentionRecord(entity, &fields);
+                for (candidates) |*candidate| {
+                    var old_features: []const matcher.Feature = &.{};
+                    if (prior[i]) |entry| for (entry.candidates) |old| {
+                        if (std.mem.eql(u8, old.doc_ref.table, candidate.doc_ref.table) and std.mem.eql(u8, old.doc_ref.key, candidate.doc_ref.key)) {
+                            old_features = old.features orelse &.{};
+                            break;
+                        }
+                    };
+                    candidate.features = try scorer.featuresAlloc(a, mention, candidate.record, old_features, if (self.stats) |stats| &stats.features else null);
+                }
+            }
+            lists[i] = candidates;
+            work[i].embedding = entity.embedding;
+            work[i].candidates = candidates;
+        }
+
         var resolution = try self.resolver.resolve(gpa, self.config_generation, parsed.entities, lists);
         defer resolution.deinit();
         resolution.skipped_mentions += admitted_count - kept;
@@ -1369,14 +1576,14 @@ pub const ResolutionStage = struct {
         // decision and endpoint (strings copied into the resolution arena so they
         // outlive the override provider).
         if (self.overrides) |ov| {
-            const arena = resolution.arena.allocator();
+            const result_arena = resolution.arena.allocator();
             const ents = @constCast(resolution.entities);
             for (ents) |*e| {
                 const o = ov.overrideFor(e.local_id) orelse continue;
                 e.decision = o.decision;
                 e.doc_ref = .{
-                    .table = try arena.dupe(u8, o.table),
-                    .key = try arena.dupe(u8, o.key),
+                    .table = try result_arena.dupe(u8, o.table),
+                    .key = try result_arena.dupe(u8, o.key),
                 };
             }
         }
@@ -1388,6 +1595,7 @@ pub const ResolutionStage = struct {
                 }
             }
         }
+        resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
         return try resolution.toJson(gpa);
     }
 
@@ -1401,12 +1609,12 @@ pub const ResolutionStage = struct {
         extraction_key: []const u8,
         resolution_key: []const u8,
     ) !RunResult {
-        const computed = try self.computeAlloc(gpa, store, provider, extraction_key);
+        const existing = try store.get(gpa, resolution_key);
+        defer if (existing) |bytes| gpa.free(bytes);
+        const computed = try self.computeCachedAlloc(gpa, store, provider, extraction_key, existing);
         defer if (computed) |bytes| gpa.free(bytes);
 
         if (computed == null) {
-            const existing = try store.get(gpa, resolution_key);
-            defer if (existing) |e| gpa.free(e);
             if (existing != null) {
                 try store.delete(resolution_key);
                 return .cleared;
@@ -1414,8 +1622,6 @@ pub const ResolutionStage = struct {
             return .source_missing;
         }
 
-        const existing = try store.get(gpa, resolution_key);
-        defer if (existing) |e| gpa.free(e);
         if (existing) |e| {
             if (std.mem.eql(u8, e, computed.?)) return .unchanged;
         }
@@ -2504,4 +2710,127 @@ test "resolver explicit aliases bypass unavailable candidate sources" {
     var result = try parseResolution(testing.allocator, bytes);
     defer result.deinit();
     try testing.expectEqualStrings("concept/qwen", result.entities[0].doc_ref.key);
+}
+
+test "incremental resolution reuses stages and invalidates changed dependencies" {
+    const a = testing.allocator;
+    const Ports = struct {
+        name: []const u8 = "Ada",
+        vector: [2]f32 = .{ 1, 0 },
+        calls: usize = 0,
+        fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) anyerror!?[]const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try alloc.dupe(f32, &self.vector);
+        }
+        fn candidates(ptr: *anyopaque, alloc: std.mem.Allocator, _: ExtractedEntity, out: *std.ArrayListUnmanaged(Candidate)) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const fields = try alloc.alloc(matcher.Field, 2);
+            fields[0] = .{ .name = "canonical_name", .value = .{ .text = self.name } };
+            fields[1] = .{ .name = "vector", .value = .{ .vector = &.{ 1, 0 } } };
+            try out.append(alloc, .{ .doc_ref = .{ .table = "entities", .key = "canonical" }, .label = "person", .record = .{ .fields = fields } });
+        }
+    };
+    var ports: Ports = .{};
+    var resolver = try Resolver.initFromParts(a, "entities", "{{ uslug _entity.text }}", .{}, true,
+        \\{"comparisons":[{"name":"name","left":"text","right":"canonical_name","levels":[{"when":"exact","weight":2},{"else":true,"weight":-2}]},{"name":"vector","left":"name_embedding","right":"vector","levels":[{"when":"cosine > 0.9","weight":2},{"else":true,"weight":-2}]}],"combine":{"bias":0},"decision":{"match":0.9}}
+    );
+    defer resolver.deinit();
+    var memory: MapStore = .{ .alloc = a };
+    defer memory.deinit();
+    try memory.store().put("ext", "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+    const provider: CandidateProvider = .{ .ptr = &ports, .vtable = &.{ .candidates_for = Ports.candidates } };
+    var stats: WorkStats = .{};
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .embedder = .{ .ptr = &ports, .embed_fn = Ports.embed }, .embedding_dependency = @as([32]u8, @splat(1)), .candidate_dependency = @as([32]u8, @splat(2)), .stats = &stats };
+    try testing.expectEqual(RunResult.written, try stage.run(a, memory.store(), provider, "ext", "res"));
+    try testing.expectEqual(@as(usize, 1), stats.embeddings);
+    try testing.expectEqual(@as(usize, 1), stats.candidate_mentions);
+    try testing.expectEqual(@as(usize, 2), stats.features.computed);
+    stats = .{};
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, memory.store(), provider, "ext", "res"));
+    try testing.expectEqual(@as(usize, 0), stats.embeddings);
+    try testing.expectEqual(@as(usize, 0), stats.candidate_mentions);
+    try testing.expectEqual(@as(usize, 0), stats.features.computed);
+    try testing.expectEqual(@as(usize, 2), stats.features.reused);
+
+    // Decisions are recomputed from features; thresholds and weights are not
+    // dependencies of embeddings, candidate sets, or raw comparisons.
+    resolver.scorer.?.match_threshold = 0.999;
+    stage.config_generation += 1;
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    const changed = (try memory.store().get(a, "res")).?;
+    defer a.free(changed);
+    var parsed = try parseResolution(a, changed);
+    defer parsed.deinit();
+    try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+    try testing.expectEqual(@as(usize, 0), stats.embeddings + stats.candidate_mentions + stats.features.computed);
+    resolver.scorer.?.bias = 10;
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 0), stats.embeddings + stats.candidate_mentions + stats.features.computed);
+
+    // Changing just one comparator computes just that feature.
+    @constCast(@constCast(resolver.scorer.?.comparisons)[0].levels)[0].condition.threshold.comparator = .jaro_winkler;
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 1), stats.features.computed);
+    try testing.expectEqual(@as(usize, 1), stats.features.reused);
+    try testing.expectEqual(@as(usize, 0), stats.embeddings + stats.candidate_mentions);
+
+    // A canonical write/index-visibility revision refetches candidates. Only
+    // consumed fields that changed invalidate their comparator values.
+    ports.name = "Augusta";
+    stage.candidate_dependency = @as([32]u8, @splat(3));
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 1), stats.candidate_mentions);
+    try testing.expectEqual(@as(usize, 0), stats.embeddings);
+    try testing.expectEqual(@as(usize, 1), stats.features.computed);
+    try testing.expectEqual(@as(usize, 1), stats.features.reused);
+
+    // Model/dimension changes regenerate embeddings and dependent ANN work.
+    stage.embedding_dependency = @as([32]u8, @splat(4));
+    ports.vector = .{ 0, 1 };
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 1), stats.embeddings);
+    try testing.expectEqual(@as(usize, 1), stats.candidate_mentions);
+    try testing.expectEqual(@as(usize, 1), stats.features.computed);
+
+    // Adding/reordering mentions preserves the other mention's independent work.
+    try memory.store().put("ext", "{\"entities\":[{\"id\":\"b\",\"text\":\"Grace\",\"label\":\"person\"},{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 1), stats.embeddings);
+    try testing.expectEqual(@as(usize, 1), stats.reused_embeddings);
+    try testing.expectEqual(@as(usize, 1), stats.candidate_mentions);
+    try testing.expectEqual(@as(usize, 1), stats.reused_candidate_mentions);
+    const warm = (try memory.store().get(a, "res")).?;
+    defer a.free(warm);
+    const cold = (try stage.computeAlloc(a, memory.store(), provider, "ext")).?;
+    defer a.free(cold);
+    // Independently recomputed and warm results, including cache, are identical.
+    try testing.expectEqualStrings(cold, warm);
+    var cache_json = try std.json.parseFromSlice(std.json.Value, a, warm, .{});
+    defer cache_json.deinit();
+    try testing.expectEqual(@as(usize, 1), cache_json.value.object.get("_resolution_work").?.object.get("candidates").?.array.items.len);
+
+    // Unknown/corrupt cache versions are expendable and need no migration.
+    try memory.store().put("res", "{\"_resolution_work\":{\"version\":99,\"mentions\":[]}}");
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 2), stats.embeddings);
+    try memory.store().put("res", "{\"_resolution_work\":{\"version\":1,\"mentions\":false}}");
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 2), stats.candidate_mentions);
+    // No candidate revision means no reuse, including previously empty results.
+    stage.candidate_dependency = null;
+    stats = .{};
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    try testing.expectEqual(@as(usize, 2), stats.candidate_mentions);
+    try memory.store().delete("ext");
+    try testing.expectEqual(RunResult.cleared, try stage.run(a, memory.store(), provider, "ext", "res"));
+    try testing.expect((try memory.store().get(a, "res")) == null);
 }

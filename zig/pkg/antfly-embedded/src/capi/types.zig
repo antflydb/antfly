@@ -465,6 +465,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ModelNotFound,
         => .invalid_argument,
         error.FileNotFound => .not_found,
+        error.Busy,
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
@@ -560,4 +561,9 @@ test "capi C ABI retains codes for generic failures and copies contextual diagno
     clearLastError();
     try std.testing.expectEqual(ErrorCode.ok, lastErrorCode());
     try std.testing.expectEqualStrings("", std.mem.span(lastErrorDetail()));
+}
+
+test "capi query retry errors retain the busy ABI diagnostic" {
+    try std.testing.expectEqual(ErrorCode.busy, mapErrorContext(error.Busy, "resolver changed; retry"));
+    try std.testing.expectEqual(ErrorCode.busy, last_error_code);
 }
