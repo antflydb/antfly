@@ -48,7 +48,8 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         "storage": {
             "engine": "local",
             "local": {"base_dir": str(tmp_path / "data")},
-        }
+        },
+        "lake_indexes": {"query_cursors": {"max_native_cuts": 2}},
     }
     if artifact_provider == "gcs":
         env["HN_GCS_BEARER"] = subprocess.run(
@@ -231,6 +232,12 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         score_query = dict(query, order_by=[{"field": "_score", "desc": True}])
         score_first = response(score_query)
         assert score_first["hits"]["hits"][0]["_source"]["amount"] == 1
+        # Fresh searches exceed the local generation cache limit. Original
+        # cursors must retain their exact durable cut through eviction/restart.
+        for _ in range(6):
+            fresh_cut = response(query)
+            assert fresh_cut["hits"]["hits"][0]["_source"]["amount"] == 1
+            assert fresh_cut["remote_snapshot"].startswith("native2:")
         for predicate in (
             {"term": {"path": "/amount", "value": 1}},
             {"range": {"path": "/amount", "gte": 1, "lte": 1}},

@@ -19727,6 +19727,17 @@ pub const DB = struct {
 
     /// A durable generation for cursor pages: no apply/read lease escapes
     /// capture, and resume never falls back to a fresh live generation.
+    fn admitQueryCut(self: *DB, io: std.Io, id: []const u8, cancellation: types.CancellationToken) !void {
+        const cut = @import("native_query_cut.zig");
+        var repository = self.backend_runtime.query_cut_repository;
+        const Confirm = struct {
+            fn durable(raw: *anyopaque, io_: std.Io, root: []const u8, manifest: cut.Manifest, token: types.CancellationToken) !bool {
+                const port: *@import("native_query_cut_repository.zig").Port = @ptrCast(@alignCast(raw));
+                return port.canEvict(io_, root, manifest.request, manifest.namespace, manifest.sequence, token);
+            }
+        };
+        return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
+    }
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
@@ -19746,7 +19757,7 @@ pub const DB = struct {
         };
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
-        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
@@ -19762,7 +19773,7 @@ pub const DB = struct {
                 else => err,
             };
         };
-        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             try repository.publish(io, root, request, self.core.identity_namespace, token);
         };
@@ -19870,10 +19881,10 @@ pub const DB = struct {
             // Legacy repositories may materialize missing generations, but
             // must not overwrite an invalid cache with active local readers.
             if (local_exists) return error.CatalogGenerationChanged;
-            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try self.admitQueryCut(io, cache_id, control.token());
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try self.admitQueryCut(io, cache_id, control.token());
             try cut.validate(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
         var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
