@@ -111,7 +111,7 @@ pub fn validateJsonbDomain(value: Json, budget: *Budget, depth: usize) !void {
     switch (value) {
         .string => |raw| try validateJsonbString(raw, budget),
         .number_string => |raw| _ = try @import("jsonb_number.zig").Layout.init(raw, budget),
-        .float => |number| if (!std.math.isFinite(number)) return error.SqlTypeMismatch,
+        .float => |number| if (!std.math.isFinite(number)) return error.SqlNumericOutOfRange,
         .array => |items| for (items.items) |item| try validateJsonbDomain(item, budget, depth + 1),
         .object => |items| for (items.keys(), items.values()) |key, item| {
             try validateJsonbString(key, budget);

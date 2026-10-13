@@ -572,7 +572,7 @@ test "SQL typed arrays preserve dimensions lower bounds widths and NULL provenan
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.null)}, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
     try std.testing.expectError(error.SqlJsonUnicodeEscape, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
-    try std.testing.expectError(error.SqlTypeMismatch, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "\xff" })}, .{}));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "\xff" })}, .{}));
     try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .float = std.math.inf(f64) })}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{ .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 } }, elements[0..1], .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{.{ .length = 4 }}, elements, .{ .work = 3 }));
