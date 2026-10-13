@@ -776,3 +776,63 @@ than replacing them with the diagnostic probes. Correctness and cache-pressure
 qualification pass; the two-cycle restart-latency criterion does not. OS caches
 are not flushed, readiness warming is enabled, and these normalized local data
 measurements do not establish full-archive or managed Cloud latency.
+
+### Restart outlier investigation after #1121
+
+[Investigation evidence](../../examples/hackernews/restart-latency-investigation-20261013.json)
+retains the original failures and records 35 isolated restart probes and four
+additional full sequences on the unchanged merged executable. The 4,385 ms
+single-search stall did not recur. Two sequences used process-local filesystem
+tracing: none of the traced `fsync`/file-lock operations exceeded 7 ms. The final
+two untraced sequences measured restart searches at 194–196 ms and retained cursor
+resumes at 899–932 ms. These observations do not prove the original stall's cause
+or erase the failed original latency criterion.
+
+The original request reports 4,377 ms inside the server versus 4,385 ms over HTTP,
+so transport does not explain it. Ranking took 87 ms and hydration 7 ms. The
+discarded aggregate phases prevent distinguishing admission/preparation from
+post-search retention/delivery for that historical sample.
+
+The original 2,583 ms cursor sample has more complete attribution: its retained
+counters record 802 ms ranking and 1,688 ms hydration. This identifies the work
+that dominated that request, but does not establish why those phases were slower
+on that shared-host run.
+
+The qualifier had dropped the engine's labeled aggregate phase counters while
+parsing Prometheus output, then would also drop labeled counters during delta
+capture. Preserve the fixed `total`, `publication`, `search`, `hydration` and
+`delivery` labels. The report now includes `lake_phase_profile`: pre-search
+includes reader admission, cache setup and metadata preparation; post-search
+includes durable cursor publication and response delivery. Hydration overlaps
+other phases and must not be added to them. Time outside the measured lake phases
+also includes native/composed work and transport; concurrent lake leaves can
+make the difference negative. Older runtimes without these counters report no
+phase profile rather than fabricated zero timings.
+
+The instrumentation regression tests and qualification/recovery tests pass 25
+tests and nine subtests. This follow-up fixes missing diagnostic evidence. It does
+not claim an engine performance fix for the unreproduced single-search stall.
+
+Further reproduction did produce a 2,498 ms retained-cursor request. Its
+aggregate counters attribute 1,361 ms to search and 1,077 ms to delivery, including
+1,070 ms hydration. Immediate first searches also reached 2,057–3,148 ms with
+persistent caching enabled, and 3,093 ms with it disabled. These are related
+latency failures, rather than proof of the original ready-cache preparation gap.
+
+A process-local filesystem trace identifies synchronous persistent-cache
+inventory restoration on the immediate first-query path: in one 1,563 ms sample,
+cache-file operations preceded the first source-file operation by approximately
+864 ms. `PersistentObjectRangeCacheState.initializeInventory` scans and validates
+retained entries before publishing the cache. Any future asynchronous restoration
+must preserve ownership, capacity accounting and retained cache hits; disabling
+the tier permanently would increase remote reads.
+
+The slow cache-enabled/disabled pair also coincided with substantial system swap
+activity. Per-process page-ins and filesystem waits support host resource
+contention as another contributor. System-wide paging does not identify who
+caused pressure, and this evidence cannot establish the historic stall's cause.
+Twenty restart probes querying six seconds after readiness did not reproduce the
+original gap. Twenty-four more probes queried 0, 50, 200 or 1,000 ms after the cache-ready
+transition and returned in 95–264 ms, without reproducing the preparation gap.
+The evidence artifact records these results and keeps the original failed
+criterion intact.
