@@ -1,0 +1,60 @@
+{
+  "project": "antfly-dev-01",
+  "cluster": "antfly-dev",
+  "region": "us-central1",
+  "bucket": "colony-import-sources-antfly-dev-01",
+  "source_prefix": "hn-poc/20261009-full-portability-2b1f7524d047",
+  "expected_rows": 47717307,
+  "source_snapshot_ms": 1791556039163,
+  "export_job_id": "antfly_hn_full_2b1f7524d047",
+  "source_objects": 334,
+  "source_bytes": 21195813507,
+  "resources": {
+    "cpu": 8,
+    "memory_gib": 48,
+    "disk_gib": 10
+  },
+  "lifetime_seconds": 3400,
+  "build_timeout_seconds": 2700,
+  "cycles": 2,
+  "repeats": 20,
+  "concurrency": 8,
+  "workload_terms": [
+    "database",
+    "postgres",
+    "sqlite",
+    "antfly",
+    "AI",
+    "the"
+  ],
+  "budget": {
+    "ceiling_usd": 150,
+    "prior_work_reserved_usd": 25,
+    "reservation_per_run_usd": 20,
+    "max_runs": 8,
+    "cpu_hour_usd": 0.0445,
+    "memory_gib_hour_usd": 0.0049225,
+    "disk_gib_hour_usd": 0.0001389,
+    "other_run_allowance_usd": 10,
+    "pricing_checked": "2026-10-10",
+    "pricing_sources": [
+      "https://cloud.google.com/kubernetes-engine/pricing",
+      "https://cloud.google.com/storage/pricing"
+    ]
+  },
+  "criteria": {
+    "warm_p95_ms": 750,
+    "concurrent_max_ms": 2000,
+    "restart_ms": 2000,
+    "cold_ms": 10000,
+    "filter_p95_ms": 2000,
+    "build_seconds": 2700,
+    "peak_rss_fraction": 0.85,
+    "cursor_min_hits": 4097,
+    "cursor_p95_ms": 2000
+  },
+  "cursor_pages": 40,
+  "cursor_term": "AI",
+  "qualify_composed_sources": true,
+  "store_source": true
+}

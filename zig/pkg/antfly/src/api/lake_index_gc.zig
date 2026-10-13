@@ -221,6 +221,7 @@ pub const Collector = struct {
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
+        if (directory.metadata_bundle) |bundle| _ = try self.mark(bundle);
         for (directory.metadata) |piece| _ = try self.mark(piece.retainedArtifact());
         for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
@@ -231,6 +232,10 @@ pub const Collector = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.members) |member| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
+        }
+        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
         for (group.descriptors) |descriptor| _ = try self.mark(descriptor);
         if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
@@ -285,6 +290,10 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    if (root.compacted) |compact| {
+                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = compact.artifact_id, .checksum = compact.checksum, .byte_len = compact.byte_len };
+                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+                    }
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.segment_files, false);
@@ -295,7 +304,14 @@ pub const Collector = struct {
                     for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
                     try self.markPages(a, root.domain, root.term_directory.leaves, false);
-                    for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+                    for (root.file_groups) |group| {
+                        for (group.members) |member| {
+                            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
+                        }
+                        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+                        for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+                    }
+
                     const manifests = if (root.inventory_version == 3) blk: {
                         const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
                         const refs = try a.alloc(artifacts.ChunkRef, records.len);
@@ -776,6 +792,23 @@ test "external lake native GC follows paged file catalogs and independent text d
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
     for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
+    // A compacted serving generation is a separate root, and its original
+    // member bitmap must be protected even without another canonical marker.
+    var bitmap = try store.put("retained member hole bitmap");
+    defer bitmap.deinit(a);
+    const member_group: text.FileGroup = .{ .file = .{ .id = "member", .digest = @splat(9) }, .segments = &.{}, .rows = &.{.{ .group = 0, .high = 0, .lower = 0, .base = 0, .count = 1, .bitmap = .{ .artifact_id = bitmap.artifact_id, .checksum = bitmap.checksum, .byte_len = bitmap.byte_len } }} };
+    var member = try store.put(try std.json.Stringify.valueAlloc(ca, member_group, .{}));
+    defer member.deinit(a);
+    var merged = try store.put("distinct compacted heap segment");
+    defer merged.deinit(a);
+    const merged_ref: artifacts.ChunkRef = .{ .artifact_id = merged.artifact_id, .checksum = merged.checksum, .byte_len = merged.byte_len };
+    const merged_group: text.FileGroup = .{ .file = group.file, .segments = &.{merged_ref}, .members = &.{.{ .file = member_group.file, .physical = .{ .artifact_id = member.artifact_id, .checksum = member.checksum, .byte_len = member.byte_len }, .source_lower = 0, .lower = 0, .count = 1 }} };
+    var serving = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .segments = &.{merged_ref}, .file_groups = &.{merged_group} }, .{}));
+    defer serving.deinit(a);
+    var parent = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .compacted = .{ .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len } }, .{}));
+    defer parent.deinit(a);
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
+    for ([_][]const u8{ parent.artifact_id, serving.artifact_id, merged.artifact_id, member.artifact_id, bitmap.artifact_id }) |id| try std.testing.expect(collector.marked.contains(id));
     // A non-serving statistics checkpoint owns pages absent from the serving
     // base. GC must retain those signed runs until finalization or retirement.
     var signed: [8]u8 = undefined;

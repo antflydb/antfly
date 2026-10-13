@@ -19836,7 +19836,17 @@ pub const DB = struct {
         var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
         var guarded = true;
         defer if (guarded) guard.deinit();
-        if (!try snapshotPathExists(io, path)) if (self.backend_runtime.query_cut_repository) |repository| {
+        const local_exists = try snapshotPathExists(io, path);
+        const local_usable = if (local_exists) validated: {
+            // Local files are a cache of the retained generation. Validate
+            // under the parent guard before trusting directory existence.
+            cut.validate(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
+                error.CatalogGenerationChanged => break :validated false,
+                else => return err,
+            };
+            break :validated true;
+        } else false;
+        if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -19857,17 +19867,20 @@ pub const DB = struct {
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
+            // Legacy repositories may materialize missing generations, but
+            // must not overwrite an invalid cache with active local readers.
+            if (local_exists) return error.CatalogGenerationChanged;
             try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
-        };
+            try cut.validate(self.alloc, io, path, request, origin, control.token());
+        } else return error.CatalogGenerationChanged;
         var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit();
-        try cut.validate(self.alloc, io, path, request, origin, control.token());
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .backend_runtime = self.backend_runtime,
@@ -21016,6 +21029,8 @@ pub const DB = struct {
             };
         };
         try cancellation.check();
+        if (purpose == .historical_table)
+            try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         // A table-local historical image cannot certify references owned by
@@ -75781,18 +75796,27 @@ test "graph relation endpoints canonicalize through injected resolutions" {
         try std.testing.expectEqualStrings("person/ada_lovelace", parsed.source_node.?);
     }
 
-    // A legacy inline endpoint object that matches no extraction entity keeps
-    // the owning document as the source (historical extraction_relation
-    // contract), with no owner split.
+    // An inline mention that matches no extraction entity has no canonical
+    // identity. It must not manufacture an edge from the owning document.
     {
         const legacy_raw =
             \\{"relations":[{"type":"mentions","source":{"id":"inline","label":"person","text":"Ada"},"target":"ext-node"}]}
         ;
         const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", legacy_raw, source, "application/json", null, null, 100);
         defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+    // An explicit document reference is already canonical and remains usable
+    // even when it is absent from the extraction entity list.
+    {
+        const explicit_raw =
+            \\{"relations":[{"type":"mentions","source":{"document_id":"person/ada"},"target":"ext-node"}]}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", explicit_raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
         try std.testing.expectEqual(@as(usize, 1), writes.len);
-        try std.testing.expectEqualStrings("doc:a", writes[0].source);
-        try std.testing.expectEqual(@as(usize, 0), writes[0].owner.len);
+        try std.testing.expectEqualStrings("person/ada", writes[0].source);
+        try std.testing.expectEqualStrings("doc:a", writes[0].owner);
     }
 }
 

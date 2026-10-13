@@ -21,17 +21,21 @@ to configuration, results, or stdout. This does not change cloud IAM or buckets.
 """
 
 import argparse
+import hashlib
+import struct
 import json
 import shutil
 import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import os
+import resource
 from pathlib import Path
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 def wait_for_index(
@@ -72,13 +76,197 @@ def wait_for_index(
         sleep(min(1, max(0, deadline - now())))
 
 
+def prepare_filesystem_source(source, state):
+    """Stage flat Parquet inputs in the filesystem object-store layout."""
+    source = source.resolve()
+    objects = source / "archive" / "buckets" / "antfly" / "objects"
+    if objects.is_dir():
+        return source
+    files = sorted((source / "archive").glob("*.parquet"))
+    if not files:
+        raise ValueError(
+            "Filesystem source needs archive/*.parquet or its native bucket layout"
+        )
+    root = state / "local-source"
+    objects = root / "archive" / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True, exist_ok=True)
+    if any(
+        path.name not in {item.name for item in files}
+        for path in objects.glob("*.parquet")
+    ):
+        raise ValueError(
+            "Staged source has extra Parquet objects; use a fresh qualification state"
+        )
+    for path in files:
+        destination = objects / path.name
+        with path.open("rb") as source_file:
+            digest = hashlib.file_digest(source_file, "sha256").hexdigest()
+        # FilesystemClient's AFOBJ001 envelope carries payload length, content-type
+        # length and the payload SHA-256. Discovery/range offsets use that envelope.
+        header = (
+            b"AFOBJ001" + struct.pack("<QI", path.stat().st_size, 0) + digest.encode()
+        )
+        if destination.exists():
+            with destination.open("rb") as staged:
+                valid = (
+                    staged.read(len(header)) == header
+                    and hashlib.file_digest(staged, "sha256").hexdigest() == digest
+                )
+            if not valid:
+                raise ValueError(
+                    "Staged source changed; use a fresh qualification state"
+                )
+        else:
+            temporary = destination.with_suffix(".staging")
+            with temporary.open("wb") as output, path.open("rb") as input_file:
+                output.write(header)
+                shutil.copyfileobj(input_file, output, length=1024 * 1024)
+            temporary.replace(destination)
+    return root
+
+
+def create_current_table(call, current):
+    if current not in json.dumps(call("GET", "/tables")):
+        call(
+            "POST",
+            "/tables/" + current,
+            {
+                "schema": {
+                    "default_type": "row",
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    **{
+                                        name: {
+                                            "type": "integer",
+                                            "x-antfly-field": {
+                                                "type": "numeric",
+                                                "sortable": True,
+                                            },
+                                        }
+                                        for name in ("hn_id", "created_at", "points")
+                                    },
+                                    **{
+                                        name: {"type": "string"}
+                                        for name in (
+                                            "body",
+                                            "title",
+                                            "author",
+                                            "item_type",
+                                        )
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text"}},
+            },
+        )
+
+
+def qualify_composed_sources(call, query, selected_source):
+    """Exercise historical/current visibility and retain a mutable source cursor."""
+    current, history = "hn_current_poc", "hn_archive_poc"
+    create_current_table(call, current)
+    selected, extra = selected_source["hn_id"], 2147483647
+    assert selected != extra
+    documents = {
+        str(key): dict(
+            selected_source,
+            hn_id=key,
+            body="antfly qualification replacement",
+            title=title,
+        )
+        for key, title in (
+            (selected, "HN qualification replacement"),
+            (extra, "HN qualification current"),
+        )
+    }
+    call(
+        "POST",
+        f"/tables/{current}/batch",
+        {"inserts": documents, "sync_level": "full_index"},
+    )
+    selected_filter = {"term": {"path": "/hn_id", "value": selected}}
+    union = dict(
+        query,
+        source={"union": [{"table": history}, {"table": current}]},
+        source_ranking="rrf",
+        filter_query=selected_filter,
+    )
+    historical = call("POST", "/query", union)["hits"]["hits"]
+    assert len(historical) == 1 and historical[0]["_source"]["hn_id"] == selected
+    overlay = {
+        "overlay": {
+            "base": {"table": history},
+            "changes": {"table": current},
+            "key": ["hn_id"],
+        }
+    }
+    suppressed = call("POST", "/query", dict(union, source=overlay))
+    assert not suppressed["hits"]["hits"], suppressed
+    if "hackernews_poc" not in json.dumps(call("GET", "/sources")):
+        call("POST", "/sources/hackernews_poc", {"source": overlay})
+    composed = dict(
+        query,
+        source={"saved": "hackernews_poc"},
+        source_ranking="rrf",
+        full_text_search={"match": "antfly", "field": "body"},
+        filter_query={
+            "bool": {
+                "should": [
+                    {"term": {"path": "/hn_id", "value": key}}
+                    for key in (selected, extra)
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+        limit=2,
+    )
+    all_hits = call("POST", "/query", composed)["hits"]["hits"]
+    assert {hit["_source"]["hn_id"] for hit in all_hits} == {selected, extra}, all_hits
+    first = call("POST", "/query", dict(composed, limit=1))
+    continuation = dict(composed, source_cursor=first["next_source_cursor"])
+    second = call("POST", "/query", continuation)["hits"]["hits"]
+    assert len(second) == 1 and second[0]["_id"] != first["hits"]["hits"][0]["_id"]
+    expected = [(hit["_id"], hit["_source"]["title"], hit["_score"]) for hit in second]
+    for document in documents.values():
+        document["title"] = "HN qualification updated after cursor capture"
+    call(
+        "POST",
+        f"/tables/{current}/batch",
+        {"inserts": documents, "sync_level": "full_index"},
+    )
+    fresh = call("POST", "/query", composed)["hits"]["hits"]
+    assert len(fresh) == 2 and all(
+        hit["_source"]["title"] == "HN qualification updated after cursor capture"
+        for hit in fresh
+    ), fresh
+    return continuation, expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="Run a Linux binary in a bounded local x86 container",
+    )
+    parser.add_argument("--docker-cpus", type=int, default=4)
+    parser.add_argument("--docker-memory-gib", type=int, default=4)
     parser.add_argument("--project", default="antfly-dev-01")
     parser.add_argument("--bucket", default="colony-import-sources-antfly-dev-01")
     parser.add_argument("--prefix", default="hn-poc/20261007")
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument(
+        "--filesystem-source",
+        type=Path,
+        help="Use a local connection root containing archive/; no cloud credentials",
+    )
     parser.add_argument("--port", type=int, default=8877)
     parser.add_argument("--expected-rows", type=int, default=10000)
     parser.add_argument("--require-filters", action="store_true")
@@ -98,15 +286,61 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
+    parser.add_argument("--query-term", default="database")
+    parser.add_argument(
+        "--no-highlights",
+        action="store_true",
+        help="Match a BM25-only comparison workload",
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="Record query execution diagnostics"
+    )
     parser.add_argument("--cursor-pages", type=int, default=0)
+    parser.add_argument("--qualify-composed-sources", action="store_true")
+    parser.add_argument(
+        "--benchmark-composed",
+        action="store_true",
+        help="Measure union and saved overlay with a recent-row native current fixture, independently after cache-cleared restarts",
+    )
+    parser.add_argument(
+        "--disable-navigation-warming",
+        action="store_true",
+        help="Disable optional readiness prefetch to measure empty serving caches",
+    )
+    parser.add_argument(
+        "--composed-current-rows",
+        type=int,
+        default=1000,
+        help="Bounded recent-row sample copied into a native table for composition benchmarks",
+    )
+    parser.add_argument("--store-source", action="store_true")
+    parser.add_argument(
+        "--cursor-term", help="Separate broad query for deep cursor coverage"
+    )
     parser.add_argument(
         "--bearer-stdin",
         action="store_true",
         help="Read a short-lived token from stdin instead of gcloud; never persist it",
     )
     parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Publish and verify count, then stop before query measurements",
+    )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
+    if not 2 <= args.composed_current_rows <= 4096:
+        parser.error("composed current rows must be between 2 and 4096")
+    if args.benchmark_composed and not args.qualify_composed_sources:
+        parser.error("composed benchmarks require --qualify-composed-sources")
+    if args.docker and not args.filesystem_source:
+        parser.error("Docker comparison mode requires --filesystem-source")
+    if args.docker_cpus < 1 or args.docker_memory_gib < 1:
+        parser.error("Docker limits must be positive")
+    args.state = args.state.resolve()
+    if not 1 <= args.port < 65535:
+        parser.error("query port must leave a valid adjacent health port")
     if not 0 <= args.cursor_pages <= 100:
         parser.error("cursor pages must be between zero and 100")
     if args.repeats < 1 or args.concurrency < 1:
@@ -122,7 +356,9 @@ def main():
         else ["hn_id", "created_at", "item_type", "author", "points"]
     )
     args.state.mkdir(parents=True, exist_ok=True)
-    if args.bearer_stdin:
+    if args.filesystem_source:
+        token = ""
+    elif args.bearer_stdin:
         token = sys.stdin.readline(65537).strip()
         if not token or len(token) > 65536:
             raise ValueError("Expected a bounded bearer token on stdin")
@@ -133,9 +369,25 @@ def main():
             capture_output=True,
             text=True,
         ).stdout.strip()
+    local_source_root = (
+        prepare_filesystem_source(args.filesystem_source, args.state)
+        if args.filesystem_source
+        else None
+    )
     env = dict(os.environ, HN_GCS_BEARER=token)
 
     def connection(capability, prefix):
+        if args.filesystem_source:
+            root = (
+                local_source_root
+                if capability == "lake_read"
+                else args.state.resolve() / "artifacts"
+            )
+            return {
+                "kind": "external_io",
+                "capabilities": [capability],
+                "external_io": {"protocol": "filesystem", "root": str(root)},
+            }
         return {
             "kind": "external_io",
             "capabilities": [capability],
@@ -168,36 +420,78 @@ def main():
             ),
         },
         "lake_cache": {"root": str(args.state / "cache"), "max_disk_bytes": 1073741824},
-        "lake_indexes": {"query_cursors": {"retention_ms": args.cursor_retention_ms}},
+        "lake_indexes": {
+            "query_cursors": {"retention_ms": args.cursor_retention_ms},
+            "navigation_warming": {"enabled": not args.disable_navigation_warming},
+        },
     }
+    if args.filesystem_source:
+        # The native local store publishes through its filesystem artifact store.
+        # The source connection still confines reads to the supplied root.
+        del config["storage"]["artifacts"]
     config_path = args.state / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     base = f"http://127.0.0.1:{args.port}/db/v1"
     process = None
     log = None
+    container = None
+
+    startup_samples_ms = []
 
     def start():
-        nonlocal process, log
+        startup_started = time.monotonic()
+        nonlocal process, log, container
         log = (args.state / "server.log").open("a")
+        command = [
+            str(Path(args.binary).resolve()),
+            "standalone",
+            "--config",
+            str(config_path),
+            "--data-dir",
+            str(args.state / "data"),
+            "--host",
+            "0.0.0.0" if args.docker else "127.0.0.1",
+            "--port",
+            str(args.port),
+            "--health",
+            "true",
+            "--health-port",
+            str(args.port + 1),
+            "--auth",
+            "false",
+            "--models-dir",
+            str(args.state / "empty-models"),
+        ]
+        if args.docker:
+            container = "hn-comparison-" + uuid.uuid4().hex
+            command[0] = "/app/antfly"
+            command = [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                container,
+                "--platform",
+                "linux/amd64",
+                "--cpus",
+                str(args.docker_cpus),
+                "--memory",
+                f"{args.docker_memory_gib}g",
+                "-p",
+                f"127.0.0.1:{args.port}:{args.port}",
+                "-p",
+                f"127.0.0.1:{args.port + 1}:{args.port + 1}",
+                "--mount",
+                f"type=bind,src={Path(args.binary).resolve()},dst=/app/antfly,readonly",
+                "--mount",
+                f"type=bind,src={args.state},dst={args.state}",
+                "--mount",
+                f"type=bind,src={args.filesystem_source.resolve()},dst={args.filesystem_source.resolve()},readonly",
+                "alpine:3.22",
+                *command,
+            ]
         process = subprocess.Popen(
-            [
-                str(Path(args.binary).resolve()),
-                "standalone",
-                "--config",
-                str(config_path),
-                "--data-dir",
-                str(args.state / "data"),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(args.port),
-                "--health",
-                "false",
-                "--auth",
-                "false",
-                "--models-dir",
-                str(args.state / "empty-models"),
-            ],
+            command,
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -210,12 +504,24 @@ def main():
                 )
             try:
                 call("GET", "/tables")
+                startup_samples_ms.append(
+                    round((time.monotonic() - startup_started) * 1000, 2)
+                )
                 return
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
                 time.sleep(0.5)
         raise RuntimeError("Antfly startup timed out")
 
     def stop():
+        nonlocal container
+        if container is not None:
+            subprocess.run(
+                ["docker", "rm", "-f", container],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            container = None
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -241,7 +547,9 @@ def main():
                 value = json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
             # Avoid echoing arbitrary server/provider bodies into task output.
-            detail = exc.read().decode(errors="replace").replace(token, "[redacted]")
+            detail = exc.read().decode(errors="replace")
+            if token:
+                detail = detail.replace(token, "[redacted]")
             raise RuntimeError(
                 f"{method} {path}: HTTP {exc.code}: {detail[:1000]}"
             ) from exc
@@ -265,7 +573,7 @@ def main():
     def resource_counters():
         # Linux counters help separate CPU work from remote transfer. Network
         # counters cover non-loopback interfaces, including TLS/DNS overhead.
-        if not Path("/proc/net/dev").exists():
+        if args.docker or not Path("/proc/net/dev").exists():
             return None
         counters = {"network_rx_bytes": 0, "network_tx_bytes": 0}
         for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
@@ -280,20 +588,55 @@ def main():
         )
         return counters
 
-    def timed_query(query, phase="search"):
+    def lake_metrics():
+        # Health exposition refreshes every five seconds. Sample serial phases
+        # after a full refresh interval, outside their measured query latency.
+        time.sleep(6)
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{args.port + 1}/metrics", timeout=15
+        ) as response:
+            text = response.read().decode()
+        return {
+            fields[0]: int(fields[1])
+            for line in text.splitlines()
+            if line.startswith("antfly_lake_")
+            and len(fields := line.split()) == 2
+            and "{" not in fields[0]
+        }
+
+    def timed_query(query, phase="search", path="/tables/hn_archive_poc/query"):
+        serial_profile = phase in {
+            "cold",
+            "restart",
+            "cursor_initial",
+            "cursor_depth_restart",
+        } or phase.startswith("composed_cold.")
+        metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
-        result = call("POST", "/tables/hn_archive_poc/query", query)
+        result = call("POST", path, query)
         elapsed = round((time.monotonic() - started) * 1000, 2)
         after = resource_counters()
-        if before is not None:
+        metrics_after = lake_metrics() if serial_profile else None
+        if before is not None or metrics_after is not None:
             io_profiles.append(
                 {
                     "phase": phase,
                     "elapsed_ms": elapsed,
                     "took_ms": result.get("took"),
                     "filter": query.get("filter_query"),
-                    **{key: round(after[key] - before[key], 2) for key in before},
+                    "lake_metrics_delta": (
+                        {
+                            key: value - metrics_before.get(key, 0)
+                            for key, value in metrics_after.items()
+                            if key.endswith("_total")
+                        }
+                        if metrics_after is not None
+                        else None
+                    ),
+                    "lake_metrics_scope": "process; nested phases may overlap",
+                    "lake_metrics_before": metrics_before,
+                    **{key: round(after[key] - before[key], 2) for key in before or {}},
                 }
             )
         return result, elapsed
@@ -320,11 +663,19 @@ def main():
                             "kind": "external",
                             "table_id": "hn-archive-poc",
                             "format": "parquet",
-                            "uri": f"gs://{args.bucket}/{args.prefix}/archive",
+                            "uri": "file:///archive"
+                            if args.filesystem_source
+                            else f"gs://{args.bucket}/{args.prefix}/archive",
                             "credentials": {"ref": "hn-gcs-source"},
                         },
                     },
-                    "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+                    "indexes": {
+                        "body_text": {
+                            "type": "full_text",
+                            "field": "body",
+                            "store_source": args.store_source,
+                        }
+                    },
                 },
             )
             registration_seconds = round(time.monotonic() - registration_started, 2)
@@ -373,45 +724,74 @@ def main():
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
         assert count["rows"] == [[str(args.expected_rows)]], count
+        if args.build_only:
+            (args.state / "construction.json").write_text(
+                json.dumps(
+                    {
+                        "rows": args.expected_rows,
+                        "ready_seconds": ready_seconds,
+                        "registration_seconds": registration_seconds,
+                        "metadata_indexes_queryable": list(metadata_status),
+                        "query_measurements_performed": False,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            return
         if args.cold_cache:
             stop()
             if (args.state / "cache").exists():
                 shutil.rmtree(args.state / "cache")
             start()
+        if not args.disable_navigation_warming:
+            readiness = call("GET", "/tables/hn_archive_poc/indexes/body_text")
+            assert readiness["status"]["readiness"]["queryable"], readiness
+        if args.disable_navigation_warming:
+            baseline_metrics = lake_metrics()
+            assert (
+                baseline_metrics.get("antfly_lake_navigation_warming_attempts_total", 0)
+                == 0
+            ), "Warming was unexpectedly active in the empty-cache scenario"
         cache_files_before_search = sum(
             p.is_file() for p in (args.state / "cache").rglob("*")
         )
         phase = "query_correctness_and_latency"
         query = {
-            "full_text_search": {"match": "database", "field": "body"},
+            "full_text_search": {"match": args.query_term, "field": "body"},
             "full_text_index": "body_text",
             "fields": ["hn_id", "title", "item_type", "author", "points", "created_at"],
             "highlight": {"fields": ["body"]},
             "limit": 5,
             "order_by": [{"field": "_score", "desc": True}],
         }
+        if args.no_highlights:
+            del query["highlight"]
+        if args.profile:
+            query["profile"] = True
         first, first_ms = timed_query(query, "cold")
-        if not first["hits"]["hits"]:
+        if not first["hits"]["hits"] and not args.no_highlights:
             query["full_text_search"]["match"] = "AI"
             first, first_ms = timed_query(query, "cold")
         hits = first["hits"]["hits"]
         assert len(hits) >= 2, "Sample must contain at least two matching rows"
-        assert all(hit.get("_highlights", {}).get("body") for hit in hits), (
-            "Missing remote highlights"
-        )
         term = query["full_text_search"]["match"].lower()
-        assert all(
-            any(
-                fragment["text"]
-                .encode("utf-8")[span["start"] : span["end"]]
-                .decode("utf-8")
-                .lower()
-                in (term, term + "s")
-                for fragment in hit["_highlights"]["body"]
-                for span in fragment["spans"]
+        if not args.no_highlights:
+            assert all(hit.get("_highlights", {}).get("body") for hit in hits), (
+                "Missing remote highlights"
             )
-            for hit in hits
-        ), "Highlight spans do not match the search term"
+            assert all(
+                any(
+                    fragment["text"]
+                    .encode("utf-8")[span["start"] : span["end"]]
+                    .decode("utf-8")
+                    .lower()
+                    in (term, term + "s")
+                    for fragment in hit["_highlights"]["body"]
+                    for span in fragment["spans"]
+                )
+                for hit in hits
+            ), "Highlight spans do not match the search term"
         assert all("body" not in hit["_source"] for hit in hits), (
             "Highlight widened source projection"
         )
@@ -469,21 +849,50 @@ def main():
         assert [h["_id"] for h in second["hits"]["hits"]] == [
             h["_id"] for h in hits[1:]
         ]
-        cursor_depth = {"hits": 1 + len(second["hits"]["hits"]), "samples_ms": []}
+        cursor_query = query
+        deep_snapshot = first_page["remote_snapshot"]
+        cursor_depth = {
+            "hits": 1 + len(second["hits"]["hits"]),
+            "samples_ms": [],
+            "term": term,
+        }
         deep_page = second
         seen = {h["_id"] for h in first_page["hits"]["hits"] + second["hits"]["hits"]}
+        if args.cursor_term:
+            cursor_query = dict(
+                query, full_text_search={"match": args.cursor_term, "field": "body"}
+            )
+            deep_page, initial_ms = timed_query(
+                dict(cursor_query, limit=128), "cursor_initial"
+            )
+            deep_snapshot = deep_page["remote_snapshot"]
+            initial_ids = [h["_id"] for h in deep_page["hits"]["hits"]]
+            assert len(set(initial_ids)) == len(initial_ids), (
+                "Cursor repeated initial hits"
+            )
+            seen = set(initial_ids)
+            cursor_depth = {
+                "hits": len(seen),
+                "samples_ms": [],
+                "term": args.cursor_term,
+                "initial_ms": initial_ms,
+            }
         deep_request = None
         deep_signature = None
         for _ in range(args.cursor_pages):
             if not deep_page["hits"]["hits"]:
                 break
-            deep_request = dict(
-                query,
+            candidate_request = dict(
+                cursor_query,
                 limit=128,
                 search_after=deep_page["hits"]["hits"][-1]["_sort"],
-                remote_snapshot=first_page["remote_snapshot"],
+                remote_snapshot=deep_snapshot,
             )
-            deep_page, elapsed = timed_query(deep_request, "cursor_depth")
+            deep_page, elapsed = timed_query(candidate_request, "cursor_depth")
+            cursor_depth["samples_ms"].append(elapsed)
+            if not deep_page["hits"]["hits"]:
+                break
+            deep_request = candidate_request
             deep_signature = [
                 (h["_id"], h["_score"]) for h in deep_page["hits"]["hits"]
             ]
@@ -493,7 +902,6 @@ def main():
             )
             seen.update(ids)
             cursor_depth["hits"] += len(ids)
-            cursor_depth["samples_ms"].append(elapsed)
         selected = hits[0]["_source"]["hn_id"]
         filtered_query = dict(
             query, filter_query={"term": {"path": "/hn_id", "value": selected}}
@@ -601,15 +1009,40 @@ def main():
         )
         empty, _ = timed_query(no_match, "empty_filter")
         assert not empty["hits"]["hits"], "Out-of-sample date range returned hits"
+        composed_cursor = None
+        composed_verified = []
+        composed_error = None
+        if args.qualify_composed_sources:
+            phase = "composed_sources"
+            try:
+                composed_cursor, composed_expected = qualify_composed_sources(
+                    call, query, hits[0]["_source"]
+                )
+            except (RuntimeError, AssertionError) as exc:
+                # Preserve baseline restart measurements while the required
+                # composed-source gate still fails. Never save provider bodies.
+                composed_error = type(exc).__name__
         stop()
         start()
         reopened, restart_ms = timed_query(query, "restart")
+        if composed_cursor is not None:
+            retained = call("POST", "/query", composed_cursor)["hits"]["hits"]
+            assert [
+                (hit["_id"], hit["_source"]["title"], hit["_score"]) for hit in retained
+            ] == composed_expected, retained
+            composed_verified = [
+                "union_history",
+                "overlay_nonmatching_suppression",
+                "saved_current_visibility",
+                "mutable_composed_cursor_restart",
+            ]
         assert [(h["_id"], h["_score"]) for h in reopened["hits"]["hits"]] == [
             (h["_id"], h["_score"]) for h in hits
         ]
-        assert all(
-            h.get("_highlights", {}).get("body") for h in reopened["hits"]["hits"]
-        )
+        if not args.no_highlights:
+            assert all(
+                h.get("_highlights", {}).get("body") for h in reopened["hits"]["hits"]
+            )
         if deep_request is not None:
             deep_reopened, elapsed = timed_query(deep_request, "cursor_depth_restart")
             assert [
@@ -636,12 +1069,141 @@ def main():
         assert not empty["hits"]["hits"], (
             "Out-of-sample date range returned hits after restart"
         )
+        composed_benchmarks = {}
+        if args.benchmark_composed and composed_cursor is not None:
+            current_benchmark = "hn_current_benchmark"
+            create_current_table(call, current_benchmark)
+            columns = [
+                "hn_id",
+                "body",
+                "title",
+                "item_type",
+                "author",
+                "points",
+                "created_at",
+            ]
+            recent = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(columns)
+                    + " FROM hn_archive_poc WHERE created_at IS NOT NULL ORDER BY created_at DESC LIMIT "
+                    + str(args.composed_current_rows),
+                    # HTTP SQL's row budget is separate from the statement LIMIT.
+                    "limit": args.composed_current_rows,
+                },
+            )
+            assert len(recent["rows"]) == args.composed_current_rows
+            documents = []
+            for row in recent["rows"]:
+                document = {
+                    name: value
+                    for name, value in zip(columns, row, strict=True)
+                    if value is not None
+                }
+                for column in ("hn_id", "points", "created_at"):
+                    if column in document:
+                        document[column] = int(document[column])
+                documents.append(document)
+            inserts = {}
+            batch_bytes = 0
+            for document in documents:
+                document_bytes = len(json.dumps(document).encode()) + 32
+                if inserts and (
+                    len(inserts) >= 128 or batch_bytes + document_bytes > 512 * 1024
+                ):
+                    call(
+                        "POST",
+                        f"/tables/{current_benchmark}/batch",
+                        {"inserts": inserts, "sync_level": "full_index"},
+                    )
+                    inserts, batch_bytes = {}, 0
+                inserts[str(document["hn_id"])] = document
+                batch_bytes += document_bytes
+            if inserts:
+                call(
+                    "POST",
+                    f"/tables/{current_benchmark}/batch",
+                    {"inserts": inserts, "sync_level": "full_index"},
+                )
+            benchmark_count = call(
+                "POST",
+                "/sql",
+                {"statement": "SELECT COUNT(*) FROM " + current_benchmark},
+            )
+            assert benchmark_count["rows"] == [[str(args.composed_current_rows)]], (
+                benchmark_count
+            )
+            benchmark_overlay = {
+                "overlay": {
+                    "base": {"table": "hn_archive_poc"},
+                    "changes": {"table": current_benchmark},
+                    "key": ["hn_id"],
+                }
+            }
+            if "hackernews_benchmark" not in json.dumps(call("GET", "/sources")):
+                call(
+                    "POST",
+                    "/sources/hackernews_benchmark",
+                    {"source": benchmark_overlay},
+                )
+            for name, source in (
+                (
+                    "union",
+                    {
+                        "union": [
+                            {"table": "hn_archive_poc"},
+                            {"table": current_benchmark},
+                        ]
+                    },
+                ),
+                ("saved_overlay", {"saved": "hackernews_benchmark"}),
+            ):
+                stop()
+                if (args.state / "cache").exists():
+                    shutil.rmtree(args.state / "cache")
+                start()
+                request = dict(query, source=source, source_ranking="rrf")
+                cold, cold_ms = timed_query(request, "composed_cold." + name, "/query")
+                expected = [(h["_id"], h["_score"]) for h in cold["hits"]["hits"]]
+                samples = []
+                for _ in range(args.repeats):
+                    result, elapsed = timed_query(
+                        request, "composed_warm." + name, "/query"
+                    )
+                    assert [
+                        (h["_id"], h["_score"]) for h in result["hits"]["hits"]
+                    ] == expected
+                    samples.append(elapsed)
+                composed_benchmarks[name] = {
+                    "first_search_ms": cold_ms,
+                    "warm_samples_ms": samples,
+                    "warm_p95_ms": sorted(samples)[
+                        min(len(samples) - 1, int(len(samples) * 0.95))
+                    ],
+                    "result_count": len(expected),
+                    "current_fixture_rows": args.composed_current_rows,
+                    "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale.",
+                }
+        stop()
+        engine_peak_rss_bytes = (
+            None
+            if args.docker
+            else resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            * (1 if sys.platform == "darwin" else 1024)
+        )
         cache_files = [p for p in (args.state / "cache").rglob("*") if p.is_file()]
         report = {
-            "project": args.project,
+            "project": None if args.filesystem_source else args.project,
             "metadata_indexes": metadata_columns,
             "metadata_indexes_queryable": list(metadata_status),
             "cold_cache_cleared_after_publication": args.cold_cache,
+            "navigation_warming_enabled": not args.disable_navigation_warming,
+            "startup_samples_ms": startup_samples_ms,
+            "engine_child_peak_rss_bytes": engine_peak_rss_bytes,
+            "engine_child_peak_rss_scope": "Maximum across child processes over the entire run, including publication if performed; not query-only RSS.",
+            "composed_benchmarks": composed_benchmarks,
             "cache_files_before_search": cache_files_before_search,
             "warm_samples_ms": warm_samples,
             "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],
@@ -650,12 +1212,21 @@ def main():
             "metadata_filters": filter_results,
             "workloads": workload_results,
             "cursor_depth": cursor_depth,
+            "composed_sources": {
+                "verified": composed_verified,
+                "error": composed_error,
+            },
             "io_profiles": io_profiles,
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
             "cache_files": len(cache_files),
             "cache_bytes": sum(p.stat().st_size for p in cache_files),
-            "source": f"gs://{args.bucket}/{args.prefix}/archive",
-            "artifacts": f"gs://{args.bucket}/{artifact_prefix}/indexes",
+            "store_source": args.store_source,
+            "source": (args.filesystem_source.resolve() / "archive").as_uri()
+            if args.filesystem_source
+            else f"gs://{args.bucket}/{args.prefix}/archive",
+            "artifacts": "native filesystem artifact store"
+            if args.filesystem_source
+            else f"gs://{args.bucket}/{artifact_prefix}/indexes",
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
@@ -684,8 +1255,19 @@ def main():
                 "empty_date_filter_before_and_after_restart",
                 "concurrent_search",
             ],
-            "note": "Qualification of the reported row count. The temporary demo bucket has an eight-day deletion lifecycle.",
+            "note": "Local filesystem comparison; OS file caches are not flushed."
+            if args.filesystem_source
+            else "Qualification of the reported row count. The temporary demo bucket has an eight-day deletion lifecycle.",
         }
+        if args.no_highlights:
+            report["verified"].remove("projected_highlights")
+        if args.docker:
+            report["execution_environment"] = {
+                "architecture": "x86_64",
+                "cpus": args.docker_cpus,
+                "memory_gib": args.docker_memory_gib,
+                "runtime": "Docker; host translation may apply",
+            }
         if exact_filter_status == "passed":
             report["verified"].append("exact_filter")
         (args.state / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -721,6 +1303,10 @@ def main():
             ("cursor_depth", "cursor_depth"),
             ("restart_ms", "after_restart_ms"),
             ("io_profiles", "io_profiles"),
+            ("ready_seconds", "ready_seconds"),
+            ("build_profile", "build_profile"),
+            ("filter_results", "metadata_filters"),
+            ("count", "sql_count"),
         ):
             if name in scope:
                 measurements[target] = scope[name]

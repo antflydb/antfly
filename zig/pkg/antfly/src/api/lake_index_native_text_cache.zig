@@ -522,6 +522,29 @@ const Entry = struct {
         defer self.allocator.free(replacements);
         var loaded: usize = 0;
         defer for (replacements[0..loaded]) |*replacement| deinitReplacement(replacement, self.allocator);
+        // Transport cohorts populate original content-addressed cache entries.
+        // Bound optional warming independently of archive size; ordinary required
+        // reads remain authoritative if residency is denied or the bound is hit.
+        if (additions.items.len != 0) {
+            var cold = std.StringHashMap(void).init(self.allocator);
+            defer cold.deinit();
+            for (additions.items) |ref| try cold.put(ref.artifact_id, {});
+            var opening_bytes: usize = 16 * 1024 * 1024;
+            for (root.file_groups) |group| {
+                const needed = for (group.segments) |ref| {
+                    if (cold.contains(ref.artifact_id)) break true;
+                } else false;
+                if (!needed) continue;
+                for (group.opening_packs) |pack| {
+                    if (pack.decoded_bytes > opening_bytes) continue;
+                    opening_bytes -= pack.decoded_bytes;
+                    @import("lake_index_text_opening_pack.zig").warm(self.allocator, store, pack, root.domain, cached, cancellation) catch |err| switch (err) {
+                        error.OutOfMemory, error.CacheBudgetExceeded => {},
+                        else => return err,
+                    };
+                }
+            }
+        }
         var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true, .resource_manager = self.resource_manager };
         var read_bytes: u64 = 512 * 1024 * 1024;
         var position: usize = 0;
@@ -604,6 +627,7 @@ const Entry = struct {
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
+        self.identities.segment_ids = self.statistics_identities;
         if (root.statistics_version >= 1) {
             const ordinals = try a.alloc(corpus.statistics.IdentityOrdinal, root.segments.len);
             var offset: u32 = 0;

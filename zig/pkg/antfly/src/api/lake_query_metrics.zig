@@ -22,10 +22,16 @@ const prom = @import("../common/health_server.zig");
 pub const Phase = enum { source, publication, index, ranking, hydration, highlight, total };
 const count = @typeInfo(Phase).@"enum".field_names.len;
 pub const Stats = struct {
+    best_first_calls: u64 = 0,
+    best_first_segments: u64 = 0,
+    best_first_pruned_nodes: u64 = 0,
     calls: [count]u64 = @splat(0),
     nanoseconds: [count]u64 = @splat(0),
 };
 pub const Metrics = struct {
+    best_first_calls: std.atomic.Value(u64) = .init(0),
+    best_first_segments: std.atomic.Value(u64) = .init(0),
+    best_first_pruned_nodes: std.atomic.Value(u64) = .init(0),
     calls: [count]std.atomic.Value(u64) = @splat(.init(0)),
     nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
     pub fn record(self: *Metrics, phase: Phase, start: u64) void {
@@ -33,8 +39,13 @@ pub const Metrics = struct {
         _ = self.calls[index].fetchAdd(1, .monotonic);
         _ = self.nanoseconds[index].fetchAdd(@import("antfly_platform").time.monotonicNs() -| start, .monotonic);
     }
+    pub fn recordBestFirst(self: *Metrics, segments: u64, pruned_nodes: u64) void {
+        _ = self.best_first_calls.fetchAdd(1, .monotonic);
+        _ = self.best_first_segments.fetchAdd(segments, .monotonic);
+        _ = self.best_first_pruned_nodes.fetchAdd(pruned_nodes, .monotonic);
+    }
     pub fn snapshot(self: *const Metrics) Stats {
-        var result: Stats = .{};
+        var result: Stats = .{ .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
         for (0..count) |i| {
             result.calls[i] = self.calls[i].load(.monotonic);
             result.nanoseconds[i] = self.nanoseconds[i].load(.monotonic);
@@ -57,6 +68,9 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
             try prom.appendPromMetric(writer, "antfly_lake_disk_cache_" ++ field, "gauge", "Persistent lake cache " ++ field, @field(stats, field));
         }
         if (stats.last_write_error) |reason| try prom.appendPromMetricLabeled(writer, "antfly_lake_disk_cache_last_write_error", "gauge", "Most recent asynchronous lake cache write failure", &.{.{ .name = "reason", .value = reason }}, 1);
+    }
+    inline for (.{ "best_first_calls", "best_first_segments", "best_first_pruned_nodes" }) |field| {
+        try prom.appendPromMetric(writer, "antfly_lake_query_" ++ field ++ "_total", "counter", "Completed publication-wide score traversal " ++ field, @field(query, field));
     }
     inline for (@typeInfo(Phase).@"enum".field_names, 0..) |phase, i| {
         try prom.appendPromMetric(writer, "antfly_lake_query_" ++ phase ++ "_calls_total", "counter", "Lake query phase invocations including failed work", query.calls[i]);

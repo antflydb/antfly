@@ -4325,7 +4325,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     const current_request = try std.fmt.allocPrint(alloc, request_template, .{current_generation});
     defer alloc.free(current_request);
     var current_out: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_aggregate_hits_json(
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
         handle_id,
         .{ .ptr = current_request.ptr, .len = current_request.len },
         &current_out,
@@ -4349,6 +4349,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
         .{ .ptr = stale_request.ptr, .len = stale_request.len },
         &stale_out,
     ));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "IdentityReadGenerationChanged") != null);
 }
 
 test "capi request paths trigger readable lease hook" {

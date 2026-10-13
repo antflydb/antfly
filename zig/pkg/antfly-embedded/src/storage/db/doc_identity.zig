@@ -408,8 +408,10 @@ pub fn loadNamespaceTxn(txn: anytype) !?Namespace {
         error.NotFound => return null,
         else => return err,
     };
+    // A point-read backend may reuse borrowed value storage on the next get.
+    const namespace = try decodeNamespace(raw);
     try requireLiveDirectoryTxn(mutable_txn);
-    return try decodeNamespace(raw);
+    return namespace;
 }
 
 /// Missing or unsupported directory metadata must fail closed, never produce
@@ -472,6 +474,77 @@ pub fn writeNamespaceToStore(store: *docstore_mod.DocStore, namespace: Namespace
     try txn.commit();
 }
 
+/// Restore compatibility for historical identity images predating ALD1. The
+/// caller exclusively owns an unpublished destination and must validate the
+/// complete image before publication. Normal database reads remain fail closed.
+pub fn upgradeImportedLiveDirectoryAlloc(alloc: Allocator, store: *docstore_mod.DocStore, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    try cancellation.check();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const raw_namespace = read.get(&internal_keys.identity_namespace_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    const namespace = try decodeNamespace(raw_namespace);
+    if (read.get(&internal_keys.identity_live_directory_manifest_key)) |marker| {
+        if (!std.mem.eql(u8, marker, internal_keys.identity_live_directory_manifest_value)) return error.InvalidDocIdentity;
+        return;
+    } else |err| if (err != error.NotFound) return err;
+
+    const Rebuild = struct {
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        read: *docstore_mod.DocStore.Txn,
+        namespace: Namespace,
+        cancellation: @import("antfly_cancellation").CancellationToken,
+        writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+        bytes: usize = 0,
+
+        fn clear(self: *@This()) void {
+            for (self.writes.items) |pair| {
+                self.alloc.free(@constCast(pair.key));
+                self.alloc.free(@constCast(pair.value));
+            }
+            self.writes.clearRetainingCapacity();
+            self.bytes = 0;
+        }
+        fn flush(self: *@This()) !void {
+            if (self.writes.items.len == 0) return;
+            try self.store.putBatch(self.writes.items, &.{});
+            self.clear();
+        }
+        fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.cancellation.check();
+            const ordinal = internal_keys.parseIdentityOrdinalKey(key, internal_keys.identity_ordinal_to_doc_kind) orelse return error.InvalidDocIdentity;
+            // Cursor bytes and point-read bytes may share backend scratch.
+            const id = try self.alloc.dupe(u8, value);
+            defer self.alloc.free(id);
+            const state = (try lookupStateTxn(self.read, ordinal)) orelse return error.InvalidDocIdentity;
+            try state.validate();
+            if (ordinal == 0 or state.canonical_doc_id != canonicalDocIdForNamespace(self.namespace, id)) return error.InvalidDocIdentity;
+            if (state.isLive()) {
+                try appendLiveDocOrdinalWrite(self.alloc, &self.writes, id, ordinal);
+                self.bytes += self.writes.items[self.writes.items.len - 1].key.len + 4;
+                if (self.writes.items.len >= 256 or self.bytes >= 512 * 1024) try self.flush();
+            }
+            return .@"continue";
+        }
+    };
+    var rebuild: Rebuild = .{ .alloc = alloc, .store = store, .read = &read, .namespace = namespace, .cancellation = cancellation };
+    defer {
+        rebuild.clear();
+        rebuild.writes.deinit(alloc);
+    }
+    const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_to_doc_kind };
+    const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_to_doc_kind + 1 };
+    try store.scanReadTxnWithContext(&read, &lower, &upper, .{}, &rebuild, Rebuild.visit);
+    try rebuild.flush();
+    try cancellation.check();
+    // Publish admission only after all bounded batches have completed.
+    try store.put(&internal_keys.identity_live_directory_manifest_key, internal_keys.identity_live_directory_manifest_value);
+}
+
 pub fn reassignNamespaceAlloc(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -501,26 +574,28 @@ pub fn reassignNamespaceWithMetadataAlloc(
     defer ordinal_rows.deinit(alloc);
     try collectOrdinalDocRowsAlloc(alloc, store, &ordinal_rows);
 
-    var txn = try store.beginWriteTxn();
-    errdefer txn.abort();
-    try @import("artifact_reconcile_intent.zig").requireAbsent(&txn);
-    if (try loadNamespaceTxn(&txn)) |previous| {
-        if (!previous.eql(namespace)) try @import("artifact_inventory.zig").invalidateOrdered(&txn);
-    } else try @import("artifact_inventory.zig").invalidateOrdered(&txn);
-    var namespace_value: [24]u8 = undefined;
-    encodeNamespace(namespace_value[0..], namespace);
-    try txn.put(internal_keys.identity_namespace_key[0..], &namespace_value);
+    // commit consumes the transaction. Post-commit validation must never
+    // unwind through abort on that retired transaction.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try @import("artifact_reconcile_intent.zig").requireAbsent(&txn);
+        if (try loadNamespaceTxn(&txn)) |previous| {
+            if (!previous.eql(namespace)) try @import("artifact_inventory.zig").invalidateOrdered(&txn);
+        } else try @import("artifact_inventory.zig").invalidateOrdered(&txn);
+        try writeNamespaceTxn(&txn, namespace);
 
-    for (ordinal_rows.items.items) |row| {
-        var state = (try lookupStateTxn(&txn, row.ordinal)) orelse return error.InvalidDocIdentity;
-        try deleteCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id);
-        state.canonical_doc_id = canonicalDocIdForNamespace(namespace, row.doc_id);
-        try writeOrdinalStateTxn(alloc, &txn, row.ordinal, state);
-        try writeCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id, row.ordinal);
+        for (ordinal_rows.items.items) |row| {
+            var state = (try lookupStateTxn(&txn, row.ordinal)) orelse return error.InvalidDocIdentity;
+            try deleteCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id);
+            state.canonical_doc_id = canonicalDocIdForNamespace(namespace, row.doc_id);
+            try writeOrdinalStateTxn(alloc, &txn, row.ordinal, state);
+            try writeCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id, row.ordinal);
+        }
+
+        for (metadata) |update| try txn.put(update.key, update.value);
+        try txn.commit();
     }
-
-    for (metadata) |update| try txn.put(update.key, update.value);
-    try txn.commit();
     try validateStoreAlloc(alloc, store);
 }
 
@@ -4354,6 +4429,12 @@ test "identity live directory validates repairs and aborts atomically (#1095)" {
     try store.putBatch(&.{}, &.{&internal_keys.identity_live_directory_manifest_key});
     try std.testing.expectError(error.InvalidDocIdentity, loadNamespaceFromStore(&store));
     try std.testing.expectError(error.InvalidDocIdentity, validateStoreAlloc(alloc, &store));
+    try store.putBatch(&.{}, &.{live_key});
+    try upgradeImportedLiveDirectoryAlloc(alloc, &store, .none);
+    try validateStoreAlloc(alloc, &store);
+    // An explicitly unsupported marker must never be treated as legacy data.
+    try store.put(&internal_keys.identity_live_directory_manifest_key, "unsupported");
+    try std.testing.expectError(error.InvalidDocIdentity, upgradeImportedLiveDirectoryAlloc(alloc, &store, .none));
 }
 
 test "identity live directory metadata releases allocation failures (#1095)" {
@@ -4366,4 +4447,100 @@ test "identity live directory metadata releases allocation failures (#1095)" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "namespace loading decodes borrowed bytes before checking the live directory" {
+    const expected: Namespace = .{ .table_id = 11, .shard_id = 22, .range_id = 33 };
+    const Probe = struct {
+        scratch: [@max(24, internal_keys.identity_live_directory_manifest_value.len)]u8 = undefined,
+        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, &internal_keys.identity_namespace_key)) {
+                encodeNamespace(self.scratch[0..24], expected);
+                return self.scratch[0..24];
+            }
+            if (std.mem.eql(u8, key, &internal_keys.identity_live_directory_manifest_key)) {
+                const value = internal_keys.identity_live_directory_manifest_value;
+                @memcpy(self.scratch[0..value.len], value);
+                return self.scratch[0..value.len];
+            }
+            return error.NotFound;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectEqualDeep(expected, (try loadNamespaceTxn(&probe)).?);
+}
+
+test "legacy imported live directory preserves tombstones and releases allocation failures" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            const backing = std.testing.allocator;
+            var backend = @import("../mem_backend.zig").Backend.init(backing, .{});
+            defer backend.close();
+            var store = try docstore_mod.DocStore.openRuntime(backing, try backend.runtimeStore(backing, .{}));
+            defer store.close();
+            try writeNamespaceToStore(&store, default_namespace);
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                _ = try ensureOrdinalForNamespaceTxn(backing, &txn, default_namespace, 10, "live\x00id");
+                _ = try ensureOrdinalForNamespaceTxn(backing, &txn, default_namespace, 10, "deleted");
+                try markDeletedTxn(backing, &txn, 20, "deleted");
+                try txn.commit();
+            }
+            const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(backing, "live\x00id");
+            defer backing.free(live_key);
+            try store.putBatch(&.{}, &.{ live_key, &internal_keys.identity_live_directory_manifest_key });
+            try upgradeImportedLiveDirectoryAlloc(alloc, &store, .none);
+            try validateStoreAlloc(backing, &store);
+            var read = try store.beginProbeTxn();
+            defer read.abort();
+            try std.testing.expect(try lookupLiveOrdinalTxn(backing, &read, "live\x00id") != null);
+            try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupLiveOrdinalTxn(backing, &read, "deleted"));
+            const deleted = (try lookupOrdinalTxn(backing, &read, "deleted")).?;
+            try std.testing.expectEqual(@as(?u64, 20), (try lookupStateTxn(&read, deleted)).?.deleted_generation);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "namespace reassignment validation failure leaves the committed transaction retired" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    try writeNamespaceToStore(&store, default_namespace);
+    const replacement: Namespace = .{ .table_id = 11, .shard_id = 22, .range_id = 33 };
+
+    // Force validation to fail after commit, rather than while the write
+    // transaction still owns its backend resources.
+    try std.testing.expectError(error.InvalidDocIdentity, reassignNamespaceWithMetadataAlloc(
+        alloc,
+        &store,
+        replacement,
+        &.{.{ .key = &internal_keys.identity_live_directory_manifest_key, .value = "unsupported" }},
+    ));
+    {
+        var probe = try store.beginProbeTxn();
+        defer probe.abort();
+        try std.testing.expectEqualDeep(replacement, try decodeNamespace(try probe.get(&internal_keys.identity_namespace_key)));
+    }
+    // A fresh transaction can repair the marker and validate the committed
+    // namespace; error unwinding must not abort the already consumed write.
+    try writeNamespaceToStore(&store, replacement);
+    try validateStoreAlloc(alloc, &store);
+}
+
+test "namespace reassignment initializes an empty owner's live directory atomically" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(?Namespace, null), try loadNamespaceFromStore(&store));
+    const replacement: Namespace = .{ .table_id = 11, .shard_id = 22, .range_id = 33 };
+    try reassignNamespaceAlloc(alloc, &store, replacement);
+    try std.testing.expectEqualDeep(replacement, (try loadNamespaceFromStore(&store)).?);
+    try validateStoreAlloc(alloc, &store);
 }

@@ -909,6 +909,12 @@ encoding/ABI mismatches between compilation units, handlers, and clients.
 
 > **Relocated:** The full dated defects ledger (1,162 lines) that previously lived here is preserved verbatim in [docs/design/vopr/history/defects-found.md](../docs/design/vopr/history/defects-found.md).
 
+Open observation (as of the 2026-09-07 log, not verified since): a broader
+public E2E run observed an intermittent post-restart exact-sort status
+assertion failure; its isolated rerun and the final broader run passed, and
+the query-deadline clock fix does not claim to resolve it
+([verbatim log](https://github.com/antflydb/antfly/blob/f3fd4d35258791fe16ab927a1e7f9b3af247b074/docs/design/vopr/history/follow-ups-2026-09.md)).
+
 ## CLI
 
 The VOPR command is a harness-only, test-mode artifact. It must not be

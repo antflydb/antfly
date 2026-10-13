@@ -383,6 +383,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.UnsupportedBatchRequestEncoding,
         error.ValueTooLong,
         error.InvalidQueryRequest,
+        error.InvalidRelationshipFilter,
         error.InvalidSchemaUpdateRequest,
         error.UnsupportedQueryRequest,
         error.UnsupportedHierarchyGrouping,
