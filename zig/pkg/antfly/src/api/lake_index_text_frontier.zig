@@ -168,8 +168,9 @@ fn bound(self: *Self, first: Id, last: Id) !?Node {
     try self.check();
     _ = self.scratch.reset(.retain_capacity);
     var range: Range = .{ .owner = self, .first = first, .last = last };
-    const upper = try self.plan.?.bound(.{ .ptr = &range, .read = Range.summary });
-    return if (range.found_first) |actual| .{ .first = actual, .last = range.found_last, .upper = upper } else null;
+    const result = try self.plan.?.rangeBound(.{ .ptr = &range, .read = Range.summary });
+    if (!result.possible) return null;
+    return if (range.found_first) |actual| .{ .first = actual, .last = range.found_last, .upper = result.upper } else null;
 }
 pub fn next(self: *Self, cutoff: ?f32) !?Id {
     try self.check();
@@ -239,38 +240,46 @@ test "external lake global frontier reaches late competitive segments and comple
     var pages: page_store.PageStore = .{ .domain = @splat(6), .attempt = @splat(4), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     const key = try corpus.statistics.keyAlloc(sa, "body", "common");
     const prefix = try corpus.term_directory.prefixAlloc(sa, key);
+    const rare_key = try corpus.statistics.keyAlloc(sa, "body", "rare");
+    const rare_prefix = try corpus.term_directory.prefixAlloc(sa, rare_key);
     const Source = struct {
         prefix: []const u8,
+        rare_prefix: []const u8,
         position: u32 = 0,
         key: [128]u8 = undefined,
         value: [corpus.statistics.Summary.max_bytes]u8 = undefined,
         pub fn next(self: *@This()) !?tree.Cursor.Record {
-            if (self.position == 8192) return null;
-            @memcpy(self.key[0..self.prefix.len], self.prefix);
-            @memset(self.key[self.prefix.len..][0..32], 0);
-            std.mem.writeInt(u32, self.key[self.prefix.len + 28 ..][0..4], self.position, .big);
-            const strong = self.position == 8191;
+            if (self.position == 8195) return null;
+            const common = self.position < 8192;
+            const prefix_ = if (common) self.prefix else self.rare_prefix;
+            const ordinal = if (common) self.position else ([_]u32{ 3, 31, 8191 })[self.position - 8192];
+            @memcpy(self.key[0..prefix_.len], prefix_);
+            @memset(self.key[prefix_.len..][0..32], 0);
+            std.mem.writeInt(u32, self.key[prefix_.len + 28 ..][0..4], ordinal, .big);
+            const strong = common and self.position == 8191;
             const summary: corpus.statistics.Summary = .{ .frequency = 1, .max_frequency = if (strong) 100 else 1, .min_norm = 100 };
             self.position += 1;
-            return .{ .key = self.key[0 .. self.prefix.len + 32], .value = summary.encode(&self.value) };
+            return .{ .key = self.key[0 .. prefix_.len + 32], .value = summary.encode(&self.value) };
         }
     };
-    var source: Source = .{ .prefix = prefix };
+    var source: Source = .{ .prefix = prefix, .rare_prefix = rare_prefix };
     var reduced = pages.store();
     reduced.reduce = corpus.term_directory.reduce;
     const leaves = try tree.buildSorted(a, reduced, &source);
     const Global = struct {
         key: []const u8,
-        done: bool = false,
+        rare_key: []const u8,
+        position: u2 = 0,
         value: [8]u8 = undefined,
         pub fn next(self: *@This()) !?tree.Cursor.Record {
-            if (self.done) return null;
-            self.done = true;
-            std.mem.writeInt(u64, &self.value, 8192, .big);
-            return .{ .key = self.key, .value = &self.value };
+            if (self.position == 2) return null;
+            const common = self.position == 0;
+            self.position += 1;
+            std.mem.writeInt(u64, &self.value, if (common) 8192 else 3, .big);
+            return .{ .key = if (common) self.key else self.rare_key, .value = &self.value };
         }
     };
-    var global: Global = .{ .key = key };
+    var global: Global = .{ .key = key, .rare_key = rare_key };
     const root: corpus.Root = .{ .domain = @splat(6), .binding = undefined, .config_json = "{}", .inventory_version = 3, .term_statistics = try tree.buildSorted(a, pages.store(), &global), .collection = .{ .documents = 8192, .fields = &.{.{ .name = "body", .total_length = 819200 }} }, .term_directory = .{ .version = 2, .leaves = leaves } };
     var last: Id = @splat(0);
     std.mem.writeInt(u32, last[28..32], 8191, .big);
@@ -305,6 +314,21 @@ test "external lake global frontier reaches late competitive segments and comple
     }
     try std.testing.expectEqual(seen.len, count);
     try std.testing.expect(!complete.pruned);
+    const conjunction = (try create(a, root, store, cached, .none, .{ .bool_query = .{ .must = &.{
+        .{ .term = .{ .field = "body", .term = "common" } },
+        .{ .term = .{ .field = "body", .term = "rare" } },
+    } } }, .{}, .{})).?;
+    defer conjunction.deinit();
+    var selected: usize = 0;
+    while (try conjunction.next(null)) |id| {
+        const ordinal = std.mem.readInt(u32, id[28..32], .big);
+        try std.testing.expect(ordinal == 3 or ordinal == 31 or ordinal == 8191);
+        selected += 1;
+    }
+    // Membership proof must work even when fewer than K rows match, so no
+    // competitive cutoff exists. No unrelated inventory is admitted.
+    try std.testing.expectEqual(@as(usize, 3), selected);
+    try std.testing.expectEqual(@as(u64, 3), conjunction.admitted);
     const optional = try create(a, root, store, cached, .none, .{ .bool_query = .{ .should = &.{.{ .term = .{ .field = "body", .term = "common" } }}, .pure_should_optional = true } }, .{}, .{});
     try std.testing.expect(optional == null);
     // Cancellation never turns a partial frontier into a successful result.

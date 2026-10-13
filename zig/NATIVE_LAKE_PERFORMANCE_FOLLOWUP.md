@@ -2902,6 +2902,10 @@ Implemented frontier details:
   read budget. Navigation failure propagates rather than returning partial
   ranked results. Optional preparation admission failures keep the established
   sequential routing path.
+- Required-term and phrase-position presence follow the same lowered Boolean
+  tree as scoring. A range missing a required clause is excluded before
+  inventory admission even when fewer than K documents match and no cutoff
+  exists. Optional clauses cannot narrow a mandatory match.
 - The global cutoff excludes only strictly lower bounds. A winner's immutable
   file identity and original file rank supply the existing full-corpus tie
   order, independent of traversal and window-local native ordinals. The same
@@ -2923,7 +2927,9 @@ Implemented frontier details:
 The deterministic navigation fixture places the strong term match last among
 8,192 immutable segments and checks that it is reached first with less than
 2 MiB of further term-tree reads and no inventory directory. A one-entry queue
-must visit every segment once. Shared native tests compare exact scores and
+must visit every segment once at an equal score bound. A conjunction of that
+common term with a rare term must admit only its three segments without a
+competitive cutoff. Shared native tests compare exact scores and
 winner order across analyzed, Boolean, signed and phrase shapes, including
 unknown bounds. Real Parquet coverage compares full admission with bounded
 profiles, metadata filters, exclusions, hybrids, hidden highlights and cursor

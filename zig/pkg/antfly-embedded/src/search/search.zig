@@ -3050,46 +3050,68 @@ pub const TextNavigationPlan = struct {
             },
         }
     }
+    pub const RangeBound = struct { upper: f32, possible: bool };
     pub fn bound(self: *const TextNavigationPlan, source: Summaries) !f32 {
+        return (try self.rangeBound(source)).upper;
+    }
+    pub fn rangeBound(self: *const TextNavigationPlan, source: Summaries) !RangeBound {
         return self.nodeBound(self.root, source);
     }
-    fn nodeBound(self: *const TextNavigationPlan, node: *const LoweredText, source: Summaries) anyerror!f32 {
+    fn nodeBound(self: *const TextNavigationPlan, node: *const LoweredText, source: Summaries) anyerror!RangeBound {
         var upper: f32 = 0;
+        var possible = true;
         switch (node.kind) {
-            .none => {},
-            .all, .bitmap => return std.math.inf(f32),
+            .none => possible = false,
+            .all, .bitmap => return .{ .upper = std.math.inf(f32), .possible = true },
             .term => {
                 const term = node.term.?;
                 const stats = try @constCast(&self.stats).get(term.field, term.term);
                 const summary = try source.read(source.ptr, term.field, term.term, stats.average, self.config);
-                if (summary.frequency != 0) upper = summary.tf_upper * inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency)) * term.boost;
-                if (term.boost < 0 or !std.math.isFinite(term.boost)) return std.math.inf(f32);
+                possible = summary.frequency != 0;
+                if (possible) upper = summary.tf_upper * inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency)) * term.boost;
+                if (term.boost < 0 or !std.math.isFinite(term.boost)) upper = std.math.inf(f32);
             },
             .phrase => {
                 // Exact phrase frequency cannot exceed first-position TF.
+                // Every position needs at least one present alternative.
                 var idf: f32 = 0;
                 var first: ?index_mod.IndexSnapshot.TextTermSummary = null;
-                for (node.groups, 0..) |group, i| for (group) |term| {
-                    const stats = try @constCast(&self.stats).get(node.field, term);
-                    const summary = try source.read(source.ptr, node.field, term, stats.average, self.config);
-                    if (i == 0 and first == null) first = summary;
-                    idf += inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency));
-                };
+                for (node.groups, 0..) |group, i| {
+                    var present = false;
+                    for (group) |term| {
+                        const stats = try @constCast(&self.stats).get(node.field, term);
+                        const summary = try source.read(source.ptr, node.field, term, stats.average, self.config);
+                        present = present or summary.frequency != 0;
+                        if (i == 0 and first == null) first = summary;
+                        idf += inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency));
+                    }
+                    possible = possible and present;
+                }
+                possible = possible and node.groups.len != 0;
                 upper = if (!node.scored) node.boost else if (first) |summary| summary.tf_upper * idf * node.boost else 0;
             },
             .boolean => {
-                for (node.must) |child| upper += try self.nodeBound(child, source);
-                var optional: f32 = 0;
-                for (node.should) |child| {
-                    const value = @max(0, try self.nodeBound(child, source));
-                    if (node.group_optional) optional += value else upper += value;
+                for (node.must) |child| {
+                    const value = try self.nodeBound(child, source);
+                    possible = possible and value.possible;
+                    upper += value.upper;
                 }
+                var optional: f32 = 0;
+                var present: usize = 0;
+                for (node.should) |child| {
+                    const value = try self.nodeBound(child, source);
+                    present += @intFromBool(value.possible);
+                    const score = @max(0, value.upper);
+                    if (node.group_optional) optional += score else upper += score;
+                }
+                possible = possible and present >= node.minimum and (node.must.len != 0 or present != 0 or node.baseline != null);
                 if (node.group_optional) upper += optional;
                 upper *= node.boost;
             },
         }
-        if (node.boost < 0 or !std.math.isFinite(upper)) return std.math.inf(f32);
-        return if (upper > 0) std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32)) else upper;
+        if (!possible) return .{ .upper = 0, .possible = false };
+        if (node.boost < 0 or !std.math.isFinite(upper)) return .{ .upper = std.math.inf(f32), .possible = true };
+        return .{ .upper = if (upper > 0) std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32)) else upper, .possible = true };
     }
 };
 
@@ -10031,8 +10053,13 @@ test "external lake metadata navigation shares scorer lowering and conservative 
     var source: Source = .{ .snapshot = writer.snapshot(), .alloc = a };
     const common: SearchQuery = .{ .term = .{ .field = "title", .term = "common" } };
     const rare: SearchQuery = .{ .term = .{ .field = "title", .term = "rare" } };
+    const missing: SearchQuery = .{ .term = .{ .field = "title", .term = "missing" } };
     const queries = [_]SearchQuery{
         common,
+        .{ .bool_query = .{ .must = &.{ common, missing } } },
+        .{ .bool_query = .{ .should = &.{ common, missing }, .min_should = 2 } },
+        .{ .bool_query = .{ .must = &.{common}, .should = &.{missing} } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "missing" } } },
         .{ .match = .{ .field = "title", .text = "COMMON rare common", .boost = 2 } },
         .{ .bool_query = .{ .must = &.{common}, .should = &.{rare}, .boost = 0.5 } },
         .{ .bool_query = .{ .should = &.{ common, rare }, .must_not = &.{rare} } },
