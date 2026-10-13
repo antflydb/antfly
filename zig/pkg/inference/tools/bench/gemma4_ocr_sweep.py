@@ -65,7 +65,7 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(
-        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable)?",
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant)?",
         case,
     )
     if cohort or case in {
@@ -93,6 +93,11 @@ def flags_for(case):
         flags["ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC"] = (
             "0" if variant == "stable" else "1"
         )
+        if variant == "invariant":
+            flags["TERMITE_METAL_Q4_0_BATCH_INVARIANT"] = "1"
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
         if variant in {"qkv", "canonical", "strict", "qkvtrace"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
         if variant in {"ple", "canonical", "reduceall", "strict"}:

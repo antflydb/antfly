@@ -37059,16 +37059,36 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
 }
 
 test "metal native q4_0 gated ffn device path matches decomposed" {
-    try testQ4GatedFfnRows(1);
+    try testQ4GatedFfnRows(1, false, 64, 64);
 }
 
 test "metal native q4_0 multirow gated ffn matches decomposed" {
-    try testQ4GatedFfnRows(2);
-    try testQ4GatedFfnRows(3);
-    try testQ4GatedFfnRows(4);
+    try testQ4GatedFfnRows(2, false, 64, 64);
+    try testQ4GatedFfnRows(3, false, 64, 64);
+    try testQ4GatedFfnRows(4, false, 64, 64);
 }
 
-fn testQ4GatedFfnRows(comptime rows: usize) !void {
+test "metal native q4_0 batch invariant linear and fused ffn are bitwise singleton" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const name = "TERMITE_METAL_Q4_0_BATCH_INVARIANT";
+    const original = if (std.c.getenv(name)) |v|
+        try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0)
+    else
+        null;
+    defer {
+        if (original) |v| {
+            _ = setenv(name, v.ptr, 1);
+            std.testing.allocator.free(v);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    try testQ4GatedFfnRows(2, true, 64, 64);
+    try testQ4GatedFfnRows(3, true, 1536, 6144);
+    try testQ4GatedFfnRows(4, true, 1536, 12288);
+    try testQ4GatedFfnRows(8, true, 128, 96);
+}
+
+fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime hidden_size: usize, comptime intermediate_size: usize) !void {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -37077,8 +37097,6 @@ fn testQ4GatedFfnRows(comptime rows: usize) !void {
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const hidden_size: usize = 64;
-    const intermediate_size: usize = 64;
     const block_values: usize = 32;
     const block_bytes: usize = 18;
     const gate_blocks = hidden_size / block_values;
@@ -37086,9 +37104,15 @@ fn testQ4GatedFfnRows(comptime rows: usize) !void {
     const gate_row_bytes = gate_blocks * block_bytes;
     const down_row_bytes = down_blocks * block_bytes;
 
-    var gate_raw: [intermediate_size * gate_row_bytes]u8 = @as([(intermediate_size * gate_row_bytes)]u8, @splat(0));
-    var up_raw: [intermediate_size * gate_row_bytes]u8 = @as([(intermediate_size * gate_row_bytes)]u8, @splat(0));
-    var down_raw: [hidden_size * down_row_bytes]u8 = @as([(hidden_size * down_row_bytes)]u8, @splat(0));
+    const gate_raw = try std.testing.allocator.alloc(u8, intermediate_size * gate_row_bytes);
+    defer std.testing.allocator.free(gate_raw);
+    @memset(gate_raw, 0);
+    const up_raw = try std.testing.allocator.alloc(u8, intermediate_size * gate_row_bytes);
+    defer std.testing.allocator.free(up_raw);
+    @memset(up_raw, 0);
+    const down_raw = try std.testing.allocator.alloc(u8, hidden_size * down_row_bytes);
+    defer std.testing.allocator.free(down_raw);
+    @memset(down_raw, 0);
 
     var dense_hidden: [hidden_size]f32 = undefined;
     for (0..intermediate_size) |row| {
@@ -37132,21 +37156,21 @@ fn testQ4GatedFfnRows(comptime rows: usize) !void {
     const down_shape = [_]i64{ @intCast(hidden_size), @intCast(intermediate_size) };
     const gate_storage = QuantizedStorage{
         .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &gate_raw,
+        .raw_bytes = gate_raw,
         .shape = &gate_shape,
         .raw_owned = false,
         .allocator = std.testing.allocator,
     };
     const up_storage = QuantizedStorage{
         .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &up_raw,
+        .raw_bytes = up_raw,
         .shape = &gate_shape,
         .raw_owned = false,
         .allocator = std.testing.allocator,
     };
     const down_storage = QuantizedStorage{
         .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &down_raw,
+        .raw_bytes = down_raw,
         .shape = &down_shape,
         .raw_owned = false,
         .allocator = std.testing.allocator,
@@ -37254,6 +37278,59 @@ fn testQ4GatedFfnRows(comptime rows: usize) !void {
     }, &stats)) orelse return error.GatedFfnAddNull;
     defer expected_tensor.deinit();
 
+    if (invariant) {
+        const tail_dim = intermediate_size - 1;
+        const tail_shape = [_]i64{ tail_dim, hidden_size };
+        const tail_storage = QuantizedStorage{
+            .tensor_type = .{ .known = .Q4_0 },
+            .raw_bytes = gate_raw[0 .. tail_dim * gate_row_bytes],
+            .shape = &tail_shape,
+            .raw_owned = false,
+            .allocator = std.testing.allocator,
+        };
+        var tail_bias = try MetalTensor.ownedCloneFrom(intermediate_bias[0..tail_dim], &.{tail_dim});
+        defer tail_bias.deinit();
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .weight = dummy_weight,
+            .bias = tail_bias,
+            .quantized_storage = @as(?*const QuantizedStorage, &tail_storage),
+            .slot = 63,
+            .in_dim = hidden_size,
+            .out_dim = tail_dim,
+            .retain_dense_fallback = false,
+        }, &prep_stats));
+        try std.testing.expect(decoderRuntimeReserveGatedFfnScratch(&provider, rows, hidden_size, intermediate_size));
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        var cohort_linear = (try decoderRuntimeApplyLinear(&provider, .{
+            .slot = 63,
+            .input = input,
+            .in_dim = hidden_size,
+            .out_dim = tail_dim,
+        })) orelse return error.UnexpectedNull;
+        defer cohort_linear.deinit();
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        const packed_values = try tensorHostSlice(&cohort_linear);
+        for (0..rows) |row| {
+            var single_input = try testDeviceTensorFromSlice(runtime, input_data[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
+            defer single_input.deinit();
+            try beginFrame(runtime);
+            var single = (try decoderRuntimeApplyLinear(&provider, .{
+                .slot = 63,
+                .input = single_input,
+                .in_dim = hidden_size,
+                .out_dim = tail_dim,
+            })) orelse return error.UnexpectedNull;
+            defer single.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            const single_values = try tensorHostSlice(&single);
+            for (single_values, packed_values[row * tail_dim ..][0..tail_dim]) |a, b|
+                try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        }
+        try beginFrame(runtime);
+    }
     const before_direct = runtimeMemorySnapshot(runtime);
     var direct = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
         .gate_linear_slot = 60,
@@ -37269,7 +37346,44 @@ fn testQ4GatedFfnRows(comptime rows: usize) !void {
         .post_down_rms_norm_slot = @as(?usize, 12),
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
+    if (invariant) {
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+    }
     const after_direct = runtimeMemorySnapshot(runtime);
+    if (invariant) {
+        // One fused gate/up dispatch for the entire cohort, not rows singleton
+        // dispatches disguised as batching. The canonical down tail is per row.
+        if (after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce)
+            try std.testing.expectEqual(before_direct.q4_0_pair_activation_reduce + 1, after_direct.q4_0_pair_activation_reduce);
+        const packed_values = try tensorHostSlice(&direct);
+        for (0..rows) |row| {
+            var single_input = try testDeviceTensorFromSlice(runtime, input_data[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
+            defer single_input.deinit();
+            var single_residual = try testDeviceTensorFromSlice(runtime, residual_data[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
+            defer single_residual.deinit();
+            try beginFrame(runtime);
+            errdefer cancelFrame(runtime) catch {};
+            var single = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+                .gate_linear_slot = 60,
+                .up_linear_slot = 61,
+                .down_linear_slot = 62,
+                .rows = 1,
+                .hidden_size = hidden_size,
+                .intermediate_size = intermediate_size,
+                .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+                .eps = 1e-5,
+                .post_gate_rms_norm_slot = null,
+                .post_down_rms_norm_slot = @as(?usize, 12),
+            }, single_input, single_residual, &stats)) orelse return error.UnexpectedNull;
+            defer single.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            const single_values = try tensorHostSlice(&single);
+            for (single_values, packed_values[row * hidden_size ..][0..hidden_size]) |a, b|
+                try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        }
+    }
     if (rows == 1) {
         const pair_activation_used =
             after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or

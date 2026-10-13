@@ -17371,6 +17371,13 @@ static termite_metal_q4_0_mmv_workload termite_metal_q4_0_mmv_workload_for_regio
     }
 }
 
+// Research policy: repeat the row-one operation family over grid.y, keeping
+// each row's reduction tree unchanged. This does not qualify an entire decoder.
+static bool termite_metal_q4_0_batch_invariant_enabled(size_t rows) {
+    return rows >= 2u && rows <= 8u &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_Q4_0_BATCH_INVARIANT"));
+}
+
 static termite_metal_q4_0_mmv_selection termite_metal_select_q4_0_mmv(
     termite_metal_decode_runtime *runtime,
     const termite_metal_quant_matmul_descriptor *descriptor
@@ -18466,22 +18473,27 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder
     // The rows 2-8 shared-read MTP kernel and rows>=9 fused prefill MM kernel
     // are independent, explicit opt-ins.  Production remains on the split
     // exact-F32 route unless the corresponding runtime policy is enabled.
-    const BOOL use_small_batch = f32_activation_buffers &&
+    const BOOL batch_invariant = f32_activation_buffers &&
+        runtime->q4_0_pair_activation_fusion_enabled &&
+        termite_metal_q4_0_batch_invariant_enabled(descriptor->rows);
+    const BOOL use_small_batch = !batch_invariant && f32_activation_buffers &&
         descriptor->rows >= 2u && descriptor->rows <= 8u &&
         termite_metal_q4_0_pair_activation_small_batch_enabled() &&
         runtime->q4_0_pair_activation_small_batch_pipeline != nil;
     const termite_metal_q4_0_pair_activation_mm_selection pair_mm =
         termite_metal_select_q4_0_pair_activation_mm(runtime, descriptor);
     if (descriptor->format != TERMITE_METAL_QUANT_FORMAT_Q4_0 ||
-        (descriptor->rows != 1u && !use_small_batch && pair_mm.pipeline == nil) ||
+        (descriptor->rows != 1u && !batch_invariant && !use_small_batch && pair_mm.pipeline == nil) ||
         descriptor->in_dim == 0 ||
         descriptor->out_dim == 0 ||
         descriptor->values_per_block != 32u ||
         descriptor->bytes_per_block != 18u ||
         descriptor->in_dim % descriptor->values_per_block != 0) return failure_code;
-    if (descriptor->in_dim > UINT32_MAX || descriptor->out_dim > UINT32_MAX) return failure_code;
+    if (descriptor->rows > UINT32_MAX || descriptor->in_dim > UINT32_MAX || descriptor->out_dim > UINT32_MAX) return failure_code;
+    termite_metal_quant_matmul_descriptor singleton_descriptor = *descriptor;
+    if (batch_invariant) singleton_descriptor.rows = 1u;
     const termite_metal_q4_0_pair_activation_mmv_selection pair_mmv =
-        termite_metal_select_q4_0_pair_activation_mmv(runtime, descriptor);
+        termite_metal_select_q4_0_pair_activation_mmv(runtime, &singleton_descriptor);
     if (pair_mm.fell_back) {
         runtime->q4_0_pair_activation_mm_variant_fallbacks += 1;
         return failure_code;
@@ -18564,10 +18576,10 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder
         const NSUInteger outputs_per_threadgroup = pair_mmv.nr0 * pair_mmv.nsg;
         [encoder dispatchThreadgroups:MTLSizeMake(
             (descriptor->out_dim + outputs_per_threadgroup - 1u) / outputs_per_threadgroup,
-            1u,
+            descriptor->rows,
             1u) threadsPerThreadgroup:MTLSizeMake(32u * pair_mmv.nsg, 1u, 1u)];
     } else {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
     runtime->q4_0_pair_activation_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     return 0;
@@ -20607,11 +20619,18 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             : runtime->q4_0_reduce_f16_input_pipeline;
     const BOOL q4_0_reduce_selected_small = q4_0_reduce_selected_pipeline == runtime->q4_0_reduce_small_pipeline;
     const BOOL q4_0_reduce_f16_input_selected_small = q4_0_reduce_f16_input_selected_pipeline == runtime->q4_0_reduce_f16_input_small_pipeline;
+    const BOOL batch_invariant =
+        descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
+        descriptor->input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
+        descriptor->output_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
+        !use_sumsq && termite_metal_q4_0_batch_invariant_enabled(descriptor->rows);
+    termite_metal_quant_matmul_descriptor singleton_descriptor = *descriptor;
+    if (batch_invariant) singleton_descriptor.rows = 1u;
     const termite_metal_q4_0_mmv_selection q4_0_mmv_selection =
-        termite_metal_select_q4_0_mmv(runtime, descriptor);
+        termite_metal_select_q4_0_mmv(runtime, &singleton_descriptor);
     termite_metal_q4_0_mmv_variant q4_0_mmv_dispatched_variant = TERMITE_METAL_Q4_0_MMV_VARIANT_AUTO;
     BOOL q4_0_mmv_dispatched_fallback = NO;
-    const BOOL q4_0_small_batch_shape = descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
+    const BOOL q4_0_small_batch_shape = !batch_invariant && descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
         !use_sumsq &&
@@ -20685,7 +20704,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             pipeline = pipeline != nil ? pipeline : runtime->q3_k_pipeline;
             break;
         case TERMITE_METAL_QUANT_FORMAT_Q4_0:
-            if (descriptor->rows >= 2 && descriptor->rows <= 8 &&
+            if (!batch_invariant && descriptor->rows >= 2 && descriptor->rows <= 8 &&
                 !use_sumsq &&
                 !antfly_q4_0_small_batch_enabled &&
                 descriptor->input_dtype == TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32 &&
@@ -56597,7 +56616,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
             ((rows >= 2 && rows <= 8 &&
                 runtime->q4_0_pair_activation_small_batch_pipeline != nil &&
                 termite_metal_q4_0_pair_activation_small_batch_enabled()) ||
-             (rows == 1 && enable_q4_0_pair_activation_fusion) ||
+             ((rows == 1 || termite_metal_q4_0_batch_invariant_enabled(rows)) && enable_q4_0_pair_activation_fusion) ||
              (rows >= 9 && termite_metal_q4_0_pair_activation_mm_enabled_for_shape(runtime, hidden_size, intermediate_size))) &&
             runtime->q4_0_pair_activation_reduce_pipeline != nil) {
             termite_metal_quant_matmul_descriptor descriptor = {
@@ -56929,6 +56948,36 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 TERMITE_METAL_COMPUTE_REGION_FFN,
                 -20);
             if (planned_status != 0) return planned_status;
+            return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -23);
+        }
+
+        if (!down_projection_done && block_q4_0 && down_q4_0 &&
+            termite_metal_q4_0_batch_invariant_enabled(rows) &&
+            post_down_rms_norm_slot != SIZE_MAX &&
+            runtime->active_frame_cb == command_buffer && !gated_buffer_f16) {
+            // Preserve the singleton down+sumsq+norm family. A plain batched
+            // down projection has a different reduction tree even when the
+            // gate/up projection itself is bitwise invariant.
+            const BOOL down_project_f16 =
+                termite_metal_q4_0_linear_rms_add_f16_project_enabled() &&
+                runtime->rms_norm_add_f16_input_pipeline != nil &&
+                runtime->q4_0_reduce_f16_output_pipeline != nil;
+            for (size_t row = 0; row < rows; ++row) {
+                const int status = termite_metal_encode_quant_linear_rms_add_planned_1x(
+                    runtime, command_buffer, down_quant_format,
+                    TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+                    down_project_f16 ? TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16
+                        : TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+                    post_gate_rms_norm_slot != SIZE_MAX ? normed_gated_buffer : gated_buffer,
+                    row * intermediate_size * sizeof(float), &down_view,
+                    projected_buffer, row * hidden_size * (down_project_f16 ? sizeof(uint16_t) : sizeof(float)),
+                    intermediate_size, hidden_size, post_down_rms_norm_slot,
+                    residual_buffer, residual_offset + row * hidden_size * sizeof(float),
+                    output_buffer, output_offset + row * hidden_size * sizeof(float),
+                    eps, 0, 1.0f, TERMITE_METAL_COMPUTE_SOURCE_FFN,
+                    TERMITE_METAL_COMPUTE_REGION_FFN, -20);
+                if (status != 0) return status;
+            }
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -23);
         }
 
