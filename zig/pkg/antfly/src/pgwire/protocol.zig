@@ -1290,13 +1290,13 @@ pub const Session = struct {
     fn fillCursor(self: *Session, cursor: *SqlCursor, through: usize) !void {
         const spool = &cursor.spool.?;
         const req = self.cursorRequest(cursor);
-        while (!cursor.exhausted and spool.rows.items.len < through) {
+        while (!cursor.exhausted and spool.row_count < through) {
             try req.check();
             const stream = cursor.stream orelse return error.InvalidResult;
             {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
-                const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
+                const wanted: u32 = @intCast(@min(through - spool.row_count, @min(self.limits.result_rows, 256)));
                 var page = try stream.next(stream.context, arena.allocator(), req, wanted);
                 defer page.result.deinit();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
@@ -1324,7 +1324,7 @@ pub const Session = struct {
         var target: i64 = switch (fetch.direction) {
             .forward => spool.position +| @as(i64, if (fetch.count == 0) 0 else 1),
             .backward => spool.position -| @as(i64, if (fetch.count == 0) 0 else 1),
-            .absolute => if (fetch.offset < 0) @as(i64, @intCast(spool.rows.items.len)) + 1 +| fetch.offset else fetch.offset,
+            .absolute => if (fetch.offset < 0) @as(i64, @intCast(spool.row_count)) + 1 +| fetch.offset else fetch.offset,
             .relative => spool.position +| fetch.offset,
         };
         const single = fetch.direction == .absolute or fetch.direction == .relative or fetch.count == 0;
@@ -1335,21 +1335,22 @@ pub const Session = struct {
         defer row_bytes.deinit();
         while (remaining != 0) : (remaining -= 1) {
             try req.check();
-            if (target > 0 and @as(u64, @intCast(target)) > spool.rows.items.len and !cursor.exhausted) {
+            if (target > 0 and @as(u64, @intCast(target)) > spool.row_count and !cursor.exhausted) {
                 const wanted: usize = @intCast(@min(@as(u64, @intCast(target)) +| @min(remaining - 1, 255), std.math.maxInt(usize)));
                 try self.fillCursor(cursor, wanted);
             }
-            const end: i64 = @intCast(spool.rows.items.len + 1);
+            const end: i64 = @intCast(spool.row_count + 1);
             spool.position = std.math.clamp(target, 0, end);
             if (target <= 0 or target >= end) break;
             if (emitted != 0 and emitted % 256 == 0) {
                 _ = validation.reset(.retain_capacity);
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
             }
-            const row = spool.rows.items[@intCast(target - 1)];
             if (!fetch.move) {
                 row_bytes.writer.end = 0;
-                try self.encodeDataRow(&row_bytes, cursor.description.columns, &.{}, row.values, row.nulls);
+                try row_bytes.writer.writeInt(u16, @intCast(cursor.description.columns.len), .big);
+                for (cursor.description.columns, 0..) |column, index| try self.appendDataCell(&row_bytes, self.alloc, column, 0, try spool.cell(@intCast(target - 1), index), cursor.description.columns.len - index);
+                if (row_bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
                 try self.message('D', row_bytes.written());
                 self.trimRowBuffer(&row_bytes);
             }
@@ -1659,6 +1660,23 @@ pub const Session = struct {
         }
         if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
     }
+    fn appendDataCell(self: *Session, bytes: *std.Io.Writer.Allocating, scratch: std.mem.Allocator, column: backend.Column, format: u16, value: backend.Cell, remaining_columns: usize) !void {
+        const payload_limit = self.limits.frame_bytes -| 4;
+        const remaining_headers = std.math.mul(usize, remaining_columns, 4) catch return error.ProgramLimitExceeded;
+        if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+        const cell_limit = payload_limit - bytes.written().len - remaining_headers;
+        if (value.sql_null) {
+            if (value.value != .null or value.array != null or value.numeric != null) return error.InvalidResult;
+            try bytes.writer.writeInt(i32, -1, .big);
+            return;
+        }
+        const position = bytes.written().len;
+        try bytes.writer.writeInt(i32, 0, .big);
+        try values.encodeCellInto(scratch, &bytes.writer, column, format, value, cell_limit);
+        const length = bytes.written().len - position - 4;
+        if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
+        std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
+    }
     fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
         const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
         if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
@@ -1671,22 +1689,8 @@ pub const Session = struct {
             bytes.writer.end = 0;
             try bytes.writer.writeInt(u16, @intCast(result.columns.len), .big);
             for (result.columns, 0..) |column, index| {
-                const payload_limit = self.limits.frame_bytes -| 4;
-                const remaining_headers = (result.columns.len - index) * 4;
-                if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
-                const cell_limit = payload_limit - bytes.written().len - remaining_headers;
                 const value = try result.cell(scratch.allocator(), row, index);
-                if (value.sql_null) {
-                    if (value.value != .null or value.array != null or value.numeric != null) return error.InvalidResult;
-                    try bytes.writer.writeInt(i32, -1, .big);
-                    continue;
-                }
-                const position = bytes.written().len;
-                try bytes.writer.writeInt(i32, 0, .big);
-                try values.encodeCellInto(scratch.allocator(), &bytes.writer, column, formatAt(formats, index), value, cell_limit);
-                const length = bytes.written().len - position - 4;
-                if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
-                std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
+                try self.appendDataCell(&bytes, scratch.allocator(), column, formatAt(formats, index), value, result.columns.len - index);
             }
             if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
             try self.message('D', bytes.written());

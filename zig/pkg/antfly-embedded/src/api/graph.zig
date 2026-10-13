@@ -2430,3 +2430,19 @@ test "public graph metric borrowed wire reverse-only contributions fence data cu
     try std.testing.expectEqual(partial.resume_cursor.?.read_generation, fresh.resume_cursor.?.read_generation);
     try std.testing.expect(partial.resume_cursor.?.reverse_generation != fresh.resume_cursor.?.reverse_generation);
 }
+
+test "public graph metric borrowed wire contributor selection retains pinned snapshot" {
+    const a = std.testing.allocator;
+    var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem, .ttl_duration_ns = 1000 });
+    defer index.close();
+    try index.batchApply(&.{.{ .source = "root", .target = "a", .edge_type = "R", .weight = 1, .ttl_created_ns = 1 }}, &.{});
+    try index.replaceContributionSnapshots(&.{.{ .source = "root", .target = "a", .edge_type = "R", .owner = "producer", .contributions = &.{.{ .state_key = "state", .source_priority = 1, .weight = 2, .created_at = 0, .updated_at = 0, .ttl_created_ns = 1, .metadata_json = "{}" }} }});
+    var pinned = try index.beginEdgeReadContextWithProof(.out);
+    defer pinned.deinit();
+    try index.replaceContributionSnapshots(&.{.{ .source = "root", .target = "a", .edge_type = "R", .owner = "producer", .contributions = &.{.{ .state_key = "state", .source_priority = 1, .weight = 3, .created_at = 0, .updated_at = 0, .ttl_created_ns = 1, .metadata_json = "{}" }} }});
+    var page = try pinned.getPage(a, "root", &.{"R"}, null, .{ .max_edges = 10, .max_owned_bytes = 4096, .max_scanned_rows = 100 }, 10, null);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), page.edges.len);
+    std.debug.print("PINNED_CONTRIBUTOR_SNAPSHOT expected=2 observed={d}\n", .{page.edges[0].weight});
+    try std.testing.expectEqual(@as(f64, 2), page.edges[0].weight);
+}

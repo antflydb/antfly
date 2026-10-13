@@ -15586,9 +15586,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
             const streamed_cell = try page.result.cell(array_alloc, 0, 0);
             try std.testing.expect(!streamed_cell.sql_null);
-            var streamed = try sources.sql_array_wire.decode(alloc, .int64, streamed_cell.value, .{});
-            defer streamed.deinit();
-            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
+            const streamed = streamed_cell.array orelse return error.ExpectedNativeArrayCell;
+            try std.testing.expect(!streamed_cell.sql_null and streamed_cell.value == .null);
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.*, &work));
         };
         {
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;

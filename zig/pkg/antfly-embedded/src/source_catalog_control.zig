@@ -412,6 +412,7 @@ pub const storage_db_query_json_view = @import("storage/db/query/json_view.zig")
 pub const storage_db_query_projection = @import("storage/db/query/projection.zig");
 pub const storage_db_query_relational_projection = @import("storage/db/query/relational_projection.zig");
 pub const storage_db_query_result_shape = @import("storage/db/query/result_shape.zig");
+pub const storage_db_query_document_authority = @import("storage/db/query/document_authority.zig");
 pub const storage_db_query_search_exec = @import("storage/db/query/search_exec.zig");
 pub const storage_db_query_structured_filter_validation = @import("storage/db/query/structured_filter_validation.zig");
 pub const storage_db_query_metrics = @import("storage/db/query_metrics.zig");

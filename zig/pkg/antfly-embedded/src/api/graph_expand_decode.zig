@@ -21,7 +21,7 @@ const query = graph.graph_query_mod;
 const types = graph.db_mod.types;
 const Allocator = std.mem.Allocator;
 
-const NodeBuilder = struct {
+pub const NodeBuilder = struct {
     a: Allocator,
     nodes: std.ArrayListUnmanaged(query.GraphResultNode) = .empty,
     owner: ?*query.GraphMetricColumns = null,
@@ -31,7 +31,7 @@ const NodeBuilder = struct {
     names: std.ArrayListUnmanaged([]u8) = .empty,
     interned: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.nodes.items) |*node| node.deinit(self.a);
         self.nodes.deinit(self.a);
         if (self.owner) |owner| owner.deinit(self.a);
@@ -95,7 +95,7 @@ const NodeBuilder = struct {
         owner.rows = rows;
         self.total_rows = rows;
     }
-    fn append(self: *@This(), source: query.GraphResultNode) !void {
+    pub fn append(self: *@This(), source: query.GraphResultNode) !void {
         if (self.nodes.items.len >= std.math.maxInt(u32)) return error.InvalidRemoteResponse;
         try self.nodes.ensureUnusedCapacity(self.a, 1);
         if (self.owner == null and self.nodes.items.len == 0) self.total_rows = self.nodes.capacity;
@@ -131,7 +131,7 @@ const NodeBuilder = struct {
         }
         self.nodes.appendAssumeCapacity(node);
     }
-    fn finish(self: *@This()) !graph.OwnedGraphNodes {
+    pub fn finish(self: *@This()) !graph.OwnedGraphNodes {
         try self.resizeColumns(self.nodes.items.len);
         const nodes = try self.nodes.toOwnedSlice(self.a);
         errdefer {
@@ -160,6 +160,7 @@ const NodeCounter = struct {
     depth: usize = 0,
     quoted: bool = false,
     count: usize = 0,
+    minimum_row_bytes: usize = 33,
     inline fn event(self: *@This(), byte: u8, offset: usize) !bool {
         if (byte == '"') {
             self.quoted = !self.quoted;
@@ -180,7 +181,7 @@ const NodeCounter = struct {
                 if (self.depth == 0) {
                     if (byte != ']') return error.SyntaxError;
                     // Required key/depth/distance occupy at least 33 bytes.
-                    if (self.count > (offset + 1) / 33) return error.MissingField;
+                    if (self.count > (offset + 1) / self.minimum_row_bytes) return error.MissingField;
                     return true;
                 }
             },
@@ -191,7 +192,11 @@ const NodeCounter = struct {
 };
 
 fn countNodes(input: []const u8) !usize {
-    var state = NodeCounter{};
+    return countObjectRows(input, 33);
+}
+pub fn countObjectRows(input: []const u8, minimum_row_bytes: usize) !usize {
+    std.debug.assert(minimum_row_bytes > 0);
+    var state = NodeCounter{ .minimum_row_bytes = minimum_row_bytes };
     var offset: usize = 0;
     var skip_first = false;
     // SIMD identifies punctuation once per block. Only those bytes affect

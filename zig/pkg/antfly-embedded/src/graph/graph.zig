@@ -1425,7 +1425,7 @@ pub const GraphIndex = struct {
         errdefer if (reads.outgoing) |*txn| txn.abort();
         if (direction != .in) reads.outgoing = if (self.ownership_handoff) |handoff| try handoff.outgoing.forkRead() else try self.beginOwnershipRead(false);
         if (builtin.is_test) if (test_ownership_read_pair_hook) |hook| hook(self);
-        if (direction != .out) reads.incoming = if (self.ownership_handoff) |handoff| try handoff.reverse.forkRead() else try self.beginOwnershipRead(true);
+        if (direction != .out or self.needsContributorSelection()) reads.incoming = if (self.ownership_handoff) |handoff| try handoff.reverse.forkRead() else try self.beginOwnershipRead(true);
         return reads;
     }
 
@@ -8282,11 +8282,12 @@ pub const GraphIndex = struct {
 
     const LiveEdgeSelection = struct {
         value: []u8,
+        value_owned: bool = true,
         rank: u64 = std.math.maxInt(u64),
         key_hex: []const u8 = "",
 
         pub fn deinit(self: @This(), alloc: Allocator) void {
-            alloc.free(self.value);
+            if (self.value_owned) alloc.free(self.value);
             if (self.key_hex.len > 0) alloc.free(self.key_hex);
         }
     };
@@ -8329,10 +8330,10 @@ pub const GraphIndex = struct {
         return try self.liveEdgeSelectionInTxnAlloc(alloc, &txn, now_ns, source, edge_type, target, projected, edge_id, owner_document, .edge, budget);
     }
 
-    const SelectionMode = enum { value, edge, presence };
+    const SelectionMode = enum { value, edge, borrowed_edge, presence };
 
     fn liveEdgeSelectionInTxnAlloc(self: *GraphIndex, alloc: Allocator, txn: *backend_erased.ReadTxn, now_ns: u64, source: []const u8, edge_type: []const u8, target: []const u8, projected: []const u8, edge_id: []const u8, owner_document: []const u8, mode: SelectionMode, supplied_budget: ?*SelectionBudget) !?LiveEdgeSelection {
-        const include_order = mode == .edge;
+        const include_order = mode == .edge or mode == .borrowed_edge;
         var local_rows: usize = 0;
         var local_budget = SelectionBudget{ .rows = &local_rows, .limit = @import("work_budget.zig").default_max_explored_edges };
         const budget = supplied_budget orelse &local_budget;
@@ -8348,7 +8349,7 @@ pub const GraphIndex = struct {
             if (self.edgeExpiredAt(try decodeEdgeValue(projected), now_ns)) return null;
             if (mode == .presence) return .{ .value = &.{} };
             if (try selectionOwnedBytes(source, edge_type, target, projected, 0, include_order) > budget.max_selection_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
-            return .{ .value = try alloc.dupe(u8, projected) };
+            return .{ .value = if (mode == .borrowed_edge) @constCast(projected) else try alloc.dupe(u8, projected), .value_owned = mode != .borrowed_edge };
         }
         const prefix = try std.mem.concat(alloc, u8, &.{ edge_prefix, &.{1} });
         defer alloc.free(prefix);
@@ -8383,8 +8384,8 @@ pub const GraphIndex = struct {
         if (winner.len < 8) return error.InvalidGraphEdgeValue;
         const borrowed_value = winner[8..];
         if (try selectionOwnedBytes(source, edge_type, target, borrowed_value, winner_key.len - prefix.len, include_order) > budget.max_selection_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
-        const value = try alloc.dupe(u8, borrowed_value);
-        errdefer alloc.free(value);
+        const value = if (mode == .borrowed_edge) @constCast(borrowed_value) else try alloc.dupe(u8, borrowed_value);
+        errdefer if (mode != .borrowed_edge) alloc.free(value);
         if (!include_order) return .{ .value = value };
         const selected_key = winner_key[prefix.len..];
         const hex = try alloc.alloc(u8, selected_key.len * 2);
@@ -8393,7 +8394,7 @@ pub const GraphIndex = struct {
             hex[2 * i] = digits[byte >> 4];
             hex[2 * i + 1] = digits[byte & 0xf];
         }
-        return .{ .value = value, .rank = best_priority_rank, .key_hex = hex };
+        return .{ .value = value, .value_owned = mode != .borrowed_edge, .rank = best_priority_rank, .key_hex = hex };
     }
 
     fn reverseEdgeExpired(self: *GraphIndex, txn: *backend_erased.ReadTxn, key: []const u8) !bool {
@@ -8583,6 +8584,7 @@ pub const GraphIndex = struct {
                 const capped = try self.scanEdgePagePhase(
                     alloc,
                     if (phase == .out) &reads.outgoing.? else &reads.incoming.?,
+                    if (reads.incoming) |*reverse| reverse else null,
                     &results,
                     &owned_bytes,
                     &scanned_rows,
@@ -8878,7 +8880,7 @@ pub const GraphIndex = struct {
                             self.entry_charged = true;
                         }
                         var selection_budget = SelectionBudget{ .rows = &self.physical_rows_scanned, .limit = @import("work_budget.zig").default_max_explored_edges, .work = self.work_budget };
-                        if (try self.index.appendAdmittedEdge(a, &results, &owned_bytes, entry, self.phase, self.direction == .both and self.phase == .in, bytes, self.now_ns, &selection_budget) == .full) break;
+                        if (try self.index.appendAdmittedEdge(a, if (self.incoming) |*reverse| reverse else null, &results, &owned_bytes, entry, self.phase, self.direction == .both and self.phase == .in, bytes, self.now_ns, &selection_budget) == .full) break;
                         // Do not advance into (or decode) the unrequested tail.
                         self.advance = true;
                         continue;
@@ -8913,6 +8915,7 @@ pub const GraphIndex = struct {
         self: *GraphIndex,
         alloc: Allocator,
         txn: *backend_erased.ReadTxn,
+        selection_txn: ?*backend_erased.ReadTxn,
         results: *std.ArrayListUnmanaged(Edge),
         owned_bytes: *usize,
         scanned_rows: *usize,
@@ -8965,7 +8968,7 @@ pub const GraphIndex = struct {
 
             scanned_rows.* += 1;
             var selection_budget = SelectionBudget{ .rows = scanned_rows, .limit = limits.max_scanned_rows };
-            switch (try self.appendAdmittedEdge(alloc, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget)) {
+            switch (try self.appendAdmittedEdge(alloc, selection_txn, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget)) {
                 .full => {
                     // The next page will fetch this row again. Both backend
                     // visits count against the physical scan budget.
@@ -8992,12 +8995,12 @@ pub const GraphIndex = struct {
 
     /// Shared by RPC pages and retained native scans. No owned edge allocation
     /// takes place until the complete decoded edge fits the remaining budget.
-    fn appendAdmittedEdge(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget) !EdgeAdmission {
+    fn appendAdmittedEdge(self: *GraphIndex, alloc: Allocator, selection_txn: ?*backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget) !EdgeAdmission {
         const key = BorrowedEdgeKey.parse(entry.key, phase) orelse return .skipped;
         if (skip_self_loops and std.mem.eql(u8, key.source, key.target)) return .skipped;
         var selection: ?LiveEdgeSelection = null;
         defer if (selection) |owned| owned.deinit(alloc);
-        const selected = if (self.needsContributorSelection()) blk: {
+        const selected = if (selection_txn != null and self.needsContributorSelection()) blk: {
             const source_key = try BorrowedEdgeKey.decode(alloc, key.source);
             defer alloc.free(source_key);
             const target_key = try BorrowedEdgeKey.decode(alloc, key.target);
@@ -9009,7 +9012,7 @@ pub const GraphIndex = struct {
             const relationship_owner = try BorrowedEdgeKey.decode(alloc, key.owner_document);
             defer alloc.free(relationship_owner);
             budget.max_selection_bytes = max_bytes - owned_bytes.*;
-            selection = self.liveEdgeSelectionWithBudgetAllocAt(alloc, now_ns, source_key, kind, target_key, entry.value, relationship_id, relationship_owner, budget) catch |err| {
+            selection = self.liveEdgeSelectionInTxnAlloc(alloc, selection_txn.?, now_ns, source_key, kind, target_key, entry.value, relationship_id, relationship_owner, .borrowed_edge, budget) catch |err| {
                 if (err == error.GraphExploredEdgeBytesBudgetExceeded and results.items.len != 0) return .full;
                 return err;
             };
@@ -9118,9 +9121,9 @@ pub const GraphIndex = struct {
         const values = try alloc.alloc(?[]const u8, keys.len);
         defer alloc.free(values);
 
-        var txn = try self.beginReadOutgoingTxn();
-        defer txn.abort();
-        try txn.getManySorted(sorted_key_refs, values);
+        var reads = try self.beginReadEdgeTxns(.out);
+        defer reads.deinit();
+        try reads.outgoing.?.getManySorted(sorted_key_refs, values);
 
         errdefer {
             for (results) |maybe_edge| if (maybe_edge) |edge| freeEdge(alloc, edge);
@@ -9133,9 +9136,9 @@ pub const GraphIndex = struct {
             const probe = probes[item.result_index];
             var selection: ?LiveEdgeSelection = null;
             defer if (selection) |owned| owned.deinit(alloc);
-            const selected = if (self.needsContributorSelection()) blk: {
+            const selected = if (reads.incoming != null and self.needsContributorSelection()) blk: {
                 selection_budget.max_selection_bytes = max_owned_bytes -| owned_bytes;
-                selection = (try self.liveEdgeSelectionWithBudgetAllocAt(alloc, now_ns, probe.source, probe.edge_type, probe.target, value, probe.edge_id, probe.owner_document, &selection_budget)) orelse continue;
+                selection = (try self.liveEdgeSelectionInTxnAlloc(alloc, &reads.incoming.?, now_ns, probe.source, probe.edge_type, probe.target, value, probe.edge_id, probe.owner_document, .borrowed_edge, &selection_budget)) orelse continue;
                 break :blk selection.?.value;
             } else value;
             const decoded = try decodeEdgeValue(selected);

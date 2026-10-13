@@ -33,6 +33,7 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = query;
+    _ = antfly_sources.table_reads.document_hydration_tests;
     _ = distributed_graph;
     _ = openapi_contract;
     _ = indexes;

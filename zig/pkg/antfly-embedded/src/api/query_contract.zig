@@ -570,6 +570,8 @@ pub const OwnedNativeDocIdConstraintEnvelope = struct {
 };
 
 pub const AlgebraicVectorWorkerRequestOptions = struct {
+    document_authority_mode: db_mod.types.document_authority.Mode = .none,
+    document_authority_group: u64 = 0,
     fields: [][]const u8 = &.{},
     filter_prefix: []const u8 = "",
     filter_query_json: []const u8 = "",
@@ -1514,6 +1516,10 @@ fn appendAlgebraicVectorWorkerRequestOptions(
     if (options.require_algebraic_filter_resolution) try appendJsonFieldBool(alloc, out, &first, "require_algebraic_filter_resolution", true);
     if (!options.include_all_fields) try appendJsonFieldBool(alloc, out, &first, "include_all_fields", false);
     if (options.defer_stored_projection) try appendJsonFieldBool(alloc, out, &first, "defer_stored_projection", true);
+    if (options.document_authority_mode != .none) {
+        try appendJsonFieldString(alloc, out, &first, "document_authority_mode", @tagName(options.document_authority_mode));
+        try appendJsonFieldU64(alloc, out, &first, "document_authority_group", options.document_authority_group);
+    }
     try appendJsonFieldUsize(alloc, out, &first, "limit", options.limit);
     if (options.offset != 0) try appendJsonFieldUsize(alloc, out, &first, "offset", options.offset);
     if (options.count_only) try appendJsonFieldBool(alloc, out, &first, "count_only", true);
@@ -1627,6 +1633,8 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         .require_algebraic_filter_resolution = require_algebraic_filter_resolution,
         .include_all_fields = try parseOptionalBoolJson(value.object.get("include_all_fields"), true),
         .defer_stored_projection = try parseOptionalBoolJson(value.object.get("defer_stored_projection"), false),
+        .document_authority_mode = if (value.object.get("document_authority_mode")) |mode| if (mode == .string) std.meta.stringToEnum(db_mod.types.document_authority.Mode, mode.string) orelse return error.InvalidQueryRequest else return error.InvalidQueryRequest else .none,
+        .document_authority_group = if (value.object.get("document_authority_group")) |group| std.json.parseFromValueLeaky(u64, alloc, group, .{}) catch return error.InvalidQueryRequest else 0,
         .limit = try parseOptionalU32Json(value.object.get("limit"), 10),
         .offset = try parseOptionalU32Json(value.object.get("offset"), 0),
         .count_only = try parseOptionalBoolJson(value.object.get("count_only"), false),
@@ -1962,6 +1970,8 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const OwnedAlgebraicVect
             .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
             .include_all_fields = envelope.options.include_all_fields,
             .defer_stored_projection = envelope.options.defer_stored_projection,
+            .document_authority_mode = envelope.options.document_authority_mode,
+            .document_authority_group = envelope.options.document_authority_group,
             .search_effort = envelope.options.search_effort,
             .distance_over = envelope.options.distance_over,
             .distance_under = envelope.options.distance_under,
@@ -2000,6 +2010,8 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const OwnedAlgebraicVect
             .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
             .include_all_fields = envelope.options.include_all_fields,
             .defer_stored_projection = envelope.options.defer_stored_projection,
+            .document_authority_mode = envelope.options.document_authority_mode,
+            .document_authority_group = envelope.options.document_authority_group,
             .search_effort = envelope.options.search_effort,
             .distance_over = envelope.options.distance_over,
             .distance_under = envelope.options.distance_under,
@@ -2795,6 +2807,19 @@ pub fn parseQueryRequestWithDeadline(
             owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
             try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+    }
+    if (std.mem.indexOf(u8, body, "_document_authority") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_document_authority")) |value| {
+            var control = try std.json.parseFromValue(struct { mode: db_mod.types.document_authority.Mode, group: u64, defer_stored_projection: bool = false }, alloc, value, .{});
+            defer control.deinit();
+            if (control.value.mode == .none or control.value.group == 0) return error.InvalidQueryRequest;
+            owned.req.include_stored = false;
+            owned.req.document_authority_mode = control.value.mode;
+            owned.req.document_authority_group = control.value.group;
+            owned.req.defer_stored_projection = control.value.defer_stored_projection;
         };
     }
     return owned;
@@ -4105,7 +4130,7 @@ pub fn encodeQueryResponsesWithDelivery(
     else
         null;
 
-    const profile = if (req.profile) try buildProfileValue(arena, req, meta, result) else null;
+    const profile = if (req.profile or result.document_authority_version != 0) try buildProfileValue(arena, req, meta, result) else null;
     const graph_metric_results = if (result.graph_metric_results.len > 0)
         try buildGraphMetricResults(arena, result.graph_metric_results)
     else
@@ -4195,13 +4220,19 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
-        ._source = if (hit.source_value) |value|
+        ._source = if (req.document_authority_mode != .none and hit.document_authority != null) private: {
+            const envelope = try db_mod.types.document_authority.encode(alloc, hit.document_authority.?.*, hit.stored_data);
+            defer alloc.free(envelope);
+            break :private try takeOpenApiObjectMap(alloc, try parseStoredSourceValue(alloc, envelope));
+        } else if (hit.source_value) |value|
             (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, value, .{
                 .fields = req.fields,
                 .include_all_fields = req.include_all_fields,
             })) else null)
         else if (hit.stored_data) |stored_data|
-            try takeOpenApiObjectMap(alloc, if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
+            try takeOpenApiObjectMap(alloc, if (req.document_authority_mode != .none)
+                try parseStoredSourceValue(alloc, stored_data)
+            else if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
                 // Deferred unit grouping uses `_source` as a private shard-to-
                 // coordinator revision envelope. Projecting it by public unit
                 // fields would turn it into `{}` and defeat revision binding.
@@ -6628,6 +6659,7 @@ fn buildProfileValue(
         if (parsed.value != .object) return error.InvalidQueryRequest;
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
     }
+    if (result.document_authority_version != 0) try parsed.value.object.put(alloc, "document_authority_version", .{ .integer = result.document_authority_version });
     return parsed.value;
 }
 
@@ -12086,6 +12118,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_document_authority",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -12429,6 +12462,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_document_authority",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -19573,4 +19607,20 @@ test "api query contract typed tensor envelope cloning preserves the wire and ow
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{program});
     const malformed = algebraic_ir.TensorProgram{ .steps = &.{.{ .expr = source, .inputs = &.{.{ .step = 0 }} }}, .output = .{ .step = 0 } };
     try std.testing.expectError(error.InvalidQueryRequest, cloneAlgebraicTensorProgramEnvelopeAlloc(std.testing.allocator, malformed));
+}
+
+test "public graph metric borrowed wire vector document authority supports full width owner identities" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"document_authority_mode\":\"candidates\",\"document_authority_group\":18446744073709551615}", .{});
+    defer parsed.deinit();
+    const options = try parseAlgebraicVectorWorkerRequestOptions(a, parsed.value);
+    defer {
+        freeOwnedStringSlice(a, options.fields);
+        if (options.filter_prefix.len != 0) a.free(options.filter_prefix);
+        a.free(options.filter_ids);
+        a.free(options.exclude_ids);
+        freeOwnedStringSlice(a, options.hierarchy_match_fields);
+    }
+    try std.testing.expectEqual(db_mod.types.document_authority.Mode.candidates, options.document_authority_mode);
+    try std.testing.expectEqual(std.math.maxInt(u64), options.document_authority_group);
 }
