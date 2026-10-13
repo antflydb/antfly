@@ -680,6 +680,11 @@ in [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md#benchmark-contract).
 - Small-table query variability and slower reclamation/churn before any broader
   default promotion (see [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md#open-work)).
 - The shared post-churn identity-lookup cost above.
+- Separate foreground and idle source-GC copy budgets remain unimplemented:
+  background steps use one `ANTFLY_SOURCE_VECTOR_GC_STEP_BYTES` budget (capped at
+  8 MiB), so sparse-only fallback can still copy during foreground work, and
+  copy-set construction and sorting remain locked
+  ([history](../docs/design/vector-store/history/experiments-2026-09.md)).
 - Finish the failure/lifetime audit in [Correctness boundaries](#correctness-boundaries)
   before adding another ownership or publication mechanism. A fully incremental
   owner-delta collector would need primary/ANN reconciliation and restart proofs.
