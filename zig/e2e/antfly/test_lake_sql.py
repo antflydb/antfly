@@ -2222,7 +2222,10 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if "file" in document and "segments" in document:
-                        manifests[hashlib.sha256(encoded).hexdigest()] = (document, len(encoded))
+                        manifests[hashlib.sha256(encoded).hexdigest()] = (
+                            document,
+                            len(encoded),
+                        )
                     elif "file_groups" in document or "file_states" in document:
                         roots.append(document)
 
@@ -2237,9 +2240,9 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 for _ in range(count):
                     key_size, value_size = struct.unpack_from("<II", page, offset)
                     offset += 8
-                    key = page[offset:offset + key_size]
+                    key = page[offset : offset + key_size]
                     offset += key_size
-                    value = page[offset:offset + value_size]
+                    value = page[offset : offset + value_size]
                     offset += value_size
                     assert len(key) == key_size and len(value) == value_size
                     if ref["height"]:
@@ -2266,7 +2269,9 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 if document.get("inventory_version") == 3:
                     chunks = {}
                     file_root = document["directories"]["files"]
-                    for key, value in records(file_root, document["domain"]) if file_root else ():
+                    for key, value in (
+                        records(file_root, document["domain"]) if file_root else ()
+                    ):
                         assert len(key) == 36
                         chunk = chunks.setdefault(key[:32], bytearray())
                         assert int.from_bytes(key[32:], "big") == len(chunk)
@@ -2274,7 +2279,10 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                     groups = []
                     for identity, encoded in chunks.items():
                         file = json.loads(encoded)
-                        assert hashlib.sha256(file["file"]["id"].encode()).digest() == identity
+                        assert (
+                            hashlib.sha256(file["file"]["id"].encode()).digest()
+                            == identity
+                        )
                         group = manifest(file["manifest"])
                         assert group["file"]["id"] == file["file"]["id"]
                         assert group["file"]["digest"] == file["file"]["digest"]
@@ -3956,7 +3964,9 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
                 },
             },
         )
-        assert call("/sql", {"statement": "SELECT COUNT(*) FROM wide_join"})["rows"] == [[str(count)]]
+        assert call("/sql", {"statement": "SELECT COUNT(*) FROM wide_join"})[
+            "rows"
+        ] == [[str(count)]]
         query = (
             "SELECT "
             + ",".join(f"SUM(l.v{j})" for j in range(width))
@@ -4002,54 +4012,88 @@ def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp
 
     def put(name, body):
         path = tmp_path / name
-        pq.write_table(pa.table({"body": [body], "amount": [1]}), path, compression="snappy")
+        pq.write_table(
+            pa.table({"body": [body], "amount": [1]}), path, compression="snappy"
+        )
         payload = path.read_bytes()
         (objects / name).write_bytes(
-            b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
-            + hashlib.sha256(payload).hexdigest().encode() + payload
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
         )
 
     put("a.parquet", "x" * 262120 + " retainedneedle")
     put("b.parquet", "initial")
     server = StandaloneAntflyServer(
-        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
     )
     failed = True
     try:
+
         def call(method, path, body=None):
             response = requests.request(
-                method, server.api_url + path, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=90,
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=90,
             )
             assert response.ok, response.text + server.debug_logs()
             value = response.json() if response.content else None
-            return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
+            return (
+                value["responses"][0]
+                if isinstance(value, dict) and "responses" in value
+                else value
+            )
 
         def ready():
             deadline = time.monotonic() + 90
             while True:
                 resources = call("GET", "/tables/directory/indexes")
-                assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
-                if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+                assert all(
+                    r["status"]["readiness"]["state"] != "failed" for r in resources
+                ), str(resources) + server.debug_logs()
+                if resources and all(
+                    r["status"]["readiness"]["queryable"] for r in resources
+                ):
                     return
                 assert time.monotonic() < deadline, str(resources) + server.debug_logs()
                 time.sleep(0.1)
 
         def check():
             ready()
-            value = call("POST", "/tables/directory/query", {
-                "full_text_search": {"match": "retainedneedle", "field": "body"},
-                "full_text_index": "body_text", "fields": ["amount"], "limit": 10,
-            })
+            value = call(
+                "POST",
+                "/tables/directory/query",
+                {
+                    "full_text_search": {"match": "retainedneedle", "field": "body"},
+                    "full_text_index": "body_text",
+                    "fields": ["amount"],
+                    "limit": 10,
+                },
+            )
             assert len(value["hits"]["hits"]) == 1, value
 
-        call("POST", "/tables/directory", {
-            "num_shards": 1,
-            "schema": {"storage_mode": "relational", "base_source": {
-                "kind": "external", "table_id": "directory", "format": "parquet", "uri": root.as_uri(),
-            }},
-            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
-        })
+        call(
+            "POST",
+            "/tables/directory",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "directory",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
         check()
         for phase, name, body in (
             (1, "b.parquet", "replacement"),
@@ -4057,10 +4101,15 @@ def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp
             (3, "b.parquet", "another replacement"),
         ):
             put(name, body)
-            call("POST", f"/tables/directory/indexes/wake{phase}", {
-                "type": "algebraic", "derive_from_schema": True,
-                "aggregates": [{"name": "rows", "op": "count"}],
-            })
+            call(
+                "POST",
+                f"/tables/directory/indexes/wake{phase}",
+                {
+                    "type": "algebraic",
+                    "derive_from_schema": True,
+                    "aggregates": [{"name": "rows", "op": "count"}],
+                },
+            )
             check()
         failed = False
     finally:
@@ -4081,40 +4130,81 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
     physical_objects = []
     for part, begin in enumerate(range(0, count, 1000)):
         end = min(count, begin + 1000)
-        pq.write_table(pa.table({
-            "k": pa.array([0 if i < fanout else i for i in range(begin, end)], type=pa.int64()),
-            "v": pa.array(range(begin, end), type=pa.int64()),
-        }), path, compression="snappy", use_dictionary=False, row_group_size=256)
+        pq.write_table(
+            pa.table(
+                {
+                    "k": pa.array(
+                        [0 if i < fanout else i for i in range(begin, end)],
+                        type=pa.int64(),
+                    ),
+                    "v": pa.array(range(begin, end), type=pa.int64()),
+                }
+            ),
+            path,
+            compression="snappy",
+            use_dictionary=False,
+            row_group_size=256,
+        )
         payload = path.read_bytes()
-        header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+        header = (
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+        )
         object_path = objects / f"part-{part}.parquet"
         object_path.write_bytes(header + payload)
         physical_objects.append((object_path, header, payload))
     server = StandaloneAntflyServer(
-        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
     )
     failed = True
     try:
+
         def call(method, route, body=None):
-            response = requests.request(method, server.api_url + route, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
             assert response.ok, response.text + server.debug_logs()
             return response.json() if response.content else None
 
-        call("POST", "/tables/join_probe", {
-            "num_shards": 1,
-            "schema": {"storage_mode": "relational", "base_source": {
-                "kind": "external", "table_id": "join-probe", "format": "parquet", "uri": root.as_uri(),
-            }, "relational_indexes": [{
-                "name": "k_idx", "keys": [{"column": "k"}],
-                "include_columns": ["v"] if covering else [],
-            }]},
-        })
+        call(
+            "POST",
+            "/tables/join_probe",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "join-probe",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "k_idx",
+                            "keys": [{"column": "k"}],
+                            "include_columns": ["v"] if covering else [],
+                        }
+                    ],
+                },
+            },
+        )
         deadline = time.monotonic() + 90
         while True:
             resources = call("GET", "/tables/join_probe/indexes")
-            assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
-            if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+            assert all(
+                r["status"]["readiness"]["state"] != "failed" for r in resources
+            ), str(resources) + server.debug_logs()
+            if resources and all(
+                r["status"]["readiness"]["queryable"] for r in resources
+            ):
                 break
             assert time.monotonic() < deadline, str(resources) + server.debug_logs()
             time.sleep(0.1)
@@ -4122,25 +4212,52 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
             f"SELECT p.v, b.k FROM join_probe p JOIN (VALUES (-1),(0),({count - 1}),(0),(NULL)) b(k) "
             "ON p.k=b.k ORDER BY p.v, b.k"
         )
-        expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [[str(count - 1), str(count - 1)]]
-        assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [
+            [str(count - 1), str(count - 1)]
+        ]
+        assert (
+            call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"]
+            == expected
+        )
         # Beyond the former 65536-probe cutoff, keys remain a complete bounded
         # stream. Most miss; duplicates retain join multiplicity.
-        build_keys = list(range(count - 100, count)) + list(range(count + 1, count + 70001)) + [count - 1, None]
+        build_keys = (
+            list(range(count - 100, count))
+            + list(range(count + 1, count + 70001))
+            + [count - 1, None]
+        )
         build_root = tmp_path / "build-lake"
         build_objects = build_root / "buckets" / "antfly" / "objects"
         build_objects.mkdir(parents=True)
-        pq.write_table(pa.table({"k": pa.array(build_keys, type=pa.int64())}), path,
-            compression="snappy", row_group_size=512)
+        pq.write_table(
+            pa.table({"k": pa.array(build_keys, type=pa.int64())}),
+            path,
+            compression="snappy",
+            row_group_size=512,
+        )
         build_payload = path.read_bytes()
         (build_objects / "part.parquet").write_bytes(
-            b"AFOBJ001" + struct.pack("<QI", len(build_payload), 0)
-            + hashlib.sha256(build_payload).hexdigest().encode() + build_payload)
-        call("POST", "/tables/join_build", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "base_source": {
-                "kind": "external", "table_id": "join-build", "format": "parquet", "uri": build_root.as_uri(),
+            b"AFOBJ001"
+            + struct.pack("<QI", len(build_payload), 0)
+            + hashlib.sha256(build_payload).hexdigest().encode()
+            + build_payload
+        )
+        call(
+            "POST",
+            "/tables/join_build",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "join-build",
+                        "format": "parquet",
+                        "uri": build_root.as_uri(),
+                    },
+                },
             },
-        }})
+        )
         large_statement = "SELECT COUNT(*) FROM join_probe p JOIN (SELECT k FROM join_build) b ON p.k=b.k"
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
         server.pause()
@@ -4149,12 +4266,17 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
             # page unreadable. The leased covering index must satisfy the join.
             for object_path, header, payload in physical_objects:
                 footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
-                object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+                object_path.write_bytes(
+                    header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+                )
         for cached in list(server.root.rglob("lake-ranges")):
             if cached.is_dir():
                 shutil.rmtree(cached)
         server.resume()
-        assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        assert (
+            call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"]
+            == expected
+        )
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
         failed = False
     finally:
@@ -4175,53 +4297,113 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         targets = ["9007199254740993", "4095"]
         values = pa.array(keys, type=pa.int64())
     else:
-        keys = ["9007199254740993.125", "9007199254740993.124"] + [f"{i}.125" for i in range(2, count)]
+        keys = ["9007199254740993.125", "9007199254740993.124"] + [
+            f"{i}.125" for i in range(2, count)
+        ]
         targets = ["9007199254740993.125", "4095.125"]
         values = pa.array(keys, type=pa.string())
     path = tmp_path / "numeric.parquet"
-    pq.write_table(pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
-        path, compression="snappy", use_dictionary=False, row_group_size=256)
+    pq.write_table(
+        pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
+        path,
+        compression="snappy",
+        use_dictionary=False,
+        row_group_size=256,
+    )
     payload = path.read_bytes()
-    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
     object_path = objects / "part.parquet"
     object_path.write_bytes(header + payload)
     server = StandaloneAntflyServer(
-        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
     )
     failed = True
     try:
+
         def call(method, route, body=None):
-            response = requests.request(method, server.api_url + route, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
             assert response.ok, response.text + server.debug_logs()
             return response.json() if response.content else None
 
-        call("POST", "/tables/numeric_probe", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "default_type": "row",
-            "base_source": {"kind": "external", "table_id": "numeric-probe",
-                "format": "parquet", "uri": root.as_uri()},
-            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
-                "k": {"type": "number", "x-antfly-sql-type": "numeric"},
-                "v": {"type": "integer"},
-            }, "additionalProperties": False}}},
-            "relational_indexes": [{"name": "k_idx", "keys": [{"column": "k"}], "include_columns": ["v"]}],
-        }})
+        call(
+            "POST",
+            "/tables/numeric_probe",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-probe",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                    "v": {"type": "integer"},
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "k_idx",
+                            "keys": [{"column": "k"}],
+                            "include_columns": ["v"],
+                        }
+                    ],
+                },
+            },
+        )
         deadline = time.monotonic() + 90
         while True:
             resources = call("GET", "/tables/numeric_probe/indexes")
-            assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
-            if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+            assert all(
+                r["status"]["readiness"]["state"] != "failed" for r in resources
+            ), str(resources) + server.debug_logs()
+            if resources and all(
+                r["status"]["readiness"]["queryable"] for r in resources
+            ):
                 break
             assert time.monotonic() < deadline, str(resources) + server.debug_logs()
             time.sleep(0.1)
         terms = ",".join(f"(CAST('{key}' AS NUMERIC))" for key in targets + targets[:1])
         statement = f"SELECT p.v FROM numeric_probe p JOIN (VALUES {terms}) b(k) ON p.k=b.k ORDER BY p.v"
         expected = [["0"], ["0"], [str(count - 1)]]
-        predicate = f"SELECT v FROM numeric_probe WHERE k=CAST('{targets[0]}' AS NUMERIC)"
+        predicate = (
+            f"SELECT v FROM numeric_probe WHERE k=CAST('{targets[0]}' AS NUMERIC)"
+        )
         assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
-        assert call("POST", "/sql", {"statement": f"SELECT CAST('{targets[0]}' AS NUMERIC)"})["rows"] == [[targets[0]]]
-        assert call("POST", "/sql", {"statement": "SELECT k FROM numeric_probe WHERE v=0"})["rows"] == [[targets[0]]]
-        assert call("POST", "/sql", {"statement": f"SELECT k FROM (VALUES {terms}) b(k)"})["rows"] == [[key] for key in targets + targets[:1]]
+        assert call(
+            "POST", "/sql", {"statement": f"SELECT CAST('{targets[0]}' AS NUMERIC)"}
+        )["rows"] == [[targets[0]]]
+        assert call(
+            "POST", "/sql", {"statement": "SELECT k FROM numeric_probe WHERE v=0"}
+        )["rows"] == [[targets[0]]]
+        assert call(
+            "POST", "/sql", {"statement": f"SELECT k FROM (VALUES {terms}) b(k)"}
+        )["rows"] == [[key] for key in targets + targets[:1]]
         residual = statement.replace("ON p.k=b.k", "ON p.k+CAST('0' AS NUMERIC)=b.k")
         assert call("POST", "/sql", {"statement": residual})["rows"] == expected
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
@@ -4229,7 +4411,9 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         # Keep identity/footer intact but remove usable data pages, then drop
         # range caches. The repeated cold query must consume covering values.
         footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
-        object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+        object_path.write_bytes(
+            header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+        )
         for cached in server.root.rglob("lake-ranges"):
             if cached.is_dir():
                 shutil.rmtree(cached)
@@ -4238,52 +4422,127 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         # Exact standalone equality/range predicates must seek the same native
         # covering index; a residual scan cannot read the damaged data pages.
         assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
-        assert call("POST", "/sql", {"statement": f"SELECT v FROM numeric_probe WHERE k>CAST('{targets[0]}' AS NUMERIC)"})["rows"] == []
+        assert (
+            call(
+                "POST",
+                "/sql",
+                {
+                    "statement": f"SELECT v FROM numeric_probe WHERE k>CAST('{targets[0]}' AS NUMERIC)"
+                },
+            )["rows"]
+            == []
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)
 
 
 @pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
-def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(tmp_path, physical_type):
+def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
+    tmp_path, physical_type
+):
     """Independent Parquet values retain NUMERIC identity through publication and restart."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
-    keys = (["9007199254740992", "9007199254740993"] if physical_type == "integer"
-            else ["9007199254740993.124", "9007199254740993.125"])
-    values = pa.array([int(k) for k in keys] + [None], type=pa.int64()) if physical_type == "integer" else pa.array(keys + [None])
+    keys = (
+        ["9007199254740992", "9007199254740993"]
+        if physical_type == "integer"
+        else ["9007199254740993.124", "9007199254740993.125"]
+    )
+    values = (
+        pa.array([int(k) for k in keys] + [None], type=pa.int64())
+        if physical_type == "integer"
+        else pa.array(keys + [None])
+    )
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
     path = tmp_path / "numeric.parquet"
-    pq.write_table(pa.table({"k": values}), path, compression="snappy", use_dictionary=False)
+    pq.write_table(
+        pa.table({"k": values}), path, compression="snappy", use_dictionary=False
+    )
     payload = path.read_bytes()
-    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
     object_path = objects / "part.parquet"
     object_path.write_bytes(header + payload)
-    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
     failed = True
     try:
+
         def call(method, route, body=None):
-            response = requests.request(method, server.api_url + route, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
             assert response.ok, response.text + server.debug_logs()
             return response.json() if response.content else None
 
-        call("POST", "/tables/numeric_groups", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "default_type": "row",
-            "base_source": {"kind": "external", "table_id": "numeric-groups", "format": "parquet", "uri": root.as_uri()},
-            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
-                "k": {"type": "number", "x-antfly-sql-type": "numeric"}
-            }, "additionalProperties": False}}},
-        }, "indexes": {"stats": {"type": "algebraic", "derive_from_schema": True, "aggregates": [
-            {"name": "counts", "op": "count", "group_by": ["k"]},
-            *[{"name": op, "op": op, "measure": "k", "group_by": ["k"]} for op in ("sum", "min", "max")],
-        ]}}})
+        call(
+            "POST",
+            "/tables/numeric_groups",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-groups",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    }
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+                "indexes": {
+                    "stats": {
+                        "type": "algebraic",
+                        "derive_from_schema": True,
+                        "aggregates": [
+                            {"name": "counts", "op": "count", "group_by": ["k"]},
+                            *[
+                                {
+                                    "name": op,
+                                    "op": op,
+                                    "measure": "k",
+                                    "group_by": ["k"],
+                                }
+                                for op in ("sum", "min", "max")
+                            ],
+                        ],
+                    }
+                },
+            },
+        )
         deadline = time.monotonic() + 90
         while True:
             resource = call("GET", "/tables/numeric_groups/indexes/stats")
-            assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
+            assert resource["status"]["readiness"]["state"] != "failed", (
+                str(resource) + server.debug_logs()
+            )
             if resource["status"]["readiness"]["queryable"]:
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
@@ -4291,11 +4550,17 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(tmp_pat
         statement = "SELECT k, COUNT(*), SUM(k), MIN(k), MAX(k) FROM numeric_groups GROUP BY k ORDER BY k"
         expected = [[k, "1", k, k, k] for k in keys] + [[None, "1", None, None, None]]
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
-        residual = statement.replace("GROUP BY k", "GROUP BY k+CAST('0' AS NUMERIC)").replace("SELECT k,", "SELECT k+CAST('0' AS NUMERIC),").replace("ORDER BY k", "ORDER BY k+CAST('0' AS NUMERIC)")
+        residual = (
+            statement.replace("GROUP BY k", "GROUP BY k+CAST('0' AS NUMERIC)")
+            .replace("SELECT k,", "SELECT k+CAST('0' AS NUMERIC),")
+            .replace("ORDER BY k", "ORDER BY k+CAST('0' AS NUMERIC)")
+        )
         assert call("POST", "/sql", {"statement": residual})["rows"] == expected
         server.pause()
         footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
-        object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+        object_path.write_bytes(
+            header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+        )
         for cached in server.root.rglob("lake-ranges"):
             if cached.is_dir():
                 shutil.rmtree(cached)
@@ -4315,56 +4580,142 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
     objects.mkdir(parents=True)
     for part in range(67):
         path = tmp_path / "part.parquet"
-        rows = [{"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
-                for i in range(part * 3, part * 3 + 3)]
-        pq.write_table(pa.Table.from_pylist(rows), path, compression="snappy", row_group_size=2)
+        rows = [
+            {"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
+            for i in range(part * 3, part * 3 + 3)
+        ]
+        pq.write_table(
+            pa.Table.from_pylist(rows), path, compression="snappy", row_group_size=2
+        )
         payload = path.read_bytes()
         (objects / f"part-{part:03}.parquet").write_bytes(
-            b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
-            + hashlib.sha256(payload).hexdigest().encode() + payload
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
         )
-    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
     failed = True
     try:
+
         def call(method, route, body=None):
-            response = requests.request(method, server.api_url + route, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
             assert response.ok, response.text + server.debug_logs()
             value = response.json() if response.content else None
-            return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
+            return (
+                value["responses"][0]
+                if isinstance(value, dict) and "responses" in value
+                else value
+            )
 
-        call("POST", "/tables/paged_text", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "default_type": "doc",
-            "document_schemas": {"doc": {"schema": {"type": "object", "properties": {
-                "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
-                "body": {"type": "string", "x-antfly-field": {"type": "text"}},
-            }}}}, "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount"}], "include_columns": ["body"]}], "base_source": {
-                "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
-            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}, "stored_text": {"type": "full_text", "field": "body", "store_source": True}}})
+        call(
+            "POST",
+            "/tables/paged_text",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "amount_idx",
+                            "keys": [{"column": "amount"}],
+                            "include_columns": ["body"],
+                        }
+                    ],
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "paged-text",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {
+                    "body_text": {"type": "full_text", "field": "body"},
+                    "all_text": {"type": "full_text"},
+                    "stored_text": {
+                        "type": "full_text",
+                        "field": "body",
+                        "store_source": True,
+                    },
+                },
+            },
+        )
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
-            assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
+            assert resource["status"]["readiness"]["state"] != "failed", (
+                str(resource) + server.debug_logs()
+            )
             sortable = call("GET", "/tables/paged_text/indexes/all_text")
-            assert sortable["status"]["readiness"]["state"] != "failed", str(sortable) + server.debug_logs()
+            assert sortable["status"]["readiness"]["state"] != "failed", (
+                str(sortable) + server.debug_logs()
+            )
             stored = call("GET", "/tables/paged_text/indexes/stored_text")
             assert stored["config"]["store_source"] is True, stored
-            assert stored["status"]["readiness"]["state"] != "failed", str(stored) + server.debug_logs()
-            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored)):
+            assert stored["status"]["readiness"]["state"] != "failed", (
+                str(stored) + server.debug_logs()
+            )
+            if all(
+                item["status"]["readiness"]["queryable"]
+                for item in (resource, sortable, stored)
+            ):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
-        request = {"full_text_search": {"match": "quasar", "field": "body"},
-                   "full_text_index": "body_text", "fields": ["amount"], "limit": 201}
+        request = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "full_text_index": "body_text",
+            "fields": ["amount"],
+            "limit": 201,
+        }
         # Profiling deliberately uses full admission, providing an independent
         # score/tie oracle for the bounded coordinator and final hydration.
         oracle = call("POST", "/tables/paged_text/query", dict(request, profile=True))
-        expected = [(h["_id"], h["_score"], h["_source"]["amount"]) for h in oracle["hits"]["hits"]]
+        expected = [
+            (h["_id"], h["_score"], h["_source"]["amount"])
+            for h in oracle["hits"]["hits"]
+        ]
         assert len(expected) == 201
 
         def check():
-            result = call("POST", "/tables/paged_text/query", dict(request, limit=19, offset=61))
-            assert [(h["_id"], h["_score"], h["_source"]["amount"]) for h in result["hits"]["hits"]] == expected[61:80]
+            result = call(
+                "POST", "/tables/paged_text/query", dict(request, limit=19, offset=61)
+            )
+            assert [
+                (h["_id"], h["_score"], h["_source"]["amount"])
+                for h in result["hits"]["hits"]
+            ] == expected[61:80]
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
             assert total["value"] <= 201
@@ -4377,31 +4728,79 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                 {"highlight": {"fields": ["body"]}},
                 {"full_text_index": "stored_text", "highlight": {"fields": ["body"]}},
                 {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
-                {"exclusion_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
-                {"filter_query": {"range": {"path": "/amount", "gte": 50}},
-                 "exclusion_query": {"range": {"path": "/amount", "gte": 160}}},
-                {"order_by": [{"field": "amount", "desc": True}], "full_text_index": "all_text"},
-                {"filter_query": {"range": {"path": "/amount", "gte": 50}},
-                 "order_by": [{"field": "amount"}], "full_text_index": "all_text", "highlight": {"fields": ["body"]}},
+                {
+                    "exclusion_query": {
+                        "range": {"path": "/amount", "gte": 50, "lt": 160}
+                    }
+                },
+                {
+                    "filter_query": {"range": {"path": "/amount", "gte": 50}},
+                    "exclusion_query": {"range": {"path": "/amount", "gte": 160}},
+                },
+                {
+                    "order_by": [{"field": "amount", "desc": True}],
+                    "full_text_index": "all_text",
+                },
+                {
+                    "filter_query": {"range": {"path": "/amount", "gte": 50}},
+                    "order_by": [{"field": "amount"}],
+                    "full_text_index": "all_text",
+                    "highlight": {"fields": ["body"]},
+                },
             ]
             for shape in shapes:
                 query = dict(request, **shape, limit=7)
-                reference = call("POST", "/tables/paged_text/query", dict(query, profile=True))
+                reference = call(
+                    "POST", "/tables/paged_text/query", dict(query, profile=True)
+                )
                 actual = call("POST", "/tables/paged_text/query", query)
-                assert actual["hits"]["hits"] == reference["hits"]["hits"], (actual, reference)
+                assert actual["hits"]["hits"] == reference["hits"]["hits"], (
+                    actual,
+                    reference,
+                )
                 counted = call("POST", "/tables/paged_text/query", dict(query, limit=0))
-                assert counted["hits"]["total"] == call("POST", "/tables/paged_text/query", dict(query, limit=0, profile=True))["hits"]["total"]
+                assert (
+                    counted["hits"]["total"]
+                    == call(
+                        "POST",
+                        "/tables/paged_text/query",
+                        dict(query, limit=0, profile=True),
+                    )["hits"]["total"]
+                )
                 assert counted["hits"]["hits"] == []
-                assert all(set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"])
+                assert all(
+                    set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"]
+                )
                 if "highlight" in shape:
                     assert all(h["_highlights"]["body"] for h in actual["hits"]["hits"])
                 if "order_by" in shape:
                     cursor = actual["hits"]["hits"][-1]["_sort"]
-                    forward = dict(query, search_after=cursor, remote_snapshot=actual["remote_snapshot"])
+                    forward = dict(
+                        query,
+                        search_after=cursor,
+                        remote_snapshot=actual["remote_snapshot"],
+                    )
                     following = call("POST", "/tables/paged_text/query", forward)
-                    assert following["hits"]["hits"] == call("POST", "/tables/paged_text/query", dict(forward, profile=True))["hits"]["hits"]
-                    backward = dict(query, search_before=following["hits"]["hits"][0]["_sort"], remote_snapshot=following["remote_snapshot"])
-                    assert call("POST", "/tables/paged_text/query", backward)["hits"]["hits"] == actual["hits"]["hits"]
+                    assert (
+                        following["hits"]["hits"]
+                        == call(
+                            "POST",
+                            "/tables/paged_text/query",
+                            dict(forward, profile=True),
+                        )["hits"]["hits"]
+                    )
+                    backward = dict(
+                        query,
+                        search_before=following["hits"]["hits"][0]["_sort"],
+                        remote_snapshot=following["remote_snapshot"],
+                    )
+                    assert (
+                        call("POST", "/tables/paged_text/query", backward)["hits"][
+                            "hits"
+                        ]
+                        == actual["hits"]["hits"]
+                    )
+
         check()
         server.restart()
         check()
@@ -4411,39 +4810,98 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
 
 
 @pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
-def test_numeric_predicates_use_only_compatible_parquet_pruning(tmp_path, physical_type):
+def test_numeric_predicates_use_only_compatible_parquet_pruning(
+    tmp_path, physical_type
+):
     """Exact integer stats prune; eight-byte decimal strings never become int stats."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
-    keys = [9007199254740992, 9007199254740993] if physical_type == "integer" else [10000000, 99999999]
-    values = pa.array(keys, type=pa.int64()) if physical_type == "integer" else pa.array([str(k) for k in keys])
+    keys = (
+        [9007199254740992, 9007199254740993]
+        if physical_type == "integer"
+        else [10000000, 99999999]
+    )
+    values = (
+        pa.array(keys, type=pa.int64())
+        if physical_type == "integer"
+        else pa.array([str(k) for k in keys])
+    )
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
     path = tmp_path / "numbers.parquet"
-    pq.write_table(pa.table({"k": values}), path, compression=None, use_dictionary=False,
-                   write_page_index=True, data_page_version="2.0")
+    pq.write_table(
+        pa.table({"k": values}),
+        path,
+        compression=None,
+        use_dictionary=False,
+        write_page_index=True,
+        data_page_version="2.0",
+    )
     payload = path.read_bytes()
-    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
     object_path = objects / "part.parquet"
     object_path.write_bytes(header + payload)
-    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
     failed = True
     try:
+
         def call(route, body):
-            response = requests.post(server.api_url + route, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            response = requests.post(
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
             assert response.ok, response.text + server.debug_logs()
             return response.json()
-        call("/tables/numeric_pruning", {"num_shards": 1, "schema": {
-            "storage_mode": "relational", "default_type": "row",
-            "base_source": {"kind": "external", "table_id": "numeric-pruning", "format": "parquet", "uri": root.as_uri()},
-            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
-                "k": {"type": "number", "x-antfly-sql-type": "numeric"}
-            }, "additionalProperties": False}}},
-        }, "indexes": {}})
+
+        call(
+            "/tables/numeric_pruning",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-pruning",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    }
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+                "indexes": {},
+            },
+        )
         for key in keys:
-            assert call("/sql", {"statement": f"SELECT k FROM numeric_pruning WHERE k=CAST('{key}' AS NUMERIC)"})["rows"] == [[str(key)]]
+            assert call(
+                "/sql",
+                {
+                    "statement": f"SELECT k FROM numeric_pruning WHERE k=CAST('{key}' AS NUMERIC)"
+                },
+            )["rows"] == [[str(key)]]
         if physical_type == "integer":
             server.pause()
             # Column/offset indexes lie between data pages and the footer.
@@ -4453,7 +4911,11 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(tmp_path, physic
             for group in range(metadata.num_row_groups):
                 for column in range(metadata.row_group(group).num_columns):
                     chunk = metadata.row_group(group).column(column)
-                    start = chunk.dictionary_page_offset if chunk.has_dictionary_page else chunk.data_page_offset
+                    start = (
+                        chunk.dictionary_page_offset
+                        if chunk.has_dictionary_page
+                        else chunk.data_page_offset
+                    )
                     end = start + chunk.total_compressed_size
                     damaged[start:end] = b"\xff" * (end - start)
             unreadable_root = tmp_path / "unreadable"
@@ -4462,22 +4924,57 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(tmp_path, physic
             # Authenticate the deliberately unreadable source as a distinct
             # current snapshot, as the independent Bloom regression does.
             unreadable_objects.joinpath("part.parquet").write_bytes(
-                b"AFOBJ001" + struct.pack("<QI", len(damaged), 0)
-                + hashlib.sha256(damaged).hexdigest().encode() + damaged
+                b"AFOBJ001"
+                + struct.pack("<QI", len(damaged), 0)
+                + hashlib.sha256(damaged).hexdigest().encode()
+                + damaged
             )
             for cached in server.root.rglob("lake-ranges"):
                 if cached.is_dir():
                     shutil.rmtree(cached)
             server.resume()
-            call("/tables/numeric_pruning_unreadable", {"num_shards": 1, "schema": {
-                "storage_mode": "relational", "default_type": "row",
-                "base_source": {"kind": "external", "table_id": "numeric-pruning-unreadable", "format": "parquet", "uri": unreadable_root.as_uri()},
-                "document_schemas": {"row": {"schema": {"type": "object", "properties": {
-                    "k": {"type": "number", "x-antfly-sql-type": "numeric"}
-                }, "additionalProperties": False}}},
-            }, "indexes": {}})
-            for op, bound in ((">", "9007199254740993.125"), ("=", "9007199254740994"), ("<", "9007199254740991.875")):
-                assert call("/sql", {"statement": f"SELECT COUNT(*) FROM numeric_pruning_unreadable WHERE k{op}CAST('{bound}' AS NUMERIC)"})["rows"] == [["0"]]
+            call(
+                "/tables/numeric_pruning_unreadable",
+                {
+                    "num_shards": 1,
+                    "schema": {
+                        "storage_mode": "relational",
+                        "default_type": "row",
+                        "base_source": {
+                            "kind": "external",
+                            "table_id": "numeric-pruning-unreadable",
+                            "format": "parquet",
+                            "uri": unreadable_root.as_uri(),
+                        },
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "k": {
+                                            "type": "number",
+                                            "x-antfly-sql-type": "numeric",
+                                        }
+                                    },
+                                    "additionalProperties": False,
+                                }
+                            }
+                        },
+                    },
+                    "indexes": {},
+                },
+            )
+            for op, bound in (
+                (">", "9007199254740993.125"),
+                ("=", "9007199254740994"),
+                ("<", "9007199254740991.875"),
+            ):
+                assert call(
+                    "/sql",
+                    {
+                        "statement": f"SELECT COUNT(*) FROM numeric_pruning_unreadable WHERE k{op}CAST('{bound}' AS NUMERIC)"
+                    },
+                )["rows"] == [["0"]]
         failed = False
     finally:
         server.stop(test_failed=failed)
