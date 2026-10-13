@@ -195,14 +195,21 @@ pub const ClapBatchPlan = struct {
     feature_elements: usize,
     feature_reserve_bytes: usize,
     fusion_enabled: bool,
+    force_short_singleton: bool,
 };
 
+pub fn clapPreprocessingPolicy(session: backends.Session, logical_batch: usize) @import("audio_preparation.zig").ClapPreprocessingPolicy {
+    const fusion_enabled = if (session_factory.getClapConfig(session)) |cfg| cfg.audio_config.enable_fusion else false;
+    return @import("audio_preparation.zig").ClapPreprocessingPolicy.init(fusion_enabled, logical_batch);
+}
+
 pub fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
-    var channels: usize = 1;
-    const fusion_enabled = if (session_factory.getClapConfig(session)) |clap_cfg| blk: {
-        channels = if (clap_cfg.audio_config.enable_fusion and batch == 1) 4 else 1;
-        break :blk clap_cfg.audio_config.enable_fusion;
-    } else false;
+    return clapBatchPlanWithPolicy(session, batch, clapPreprocessingPolicy(session, batch));
+}
+
+/// Reserve physical-batch storage while preserving the caller's feature policy.
+pub fn clapBatchPlanWithPolicy(session: backends.Session, batch: usize, policy: @import("audio_preparation.zig").ClapPreprocessingPolicy) !ClapBatchPlan {
+    const channels = policy.channels;
     const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
     const frames = clapInputFeatureFrames(session, default_frames);
     const mels = audio.CLAP_CONFIG.n_mels;
@@ -214,7 +221,8 @@ pub fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
         .mels = mels,
         .feature_elements = working.elements,
         .feature_reserve_bytes = working.reserve_bytes,
-        .fusion_enabled = fusion_enabled,
+        .fusion_enabled = policy.fusion_enabled,
+        .force_short_singleton = policy.force_short_singleton,
     };
 }
 
@@ -1722,10 +1730,11 @@ pub const EmbeddingPipeline = struct {
         defer for (&slots, live) |*slot, exists| if (exists) slot.deinit();
         const control = self.execution_control orelse InferenceExecutionControl{};
         const budget = self.config.max_audio_decode_working_bytes;
+        const preprocessing = clapPreprocessingPolicy(session, clips.len);
         var current: usize = 0;
         var offset: usize = 0;
         const first = @min(prep.max_batch, clips.len);
-        slots[0] = prep.Wave.init(session, clips[0..first], if (errors) |e| e[0..first] else null, control, .clap, budget);
+        slots[0] = prep.Wave.initClap(session, clips[0..first], if (errors) |e| e[0..first] else null, control, budget, preprocessing);
         live[0] = true;
         slots[0].run();
         var observation = @import("batch_execution.zig").Observation{};
@@ -1740,7 +1749,7 @@ pub const EmbeddingPipeline = struct {
             const next_offset = offset + slot.consumed;
             const next_count = @min(prep.max_batch, clips.len - next_offset);
             if (next_count > 0) {
-                slots[next] = prep.Wave.init(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .clap, budget);
+                slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
                 live[next] = true;
                 if (self.config.audio_prepare_ahead) {
                     const spawned = slots[next].start();
@@ -1753,7 +1762,7 @@ pub const EmbeddingPipeline = struct {
                 scoped.allocator = slot.allocator();
                 scoped.execution_lock = null;
                 scoped.execution_gate_held = true;
-                const plan = try clapBatchPlan(session, slot.retained);
+                const plan = try slot.clapPlan(slot.retained);
                 const request = @import("../backends/session.zig").RunRequest{ .batch = slot.retained, .sequence = plan.frames, .input_bytes = slot.mels.len * 4, .pre_admitted_host_bytes = slot.mels.len * 4, .host_preprocess_bytes = plan.feature_reserve_bytes };
                 var permit = session.admit(request) catch |err| blk: {
                     if (next_count == 0 or !self.config.audio_prepare_ahead or !prep.pressure(err)) return err;
@@ -1806,7 +1815,7 @@ pub const EmbeddingPipeline = struct {
                 slots[next].join();
                 if (slots[next].failure) |err| if (prep.pressure(err)) {
                     slots[next].deinit();
-                    slots[next] = prep.Wave.init(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, .clap, budget);
+                    slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
                     if (self.audio_timings) |t| t.preparation_backpressure_retries += 1;
                     slots[next].run();
                 };

@@ -659,6 +659,9 @@ encoder in length-qualified groups of at most four (25% padding, 1,024-token
 sequence cap); conformer execution remains per clip. CLAP retains native batches
 of up to eight and singleton fusion/fallback behavior. Both prepare one bounded
 future CPU wave, join producers on every exit and preserve indexed codec errors.
+CLAP selects channel count and forced short-clip fusion from the full logical
+request. Every physical wave and admission retry keeps that policy; a singleton
+tail of a larger request does not activate singleton fusion.
 Gemma4 audio-only server groups can use the generation-qualified broker; mixed
 and titled groups retain compatibility. No CUDA performance gain is claimed.
 

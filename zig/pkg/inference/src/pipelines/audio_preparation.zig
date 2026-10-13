@@ -24,6 +24,17 @@ const bounded_mod = @import("../runtime/bounded_allocator.zig");
 pub const max_batch = 8;
 pub const Clip = struct { bytes: []const u8 = &.{}, decode_options: audio.DecodeOptions = .{}, pcm: ?audio.PcmAudio = null };
 pub const Kind = enum { gemma4, clap };
+/// Select preprocessing from the logical request, not a physical wave's size.
+pub const ClapPreprocessingPolicy = struct {
+    fusion_enabled: bool,
+    channels: usize,
+    force_short_singleton: bool,
+
+    pub fn init(fusion_enabled: bool, logical_batch: usize) ClapPreprocessingPolicy {
+        const singleton = fusion_enabled and logical_batch == 1;
+        return .{ .fusion_enabled = fusion_enabled, .channels = if (singleton) 4 else 1, .force_short_singleton = singleton };
+    }
+};
 pub fn pressure(err: anyerror) bool {
     return err == error.ResourceTemporarilyUnavailable or err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded;
 }
@@ -36,6 +47,7 @@ pub const Wave = struct {
     errors: ?[]?anyerror,
     control: Control,
     kind: Kind,
+    clap_policy: ?ClapPreprocessingPolicy = null,
     bounded: bounded_mod.BoundedAllocator,
     allocation_exceeded_budget: bool = false,
     permit: ?@import("../backends/session.zig").RunPermit = null,
@@ -54,6 +66,15 @@ pub const Wave = struct {
 
     pub fn init(session: Session, clips: []const Clip, errors: ?[]?anyerror, control: Control, kind: Kind, budget: usize) Wave {
         return .{ .session = session, .clips = clips, .errors = errors, .control = control, .kind = kind, .bounded = .{ .backing = std.heap.smp_allocator, .limit = budget } };
+    }
+    pub fn initClap(session: Session, clips: []const Clip, errors: ?[]?anyerror, control: Control, budget: usize, policy: ClapPreprocessingPolicy) Wave {
+        var wave = init(session, clips, errors, control, .clap, budget);
+        wave.clap_policy = policy;
+        return wave;
+    }
+    pub fn clapPlan(self: *const Wave, batch: usize) !@import("embedding.zig").ClapBatchPlan {
+        if (self.clap_policy) |policy| return @import("embedding.zig").clapBatchPlanWithPolicy(self.session, batch, policy);
+        return @import("embedding.zig").clapBatchPlan(self.session, batch);
     }
     pub fn allocator(self: *Wave) std.mem.Allocator {
         self.bounded.failure_context = self;
@@ -152,7 +173,7 @@ pub const Wave = struct {
         var pcm_bytes: usize = 0;
         while (self.consumed < self.clips.len) {
             try self.control.check();
-            const plan = try @import("embedding.zig").clapBatchPlan(self.session, self.retained + 1);
+            const plan = try self.clapPlan(self.retained + 1);
             if (plan.feature_reserve_bytes >= self.bounded.limit or pcm_bytes >= self.bounded.limit - plan.feature_reserve_bytes or !try self.session.fitsRun(.{ .batch = self.retained + 1, .sequence = plan.frames, .input_bytes = plan.feature_elements * 4, .host_preprocess_bytes = pcm_bytes + plan.feature_reserve_bytes })) {
                 if (self.retained > 0) break;
                 try self.failItem(self.consumed, error.AudioTooLarge);
@@ -177,7 +198,7 @@ pub const Wave = struct {
             self.retained_bytes = self.input_bytes;
             return;
         }
-        const plan = try @import("embedding.zig").clapBatchPlan(self.session, self.retained);
+        const plan = try self.clapPlan(self.retained);
         self.channels = plan.channels;
         self.mels = try self.allocator().alloc(f32, plan.feature_elements);
         @memset(self.mels, 0);
@@ -191,8 +212,8 @@ pub const Wave = struct {
             };
             self.flags[index] = @intFromBool(features.is_longer);
         }
-        // Preserve the existing singleton fusion policy of exported graphs.
-        if (plan.fusion_enabled and self.retained == 1 and self.flags[0] == 0) self.flags[0] = 1;
+        // A singleton tail in a larger request must not activate AFF fusion.
+        if (plan.force_short_singleton and self.retained == 1 and self.flags[0] == 0) self.flags[0] = 1;
         self.retained_bytes = self.input_bytes + self.mels.len * 4;
     }
 };
@@ -331,4 +352,65 @@ test "audio preparation Gemma4 splits bounded waves without consuming deferred c
     };
     try Runner.run(std.testing.allocator, session, &clips);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ session, &clips });
+}
+
+test "clap prepared waves preserve fusion inputs across uneven batches and memory splits" {
+    const tensor = @import("../backends/tensor.zig");
+    const Mock = struct {
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.UnexpectedModelForward;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{.{ .name = "input_features", .dtype = .f32, .shape = &.{ -1, -1, 1001, 64 } }};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close } };
+    var samples: [6400]f32 = undefined;
+    for (&samples, 0..) |*value, index| value.* = @sin(@as(f32, @floatFromInt(index)) * 0.17) * 0.1;
+    const pcm = audio.PcmAudio{ .samples = &samples, .sample_rate = 48000 };
+    const clips: [17]Clip = @splat(.{ .pcm = pcm });
+    const Case = struct { count: usize, split_budget: bool = false };
+    for ([_]Case{ .{ .count = 1 }, .{ .count = 9 }, .{ .count = 17 }, .{ .count = 9, .split_budget = true } }) |case| {
+        // The legacy full request selects four channels only for a genuine
+        // fusion singleton. Compare actual prepared tensors to its frontend.
+        const expected_channels: usize = if (case.count == 1) 4 else 1;
+        var reference = try audio.clapFeaturesFromPcm(a, &samples, pcm.sample_rate, expected_channels);
+        defer reference.deinit();
+        const policy = ClapPreprocessingPolicy.init(true, case.count);
+        const one = try @import("embedding.zig").clapBatchPlanWithPolicy(session, 1, policy);
+        const budget: usize = if (case.split_budget) one.feature_reserve_bytes + 40000 else 64 * 1024 * 1024;
+        var offset: usize = 0;
+        var waves: usize = 0;
+        while (offset < case.count) {
+            const count = @min(max_batch, case.count - offset);
+            var wave = Wave.initClap(session, clips[offset..][0..count], null, .{}, budget, policy);
+            wave.bounded.backing = a;
+            defer wave.deinit();
+            _ = wave.start();
+            wave.join();
+            if (wave.failure) |err| return err;
+            try std.testing.expectEqual(expected_channels, wave.channels);
+            try std.testing.expectEqual(wave.consumed, wave.retained);
+            if (case.split_budget) try std.testing.expectEqual(@as(usize, 1), wave.retained);
+            const plan = try wave.clapPlan(wave.retained);
+            try std.testing.expectEqual(wave.mels.len, plan.feature_elements);
+            for (0..wave.retained) |row| {
+                try std.testing.expectEqual(@as(u8, if (case.count == 1) 1 else 0), wave.flags[row]);
+                for (0..expected_channels) |channel| for (0..plan.frames) |frame| {
+                    const dst = ((row * expected_channels + channel) * plan.frames + frame) * plan.mels;
+                    const src = (channel * reference.time_frames + frame) * reference.mel_bins;
+                    try std.testing.expectEqualSlices(f32, reference.data[src..][0..plan.mels], wave.mels[dst..][0..plan.mels]);
+                };
+            }
+            offset += wave.consumed;
+            waves += 1;
+        }
+        try std.testing.expectEqual(if (case.split_budget) case.count else (case.count + max_batch - 1) / max_batch, waves);
+    }
 }
