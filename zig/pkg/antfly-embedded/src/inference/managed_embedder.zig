@@ -1521,11 +1521,17 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheU64(&hasher, if (secret_store) |store| store.generationFast() else 0);
         // Hash the effective secret too: environment variables and secret
         // references can rotate without changing their configured locator.
-        if (entry.api_key) |secret| {
-            var resolved = try secret.resolveOwnedWithGeneration(a, entry.secret_store);
-            defer resolved.deinit(a);
-            hashQueryCacheField(&hasher, resolved.value);
-        }
+        if (entry.antfly_provider == null) if (entry.api_key) |secret| {
+            var resolved: ?common_secrets.ResolvedSecret = secret.resolveOwnedWithGeneration(a, entry.secret_store) catch |err| switch (err) {
+                error.SecretNotFound => null,
+                else => return err,
+            };
+            if (resolved) |*value| {
+                defer value.deinit(a);
+                hashQueryCacheField(&hasher, "present");
+                hashQueryCacheField(&hasher, value.value);
+            } else hashQueryCacheField(&hasher, "absent");
+        };
         var endpoint_digest: [32]u8 = undefined;
         hasher.final(&endpoint_digest);
         return try @import("antfly_resolver").fingerprint(a, .{
@@ -10294,12 +10300,13 @@ pub fn testSparseCacheRevision() !void {
     const moved = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
     try std.testing.expect(!std.mem.eql(u8, &initial, &moved));
     managed.entries[0].base_url = original_url;
+    const original_api_key = managed.entries[0].api_key;
     managed.entries[0].api_key = .{ .literal = @constCast("tenant-a") };
     const tenant_a = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
     managed.entries[0].api_key = .{ .literal = @constCast("tenant-b") };
     const tenant_b = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
     try std.testing.expect(!std.mem.eql(u8, &tenant_a, &tenant_b));
-    managed.entries[0].api_key = null;
+    managed.entries[0].api_key = original_api_key;
     managed.entries[0].sparse = true;
     const sparse = managed.sparseInterface();
     const revision = (try sparse.cache_revision_fn.?(sparse.ptr, std.testing.allocator, "semantic_idx")).?;

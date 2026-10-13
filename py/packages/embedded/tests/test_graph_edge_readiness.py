@@ -1093,50 +1093,75 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_replacement_recovers_after_process_exit(tmp_path, storage):
+    import select
+    import signal
+
     path = tmp_path / ("crash-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "crash-shadow")
     script = r"""
-import os, sys, time
+import sys, time, json
 import antfly_embedded as af
-options = af.OpenOptions(storage=af.Storage(int(sys.argv[2])))
+options = af.OpenOptions(storage=af.Storage(int(sys.argv[2])), busy_timeout=5)
 opener = af.create_with_options if options.storage == af.Storage.LITE else af.open_with_options
 db = opener(sys.argv[1], options)
 db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
-db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(3000)}})
+# Many source pages force a partial build; endpoint rows check both the
+# acknowledged prefix and the unbuilt suffix without benchmarking graph size.
+db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"] if i in (0, 9999) else [],
+                    "next_links": ["new"] if i in (0, 9999) else []} for i in range(10000)}})
 db.run_until_idle()
-try:
-    db.add_index({"name": "new", "type": "graph", "replaces": "old",
-                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
-except af.BusyError:
-    pass
-else:
-    raise AssertionError("expected the registered shadow to remain pending")
-progress = db.pending_work_stats()["replacements"]
-deadline = time.monotonic() + 10
-while len(progress) == 1 and progress[0]["scanned_keys"] == 0:
-    assert time.monotonic() < deadline, progress
+print("ready", flush=True)
+assert sys.stdin.readline().strip() == "build"
+while True:
     try:
         db.add_index({"name": "new", "type": "graph", "replaces": "old",
                       "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
     except af.BusyError:
         pass
+    else:
+        raise AssertionError("replacement finished before the parent observed its crash point")
     progress = db.pending_work_stats()["replacements"]
-assert len(progress) == 1 and progress[0]["scanned_keys"] > 0 and progress[0]["phase"] == "building", progress
-assert "old" in {i["name"] for i in db.list_indexes()}
-# Advance beyond the acknowledged cursor, then crash without close/flush.
-try:
-    db.add_index({"name": "new", "type": "graph", "replaces": "old",
-                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
-except af.BusyError:
-    pass
-else:
-    raise AssertionError("build should still be partial")
-os._exit(0)
+    if progress and progress[0]["phase"] == "building" and progress[0]["scanned_keys"] > 0:
+        assert "old" in {i["name"] for i in db.list_indexes()}
+        print(json.dumps(progress[0]), flush=True)
+        sys.stdin.readline()  # Parent kills us; never close or flush.
+        raise AssertionError("parent did not crash the builder")
+    time.sleep(0.05)
 """
-    subprocess.run([sys.executable, "-c", script, str(path), str(int(storage))], check=True, timeout=60)
+    with subprocess.Popen(
+        [sys.executable, "-u", "-c", script, str(path), str(int(storage))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert select.select([child.stdout], [], [], 60)[0], "child did not initialize"
+            assert child.stdout.readline().strip() == "ready"
+            child.stdin.write("build\n")
+            child.stdin.flush()
+            assert select.select([child.stdout], [], [], 30)[0], "builder did not checkpoint"
+            line = child.stdout.readline()
+            assert line, child.stderr.read()
+            observed = json.loads(line)
+            assert observed["phase"] == "building" and observed["scanned_keys"] > 0
+            child.kill()
+            assert child.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+    # Observe the durable marker after the crash and before any writer can
+    # resume. This proves the fixture killed a partially built replacement.
+    with _open_graph_test(
+        path, antfly_embedded.OpenOptions(storage=storage, mode=antfly_embedded.OpenMode.READONLY)
+    ) as observer:
+        progress = observer.pending_work_stats()["replacements"]
+        assert len(progress) == 1 and progress[0]["phase"] == "building"
+        assert progress[0]["scanned_keys"] >= observed["scanned_keys"]
     with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
         db.run_until_idle()
         assert "old" not in {i["name"] for i in db.list_indexes()}
-        for key in ("source:0000", "source:2999"):
+        for key in ("source:0000", "source:9999"):
             assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
 
 

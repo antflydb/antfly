@@ -27580,7 +27580,9 @@ pub const DB = struct {
                 state.applied = sequence;
             }
         };
-        var collected = Collect{ .alloc = a, .target = target, .deadline = deadline, .applied = from };
+        const collect_now = monotonicTimeNs();
+        const collection_deadline = if (deadline) |end| collect_now +| (end -| collect_now) / 4 else null;
+        var collected = Collect{ .alloc = a, .target = target, .deadline = collection_deadline, .applied = from };
         _ = self.core.store.forEachReplayLaneFrom(internal_keys.replay_all_kind, from +| 1, limit, &collected, Collect.record) catch |err| switch (err) {
             error.StopReplayChunk => {},
             else => return err,
@@ -27615,9 +27617,11 @@ pub const DB = struct {
             if (owner_key != null and collected.documents.contains(owner_key.?)) continue;
             try keys.append(a, key.*);
         }
-        if (deadline) |end| if (monotonicTimeNs() >= end) return from;
-        const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, private, keys.items, name, .{ .require_resolution_contract = true });
-        try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = name, .kind = .graph }, null, false, null);
+        if (keys.items.len != 0) {
+            if (deadline) |end| if (monotonicTimeNs() >= end) return from;
+            const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, private, keys.items, name, .{ .require_resolution_contract = true });
+            try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = name, .kind = .graph }, null, false, null);
+        }
         return collected.applied;
     }
 
@@ -27844,6 +27848,14 @@ pub const DB = struct {
             errdefer self.alloc.destroy(manager);
             manager.* = try index_manager_mod.IndexManager.initWithOptions(self.core.index_manager.alloc, self.core.index_manager.base_path, self.index_backends);
             errdefer manager.deinit();
+            // Repeated bounded pages revisit the same checkpoint runs. Use
+            // the backend's existing bounded cache rather than publishing a
+            // fresh native immutable-source lease on every block read.
+            manager.graph_reverse_lsm_options.local_block_cache_enabled = true;
+            // This unpublished manager has no independent compactor. Let
+            // ordinary bounded write-pressure maintenance prevent checkpoint
+            // runs accumulating without limit during a long build.
+            manager.graph_reverse_lsm_options.foreground_soft_compaction = true;
             manager.source_payload_store = self.core.index_manager.source_payload_store;
             manager.setIo(self.backend_runtime.io());
             try manager.registerReplacementIndex(self.core.store, cfg);

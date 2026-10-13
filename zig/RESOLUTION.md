@@ -1075,7 +1075,11 @@ a source snapshot across each page, and checkpoints its resumable progress.
 Source pages collect at most 32 sources per turn, sharing their write plan,
 artifact transaction and graph apply. Collection yields after 100 ms, followed
 by the current bounded source batch. Resident managers are invalidated when the
-catalog revision changes, so reused builders cannot retain stale resolver rules. A resident progress cursor lets these
+catalog revision changes, so reused builders cannot retain stale resolver rules.
+The private builder uses the LSM backend's existing bounded block cache to avoid
+repeated native immutable-source lease publication across checkpoint runs.
+It also drives the existing bounded foreground compaction policy, since private
+builders have no independent compactor to limit checkpoint-run accumulation. A resident progress cursor lets these
 short turns share a durability checkpoint: checkpoint the first turn, then at
 most once per second during construction, and always before activation. The
 journal remains pinned at the last durable cut; crash recovery repeats only
