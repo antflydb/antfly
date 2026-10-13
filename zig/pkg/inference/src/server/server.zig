@@ -1218,6 +1218,11 @@ fn rawGenerateChatTemplateKwargsAreValid(
 
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
+pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
+    if (mib == 0) return error.InvalidHttpBodyLimit;
+    return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -1236,6 +1241,9 @@ pub const NodeConfig = struct {
     /// from connection lifetimes; in particular, HTTP/2 frame pumps remain
     /// available to receive streaming request bodies.
     http_max_request_tasks: u32 = 64,
+    /// Encoded HTTP payload limit, independent of GPU cohort/admission bounds.
+    /// Inline media batches can exceed the transport's 10 MiB default.
+    http_max_body_bytes: usize = 10 * 1024 * 1024,
     pool_size: usize = 2,
     /// Optional hard envelope for all memory charged to this process/container.
     /// This is required when the runtime has no finite cgroup memory.max and
@@ -3996,7 +4004,7 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0)
+        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
             return error.KernelJitProfileCaptureUnsupportedInServer;
@@ -20855,6 +20863,7 @@ pub const Node = struct {
             .port = port,
             .max_connections = self.config.http_max_connections,
             .max_request_tasks = self.config.http_max_request_tasks,
+            .max_body_size = self.config.http_max_body_bytes,
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,
@@ -36482,4 +36491,18 @@ test "Metal OCR continuous coordinator refills four row cohorts from eight unequ
     try std.testing.expect(try coordinator.claimStep(a, &leases[8], @ptrCast(&work[8]), .decode, coordinator.defaultStepBudget(), &claimed));
     try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
     coordinator.completeStep(&leases[8], claimed.items);
+}
+
+test "inference HTTP inline media body limit remains bounded and configurable" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), try httpBodyLimitBytesFromMib(32));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(0));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidHttpTransportCapacity, Node.init(std.testing.allocator, .{ .http_max_body_bytes = 0 }));
+    var node: Node = undefined;
+    node.config = .{};
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), node.httpServerConfig("127.0.0.1", 8090).max_body_size);
+    node.config.http_max_body_bytes = try httpBodyLimitBytesFromMib(32);
+    const transport = node.httpServerConfig("127.0.0.1", 8090).normalized();
+    try std.testing.expectEqual(node.config.http_max_body_bytes, transport.max_body_size);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), transport.request_body_buffer_budget_bytes);
 }

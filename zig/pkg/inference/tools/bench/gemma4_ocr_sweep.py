@@ -198,6 +198,11 @@ def qualification(report, reference):
 
 
 def profile(log):
+    # Server preload performs a dummy generation before accepting traffic.
+    # Keep that out of request latency/work counters; explicit warmups are
+    # removed by run() afterward.
+    if "listening on 127.0.0.1:" in log:
+        log = log.split("listening on 127.0.0.1:", 1)[1]
     result = {}
     for label, key in [
         ("generate_timing_ms:", "total"),
@@ -354,8 +359,13 @@ def run(args):
             "--preload-model",
             "generator:metal:" + args.model,
         ]
+        if args.http_max_body_mb is not None:
+            command.extend(["--http-max-body-mb", str(args.http_max_body_mb)])
         entry = {
             "case": case,
+            "http_max_body_mb": args.http_max_body_mb
+            if args.http_max_body_mb is not None
+            else 10,
             "batch": batch,
             "server_flags": flags,
             "server_command": command,
@@ -549,6 +559,11 @@ if __name__ == "__main__":
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--port", type=int, default=18097)
+    parser.add_argument(
+        "--http-max-body-mb",
+        type=int,
+        help="Explicit encoded media payload limit; requires a server with this run option",
+    )
     parser.add_argument(
         "--reverse",
         action="store_true",
