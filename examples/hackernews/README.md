@@ -1100,3 +1100,21 @@ composed pages can return a `gte` total; request `count: true` separately for ex
 overlay cardinality.
 No end-to-end composed speedup is claimed. Count, aggregation and graph consumers
 retain their larger streaming batches, and cursor identity/authority checks remain.
+
+The follow-up to #1081 removes the SQL sampling workaround: current-table fixture
+rows now come from Antfly SQL for both local and remote sources. The statement's
+`LIMIT` and the HTTP request's `limit` are separate budgets; the latter must admit
+the requested fixture size (default 1,000, maximum 4,096). Rows without timestamps
+are excluded before ordering. Earlier recorded SQLSTATE 54000 observations used
+the default 128-row HTTP budget and do not establish an ordered-projection scan
+limit.
+
+Native-text metadata 11/reader protocol 36 can retain a compacted serving root
+alongside the original per-file rebuild inventory. Small adjacent one-run files
+merge in bounded units without changing their source Parquet, row identities,
+delete-hole maps or retained generations. The 67-file development fixture serves
+9 native runs. Publication-wide score traversal uses authenticated term envelopes
+for supported descending-score terms; ties remain eligible and pruned totals are
+lower bounds. Exact counts and other query shapes keep the exact fallback. Upgrade
+readers before publishing this format. See the deployment qualification plan for
+bounds and separate correctness/performance evidence.

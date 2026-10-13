@@ -718,3 +718,29 @@ executor and rejects PostgreSQL managed setup.
 
 See [operator setup](../../py/packages/lake-maintenance/README.md) for the CLI,
 endpoints, cloud configuration contracts and real-provider qualification scope.
+
+### Canonical and compacted native-text generations
+
+Canonical per-source-file manifests remain authoritative for refresh/checkpoint
+recovery. A publication may additionally reference a compacted serving root. Native
+runs may span complete small files; each member records its original physical
+manifest and native ordinal interval. Query admission derives physical row spans
+from those members, preserving delete holes and original producer keys without
+rewriting external Parquet. All global collection statistics remain canonical;
+segment statistics and term envelopes describe the merged runs.
+
+A refresh compares member identity/digest in immutable file order. Unchanged units
+retain their artifacts. A replaced/removed member rebuilds only its bounded unit,
+and fresh grouping stops at surviving unit boundaries to prevent a deletion from
+shifting every subsequent batch. Metadata and term directories update through
+copy-on-write deltas. Initial merges contain at most eight one-run source files,
+target 16 MiB, cap output at 32 MiB, and use a 64 MiB workspace with exact original
+run fallback on allocation denial. Larger files keep their existing run layout.
+
+Canonical roots retain their serving root; GC also traverses member manifests and
+hole bitmaps. Old serving generations stay immutable for retained cursors. Reader
+protocol 36/native-text metadata 11 gates member-aware publication, while historical
+metadata 9/10 stays readable. Best-first traversal consumes authenticated score
+envelopes with strictly losing pruning, bounded frontier/read admission, equal-score
+tie preservation and explicit lower-bound count semantics. Unsupported proofs and
+exact counts keep the existing exact traversal.
