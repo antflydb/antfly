@@ -812,3 +812,27 @@ phase profile rather than fabricated zero timings.
 The instrumentation regression tests and qualification/recovery tests pass 25
 tests and nine subtests. This follow-up fixes missing diagnostic evidence. It does
 not claim an engine performance fix for the unreproduced single-search stall.
+
+Further reproduction did produce a 2,498 ms retained-cursor request. Its
+aggregate counters attribute 1,361 ms to search and 1,077 ms to delivery, including
+1,070 ms hydration. Immediate first searches also reached 2,057–3,148 ms with
+persistent caching enabled, and 3,093 ms with it disabled. These are related
+latency failures, rather than proof of the original ready-cache preparation gap.
+
+A process-local filesystem trace identifies synchronous persistent-cache
+inventory restoration on the immediate first-query path: in one 1,563 ms sample,
+cache-file operations preceded the first source-file operation by approximately
+864 ms. `PersistentObjectRangeCacheState.initializeInventory` scans and validates
+retained entries before publishing the cache. Any future asynchronous restoration
+must preserve ownership, capacity accounting and retained cache hits; disabling
+the tier permanently would increase remote reads.
+
+The slow cache-enabled/disabled pair also coincided with substantial system swap
+activity. Per-process page-ins and filesystem waits support host resource
+contention as another contributor. System-wide paging does not identify who
+caused pressure, and this evidence cannot establish the historic stall's cause.
+Twenty restart probes querying six seconds after readiness did not reproduce the
+original gap. Twenty-four more probes queried 0, 50, 200 or 1,000 ms after the cache-ready
+transition and returned in 95–264 ms, without reproducing the preparation gap.
+The evidence artifact records these results and keeps the original failed
+criterion intact.
