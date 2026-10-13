@@ -189,11 +189,26 @@ pub fn typeSize(kind: Type) i16 {
 }
 
 pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !std.json.Value {
+    var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = alloc };
+    return decodeWithContext(alloc, param_oid, format, bytes, &context);
+}
+
+/// One Bind owner is shared by all parameters and every nested typed codec.
+/// Neither a new parameter nor conversion into the backend envelope renews it.
+/// The allocator belongs to the retained portal region, never to this context.
+pub fn decodeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8, context: *@import("antfly_local_sources").sql_numeric_value.Context) !std.json.Value {
+    try context.charge(0);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = offset + @min(bytes.len - offset, 256);
+        try context.charge(end - offset);
+        offset = end;
+    }
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
     if (param_oid == 3802) {
         const sources = @import("antfly_local_sources");
-        var work: sources.sql_array_value.Budget = .{};
+        var work: sources.sql_array_value.Budget = .{ .shared = context };
         const datum = if (format == 0)
             try sources.sql_array_text.decodeElementLeaky(alloc, .jsonb, bytes, &work)
         else
@@ -202,17 +217,17 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
     }
     if (param_oid == 1700) {
         const sources = @import("antfly_local_sources");
-        var context: sources.sql_numeric_value.Context = .{ .alloc = alloc };
-        var number = if (format == 0) try sources.sql_numeric_value.parse(&context, bytes) else try sources.sql_numeric_binary.decode(&context, bytes, .{});
+        var numeric: sources.sql_numeric_value.Context = .{ .alloc = alloc, .parent = context };
+        var number = if (format == 0) try sources.sql_numeric_value.parse(&numeric, bytes) else try sources.sql_numeric_binary.decode(&numeric, bytes, .{});
         defer number.deinit();
-        return .{ .number_string = try sources.sql_numeric_value.format(&context, number.value) };
+        return .{ .number_string = try sources.sql_numeric_value.format(&numeric, number.value) };
     }
     if (kind == .array) {
         const sources = @import("antfly_local_sources");
         const element = (try parameterFromOid(param_oid)).element_type orelse return error.UnsupportedParameterType;
-        var decoded = if (format == 0) try sources.sql_array_text.decode(alloc, element, bytes, .{}) else try sources.sql_array_binary.decode(alloc, element, bytes, .{});
+        var decoded = if (format == 0) try sources.sql_array_text.decode(alloc, element, bytes, .{ .context = context }) else try sources.sql_array_binary.decode(alloc, element, bytes, .{ .context = context });
         defer decoded.deinit();
-        return sources.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{});
+        return sources.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{ .context = context });
     }
     if (format == 0) {
         if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidParameter;
@@ -540,6 +555,68 @@ test "SQL pgwire scalar builtin descriptors match binary widths and round trip v
     }
 }
 
+test "pgwire Bind admission shares cumulative work and sticky cancellation across typed codecs" {
+    const a = std.testing.allocator;
+    const Context = @import("antfly_local_sources").sql_numeric_value.Context;
+    var wide: [1026]u8 = undefined;
+    @memset(&wide, 'a');
+    wide[0] = '"';
+    wide[wide.len - 1] = '"';
+    const sources = @import("antfly_local_sources");
+    var source = try sources.sql_array_text.decode(a, .jsonb, "{1.20,null,NULL}", .{});
+    defer source.deinit();
+    var binary: std.Io.Writer.Allocating = .init(a);
+    defer binary.deinit();
+    try sources.sql_array_binary.encode(a, source.value, &binary.writer, .{});
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    for ([_]struct { oid: u32, format: u16 = 0, bytes: []const u8 }{
+        .{ .oid = 20, .format = 1, .bytes = "\x00\x00\x00\x00\x00\x00\x00\x01" },
+        .{ .oid = 25, .bytes = "leaf" },
+        .{ .oid = 1700, .bytes = "1.20" },
+        .{ .oid = 3802, .bytes = "{\"k\":1.20}" },
+        .{ .oid = 3802, .format = 1, .bytes = "\x01{\"k\":1.20}" },
+        .{ .oid = 3802, .bytes = &wide },
+        .{ .oid = 3807, .bytes = "{1.20,null,NULL}" },
+        .{ .oid = 3807, .format = 1, .bytes = binary.written() },
+        .{ .oid = 1231, .bytes = "{1.20,NULL}" },
+    }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var observed: Control = .{};
+        var parent: Context = .{ .alloc = arena.allocator(), .remaining = 1024 * 1024, .checkpoint = Control.check, .ptr = &observed };
+        var child: Context = .{ .alloc = arena.allocator(), .remaining = parent.remaining, .parent = &parent };
+        _ = try decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &child);
+        const spent = 1024 * 1024 - parent.remaining;
+        try std.testing.expect(spent >= case.bytes.len);
+        try std.testing.expectEqual(parent.remaining, child.remaining);
+        var limited: Context = .{ .alloc = arena.allocator(), .remaining = spent * 2 - 1 };
+        _ = try decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &limited);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &limited));
+        const remaining = limited.remaining;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, decodeWithContext(.failing, case.oid, case.format, case.bytes, &limited));
+        try std.testing.expectEqual(remaining, limited.remaining);
+        for (1..observed.polls + 1) |cut| {
+            var control: Control = .{ .fail_at = cut };
+            var canceled: Context = .{ .alloc = arena.allocator(), .checkpoint = Control.check, .ptr = &control };
+            try std.testing.expectError(error.QueryCanceled, decodeWithContext(arena.allocator(), case.oid, case.format, case.bytes, &canceled));
+            const left = canceled.remaining;
+            try std.testing.expectError(error.QueryCanceled, decodeWithContext(.failing, case.oid, case.format, case.bytes, &canceled));
+            try std.testing.expectEqual(left, canceled.remaining);
+        }
+    }
+    var healthy: Context = .{ .alloc = .failing };
+    try std.testing.expectError(error.OutOfMemory, decodeWithContext(.failing, 3802, 0, "{\"k\":1}", &healthy));
+    try std.testing.expect(healthy.failure == null);
+}
+
 test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads" {
     const a = std.testing.allocator;
     const sources = @import("antfly_local_sources");
@@ -563,6 +640,22 @@ test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads
     output.writer.end = 0;
     try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &output.writer, column, 1, .{ .string = decoded.number_string }, 1));
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "pgwire Bind fixed width admission scales without decoder allocations" {
+    const Context = @import("antfly_local_sources").sql_numeric_value.Context;
+    for ([_]usize{ 1, 16, 256 }) |count| {
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..1000) |_| {
+            var work: Context = .{ .alloc = .failing, .remaining = count * 8 };
+            for (0..count) |_| {
+                const value = try decodeWithContext(.failing, 20, 1, "\x00\x00\x00\x00\x00\x00\x00\x01", &work);
+                try std.testing.expectEqual(@as(i64, 1), value.integer);
+            }
+            try std.testing.expectEqual(@as(u64, 0), work.remaining);
+        }
+        std.debug.print("pgwire fixed-width admission: parameters={d} iterations=1000 work_per_bind={d} decoder_allocations=0 elapsed_ns={d}\n", .{ count, count * 8, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
 }
 
 test "pgwire typed parameters preserve exact integers and reject binary guesses" {

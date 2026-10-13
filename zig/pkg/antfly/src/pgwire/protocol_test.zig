@@ -35,6 +35,7 @@ const Mock = struct {
     json_null_results: bool = false,
     array_results: bool = false,
     array_parameters: bool = false,
+    two_parameters: bool = false,
     result_override: ?backend.Result = null,
     result_cells: bool = false,
     ddl_pending: bool = false,
@@ -213,6 +214,7 @@ const Mock = struct {
         self.describes += 1;
         try request.check();
         if (self.cached_shape_change and self.describes > 1) return .{ .columns = &.{.{ .name = "n", .type = .string }}, .parameter_types = &.{.integer} };
+        if (self.two_parameters) return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{ .integer, .integer } };
         if (self.array_parameters) {
             if (request.parameter_descriptors.len != 0 and request.parameter_descriptors[0].kind != null) try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
             return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{.array}, .parameter_descriptors = &.{.{ .kind = .array, .element_type = .int64 }} };
@@ -227,6 +229,7 @@ const Mock = struct {
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.array_parameters) for (request.parameters) |parameter| try retainedAllocator(parameter, alloc);
         if (self.result_override) |result| return result;
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         try self.checkSettingEpoch(request);
@@ -367,6 +370,17 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.releases += 1;
     }
+    fn retainedAllocator(value: std.json.Value, alloc: std.mem.Allocator) anyerror!void {
+        switch (value) {
+            .array => |items| {
+                try std.testing.expectEqual(alloc.ptr, items.allocator.ptr);
+                try std.testing.expectEqual(alloc.vtable, items.allocator.vtable);
+                for (items.items) |item| try retainedAllocator(item, alloc);
+            },
+            .object => |items| for (items.values()) |item| try retainedAllocator(item, alloc),
+            else => {},
+        }
+    }
 };
 
 fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
@@ -443,6 +457,93 @@ fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
         _ = try cursor.take(len - 4);
     }
     return out.toOwnedSlice(alloc);
+}
+
+test "pgwire Bind cumulative admission rejects before publishing a partial portal" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    var payload: std.Io.Writer.Allocating = .init(a);
+    defer payload.deinit();
+    try payload.writer.writeAll("q\x00SELECT $1, $2\x00");
+    try payload.writer.writeInt(u16, 2, .big);
+    try payload.writer.writeInt(u32, 20, .big);
+    try payload.writer.writeInt(u32, 20, .big);
+    try frame(&input.writer, 'P', payload.written());
+    payload.writer.end = 0;
+    try payload.writer.writeAll("p\x00q\x00");
+    try payload.writer.writeInt(u16, 1, .big);
+    try payload.writer.writeInt(u16, 1, .big);
+    try payload.writer.writeInt(u16, 2, .big);
+    for ([_]i64{ 1, 2 }) |value| {
+        try payload.writer.writeInt(i32, 8, .big);
+        try payload.writer.writeInt(i64, value, .big);
+    }
+    try payload.writer.writeInt(u16, 0, .big);
+    try frame(&input.writer, 'B', payload.written());
+    const sync_offset = input.written().len;
+    try frame(&input.writer, 'S', "");
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .two_parameters = true };
+    var output = try run(&mock, input.written(), .{ .parameter_work = 17 });
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    var messages: protocol.Cursor = .{ .bytes = output.written() };
+    var errors: usize = 0;
+    while (messages.offset < messages.bytes.len) {
+        const tag = try messages.int(u8);
+        const length = try messages.int(u32);
+        const body = try messages.take(length - 4);
+        try std.testing.expect(tag != '2');
+        if (tag == 'E') {
+            const expected = if (errors == 0) "C54000\x00" else "C34000\x00";
+            try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+            errors += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), errors);
+    // Both cells must fit exactly; neither metadata nor the second parameter
+    // may renew the owner or consume work already charged by the first cell.
+    var admitted: Mock = .{ .two_parameters = true };
+    var success_input: std.Io.Writer.Allocating = .init(a);
+    defer success_input.deinit();
+    // Successful implicit-transaction portals must execute before Sync.
+    try success_input.writer.writeAll(input.written()[0..sync_offset]);
+    try success_input.writer.writeAll(input.written()[sync_offset + 5 ..]);
+    var success = try run(&admitted, success_input.written(), .{ .parameter_work = 18 });
+    defer success.deinit();
+    try std.testing.expectEqual(@as(usize, 1), admitted.executions);
+    var complete: protocol.Cursor = .{ .bytes = success.written() };
+    var bound: usize = 0;
+    while (complete.offset < complete.bytes.len) {
+        const tag = try complete.int(u8);
+        const length = try complete.int(u32);
+        _ = try complete.take(length - 4);
+        try std.testing.expect(tag != 'E');
+        if (tag == '2') bound += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bound);
+    // Protocol errors may legitimately consume an allocation failure and
+    // continue to Sync. Sweep every cut, including portal/registry admission,
+    // and require all retained regions to retire without a leak either way.
+    var cut: usize = 0;
+    while (true) : (cut += 1) {
+        var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = cut, .resize_fail_index = 0 });
+        var reader: std.Io.Reader = .fixed(success_input.written());
+        var responses: std.Io.Writer.Allocating = .init(a);
+        defer responses.deinit();
+        var faulted: Mock = .{ .two_parameters = true };
+        {
+            var session: protocol.Session = .{ .alloc = failing.allocator(), .io = std.testing.io, .source = faulted.source(), .reader = &reader, .writer = &responses.writer, .limits = .{ .parameter_work = 18 } };
+            defer session.deinit();
+            session.run() catch |err| if (err != error.OutOfMemory) return err;
+        }
+        if (!failing.has_induced_failure) break;
+    }
+    try std.testing.expect(cut > 0);
 }
 
 test "pgwire Parse Bind Execute retain inferred and declared array parameter identity" {

@@ -4755,3 +4755,73 @@ grammar/lowering and schema-definition identity, typed projected tuple/vector
 consumers, unified JSONB numeric-range admission for non-rendered parameters,
 broader statement-wide owner wiring, and the remaining exact original cases and
 distributed activation proofs still require implementation.
+
+### Unified PostgreSQL JSONB input-domain admission (2026-10-13)
+
+JSONB input now uses one borrowed numeric-domain layout for admission and
+display. Admission checks PostgreSQL's integer-digit, scale and exponent limits
+without expanding the physical output or allocating. A valid 1e131071 parameter
+can therefore be queried with jsonb_typeof or array cardinality under a 4 KiB
+input allowance; 1e131072 is rejected even when never rendered. Display output
+is admitted separately. Generic document JSON number hashing remains unrestricted.
+
+Owned and pinned parsing share one cancellation-aware tree assembler. A fixed
+nine-byte lexical stack rejects excessive nesting and invalid discarded
+duplicate values before any DOM allocation. Duplicate object keys use
+PostgreSQL's last-key-wins rule, including escaped-equivalent keys. JSONB zero
+characters, invalid UTF-8, numeric range and binary protocol/version failures
+retain their distinct PostgreSQL diagnostics rather than being flattened into
+a type mismatch. Genuine allocation failure maps to 53200; quota exhaustion
+remains 54000. Fallback protocol messages do not expose internal error names.
+
+Independent PostgreSQL 18.6 evidence covers 22 input-domain cases across text,
+scalar binary and array binary admission, full display fingerprints, and five
+malformed scalar binary payloads. Debug contracts also cover input-owner
+retirement, every allocation failure and observed cancellation cut, strict
+physical restore, and non-rendered large parameters. Old assertions were
+updated only where independently verified PostgreSQL behavior changed; restore
+still rejects noncanonical duplicate-key bytes.
+
+Origin/main 0bbd1807c1 was merged without conflicts after checkpointing this
+work. Full merged-tree Debug qualification passed 1,040 SQL tests (three existing
+skips), 108 protocol tests, 249 native relational tests and 113 transaction
+tests. The sandbox-denied socket tests passed when rerun with local socket
+access; no production workaround or skipped test was added.
+
+### Cumulative Bind admission and stable portal ownership
+
+One pgwire Bind now owns the work/cancellation context shared by all its
+parameters, nested JSONB/NUMERIC/array codecs and conversion to backend
+envelopes. A new parameter cannot renew the quota. The listener's existing
+statement deadline/cancel signal covers decoding as well as backend execution;
+the existing connection allocator remains the retained-memory bound. The
+context is invocation-local and never retained by a published portal.
+
+The portal's arena is initialized at its final heap address before decoding.
+Managed JSON arrays therefore retain the correct allocator through Execute,
+not a pointer to a moved stack arena. All fallible preparation, including
+registry capacity, completes before an existing unnamed portal is retired.
+Publication itself does not allocate.
+
+Protocol qualification checks parent accounting, sticky quota/cancellation,
+genuine OOM, text/binary JSONB arrays, large strings, exact-quota success,
+one-unit-short failure before BindComplete, retained allocator identity after
+Parse/Bind/Close/Execute, and every allocation-failure cut through admission and
+cleanup. A fixed-width decoder scaling contract uses a failing allocator and
+exact cumulative work for 1, 16 and 256 parameters; it does not claim a
+production latency improvement.
+
+Final Debug protocol qualification passed all 111 tests, with no failures or
+leaks. One local scaling sample took 74/692/10,968 microseconds for 1,000
+iterations at 1/16/256 parameters, with 8/128/2,048 admitted units per iteration
+and zero decoder allocations. These measurements cover the decoder, not the
+whole Bind (which also charges one metadata unit per parameter). Formatting,
+the 2,048-file Apache boundary/license headers and inventory integrity passed.
+
+This closes Bind-level owner renewal, not the entire statement-wide ownership
+campaign. Generic raw JSON codec cooperation, deep envelope clone polling,
+public JSON program/schema identity and lowering, typed projected consumers,
+distributed activation proofs and the remaining exact original cases still
+need implementation. Original accounting remains 479 implemented / 136 rejected /
+73 superseded / 898 unresolved; these component contracts grant no original
+case credit.

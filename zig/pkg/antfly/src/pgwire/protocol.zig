@@ -31,6 +31,8 @@ pub const Limits = struct {
     prepared_statements: u16 = 64,
     portals: u16 = 16,
     parameters: u16 = 256,
+    /// Cumulative admission for one Bind, not a fresh quota per parameter.
+    parameter_work: u64 = 8 * 1024 * 1024,
     columns: u16 = 1024,
     result_rows: u32 = 4096,
     cursor_rows: u32 = 65536,
@@ -867,10 +869,14 @@ pub const Session = struct {
                 const statement = self.prepared.get(statement_name) orelse return error.InvalidStatementName;
                 if (name.len != 0 and self.portals.contains(name)) return error.DuplicatePortal;
                 if (!self.portals.contains(name) and self.portals.count() >= self.limits.portals) return error.ProgramLimitExceeded;
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                // Decoded JSON arrays retain their allocator. Initialize the
+                // portal's arena at its final address before any decoding.
+                const portal = try self.alloc.create(Portal);
                 var transferred = false;
-                errdefer if (!transferred) arena.deinit();
-                const a = arena.allocator();
+                errdefer if (!transferred) self.alloc.destroy(portal);
+                portal.* = .{ .arena = .init(self.alloc), .statement = "", .parameters = &.{}, .types = &.{}, .formats = &.{}, .description = .{ .columns = &.{} } };
+                errdefer if (!transferred) portal.arena.deinit();
+                const a = portal.arena.allocator();
                 const previous_namespace = self.request_namespace;
                 const previous_search_path = self.request_search_path;
                 self.request_namespace = statement.namespace;
@@ -878,6 +884,22 @@ pub const Session = struct {
                 self.request_search_path = statement.search_path;
                 defer self.request_search_path = previous_search_path;
                 const current = try self.rebindCached(a, statement.statement, statement.description);
+                self.executing.store(true, .release);
+                defer self.executing.store(false, .release);
+                var admission_request = self.request(statement.statement, &.{}, &.{});
+                const Admission = struct {
+                    fn check(raw: ?*anyopaque) anyerror!void {
+                        const request_: *backend.Request = @ptrCast(@alignCast(raw.?));
+                        try request_.check();
+                    }
+                };
+                var parameter_work: @import("antfly_local_sources").sql_numeric_value.Context = .{
+                    .alloc = a,
+                    .remaining = self.limits.parameter_work,
+                    .checkpoint = Admission.check,
+                    .ptr = &admission_request,
+                };
+                try parameter_work.charge(0);
                 const format_count = try cursor.int(u16);
                 if (format_count > self.limits.parameters) return error.ProgramLimitExceeded;
                 const formats = try a.alloc(u16, format_count);
@@ -890,6 +912,7 @@ pub const Session = struct {
                 const parameters = try a.alloc(std.json.Value, count);
                 const types = try a.alloc(backend.Type, count);
                 for (parameters, types, statement.parameter_oids, 0..) |*parameter, *kind, oid, index| {
+                    try parameter_work.charge(1);
                     kind.* = try values.fromOid(oid);
                     const len = try cursor.int(i32);
                     if (len == -1) {
@@ -897,7 +920,7 @@ pub const Session = struct {
                         continue;
                     }
                     if (len < 0) return error.ProtocolViolation;
-                    parameter.* = try values.decode(a, oid, formatAt(formats, index), try cursor.take(@intCast(len)));
+                    parameter.* = try values.decodeWithContext(a, oid, formatAt(formats, index), try cursor.take(@intCast(len)), &parameter_work);
                 }
                 const result_count = try cursor.int(u16);
                 if (result_count > self.limits.columns or (result_count > 1 and result_count != statement.description.columns.len)) return error.UnsupportedResultFormat;
@@ -917,12 +940,19 @@ pub const Session = struct {
                 };
                 const owned_name = try self.alloc.dupe(u8, name);
                 errdefer if (!transferred) self.alloc.free(owned_name);
-                self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                const portal = try self.alloc.create(Portal);
-                errdefer if (!transferred) self.alloc.destroy(portal);
-                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
-                try self.portals.put(self.alloc, owned_name, portal);
+                portal.statement = text;
+                portal.parameters = parameters;
+                portal.types = types;
+                portal.formats = result_formats;
+                portal.description = description;
+                portal.namespace = namespace;
+                portal.search_path = statement.search_path;
+                // Complete every fallible preparation before retiring an
+                // existing unnamed portal. Publication itself cannot allocate.
+                try self.portals.ensureUnusedCapacity(self.alloc, 1);
+                self.removePortal(name);
+                self.portals.putAssumeCapacityNoClobber(owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
             },
