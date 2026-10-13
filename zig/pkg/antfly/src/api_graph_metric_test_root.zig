@@ -23,6 +23,7 @@ const distributed_graph = @import("api/distributed_graph.zig");
 const openapi_contract = @import("api/openapi_contract.zig");
 const indexes = @import("api/indexes.zig");
 const public_table_http = @import("api/public_table_http.zig");
+const http_client = @import("api/http_client.zig");
 const graph_exec = @import("antfly_local_sources").storage_db_query_graph_exec;
 const metadata_status_codec = @import("metadata/storage/raft_apply_store.zig");
 
@@ -36,6 +37,7 @@ test {
     _ = openapi_contract;
     _ = indexes;
     _ = public_table_http;
+    _ = http_client;
     _ = graph_exec;
     _ = metadata_status_codec;
 }

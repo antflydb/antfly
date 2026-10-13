@@ -825,6 +825,10 @@ pub const OwnedAlgebraicTensorExprEnvelope = struct {
         self.* = undefined;
     }
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .expr_id = self.expr_id, .fragment = self.fragment, .input_dims = self.input_dims, .output_dims = self.output_dims, .semantic_id = self.semantic_id, .owner = self.owner, .layout = self.layout, .dictionary = self.dictionary, .law_id = self.law_id, .metadata = self.metadata });
+    }
+
     pub fn asExpr(self: *const @This()) algebraic_ir.TensorExpr {
         const dictionary = if (self.dictionary) |*value| value.asIdentity() else null;
         return .{
@@ -844,6 +848,10 @@ pub const OwnedAlgebraicTensorExprEnvelope = struct {
 pub const OwnedAlgebraicTensorProgramStepEnvelope = struct {
     expr: OwnedAlgebraicTensorExprEnvelope,
     inputs: []algebraic_ir.TensorProgramRef,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .expr = self.expr, .inputs = TensorRefsWire{ .refs = self.inputs } });
+    }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.expr.deinit(alloc);
@@ -869,6 +877,10 @@ pub const OwnedAlgebraicTensorProgramEnvelope = struct {
         self.* = undefined;
     }
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .program_id = self.program_id, .inputs = self.inputs, .steps = self.steps, .output = TensorRefWire{ .ref = self.output }, .outputs = TensorRefsWire{ .refs = self.outputs } });
+    }
+
     pub fn asProgramAlloc(self: *const @This(), alloc: std.mem.Allocator) !OwnedAlgebraicTensorProgramView {
         const inputs = try alloc.alloc(algebraic_ir.TensorExpr, self.inputs.len);
         errdefer if (inputs.len > 0) alloc.free(inputs);
@@ -891,6 +903,24 @@ pub const OwnedAlgebraicTensorProgramEnvelope = struct {
             .input_exprs = inputs,
             .steps = steps,
         };
+    }
+};
+
+const TensorRefWire = struct {
+    ref: algebraic_ir.TensorProgramRef,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        const index = switch (self.ref) {
+            inline else => |v| v,
+        };
+        try writer.write(.{ .kind = @tagName(self.ref), .index = index });
+    }
+};
+const TensorRefsWire = struct {
+    refs: []const algebraic_ir.TensorProgramRef,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginArray();
+        for (self.refs) |ref| try writer.write(TensorRefWire{ .ref = ref });
+        try writer.endArray();
     }
 };
 
@@ -1125,6 +1155,74 @@ pub fn parseAlgebraicTensorExprEnvelopeInputAlloc(
         .law_id = law_id,
         .metadata = metadata,
     };
+}
+
+// Native programs already carry typed dimensions, references and identities.
+// Clone ownership directly; JSON belongs only at the transport boundary.
+pub fn cloneAlgebraicTensorProgramEnvelopeAlloc(alloc: std.mem.Allocator, program: algebraic_ir.TensorProgram) !OwnedAlgebraicTensorProgramEnvelope {
+    const inputs = try alloc.alloc(OwnedAlgebraicTensorExprEnvelope, program.inputs.len);
+    var input_count: usize = 0;
+    errdefer {
+        for (inputs[0..input_count]) |*expr| expr.deinit(alloc);
+        alloc.free(inputs);
+    }
+    for (program.inputs, inputs) |expr, *owned| {
+        owned.* = try cloneTensorExprEnvelopeAlloc(alloc, expr);
+        input_count += 1;
+    }
+    const steps = try alloc.alloc(OwnedAlgebraicTensorProgramStepEnvelope, program.steps.len);
+    var step_count: usize = 0;
+    errdefer {
+        for (steps[0..step_count]) |*step| step.deinit(alloc);
+        alloc.free(steps);
+    }
+    for (program.steps, steps) |step, *owned| {
+        var expr = try cloneTensorExprEnvelopeAlloc(alloc, step.expr);
+        errdefer expr.deinit(alloc);
+        const refs = try alloc.dupe(algebraic_ir.TensorProgramRef, step.inputs);
+        owned.* = .{ .expr = expr, .inputs = refs };
+        step_count += 1;
+    }
+    const outputs = try alloc.dupe(algebraic_ir.TensorProgramRef, program.outputs);
+    errdefer alloc.free(outputs);
+    const id = try algebraic_ir.tensorProgramIdAlloc(alloc, program);
+    errdefer alloc.free(id);
+    const result = OwnedAlgebraicTensorProgramEnvelope{ .program_id = id, .inputs = inputs, .steps = steps, .output = program.output, .outputs = outputs };
+    try validateAlgebraicTensorProgramEnvelopeStructure(result);
+    return result;
+}
+
+fn cloneTensorExprEnvelopeAlloc(alloc: std.mem.Allocator, expr: algebraic_ir.TensorExpr) !OwnedAlgebraicTensorExprEnvelope {
+    var result = OwnedAlgebraicTensorExprEnvelope{
+        .expr_id = &.{},
+        .fragment = expr.fragment,
+        .input_dims = &.{},
+        .output_dims = &.{},
+        .semantic_id = null,
+        .owner = null,
+        .layout = expr.layout,
+        .dictionary = null,
+        .law_id = expr.law_id,
+        .metadata = null,
+    };
+    errdefer result.deinit(alloc);
+    result.expr_id = try algebraic_ir.tensorExprIdAlloc(alloc, expr);
+    result.input_dims = try alloc.dupe(algebraic_ir.Dimension, expr.input_dims);
+    result.output_dims = try alloc.dupe(algebraic_ir.Dimension, expr.output_dims);
+    if (expr.semantic_id) |v| result.semantic_id = try alloc.dupe(u8, v);
+    if (expr.owner) |v| result.owner = try alloc.dupe(u8, v);
+    if (expr.metadata) |v| result.metadata = try alloc.dupe(u8, v);
+    if (expr.dictionary) |d| {
+        var owned = OwnedAlgebraicDictionaryIdentity{ .scope = &.{}, .field_or_path = &.{}, .label_kind = d.label_kind, .analyzer_or_canonicalization = &.{}, .value_kind = &.{}, .coercion_policy = &.{} };
+        errdefer owned.deinit(alloc);
+        owned.scope = try alloc.dupe(u8, d.scope);
+        owned.field_or_path = try alloc.dupe(u8, d.field_or_path);
+        owned.analyzer_or_canonicalization = try alloc.dupe(u8, d.analyzer_or_canonicalization);
+        owned.value_kind = try alloc.dupe(u8, d.value_kind);
+        owned.coercion_policy = try alloc.dupe(u8, d.coercion_policy);
+        result.dictionary = owned;
+    }
+    return result;
 }
 
 pub fn parseAlgebraicTensorProgramEnvelopeAlloc(
@@ -19373,4 +19471,99 @@ test "public graph metric borrowed wire preserves projected documents paths and 
     };
     try Runner.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "api query contract bounded graph allocation sparse selection" {
+    const a = std.testing.allocator;
+    var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    const n = 50_000;
+    const q = graph_query_mod.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .metrics = &.{.{ .name = "rank" }}, .where_metric = &.{.{ .name = "rank", .op = .gte, .value = 49_999 }}, .params = .{ .max_results = 0 } };
+    var work = try graph_query_mod.GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), try graph_query_mod.MetricReadPlan.init(q), n);
+    const values = try counter.allocator().alloc(f64, n);
+    for (values, 0..) |*v, row| v.* = @floatFromInt(row);
+    work.groups[0] = .{ .references = 1 };
+    work.columns[0] = .{ .source = .{ .decoded = values }, .group = 0 };
+    const before = counter.live;
+    const calls = counter.alloc_calls;
+    try work.select(q, false, &.{"rank"}, &.{"rank"}, &.{});
+    try std.testing.expectEqual(@as(usize, 1), work.rowCount());
+    try std.testing.expectEqual(@as(usize, n - 1), work.rowAt(0));
+    std.debug.print("FRESH_SPARSE input={d} selected=1 extra_peak={d} allocations={d} retained={d}\n", .{ n, counter.peak - before, counter.alloc_calls - calls, counter.live });
+    try std.testing.expect(counter.peak - before < 1024);
+    work.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+}
+
+test "api query contract bounded graph allocation decoder hint amplification" {
+    const a = std.testing.allocator;
+    const local_graph = @import("graph.zig");
+    const decoder = @import("graph_expand_decode.zig");
+    const long_id = try a.alloc(u8, 512 * 1024);
+    defer a.free(long_id);
+    @memset(long_id, 'x');
+    @memcpy(long_id[0..9], "{\"body\":\"");
+    @memcpy(long_id[long_id.len - 2 ..], "\"}");
+    var name_buffers: [16][8]u8 = undefined;
+    var names: [16][]u8 = undefined;
+    var scores: [16]f64 = undefined;
+    for (&names, &scores, &name_buffers, 0..) |*name, *score, *buffer, i| {
+        name.* = try std.fmt.bufPrint(buffer, "m{d}", .{i});
+        score.* = @floatFromInt(i);
+    }
+    var cols = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    const nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .depth = 1, .distance = 1, .metric_columns = &cols }};
+    const hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .score = 1, .stored_data = long_id }};
+    var reference_peak: ?usize = null;
+    for ([_]u32{ 1, 50_000 }) |total| {
+        const wire = try std.json.Stringify.valueAlloc(a, local_graph.GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "s", .name = "g", .total = total, .nodes = &nodes, .hits = &hits }} }, .{ .emit_null_optional_fields = false });
+        defer a.free(wire);
+        var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var parsed = try decoder.parse(counter.allocator(), wire);
+        errdefer parsed.deinit(counter.allocator());
+        try std.testing.expectEqual(@as(usize, 1), parsed.expansions[0].graph_result.nodes.len);
+        try std.testing.expectEqualStrings(long_id, parsed.expansions[0].graph_result.hits[0].stored_data.?);
+        std.debug.print("FRESH_HINT total={d} nodes=1 wire={d} peak={d} retained={d}\n", .{ total, wire.len, counter.peak, counter.live });
+        // Arena remapping may change the allocator's transient high-water mark.
+        // An unrelated total must not add a row-sized reservation.
+        if (reference_peak) |peak| try std.testing.expect(@max(peak, counter.peak) - @min(peak, counter.peak) < 16 * 1024) else reference_peak = counter.peak;
+        try std.testing.expect(counter.peak < 2 * 1024 * 1024);
+        parsed.deinit(counter.allocator());
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "api query contract bounded graph allocation tensor construction" {
+    const a = std.testing.allocator;
+    const local_graph = @import("graph.zig");
+    var direct = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var plan = (try db_mod.algebraic.planner.planGraphEdgesTensorProgramAlloc(direct.allocator(), "graph_idx")).?;
+    std.debug.print("FRESH_TENSOR_PLAN allocs={d} peak={d} retained={d}\n", .{ direct.alloc_calls, direct.peak, direct.live });
+    plan.deinit(direct.allocator());
+    try std.testing.expectEqual(@as(usize, 0), direct.live);
+    var serialized = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var envelope = try local_graph.graphEdgesTensorProgramEnvelopeAlloc(serialized.allocator(), "graph_idx");
+    std.debug.print("FRESH_TENSOR_ENVELOPE allocs={d} peak={d} retained={d}\n", .{ serialized.alloc_calls, serialized.peak, serialized.live });
+    envelope.deinit(serialized.allocator());
+    try std.testing.expectEqual(@as(usize, 0), serialized.live);
+}
+
+test "api query contract typed tensor envelope cloning preserves the wire and ownership" {
+    const dims = [_]algebraic_ir.Dimension{.src};
+    const source = algebraic_ir.TensorExpr{ .fragment = .graph_traverse, .layout = .graph_edges, .owner = "g", .output_dims = &dims, .semantic_id = "semantic", .metadata = "opaque", .law_id = .provenance_semiring };
+    const program = algebraic_ir.TensorProgram{ .inputs = &.{source}, .steps = &.{.{ .expr = source, .inputs = &.{.{ .input = 0 }} }}, .output = .{ .step = 0 }, .outputs = &.{ .{ .step = 0 }, .{ .input = 0 } } };
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, original: algebraic_ir.TensorProgram) !void {
+            var owned = try cloneAlgebraicTensorProgramEnvelopeAlloc(a, original);
+            defer owned.deinit(a);
+            const expected = try encodeAlgebraicTensorProgramEnvelopeAlloc(a, original);
+            defer a.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(a, owned, .{ .emit_null_optional_fields = false });
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+    };
+    try Runner.run(std.testing.allocator, program);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{program});
+    const malformed = algebraic_ir.TensorProgram{ .steps = &.{.{ .expr = source, .inputs = &.{.{ .step = 0 }} }}, .output = .{ .step = 0 } };
+    try std.testing.expectError(error.InvalidQueryRequest, cloneAlgebraicTensorProgramEnvelopeAlloc(std.testing.allocator, malformed));
 }

@@ -1398,10 +1398,13 @@ pub const GraphQueryEngine = struct {
                 continue;
             }
             if (candidates.len == 0) {
-                candidates = try alloc.alloc(usize, requested_limit);
+                candidates = try alloc.alloc(usize, @min(requested_limit, @max(@as(usize, 8), count + 1)));
                 for (0..count) |i| candidates[i] = i;
             }
-            if (count < candidates.len) {
+            if (count == candidates.len and count < requested_limit) {
+                candidates = try alloc.realloc(candidates, @min(requested_limit, @max(count + 1, candidates.len *| 2)));
+            }
+            if (count < requested_limit) {
                 candidates[count] = row;
                 count += 1;
                 if (bounded_order) siftWorstMetricCandidateUp(context, candidates[0..count], count - 1);

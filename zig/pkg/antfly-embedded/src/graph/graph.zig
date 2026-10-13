@@ -8329,6 +8329,21 @@ pub const GraphIndex = struct {
         limits: EdgePageLimits,
         now_ns: u64,
     ) !EdgePage {
+        return self.getEdgesByTypesPageAtCounted(alloc, key, edge_types, direction, scan_cursor, limits, now_ns, null);
+    }
+
+    pub fn getEdgesByTypesPageAtCounted(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        scan_cursor: ?EdgeScanCursor,
+        limits: EdgePageLimits,
+        now_ns: u64,
+        scanned_out: ?*usize,
+    ) !EdgePage {
+        if (scanned_out) |out| out.* = 0;
         if (limits.max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -8340,6 +8355,9 @@ pub const GraphIndex = struct {
         }
         var owned_bytes: usize = 0;
         var scanned_rows: usize = 0;
+        defer {
+            if (scanned_out) |out| out.* = scanned_rows;
+        }
         var byte_limit_hit = false;
         const type_count: usize = if (edge_types.len == 0) 1 else edge_types.len;
         var type_index: usize = if (scan_cursor) |cursor| cursor.type_index else 0;
@@ -8479,6 +8497,22 @@ pub const GraphIndex = struct {
         max_physical_rows: usize,
         now_ns: u64,
     ) !BoundedEdgeResult {
+        return self.getEdgesByTypesBoundedWithStatsAtCounted(alloc, key, edge_types, direction, max_edges, max_owned_bytes, max_physical_rows, now_ns, null);
+    }
+
+    pub fn getEdgesByTypesBoundedWithStatsAtCounted(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        max_physical_rows: usize,
+        now_ns: u64,
+        scanned_out: ?*usize,
+    ) !BoundedEdgeResult {
+        if (scanned_out) |out| out.* = 0;
         const page_edge_cap: usize = 4096;
         const page_byte_cap: usize = 4 * 1024 * 1024;
         if (max_physical_rows == 0 or max_physical_rows > @import("work_budget.zig").default_max_explored_edges)
@@ -8497,7 +8531,8 @@ pub const GraphIndex = struct {
             const edge_room = if (results.items.len < max_edges) max_edges - results.items.len else 0;
             const byte_room = if (total_bytes < max_owned_bytes) max_owned_bytes - total_bytes else 0;
             const scan_room = if (total_scanned < max_physical_rows) max_physical_rows - total_scanned else 0;
-            var page = try self.getEdgesByTypesPageAt(
+            var page_scanned: usize = 0;
+            var page = self.getEdgesByTypesPageAtCounted(
                 alloc,
                 key,
                 edge_types,
@@ -8509,7 +8544,12 @@ pub const GraphIndex = struct {
                     .max_scanned_rows = @max(scan_room, 1),
                 },
                 now_ns,
-            );
+                &page_scanned,
+            ) catch |err| {
+                if (scanned_out) |out| out.* = total_scanned + page_scanned;
+                return err;
+            };
+            if (scanned_out) |out| out.* = total_scanned + page.scanned_rows;
             if (cursor) |*value| value.deinit(alloc);
             cursor = null;
             errdefer page.deinit(alloc);

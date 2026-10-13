@@ -153,6 +153,7 @@ pub const Worker = struct {
             req: GraphEdgesRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!GraphEdgesResponse = null,
+        execute_graph_get_edges_batch: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: GraphEdgesRequest, consistency: raft_mod.ReadConsistency) anyerror!GraphEdgesResponse = null,
         resolve_incoming_source_groups: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -229,6 +230,19 @@ pub const Worker = struct {
         errdefer response.deinit(alloc);
         try self.ensureActive();
         return response;
+    }
+
+    pub fn executeGraphGetEdgesBatch(self: Worker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !GraphEdgesResponse {
+        try self.ensureActive();
+        const func = self.vtable.execute_graph_get_edges_batch orelse return error.GraphEdgesBatchUnsupported;
+        if (self.work_cost_port) |port| try port.charge(group_id, .get_edges, 1);
+        var controlled = req;
+        controlled.timeout_ms = try self.remainingTimeoutMs();
+        controlled.cancellation = self.cancellation;
+        var result = try func(self.ptr, alloc, group_id, table_name, controlled, consistency);
+        errdefer result.deinit(alloc);
+        try self.ensureActive();
+        return result;
     }
 
     pub fn resolveIncomingSourceGroups(
@@ -2345,6 +2359,21 @@ const GraphNodeAdmissionContext = struct {
     consistency: raft_mod.ReadConsistency,
     incoming_probe_options: IncomingProbeOptions = .{},
     tables: std.StringArrayHashMapUnmanaged(GraphAdmissionTableState) = .empty,
+    prepared_edge_allocator: ?graph_work_budget.RetainedAllocator = null,
+    prepared_edges: ?struct { path: OwnedGraphTensorAccessPath, program: query_contract.OwnedAlgebraicTensorProgramEnvelope } = null,
+
+    fn preparedEdges(self: *@This()) !void {
+        if (self.prepared_edges != null) return;
+        if (self.prepared_edge_allocator == null) self.prepared_edge_allocator = .{ .backing = self.alloc, .budget = self.incoming_probe_options.work_budget };
+        self.prepareEdgesOwned() catch |err| return if (err == error.OutOfMemory and self.prepared_edge_allocator.?.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn prepareEdgesOwned(self: *@This()) !void {
+        const a = self.prepared_edge_allocator.?.allocator();
+        var path = try cloneGraphTensorAccessPathAlloc(a, algebraic_ir.graphEdgeAccessPath(self.graph_index_name));
+        errdefer path.deinit(a);
+        const program = try graphEdgesTensorProgramEnvelopeAlloc(a, self.graph_index_name);
+        self.prepared_edges = .{ .path = path, .program = program };
+    }
 
     fn init(
         alloc: std.mem.Allocator,
@@ -2380,6 +2409,13 @@ const GraphNodeAdmissionContext = struct {
     }
 
     pub fn deinit(self: *GraphNodeAdmissionContext) void {
+        if (self.prepared_edge_allocator) |*tracked| {
+            if (self.prepared_edges) |*prepared| {
+                prepared.path.deinit(tracked.allocator());
+                prepared.program.deinit(tracked.allocator());
+            }
+            std.debug.assert(tracked.live_bytes == 0);
+        }
         for (self.tables.values()) |*state| state.deinit(self.alloc);
         self.tables.deinit(self.alloc);
         self.* = undefined;
@@ -2910,6 +2946,136 @@ fn executeSingleCrossRange(
     };
 }
 
+// Optional bounded prefetch for traversals that must visit the full candidate
+// frontier. Early-stop queries retain demand-driven single-key reads.
+const CanonicalEdgeBatch = struct {
+    const Table = struct { logical: []const u8, physical: []const u8 = "", groups_loaded: bool = false, key_bytes: usize = 0, keys: std.ArrayListUnmanaged([]const u8) = .empty, groups: []u64 = &.{} };
+    const Shard = struct { table: usize, group: u64, result: GraphEdgesResponse };
+    tracked: graph_work_budget.RetainedAllocator,
+    tables: std.ArrayListUnmanaged(Table) = .empty,
+    shards: std.ArrayListUnmanaged(Shard) = .empty,
+    unsupported: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn clear(self: *@This()) void {
+        const a = self.tracked.allocator();
+        for (self.shards.items) |*shard| shard.result.deinit(a);
+        self.shards.clearRetainingCapacity();
+        for (self.tables.items) |*entry| {
+            entry.keys.deinit(a);
+            a.free(entry.groups);
+        }
+        self.tables.clearRetainingCapacity();
+    }
+    fn deinit(self: *@This()) void {
+        self.clear();
+        const a = self.tracked.allocator();
+        self.tables.deinit(a);
+        self.shards.deinit(a);
+        self.unsupported.deinit(a);
+        std.debug.assert(self.tracked.live_bytes == 0);
+    }
+    fn table(self: *@This(), logical: []const u8) ?*Table {
+        for (self.tables.items) |*entry| if (std.mem.eql(u8, logical, entry.logical)) return entry;
+        return null;
+    }
+    fn hasKey(self: *@This(), logical: []const u8, key: []const u8) bool {
+        for (self.shards.items) |*shard| {
+            const source = self.tables.items[shard.table];
+            if (!std.mem.eql(u8, source.logical, logical)) continue;
+            for (shard.result.key_scanned_rows, 0..) |scans, i| if (scans != std.math.maxInt(u32) and std.mem.eql(u8, source.keys.items[i], key)) return true;
+        }
+        return false;
+    }
+    fn take(self: *@This(), logical: []const u8, group: u64, key: []const u8) ?GraphEdgesResponse {
+        for (self.shards.items) |*shard| {
+            const source = self.tables.items[shard.table];
+            if (shard.group != group or !std.mem.eql(u8, source.logical, logical)) continue;
+            for (shard.result.key_scanned_rows, 0..) |*scans, i| {
+                if (scans.* == std.math.maxInt(u32) or !std.mem.eql(u8, source.keys.items[i], key)) continue;
+                const counted = scans.*;
+                scans.* = std.math.maxInt(u32);
+                return .{ .edges = shard.result.edges[shard.result.key_offsets[i]..shard.result.key_offsets[i + 1]], .scanned_rows = counted, .borrowed_edges = true, .physical_rows_precharged = true };
+            }
+        }
+        return null;
+    }
+    fn prepare(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
+        self.clear();
+        if (reader.worker.vtable.execute_graph_get_edges_batch == null or params.direction == .in) return;
+        self.prepareOwned(reader, frontier, max_depth, params) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn prepareOwned(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
+        const a = self.tracked.allocator();
+        const budget = reader.physical_work_budget orelse return;
+        if (budget.max_retained_state_bytes -| budget.retained_state_bytes < 2 * 1024 * 1024) return;
+        for (frontier) |item| {
+            if (max_depth != 0 and item.depth >= max_depth) continue;
+            const tagged = item.table orelse reader.source_table;
+            const names = [_][]const u8{ tagged, reader.source_table };
+            const count: usize = if (std.mem.eql(u8, tagged, reader.source_table)) 1 else 2;
+            for (names[0..count]) |name| {
+                if (self.table(name) == null) try self.tables.append(a, .{ .logical = name });
+                const entry = self.table(name).?;
+                if (item.key.len > 64 * 1024 - entry.key_bytes) continue;
+                try entry.keys.append(a, item.key);
+                entry.key_bytes += item.key.len;
+            }
+        }
+        try reader.admission.preparedEdges();
+        const prepared = &reader.admission.prepared_edges.?;
+        for (self.tables.items, 0..) |*entry, ti| {
+            if (entry.keys.items.len < 2) continue;
+            const state = try reader.admission.ensureTable(entry.logical);
+            entry.physical = state.table_name;
+            if (!state.allowed or !(try reader.admission.graphIndexAvailable(state, reader.index_name))) continue;
+            entry.groups = try table_catalog.resolveGroupsForSpanPinnedUntil(a, reader.catalog, entry.physical, "", "", state.topology_epoch, reader.worker.routingDeadline(reader.catalog));
+            entry.groups_loaded = true;
+            for (entry.groups) |group| {
+                if (self.unsupported.contains(group)) continue;
+                if (budget.remaining_physical_edges == 0) return;
+                const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+                // Reserve headroom for JSON escaping, request metadata and
+                // duplicate transport buffers before bounding response payloads.
+                const overhead = (entry.key_bytes + entry.keys.items[0].len) * 6 + 64 * 1024;
+                if (room < overhead + 128 * 1024) return;
+                try self.shards.ensureUnusedCapacity(a, 1);
+                const request = GraphEdgesRequest{
+                    .index_name = @constCast(reader.index_name),
+                    .key = @constCast(entry.keys.items[0]),
+                    .keys = entry.keys.items,
+                    .edge_types = @constCast(params.edge_types),
+                    .direction = params.direction,
+                    .tensor_access_path = prepared.path,
+                    .tensor_program = prepared.program,
+                    .topology_epoch = state.topology_epoch,
+                    .identity_read_generation = try state.generationForGroup(group),
+                    .ttl_now_ns = reader.ttl_now_ns,
+                    .max_edges = 4096,
+                    .max_owned_bytes = @intCast(@min(@as(usize, 1024 * 1024), (room - overhead) / 16)),
+                    .max_scanned_rows = @intCast(@min(budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges)),
+                };
+                var result = reader.worker.executeGraphGetEdgesBatch(a, group, entry.physical, request, reader.consistency) catch |err| {
+                    if (err == error.GraphEdgesBatchUnsupported) {
+                        try self.unsupported.put(a, group, {});
+                        continue;
+                    }
+                    return err;
+                };
+                errdefer result.deinit(a);
+                if (result.key_offsets.len != result.key_scanned_rows.len + 1 or result.key_scanned_rows.len > entry.keys.items.len or result.key_offsets[0] != 0 or result.key_offsets[result.key_offsets.len - 1] != result.edges.len or result.scanned_rows > request.max_scanned_rows) return error.InvalidGraphEdgesResponse;
+                var scans: usize = 0;
+                for (result.key_scanned_rows, 0..) |counted, i| {
+                    if (result.key_offsets[i + 1] < result.key_offsets[i] or result.key_offsets[i + 1] - result.key_offsets[i] > counted) return error.InvalidGraphEdgesResponse;
+                    scans = try std.math.add(usize, scans, counted);
+                }
+                if (scans > result.scanned_rows) return error.InvalidGraphEdgesResponse;
+                try budget.consumePhysicalEdges(result.scanned_rows);
+                self.shards.appendAssumeCapacity(.{ .table = ti, .group = group, .result = result });
+            }
+        }
+    }
+};
+
 const DistributedEdgeReader = struct {
     catalog: table_catalog.CatalogSource,
     worker: Worker,
@@ -2919,6 +3085,7 @@ const DistributedEdgeReader = struct {
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
     physical_work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    prefetched: ?*CanonicalEdgeBatch = null,
 
     pub fn routingIndexTable(self: @This(), table: ?[]const u8) ?[]const u8 {
         return table orelse self.source_table;
@@ -3007,7 +3174,7 @@ const DistributedEdgeReader = struct {
             budget.remaining_physical_edges
         else
             graph_pattern_mod.default_max_explored_edges;
-        if (remaining_physical_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (remaining_physical_rows == 0 and (self.prefetched == null or !self.prefetched.?.hasKey(table orelse self.source_table, key))) return error.GraphExploredEdgesBudgetExceeded;
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
@@ -3017,22 +3184,20 @@ const DistributedEdgeReader = struct {
         if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
             return try a.alloc(graph_mod.Edge, 0);
 
+        // Prepare before any parallel shard dispatch; fanout workers only
+        // borrow immutable cached state and never race its lazy initialization.
+        try self.admission.preparedEdges();
+
         // Legacy reverse expansion carries only the bound target table and
         // therefore cannot identify an external source index. Canonical MATCH
         // supplies the declared source-alias table explicitly.
         if (direction != .out and !std.mem.eql(u8, table_name, self.source_table) and !source_table_declared)
             return error.UnsupportedQueryRequest;
 
-        const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
-            a,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            table_state.topology_epoch,
-            self.worker.routingDeadline(self.catalog),
-        );
-        defer if (group_ids.len > 0) a.free(group_ids);
+        const candidate = if (self.prefetched) |batch| batch.table(table_name) else null;
+        const cached = if (candidate != null and candidate.?.groups_loaded) candidate else null;
+        const group_ids = if (cached) |entry| entry.groups else try table_catalog.resolveGroupsForSpanPinnedUntil(a, self.catalog, table_state.table_name, "", "", table_state.topology_epoch, self.worker.routingDeadline(self.catalog));
+        defer if (cached == null and group_ids.len > 0) a.free(group_ids);
         if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
 
         // A direct contribution is routed by the physical source. Probe that
@@ -3042,7 +3207,7 @@ const DistributedEdgeReader = struct {
             (try table_catalog.resolveGroupForKeyPinnedUntil(
                 a,
                 self.catalog,
-                table_name,
+                table_state.table_name,
                 key,
                 table_state.topology_epoch,
                 self.worker.routingDeadline(self.catalog),
@@ -3241,7 +3406,7 @@ const DistributedEdgeReader = struct {
                             max_owned_bytes,
                             &owned_bytes,
                         );
-                        try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, slot.result.?.scanned_rows);
+                        if (!slot.result.?.physical_rows_precharged) try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, slot.result.?.scanned_rows);
                     }
                     for (slots[0..wave_len], candidate_group_ids.items[start..end]) |*slot, group_id| {
                         const slot_err = slot.err orelse continue;
@@ -3270,7 +3435,7 @@ const DistributedEdgeReader = struct {
                             max_owned_bytes,
                             &owned_bytes,
                         );
-                        try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, retry.scanned_rows);
+                        if (!retry.physical_rows_precharged) try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, retry.scanned_rows);
                     }
                     for (slots[0..wave_len]) |*slot| {
                         slot.deinit();
@@ -3295,7 +3460,7 @@ const DistributedEdgeReader = struct {
                 remaining_physical_rows,
             );
             defer resp.deinit(a);
-            try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, resp.scanned_rows);
+            if (!resp.physical_rows_precharged) try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, resp.scanned_rows);
             try Appender.appendCloned(
                 a,
                 &edges,
@@ -3323,6 +3488,7 @@ const DistributedEdgeReader = struct {
         max_owned_bytes: usize,
         max_scanned_rows: usize,
     ) !GraphEdgesResponse {
+        if (self.prefetched) |batch| if (batch.take(table_name, group_id, key)) |response| return response;
         if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -3330,38 +3496,26 @@ const DistributedEdgeReader = struct {
             max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes or
             max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
             return error.InvalidQueryRequest;
-        var request_owns_fields = false;
-        const index_name = try a.dupe(u8, self.index_name);
-        errdefer if (!request_owns_fields) a.free(index_name);
-        const owned_key = try a.dupe(u8, key);
-        errdefer if (!request_owns_fields) a.free(owned_key);
-        const owned_edge_types = try dupConstStrings(a, edge_types);
-        errdefer if (!request_owns_fields) freeConstStrings(a, owned_edge_types);
-        var tensor_access_path = try cloneGraphTensorAccessPathAlloc(
-            a,
-            algebraic_ir.graphEdgeAccessPath(self.index_name),
-        );
-        errdefer if (!request_owns_fields) tensor_access_path.deinit(a);
-        var tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(a, self.index_name);
-        errdefer if (!request_owns_fields) tensor_program.deinit(a);
-        var req = GraphEdgesRequest{
-            .index_name = index_name,
-            .key = owned_key,
-            .edge_types = owned_edge_types,
+        try self.admission.preparedEdges();
+        const prepared = &self.admission.prepared_edges.?;
+        // Synchronous worker calls borrow the immutable query-owned program
+        // and request strings. Only responses transfer ownership here.
+        const req = GraphEdgesRequest{
+            .index_name = @constCast(self.index_name),
+            .key = @constCast(key),
+            .edge_types = @constCast(edge_types),
             .direction = direction,
-            .tensor_access_path = tensor_access_path,
-            .tensor_program = tensor_program,
+            .tensor_access_path = prepared.path,
+            .tensor_program = prepared.program,
             .topology_epoch = table_state.topology_epoch,
             .ttl_now_ns = self.ttl_now_ns,
             .identity_read_generation = try table_state.generationForGroup(group_id),
             .max_edges = @intCast(max_edges),
             .max_owned_bytes = @intCast(max_owned_bytes),
             .max_scanned_rows = @intCast(max_scanned_rows),
-            .allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(a, self.catalog, table_name, self.index_name),
+            .allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(a, self.catalog, table_state.table_name, self.index_name),
         };
-        request_owns_fields = true;
-        defer req.deinit(a);
-        var response = try self.worker.executeGraphGetEdges(a, group_id, table_name, req, self.consistency);
+        var response = try self.worker.executeGraphGetEdges(a, group_id, table_state.table_name, req, self.consistency);
         errdefer response.deinit(a);
         if (response.scanned_rows < response.edges.len or response.scanned_rows > max_scanned_rows)
             return error.InvalidGraphEdgesResponse;
@@ -4619,6 +4773,9 @@ fn executeDistributedTraverse(
 
     var metric_batch = CanonicalMetricBatch{ .alloc = alloc, .worker = worker, .admission = admission, .state = &state, .index_name = graph_query.query.index_name, .reads = metric_reads, .consistency = consistency, .work_budget = request_work_budget, .status_seen = &metric_status_seen_groups, .row_limit = @min(@as(usize, 256), collection_limit) };
     defer metric_batch.deinit();
+    var edge_batch = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = request_work_budget } };
+    defer edge_batch.deinit();
+    const batch_edges = defer_result_limit or result_limit == 0;
     while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
         var completed_depth: u32 = 0;
         for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
@@ -4650,8 +4807,10 @@ fn executeDistributedTraverse(
                 .consistency = consistency,
                 .admission = admission,
                 .physical_work_budget = request_work_budget,
+                .prefetched = if (batch_edges) &edge_batch else null,
             };
-            for (frontier) |item| {
+            for (frontier, 0..) |item, frontier_index| {
+                if (batch_edges and frontier_index % 64 == 0) try edge_batch.prepare(reader, frontier[frontier_index..@min(frontier.len, frontier_index + 64)], max_depth, graph_query.query.params);
                 if (max_depth != 0 and item.depth >= max_depth) continue;
                 const tagged_table = item.table orelse table_name;
                 const tables = [_][]const u8{ tagged_table, table_name };
@@ -4733,6 +4892,7 @@ fn executeDistributedTraverse(
                 .depth = completed_depth +| 1,
                 .result_count = state.nodes.items.len,
             });
+            edge_batch.clear();
             const ready_frontier = try next_frontier.toOwnedSlice(alloc);
             freeFrontier(alloc, frontier);
             frontier = ready_frontier;
@@ -8480,6 +8640,7 @@ pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest)
 }
 
 pub fn encodeLegacyGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
+    if (req.keys.len != 0) return error.GraphEdgesBatchUnsupported;
     if (!req.allow_legacy_wire_fallback or req.max_scanned_rows != graph_pattern_mod.default_max_explored_edges)
         return error.GraphExploredEdgesBudgetExceeded;
     return encodeGraphEdgesRequestWithWireMode(alloc, req, true);
@@ -8488,33 +8649,22 @@ pub fn encodeLegacyGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRe
 fn encodeGraphEdgesRequestWithWireMode(alloc: std.mem.Allocator, req: GraphEdgesRequest, legacy: bool) ![]u8 {
     try validateGraphEdgesTensorAccessPath(alloc, req);
     try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
-    var fragment_names: ?[][]const u8 = null;
-    defer if (fragment_names) |names| alloc.free(names);
-    var output_dim_names: ?[][]const u8 = null;
-    defer if (output_dim_names) |names| alloc.free(names);
-    var law_names: ?[][]const u8 = null;
-    defer if (law_names) |names| alloc.free(names);
     const tensor_path = req.tensor_access_path orelse return error.InvalidQueryRequest;
     const tensor_program = req.tensor_program orelse return error.InvalidQueryRequest;
-    var tensor_program_json = try graphTensorProgramJsonValueAlloc(alloc, &tensor_program);
-    defer tensor_program_json.deinit();
-    return try jsonStringifyAlloc(alloc, GraphEdgesRequestJson{
+    return try jsonStringifyAlloc(alloc, .{
         .index_name = req.index_name,
         .key = req.key,
+        .keys = if (req.keys.len == 0) null else req.keys,
         .edge_types = req.edge_types,
-        .direction = switch (req.direction) {
-            .out => "out",
-            .in => "in",
-            .both => "both",
-        },
+        .direction = @tagName(req.direction),
         .topology_epoch = req.topology_epoch,
         .ttl_now_ns = if (legacy) null else req.ttl_now_ns,
         .identity_read_generation = req.identity_read_generation,
         .max_edges = req.max_edges,
         .max_owned_bytes = req.max_owned_bytes,
         .max_scanned_rows = if (legacy) null else req.max_scanned_rows,
-        .tensor_access_path = try graphTensorAccessPathJsonAlloc(alloc, tensor_path, &fragment_names, &output_dim_names, &law_names),
-        .tensor_program = tensor_program_json.value,
+        .tensor_access_path = tensor_path,
+        .tensor_program = tensor_program,
     });
 }
 
@@ -8555,7 +8705,21 @@ pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !Grap
     }
     const scanned_rows = parsed.value.scanned_rows orelse @as(u32, graph_pattern_mod.default_max_explored_edges);
     if (scanned_rows < edges.len) return error.InvalidGraphEdgesResponse;
-    return .{ .edges = edges, .scanned_rows = scanned_rows };
+    const offsets = try alloc.dupe(u32, parsed.value.key_offsets orelse &.{});
+    errdefer alloc.free(offsets);
+    const scans = try alloc.dupe(u32, parsed.value.key_scanned_rows orelse &.{});
+    errdefer alloc.free(scans);
+    if ((parsed.value.key_offsets == null) != (parsed.value.key_scanned_rows == null)) return error.InvalidGraphEdgesResponse;
+    if (offsets.len != 0) {
+        if (offsets.len != scans.len + 1 or offsets[0] != 0 or offsets[offsets.len - 1] != edges.len) return error.InvalidGraphEdgesResponse;
+        var sum: usize = 0;
+        for (scans, 0..) |count, i| {
+            if (offsets[i + 1] < offsets[i] or offsets[i + 1] - offsets[i] > count) return error.InvalidGraphEdgesResponse;
+            sum = try std.math.add(usize, sum, count);
+        }
+        if (sum > scanned_rows) return error.InvalidGraphEdgesResponse;
+    } else if (scans.len != 0) return error.InvalidGraphEdgesResponse;
+    return .{ .edges = edges, .scanned_rows = scanned_rows, .key_offsets = offsets, .key_scanned_rows = scans };
 }
 
 /// Charge coordinator-side work from the complete fan-out response, before
@@ -16608,19 +16772,38 @@ test "distributed graph metric post processing applies max results after filter 
         fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
-    const TestState = struct { graph: *graph_mod.GraphIndex, score_calls: usize = 0, status_calls: usize = 0, score_keys: usize = 0, largest_cells: usize = 0, fail_scores: bool = false };
+    const TestState = struct { graph: *graph_mod.GraphIndex, score_calls: usize = 0, status_calls: usize = 0, score_keys: usize = 0, largest_cells: usize = 0, fail_scores: bool = false, edge_calls: usize = 0, batch_edge_calls: usize = 0, unsupported_batch: bool = false, batch_edge_cap: ?u32 = null, batch_byte_cap: ?u32 = null };
     const FakeWorker = struct {
         fn iface(state: *TestState) Worker {
-            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges } };
+            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = batchEdges } };
         }
         fn expand(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
             return error.TestUnexpectedResult;
         }
         fn edges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.edge_calls += 1;
             if (group == 11) return .{ .edges = &.{} };
-            const result = try state.graph.getEdgesByTypesBounded(a, request.key, request.edge_types, request.direction, request.max_edges, request.max_owned_bytes);
-            return .{ .edges = result, .scanned_rows = @intCast(result.len) };
+            return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(a, state.graph, request, 1);
+        }
+        fn batchEdges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.batch_edge_calls += 1;
+            if (state.unsupported_batch) return error.GraphEdgesBatchUnsupported;
+            try std.testing.expect(request.keys.len <= 64);
+            try std.testing.expectEqual(@as(?u64, 12345), request.identity_read_generation);
+            if (group == 22) {
+                var limited = request;
+                if (state.batch_edge_cap) |cap| limited.max_edges = cap;
+                if (state.batch_byte_cap) |cap| limited.max_owned_bytes = cap;
+                return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(a, state.graph, limited, 1);
+            }
+            const offsets = try a.alloc(u32, request.keys.len + 1);
+            errdefer a.free(offsets);
+            const scans = try a.alloc(u32, request.keys.len);
+            @memset(offsets, 0);
+            @memset(scans, 0);
+            return .{ .edges = &.{}, .key_offsets = offsets, .key_scanned_rows = scans };
         }
         fn hydrate(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
@@ -16723,6 +16906,37 @@ test "distributed graph metric post processing applies max results after filter 
     try std.testing.expectEqual(@as(usize, 2), test_state.score_calls);
     try std.testing.expectEqual(@as(usize, 1), test_state.status_calls);
     std.debug.print("CANONICAL_BATCH frontier={d} returned={d} score_calls={d} metadata_calls={d} largest_cells={d}\n", .{ n, result.nodes.len, test_state.score_calls, test_state.status_calls, test_state.largest_cells });
+    // Full-frontier traversal retains identical ordering/scores while grouping
+    // raw adjacency reads. Prefix capacity retries remain physically charged.
+    const prototype = try graph.getEdgesByTypesBounded(alloc, roots[0], &.{}, .out, 10, 4096);
+    const byte_cap: u32 = @intCast(graphEdgeOwnedBytes(prototype[0]) + graphEdgeOwnedBytes(prototype[1]) + graphEdgeOwnedBytes(prototype[0]) / 2);
+    graph_mod.GraphIndex.freeEdges(alloc, prototype);
+    for (0..4) |mode| {
+        var batched_state = TestState{ .graph = &graph, .unsupported_batch = mode == 1, .batch_edge_cap = if (mode == 2) 2 else null, .batch_byte_cap = if (mode == 3) byte_cap else null };
+        var batched_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var batched_admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&batched_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        batched_admission.incoming_probe_options.work_budget = &batched_budget;
+        defer batched_admission.deinit();
+        var full = query;
+        full.query.params.max_results = 0;
+        var batched_result = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&batched_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, full, .read_index, &batched_admission, &batched_budget);
+        defer batched_result.deinit(alloc);
+        try std.testing.expectEqual(n, batched_result.nodes.len);
+        for (batched_result.nodes, 0..) |node, row| {
+            try std.testing.expectEqualStrings(targets[row], node.key);
+            try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
+        }
+        if (mode == 0) {
+            try std.testing.expectEqual(@as(usize, 10), batched_state.batch_edge_calls);
+            try std.testing.expectEqual(@as(usize, 0), batched_state.edge_calls);
+            try std.testing.expectEqual(@as(usize, n * 2), batched_budget.max_edges - batched_budget.remaining_physical_edges);
+        } else if (mode == 1) {
+            try std.testing.expectEqual(@as(usize, 2), batched_state.batch_edge_calls);
+            try std.testing.expectEqual(@as(usize, n * 2), batched_state.edge_calls);
+        }
+        if (mode == 3) try std.testing.expect(batched_budget.max_edges - batched_budget.remaining_physical_edges > n * 2);
+        std.debug.print("CANONICAL_EDGE_BATCH mode={d} frontier={d} batch_calls={d} single_calls={d} physical_scans={d}\n", .{ mode, n, batched_state.batch_edge_calls, batched_state.edge_calls, batched_budget.max_edges - batched_budget.remaining_physical_edges });
+    }
     // No selected targets: preserve metadata without fetching any score cells.
     test_state = .{ .graph = &graph };
     var empty_query = query;
@@ -16791,6 +17005,7 @@ test "distributed graph metric post processing applies max results after filter 
             var gate = GraphNodeAdmissionContext.init(a, FakeCatalog.iface(), FakeWorker.iface(&worker_state), "docs", "graph_idx", topology, request, null, &.{}, .{}, .read_index);
             defer gate.deinit();
             var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+            gate.incoming_probe_options.work_budget = &work;
             const named = db_mod.types.NamedGraphQuery{ .name = "failure", .query = .{
                 .query_type = .traverse,
                 .index_name = "graph_idx",
@@ -16798,7 +17013,7 @@ test "distributed graph metric post processing applies max results after filter 
                 .target_nodes = .{ .keys = ends },
                 .metrics = &.{.{ .name = "rank" }},
                 .include_metric_status = true,
-                .params = .{ .max_depth = 2, .max_results = 1000 },
+                .params = .{ .max_depth = 2, .max_results = 0 },
             } };
             var output = executeDistributedTraverse(a, FakeCatalog.iface(), FakeWorker.iface(&worker_state), "docs", request, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, named, .read_index, &gate, &work) catch |err| {
                 var marker = std.testing.FailingAllocator.init(a, .{});
@@ -17076,4 +17291,85 @@ test "distributed graph metric post processing applies max results after filter 
     };
     try Runner.run(a, wire);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{wire});
+}
+
+test "distributed graph metric post processing applies max results after filter and order edge batch wire and prepared cache" {
+    const a = std.testing.allocator;
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var req = GraphEdgesRequest{ .index_name = &.{}, .key = &.{}, .direction = .out };
+            defer req.deinit(alloc);
+            req.index_name = try alloc.dupe(u8, "g");
+            req.key = try alloc.dupe(u8, "a");
+            req.keys = try dupConstStrings(alloc, &.{ "a", "b" });
+            req.tensor_access_path = try cloneGraphTensorAccessPathAlloc(alloc, algebraic_ir.graphEdgeAccessPath("g"));
+            req.tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(alloc, "g");
+            const body = try encodeGraphEdgesRequest(alloc, req);
+            defer alloc.free(body);
+            var decoded = try parseGraphEdgesRequest(alloc, body);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), decoded.keys.len);
+            try std.testing.expectEqualStrings("b", decoded.keys[1]);
+            var offsets = [_]u32{ 0, 0, 0 };
+            var scans = [_]u32{ 0, 3 };
+            const result = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 4, .key_offsets = &offsets, .key_scanned_rows = &scans };
+            const wire = try encodeGraphEdgesResponse(alloc, result);
+            defer alloc.free(wire);
+            var parsed = try parseGraphEdgesResponse(alloc, wire);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualSlices(u32, &offsets, parsed.key_offsets);
+            try std.testing.expectEqualSlices(u32, &scans, parsed.key_scanned_rows);
+            try std.testing.expectEqual(@as(u32, 4), parsed.scanned_rows);
+        }
+    };
+    try Runner.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{});
+    for ([_][]const u8{
+        "{\"edges\":[],\"scanned_rows\":1,\"key_offsets\":[0,1],\"key_scanned_rows\":[1]}",
+        "{\"edges\":[],\"scanned_rows\":1,\"key_offsets\":[0,0],\"key_scanned_rows\":[2]}",
+        "{\"edges\":[],\"scanned_rows\":1,\"key_offsets\":[0]}",
+        "{\"edges\":[],\"scanned_rows\":1,\"key_offsets\":[0,0],\"key_scanned_rows\":[]}",
+    }) |wire| try std.testing.expectError(error.InvalidGraphEdgesResponse, parseGraphEdgesResponse(a, wire));
+    var counter = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = a };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var context = GraphNodeAdmissionContext.init(counter.allocator(), undefined, undefined, "docs", "g", 0, .{}, null, &.{}, .{}, .read_index);
+    context.incoming_probe_options.work_budget = &budget;
+    try context.preparedEdges();
+    const calls = counter.alloc_calls;
+    const bytes = counter.live;
+    for (0..300) |_| try context.preparedEdges();
+    try std.testing.expectEqual(calls, counter.alloc_calls);
+    std.debug.print("PREPARED_EDGE_PROGRAM builds=1 warm_calls=300 warm_allocations={d} retained={d}\n", .{ counter.alloc_calls - calls, bytes });
+    context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    budget.max_retained_state_bytes = 1;
+    var denied = GraphNodeAdmissionContext.init(a, undefined, undefined, "docs", "g", 0, .{}, null, &.{}, .{}, .read_index);
+    defer denied.deinit();
+    denied.incoming_probe_options.work_budget = &budget;
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, denied.preparedEdges());
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed graph metric post processing applies max results after filter and order decoder SIMD escape boundaries" {
+    const a = std.testing.allocator;
+    var names = [_][]u8{@constCast("rank")};
+    var scores = [_]f64{3};
+    var owner = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    for (0..64) |padding| {
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        defer key.deinit(a);
+        try key.appendNTimes(a, 'x', padding);
+        try key.appendSlice(a, "\\\"{}[]\\\\tail");
+        const node = graph_query_mod.GraphResultNode{ .key = key.items, .depth = 1, .distance = 1, .metric_columns = &owner };
+        const wire = try std.json.Stringify.valueAlloc(a, GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "s", .name = "g", .total = 999999, .nodes = &.{ node, node } }} }, .{});
+        defer a.free(wire);
+        var decoded = try parseGraphExpandResponse(a, wire);
+        defer decoded.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), decoded.expansions[0].graph_result.nodes.len);
+        for (decoded.expansions[0].graph_result.nodes) |parsed| {
+            try std.testing.expectEqualStrings(key.items, parsed.key);
+            try std.testing.expectEqual(@as(?f64, 3), parsed.metricAt(0).score);
+        }
+    }
 }

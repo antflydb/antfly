@@ -156,44 +156,77 @@ const NodeBuilder = struct {
 
 // This pass counts only structure; typed parsing remains authoritative. It
 // skips quoted bytes without converting numbers or allocating token stacks.
-fn countNodes(input: []const u8) !usize {
-    var depth: usize = 0;
-    var quoted = false;
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        const byte = input[i];
-        if (quoted) {
-            if (byte == '\\') {
-                i += 1;
-                continue;
-            }
-            if (byte == '"') quoted = false;
-            continue;
+const NodeCounter = struct {
+    depth: usize = 0,
+    quoted: bool = false,
+    count: usize = 0,
+    inline fn event(self: *@This(), byte: u8, offset: usize) !bool {
+        if (byte == '"') {
+            self.quoted = !self.quoted;
+            return false;
         }
+        if (self.quoted) return false;
         switch (byte) {
-            '"' => quoted = true,
             '{', '[' => {
-                if (byte == '{' and depth == 1) {
-                    if (count == std.math.maxInt(u32)) return error.InvalidRemoteResponse;
-                    count += 1;
+                if (byte == '{' and self.depth == 1) {
+                    if (self.count == std.math.maxInt(u32)) return error.InvalidRemoteResponse;
+                    self.count += 1;
                 }
-                depth += 1;
+                self.depth += 1;
             },
             '}', ']' => {
-                if (depth == 0) return error.SyntaxError;
-                depth -= 1;
-                if (depth == 0) {
+                if (self.depth == 0) return error.SyntaxError;
+                self.depth -= 1;
+                if (self.depth == 0) {
                     if (byte != ']') return error.SyntaxError;
-                    // A valid node needs key, depth and distance (at least 33
-                    // encoded bytes). Reject impossible counts before reserving
-                    // output for malformed arrays full of tiny empty objects.
-                    if (count > (i + 1) / 33) return error.MissingField;
-                    return count;
+                    // Required key/depth/distance occupy at least 33 bytes.
+                    if (self.count > (offset + 1) / 33) return error.MissingField;
+                    return true;
                 }
             },
             else => {},
         }
+        return false;
+    }
+};
+
+fn countNodes(input: []const u8) !usize {
+    var state = NodeCounter{};
+    var offset: usize = 0;
+    var skip_first = false;
+    // SIMD identifies punctuation once per block. Only those bytes affect
+    // nesting; numeric literals and ordinary string contents are skipped.
+    while (input.len - offset >= 32) : (offset += 32) {
+        const block: @Vector(32, u8) = input[offset..][0..32].*;
+        const quote = block == @as(@Vector(32, u8), @splat('"'));
+        const escape = block == @as(@Vector(32, u8), @splat('\\'));
+        const opening = (block == @as(@Vector(32, u8), @splat('{'))) | (block == @as(@Vector(32, u8), @splat('[')));
+        const closing = (block == @as(@Vector(32, u8), @splat('}'))) | (block == @as(@Vector(32, u8), @splat(']')));
+        var events: u32 = @bitCast(quote | escape | opening | closing);
+        if (skip_first) events &= ~@as(u32, 1);
+        skip_first = false;
+        while (events != 0) {
+            const lane: u5 = @intCast(@ctz(events));
+            events &= events - 1;
+            const byte = input[offset + lane];
+            if (state.quoted and byte == '\\') {
+                if (lane == 31) skip_first = true else events &= ~(@as(u32, 1) << (lane + 1));
+                continue;
+            }
+            if (try state.event(byte, offset + lane)) return state.count;
+        }
+    }
+    if (skip_first) {
+        if (offset == input.len) return error.SyntaxError;
+        offset += 1;
+    }
+    while (offset < input.len) : (offset += 1) {
+        const byte = input[offset];
+        if (state.quoted and byte == '\\') {
+            offset += 1;
+            continue;
+        }
+        if (try state.event(byte, offset)) return state.count;
     }
     return error.SyntaxError;
 }
@@ -228,13 +261,11 @@ const Parser = struct {
         };
         return error.UnknownField;
     }
-    fn nodes(self: *@This(), hint: ?u32) !graph.OwnedGraphNodes {
+    fn nodes(self: *@This()) !graph.OwnedGraphNodes {
         if (try self.scanner.peekNextTokenType() != .array_begin) return error.UnexpectedToken;
-        // Current workers send total before nodes. Treat it only as a bounded
-        // allocation hint; arbitrary field order and inaccurate totals remain
-        // valid, and exported columns always use the actual row count.
-        const remaining = self.scanner.input.len - self.scanner.cursor;
-        const count = if (hint) |total| @min(@as(usize, total), remaining / 33) else try countNodes(self.scanner.input[self.scanner.cursor..]);
+        // Total is independent of the serialized row count. Count only this
+        // array so unrelated hits/status payloads cannot inflate reservations.
+        const count = try countNodes(self.scanner.input[self.scanner.cursor..]);
         try self.expect(.array_begin);
         var builder = NodeBuilder{ .a = self.a, .total_rows = count };
         defer builder.deinit();
@@ -274,7 +305,7 @@ const Parser = struct {
             2 => result.graph_result.name = try self.a.dupe(u8, try self.read([]const u8)),
             3 => result.graph_result.total_hits = try self.read(u32),
             4 => {
-                const owned = try self.nodes(if (seen & 8 != 0) result.graph_result.total_hits else null);
+                const owned = try self.nodes();
                 result.graph_result.nodes = owned.nodes;
                 result.graph_result.metric_columns = owned.metrics.columns;
                 result.graph_result.metric_values_slab = owned.metrics.values;

@@ -252,6 +252,7 @@ pub const GraphHydrateResponse = struct {
 pub const GraphEdgesRequest = struct {
     index_name: []u8,
     key: []u8,
+    keys: [][]const u8 = &.{},
     edge_types: [][]const u8 = &.{},
     direction: graph_mod.EdgeDirection,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
@@ -271,6 +272,7 @@ pub const GraphEdgesRequest = struct {
     pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.key);
+        freeConstStrings(alloc, self.keys);
         freeConstStrings(alloc, self.edge_types);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
@@ -281,8 +283,16 @@ pub const GraphEdgesRequest = struct {
 pub const GraphEdgesResponse = struct {
     edges: []graph_mod.Edge,
     scanned_rows: u32 = 0,
+    // Complete key prefixes only. Total scans also include an incomplete key.
+    key_offsets: []u32 = &.{},
+    key_scanned_rows: []u32 = &.{},
+    borrowed_edges: bool = false,
+    physical_rows_precharged: bool = false,
 
     pub fn deinit(self: *GraphEdgesResponse, alloc: std.mem.Allocator) void {
+        if (self.borrowed_edges) return;
+        alloc.free(self.key_offsets);
+        alloc.free(self.key_scanned_rows);
         for (self.edges) |e| graph_mod.GraphIndex.freeEdge(alloc, e);
         if (self.edges.len > 0) alloc.free(self.edges);
         self.* = undefined;
@@ -415,6 +425,7 @@ pub const GraphHydrateResponseJson = struct {
 pub const GraphEdgesRequestJson = struct {
     index_name: []const u8,
     key: []const u8,
+    keys: ?[]const []const u8 = null,
     edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
@@ -444,6 +455,8 @@ pub const GraphEdgeJson = struct {
 pub const GraphEdgesResponseJson = struct {
     edges: []const GraphEdgeJson,
     scanned_rows: ?u32 = null,
+    key_offsets: ?[]const u32 = null,
+    key_scanned_rows: ?[]const u32 = null,
 };
 
 pub fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
@@ -544,6 +557,11 @@ pub fn identityGenerationFromResolvedFilterEnvelope(
 pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !GraphEdgesRequest {
     var parsed = try std.json.parseFromSlice(GraphEdgesRequestJson, alloc, body, .{});
     defer parsed.deinit();
+    const requested_keys = parsed.value.keys orelse &.{};
+    if (requested_keys.len > 64 or (requested_keys.len != 0 and !std.mem.eql(u8, parsed.value.key, requested_keys[0]))) return error.InvalidQueryRequest;
+    var key_bytes: usize = 0;
+    for (requested_keys) |key| key_bytes = std.math.add(usize, key_bytes, key.len) catch return error.InvalidQueryRequest;
+    if (key_bytes > 64 * 1024) return error.InvalidQueryRequest;
     var tensor_access_path = try parseGraphTensorAccessPathAlloc(alloc, parsed.value.tensor_access_path);
     errdefer tensor_access_path.deinit(alloc);
     var tensor_program = try parseGraphTensorProgramJsonValueAlloc(alloc, parsed.value.tensor_program);
@@ -556,10 +574,20 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
     );
     const max_scanned_rows = parsed.value.max_scanned_rows orelse @as(u32, graph_pattern_mod.default_max_explored_edges);
     try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes, max_scanned_rows);
+    const index_name = try alloc.dupe(u8, parsed.value.index_name);
+    errdefer alloc.free(index_name);
+    const key = try alloc.dupe(u8, parsed.value.key);
+    errdefer alloc.free(key);
+    const kinds = try dupConstStrings(alloc, parsed.value.edge_types);
+    errdefer freeConstStrings(alloc, kinds);
+    const keys = try dupConstStrings(alloc, requested_keys);
+    errdefer freeConstStrings(alloc, keys);
+    if (keys.len > 64 or (keys.len != 0 and !std.mem.eql(u8, key, keys[0]))) return error.InvalidQueryRequest;
     return .{
-        .index_name = try alloc.dupe(u8, parsed.value.index_name),
-        .key = try alloc.dupe(u8, parsed.value.key),
-        .edge_types = try dupConstStrings(alloc, parsed.value.edge_types),
+        .index_name = index_name,
+        .key = key,
+        .keys = keys,
+        .edge_types = kinds,
         .direction = if (std.mem.eql(u8, parsed.value.direction, "in"))
             .in
         else if (std.mem.eql(u8, parsed.value.direction, "both"))
@@ -576,6 +604,69 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
+}
+
+// One pinned index/read activity serves a bounded list of adjacency keys.
+// Capacity exhaustion returns a complete prefix and charges the unsuccessful
+// key's scans too; the coordinator can continue with a single-key read.
+pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIndex, req: GraphEdgesRequest, now_ns: u64) !GraphEdgesResponse {
+    try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
+    if (req.keys.len == 0) {
+        const result = try index.getEdgesByTypesBoundedWithStatsAt(alloc, req.key, req.edge_types, req.direction, req.max_edges, req.max_owned_bytes, req.max_scanned_rows, now_ns);
+        return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    }
+    if (req.keys.len > 64 or !std.mem.eql(u8, req.key, req.keys[0])) return error.InvalidQueryRequest;
+    var request_key_bytes: usize = 0;
+    for (req.keys) |key| request_key_bytes = std.math.add(usize, request_key_bytes, key.len) catch return error.InvalidQueryRequest;
+    if (request_key_bytes > 64 * 1024) return error.InvalidQueryRequest;
+    var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+    errdefer {
+        for (edges.items) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
+        edges.deinit(alloc);
+    }
+    var offsets = std.ArrayListUnmanaged(u32).empty;
+    defer offsets.deinit(alloc);
+    var scans = std.ArrayListUnmanaged(u32).empty;
+    defer scans.deinit(alloc);
+    try offsets.ensureTotalCapacity(alloc, req.keys.len + 1);
+    try scans.ensureTotalCapacity(alloc, req.keys.len);
+    offsets.appendAssumeCapacity(0);
+    var scanned: usize = 0;
+    var owned_bytes: usize = 0;
+    for (req.keys) |key| {
+        if (scanned >= req.max_scanned_rows or edges.items.len >= req.max_edges or owned_bytes >= req.max_owned_bytes) break;
+        if (req.cancellation) |token| try token.check();
+        if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        var attempted: usize = 0;
+        const result = index.getEdgesByTypesBoundedWithStatsAtCounted(alloc, key, req.edge_types, req.direction, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
+            error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
+                scanned += attempted;
+                if (scanned > req.max_scanned_rows) return error.GraphExploredEdgesBudgetExceeded;
+                break;
+            },
+            else => return err,
+        };
+        var moved = false;
+        defer if (!moved) graph_mod.GraphIndex.freeEdges(alloc, result.edges);
+        try edges.ensureUnusedCapacity(alloc, result.edges.len);
+        for (result.edges) |edge| {
+            // Graph pages include edge descriptors in their owned-byte limit.
+            var bytes: usize = @sizeOf(graph_mod.Edge);
+            inline for (.{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata, edge.winner_key_hex }) |v| bytes += v.len;
+            owned_bytes += bytes;
+            edges.appendAssumeCapacity(edge);
+        }
+        alloc.free(result.edges);
+        moved = true;
+        scanned += result.scanned_rows;
+        scans.appendAssumeCapacity(@intCast(result.scanned_rows));
+        offsets.appendAssumeCapacity(@intCast(edges.items.len));
+    }
+    const owned_edges = try edges.toOwnedSlice(alloc);
+    errdefer graph_mod.GraphIndex.freeEdges(alloc, owned_edges);
+    const owned_offsets = try offsets.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_offsets);
+    return .{ .edges = owned_edges, .key_offsets = owned_offsets, .key_scanned_rows = try scans.toOwnedSlice(alloc), .scanned_rows = @intCast(scanned) };
 }
 
 pub fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32, max_scanned_rows: u32) !void {
@@ -751,9 +842,7 @@ pub fn cloneGraphTensorProgramEnvelopeAlloc(
     alloc: std.mem.Allocator,
     program: algebraic_ir.TensorProgram,
 ) !query_contract.OwnedAlgebraicTensorProgramEnvelope {
-    const encoded = try query_contract.encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
-    defer alloc.free(encoded);
-    return try query_contract.parseAlgebraicTensorProgramEnvelopeAlloc(alloc, encoded);
+    return query_contract.cloneAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
 }
 
 pub fn validateGraphExpandTensorAccessPath(alloc: std.mem.Allocator, req: GraphExpandRequest) !void {
@@ -2083,7 +2172,7 @@ pub fn encodeGraphEdgesResponseForWire(alloc: std.mem.Allocator, res: GraphEdges
             .winner_key_hex = edge.winner_key_hex,
         };
     }
-    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows });
+    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows, .key_offsets = if (res.key_offsets.len == 0) null else res.key_offsets, .key_scanned_rows = if (res.key_offsets.len == 0) null else res.key_scanned_rows });
 }
 
 pub fn encodeGraphExpandResponseForWire(alloc: std.mem.Allocator, res: GraphExpandResponse, legacy: bool) ![]u8 {

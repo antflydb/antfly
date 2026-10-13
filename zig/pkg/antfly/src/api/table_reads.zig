@@ -3188,17 +3188,7 @@ pub const BoundTableReadSource = struct {
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
         const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-        const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-            alloc,
-            req.key,
-            req.edge_types,
-            req.direction,
-            req.max_edges,
-            req.max_owned_bytes,
-            req.max_scanned_rows,
-            if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
-        );
-        return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+        return try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
     }
 };
 
@@ -10828,6 +10818,7 @@ const ProvisionedGraphWorkerContext = struct {
                 .execute_graph_expand = executeProvisionedGraphExpand,
                 .execute_graph_hydrate = executeProvisionedGraphHydrate,
                 .execute_graph_get_edges = executeProvisionedGraphGetEdges,
+                .execute_graph_get_edges_batch = executeProvisionedGraphGetEdges,
                 .resolve_incoming_source_groups = resolveProvisionedIncomingSourceGroups,
                 .record_incoming_source_groups = recordProvisionedIncomingSourceGroups,
                 .fanout_io = provisionedGraphFanoutIo,
@@ -10846,6 +10837,7 @@ fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.
             .execute_graph_expand = executeHostedGraphExpand,
             .execute_graph_hydrate = executeHostedGraphHydrate,
             .execute_graph_get_edges = executeHostedGraphGetEdges,
+            .execute_graph_get_edges_batch = executeHostedGraphGetEdges,
             .resolve_incoming_source_groups = resolveHostedIncomingSourceGroups,
             .record_incoming_source_groups = recordHostedIncomingSourceGroups,
             .fanout_io = hostedGraphFanoutIo,
@@ -11298,18 +11290,7 @@ fn executeProvisionedGraphGetEdgesAttempt(
     defer db_owner.deinit();
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const ttl_now_ns = if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs();
-    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-        alloc,
-        req.key,
-        req.edge_types,
-        req.direction,
-        req.max_edges,
-        req.max_owned_bytes,
-        req.max_scanned_rows,
-        ttl_now_ns,
-    );
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
 }
 
 fn executeHostedGraphGetEdges(
@@ -11355,17 +11336,7 @@ fn graphGetEdgesLocal(
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-        alloc,
-        req.key,
-        req.edge_types,
-        req.direction,
-        req.max_edges,
-        req.max_owned_bytes,
-        req.max_scanned_rows,
-        if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
-    );
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
 }
 
 fn lookupLocal(
@@ -15874,6 +15845,11 @@ fn graphEdgesRemote(
         http_common.RequestCancellation.fromToken(token)
     else
         null;
+    if (req.keys.len != 0) {
+        var batch = try client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null);
+        defer batch.deinit(alloc);
+        return try distributed_graph.parseGraphEdgesResponse(alloc, batch.body);
+    }
     var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
         group_id,
