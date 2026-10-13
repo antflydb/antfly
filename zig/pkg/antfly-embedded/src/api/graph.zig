@@ -633,12 +633,14 @@ pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIn
     offsets.appendAssumeCapacity(0);
     var scanned: usize = 0;
     var owned_bytes: usize = 0;
+    var read_context = try index.beginEdgeReadContext(req.direction);
+    defer read_context.deinit();
     for (req.keys) |key| {
         if (scanned >= req.max_scanned_rows or edges.items.len >= req.max_edges or owned_bytes >= req.max_owned_bytes) break;
         if (req.cancellation) |token| try token.check();
         if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
         var attempted: usize = 0;
-        const result = index.getEdgesByTypesBoundedWithStatsAtCounted(alloc, key, req.edge_types, req.direction, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
+        const result = read_context.getBounded(alloc, key, req.edge_types, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
             error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
                 scanned += attempted;
                 if (scanned > req.max_scanned_rows) return error.GraphExploredEdgesBudgetExceeded;

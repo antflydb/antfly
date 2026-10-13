@@ -172,10 +172,14 @@ pub const Filter = struct {
         const prepared = filter.prepared.?;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
+        return filter.matchesPrepared(scratch.allocator(), edge, prepared);
+    }
+
+    fn matchesPrepared(self: Filter, alloc: Allocator, edge: anytype, prepared: *const Prepared) !bool {
         var values: [68]?std.json.Value = @splat(null);
         if (prepared.slot_count > 0) {
             const metadata = if (edge.metadata.len > 0) edge.metadata else "{}";
-            projectMetadata(scratch.allocator(), metadata, prepared, &values) catch |err|
+            projectMetadata(alloc, metadata, prepared, &values) catch |err|
                 return if (err == error.OutOfMemory) err else false;
         }
         if (prepared.valid_interval) |interval| if (!intervalContainsValues(values[interval.lower], values[interval.upper], self.valid_at_ns.?, false)) return false;
@@ -206,6 +210,49 @@ pub const Filter = struct {
             if (!passes) return false;
         }
         return true;
+    }
+};
+
+/// Query-owned predicate preparation and metadata arena. Keep this object at
+/// a stable address: its allocator accounts both cached syntax and scratch.
+pub const EvaluationScratch = struct {
+    tracked: work_budget.RetainedAllocator,
+    arena: ?std.heap.ArenaAllocator = null,
+    source: ?Filter = null,
+    filter: ?Filter = null,
+    owns_prepared: bool = false,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.arena) |*arena| arena.deinit();
+        if (self.owns_prepared) self.filter.?.releasePrepared(self.tracked.allocator());
+        std.debug.assert(self.tracked.live_bytes == 0);
+        self.* = undefined;
+    }
+    pub fn matches(self: *@This(), filter: Filter, edge: anytype) !bool {
+        self.tracked.denied = false;
+        return self.matchesOwned(filter, edge) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn matchesOwned(self: *@This(), input: Filter, edge: anytype) !bool {
+        if (!input.active()) return true;
+        const same = if (self.source) |source| source.properties.ptr == input.properties.ptr and source.properties.len == input.properties.len and source.valid_at_ns == input.valid_at_ns and source.known_at_ns == input.known_at_ns and source.prepared == input.prepared else false;
+        if (!same) {
+            if (self.owns_prepared) self.filter.?.releasePrepared(self.tracked.allocator());
+            self.filter = null;
+            self.source = null;
+            self.owns_prepared = false;
+            const prepared = try input.prepare(self.tracked.allocator());
+            self.filter = prepared;
+            self.source = input;
+            self.owns_prepared = input.prepared == null;
+        }
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(self.tracked.allocator());
+        const arena = &self.arena.?;
+        defer {
+            // Failed preheating can leave the old block in this Zig version.
+            // Cache warming is optional; retaining above the cap is not.
+            if (!arena.reset(.{ .retain_with_limit = 64 * 1024 })) _ = arena.reset(.free_all);
+        }
+        return self.filter.?.matchesPrepared(arena.allocator(), edge, self.filter.?.prepared.?);
     }
 };
 

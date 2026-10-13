@@ -1283,6 +1283,26 @@ pub const GraphIndex = struct {
         }
     };
 
+    /// A bounded adjacency batch pins one outgoing/reverse ownership pair.
+    /// The context must be retired before its index or ownership handoff.
+    pub const EdgeReadContext = struct {
+        index: *GraphIndex,
+        direction: EdgeDirection,
+        reads: OwnershipReads,
+
+        pub fn deinit(self: *@This()) void {
+            self.reads.deinit();
+            self.* = undefined;
+        }
+        pub fn getBounded(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, max_edges: usize, max_owned_bytes: usize, max_physical_rows: usize, now_ns: u64, scanned_out: ?*usize) !BoundedEdgeResult {
+            return self.index.getEdgesByTypesBoundedInRead(alloc, key, edge_types, self.direction, max_edges, max_owned_bytes, max_physical_rows, now_ns, scanned_out, &self.reads);
+        }
+    };
+
+    pub fn beginEdgeReadContext(self: *GraphIndex, direction: EdgeDirection) !EdgeReadContext {
+        return .{ .index = self, .direction = direction, .reads = try self.beginReadEdgeTxns(direction) };
+    }
+
     fn beginReadEdgeTxns(self: *GraphIndex, direction: EdgeDirection) !OwnershipReads {
         if (self.borrowed_owner) |owner| return owner.beginReadEdgeTxns(direction);
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
@@ -8347,6 +8367,27 @@ pub const GraphIndex = struct {
         if (limits.max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
+        var context = try self.beginEdgeReadContext(direction);
+        defer context.deinit();
+        return self.getEdgesByTypesPageInRead(alloc, key, edge_types, direction, scan_cursor, limits, now_ns, scanned_out, &context.reads);
+    }
+
+    fn getEdgesByTypesPageInRead(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        scan_cursor: ?EdgeScanCursor,
+        limits: EdgePageLimits,
+        now_ns: u64,
+        scanned_out: ?*usize,
+        reads: *OwnershipReads,
+    ) !EdgePage {
+        if (scanned_out) |out| out.* = 0;
+        if (limits.max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
+        if (limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
 
         var results = std.ArrayListUnmanaged(Edge).empty;
         errdefer {
@@ -8375,8 +8416,6 @@ pub const GraphIndex = struct {
             }
         }
 
-        var reads = try self.beginReadEdgeTxns(direction);
-        defer reads.deinit();
         while (type_index < type_count) : (type_index += 1) {
             if (edge_types.len > 0) {
                 var duplicate = false;
@@ -8513,6 +8552,26 @@ pub const GraphIndex = struct {
         scanned_out: ?*usize,
     ) !BoundedEdgeResult {
         if (scanned_out) |out| out.* = 0;
+        if (max_physical_rows == 0 or max_physical_rows > @import("work_budget.zig").default_max_explored_edges) return error.InvalidQueryRequest;
+        var context = try self.beginEdgeReadContext(direction);
+        defer context.deinit();
+        return context.getBounded(alloc, key, edge_types, max_edges, max_owned_bytes, max_physical_rows, now_ns, scanned_out);
+    }
+
+    fn getEdgesByTypesBoundedInRead(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        max_physical_rows: usize,
+        now_ns: u64,
+        scanned_out: ?*usize,
+        reads: *OwnershipReads,
+    ) !BoundedEdgeResult {
+        if (scanned_out) |out| out.* = 0;
         const page_edge_cap: usize = 4096;
         const page_byte_cap: usize = 4 * 1024 * 1024;
         if (max_physical_rows == 0 or max_physical_rows > @import("work_budget.zig").default_max_explored_edges)
@@ -8532,7 +8591,7 @@ pub const GraphIndex = struct {
             const byte_room = if (total_bytes < max_owned_bytes) max_owned_bytes - total_bytes else 0;
             const scan_room = if (total_scanned < max_physical_rows) max_physical_rows - total_scanned else 0;
             var page_scanned: usize = 0;
-            var page = self.getEdgesByTypesPageAtCounted(
+            var page = self.getEdgesByTypesPageInRead(
                 alloc,
                 key,
                 edge_types,
@@ -8545,6 +8604,7 @@ pub const GraphIndex = struct {
                 },
                 now_ns,
                 &page_scanned,
+                reads,
             ) catch |err| {
                 if (scanned_out) |out| out.* = total_scanned + page_scanned;
                 return err;
@@ -39526,4 +39586,39 @@ test "graph owned cleanup resumes independent relationship history across bounde
     const edges = try graph.getEdges(alloc, "a", "R", .out);
     defer GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "graph metric native response adoption batch ownership context" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        threadlocal var calls: usize = 0;
+        fn count(_: *GraphIndex) void {
+            calls += 1;
+        }
+    };
+    inline for (.{ ReverseBackend.mem, ReverseBackend.lsm_memory }) |kind| {
+        var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = kind });
+        defer g.close();
+        try g.addEdge("a", "z", "link", 1, 0, 0, "{}");
+        try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+        Hook.calls = 0;
+        test_ownership_read_pair_hook = Hook.count;
+        defer test_ownership_read_pair_hook = null;
+        var context = try g.beginEdgeReadContext(.both);
+        defer context.deinit();
+        for (0..64) |_| {
+            const edges = try context.getBounded(a, "a", &.{"link"}, 10, 4096, 100, 1, null);
+            defer GraphIndex.freeEdges(a, edges.edges);
+            try std.testing.expectEqual(@as(usize, 2), edges.edges.len);
+        }
+        try std.testing.expectEqual(@as(usize, 1), Hook.calls);
+        try g.fenceOwnedRange(a, "m", "");
+        const pinned = try context.getBounded(a, "a", &.{"link"}, 10, 4096, 100, 1, null);
+        defer GraphIndex.freeEdges(a, pinned.edges);
+        try std.testing.expectEqual(@as(usize, 2), pinned.edges.len);
+        const fresh = try g.getEdges(a, "a", "link", .both);
+        defer GraphIndex.freeEdges(a, fresh);
+        try std.testing.expectEqual(@as(usize, 1), fresh.len);
+        std.debug.print("EDGE_READ_CONTEXT backend={s} keys=64 ownership_pairs=1 pinned_edges=2 fresh_edges=1\n", .{@tagName(kind)});
+    }
 }

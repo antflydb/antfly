@@ -2359,8 +2359,14 @@ const GraphNodeAdmissionContext = struct {
     consistency: raft_mod.ReadConsistency,
     incoming_probe_options: IncomingProbeOptions = .{},
     tables: std.StringArrayHashMapUnmanaged(GraphAdmissionTableState) = .empty,
+    filter_scratch: ?relationship_filter.EvaluationScratch = null,
     prepared_edge_allocator: ?graph_work_budget.RetainedAllocator = null,
     prepared_edges: ?struct { path: OwnedGraphTensorAccessPath, program: query_contract.OwnedAlgebraicTensorProgramEnvelope } = null,
+
+    fn matchesEdge(self: *@This(), filter: relationship_filter.Filter, edge: graph_mod.Edge) !bool {
+        if (self.filter_scratch == null) self.filter_scratch = .{ .tracked = .{ .backing = self.alloc, .budget = self.incoming_probe_options.work_budget } };
+        return self.filter_scratch.?.matches(filter, edge);
+    }
 
     fn preparedEdges(self: *@This()) !void {
         if (self.prepared_edges != null) return;
@@ -2409,6 +2415,7 @@ const GraphNodeAdmissionContext = struct {
     }
 
     pub fn deinit(self: *GraphNodeAdmissionContext) void {
+        if (self.filter_scratch) |*scratch| scratch.deinit();
         if (self.prepared_edge_allocator) |*tracked| {
             if (self.prepared_edges) |*prepared| {
                 prepared.path.deinit(tracked.allocator());
@@ -3076,6 +3083,24 @@ const CanonicalEdgeBatch = struct {
     }
 };
 
+const SelectedGraphEdges = struct {
+    edges: []graph_mod.Edge,
+    owned: []bool = &.{},
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        for (self.edges, 0..) |edge, i| if (self.owned.len == 0 or self.owned[i]) graph_mod.GraphIndex.freeEdge(a, edge);
+        a.free(self.edges);
+        a.free(self.owned);
+    }
+    fn finish(a: std.mem.Allocator, edges: *std.ArrayListUnmanaged(graph_mod.Edge), owned: *std.ArrayListUnmanaged(bool)) !@This() {
+        const result = try edges.toOwnedSlice(a);
+        errdefer {
+            for (result, 0..) |edge, i| if (owned.items.len == 0 or owned.items[i]) graph_mod.GraphIndex.freeEdge(a, edge);
+            a.free(result);
+        }
+        return .{ .edges = result, .owned = try owned.toOwnedSlice(a) };
+    }
+};
+
 const DistributedEdgeReader = struct {
     catalog: table_catalog.CatalogSource,
     worker: Worker,
@@ -3168,6 +3193,23 @@ const DistributedEdgeReader = struct {
         max_owned_bytes: usize,
         source_table_declared: bool,
     ) ![]graph_mod.Edge {
+        const selection = try self.getEdgeSelection(a, table, key, edge_types, direction, max_edges, max_owned_bytes, source_table_declared, false);
+        a.free(selection.owned);
+        return selection.edges;
+    }
+
+    fn getEdgeSelection(
+        self: @This(),
+        a: std.mem.Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        source_table_declared: bool,
+        borrow_cached: bool,
+    ) !SelectedGraphEdges {
         if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         var remaining_physical_rows = if (self.physical_work_budget) |budget|
@@ -3177,12 +3219,12 @@ const DistributedEdgeReader = struct {
         if (remaining_physical_rows == 0 and (self.prefetched == null or !self.prefetched.?.hasKey(table orelse self.source_table, key))) return error.GraphExploredEdgesBudgetExceeded;
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
-        if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
+        if (!table_state.allowed) return .{ .edges = try a.alloc(graph_mod.Edge, 0) };
         // Cross-table endpoints remain useful result nodes even when their table
         // does not expose the same graph index. Treat those nodes as terminals
         // instead of turning an explicit multi-hop traversal into IndexNotFound.
         if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
-            return try a.alloc(graph_mod.Edge, 0);
+            return .{ .edges = try a.alloc(graph_mod.Edge, 0) };
 
         // Prepare before any parallel shard dispatch; fanout workers only
         // borrow immutable cached state and never race its lazy initialization.
@@ -3198,7 +3240,7 @@ const DistributedEdgeReader = struct {
         const cached = if (candidate != null and candidate.?.groups_loaded) candidate else null;
         const group_ids = if (cached) |entry| entry.groups else try table_catalog.resolveGroupsForSpanPinnedUntil(a, self.catalog, table_state.table_name, "", "", table_state.topology_epoch, self.worker.routingDeadline(self.catalog));
         defer if (cached == null and group_ids.len > 0) a.free(group_ids);
-        if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
+        if (group_ids.len == 0) return .{ .edges = try a.alloc(graph_mod.Edge, 0) };
 
         // A direct contribution is routed by the physical source. Probe that
         // group first for stable fanout order; duplicate TTL payloads are
@@ -3247,11 +3289,14 @@ const DistributedEdgeReader = struct {
             if (direction != .in or has_incoming)
                 try candidate_group_ids.append(a, group_id);
         }
-        if (candidate_group_ids.items.len == 0) return try a.alloc(graph_mod.Edge, 0);
+        if (candidate_group_ids.items.len == 0) return .{ .edges = try a.alloc(graph_mod.Edge, 0) };
 
         var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+        var ownership = std.ArrayListUnmanaged(bool).empty;
+        // Error cleanup consults these flags before their storage is retired.
+        defer ownership.deinit(a);
         errdefer {
-            for (edges.items) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+            for (edges.items, 0..) |edge, i| if (ownership.items.len == 0 or ownership.items[i]) graph_mod.GraphIndex.freeEdge(a, edge);
             edges.deinit(a);
         }
         var seen_edges = GraphEdgeIdentitySet.empty;
@@ -3263,9 +3308,21 @@ const DistributedEdgeReader = struct {
         const plan = planGraphFanout(fanout_io != null, self.worker.fanoutWidthCap(), candidate_group_ids.items.len);
 
         const Appender = struct {
-            fn appendCloned(
+            // All-owned reads retain the existing layout. Allocate flags only
+            // when the first borrowed payload joins the selection.
+            fn prepareOwnership(alloc: std.mem.Allocator, flag_state: ?*std.ArrayListUnmanaged(bool), count: usize, borrow: bool) !bool {
+                const flags = flag_state orelse return false;
+                if (flags.items.len == 0) {
+                    if (!borrow) return false;
+                    try flags.appendNTimes(alloc, true, count);
+                }
+                return true;
+            }
+            fn appendSelected(
                 alloc: std.mem.Allocator,
                 output: *std.ArrayListUnmanaged(graph_mod.Edge),
+                ownership_out: ?*std.ArrayListUnmanaged(bool),
+                borrow_input: bool,
                 seen: *GraphEdgeIdentitySet,
                 input: []const graph_mod.Edge,
                 group_id: u64,
@@ -3293,23 +3350,29 @@ const DistributedEdgeReader = struct {
                         const new_bytes = graphEdgeOwnedBytes(edge);
                         if (new_bytes > byte_limit -| (owned_bytes.* - old_bytes))
                             return error.GraphExploredEdgeBytesBudgetExceeded;
-                        var replacement = try cloneOwnedGraphEdge(alloc, edge);
+                        const track = try prepareOwnership(alloc, ownership_out, output.items.len, borrow_input);
+                        var replacement = if (borrow_input) edge else try cloneOwnedGraphEdge(alloc, edge);
                         replacement.origin_group_id = group_id;
                         output.items[existing_index] = replacement;
                         existing.key_ptr.* = graphEdgeIdentity(replacement);
-                        graph_mod.GraphIndex.freeEdge(alloc, current);
+                        if (track) {
+                            const flags = ownership_out.?;
+                            if (flags.items[existing_index]) graph_mod.GraphIndex.freeEdge(alloc, current);
+                            flags.items[existing_index] = !borrow_input;
+                        } else graph_mod.GraphIndex.freeEdge(alloc, current);
                         owned_bytes.* = owned_bytes.* - old_bytes + new_bytes;
                         continue;
                     }
                     if (output.items.len >= edge_limit) return error.GraphExploredEdgesBudgetExceeded;
                     const edge_bytes = graphEdgeOwnedBytes(edge);
                     if (edge_bytes > byte_limit -| owned_bytes.*) return error.GraphExploredEdgeBytesBudgetExceeded;
-                    var cloned = try cloneOwnedGraphEdge(alloc, edge);
+                    const track = try prepareOwnership(alloc, ownership_out, output.items.len, borrow_input);
+                    try output.ensureUnusedCapacity(alloc, 1);
+                    if (track) try ownership_out.?.ensureUnusedCapacity(alloc, 1);
+                    var cloned = if (borrow_input) edge else try cloneOwnedGraphEdge(alloc, edge);
                     cloned.origin_group_id = group_id;
-                    var cloned_owned = true;
-                    errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(alloc, cloned);
-                    try output.append(alloc, cloned);
-                    cloned_owned = false;
+                    output.appendAssumeCapacity(cloned);
+                    if (track) ownership_out.?.appendAssumeCapacity(!borrow_input);
                     owned_bytes.* += edge_bytes;
                     try seen.put(alloc, graphEdgeIdentity(cloned), output.items.len - 1);
                 }
@@ -3396,9 +3459,11 @@ const DistributedEdgeReader = struct {
                             => continue,
                             else => return err,
                         };
-                        try Appender.appendCloned(
+                        try Appender.appendSelected(
                             a,
                             &edges,
+                            if (borrow_cached) &ownership else null,
+                            borrow_cached and slot.result.?.borrowed_edges,
                             &seen_edges,
                             slot.result.?.edges,
                             group_id,
@@ -3425,9 +3490,11 @@ const DistributedEdgeReader = struct {
                             remaining_physical_rows,
                         );
                         defer retry.deinit(a);
-                        try Appender.appendCloned(
+                        try Appender.appendSelected(
                             a,
                             &edges,
+                            if (borrow_cached) &ownership else null,
+                            borrow_cached and retry.borrowed_edges,
                             &seen_edges,
                             retry.edges,
                             group_id,
@@ -3442,7 +3509,7 @@ const DistributedEdgeReader = struct {
                         slot.* = .init();
                     }
                 }
-                return try edges.toOwnedSlice(a);
+                return SelectedGraphEdges.finish(a, &edges, &ownership);
             }
         }
 
@@ -3461,9 +3528,11 @@ const DistributedEdgeReader = struct {
             );
             defer resp.deinit(a);
             if (!resp.physical_rows_precharged) try consumeGraphEdgePhysicalRows(self.physical_work_budget, &remaining_physical_rows, resp.scanned_rows);
-            try Appender.appendCloned(
+            try Appender.appendSelected(
                 a,
                 &edges,
+                if (borrow_cached) &ownership else null,
+                borrow_cached and resp.borrowed_edges,
                 &seen_edges,
                 resp.edges,
                 group_id,
@@ -3472,7 +3541,7 @@ const DistributedEdgeReader = struct {
                 &owned_bytes,
             );
         }
-        return try edges.toOwnedSlice(a);
+        return SelectedGraphEdges.finish(a, &edges, &ownership);
     }
 
     fn getEdgesFromGroup(
@@ -3532,6 +3601,7 @@ const DistributedEdgeReader = struct {
 /// weight predicate, node admission, or path cost is applied.
 const CanonicalGraphStep = struct {
     edges: []graph_mod.Edge,
+    edge_ownership: []bool = &.{},
     nodes: []graph_query_mod.GraphResultNode,
     path_edges: []graph_query_mod.PathEdgeInfo,
     group_ids: []u64,
@@ -3554,7 +3624,8 @@ const CanonicalGraphStep = struct {
         if (self.metric_columns) |owner| owner.deinit(alloc);
         alloc.free(self.path_edges);
         alloc.free(self.group_ids);
-        graph_mod.GraphIndex.freeEdges(alloc, self.edges);
+        var selection = SelectedGraphEdges{ .edges = self.edges, .owned = self.edge_ownership };
+        selection.deinit(alloc);
         self.metrics_lease.deinit();
         self.table_scratch.deinit();
         self.array_lease.deinit();
@@ -3571,7 +3642,7 @@ fn canonicalGraphStepAlloc(
     params: graph_query_mod.QueryParams,
     work_budget: *graph_pattern_mod.WorkBudget,
 ) !CanonicalGraphStep {
-    const edges = try reader.getEdgesBoundedForPattern(
+    var selection = try reader.getEdgeSelection(
         alloc,
         expansion_table,
         key,
@@ -3580,12 +3651,11 @@ fn canonicalGraphStepAlloc(
         graph_pattern_mod.default_max_explored_edges,
         graph_pattern_mod.default_max_explored_edge_bytes,
         true,
+        reader.prefetched != null,
     );
-    errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
-    const edge_filter = try params.edge_filter.prepare(alloc);
-    defer if (params.edge_filter.prepared == null) edge_filter.releasePrepared(alloc);
-    var filter_lease = try graph_work_budget.RetainedLease.init(work_budget, edge_filter.retainedBytes());
-    defer filter_lease.deinit();
+    errdefer selection.deinit(alloc);
+    const edges = selection.edges;
+
     const capacity = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
     const array_bytes = std.math.mul(
         usize,
@@ -3607,7 +3677,7 @@ fn canonicalGraphStepAlloc(
     for (edges) |edge| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
             return work_budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
-        if (!(try edge_filter.matchesWithBudget(alloc, edge, work_budget))) continue;
+        if (!(try reader.admission.matchesEdge(params.edge_filter, edge))) continue;
         if (params.min_weight) |minimum| if (edge.weight < minimum) continue;
         if (params.max_weight) |maximum| if (edge.weight > maximum) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
@@ -3643,7 +3713,7 @@ fn canonicalGraphStepAlloc(
     try work_budget.consumeEdgeBytes(edge_bytes);
     try work_budget.consumeNodes(node_count);
     try work_budget.consumeEdges(node_count);
-    return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
+    return .{ .edges = edges, .edge_ownership = selection.owned, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
 }
 
 // Keep discovery serial while a bounded window groups independent score reads.
@@ -16863,6 +16933,39 @@ test "distributed graph metric post processing applies max results after filter 
     const epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
     var admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
     defer admission.deinit();
+    // Compare selection ownership with a wide cached payload, independently
+    // of response creation. No filtered-out payload needs a second copy.
+    for ([_]bool{ false, true }) |borrow| {
+        var scratch_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var fixture = TestState{ .graph = &graph };
+        var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        gate.incoming_probe_options.work_budget = &scratch_budget;
+        defer gate.deinit();
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = &scratch_budget } };
+        defer cache.deinit();
+        const reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = FakeWorker.iface(&fixture), .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &gate, .physical_work_budget = &scratch_budget, .prefetched = &cache };
+        const frontier = [_]FrontierState{ .{ .key = @constCast(roots[0]) }, .{ .key = @constCast(roots[1]) } };
+        try cache.prepare(reader, &frontier, 1, query.query.params);
+        const cached_edge = &cache.shards.items[1].result.edges[0];
+        const payload_alloc = cache.tracked.allocator();
+        payload_alloc.free(cached_edge.metadata);
+        cached_edge.metadata = try payload_alloc.alloc(u8, 128 * 1024);
+        @memset(@constCast(cached_edge.metadata), 'x');
+        var measured = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = alloc };
+        var selection = try reader.getEdgeSelection(measured.allocator(), "docs", roots[0], &.{}, .out, 10, 1024 * 1024, true, borrow);
+        try std.testing.expectEqual(@as(usize, 2), selection.edges.len);
+        if (borrow) {
+            try std.testing.expect(!selection.owned[0] and !selection.owned[1]);
+            try std.testing.expectEqual(cached_edge.metadata.ptr, selection.edges[0].metadata.ptr);
+            try std.testing.expect(measured.peak < 16 * 1024);
+        } else try std.testing.expect(measured.peak >= 128 * 1024);
+        std.debug.print("CACHED_EDGE_SELECTION borrowed={any} payload_bytes=131072 alloc_calls={d} peak_bytes={d}\n", .{ borrow, measured.alloc_calls, measured.peak });
+        selection.deinit(measured.allocator());
+        try std.testing.expectEqual(@as(usize, 0), measured.live);
+        // Selection retirement must not free the response's borrowed payload.
+        try std.testing.expectEqual(@as(u8, 'x'), cached_edge.metadata[0]);
+    }
+
     // Compare with the former per-frontier hydration using the same source,
     // pinned reader, and transport fixture, excluding graph construction.
     {
@@ -17372,4 +17475,95 @@ test "distributed graph metric post processing applies max results after filter 
             try std.testing.expectEqual(@as(?f64, 3), parsed.metricAt(0).score);
         }
     }
+}
+
+test "distributed graph metric post processing applies max results after filter and order reusable property scratch" {
+    const a = std.testing.allocator;
+    const Edge = struct {
+        edge_id: []const u8 = "",
+        owner_document: []const u8 = "",
+        source: []const u8 = "a",
+        target: []const u8 = "b",
+        edge_type: []const u8 = "R",
+        weight: f64 = 1,
+        created_at: u64 = 0,
+        updated_at: u64 = 0,
+        metadata: []const u8,
+    };
+    const filter = relationship_filter.Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .eq, .value_json = "\"value\"" }} };
+    const input = Edge{ .metadata = "{\"value\":\"v\\u0061lue\"}" };
+    var counter = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = a };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var scratch = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = counter.allocator(), .budget = &budget } };
+    try std.testing.expect(try scratch.matches(filter, input));
+    const cold_calls = counter.alloc_calls;
+    for (0..300) |_| try std.testing.expect(try scratch.matches(filter, input));
+    try std.testing.expectEqual(cold_calls, counter.alloc_calls);
+    std.debug.print("PROPERTY_SCRATCH cold_allocations={d} warm_edges=300 warm_allocations={d} retained={d}\n", .{ cold_calls, counter.alloc_calls - cold_calls, counter.live });
+    var wide = std.ArrayListUnmanaged(u8).empty;
+    defer wide.deinit(a);
+    try wide.appendSlice(a, "{\"value\":\"");
+    for (0..80_000) |_| try wide.appendSlice(a, "\\u0061");
+    try wide.appendSlice(a, "\"}");
+    try std.testing.expect(!try scratch.matches(filter, Edge{ .metadata = wide.items }));
+    try std.testing.expect(counter.peak >= 80_000);
+    try std.testing.expect(scratch.arena.?.queryCapacity() <= 64 * 1024);
+    scratch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    const NoResize = struct {
+        counter: *@import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator,
+        denied_resets: usize = 0,
+        saw_wide: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn allocate(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (len >= 80_000) self.saw_wide = true;
+            // Fail optional capped preheating after a wide value was parsed.
+            if (self.saw_wide and len >= 64 * 1024 and len <= 64 * 1024 + 128) {
+                self.denied_resets += 1;
+                return null;
+            }
+            return self.counter.allocator().rawAlloc(len, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.counter.allocator().rawFree(bytes, alignment, ra);
+        }
+    };
+    var no_resize = NoResize{ .counter = &counter };
+    var capped = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = no_resize.allocator(), .budget = &budget } };
+    try std.testing.expect(!try capped.matches(filter, Edge{ .metadata = wide.items }));
+    try std.testing.expect(no_resize.denied_resets > 0);
+    try std.testing.expectEqual(@as(usize, 0), capped.arena.?.queryCapacity());
+    try std.testing.expect(try capped.matches(filter, input));
+    capped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, f: relationship_filter.Filter, edge: Edge) !void {
+            var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+            var cached = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = alloc, .budget = &work } };
+            defer cached.deinit();
+            try std.testing.expect(try cached.matches(f, edge));
+            try std.testing.expect(!try cached.matches(f, Edge{ .metadata = "malformed" }));
+            const presence = relationship_filter.Filter{ .properties = &.{.{ .field = "/metadata/value", .op = .is_not_null }} };
+            try std.testing.expect(try cached.matches(presence, edge));
+        }
+    };
+    try Runner.run(a, filter, input);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ filter, input });
+    budget.max_retained_state_bytes = 1;
+    var denied = relationship_filter.EvaluationScratch{ .tracked = .{ .backing = a, .budget = &budget } };
+    defer denied.deinit();
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, denied.matches(filter, input));
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
