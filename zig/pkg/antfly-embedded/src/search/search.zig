@@ -593,9 +593,12 @@ pub fn execute(
 /// Exact snapshot count with at most one segment's filter bitmap in memory.
 /// Callers must separately prove that no primary visibility/residual check is owed.
 pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    return countMatchesPrepared(alloc, snap, query, null);
+}
+pub fn countMatchesPrepared(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan) !u32 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const filter = try searchQueryToFilterArena(arena.allocator(), query);
+    const filter = try searchQueryToFilterWithPreparation(arena.allocator(), query, if (prepared) |plan| if (plan.stats.count == snap.scoringDocCount()) plan else null else null);
     return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
 }
 
@@ -3018,9 +3021,18 @@ pub const TextNavigationPlan = struct {
     scoring_query: SearchQuery = undefined,
     scoring_root: *const LoweredText = undefined,
     scoring_constrained_root: *const LoweredText = undefined,
+    membership: query_mod.Filter = undefined,
     config: inverted.BM25Config,
 
     pub fn create(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config) !?*TextNavigationPlan {
+        return initialize(a, query, source, config, true);
+    }
+    /// Analysis, membership and scoring preparation do not require a finite
+    /// routing bound. Baselines and physical ordering retain complete admission.
+    pub fn prepare(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config) !?*TextNavigationPlan {
+        return initialize(a, query, source, config, false);
+    }
+    fn initialize(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config, routed: bool) !?*TextNavigationPlan {
         if (!canStreamBool(query, 0)) return null;
         const self = try a.create(TextNavigationPlan);
         self.* = .{ .a = a, .arena = .init(a), .config = config, .query = query };
@@ -3032,7 +3044,7 @@ pub const TextNavigationPlan = struct {
         self.root = try lowerer.lower(query);
         lowerer.constrained = true;
         self.constrained_root = try lowerer.lower(query);
-        if (!restricted(self.root) or !restricted(self.constrained_root)) {
+        if (routed and (!restricted(self.root) or !restricted(self.constrained_root))) {
             self.deinit();
             return null;
         }
@@ -3046,12 +3058,21 @@ pub const TextNavigationPlan = struct {
         lowerer.constrained = true;
         self.scoring_constrained_root = try lowerer.lower(self.scoring_query);
         try self.stats.load();
+        self.membership = try searchQueryToFilterArena(scratch, query);
         return self;
     }
     pub fn deinit(self: *TextNavigationPlan) void {
         const a = self.a;
         self.arena.deinit();
         a.destroy(self);
+    }
+    /// Read immutable prepared global frequencies without metadata I/O. Serving
+    /// windows use this after preparation; unknown terms must never fall back
+    /// to a window-local DF and silently change scores.
+    pub fn preparedFrequencies(self: *const TextNavigationPlan, field: []const u8, terms: []const []const u8, out: []u32) !void {
+        if (terms.len != out.len) return error.InvalidArgument;
+        const prepared = self.stats.fields.get(field) orelse return error.UnpreparedTextTerm;
+        for (terms, out) |term, *value| value.* = (prepared.frequencies.get(term) orelse return error.UnpreparedTextTerm).value;
     }
     // Only borrow lowered syntax when the actual scorer query is identical.
     // Predicate wrapping or other semantic changes keep ordinary lowering.
@@ -4904,6 +4925,10 @@ fn executeBoolAllHit(
 }
 
 pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
+    return searchQueryToFilterWithPreparation(alloc, sq, null);
+}
+pub fn searchQueryToFilterWithPreparation(alloc: Allocator, sq: SearchQuery, prepared: ?*const TextNavigationPlan) anyerror!query_mod.Filter {
+    if (prepared) |plan| if (TextNavigationPlan.sameQuery(sq, plan.query)) return plan.membership;
     return switch (sq) {
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },
@@ -5001,9 +5026,9 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
         .regexp => |rq| .{ .regexp = .{ .field = rq.field, .pattern = rq.pattern } },
         .bool_query => |bq| blk: {
-            const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must);
-            const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should);
-            const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not);
+            const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must, prepared);
+            const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should, prepared);
+            const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not, prepared);
             const filter_must = if (bq.pure_should_optional and must.len == 0) required: {
                 const match_all = try alloc.alloc(query_mod.Filter, 1);
                 match_all[0] = .{ .match_all = {} };
@@ -5029,11 +5054,11 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
     };
 }
 
-fn searchQuerySliceToFilterSliceArena(alloc: Allocator, items: []const SearchQuery) anyerror![]query_mod.Filter {
+fn searchQuerySliceToFilterSliceArena(alloc: Allocator, items: []const SearchQuery, prepared: ?*const TextNavigationPlan) anyerror![]query_mod.Filter {
     if (items.len == 0) return &.{};
     var out = try alloc.alloc(query_mod.Filter, items.len);
     for (items, 0..) |item, i| {
-        out[i] = try searchQueryToFilterArena(alloc, item);
+        out[i] = try searchQueryToFilterWithPreparation(alloc, item, prepared);
     }
     return out;
 }
@@ -10133,6 +10158,11 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         const plan = (try TextNavigationPlan.create(a, query, .{ .ptr = &source, .count = source.snapshot.scoringDocCount(), .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
         defer plan.deinit();
         const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
+        try std.testing.expectEqual(try countMatches(a, source.snapshot, query), try countMatchesPrepared(a, source.snapshot, query, plan));
+        // Physical membership wrapping must borrow the analyzed child without
+        // bypassing the new required branch.
+        const wrapped: SearchQuery = .{ .bool_query = .{ .must = &.{ query, .{ .match_none = {} } } } };
+        try std.testing.expectEqual(@as(u32, 0), try countMatchesPrepared(a, source.snapshot, wrapped, plan));
         for ([_]bool{ false, true }) |constrained| {
             try std.testing.expectEqual(if (constrained) plan.scoring_constrained_root else plan.scoring_root, plan.scoringRoot(plan.scoring_query, constrained).?);
             try std.testing.expect(plan.scoringRoot(.{ .term = .{ .field = "title", .term = "unrelated" } }, constrained) == null);
@@ -10157,4 +10187,16 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         source.unknown = false;
     }
     try std.testing.expect((try TextNavigationPlan.create(a, .{ .bool_query = .{ .must_not = &.{rare} } }, .{ .ptr = &source, .count = 2, .average = Source.average, .frequencies = Source.frequencies }, .{})) == null);
+    const baseline: SearchQuery = .{ .bool_query = .{ .must_not = &.{rare} } };
+    const full = (try TextNavigationPlan.prepare(a, baseline, .{ .ptr = &source, .count = 2, .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
+    defer full.deinit();
+    var reference = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false });
+    defer reference.deinit();
+    var reused = try execute(a, source.snapshot, .{ .query = baseline, .k = 10, .include_stored = false, .text_navigation_plan = full });
+    defer reused.deinit();
+    try std.testing.expectEqual(reference.hits.len, reused.hits.len);
+    for (reference.hits, reused.hits) |left, right| {
+        try std.testing.expectEqual(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
 }

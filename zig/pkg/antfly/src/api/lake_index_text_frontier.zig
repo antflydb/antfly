@@ -45,6 +45,7 @@ budget: local.sql_memory_budget,
 scratch: std.heap.ArenaAllocator = undefined,
 syntax: std.heap.ArenaAllocator = undefined,
 root: corpus.Root,
+recent: ?*const local.index.IndexSnapshot = null,
 store: stores.ArtifactStore,
 cached: artifacts.CachedRead,
 token: Token,
@@ -73,9 +74,18 @@ pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: arti
     return createObserved(a, root, store, cached, token, text, analysis, schema, null);
 }
 pub fn createObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics) !?*Self {
-    if (root.inventory_version != 3 or root.collection == null or root.term_statistics == null or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
+    return initialize(a, root, store, cached, token, text, analysis, schema, metrics, true, null);
+}
+pub fn prepareObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics) !?*Self {
+    return initialize(a, root, store, cached, token, text, analysis, schema, metrics, false, null);
+}
+pub fn prepareRecentObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics, recent: *const local.index.IndexSnapshot) !?*Self {
+    return initialize(a, root, store, cached, token, text, analysis, schema, metrics, false, recent);
+}
+fn initialize(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics, routed: bool, recent: ?*const local.index.IndexSnapshot) !?*Self {
+    if (root.inventory_version != 3 or root.collection == null or root.term_statistics == null or (routed and (root.term_directory.version != 2 or root.term_directory.leaves == null))) return null;
     const self = try a.create(Self);
-    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .root = root, .store = store, .cached = cached, .token = token, .metrics = metrics };
+    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .root = root, .store = store, .cached = cached, .token = token, .metrics = metrics, .recent = recent };
     const ba = self.budget.allocator();
     self.scratch = .init(ba);
     self.syntax = .init(ba);
@@ -84,13 +94,28 @@ pub fn createObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cach
     self.pages = .{ .domain = root.domain, .artifacts = &self.store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = .{ .ptr = self, .read = readPage } };
     self.cache = .{ .alloc = ba, .underlying = self.pages.store() };
     errdefer self.deinit();
+    if (recent) |snapshot| {
+        const collection = root.collection.?;
+        var fields: std.ArrayList(corpus.Collection.Field) = .empty;
+        for (collection.fields) |field| try fields.append(self.syntax.allocator(), .{ .name = field.name, .total_length = try std.math.add(u64, field.total_length, snapshot.liveTotalFieldLen(field.name)) });
+        var extra = snapshot.global_total_field_len.iterator();
+        while (extra.next()) |field| {
+            var found = false;
+            for (collection.fields) |base| if (std.mem.eql(u8, base.name, field.key_ptr.*)) {
+                found = true;
+                break;
+            };
+            if (!found) try fields.append(self.syntax.allocator(), .{ .name = field.key_ptr.*, .total_length = field.value_ptr.* });
+        }
+        self.root.collection = .{ .documents = try std.math.add(u32, collection.documents, snapshot.scoringDocCount()), .fields = fields.items };
+    }
     const query = try local.storage_db_query_search_exec.textQueryToSearchQuery(self.syntax.allocator(), text, analysis, schema);
-    self.plan = try Plan.create(ba, query, .{ .ptr = self, .count = root.collection.?.documents, .average = average, .frequencies = frequencies }, .{});
+    self.plan = if (routed) try Plan.create(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies }, .{}) else try Plan.prepare(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies }, .{});
     if (self.plan == null) {
         self.deinit();
         return null;
     }
-    if (try self.bound(@splat(0), @splat(255))) |node| try self.heap.push(ba, node);
+    if (routed) if (try self.bound(@splat(0), @splat(255))) |node| try self.heap.push(ba, node);
     return self;
 }
 pub fn deinit(self: *Self) void {
@@ -132,6 +157,13 @@ fn frequencies(raw: *anyopaque, _: A, field: []const u8, terms: []const []const 
         }
         if (entry.value.len != 8) return error.InvalidNativeLakeTextStatistics;
         frequency.* = @intCast(@min(std.math.maxInt(u32), std.mem.readInt(u64, entry.value[0..8], .big)));
+    }
+    if (self.recent) |snapshot| {
+        var temporary = std.heap.ArenaAllocator.init(self.a);
+        defer temporary.deinit();
+        const extra = try temporary.allocator().alloc(u32, terms.len);
+        try snapshot.termDocFreqs(temporary.allocator(), field, terms, extra);
+        for (out, extra) |*frequency, value| frequency.* = try std.math.add(u32, frequency.*, value);
     }
 }
 
@@ -403,6 +435,19 @@ test "external lake global frontier reaches late competitive segments and comple
     try std.testing.expectEqual(@as(u64, 3), conjunction.admitted);
     const optional = try create(a, root, store, cached, .none, .{ .bool_query = .{ .should = &.{.{ .term = .{ .field = "body", .term = "common" } }}, .pure_should_optional = true } }, .{}, .{});
     try std.testing.expect(optional == null);
+    // Accepted rows add global statistics exactly once, including terms absent
+    // from the archive and fields absent from its retained collection counters.
+    var overlay: @import("lake_search_overlay.zig").Overlay = .{ .pending = undefined, .key_filter = "" };
+    try overlay.rows.put(sa, "wal1:recent", try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"body\":\"common rare novel\"}", .{}));
+    var recent = try overlay.recent(a, "text", .{}, null, "body", .{});
+    defer recent.deinit();
+    const prepared_recent = (try prepareRecentObserved(a, root, store, cached, .none, .{ .match = .{ .field = "body", .text = "common rare novel" } }, .{}, .{}, null, recent.snapshot)).?;
+    defer prepared_recent.deinit();
+    try std.testing.expectEqual(@as(u32, 8193), prepared_recent.root.collection.?.documents);
+    var dfs: [3]u32 = undefined;
+    try prepared_recent.plan.?.preparedFrequencies("body", &.{ "common", "rare", "novel" }, &dfs);
+    try std.testing.expectEqualSlices(u32, &.{ 8193, 4, 1 }, &dfs);
+    try std.testing.expectError(error.UnpreparedTextTerm, prepared_recent.plan.?.preparedFrequencies("body", &.{"unknown"}, dfs[0..1]));
     // Cancellation never turns a partial frontier into a successful result.
     const Cancel = struct {
         fn yes(_: *const anyopaque) bool {

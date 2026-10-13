@@ -53,49 +53,20 @@ pub const Overlay = struct {
     pub fn row(self: *const Overlay, key: []const u8) ?V {
         return self.rows.get(key);
     }
-    /// Corpus owners and range capability outlive the composed facade.
-    const Owner = struct {
-        a: A,
-        base: search.PinnedTextSource,
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.base.deinit();
-            self.a.destroy(self);
-        }
-    };
-    /// The input pin transfers only on success. Tombstones have private shared
-    /// cells, so archive readers cannot see another query's pending deletes.
-    pub fn compose(self: *const Overlay, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
-        const a = base.snapshot.alloc;
+    /// Build the recent corpus once, independently of archive admission. Its
+    /// immutable statistics are added to published base statistics, matching
+    /// compose's existing BM25 contract (tombstones do not subtract statistics).
+    pub fn recent(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
-        const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, base.snapshot.segments.len);
-        defer a.free(sources);
-        const masks = try a.alloc(Bitmap, sources.len);
-        defer a.free(masks);
-        var made: usize = 0;
-        defer for (masks[0..made]) |*mask| mask.deinit();
-        var offset: u32 = 0;
-        var excluded_iterator = excluded.iterator();
-        var next_excluded = excluded_iterator.next();
-        for (sources, masks, base.snapshot.segments, 0..) |*source, *mask, segment, ordinal| {
-            try context.ensureActive();
-            source.* = .{ .snapshot = base.snapshot, .ordinal = ordinal, .target_id = ordinal + 1 };
-            mask.* = Bitmap.init(a);
-            made += 1;
-            while (next_excluded) |doc| {
-                if (doc >= @as(u64, offset) + segment.reader.doc_count) break;
-                if (doc >= offset) try mask.add(doc - offset);
-                next_excluded = excluded_iterator.next();
-            }
-            offset = try std.math.add(u32, offset, segment.reader.doc_count);
-        }
-        try writer.shareMaskedImmutableSegments(sources, masks);
+        try self.appendRecent(a, &writer, analysis, schema, field, context);
+        return .{ .snapshot = writer.acquireSnapshot(), .name = name, .text_analysis = analysis, .runtime_schema = schema, .selected_field = field };
+    }
+    fn appendRecent(self: *const Overlay, a: A, writer: *local.index.IndexWriter, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !void {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(scratch, base.text_analysis, base.runtime_schema, null, base.selected_field);
-        // Sort stable identities so ties and document ordinals survive restart.
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(scratch, analysis, schema, null, field);
         const ids = try scratch.alloc([]const u8, self.rows.count());
         var iterator = self.rows.keyIterator();
         for (ids) |*id| id.* = iterator.next().?.*;
@@ -109,12 +80,90 @@ pub const Overlay = struct {
             try builder.appendSourceDoc(.{ .key = id, .root = self.rows.get(id).?, .stored_data = "", .typed_source = null });
         }
         try context.ensureActive();
-        const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, builder.batch(), base.text_analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
+        const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, builder.batch(), analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
         defer mapper.freeTextSegments(a, encoded);
         for (encoded) |bytes| {
             try context.ensureActive();
             try writer.addSegment(bytes);
         }
+    }
+    /// Transfers base only on success. Global frequencies come from immutable
+    /// preparation, while exact per-segment bounds keep their original owner.
+    pub fn window(base: search.PinnedTextSource, excluded: *const Bitmap, collection: @import("lake_index_native_text.zig").Collection, preparation: *const local.search_search.TextNavigationPlan, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+        const a = base.snapshot.alloc;
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try shareMasked(a, &writer, base, excluded, context);
+        const fields = try a.alloc(local.index.IndexWriter.CollectionField, collection.fields.len);
+        defer a.free(fields);
+        for (fields, collection.fields) |*out, field| out.* = .{ .name = field.name, .total_length = field.total_length };
+        try writer.sealImmutableCollection(collection.documents, fields);
+        const owner = try a.create(Owner);
+        errdefer a.destroy(owner);
+        owner.* = .{ .a = a, .base = base, .preparation = preparation, .context = context };
+        const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = owner, .check = Owner.check, .io = context.io });
+        snapshot.text_statistics = .{ .ptr = owner, .check = Owner.check, .frequencies = Owner.frequencies, .summary = Owner.summary };
+        return .{ .snapshot = snapshot, .read_context = owner, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .provider_metadata = base.provider_metadata, .owner = owner, .release_owner = Owner.release };
+    }
+    fn shareMasked(a: A, writer: *local.index.IndexWriter, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !void {
+        const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, base.snapshot.segments.len);
+        defer a.free(sources);
+        const masks = try a.alloc(Bitmap, sources.len);
+        defer a.free(masks);
+        var made: usize = 0;
+        defer for (masks[0..made]) |*mask| mask.deinit();
+        var offset: u32 = 0;
+        var iterator = excluded.iterator();
+        var next = iterator.next();
+        for (sources, masks, base.snapshot.segments, 0..) |*source, *mask, segment, ordinal| {
+            try context.ensureActive();
+            source.* = .{ .snapshot = base.snapshot, .ordinal = ordinal, .target_id = ordinal + 1 };
+            mask.* = Bitmap.init(a);
+            made += 1;
+            while (next) |doc| {
+                if (doc >= @as(u64, offset) + segment.reader.doc_count) break;
+                if (doc >= offset) try mask.add(doc - offset);
+                next = iterator.next();
+            }
+            offset = try std.math.add(u32, offset, segment.reader.doc_count);
+        }
+        try writer.shareMaskedImmutableSegments(sources, masks);
+    }
+    /// Corpus owners and range capability outlive the composed facade.
+    const Owner = struct {
+        a: A,
+        base: search.PinnedTextSource,
+        preparation: ?*const local.search_search.TextNavigationPlan = null,
+        context: local.serverless_query_lake_read_context.Context = .{},
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.context.ensureActive();
+        }
+        fn frequencies(raw: *anyopaque, _: A, field: []const u8, terms: []const []const u8, out: []u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.context.ensureActive();
+            try self.preparation.?.preparedFrequencies(field, terms, out);
+        }
+        fn summary(raw: *anyopaque, a: A, segment: usize, field: []const u8, term: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.context.ensureActive();
+            if (self.base.snapshot.text_statistics) |provider| return provider.summary(provider.ptr, a, segment, field, term, avg, config);
+            return .{ .frequency = self.base.snapshot.segments[segment].reader.doc_count, .tf_upper = std.math.inf(f32) };
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.base.deinit();
+            self.a.destroy(self);
+        }
+    };
+    /// The input pin transfers only on success. Tombstones have private shared
+    /// cells, so archive readers cannot see another query's pending deletes.
+    pub fn compose(self: *const Overlay, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+        const a = base.snapshot.alloc;
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try shareMasked(a, &writer, base, excluded, context);
+        try self.appendRecent(a, &writer, base.text_analysis, base.runtime_schema, base.selected_field, context);
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .base = base };
@@ -206,4 +255,97 @@ test "external lake overlay recognizes the synthetic empty baseline without assu
     try std.testing.expectEqual(@as(u64, 0), try snapshotCoverage(root, id));
     try requireNativeAncestry(root, id);
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, snapshotCoverage(root, "empty:other-1:" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+}
+
+test "external lake bounded WAL windows preserve composed BM25 and private masks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var archive: Overlay = .{ .pending = undefined, .key_filter = "" };
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    // Independent source segments exercise per-window document ordinals.
+    for (0..67) |i| {
+        const id = try std.fmt.allocPrint(sa, "base-{d:0>3}", .{i});
+        const row = try std.json.parseFromSliceLeaky(V, sa, if (i % 3 == 0) "{\"body\":\"common rare rare\"}" else "{\"body\":\"common\"}", .{});
+        archive.rows.clearRetainingCapacity();
+        try archive.rows.put(sa, id, row);
+        try archive.appendRecent(a, &writer, .{}, null, "body", .{});
+    }
+    var changes: Overlay = .{ .pending = undefined, .key_filter = "" };
+    try changes.rows.put(sa, "wal1:new", try std.json.parseFromSliceLeaky(V, sa, "{\"body\":\"common recent recent recent\"}", .{}));
+    try changes.rows.put(sa, "wal1:replacement", try std.json.parseFromSliceLeaky(V, sa, "{\"body\":\"common rare\"}", .{}));
+    var base = try (search.PinnedTextSource{ .snapshot = writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" }).share(a);
+    defer base.deinit();
+    var excluded = Bitmap.init(a);
+    defer excluded.deinit();
+    try excluded.add(0);
+    try excluded.add(65);
+    var reference = try changes.compose(try base.clone(), &excluded, .{});
+    defer reference.deinit();
+    const Stats = struct {
+        fn average(raw: *anyopaque, field: []const u8) f32 {
+            const snapshot: *local.index.IndexSnapshot = @ptrCast(@alignCast(raw));
+            return snapshot.textAvgDocLen(field);
+        }
+        fn frequencies(raw: *anyopaque, alloc: A, field: []const u8, terms: []const []const u8, output: []u32) !void {
+            const snapshot: *local.index.IndexSnapshot = @ptrCast(@alignCast(raw));
+            try snapshot.termDocFreqs(alloc, field, terms, output);
+        }
+    };
+    var collection_fields: std.ArrayList(@import("lake_index_native_text.zig").Collection.Field) = .empty;
+    var totals = reference.snapshot.global_total_field_len.iterator();
+    while (totals.next()) |field| try collection_fields.append(sa, .{ .name = field.key_ptr.*, .total_length = field.value_ptr.* });
+    const collection: @import("lake_index_native_text.zig").Collection = .{ .documents = reference.snapshot.scoringDocCount(), .fields = collection_fields.items };
+    var recent_pin = try (try changes.recent(a, "text", .{}, null, "body", .{})).share(a);
+    defer recent_pin.deinit();
+    const queries = [_]local.search_search.SearchQuery{
+        .{ .term = .{ .field = "body", .term = "common" } },
+        .{ .match = .{ .field = "body", .text = "rare recent" } },
+        .{ .phrase = .{ .field = "body", .text = "rare rare" } },
+        .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = "body", .term = "common", .boost = 2 } }}, .should = &.{.{ .term = .{ .field = "body", .term = "rare", .boost = 3 } }} } },
+    };
+    for (queries) |query| {
+        const prepared = (try local.search_search.TextNavigationPlan.prepare(a, query, .{ .ptr = reference.snapshot, .count = collection.documents, .average = Stats.average, .frequencies = Stats.frequencies }, .{})).?;
+        defer prepared.deinit();
+        var expected = try local.search_search.execute(a, reference.snapshot, .{ .query = query, .k = 100, .include_stored = false });
+        defer expected.deinit();
+        var seen: usize = 0;
+        for (0..68) |window_index| {
+            var pin: search.PinnedTextSource = undefined;
+            var mask = Bitmap.init(a);
+            defer mask.deinit();
+            if (window_index == 67) {
+                pin = try recent_pin.clone();
+            } else {
+                var window_writer = try local.index.IndexWriter.init(a);
+                defer window_writer.deinit();
+                try window_writer.shareImmutableSegments(&.{.{ .snapshot = base.snapshot, .ordinal = window_index, .target_id = 1 }});
+                pin = .{ .snapshot = window_writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" };
+                if (excluded.contains(@intCast(window_index))) try mask.add(0);
+            }
+            const window = Overlay.window(pin, &mask, collection, prepared, .{}) catch |err| {
+                pin.deinit();
+                return err;
+            };
+            var owned = window;
+            defer owned.deinit();
+            try std.testing.expectEqual(collection.documents, window.snapshot.scoringDocCount());
+            var result = try local.search_search.execute(a, window.snapshot, .{ .query = query, .k = 100, .include_stored = false, .text_navigation_plan = prepared });
+            defer result.deinit();
+            for (result.hits) |hit| {
+                const offset: u32 = if (window_index == 67) 67 else @intCast(window_index);
+                const original = offset + hit.doc_id;
+                const matched = for (expected.hits) |candidate| {
+                    if (candidate.doc_id == original) break candidate;
+                } else return error.UnexpectedWindowMatch;
+                try std.testing.expectEqual(matched.score, hit.score);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(expected.hits.len, seen);
+    }
+    // Another query retains the unmasked archive generation.
+    try std.testing.expectEqual(@as(u32, 67), base.snapshot.liveDocCount());
 }

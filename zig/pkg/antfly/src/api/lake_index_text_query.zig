@@ -214,8 +214,8 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
             owner.vector_exclude_provider = try resolver.openMembership(a, effective.exclusion_query_json);
         }
     } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
-    owner.hydration_fields = try owner.planHydration(effective);
-    owner.typed_delivery = owner.overlay == null and canDeliverTypedSource(retrievalRequest(effective));
+    owner.hydration_fields = try owner.planHydration(retrievalRequest(effective));
+    owner.typed_delivery = (owner.overlay == null or !has_vectors) and canDeliverTypedSource(retrievalRequest(effective));
     var execution_req = effective;
     if (effective.hasHitEvaluation()) {
         execution_req.offset = 0;
@@ -247,7 +247,8 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     // Source-dependent transforms consume the globally selected candidate pool,
     // never every admitted segment's local pool. Preserve hidden input fields.
     const candidate_sources_loaded = owner.typed_delivery and needsCandidateSource(effective);
-    if (candidate_sources_loaded) try owner.hydrateTransformCandidates(a, result.hits);
+    const transform_plan = if (candidate_sources_loaded) try owner.planTransformInputs(effective) else null;
+    if (transform_plan) |inputs| try owner.hydrateTransformCandidates(a, effective, inputs.fields, result.hits);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
     // Reused source is deliberately complete, including fields hidden from
     // the public page. The encoder must apply the final projection even when
@@ -262,7 +263,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     } else if (owner.typed_delivery) {
         // Transforms retain full source on surviving hits. Reuse it for wire
         // projection/highlights rather than fetching the final page again.
-        if (!candidate_sources_loaded and !effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, effective, result.hits);
+        if ((!candidate_sources_loaded or !transform_plan.?.covers_output) and !effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, effective, result.hits);
         try owner.attachHighlights(a, effective, &result);
     }
     if (candidate_sources_loaded and !effective.include_stored) for (result.hits) |*hit| {
@@ -323,6 +324,9 @@ const Execution = struct {
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
     active_text: ?types.TextQuery = null,
     forced_selection: ?[]const [32]u8 = null,
+    overlay_preparation: ?*@import("lake_index_text_frontier.zig") = null,
+    recent_text_source: ?*const search.PinnedTextSource = null,
+    recent_text_window: bool = false,
     text_identities: std.AutoHashMapUnmanaged(usize, @import("lake_index_text_predicate.zig").Identities) = .empty,
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
@@ -614,7 +618,7 @@ const Execution = struct {
         } else if (req.full_text) |text| {
             if (try self.highlightPlan(req.primary_text_index_name orelse req.index_name, text)) |plan| {
                 try queries.append(self.arena, plan.query);
-                if (storedHighlightEligible(req, plan.query.selected_field, plan.stores_source)) {
+                if (self.overlay == null and storedHighlightEligible(req, plan.query.selected_field, plan.stores_source)) {
                     self.use_stored_highlights = true;
                     self.highlight_index = plan.name;
                 }
@@ -627,6 +631,14 @@ const Execution = struct {
         const started = @import("antfly_platform").time.monotonicNs();
         defer self.server.lake_query_metrics.record(.index, started);
         try self.context.ensureActive();
+        if (self.recent_text_window) {
+            const preparation = self.overlay_preparation orelse return error.InvalidNativeLakeTextCorpus;
+            var pin = try self.recent_text_source.?.clone();
+            errdefer pin.deinit();
+            var empty = local.encoding_roaring.RoaringBitmap.init(self.arena);
+            defer empty.deinit();
+            return try overlay_api.Overlay.window(pin, &empty, preparation.root.collection.?, preparation.plan.?, self.context);
+        }
         const selected = (try self.textDeclaration(name)) orelse return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
@@ -659,11 +671,17 @@ const Execution = struct {
         errdefer pin.deinit();
         const identities = @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus))).*;
         if (self.overlay) |overlay| {
-            const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = false, .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-            var excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
-            defer excluded.bitmap.deinit();
-            if (!excluded.exact) return error.UnsupportedQueryRequest;
-            const joined = try overlay.compose(pin, &excluded.bitmap, self.context);
+            const joined = if (self.overlay_preparation) |preparation| bounded: {
+                var excluded = try identities.bitmapForPhysical(self.arena, &overlay.physical.?, self.store.artifactStore(), cached);
+                defer excluded.deinit();
+                break :bounded try overlay_api.Overlay.window(pin, &excluded, preparation.root.collection.?, preparation.plan.?, self.context);
+            } else full: {
+                const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = false, .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+                var excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
+                defer excluded.bitmap.deinit();
+                if (!excluded.exact) return error.UnsupportedQueryRequest;
+                break :full try overlay.compose(pin, &excluded.bitmap, self.context);
+            };
             // compose consumed pin; the error cleanup must now own joined.
             pin = joined;
         }
@@ -841,7 +859,7 @@ const Execution = struct {
         try self.hydrateTypedFromSource(a, hits, keys, pin);
     }
     fn hydrateTypedFromSource(self: *Execution, a: A, hits: []types.SearchHit, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
-        if (pin == null or pin.?.stored_projection_fields.len == 0) {
+        if (self.overlay == null and (pin == null or pin.?.stored_projection_fields.len == 0)) {
             const columns = try loadSelected(types.ColumnSource, self, a, keys, self.hydration_fields);
             defer {
                 for (columns) |value| if (value) |owned| owned.deinit();
@@ -997,6 +1015,23 @@ const Execution = struct {
     }
     fn resolveIndexedFilter(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, json: []const u8) !?search.IndexedTextPredicate {
         const self = from(raw);
+        if (self.recent_text_window) {
+            var result = local.encoding_roaring.RoaringBitmap.init(a);
+            errdefer result.deinit();
+            var temporary = std.heap.ArenaAllocator.init(a);
+            defer temporary.deinit();
+            const filter = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, json, .{});
+            var ordinal: u32 = 0;
+            for (snapshot.segments) |segment| for (0..segment.reader.doc_count) |_| {
+                try self.context.ensureActive();
+                _ = temporary.reset(.retain_capacity);
+                const id = (try snapshot.storedIdScoped(temporary.allocator(), ordinal)) orelse return error.InvalidNativeLakeTextCorpus;
+                const row = self.overlay.?.row(id) orelse return error.InvalidNativeLakeTextCorpus;
+                if (try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(temporary.allocator(), id, row, filter)) try result.add(ordinal);
+                ordinal += 1;
+            };
+            return .{ .bitmap = result };
+        }
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var result = (try resolver.resolve(a, json)) orelse return null;
@@ -1145,7 +1180,7 @@ const Execution = struct {
     // bounded coordinator. The composed owner retains fusion and source leases;
     // source-dependent transforms run once on the global candidate pool.
     fn pagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
-        if (self.forced_selection != null or !self.typed_delivery or self.overlay != null or
+        if (self.forced_selection != null or !self.typed_delivery or
             req.filter_text != null or req.exclusion_text != null or requiresEarlySource(retrievalRequest(req)) or
             req.filter_prefix.len != 0 or req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
             req.filter_doc_ids.len != 0 or req.filter_doc_ids_positive or req.exclude_doc_ids.len != 0 or
@@ -1157,6 +1192,7 @@ const Execution = struct {
             .term, .match, .phrase, .bool_query => {},
             else => return null,
         }
+        if (self.overlay != null and req.distributed_text_stats.len != 0) return null;
         var indexes: usize = 0;
         for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version) {
             indexes += 1;
@@ -1209,28 +1245,65 @@ const Execution = struct {
             queries[0] = .{ .query = text, .text_analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime), .runtime_schema = runtime, .selected_field = field };
             self.highlight_queries = queries;
         }
+        var recent: ?search.PinnedTextSource = null;
+        defer if (recent) |*pin| pin.deinit();
+        if (self.overlay) |overlay| {
+            const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
+            const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
+            const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime);
+            var pin = try overlay.recent(std.heap.page_allocator, selected.name, analysis, runtime, field, self.context);
+            errdefer pin.deinit();
+            recent = try pin.share(std.heap.page_allocator);
+        }
         const frontier_mod = @import("lake_index_text_frontier.zig");
         var frontier: ?*frontier_mod = null;
-        if (ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
+        if (self.overlay == null and ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
-            frontier = frontier_mod.createObserved(a, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics) catch |err| switch (err) {
+            frontier = frontier_mod.createObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.NativeLakeTermDirectoryKeyTooLarge => null,
                 else => return err,
             };
         }
         defer if (frontier) |value| value.deinit();
+        var preparation: ?*frontier_mod = null;
+        if (frontier == null and req.distributed_text_stats.len == 0) {
+            _ = plan.reset(.retain_capacity);
+            const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
+            preparation = (if (recent) |pin|
+                frontier_mod.prepareRecentObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics, pin.snapshot)
+            else
+                frontier_mod.prepareObserved(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics)) catch |err| switch (err) {
+                error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.NativeLakeTermDirectoryKeyTooLarge => null,
+                else => return err,
+            };
+        }
+        defer if (preparation) |value| value.deinit();
+        if (self.overlay) |overlay| {
+            // Unsupported prepared syntax retains the independent complete
+            // corpus path; window-local frequencies are never a substitute.
+            if (preparation == null) return null;
+            if (overlay.physical == null) {
+                const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+                const excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
+                if (!excluded.exact) return error.UnsupportedQueryRequest;
+                overlay.physical = excluded.bitmap;
+            }
+        }
+
         var reader: ?*@import("lake_index_text_directory.zig").RoutingCursor = null;
         if (frontier == null) {
+            var selection_scratch = std.heap.ArenaAllocator.init(plan_budget.allocator());
+            defer selection_scratch.deinit();
             var planning = self.*;
-            planning.arena = plan.allocator();
-            const subset = planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
+            planning.arena = selection_scratch.allocator();
+            const subset = if (self.overlay != null) null else planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
                 error.OutOfMemory => null,
                 else => return err,
             };
             if (subset) |selected_ids| if (selected_ids.len <= 64 or selected_ids.len < root.segment_count / 2) return null;
-            reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
+            reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation);
         }
         defer if (reader) |value| value.deinit();
         const paging = local.storage_db_query_control_contract.componentPaging(req);
@@ -1242,10 +1315,26 @@ const Execution = struct {
         defer profiled.deinit();
         var ids: [64][32]u8 = undefined;
         var batch_limit: usize = 1;
+        const Navigation = struct {
+            frontier: ?*frontier_mod,
+            reader: ?*@import("lake_index_text_directory.zig").RoutingCursor,
+            fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (self_.frontier) |value| {
+                    const selected_ids = (try value.nextWindow(output, cutoff, 32 * 1024 * 1024)) orelse return null;
+                    return .{ .identities = selected_ids, .doc_offset = 0 };
+                }
+                return self_.reader.?.nextBounded(output, 32 * 1024 * 1024);
+            }
+        };
+        var navigation: Navigation = .{ .frontier = frontier, .reader = reader };
+        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next }, self.context.io);
+        defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
+        var recent_scored = false;
         while (true) {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
@@ -1253,18 +1342,24 @@ const Execution = struct {
             // Full-match evaluation must establish complete membership before
             // evaluating any source; a competitive top-K cannot prove it.
             const competitive_cutoff = if (req.evaluation_matches) null else winners.cutoff();
-            const window: @import("lake_index_text_directory.zig").RoutingCursor.Window = if (frontier) |value| blk: {
-                const selected_ids = (try value.nextWindow(ids[0..batch_limit], competitive_cutoff, 32 * 1024 * 1024)) orelse break;
-                break :blk .{ .identities = selected_ids, .doc_offset = 0 };
-            } else (try reader.?.nextBounded(&ids, 32 * 1024 * 1024)) orelse break;
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities };
+            const pulled = try ahead.next(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
+            const recent_window = pulled == null;
+            if (recent_window and (recent == null or recent_scored)) break;
+            var window: @import("lake_index_text_directory.zig").RoutingCursor.Window = .{ .identities = &.{}, .doc_offset = root.collection.?.documents };
+            if (pulled) |value| {
+                // Copy worker-owned output before the single lookahead reuses it.
+                @memcpy(ids[0..value.identities.len], value.identities);
+                window = .{ .identities = ids[0..value.identities.len], .doc_offset = value.doc_offset };
+                ahead.prefetch(if (frontier != null) batch_limit else ids.len, competitive_cutoff);
+            } else recent_scored = true;
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
             var request = retrievalRequest(req);
             request.offset = 0;
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
             request.highlight = null;
-            request.text_navigation_plan = if (frontier) |value| value.plan else null;
+            request.text_navigation_plan = if (frontier orelse preparation) |value| value.plan else null;
             if (ordering == null and !req.count_only) request.minimum_competitive_score = competitive_cutoff;
             const previous_cutoff = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
@@ -1570,20 +1665,73 @@ const Execution = struct {
         defer a.free(result);
         return result[0];
     }
-    fn hydrateTransformCandidates(self: *Execution, a: A, hits: []types.SearchHit) !void {
-        const keys = try a.alloc([]const u8, hits.len);
-        defer a.free(keys);
-        for (hits, keys) |hit, *key| key.* = hit.id;
-        const documents = try loadMany(self, a, keys);
-        defer {
-            for (documents) |bytes| if (bytes) |value| a.free(value);
-            a.free(documents);
+    const TransformInputs = struct { fields: ?[]const []const u8, covers_output: bool };
+    fn planTransformInputs(self: *Execution, req: types.SearchRequest) !TransformInputs {
+        var fields: std.ArrayList([]const u8) = .empty;
+        if (req.hasHitEvaluation()) {
+            const raw = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, req.evaluation_json, .{});
+            const plan = try local.functions_expressions.Plan.parse(self.arena, raw);
+            for (plan.required_fields) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
         }
-        for (hits, documents) |*hit, *bytes| {
-            const value = bytes.* orelse return error.StoredDocMissing;
-            if (hit.stored_data) |old| a.free(old);
-            hit.stored_data = value;
-            bytes.* = null;
+        if (req.reranker) |reranker| {
+            // Free-form template helpers may inspect the root or change context.
+            // Without an authoritative dependency proof, retain complete input
+            // under the same byte admission as direct-field templates.
+            if (reranker.template.len != 0) return .{ .fields = null, .covers_output = true };
+            try appendHydrationPath(self.arena, self.table, &fields, reranker.field);
+        }
+        var highlights = retrievalRequest(req);
+        highlights.include_stored = false;
+        highlights.include_all_fields = false;
+        highlights.fields = &.{};
+        const highlight_fields = try self.planHydration(highlights);
+        if (highlight_fields) |paths| {
+            for (paths) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
+        } else return .{ .fields = null, .covers_output = true };
+        const output = try projectionColumns(self.arena, self.table, retrievalRequest(req));
+        const covered = if (output) |paths| for (paths) |path| {
+            const present = for (fields.items) |field| {
+                if (std.mem.eql(u8, field, path)) break true;
+            } else false;
+            if (!present) break false;
+        } else true else false;
+        return .{ .fields = fields.items, .covers_output = covered };
+    }
+    const transform_source_bytes = 64 * 1024 * 1024;
+    fn hydrateTransformCandidates(self: *Execution, a: A, req: types.SearchRequest, fields: ?[]const []const u8, hits: []types.SearchHit) !void {
+        var budget: local.sql_memory_budget = .{ .backing = a, .limit = transform_source_bytes };
+        self.hydrateTransformCandidatesBounded(a, &budget, fields, hits) catch |err| {
+            if (budget.isExhausted() or err == error.TransformSourceBudgetExceeded) return if (req.hasHitEvaluation()) error.DecisionLimitExceeded else error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+    }
+    fn hydrateTransformCandidatesBounded(self: *Execution, a: A, budget: *local.sql_memory_budget, fields: ?[]const []const u8, hits: []types.SearchHit) !void {
+        var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+        defer scratch.deinit();
+        var retained: usize = 0;
+        var first: usize = 0;
+        while (first < hits.len) {
+            try self.context.ensureActive();
+            _ = scratch.reset(.free_all);
+            const count = @min(32, hits.len - first);
+            const batch = hits[first..][0..count];
+            var keys: [32][]const u8 = undefined;
+            for (batch, keys[0..count]) |hit, *key| key.* = hit.id;
+            const documents = try loadManySelected(self, scratch.allocator(), keys[0..count], fields);
+            // Loading joins all cursor work before the budget is narrowed. The
+            // retained pool and temporary cursor/serialization capacity share
+            // one bound, including the copy that transfers into SearchHit's
+            // ordinary allocator ownership.
+            for (batch, documents) |*hit, document| {
+                const bytes = document orelse return error.StoredDocMissing;
+                if (bytes.len > budget.limit -| budget.live) return error.TransformSourceBudgetExceeded;
+                const owned = try a.dupe(u8, bytes);
+                retained += owned.len;
+                budget.limit = transform_source_bytes - retained;
+                if (hit.stored_data) |old| a.free(old);
+                hit.stored_data = owned;
+            }
+            first += count;
         }
     }
     fn loadMany(raw: ?*anyopaque, a: A, keys: []const []const u8) ![]?[]u8 {
@@ -2190,6 +2338,32 @@ test "external lake typed delivery separates final projection from residual pred
     req.hierarchy_include_source = false;
     req.evaluation_limit = 1;
     try std.testing.expect(!canDeliverTypedSource(req));
+}
+
+test "external lake bounded transforms project dependencies before candidate admission" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var owner: Execution = .{ .server = undefined, .source = undefined, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = "", .arena = arena.allocator(), .table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "body", .path = "body", .type = .string },
+        .{ .name = "amount", .path = "amount", .type = .integer },
+        .{ .name = "unused", .path = "unused", .type = .string },
+    } } };
+    var req: types.SearchRequest = .{ .limit = 1, .fields = &.{"amount"}, .evaluation_limit = 201, .evaluation_json =
+        \\{"scope":"candidates","candidate_count":201,"compute":{"tiny":{"field":"body"}}}
+    };
+    const inputs = try owner.planTransformInputs(req);
+    try std.testing.expectEqual(@as(usize, 1), inputs.fields.?.len);
+    try std.testing.expectEqualStrings("body", inputs.fields.?[0]);
+    try std.testing.expect(!inputs.covers_output);
+    req.fields = &.{"body"};
+    try std.testing.expect((try owner.planTransformInputs(req)).covers_output);
+    req.evaluation_limit = 0;
+    req.reranker = .{ .provider = .antfly, .field = "body" };
+    const direct = try owner.planTransformInputs(req);
+    try std.testing.expectEqualStrings("body", direct.fields.?[0]);
+    req.reranker.?.template = "{{json this}}";
+    try std.testing.expect((try owner.planTransformInputs(req)).fields == null);
 }
 
 test "external lake bounded transforms retain global candidate windows and source dependencies" {

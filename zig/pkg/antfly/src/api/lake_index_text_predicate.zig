@@ -264,6 +264,27 @@ pub const Identities = struct {
         const item = self.spans[lo];
         return .{ .file = corpus.term_directory.identity(item.file), .rank = try item.span.original(ordinal_value) };
     }
+    /// Translate a query-wide compressed physical tombstone set into just the
+    /// admitted native window. Keep each temporary bitmap within one 2^20 block.
+    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !Bitmap {
+        var result = Bitmap.init(a);
+        errdefer result.deinit();
+        var cache: LiveRowsCache = .{};
+        defer cache.deinit(a);
+        for (self.spans) |item| {
+            const selected_blocks = selected.files.getPtr(item.file) orelse continue;
+            for (try item.span.blocks(&cache, store, cached, item.file)) |block| {
+                try cached.context.ensureActive();
+                const physical_base = block.high << corpus.physical.shift;
+                const bitmap = selected_blocks.getPtr(.{ .group = block.group, .high = @intCast(physical_base >> 32) }) orelse continue;
+                const lower: u32 = @truncate(physical_base);
+                var sliced = try bitmap.sliceRebased(a, lower, @as(u64, lower) + (1 << corpus.physical.shift));
+                defer sliced.deinit();
+                if (!sliced.isEmpty()) try self.addBlock(a, a, &cache, store, cached, .{ .file = item.file, .group = block.group, .base = physical_base, .selection = .{ .bitmap = sliced } }, &result);
+            }
+        }
+        return result;
+    }
     fn liveRows(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         return cache.load(a, store, cached, block);
     }
@@ -1517,4 +1538,25 @@ test "external lake selected segment predicates map ranges and bitmaps across fi
     defer block.deinit();
     try std.testing.expectEqual(@as(u64, 1), block.cardinality());
     try std.testing.expect(block.contains(1));
+}
+
+test "external lake bounded WAL physical masks preserve selected gaps and high row bits" {
+    const a = std.testing.allocator;
+    const high: u64 = 1 << 40;
+    const span: Identities.Span = .{ .lower = 0, .upper = 4, .rows = &.{.{ .group = 2, .high = high >> corpus.physical.shift, .base = 0, .count = 6, .lower = 10 }}, .intervals = &.{ .{ .file_lower = 0, .lower = 0, .upper = 1 }, .{ .file_lower = 3, .lower = 1, .upper = 4 } } };
+    var identities: Identities = .{ .offsets = &.{ 0, 1, 4 }, .partial_inventory = true, .spans = &.{.{ .file = "part", .span = span }} };
+    defer identities.files.deinit(a);
+    try identities.files.put(a, "part", span);
+    var physical = @import("lake_index_physical_set.zig").Set.init(a);
+    defer physical.deinit();
+    for ([_]u64{ 10, 12, 13, 15, 100 }) |row| try physical.addRow("part", 2, high + row);
+    try physical.addRow("part", 0, high + 10);
+    try physical.addRow("unadmitted", 2, high + 10);
+    // Contiguous physical extents do not access artifact storage.
+    const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = undefined, .scope = @splat(1), .context = .{} };
+    var result = try identities.bitmapForPhysical(a, &physical, store, cached);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
+    try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
 }

@@ -11936,7 +11936,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        const total = try search_mod.countMatchesPrepared(alloc, snapshot, search_query, effective_req.text_navigation_plan);
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -11961,7 +11961,7 @@ pub fn searchTextQuery(
         effective_req.full_text_queries.len == 0)
     {
         const sorted_membership_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, true);
-        const membership_filter = search_mod.searchQueryToFilterArena(arena_alloc, sorted_membership_query) catch |err| switch (err) {
+        const membership_filter = search_mod.searchQueryToFilterWithPreparation(arena_alloc, sorted_membership_query, effective_req.text_navigation_plan) catch |err| switch (err) {
             error.InvalidArgument => null,
             else => return err,
         };

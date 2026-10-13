@@ -5119,3 +5119,122 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_remote_transform_dependencies_bound_wide_candidate_sources(tmp_path):
+    """Unrelated wide columns cannot enter the transform candidate pool."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    for part in range(67):
+        path = tmp_path / "part.parquet"
+        pq.write_table(
+            pa.table({"body": ["quasar"] * 3, "unused": ["x" * (512 * 1024)] * 3}),
+            path,
+            compression="snappy",
+            use_dictionary=False,
+            write_statistics=False,
+            row_group_size=2,
+        )
+        data = path.read_bytes()
+        (objects / f"part-{part:03}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        definition = {
+            "num_shards": 1,
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "body": {
+                                    "type": "string",
+                                    "x-antfly-field": {"type": "text"},
+                                },
+                                "unused": {"type": "string"},
+                            },
+                        }
+                    }
+                },
+                "base_source": {
+                    "kind": "external",
+                    "table_id": "wide-transform",
+                    "format": "parquet",
+                    "uri": root.as_uri(),
+                },
+            },
+            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        }
+
+        def call(method, path, body=None):
+            return requests.request(
+                method, server.api_url + path, json=body, timeout=120
+            )
+
+        created = call("POST", "/tables/wide_transform", definition)
+        assert created.ok, created.text + server.debug_logs()
+        deadline = time.monotonic() + 120
+        while True:
+            index = call("GET", "/tables/wide_transform/indexes/body_text").json()
+            assert index["status"]["readiness"]["state"] != "failed", index
+            if index["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(index) + server.debug_logs()
+            time.sleep(0.1)
+        query = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "full_text_index": "body_text",
+            "fields": ["body"],
+            "limit": 1,
+            "evaluate": {
+                "scope": "candidates",
+                "candidate_count": 201,
+                "compute": {"tiny": {"field": "body"}},
+            },
+        }
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            response = call("POST", "/tables/wide_transform/query", query)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            result = value.get("responses", [value])[0]
+            assert result["evaluation"]["evaluated_rows"] == 201
+            assert len(result["hits"]["hits"]) == 1
+            hit = result["hits"]["hits"][0]
+            assert hit["_source"] == {"body": "quasar"}
+            assert hit["_computed"]["tiny"] == "quasar"
+            # A genuine wide dependency uses the same pre-hydration byte guard.
+            wide = dict(
+                query,
+                evaluate=dict(query["evaluate"], compute={"wide": {"field": "unused"}}),
+            )
+            rejected = call("POST", "/tables/wide_transform/query", wide)
+            assert rejected.status_code == 422, rejected.text + server.debug_logs()
+            assert rejected.json()["code"] == "decision_limit_exceeded"
+            # Final full source is needed only for the one surviving row.
+            complete = dict(query)
+            del complete["fields"]
+            response = call("POST", "/tables/wide_transform/query", complete)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            result = value.get("responses", [value])[0]
+            assert len(result["hits"]["hits"][0]["_source"]["unused"]) == 512 * 1024
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
