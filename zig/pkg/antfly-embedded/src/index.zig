@@ -1014,6 +1014,15 @@ pub const IndexSnapshot = struct {
             if (flight.failure) |failure| return failure;
         }
     }
+    /// Immutable composition must allocate through the inventory owner. A
+    /// query facade's locked allocator is tied to that facade's lifetime and
+    /// is not the allocator that owns shared readers and visibility cells.
+    pub fn inventoryAllocator(self: *const IndexSnapshot) Allocator {
+        var owner = self;
+        while (owner.inventory_owner) |parent| owner = parent;
+        return owner.alloc;
+    }
+
     /// Compatibility borrow: the returned pointer is stable until snapshot
     /// release. Streaming consumers should use a lease to bound visited readers.
     pub fn readSegment(self: *const IndexSnapshot, ordinal: usize) !*SegmentEntry {
@@ -1695,6 +1704,11 @@ pub const IndexSnapshot = struct {
     /// Request-owned, bounded decoded blocks for ranked (not physical-order)
     /// result hydration. Returned identity/body expire on the next cache get.
     /// The snapshot must remain pinned until the cache is destroyed.
+    pub fn prefetchStoredDoc(self: *const IndexSnapshot, global_id: u32) !void {
+        const resolved = self.resolveDocId(global_id) orelse return error.StoredDocMissing;
+        try self.segments[resolved.seg_idx].reader.prefetchStoredDoc(resolved.local_id);
+    }
+
     pub fn storedDocWithBlockCache(self: *const IndexSnapshot, cache: *StoredDocBlockCache, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
         const segment = try self.readSegment(resolved.seg_idx);

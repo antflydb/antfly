@@ -772,7 +772,10 @@ def test_native_catalog_file_commit_read_and_restart(
                         "storage_mode": "relational",
                         "default_type": "row",
                         "relational_indexes": [
-                            {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                            {
+                                "name": "current_amount_idx",
+                                "keys": [{"column": "amount"}],
+                            }
                         ],
                         "document_schemas": {
                             "row": {
@@ -865,7 +868,20 @@ def test_native_catalog_file_commit_read_and_restart(
                 "limit": 1,
             }
             combined = call("POST", "/query", composed)["responses"][0]
-            assert combined["hits"]["total"]["value"] == 2, combined
+            # A bounded page can report a lower bound before visiting the
+            # remaining archive. Request exact counting separately so this
+            # test covers both archive pagination and overlay cardinality.
+            total = combined["hits"]["total"]
+            assert total["relation"] in ("exact", "gte"), combined
+            assert (
+                total["value"] == 2
+                if total["relation"] == "exact"
+                else 1 <= total["value"] <= 2
+            ), combined
+            counted = call("POST", "/query", dict(composed, count=True))["responses"][0]
+            assert counted["hits"]["total"] == {"value": 2, "relation": "exact"}, (
+                counted
+            )
             assert combined["hits"]["hits"][0]["_source"]["amount"] == 3, combined
             second = call(
                 "POST",

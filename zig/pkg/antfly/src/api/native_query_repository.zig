@@ -27,6 +27,31 @@ const fs = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
 const Namespace = local.storage_db_doc_identity_namespace.Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+/// Register discovery before publishing a capability. Even a failed physical
+/// capture must leave its descriptor discoverable after restart or table drop.
+pub fn saveWithCover(a: A, store: *Store, io: std.Io, table: anytype, now: u64, retention_ms: u64, cover: anytype, cancellation: Cancellation) ![]const u8 {
+    for (cover) |range| try registerOwner(a, store, range.namespace, cancellation);
+    var artifact_store = store.artifactStore();
+    const retained = @import("native_retained_cut.zig");
+    return retained.saveWithCover(a, &artifact_store, try retained.storeIdentity(a, store.locator), io, table, now, retention_ms, cover, cancellation);
+}
+fn registerOwner(a: A, store: *Store, namespace: Namespace, cancellation: Cancellation) !void {
+    try cancellation.check();
+    const key = try std.fmt.allocPrint(a, "{s}{s}native-query-owners/{d}/{d}/{d}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id });
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, namespace, .{});
+    defer a.free(bytes);
+    const bridge: TokenBridge = .{ .token = cancellation };
+    var result = store.opened.client.putObject(store.opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+        try cancellation.check();
+        switch (err) {
+            error.PreconditionFailed, error.ConditionalCheckFailed => return,
+            else => return err,
+        }
+    };
+    result.deinit(store.opened.client.allocator);
+    try cancellation.check();
+}
 const TokenBridge = struct {
     token: Cancellation,
     fn cancelled(raw: *const anyopaque) bool {
@@ -238,18 +263,7 @@ pub const Repository = struct {
         return std.fmt.allocPrint(a, "{s}{s}native-query-owners/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/" });
     }
     fn register(self: *Repository, a: A, namespace: Namespace, cancellation: Cancellation) !void {
-        const key_bytes = try std.fmt.allocPrint(a, "{s}{d}/{d}/{d}.json", .{ try self.ownerPrefix(a), namespace.table_id, namespace.shard_id, namespace.range_id });
-        const bytes = try std.json.Stringify.valueAlloc(a, namespace, .{});
-        const bridge: TokenBridge = .{ .token = cancellation };
-        var result = self.store.opened.client.putObject(self.store.opened.bucket, key_bytes, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
-            try cancellation.check();
-            switch (err) {
-                error.PreconditionFailed, error.ConditionalCheckFailed => return,
-                else => return err,
-            }
-        };
-        result.deinit(self.store.opened.client.allocator);
-        try cancellation.check();
+        try registerOwner(a, &self.store, namespace, cancellation);
     }
     /// One namespace per supervised pass. The caller owns the returned cursor;
     /// registry witnesses survive failed upload, owner loss and table drop.
@@ -381,7 +395,9 @@ pub const Repository = struct {
             return true;
         }
         try self.register(a, namespace, cancellation);
-        try self.collect(namespace, cut.nowMs(), cancellation);
+        // collectNext runs under the background maintenance owner. A new cut
+        // only publishes its own generation; sweeping older cuts here makes
+        // query latency depend on the size of unrelated retained history.
         // An immutable commit proves a prior attempt completed every chunk.
         if (self.readManifest(a, request, namespace, cancellation)) |bytes| {
             _ = try checkedManifest(a, bytes, request, namespace);
@@ -529,9 +545,12 @@ pub const Repository = struct {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var store = self.store.artifactStore();
         store.allocator = a;
-        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| switch (err) {
-            error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
-            else => err,
+        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| {
+            std.log.warn("retained native chunk read failed err={s} bytes={d}", .{ @errorName(err), ref.byte_len });
+            return switch (err) {
+                error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
+                else => err,
+            };
         };
     }
     fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
@@ -539,7 +558,14 @@ pub const Repository = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const manifest = try checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace);
+        const bytes = self.readManifest(a, request, namespace, cancellation) catch |err| {
+            std.log.warn("retained native manifest lookup failed err={s} table={d} shard={d} range={d} expires={d}", .{ @errorName(err), namespace.table_id, namespace.shard_id, namespace.range_id, request.expires_ms });
+            return err;
+        };
+        const manifest = checkedManifest(a, bytes, request, namespace) catch |err| {
+            std.log.warn("retained native manifest validation failed err={s}", .{@errorName(err)});
+            return err;
+        };
         const expected_domain = try self.domain(a, namespace);
         // Publication may reuse the adjacent warmer epoch (one additional
         // hour) beyond its ordinary two-window chunk horizon.
@@ -635,6 +661,119 @@ test "external lake native repository setup round trips protocol-specific connec
     try std.testing.expectEqualStrings("fixture", recovered.connections.get("amazon").?.external_io.?.credentials.access_key_id.?);
     try std.testing.expectEqualStrings("yes", recovered.connections.get("http").?.external_io.?.headers.get("X-Fixture").?);
     try std.testing.expectEqualStrings("/tmp/fixture", recovered.connections.get("files").?.external_io.?.root.?);
+}
+
+test "external lake native repository opens retained vector storage after local cache loss" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cut-vector-read");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .table_storage = .{ .dense_embeddings = .vector_store } });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1,\"body\":\"retained original\"}" }} });
+    const id: [64]u8 = @splat('f');
+    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    {
+        var retained = try db.openQueryCut(request, .none);
+        defer retained.close();
+        const prior = (try retained.get(a, "doc")).?;
+        defer a.free(prior);
+        var initial_matches = try retained.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
+        defer initial_matches.deinit();
+        try std.testing.expectEqual(@as(u32, 1), initial_matches.total_hits);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2,\"body\":\"replacement\"}" }} });
+    db.close();
+    db_open = false;
+    db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .table_storage = .{ .dense_embeddings = .vector_store } });
+    db_open = true;
+    request.create = false;
+    {
+        var restarted = try db.openQueryCut(request, .none);
+        defer restarted.close();
+        const before_loss = (try restarted.get(a, "doc")).?;
+        defer a.free(before_loss);
+        try std.testing.expect(std.mem.indexOf(u8, before_loss, "\"amount\":1") != null);
+    }
+    const pinned = try cut.pathAlloc(a, root, &id);
+    defer a.free(pinned);
+    const local_manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{pinned});
+    defer a.free(local_manifest);
+    const original_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, local_manifest, max_manifest_bytes);
+    defer a.free(original_manifest);
+    const vector_current = try std.fmt.allocPrint(a, "{s}/source-vectors/CURRENT", .{pinned});
+    defer a.free(vector_current);
+    request.create = false;
+    for (0..3) |loss| {
+        // Preserve the directory while losing metadata or a sealed file.
+        // Neither invalid local bytes nor a partial cache can replace authority.
+        switch (loss) {
+            0 => try std.Io.Dir.cwd().deleteFile(io, local_manifest),
+            1 => _ = try local.storage_db_native_backup.writeFileDurable(io, local_manifest, "{invalid"),
+            2 => {
+                _ = try local.storage_db_native_backup.writeFileDurable(io, local_manifest, original_manifest);
+                try std.Io.Dir.cwd().deleteFile(io, vector_current);
+            },
+            else => unreachable,
+        }
+        var remote = try db.openQueryCut(request, .none);
+        defer remote.close();
+        const original = (try remote.get(a, "doc")).?;
+        defer a.free(original);
+        try std.testing.expect(std.mem.indexOf(u8, original, "\"amount\":1") != null);
+        var matches = try remote.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
+        defer matches.deinit();
+        try std.testing.expectEqual(@as(u32, 1), matches.total_hits);
+        try std.Io.Dir.accessAbsolute(io, pinned, .{});
+        if (loss == 0) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, local_manifest, .{}));
+        if (loss == 2) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, vector_current, .{}));
+    }
+    const remote_key = try repository.key(a, request, namespace);
+    defer a.free(remote_key);
+    try repository.store.opened.client.deleteObject(repository.store.opened.bucket, remote_key, .{});
+    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    const latest = (try db.get(a, "doc")).?;
+    defer a.free(latest);
+    try std.testing.expect(std.mem.indexOf(u8, latest, "\"amount\":2") != null);
+}
+
+test "external lake invalid native cache admission protects active readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cut-cache-admission");
+    defer directory.cleanup();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const old_id: [64]u8 = @splat('a');
+    const new_id: [64]u8 = @splat('b');
+    const pinned = try cut.pathAlloc(a, root, &old_id);
+    defer a.free(pinned);
+    const manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{pinned});
+    defer a.free(manifest);
+    var guard = try cut.lock(a, io, root, .none);
+    defer guard.deinit();
+    for ([_]bool{ false, true }) |malformed| {
+        try fs.createDirPathPortable(io, pinned);
+        if (malformed) _ = try local.storage_db_native_backup.writeFileDurable(io, manifest, "{invalid");
+        {
+            var reader = try cut.readLease(a, io, root, &old_id, .none);
+            defer reader.deinit();
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, cut.admit(a, io, root, &new_id, .{ .max_cuts = 1, .max_bytes = 1024 }, .none));
+            try std.Io.Dir.accessAbsolute(io, pinned, .{});
+        }
+        try cut.admit(a, io, root, &new_id, .{ .max_cuts = 1, .max_bytes = 1024 }, .none);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pinned, .{}));
+    }
 }
 
 test "external lake native repository reuses immutable extents and collects expired generations" {

@@ -204,6 +204,9 @@ pub const SearchTextQueryExecutor = struct {
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
     project_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+    /// An authenticated provider ordinal map can project identity without
+    /// fetching a stored-key page. Null preserves ordinary key hydration.
+    project_doc_num: ?*const fn (?*anyopaque, Allocator, *const index_mod.IndexSnapshot, u32) anyerror!?[]u8 = null,
     native_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
     acquire_text_source: ?*const fn (?*anyopaque, ?[]const u8) anyerror!?PinnedTextSource = null,
     /// Primary rows can disappear independently of a derived posting. Keep
@@ -9417,11 +9420,7 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("bool")) |bool_query| return try patternBoolFilterToSearchQuery(alloc, bool_query, text_analysis, runtime_schema);
 
     if (value.object.get("term")) |term| {
-        const field_value = try singleFieldString(term, "term");
-        return .{ .term = .{
-            .field = try exactTermFilterFieldAlloc(alloc, field_value.field, text_analysis, runtime_schema),
-            .term = field_value.value,
-        } };
+        return try scalarTermFilterToSearchQuery(alloc, term, text_analysis, runtime_schema);
     }
     if (value.object.get("terms")) |terms| {
         const field_terms = try singleFieldTerms(alloc, terms);
@@ -9508,7 +9507,7 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
-    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(range_query, runtime_schema);
+    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(alloc, range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
     if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
@@ -9865,6 +9864,62 @@ const FieldFuzzy = struct {
     auto_fuzzy: bool = false,
 };
 
+/// Native indexes use dotted source paths. Only translate pointers whose
+/// components have the same meaning; literal dots and array positions need
+/// stored evaluation rather than an approximate index predicate.
+fn nativeFilterFieldAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, field, "/")) {
+        if (field.len == 0) return error.InvalidArgument;
+        return field;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, field[1..], '/');
+    while (parts.next()) |part| {
+        const decoded = try graph_exec.decodePatternJsonPointerSegmentAlloc(alloc, part);
+        defer if (std.mem.indexOfScalar(u8, part, '~') != null) alloc.free(decoded);
+        if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, '.') != null) return error.InvalidArgument;
+        if (std.fmt.parseInt(u64, decoded, 10)) |_| return error.InvalidArgument else |_| {}
+        if (out.items.len != 0) try out.append(alloc, '.');
+        try out.appendSlice(alloc, decoded);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn scalarTermFilterToSearchQuery(
+    alloc: Allocator,
+    term: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    if (term != .object) return error.InvalidArgument;
+    if (term.object.get("field") != null and term.object.get("path") != null) return error.InvalidArgument;
+    if (term.object.get("term") != null and term.object.get("value") != null) return error.InvalidArgument;
+    const raw_field, const value = blk: {
+        if (term.object.get("field") orelse term.object.get("path")) |field| {
+            break :blk .{ jsonString(field) orelse return error.InvalidArgument, term.object.get("term") orelse term.object.get("value") orelse return error.InvalidArgument };
+        }
+        if (term.object.count() != 1) return error.InvalidArgument;
+        var it = term.object.iterator();
+        const entry = it.next().?;
+        break :blk .{ entry.key_ptr.*, entry.value_ptr.* };
+    };
+    const field = try nativeFilterFieldAlloc(alloc, raw_field);
+    if (value == .string) return .{ .term = .{
+        .field = try exactTermFilterFieldAlloc(alloc, field, text_analysis, runtime_schema),
+        .term = value.string,
+    } };
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(runtime_schema orelse return error.InvalidArgument, field) orelse return error.InvalidArgument;
+    if (mapping.field_type == .numeric and (value == .integer or value == .float or value == .number_string)) {
+        const number = try jsonOptionalF64Strict(value);
+        // f64 indexes cannot distinguish neighboring large integer keys.
+        if (!std.math.isFinite(number.?) or @abs(number.?) >= 9007199254740992.0) return error.InvalidArgument;
+        return .{ .numeric_range = .{ .field = field, .min = number, .max = number, .inclusive_min = true, .inclusive_max = true } };
+    }
+    if (mapping.field_type == .boolean and value == .bool) return .{ .bool_field = .{ .field = field, .value = value.bool } };
+    return error.InvalidArgument;
+}
+
 fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
@@ -10055,6 +10110,42 @@ test "pattern date range filter lowers public date and timestamp bounds" {
     try std.testing.expect(ns_query == .date_range);
     try std.testing.expectEqual(@as(u64, 1767398400000000000), ns_query.date_range.start_ns.?);
     try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
+}
+
+test "pattern native pointer scalar filters preserve exact numeric and escaped path semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema: runtime_schema_mod.TableSchema = .{ .declared_fields = &.{
+        .{ .field = "hn_id", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "created_at", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "published", .mapping = .{ .field_type = .boolean } },
+    } };
+    const term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":142577}}
+    , .{});
+    const query = try patternFilterValueToSearchQuery(alloc, term.value, .{}, schema);
+    try std.testing.expectEqualStrings("hn_id", query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 142577), query.numeric_range.min);
+    try std.testing.expectEqual(query.numeric_range.min, query.numeric_range.max);
+    try std.testing.expect(query.numeric_range.inclusive_min and query.numeric_range.inclusive_max);
+    const range = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"path":"/created_at","gte":1700000000}}
+    , .{});
+    const range_query = try patternFilterValueToSearchQuery(alloc, range.value, .{}, schema);
+    try std.testing.expectEqualStrings("created_at", range_query.numeric_range.field);
+    const boolean = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/published","value":true}}
+    , .{});
+    try std.testing.expect((try patternFilterValueToSearchQuery(alloc, boolean.value, .{}, schema)).bool_field.value);
+    const unsafe = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":9007199254740993}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unsafe.value, .{}, schema));
+    try std.testing.expectEqualStrings("a/b~c.child", try nativeFilterFieldAlloc(alloc, "/a~1b~0c/child"));
+    for ([_][]const u8{ "", "/", "/a.b", "/items/0", "/a~2b" }) |path| {
+        try std.testing.expectError(error.InvalidArgument, nativeFilterFieldAlloc(alloc, path));
+    }
 }
 
 test "pattern typed structured filters accept explicit path alias" {
@@ -10495,20 +10586,21 @@ const JsonRangeBound = struct {
 };
 
 fn parseStandardRangeQuery(
+    alloc: Allocator,
     value: std.json.Value,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
         const field = jsonString(field_value) orelse return error.InvalidArgument;
-        return try parseStandardRangeObject(field, value.object, runtime_schema);
+        return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, field), value.object, runtime_schema);
     }
 
     if (value.object.count() != 1) return error.InvalidArgument;
     var it = value.object.iterator();
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .object) return error.InvalidArgument;
-    return try parseStandardRangeObject(entry.key_ptr.*, entry.value_ptr.object, runtime_schema);
+    return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, entry.key_ptr.*), entry.value_ptr.object, runtime_schema);
 }
 
 fn parseStandardRangeObject(
@@ -12191,6 +12283,16 @@ pub fn searchTextQuery(
         for (result.hits, 0..) |hit, i| {
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
+            if (!chunk_backed) if (executor.project_doc_num) |project_doc_num| if (try project_doc_num(executor.ctx, alloc, snapshot, hit.doc_id)) |key| {
+                var materialized = types.SearchHit{ .id = key, .doc_ordinal = doc_ordinal, .native_text_doc_id = hit.doc_id, .score = hit.score };
+                var assigned = false;
+                errdefer if (!assigned) materialized.deinit(alloc);
+                materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+                hits[i] = materialized;
+                assigned = true;
+                initialized += 1;
+                continue;
+            };
             const id = hit.id orelse {
                 identity_scratch.reset();
                 const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), hit.doc_id)) orelse return error.StoredDocMissing };
@@ -32657,6 +32759,106 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "external lake ordinal identity projection avoids stored key I/O and preserves score ties" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const mapper = @import("../document_mapper.zig");
+    const docs = try ca.alloc(mapper.MapperDoc, 4000);
+    var random = std.Random.DefaultPrng.init(73);
+    for (docs, 0..) |*doc, i| {
+        var payload: [128]u8 = undefined;
+        random.random().bytes(&payload);
+        doc.* = .{ .key = try std.fmt.allocPrint(ca, "native-{d}", .{i}), .value = try std.fmt.allocPrint(ca, "{{\"body\":\"alpha {s}\"}}", .{std.fmt.bytesToHex(&payload, .lower)}) };
+    }
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, docs, .{}, null)).?;
+    defer a.free(bytes);
+    const Harness = struct {
+        bytes: []const u8,
+        writer: *index_mod.IndexWriter,
+        identity_reads: usize = 0,
+        hints: [16]struct { offset: u64, length: u64 } = undefined,
+        hint_count: usize = 0,
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.hint_count < self.hints.len) self.hints[self.hint_count] = .{ .offset = offset, .length = length };
+            self.hint_count += 1;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset == 0 and out.len > 21) self.identity_reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn chunk(_: ?*anyopaque, _: Allocator, _: ?[]const u8) !bool {
+            return false;
+        }
+        fn matchAll(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn project(_: ?*anyopaque, out: Allocator, _: types.SearchRequest, _: []const u8, data: []const u8) ![]u8 {
+            return out.dupe(u8, data);
+        }
+        fn post(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+            return result;
+        }
+        fn ordinal(_: ?*anyopaque, out: Allocator, _: *const index_mod.IndexSnapshot, doc: u32) !?[]u8 {
+            return try key(out, doc);
+        }
+        fn key(out: Allocator, doc: u32) ![]u8 {
+            return std.fmt.allocPrint(out, "public-{d:0>4}", .{3999 - doc});
+        }
+        fn identity(_: ?*anyopaque, out: Allocator, id: []const u8) ![]u8 {
+            return key(out, try std.fmt.parseInt(u32, id[7..], 10));
+        }
+    };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    var harness: Harness = .{ .bytes = bytes, .writer = &writer };
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &harness, .length = bytes.len, .read_into = Harness.read, .close = Harness.close, .prefetch = Harness.prefetch } }));
+    harness.hint_count = 0;
+    try writer.snapshot().prefetchStoredDoc(3999);
+    try std.testing.expectEqual(@as(usize, 2), harness.hint_count);
+    const identity = harness.hints[0];
+    try std.testing.expectEqualStrings("native-3999", bytes[@intCast(identity.offset)..][0..@intCast(identity.length)]);
+    try std.testing.expect(harness.hints[1].length > 0);
+    try std.testing.expect(harness.hints[1].offset + harness.hints[1].length <= bytes.len);
+    harness.identity_reads = 0;
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 3, .order_by = &.{ .{ .field = "_score", .desc = true }, .{ .field = "_id" } } };
+    var executor: SearchTextQueryExecutor = .{ .ctx = &harness, .acquire_text_source = Harness.acquire, .text_index_entry = Harness.entry, .text_index_is_chunk_backed = Harness.chunk, .search_match_all = Harness.matchAll, .project_stored_search = Harness.project, .load_stored = Harness.stored, .postprocess = Harness.post, .project_key = Harness.identity, .project_doc_num = Harness.ordinal };
+    var mapped = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer mapped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), harness.identity_reads);
+    try std.testing.expectEqualStrings("public-0000", mapped.hits[0].id);
+    try std.testing.expectEqual(@as(?u32, 3999), mapped.hits[0].native_text_doc_id);
+    executor.project_doc_num = null;
+    var legacy = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer legacy.deinit();
+    try std.testing.expect(harness.identity_reads > 0);
+    try std.testing.expectEqual(mapped.total_hits, legacy.total_hits);
+    for (mapped.hits, legacy.hits) |lhs, rhs| {
+        try std.testing.expectEqualStrings(lhs.id, rhs.id);
+        try std.testing.expectEqual(lhs.score, rhs.score);
+    }
+    var next = req;
+    next.search_after = mapped.hits[mapped.hits.len - 1].sort_values;
+    executor.project_doc_num = Harness.ordinal;
+    var resumed = try searchTextQuery(a, next, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("public-0003", resumed.hits[0].id);
 }
 
 test "primary match_all stream retains ownership on consumer error (#1095)" {

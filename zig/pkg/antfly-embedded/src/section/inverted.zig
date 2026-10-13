@@ -9163,6 +9163,20 @@ pub const RangeInvertedIndexReader = struct {
         return stats;
     }
 
+    /// Small disjoint ranges needed to reopen this reader, excluding postings,
+    /// dictionary blocks and norms. Publishers may bundle them without changing
+    /// the section's native bytes or payload validation contract.
+    pub fn initialMetadataViews(self: *const RangeInvertedIndexReader) ![4]?@import("../segment_source.zig").View {
+        const View = @import("../segment_source.zig").View;
+        const dictionary = self.blocks_offset - term_dict_header_size;
+        return .{
+            try View.init(self.view.source, self.view.offset, v7_header_size),
+            try View.init(self.view.source, self.view.offset + dictionary, term_dict_header_size),
+            if (self.term_bloom) |filter| try View.init(self.view.source, self.view.offset + filter.bytes_offset - (bloom.magic.len + 13), bloom.magic.len + 13) else null,
+            if (self.norms_length != 0) try View.init(self.view.source, self.view.offset + self.norms_offset, 5) else null,
+        };
+    }
+
     pub fn docLength(self: *const RangeInvertedIndexReader, doc: u32) !u32 {
         if (doc >= self.norm_count or self.norms_length < 5) return 0;
         const count = self.norm_count;

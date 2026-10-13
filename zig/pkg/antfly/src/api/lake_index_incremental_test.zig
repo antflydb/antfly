@@ -141,9 +141,12 @@ test "external lake incremental native publication appends replaces removes and 
                 var stored = try std.json.parseFromSlice(std.json.Value, a, doc.data, .{});
                 defer stored.deinit();
                 if (std.mem.eql(u8, declaration.name, "body_text")) {
-                    try std.testing.expect(stored.value.object.contains("body"));
-                    try std.testing.expect(!stored.value.object.contains("dense"));
-                    try std.testing.expect(!stored.value.object.contains("sparse"));
+                    // Stored-source recipe v2 retains the complete declared
+                    // row even when only body contributes searchable text.
+                    try std.testing.expectEqual(@as(usize, 3), stored.value.object.count());
+                    const original = std.mem.eql(u8, stored.value.object.get("body").?.string, "needle");
+                    try std.testing.expectEqualStrings(if (original) "[1,0]" else "[0,1]", stored.value.object.get("dense").?.string);
+                    try std.testing.expectEqualStrings(if (original) "{\"1\":2}" else "{\"2\":3}", stored.value.object.get("sparse").?.string);
                 } else try std.testing.expectEqual(@as(usize, 0), stored.value.object.count());
                 var pooled = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer pooled.deinit();
