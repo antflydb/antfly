@@ -111,8 +111,8 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 ## Additional records
 
-- [Gemma4 media throughput](inference/history/gemma4/media-throughput-2026-10.md) — residency, image/audio embeddings, PDF painter and JPEG/WebP qualification; current contracts in [BATCHING.md](../../zig/pkg/inference/BATCHING.md#gpu-residency-for-media-embeddings).
-- [Gemma4 OCR throughput](inference/history/gemma4/ocr-throughput-2026-10.md) — rejected matrix/MTP trials, paragraph omission correction and canonical cohort gains; current [OCR design](inference/gemma4-ocr-optimization.md).
+- [Media and OCR optimization](inference/history/gemma4/media-optimization-2026-10.md) — final results, rejected trials and pinned detailed evidence; current [batching](../../zig/pkg/inference/BATCHING.md#gpu-residency-for-media-embeddings) and [OCR contracts](inference/gemma4-ocr-optimization.md).
+
 
 - [Apache Lite and inference licensing](../reference/licensing/history/apache2-lite-inference-2026-09.md) — implementation, review, packaging, and WASM validation.
 - [Laya qualification](inference/history/laya/qualification.md) — measured CPU/Metal accuracy and performance.

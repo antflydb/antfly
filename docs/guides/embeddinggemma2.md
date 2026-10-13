@@ -58,7 +58,7 @@ On qualified Metal/CUDA row-operation paths, image-only cohorts retain visual
 soft tokens, prompt embeddings and encoder activations on the backend through
 masked pooling. Only final vectors are downloaded. CPU codec decoding and
 model-exact resizing still precede upload; Native keeps the host execution path.
-The [real-PDF benchmark](../design/inference/gemma4-pdf-performance.md) compares
+The [real-PDF benchmark](../../zig/pkg/inference/BATCHING.md#gemma4-pdf-measurement-and-resident-embedding-handoff) compares
 host/resident handoffs and an experimental GPU painter with the exact CPU renderer.
 Production PDF rendering uses the CPU renderer.
 For example, post this body to `/ai/v1/embed`:

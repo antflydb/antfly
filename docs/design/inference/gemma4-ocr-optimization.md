@@ -4,8 +4,8 @@ Gemma4 OCR generates text from page images. Its decode costs and qualification
 are separate from image/audio **embedding** throughput. This document describes
 the current contracts and qualified local result. The dated experiments,
 rejected approaches and source-pinned reports are summarized in
-[OCR history](history/gemma4/ocr-throughput-2026-10.md); the
-[Apple comparison](gemma4-ocr-comparison.md) defines the original corpus.
+[media/OCR history](history/gemma4/media-optimization-2026-10.md) and the
+single [results report](media-throughput-results.json).
 
 ## Serving policy and output qualification
 
@@ -126,8 +126,8 @@ excluded. Across the recorded native-cohort conditions, 128 page observations
 and 79,222 completion tokens pass full output gates, including diagnostics.
 The final runtime passed 66 experiment-enabled checks, all 101 compiled checks
 at default flags, the optional sum-of-squares check and nine sweep tests.
-[Shared-batching evidence](gemma4-ocr-shared-batching.json) retains exact pins,
-flags, hashes, output gates, counters and excluded conditions.
+[Results](media-throughput-results.json) retain the final samples, pins, exact
+flags and gates; detailed diagnostics are preserved at the linked evidence snapshot.
 
 ## Speculative image OCR
 
@@ -207,9 +207,8 @@ RSS can double-count shared mappings. Neither is total nonoverlapping memory.
 
 ## Reproduction
 
-Use the model/corpus preparation and server budgets in the
-[comparison report](gemma4-ocr-comparison.md#reproduction). Build the ReleaseFast
-server with Zig 0.17, freeze the binary/checksum and source revision, then run
+Build the ReleaseFast server with Zig 0.17, freeze its binary/checksum and source
+revision, then run
 [`gemma4_ocr_sweep.py`](../../../zig/pkg/inference/tools/bench/gemma4_ocr_sweep.py).
 It starts fresh servers, clears inherited experiment flags, records source/binary
 pins and rejects incomplete outputs before ranking time per committed token.
@@ -224,6 +223,37 @@ requests may require `--http-max-body-mb 32` (run JSON `http_max_body_mb`): defa
 10 MiB, finite/overflow-checked, independently bounded by HTTP aggregate retention
 and model/KV admission. A connection reset before decode is not a GPU capacity
 measurement. Preserve complete outputs, not only token totals or `stop` status.
+
+### Corpus and Apple comparison
+
+Use the E2B Q4_0 GGUF target and matching Q8_0 projector. Render once with Poppler
+at 150 DPI, long edge <=1,536 pixels: Attention PDF pages 1/3/6, NIST SP800-220
+pages 5/6/9, and the 1907 Bureau of Standards report pages 8/12. The results JSON
+records all raster hashes; the pinned comparison report records PDF sources/hashes.
+Both engines consume the same pixels. OCR uses greedy transcription, thinking
+false and a 2,048-token cap; warm one page before two full Gemma passes. Apple
+uses `antfly_vision_read`, accurate recognition, language correction, `en-US`,
+two corpus warmups and three measurements. Apple excludes PNG/RGBA preparation;
+Gemma includes image preparation and HTTP. Word-multiset F1 against `pdftotext`
+is a noisy coverage proxy, not reading-order/table quality or annotated CER/WER.
+
+```sh
+cd zig/pkg/inference
+zig build bench-server build-pdf-ocr-comparison -Doptimize=ReleaseFast
+zig-out/bin/antfly-inference-bench-server run --port 18097 \
+  --models-dir MODEL_ROOT --max-concurrent-requests 512 \
+  --host-budget-mb 8192 --backend-budget-mb 16384 --combined-budget-mb 24576 \
+  --scratch-budget-mb 4096 --kv-budget-mb 8192 \
+  --preload-model generator:metal:MODEL
+```
+
+Supply the corpus/model/reference to `tools/bench/gemma4_ocr_sweep.py`; its
+`--cases ordinary cohort4w8pool cohort4w8head ordinary` reproduces the bracketed
+configuration. Corpus JSON has `pages` entries with `path`, `document`, one-based
+`page`. `antfly-pdf-ocr-comparison --corpus CORPUS --recognition accurate
+--batch 1 --warmups 2 --iterations 3 --output /tmp/apple.json` measures Apple.
+`tools/bench/pdf_ocr.py` and `pdf_ocr_report.py` retain transcripts/token counts and
+quality proxies; raw outputs stay under ignored `.benchmark-results/`.
 
 ## Remaining work
 
