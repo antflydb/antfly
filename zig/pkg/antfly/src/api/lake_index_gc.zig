@@ -345,7 +345,10 @@ pub const Collector = struct {
                             try progress.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = false } } });
                         } else {
                             try self.markPages(a, root.domain, files, false);
-                            const records = try @import("lake_index_native_text.zig").checkpointDeltaFiles(a, a, root, self.store, self.cancellation());
+                            var directory = root;
+                            directory.directories = .{ .files = files };
+                            directory.file_count = root.checkpoint_file_count;
+                            const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, directory, self.store, null, self.cancellation(), &self.remaining_reads);
                             for (records) |record| try self.markTextManifestMode(a, record.manifest, root.seekable, false);
                         }
                     }

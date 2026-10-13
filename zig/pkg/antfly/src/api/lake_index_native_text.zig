@@ -582,6 +582,24 @@ fn loadRootView(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     const bounded = budget.allocator();
     var root = try loadRootDirectory(bounded, store, ref, cancellation, cache);
     if (serving) root = try servingRoot(bounded, store, root, cancellation, cache);
+    // Explicit materializing maintenance callers retain the legacy plain-view
+    // contract. Build/GC paths use loadRootDirectory and keep checkpoint pages.
+    if (root.checkpoint_files != null or root.checkpoint_removed_files != null) {
+        const records = try checkpointDeltaFiles(bounded, bounded, root, store, cancellation);
+        const refs = try bounded.alloc(artifacts.ChunkRef, records.len);
+        for (records, refs) |record, *manifest| manifest.* = record.manifest;
+        root.manifests = refs;
+        if (root.checkpoint_removed_files != null) {
+            const removed = try checkpointRecords(bounded, root, root.checkpoint_removed_files, root.checkpoint_removed_count, store, cancellation);
+            const ids = try bounded.alloc([]const u8, removed.len);
+            for (removed, ids) |record, *id| id.* = record.file.id;
+            root.checkpoint_removed = ids;
+        }
+        root.checkpoint_files = null;
+        root.checkpoint_file_count = 0;
+        root.checkpoint_removed_files = null;
+        root.checkpoint_removed_count = 0;
+    }
     root = try text_directory.withManifests(bounded, root, store, cache, cancellation);
     if (root.manifests.len != 0) {
         var groups: std.ArrayList(FileGroup) = .empty;

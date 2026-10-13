@@ -796,7 +796,7 @@ const Execution = struct {
         defer input.deinit();
         for (hits, winners, 0..) |hit, *winner, index| {
             try self.context.ensureActive();
-            _ = input.reset(.free_all);
+            _ = input.reset(.retain_capacity);
             const ia = input.allocator();
             const key = try publicKey(self, ia, hit.id);
             const position = try @import("lake_index_native_state.zig").coordinates(key);
@@ -822,7 +822,7 @@ const Execution = struct {
             if (segment_index == pin.snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
             const segment = try pin.snapshot.readSegment(segment_index);
             const doc = (try cursor.get(&segment.reader, winner.ordinal - lower)) orelse return error.InvalidNativeLakeTextCorpus;
-            _ = input.reset(.free_all);
+            _ = input.reset(.retain_capacity);
             try self.attachStoredSnippet(a, input.allocator(), req, hits[winner.index .. winner.index + 1], doc);
         }
     }
@@ -856,7 +856,7 @@ const Execution = struct {
             try self.context.ensureActive();
             var end = begin + 1;
             while (end < winners.len and std.mem.eql(u8, &winners[begin].location.segment, &winners[end].location.segment)) : (end += 1) {}
-            _ = reader_arena.reset(.free_all);
+            _ = reader_arena.reset(.retain_capacity);
             const sa = reader_arena.allocator();
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = sa, .result_allocator = sa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .forced_selection = &.{winners[begin].location.segment} };
             defer child.deinit();
@@ -868,7 +868,7 @@ const Execution = struct {
             defer cursor.deinit();
             for (winners[begin..end]) |winner| {
                 try self.context.ensureActive();
-                _ = input.reset(.free_all);
+                _ = input.reset(.retain_capacity);
                 const ia = input.allocator();
                 const page = hits[winner.index .. winner.index + 1];
                 const doc = (try cursor.get(&segment.reader, winner.location.document)) orelse return error.InvalidNativeLakeTextCorpus;

@@ -3621,7 +3621,9 @@ Reader protocol 40 fences workers before publication of paged build checkpoints.
 Completed file deltas and removed baseline identities live in authenticated COW
 file trees; checkpoint roots contain only tree references/counts, the published
 baseline reference and bounded signed DF runs. Legacy inline checkpoints remain
-recoverable. New builds save their first completed file immediately, then batch
+recoverable. Explicit materializing maintenance loaders expand paged checkpoints
+into their existing plain manifest/group view; build recovery and GC keep the
+paged representation and charge tree reads to their operation budget. New builds save their first completed file immediately, then batch
 up to 64 completed files or five seconds at file boundaries. A checkpoint saves
 its inventory and DF cut together. A crash can replay the unsaved tail; queries
 continue to use the previous complete publication. Removing a file from an
