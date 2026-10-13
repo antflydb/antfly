@@ -4141,6 +4141,22 @@ pub const Set = struct {
         try nulls.bindAdmission(execution.bytes);
         try nulls.import(json_null_fields);
         try self.readValues(execution, document, values, present, false, &roots, &nulls);
+        // Logical transport may spell NUMERIC(p,s) with an equivalent scale.
+        // First reject any coefficient changed by assignment, then normalize
+        // only this unpublished typed shadow to the declared domain. The
+        // document is unchanged; generated expressions are never repaired.
+        // Physical verifyRow has no such allowance: its caller admitted the
+        // exact canonical bytes already, including typmod display metadata.
+        for (self.modifier_ordinals) |ordinal| {
+            if (!present[ordinal] or values[ordinal] == .null) continue;
+            const modifier = self.table.relational_columns[ordinal].numeric_modifier.?;
+            if (values[ordinal] == .sql_array) {
+                _ = try normalizeNumericArrayBinding(execution, values[ordinal], modifier, true);
+            } else if (values[ordinal] == .numeric) {
+                _ = try normalizeNumericBinding(execution, values[ordinal].numeric, modifier, true);
+            } else return error.InvalidRelationalGeneratedValue;
+            values[ordinal] = try self.normalizeBinding(execution, ordinal, values[ordinal]);
+        }
         try self.verifyValues(execution, values, present);
     }
 
@@ -4221,12 +4237,7 @@ pub const Set = struct {
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
             const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
             const actual = values[binding.ordinal];
-            const equal = if (std.meta.activeTag(expected) != std.meta.activeTag(actual))
-                false
-            else if (expected == .null)
-                true
-            else
-                (compareValues(execution, expected, actual, false) catch |err| return executionFailure(err)) == .eq;
+            const equal = generatedDisplayEqual(execution, expected, actual) catch |err| return executionFailure(err);
             if (!equal) return error.InvalidRelationalGeneratedValue;
         }
     }
@@ -4286,6 +4297,216 @@ pub const Set = struct {
         }
     }
 };
+
+/// Generated restore results retain observable display, not only SQL equality.
+/// Encoded NUMERIC/arrays are authenticated canonical values in one active
+/// codec; comparing their display metadata never changes semantic row hashes.
+fn generatedDisplayEqual(execution: *Execution, expected: Value, actual: Value) !bool {
+    if (std.meta.activeTag(expected) != std.meta.activeTag(actual)) return false;
+    if (expected == .null) return true;
+    if (expected == .json) {
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        return @import("../sql/json_order.zig").sameDisplay(expected.json.value, actual.json.value, &work, 0);
+    }
+    if (expected == .numeric) {
+        // Validate once, retaining the same borrowed views for value and scale.
+        const left = try binary.layout.View.openWithBudget(expected.numeric, .{}, &execution.numeric);
+        const right = try binary.layout.View.openWithBudget(actual.numeric, .{}, &execution.numeric);
+        return left.scale == right.scale and try left.order(right, &execution.numeric) == .eq;
+    }
+    if (expected == .sql_array) {
+        if (expected.sql_array.element_type != actual.sql_array.element_type) return false;
+        // Value.Array is a pinned canonical-codec capability, not producer
+        // input. verifyRow's caller already checked canonicality/checksums;
+        // parsed envelopes enter through the canonical owning encoder.
+        // Exact bytes retain every observable scale/zero bit without decoding
+        // JSONB cells again. This is not a storage-format migration identity.
+        _ = try expected.sql_array.view();
+        _ = try actual.sql_array.view();
+        return try orderBytes(expected.sql_array.bytes, actual.sql_array.bytes, false, &execution.numeric) == .eq;
+    }
+    if (try compareValues(execution, expected, actual, false) != .eq) return false;
+    return switch (expected) {
+        .number => |number| if (number == 0) std.math.signbit(number) == std.math.signbit(actual.number) else true,
+        else => true,
+    };
+}
+
+test "relational index system generated restore rejects display forgeries with unchanged SQL equality" {
+    const a = std.testing.allocator;
+    const Helper = struct {
+        fn cell(alloc: Allocator, ordinal: u32, column: schema.RelationalColumn, value: Value) !codec.Cell {
+            var result: codec.Cell = .{ .ordinal = ordinal, .path = column.path, .value_type = .bytes_val, .value = .{ .bytes_val = &.{} } };
+            switch (value) {
+                .json => |json| {
+                    var work: @import("../sql/json_order.zig").Budget = .{};
+                    result.is_json = true;
+                    result.value.bytes_val = try @import("../sql/jsonb_text.zig").format(alloc, json.value, max_output_bytes, &work);
+                },
+                .numeric => |bytes| {
+                    result.is_numeric = true;
+                    result.value.bytes_val = bytes;
+                },
+                .sql_array => |array| {
+                    result.sql_array_element_type = array.element_type;
+                    result.value.bytes_val = array.bytes;
+                },
+                .number => |number| {
+                    result.value_type = .f64_val;
+                    result.value = .{ .f64_val = number };
+                },
+                else => return error.UnexpectedDisplayFixture,
+            }
+            return result;
+        }
+        fn check(alloc: Allocator, expected: Value, forged: Value) !void {
+            const kind = std.meta.stringToEnum(Kind, @tagName(std.meta.activeTag(expected))) orelse return error.UnexpectedDisplayFixture;
+            const element: ?Numeric = switch (expected) {
+                .numeric => .numeric,
+                .number => .float64,
+                .sql_array => |array| array.element_type,
+                else => null,
+            };
+            const columns = [_]schema.RelationalColumn{
+                .{ .name = "source", .path = "source", .column_type = kind, .is_json = kind == .json, .json_kind = if (kind == .json) .any else .none, .sql_element_type = element },
+                .{ .name = "target", .path = "target", .column_type = kind, .is_json = kind == .json, .json_kind = if (kind == .json) .any else .none, .sql_element_type = element },
+            };
+            const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = kind == .json, .requires_jsonb_display = kind == .json, .requires_exact_numeric_expressions = kind == .numeric, .requires_exact_numeric_validation = kind == .numeric, .requires_array_expressions = kind == .sql_array, .requires_jsonb_array_display = kind == .sql_array and element == .jsonb, .relational_columns = &columns };
+            const bytes = try schema.serializeSchema(alloc, table);
+            defer alloc.free(bytes);
+            const owned = try schema.deserializeSchema(alloc, bytes);
+            const definition = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"column\":\"target\",\"expression\":{\"op\":\"column\",\"column\":\"source\"}}]", .{});
+            defer definition.deinit();
+            const set = Set.createOwned(alloc, owned, .null, definition.value) catch |err| {
+                schema.freeSchema(alloc, owned);
+                return err;
+            };
+            defer set.deinit();
+            var region: std.heap.ArenaAllocator = .init(alloc);
+            defer region.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &remaining);
+            try std.testing.expectEqual(std.math.Order.eq, try compareValues(&execution, expected, forged, false));
+            try std.testing.expect(!try generatedDisplayEqual(&execution, expected, forged));
+            const present = [_]bool{ true, true };
+            try set.verifyValues(&execution, &.{ expected, expected }, &present);
+            try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyValues(&execution, &.{ expected, forged }, &present));
+            var layout = try codec.PhysicalLayout.init(alloc, set.table);
+            defer layout.deinit();
+            for ([_]bool{ false, true }) |tampered| {
+                const cells = [_]codec.Cell{
+                    try cell(region.allocator(), 0, set.table.relational_columns[0], expected),
+                    try cell(region.allocator(), 1, set.table.relational_columns[1], if (tampered) forged else expected),
+                };
+                const row_bytes = try codec.serializePreparedOrdinalDeferredHash(region.allocator(), 1, set.table.relational_columns, &cells, &layout);
+                try codec.finalizeOrdinalMetadata(row_bytes, @splat(0), 0);
+                const row = try codec.ordinalRowView(row_bytes, set.table, &layout);
+                if (tampered) try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRow(region.allocator(), row)) else try set.verifyRow(region.allocator(), row);
+            }
+        }
+    };
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const alloc = region.allocator();
+    var parsing: @import("../sql/json_order.zig").Budget = .{};
+    const left_json: @import("../sql/row_value.zig").Json = .{ .value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, "{\"n\":1.20}", &parsing) };
+    const right_json: @import("../sql/row_value.zig").Json = .{ .value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, "{\"n\":1.2}", &parsing) };
+    try Helper.check(a, .{ .json = &left_json }, .{ .json = &right_json });
+    var numeric_context: exact.Context = .{ .alloc = alloc };
+    var left_number = try exact.parse(&numeric_context, "1.20");
+    defer left_number.deinit();
+    var right_number = try exact.parse(&numeric_context, "1.2");
+    defer right_number.deinit();
+    const left_bytes = try binary.encodeAlloc(&numeric_context, left_number.value);
+    const right_bytes = try binary.encodeAlloc(&numeric_context, right_number.value);
+    try Helper.check(a, .{ .numeric = left_bytes }, .{ .numeric = right_bytes });
+    try Helper.check(a, .{ .number = -0.0 }, .{ .number = 0.0 });
+    const arrays = @import("../sql/array_value.zig");
+    for ([_]Numeric{ .jsonb, .numeric, .float64 }) |element| {
+        const left_cell: arrays.Element = switch (element) {
+            .jsonb => arrays.Element.json(.{ .number_string = "1.20" }),
+            .numeric => arrays.Element.typedNumeric(&left_number.value),
+            else => arrays.Element.json(.{ .float = -0.0 }),
+        };
+        const right_cell: arrays.Element = switch (element) {
+            .jsonb => arrays.Element.json(.{ .number_string = "1.2" }),
+            .numeric => arrays.Element.typedNumeric(&right_number.value),
+            else => arrays.Element.json(.{ .float = 0.0 }),
+        };
+        const left_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ left_cell, .{} }, .{}), .{});
+        const right_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ right_cell, .{} }, .{}), .{});
+        try Helper.check(a, .{ .sql_array = .{ .element_type = element, .bytes = left_array } }, .{ .sql_array = .{ .element_type = element, .bytes = right_array } });
+    }
+}
+
+test "relational index system generated logical restore normalizes typmod display aliases without repairing values" {
+    const a = std.testing.allocator;
+    for ([_]Kind{ .numeric, .sql_array }) |kind| {
+        const columns = [_]schema.RelationalColumn{
+            .{ .name = "source", .path = "source", .column_type = kind, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+            .{ .name = "target", .path = "target", .column_type = kind, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        };
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = kind == .numeric, .requires_exact_numeric_validation = kind == .numeric, .requires_array_expressions = kind == .sql_array, .requires_numeric_modifiers = true, .relational_columns = &columns };
+        const bytes = try schema.serializeSchema(a, table);
+        defer a.free(bytes);
+        const owned = try schema.deserializeSchema(a, bytes);
+        const definition = try std.json.parseFromSlice(std.json.Value, a, "[{\"column\":\"target\",\"expression\":{\"op\":\"column\",\"column\":\"source\"}}]", .{});
+        defer definition.deinit();
+        const set = Set.createOwned(a, owned, .null, definition.value) catch |err| {
+            schema.freeSchema(a, owned);
+            return err;
+        };
+        defer set.deinit();
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const input = if (kind == .numeric) "{\"source\":1.2,\"target\":1.2}" else "{\"source\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-2}],\"values\":[\"1.2\"],\"sql_nulls\":[false]},\"target\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-2}],\"values\":[\"1.2\"],\"sql_nulls\":[false]}}";
+        const document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), input, .{ .parse_numbers = false });
+        const source = if (kind == .numeric) document.object.getPtr("source").? else &document.object.getPtr("source").?.object.getPtr("values").?.array.items[0];
+        const target = if (kind == .numeric) document.object.getPtr("target").? else &document.object.getPtr("target").?.object.getPtr("values").?.array.items[0];
+        try set.verifyJson(region.allocator(), document);
+        try std.testing.expectEqualStrings("1.2", if (kind == .numeric) source.number_string else source.string);
+        try std.testing.expectEqualStrings("1.2", if (kind == .numeric) target.number_string else target.string);
+        target.* = if (kind == .numeric) .{ .number_string = "1.3" } else .{ .string = "1.3" };
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyJson(region.allocator(), document));
+        source.* = if (kind == .numeric) .{ .number_string = "1.234" } else .{ .string = "1.234" };
+        target.* = source.*;
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyJson(region.allocator(), document));
+    }
+}
+
+test "relational index system generated array display verification streams authenticated bytes without allocations" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"n\":1.20,\"a\":[null,true]}", .{ .parse_numbers = false });
+    const cells = try region.allocator().alloc(arrays.Element, 1000);
+    @memset(cells, arrays.Element.json(json));
+    const encoded = try @import("../sql/array_storage.zig").encodeAlloc(region.allocator(), try arrays.Value.init(.jsonb, &.{.{ .length = 1000 }}, cells, .{}), .{});
+    const value: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = encoded } };
+    const independent = try region.allocator().dupe(u8, encoded);
+    const other: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = independent } };
+    try std.testing.expect(encoded.ptr != independent.ptr);
+    var old_bytes: usize = max_allocated_bytes;
+    var old = Execution.init(a, &old_bytes);
+    const old_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..8) |_| try std.testing.expectEqual(std.math.Order.eq, try compareValues(&old, value, other, false));
+    const old_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - old_start;
+    var new_bytes: usize = max_allocated_bytes;
+    var current = Execution.init(.failing, &new_bytes);
+    const new_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..8) |_| try std.testing.expect(try generatedDisplayEqual(&current, value, other));
+    const new_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - new_start;
+    try std.testing.expectEqual(max_allocated_bytes, new_bytes);
+    std.debug.print("generated JSONB array verification: cells=1000 iterations=8 bytes={d} old_logical_ns={d} display_ns={d} display_allocations=0\n", .{ encoded.len, old_ns, new_ns });
+    const cost = 8 * 1024 * 1024 - current.numeric.remaining;
+    current.numeric.remaining = cost / 8;
+    try std.testing.expect(try generatedDisplayEqual(&current, value, other));
+    try std.testing.expectEqual(@as(u64, 0), current.numeric.remaining);
+    current.numeric.remaining = cost / 8 - 1;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, generatedDisplayEqual(&current, value, other));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, generatedDisplayEqual(&current, value, other));
+}
 
 fn valuesEqual(a: Value, b: Value) !bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;

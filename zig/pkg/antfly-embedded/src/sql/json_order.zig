@@ -701,6 +701,131 @@ fn tokenHash(text: []const u8, budget: *Budget) !u64 {
     return normalized.hash();
 }
 
+/// Observable JSONB display equality for durable generated-result verification.
+/// SQL comparison/hash intentionally ignore numeric display scale; this does
+/// not. Inputs are admitted typed JSONB. No output rendering, exponent
+/// expansion, sort vectors or heap allocation are needed.
+pub fn sameDisplay(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!bool {
+    try budget.consume(1);
+    if (depth > 64) return if (budget.shared) |owner| owner.limit() else error.SqlProgramLimitExceeded;
+    if (rank(a) != rank(b)) return false;
+    if (rank(a) == 2) {
+        var left: [768]u8 = undefined;
+        var right: [768]u8 = undefined;
+        if (Decimal.compare(try decimal(a, &left, budget), try decimal(b, &right, budget)) != .eq) return false;
+        return try displayScale(a, budget) == try displayScale(b, budget);
+    }
+    return switch (a) {
+        .null => true,
+        .bool => a.bool == b.bool,
+        .string => try budget.orderBytes(a.string, b.string) == .eq,
+        .array => equal: {
+            if (a.array.items.len != b.array.items.len) break :equal false;
+            for (a.array.items, b.array.items) |x, y| if (!try sameDisplay(x, y, budget, depth + 1)) break :equal false;
+            break :equal true;
+        },
+        .object => equal: {
+            if (a.object.count() != b.object.count()) break :equal false;
+            for (a.object.keys(), a.object.values()) |key, value| {
+                try budget.consume(key.len + 1);
+                const other = b.object.get(key) orelse break :equal false;
+                if (!try sameDisplay(value, other, budget, depth + 1)) break :equal false;
+            }
+            break :equal true;
+        },
+        else => unreachable,
+    };
+}
+
+fn displayScale(value: Json, work: *Budget) !u16 {
+    return switch (value) {
+        .integer => 0,
+        .number_string => |raw| (try @import("jsonb_number.zig").Layout.init(raw, work)).scale,
+        .float => |number| scale: {
+            const parts = @import("../common/json_float_decimal.zig").Parts.init(number) catch return error.SqlNumericOutOfRange;
+            break :scale @intCast(-parts.decimalExponent());
+        },
+        else => error.SqlTypeMismatch,
+    };
+}
+
+test "SQL JSONB display equality matches PostgreSQL without changing logical hashes" {
+    const a = std.testing.allocator;
+    const Fixture = struct { entries: []const struct { left: []const u8, right: []const u8, logical_equal: bool, display_equal: bool } };
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/sql_jsonb_display_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 19), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var parse: Budget = .{};
+        const left = try parseTextLeaky(region.allocator(), entry.left, &parse);
+        const right = try parseTextLeaky(region.allocator(), entry.right, &parse);
+        var work: Budget = .{};
+        try std.testing.expectEqual(entry.logical_equal, try compare(left, right, &work, 0) == .eq);
+        try std.testing.expectEqual(entry.display_equal, try sameDisplay(left, right, &work, 0));
+        if (entry.logical_equal) try std.testing.expectEqual(try hash(left, &work, 0), try hash(right, &work, 0));
+    }
+    var work: Budget = .{ .remaining = 512 };
+    try std.testing.expect(try sameDisplay(.{ .number_string = "1e131071" }, .{ .number_string = "10e131070" }, &work, 0));
+    try std.testing.expect(512 - work.remaining < 128);
+    for ([_]struct { left: Json, right: Json, expected: bool }{
+        .{ .left = .{ .float = 0.125 }, .right = .{ .number_string = "0.1250" }, .expected = false },
+        .{ .left = .{ .float = 2.5 }, .right = .{ .number_string = "25e-1" }, .expected = true },
+        .{ .left = .{ .float = -0.0 }, .right = .{ .integer = 0 }, .expected = true },
+        .{ .left = .{ .float = 0.1 }, .right = .{ .number_string = "0.1" }, .expected = false },
+    }) |entry| {
+        work = .{};
+        try std.testing.expectEqual(entry.expected, try sameDisplay(entry.left, entry.right, &work, 0));
+    }
+}
+
+test "SQL JSONB display equality retains exact shared quota and every cancellation cut" {
+    const Context = @import("numeric_value.zig").Context;
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(ptr: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const key: [512]u8 = @splat('k');
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    var cells: [64]Json = @splat(.{ .number_string = "1.20" });
+    const array = std.json.Array.fromOwnedSlice(std.mem.Allocator.failing, &cells);
+    // The stack vector is borrowed for this immutable kernel fixture.
+    try object.put(std.testing.allocator, &key, .{ .array = array });
+    const value: Json = .{ .object = object };
+    var observed: Control = .{};
+    var parent: Context = .{ .alloc = .failing, .checkpoint = Control.check, .ptr = &observed };
+    var child: Context = .{ .alloc = .failing, .parent = &parent };
+    var work: Budget = .{ .shared = &child };
+    try std.testing.expect(try sameDisplay(value, value, &work, 0));
+    const cost = 8 * 1024 * 1024 - parent.remaining;
+    try std.testing.expectEqual(parent.remaining, child.remaining);
+    var exact: Context = .{ .alloc = .failing, .remaining = cost };
+    work = .{ .remaining = @intCast(cost), .shared = &exact };
+    try std.testing.expect(try sameDisplay(value, value, &work, 0));
+    try std.testing.expectEqual(@as(u64, 0), exact.remaining);
+    var short: Context = .{ .alloc = .failing, .remaining = cost - 1 };
+    work = .{ .shared = &short };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, sameDisplay(value, value, &work, 0));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, sameDisplay(.null, .{ .bool = true }, &work, 0));
+    try std.testing.expect(observed.polls > 1);
+    for (1..observed.polls + 1) |cut| {
+        var control: Control = .{ .fail_at = cut };
+        var canceled: Context = .{ .alloc = .failing, .checkpoint = Control.check, .ptr = &control };
+        work = .{ .shared = &canceled };
+        try std.testing.expectError(error.QueryCanceled, sameDisplay(value, value, &work, 0));
+        const remaining = canceled.remaining;
+        try std.testing.expectError(error.QueryCanceled, sameDisplay(.null, .{ .bool = true }, &work, 0));
+        try std.testing.expectEqual(remaining, canceled.remaining);
+    }
+}
+
 pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     try budget.consume(1);

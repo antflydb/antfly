@@ -3487,6 +3487,64 @@ barriers before persisted/public type activation. No original case receives
 credit until its unchanged query passes public execution. Counts remain
 479 implemented / 136 rejected / 73 superseded / 898 unresolved.
 
+### Observable generated-result verification without rendering
+
+Generated restore verification now distinguishes observable display from SQL
+logical equality. JSONB equality uses a bounded structural walk plus numeric
+display scale: equivalent spellings such as 1.20 and 120e-2 match, while 1.20
+and 1.2 do not. Object key ordering and JSON escapes do not create false
+differences. No canonical output string, exponent expansion, sort vector or
+heap allocation is required. Query comparison and semantic hashing are unchanged.
+
+NUMERIC retains borrowed canonical views for both value and scale comparison,
+validating each operand once. Scalar floating zero retains its sign. Arrays
+use chunked exact-byte equality within the active canonical codec, preserving
+scale, zero bits, dimensions and SQL NULL/JSON null distinctions without
+decoding JSONB elements again.
+
+The array fast path has an explicit authority boundary: Value.Array admits only
+codec-validated pinned bytes; verifyRow's caller has already verified physical
+canonicality/checksums, and parsed logical envelopes pass through the owning
+canonical encoder. This verifier grants no producer admission and is not a
+cross-format migration identity. Strict producer/restore byte validation was
+not relaxed.
+
+Logical restore keeps declared-domain coercion semantics. Equivalent display
+aliases for NUMERIC(p,s), including NUMERIC arrays, are first checked for any
+coefficient change and then normalized only in an unpublished typed shadow.
+Generated verification uses that domain-normalized input. The supplied document
+is unchanged, defaults are not filled, generated expressions are not repaired,
+and coefficient changes are rejected. Cold physical verification has no such
+transport-alias allowance.
+
+An independent PostgreSQL 18.6 fixture covers 19 JSONB logical/display pairs;
+another oracle test checks NUMERIC scale and floating signed zero. Debug tests
+preserve logical hashes, exercise every observed cancellation cut and exact
+parent/local quota, and compare a huge positive exponent under 128 work units
+without rendering its 131,072-character display. Six native forgery classes
+(JSONB, NUMERIC, floating zero and their array forms) remain SQL-equal yet fail
+generated verification in both typed values and canonical cold rows. Valid
+counterparts continue to pass.
+
+A distinct-buffer Debug operator sample compared 1,000 JSONB cells over eight
+iterations: the previous logical-check path took 49.3 ms versus 0.475 ms for
+display-aware canonical verification, with zero verifier allocations. Both
+operands occupy independent 30,145-byte buffers. This measures the verified
+canonical-array boundary, not arbitrary producer bytes or production restore
+throughput.
+
+Final production Debug qualification passed 1,043 SQL tests (three existing
+skips), 111 protocol tests and 113 transaction tests. The final native rerun
+passed all 257 tests, including both scalar and array NUMERIC transport aliases,
+without failures or leaks. Two independent PostgreSQL oracle tests passed.
+Formatting, control-catalog freshness, the 2,048-file Apache boundary/license
+headers and original inventory integrity passed.
+
+Public JSON schema/SDK activation, typed projected consumers, reader/capability
+barriers and distributed activation qualification remain open. Original
+accounting remains 479 implemented / 136 rejected / 73 superseded / 898 unresolved;
+these component proofs do not establish the public original SQL cases.
+
 The shared temporal text boundary now provides allocation-free canonical
 ISO/YMD output (UTC for timestamptz) and postgres-style interval output, plus
 strict canonical decoding for all six domains. Gregorian conversion spans the
