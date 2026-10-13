@@ -2719,7 +2719,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             state.ordinal += 1;
         }
         if (state.ordinal == state.object_count) state.phase = .layouts;
-        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{});
+        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{}, null);
         try writes.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
         try cancellation.check();
         try validateAndImportDocumentEntries(alloc, store, selected, &archive, writes.items);
@@ -6517,11 +6517,14 @@ test "export and import preserves doc identity metadata" {
         &initial_identity,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try src.putBatch(initial_identity.items, &.{});
 
     var tombstone_identity = std.ArrayListUnmanaged(KVPair).empty;
     defer freeAllocatedKVPairs(alloc, &tombstone_identity);
+    var live_deletes_tombstone_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         &src,
@@ -6531,8 +6534,9 @@ test "export and import preserves doc identity metadata" {
         &tombstone_identity,
         &.{},
         &.{"doc:b"},
+        &live_deletes_tombstone_identity,
     );
-    try src.putBatch(tombstone_identity.items, &.{});
+    try src.putBatch(tombstone_identity.items, live_deletes_tombstone_identity.items);
 
     var out: ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -6640,6 +6644,7 @@ test "import rejects doc identity metadata with invalid canonical ids" {
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
@@ -6687,6 +6692,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
