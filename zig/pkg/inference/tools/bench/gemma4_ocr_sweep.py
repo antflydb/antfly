@@ -65,7 +65,7 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(
-        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant)?",
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace|stable|invariant|invariantprofile|share|fused|reuse|optimized|optimizedprofile)?",
         case,
     )
     if cohort or case in {
@@ -93,11 +93,29 @@ def flags_for(case):
         flags["ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC"] = (
             "0" if variant == "stable" else "1"
         )
-        if variant == "invariant":
+        if variant in {
+            "invariant",
+            "invariantprofile",
+            "share",
+            "fused",
+            "reuse",
+            "optimized",
+            "optimizedprofile",
+        }:
             flags["TERMITE_METAL_Q4_0_BATCH_INVARIANT"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
+        if variant in {"invariantprofile", "optimizedprofile"}:
+            flags["TERMITE_METAL_STAGE_TIMING"] = "1"
+            flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"] = "0"
+        if variant in {"share", "fused", "reuse", "optimized", "optimizedprofile"}:
+            flags["TERMITE_METAL_Q4_0_BATCH_SHARED"] = "1"
+        if variant in {"fused", "reuse", "optimized", "optimizedprofile"}:
+            flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"] = "1"
+            flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"] = "1"
+        if variant in {"reuse", "optimized", "optimizedprofile"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"] = "1"
         if variant in {"qkv", "canonical", "strict", "qkvtrace"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
         if variant in {"ple", "canonical", "reduceall", "strict"}:
@@ -228,6 +246,8 @@ def profile(log):
         ("mtp_phase_profile:", "draft_steps"),
         ("mtp_draft_profile:", "resident_steps"),
         ("metal_ocr_matrix_frame:", "rows"),
+        ("metal_ocr_gpu_stages:", "frames"),
+        ("metal_ocr_cohort_overhead:", "rows"),
     ]:
         rows = []
         for line in log.splitlines():
@@ -387,7 +407,7 @@ def run(args):
             "server_flags": flags,
             "server_command": command,
             "diagnostic": case in {"differential", "stepdiff"}
-            or case.endswith("trace")
+            or case.endswith(("trace", "profile"))
             or args.memory_probe is not None,
             "directory": directory.name,
         }

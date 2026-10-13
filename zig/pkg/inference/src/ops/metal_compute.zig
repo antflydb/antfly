@@ -739,6 +739,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     var host_materialize_trace_count: usize = 0;
     var boundary_scope_serial = std.atomic.Value(u64).init(0);
 
+    const OcrCarrierKind = enum { query, key, value, norm, head, attention_output, ffn_output, ple_output, ple_layer, hidden_front, hidden_back, ple_vectors };
+
     const Buf = struct {
         data: []f32,
         allocator: std.mem.Allocator,
@@ -1150,6 +1152,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     layer_output_scale_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     unit_rms_weight_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     adjusted_norm_weight_device_cache: std.AutoHashMapUnmanaged(AdjustedNormWeightKey, MetalTensor) = .empty,
+    ocr_carriers: [@typeInfo(OcrCarrierKind).@"enum".field_names.len]?MetalTensor = @splat(null),
+    ocr_carrier_allocations: usize = 0,
+    ocr_carrier_reuses: usize = 0,
+    ocr_last_stage_samples: u64 = 0,
     mtp_ordering_device_cache: ?MetalTensor = null,
     mtp_ordering_weight_name: ?[]u8 = null,
     attention_mask_device_cache: ?MetalTensor = null,
@@ -4519,6 +4525,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
         self.cyclic_page_table_cache.deinit(self.allocator);
+        for (&self.ocr_carriers) |*entry| if (entry.*) |*tensor| tensor.deinit();
         if (self.mtp_ordering_device_cache) |*tensor| tensor.deinit();
         if (self.mtp_ordering_weight_name) |name| self.allocator.free(name);
         if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
@@ -21280,6 +21287,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             attention_linear_input = attention_linear_input_owned.?;
             try self.maybeDumpDecodeStageTensor("attn-pre", attention_layer_index, attention_linear_input, attention_input_size);
         }
+        var attention_output_ct: ?CT = null;
+        defer if (attention_output_ct) |ct| freeOp(self, ct);
+        var ffn_output_ct: ?CT = null;
+        defer if (ffn_output_ct) |ct| freeOp(self, ct);
+        const reuse = request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and
+            getenvBool("ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS");
+        if (reuse) {
+            const shape = [_]i32{ attn_out.dim(0), @intCast(request.hidden_size) };
+            attention_output_ct = try self.ocrCarrier(self, .attention_output, &shape);
+            ffn_output_ct = try self.ocrCarrier(self, .ffn_output, &shape);
+        }
         var canonical_attention_residual: ?MetalTensor = null;
         defer if (canonical_attention_residual) |*tensor| tensor.deinit();
         if (request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and
@@ -21289,6 +21307,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             canonical_attention_residual = try metal_runtime.decoderRuntimeApplyCanonicalQ4LinearRmsAdd(self.provider_impl, .{
                 .input = attention_linear_input,
                 .residual = residual_mt,
+                .output = if (attention_output_ct) |ct| try self.borrowedMetalTensorFromCt(ct) else @as(?MetalTensor, null),
                 .linear_slot = request.attention_linear_slot,
                 .norm_slot = request.attention_post_linear_rms_norm_slot.?,
                 .rows = @as(usize, @intCast(attention_linear_input.dim(0))),
@@ -21388,6 +21407,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer ffn_normed.deinit();
 
         if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
+            .output = if (ffn_output_ct) |ct| try self.borrowedMetalTensorFromCt(ct) else @as(?MetalTensor, null),
             .gate_linear_slot = request.gate_ffn_linear_slot,
             .up_linear_slot = request.up_ffn_linear_slot,
             .down_linear_slot = request.down_ffn_linear_slot,
@@ -26610,10 +26630,51 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    // Each semantic carrier is reused only after its prior consumers have
+    // been encoded. Encoder/blit range tracking orders GPU reuse; retained
+    // views keep a superseded allocation alive if the model's width grows.
+    fn ocrCarrier(self: *MetalCompute, ctx: *anyopaque, kind: OcrCarrierKind, shape: []const i32) !CT {
+        if (!getenvBool("ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS") or
+            getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL") or getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP"))
+            return (try allocUninitF32ShapeOp(ctx, shape)) orelse error.NativeBatchedDecodeUnavailable;
+        return self.ocrCachedCarrier(kind, shape);
+    }
+
+    fn ocrCachedCarrier(self: *MetalCompute, kind: OcrCarrierKind, shape: []const i32) !CT {
+        if (shape.len != 2 or shape[0] < 1 or shape[0] > 4 or shape[1] < 1) return error.InvalidTensorShape;
+        const width: usize = @intCast(shape[1]);
+        const count = try std.math.mul(usize, 4, width);
+        const bytes = try std.math.mul(usize, count, @sizeOf(f32));
+        const entry = &self.ocr_carriers[@backingInt(kind)];
+        if (entry.* == null or entry.*.?.deviceByteLen() < bytes) {
+            const runtime = self.provider_impl.raw_decode_runtime orelse return error.NativeBatchedDecodeUnavailable;
+            var tensor = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, bytes, .private, &.{@intCast(count)});
+            errdefer tensor.deinit();
+            if (entry.*) |*old| old.deinit();
+            entry.* = tensor;
+            self.ocr_carrier_allocations += 1;
+        } else self.ocr_carrier_reuses += 1;
+        var view = try entry.*.?.retainedView(0, @as(usize, @intCast(shape[0])) * width * @sizeOf(f32), shape);
+        defer view.deinit();
+        return retainedCtFromMetalTensor(self, &view);
+    }
+
+    fn logOcrStages(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime) void {
+        const snapshot = metal_runtime.stageTimingSnapshot(runtime);
+        if (snapshot.enabled == 0 or snapshot.decode.sampled_frames <= self.ocr_last_stage_samples) return;
+        self.ocr_last_stage_samples = snapshot.decode.sampled_frames;
+        const d = snapshot.decode;
+        std.log.info("metal_ocr_gpu_stages: scope=sampled_backbone_frames complete={d} frames={d} gpu_ns={d} attention_ns={d} ffn_ns={d} ple_ns={d} tail_ns={d} embedding_ns={d} other_ns={d}", .{
+            snapshot.complete, d.sampled_frames,  d.whole_frame_gpu_nanos,
+            d.bucket_nanos[0], d.bucket_nanos[1], d.bucket_nanos[2],
+            d.bucket_nanos[3], d.bucket_nanos[4], d.bucket_nanos[5],
+        });
+    }
+
     fn ocrRowwisePrepared(ctx: *anyopaque, self: *MetalCompute, input: MetalTensor, slot: usize, in_dim: usize, out_dim: usize, norm_eps: ?f32) !MetalTensor {
         const rows: usize = @intCast(input.dim(0));
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        const carrier_ct = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return error.NativeBatchedDecodeUnavailable;
+        const carrier_ct = try self.ocrCarrier(ctx, if (norm_eps != null) .norm else if (out_dim > 65536) .head else .query, &shape);
         defer freeOp(ctx, carrier_ct);
         for (0..rows) |row| {
             const row_shape = [_]i32{ 1, @intCast(in_dim) };
@@ -26636,11 +26697,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // reduction. Three standalone row linears are not a canonical QKV replay.
     fn ocrRowwiseQkv(ctx: *anyopaque, self: *MetalCompute, input: MetalTensor, layer: *const ops.DecoderRuntimeLayerSpec, in_dim: usize, q_dim: usize, kv_dim: usize) !metal_runtime.RuntimeLinearTripleResult {
         const rows: usize = @intCast(input.dim(0));
-        const q_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(q_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        const q_ct = try self.ocrCarrier(ctx, .query, &.{ @intCast(rows), @intCast(q_dim) });
         defer freeOp(ctx, q_ct);
-        const k_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(kv_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        const k_ct = try self.ocrCarrier(ctx, .key, &.{ @intCast(rows), @intCast(kv_dim) });
         defer freeOp(ctx, k_ct);
-        const v_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(kv_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        const v_ct = try self.ocrCarrier(ctx, .value, &.{ @intCast(rows), @intCast(kv_dim) });
         defer freeOp(ctx, v_ct);
         for (0..rows) |row| {
             var view = try input.retainedView(row * in_dim * @sizeOf(f32), in_dim * @sizeOf(f32), &.{ 1, @intCast(in_dim) });
@@ -26679,7 +26740,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer owned_block.deinit();
         const rows: usize = @intCast(block.dim(0));
         const shape = [_]i32{ @intCast(rows), @intCast(request.hidden_size) };
-        const output_ct = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return error.NativeBatchedDecodeUnavailable;
+        const output_ct = try self.ocrCarrier(ctx, .ple_output, &shape);
         defer freeOp(ctx, output_ct);
         for (0..rows) |row| {
             const h_shape = [_]i32{ 1, @intCast(request.hidden_size) };
@@ -26853,7 +26914,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer hidden.deinit();
         const ple = if (initial.ple_vectors) |tensor| tensor else return error.NativeBatchedDecodeUnavailable;
         const ple_shape = [_]i32{ @intCast(rows), @intCast(request.ple_hidden_size) };
-        const ple_layer_ct = (try allocUninitF32ShapeOp(ctx, &ple_shape)) orelse return error.NativeBatchedDecodeUnavailable;
+        const ple_layer_ct = try self.ocrCarrier(ctx, .ple_layer, &ple_shape);
         defer freeOp(ctx, ple_layer_ct);
         const ple_layer_mt = try self.borrowedMetalTensorFromCt(ple_layer_ct);
         for (request.layers, 0..) |layer, layer_index| {
@@ -26872,7 +26933,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }, &self.timing_stats)) orelse return error.NativeBatchedDecodeUnavailable;
             defer normed.deinit();
             const canonical_qkv = getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV");
-            var paired: ?metal_runtime.RuntimeLinearTripleResult = if (canonical_qkv and !layer.shares_kv) try ocrRowwiseQkv(ctx, self, normed, &layer, request.hidden_size, q_dim, kv_dim) else null;
+            var paired: ?metal_runtime.RuntimeLinearTripleResult = null;
+            if (canonical_qkv and !layer.shares_kv) {
+                if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"))
+                    paired = try metal_runtime.tryApplyBatchInvariantRuntimeLinearQkvScratch(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, normed, rows, request.hidden_size, q_dim, kv_dim);
+                if (paired == null) paired = try ocrRowwiseQkv(ctx, self, normed, &layer, request.hidden_size, q_dim, kv_dim);
+            }
             defer if (paired) |*triple| {
                 triple.first.deinit();
                 triple.second.deinit();
@@ -27081,6 +27147,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // the backbone frame. Generic row norm/linear packing within the
             // planned tail is not a canonical reference and failed OCR parity.
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
+            const heads_started = if (profile) monotonicNowNs() else 0;
             for (0..rows) |row| {
                 const view = try sliceRows2DOp(ctx, hidden_ct, row, 1, request.hidden_size);
                 defer freeOp(ctx, view);
@@ -27100,6 +27167,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const after = metal_runtime.runtimeMemorySnapshot(runtime);
                 // This counter covers the backbone frame; scalar tail command
                 // buffers are included in wall time, not these frame counters.
+                self.logOcrStages(runtime);
+                std.log.info("metal_ocr_cohort_overhead: rows={d} canonical_heads_wall_ns={d} carrier_allocations={d} carrier_reuses={d}", .{ rows, monotonicNowNs() - heads_started, self.ocr_carrier_allocations, self.ocr_carrier_reuses });
                 std.log.info("metal_ocr_matrix_frame: rows={d} submits={d} wait_ns={d} gpu_ns={d} canonical_tail=1", .{ rows, after.frame_submit_count - before.frame_submit_count, after.frame_wait_nanos - before.frame_wait_nanos, after.frame_gpu_nanos - before.frame_gpu_nanos });
             }
             self.timing_stats.active_decode_frame_successes += 1;
@@ -27180,13 +27249,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.hasActiveFrame(runtime)) return false;
         var cb = self.computeBackend();
         const shape = [_]i32{ @intCast(count), @intCast(request.hidden_size) };
-        const front = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return false;
+        const front = try self.ocrCarrier(ctx, .hidden_front, &shape);
         defer freeOp(ctx, front);
-        const back = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return false;
+        const back = try self.ocrCarrier(ctx, .hidden_back, &shape);
         defer freeOp(ctx, back);
         const ple_width = request.ple_hidden_size * request.layer_count;
         const ple_shape = [_]i32{ @intCast(count), @intCast(ple_width) };
-        const ple = (try allocUninitF32ShapeOp(ctx, &ple_shape)) orelse return false;
+        const ple = try self.ocrCarrier(ctx, .ple_vectors, &ple_shape);
         defer freeOp(ctx, ple);
 
         // Keep the singleton embedding/PLE arithmetic and copy each result
@@ -42130,4 +42199,38 @@ test "Metal OCR rowwise block preserves distinct rows and canonical arithmetic o
     try cb.decoderRuntimeSubmitAndWaitFrame();
     try std.testing.expect(actual.isDevice());
     try std.testing.expectEqualSlices(f32, &expected, try actual.toHostSlice());
+}
+
+test "Metal OCR carrier cache preserves shapes roles and retained growth views" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("../backends/metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    var compute = MetalCompute{ .allocator = std.testing.allocator, .data = undefined, .provider_impl = &provider };
+    defer for (&compute.ocr_carriers) |*entry| if (entry.*) |*tensor| tensor.deinit();
+    const first = try compute.ocrCachedCarrier(.query, &.{ 2, 64 });
+    defer MetalCompute.freeOp(&compute, first);
+    const first_mt = try compute.borrowedMetalTensorFromCt(first);
+    var held = try compute.ownedDeviceMetalTensorFromCt(first);
+    defer held.deinit();
+    var values: [128]f32 = undefined;
+    for (&values, 0..) |*v, index| v.* = @as(f32, @floatFromInt(index)) * 0.015625;
+    var host = MetalTensor.borrowed(values[0..].ptr, values.len, &.{ 2, 64 });
+    try host.copyInto(&held);
+    const again = try compute.ocrCachedCarrier(.query, &.{ 3, 64 });
+    defer MetalCompute.freeOp(&compute, again);
+    const again_mt = try compute.borrowedMetalTensorFromCt(again);
+    try std.testing.expectEqual(first_mt.deviceHandle(), again_mt.deviceHandle());
+    try std.testing.expectEqual(@as(i32, 3), again_mt.dim(0));
+    const other = try compute.ocrCachedCarrier(.key, &.{ 3, 64 });
+    defer MetalCompute.freeOp(&compute, other);
+    try std.testing.expect((try compute.borrowedMetalTensorFromCt(other)).deviceHandle() != first_mt.deviceHandle());
+    const grown = try compute.ocrCachedCarrier(.query, &.{ 4, 128 });
+    defer MetalCompute.freeOp(&compute, grown);
+    try std.testing.expect((try compute.borrowedMetalTensorFromCt(grown)).deviceHandle() != first_mt.deviceHandle());
+    // The smaller retained view remains valid after replacing the cache owner.
+    try std.testing.expectEqual(@as(usize, 2 * 64 * @sizeOf(f32)), first_mt.deviceByteLen());
+    try std.testing.expectEqualSlices(f32, &values, try held.toHostSlice());
+    try std.testing.expectEqual(@as(usize, 3), compute.ocr_carrier_allocations);
+    try std.testing.expectEqual(@as(usize, 1), compute.ocr_carrier_reuses);
+    try std.testing.expectError(error.InvalidTensorShape, compute.ocrCachedCarrier(.query, &.{ 5, 64 }));
 }

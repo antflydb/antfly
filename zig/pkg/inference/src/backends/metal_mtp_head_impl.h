@@ -111,7 +111,7 @@ int termite_metal_decode_runtime_mtp_cluster_head(
             w->centroid_offset != offsets[1] || w->ordering_offset != ordering_offset;
         if (rebuild) {
             w = [[TermiteMetalMtpHeadWorkspace alloc] init];
-            MTLCompileOptions *options = [[MTLCompileOptions alloc] init]; options.fastMathEnabled = NO;
+            MTLCompileOptions *options = [[MTLCompileOptions alloc] init]; options.mathMode = MTLMathModeSafe;
             NSError *error = nil;
             id<MTLLibrary> library = [runtime->device newLibraryWithSource:[NSString stringWithUTF8String:termite_mtp_head_source] options:options error:&error];
             if (!library) { fprintf(stderr, "mtp_cluster_head_compile: %s\n", error.localizedDescription.UTF8String); return -6; }

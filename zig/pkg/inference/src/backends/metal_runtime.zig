@@ -9238,7 +9238,14 @@ pub fn decoderRuntimeApplyCanonicalQ4LinearRmsAdd(self: anytype, request: anytyp
     if (request.input.ndim() != 2 or request.residual.ndim() != 2 or
         @as(usize, @intCast(request.input.dim(0))) != request.rows or @as(usize, @intCast(request.input.dim(1))) != request.in_dim or
         @as(usize, @intCast(request.residual.dim(0))) != request.rows or @as(usize, @intCast(request.residual.dim(1))) != request.hidden_size) return null;
-    var output = try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &.{ @intCast(request.rows), @intCast(request.hidden_size) });
+    var output = output: {
+        if (@hasField(@TypeOf(request), "output")) if (request.output) |target| {
+            if (!target.isDevice() or target.dtype != .f32 or target.ndim() != 2 or
+                @as(usize, @intCast(target.dim(0))) != request.rows or @as(usize, @intCast(target.dim(1))) != request.hidden_size) return null;
+            break :output try target.retainedCopy();
+        };
+        break :output try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &.{ @intCast(request.rows), @intCast(request.hidden_size) });
+    };
     errdefer output.deinit();
     const status = termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(runtime, request.linear_slot, request.norm_slot, request.input.deviceHandle(), request.input.deviceByteOffset(), request.residual.deviceHandle(), request.residual.deviceByteOffset(), request.rows, request.in_dim, request.hidden_size, request.eps, output.deviceHandle(), output.deviceByteOffset());
     if (status == 0) return output;
@@ -28273,6 +28280,27 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     };
 }
 
+/// Only Q4 slots whose batched dispatch preserves the singleton Q + paired
+/// K/V family. Returned scratch must be consumed before the next QKV call.
+pub fn tryApplyBatchInvariantRuntimeLinearQkvScratch(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+) !?RuntimeLinearTripleResult {
+    if (!getenvFlagEnabled("TERMITE_METAL_Q4_0_BATCH_INVARIANT") or rows < 2 or rows > 4) return null;
+    for ([_]usize{ q_slot, k_slot, v_slot }, 0..) |slot, index| {
+        if (slot >= decoder_runtime_linear_slot_capacity or !self.raw_linear_slot_bias_is_zero[slot] or
+            ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, if (index == 0) q_dim else kv_dim) != .q4_0) return null;
+    }
+    return tryApplyQuantizedRuntimeLinearQkvScratch(self, q_slot, k_slot, v_slot, input, rows, in_dim, q_dim, kv_dim);
+}
+
 pub fn tryApplyQuantizedRuntimeLinearQkvScratch(
     self: anytype,
     q_slot: usize,
@@ -28933,12 +28961,14 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         (if (@hasField(@TypeOf(request), "multirow_q4")) request.multirow_q4 else getenvFlagEnabled("ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN") or getenvFlagEnabled("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"));
     const none = std.math.maxInt(usize);
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
-    var output = MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        request.rows * request.hidden_size * @sizeOf(f32),
-        .private,
-        &out_shape,
-    ) catch return null;
+    var output = output: {
+        if (@hasField(@TypeOf(request), "output")) if (request.output) |target| {
+            if (!target.isDevice() or target.dtype != .f32 or target.ndim() != 2 or
+                @as(usize, @intCast(target.dim(0))) != request.rows or @as(usize, @intCast(target.dim(1))) != request.hidden_size) return null;
+            break :output try target.retainedCopy();
+        };
+        break :output MetalTensor.deviceAllocate(@ptrCast(runtime), request.rows * request.hidden_size * @sizeOf(f32), .private, &out_shape) catch return null;
+    };
     errdefer output.deinit();
 
     const input_handle = input.deviceHandle();
@@ -37122,6 +37152,8 @@ test "metal native q4_0 batch invariant linear and fused ffn are bitwise singlet
     try testQ4GatedFfnRows(3, true, 1536, 6144);
     try testQ4GatedFfnRows(4, true, 1536, 12288);
     try testQ4GatedFfnRows(8, true, 128, 96);
+    try testQ4QkvRows(3);
+    try testQ4QkvRows(4);
 }
 
 fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime hidden_size: usize, comptime intermediate_size: usize) !void {
@@ -37314,6 +37346,9 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     }, &stats)) orelse return error.GatedFfnAddNull;
     defer expected_tensor.deinit();
 
+    var output_target: ?MetalTensor = null;
+    defer if (output_target) |*tensor| tensor.deinit();
+    if (invariant) output_target = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &.{ rows, hidden_size });
     if (invariant) {
         const tail_dim = intermediate_size - 1;
         const tail_shape = [_]i64{ tail_dim, hidden_size };
@@ -37335,6 +37370,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
             .out_dim = tail_dim,
             .retain_dense_fallback = false,
         }, &prep_stats));
+        std.debug.print("invariant-fixture rows={d} hidden={d} intermediate={d} stage=linear\n", .{ rows, hidden_size, intermediate_size });
         try std.testing.expect(decoderRuntimeReserveGatedFfnScratch(&provider, rows, hidden_size, intermediate_size));
         try beginFrame(runtime);
         errdefer cancelFrame(runtime) catch {};
@@ -37365,9 +37401,11 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
             for (single_values, packed_values[row * tail_dim ..][0..tail_dim]) |a, b|
                 try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
         }
+        std.debug.print("invariant-fixture rows={d} stage=fused-tail\n", .{rows});
         const gate_values = try tensorHostSlice(&gated);
         try beginFrame(runtime);
         var fused_rows = (try decoderRuntimeApplyCanonicalQ4LinearRmsAdd(&provider, .{
+            .output = output_target,
             .input = gated,
             .residual = residual,
             .linear_slot = @as(usize, 62),
@@ -37410,6 +37448,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     }
     const before_direct = runtimeMemorySnapshot(runtime);
     var direct = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+        .output = output_target,
         .gate_linear_slot = 60,
         .up_linear_slot = 61,
         .down_linear_slot = 62,
@@ -37423,16 +37462,26 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         .post_down_rms_norm_slot = @as(?usize, 12),
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
+    if (invariant) try std.testing.expectEqual(output_target.?.deviceHandle(), direct.deviceHandle());
     if (invariant) {
         try submitFrame(runtime);
         try waitFrame(runtime);
     }
     const after_direct = runtimeMemorySnapshot(runtime);
+    if (invariant and getenvFlagEnabled("TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS") and !q4_0LinearRmsAddF16ProjectEnabled()) {
+        if (q4_0LinearRmsAddSumsqDisabled()) {
+            try std.testing.expectEqual(before_direct.q4_0_linear_reduce + 1, after_direct.q4_0_linear_reduce);
+        } else {
+            try std.testing.expectEqual(before_direct.q4_0_linear_reduce_sumsq + 1, after_direct.q4_0_linear_reduce_sumsq);
+            try std.testing.expectEqual(before_direct.rms_norm_add_sumsq + 1, after_direct.rms_norm_add_sumsq);
+        }
+    }
     if (invariant) {
         // One fused gate/up dispatch for the entire cohort, not rows singleton
         // dispatches disguised as batching. The canonical down tail is per row.
         if (after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce)
             try std.testing.expectEqual(before_direct.q4_0_pair_activation_reduce + 1, after_direct.q4_0_pair_activation_reduce);
+        std.debug.print("invariant-fixture rows={d} stage=ffn\n", .{rows});
         const packed_values = try tensorHostSlice(&direct);
         for (0..rows) |row| {
             var single_input = try testDeviceTensorFromSlice(runtime, input_data[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
@@ -40213,6 +40262,10 @@ test "metal native q8_0 qkv scratch supports batched rows" {
 }
 
 test "metal native q4_0 qkv uses packed kv pair path" {
+    try testQ4QkvRows(1);
+}
+
+fn testQ4QkvRows(comptime rows: usize) !void {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -40222,7 +40275,6 @@ test "metal native q4_0 qkv uses packed kv pair path" {
     if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const rows: usize = 1;
     const hidden_size: usize = 64;
     const q_out_dim: usize = 32;
     const kv_out_dim: usize = 32;
@@ -40363,6 +40415,36 @@ test "metal native q4_0 qkv uses packed kv pair path" {
         try std.testing.expectEqual(expected.len, actual.len);
         for (expected, actual) |exp, got| {
             try std.testing.expectApproxEqAbs(exp, got, 1e-4);
+        }
+    }
+    if (rows > 1) {
+        const inputs = try tensorHostSlice(&input);
+        var expected_rows: [3][rows * q_out_dim]f32 = undefined;
+        for (0..rows) |row| {
+            var single_input = try testDeviceTensorFromSlice(runtime, inputs[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
+            defer single_input.deinit();
+            try beginFrame(runtime);
+            var reference = (try tryApplyQuantizedRuntimeLinearQkvScratch(&provider, 20, 21, 22, single_input, 1, hidden_size, q_out_dim, kv_out_dim)) orelse return error.UnexpectedNull;
+            defer reference.first.deinit();
+            defer reference.second.deinit();
+            defer reference.third.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            for ([_]*MetalTensor{ &reference.first, &reference.second, &reference.third }, 0..) |tensor, index| {
+                const values = try tensorHostSlice(tensor);
+                @memcpy(expected_rows[index][row * q_out_dim ..][0..q_out_dim], values);
+            }
+        }
+        try beginFrame(runtime);
+        var batch = (try tryApplyBatchInvariantRuntimeLinearQkvScratch(&provider, 20, 21, 22, input, rows, hidden_size, q_out_dim, kv_out_dim)) orelse return error.UnexpectedNull;
+        defer batch.first.deinit();
+        defer batch.second.deinit();
+        defer batch.third.deinit();
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        for ([_]*MetalTensor{ &batch.first, &batch.second, &batch.third }, 0..) |tensor, index| {
+            const values = try tensorHostSlice(tensor);
+            for (values, expected_rows[index]) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
         }
     }
 }

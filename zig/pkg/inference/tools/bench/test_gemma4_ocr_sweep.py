@@ -94,6 +94,25 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES"], "1")
             self.assertNotIn("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP", flags)
 
+    def test_shared_fused_reuse_controls_and_sampled_profile(self):
+        for variant in ["share", "fused", "reuse", "optimized", "optimizedprofile"]:
+            flags, batch, _ = sweep.flags_for("cohort4w8" + variant)
+            self.assertEqual(batch, 8)
+            self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_SHARED"], "1")
+            self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_INVARIANT"], "1")
+            if variant != "share":
+                self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"], "1")
+                self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"], "1")
+            if variant in {"reuse", "optimized", "optimizedprofile"}:
+                self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"], "1")
+        flags, _, _ = sweep.flags_for("cohort4w8optimizedprofile")
+        self.assertEqual(flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"], "0")
+        parsed = sweep.profile(
+            "metal_ocr_gpu_stages: scope=sampled_backbone_frames complete=1 frames=2 gpu_ns=3 ffn_ns=2\nmetal_ocr_cohort_overhead: rows=4 canonical_heads_wall_ns=10 carrier_allocations=3 carrier_reuses=8\n"
+        )
+        self.assertEqual(parsed["metal_ocr_gpu_stages"][0]["frames"], 2)
+        self.assertEqual(parsed["metal_ocr_cohort_overhead"][0]["carrier_reuses"], 8)
+
     def test_recommendation_excludes_failed_quality_and_overlapping_ranges(self):
         ordinary = {
             "case": "ordinary",
