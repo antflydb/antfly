@@ -97,8 +97,22 @@ pub const Reader = struct {
     limits: Limits,
 
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
-        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limits.max_index_bytes }) else @import("admission.zig").Token{};
-        errdefer index_reservation.deinit();
+        // Packet limits describe the returned index. Construction can briefly
+        // own old/new growth buffers plus the bounded top-level box lists.
+        const lists = try std.math.mul(usize, 3 * (1024 + 8), @sizeOf(Span) + @sizeOf(Fragment));
+        const bound = try std.math.add(usize, try std.math.mul(usize, limits.max_index_bytes, 2), lists);
+        var scratch = IndexAllocator{ .backing = allocator, .limit = bound, .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else @import("admission.zig").Token{} };
+        errdefer scratch.reservation.deinit();
+        var reader = initAllocated(scratch.allocator(), input, limits) catch |err| {
+            std.debug.assert(scratch.live == 0);
+            return if (err == error.OutOfMemory and scratch.denied != null) scratch.denied.? else err;
+        };
+        std.debug.assert(scratch.live == reader.packets.len * @sizeOf(Packet));
+        reader.allocator = allocator;
+        reader.index_reservation = scratch.reservation;
+        return reader;
+    }
+    fn initAllocated(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
         var metadata: ?source.Lease = null;
         errdefer if (metadata) |*lease| lease.deinit();
         var spans: std.ArrayList(Span) = .empty;
@@ -153,7 +167,7 @@ pub const Reader = struct {
             if (fragments.items.len != 0) return error.MalformedMedia;
             break :blk try buildPackets(allocator, tables, track, spans.items, limits, input.control);
         };
-        return .{ .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
+        return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
     }
     pub fn deinit(self: *Reader) void {
         self.allocator.free(self.packets);
@@ -700,4 +714,136 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
     if (packets.items.len == 0) return error.EmptyVideoTrack;
     for (packets.items) |*packet| packet.dts = try track.edit.present(try std.math.sub(i64, packet.media_dts, track.decode_preroll_ticks));
     return packets.toOwnedSlice(allocator);
+}
+
+/// Scoped packet/list allocator. Returned packet ownership is transferred to
+/// the original allocator and this reservation after all temporary lists free.
+const IndexAllocator = struct {
+    backing: std.mem.Allocator,
+    reservation: @import("admission.zig").Token,
+    limit: usize,
+    live: usize = 0,
+    denied: ?anyerror = null,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn reserve(self: *@This(), bytes: usize) bool {
+        if (bytes > self.limit) {
+            self.denied = error.ResourceLimitExceeded;
+            return false;
+        }
+        self.reservation.resize(.{ .host_bytes = bytes }) catch |err| {
+            self.denied = err;
+            return false;
+        };
+        self.denied = null;
+        return true;
+    }
+    fn restore(self: *@This(), bytes: usize) void {
+        // Restoration only shrinks an existing reservation.
+        self.reservation.resize(.{ .host_bytes = bytes }) catch unreachable;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const next = std.math.add(usize, self.live, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return null;
+        };
+        if (!self.reserve(next)) return null;
+        const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+            self.restore(self.live);
+            self.denied = null;
+            return null;
+        };
+        self.live = next;
+        self.denied = null;
+        return result;
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (len <= bytes.len) {
+            // Do not publish a smaller charge before the backing allocator has
+            // actually shrunk; another request may consume the released room.
+            if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
+            self.live = self.live - bytes.len + len;
+            self.restore(self.live);
+            self.denied = null;
+            return true;
+        }
+        const next = std.math.add(usize, self.live - bytes.len, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return false;
+        };
+        if (!self.reserve(next)) return false;
+        if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+            self.restore(self.live);
+            return false;
+        }
+        self.live = next;
+        self.denied = null;
+        return true;
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Try explicit in-place resize before reserving a possible move.
+        if (resize(raw, bytes, alignment, len, ra)) return bytes.ptr;
+        const overlap = std.math.add(usize, self.live, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return null;
+        };
+        if (!self.reserve(overlap)) return null;
+        const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+            self.restore(self.live);
+            return null;
+        };
+        self.live = self.live - bytes.len + len;
+        self.restore(self.live);
+        self.denied = null;
+        return result;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(bytes, alignment, ra);
+        self.live -= bytes.len;
+        self.restore(self.live);
+    }
+};
+
+test "MP4 index allocator charges moving growth overlap and releases failed probes" {
+    const Copying = struct {
+        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
+    var marker: u8 = 0;
+    const backing = std.mem.Allocator{ .ptr = &marker, .vtable = &.{ .alloc = Copying.alloc, .resize = Copying.resize, .remap = Copying.remap, .free = Copying.free } };
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 200 } };
+    var scoped = IndexAllocator{ .backing = backing, .limit = 1000, .reservation = try pool.acquire(.{}) };
+    defer scoped.reservation.deinit();
+    const allocator = scoped.allocator();
+    {
+        var bytes = try allocator.alloc(u8, 100);
+        defer allocator.free(bytes);
+        @memset(bytes, 0x5a);
+        try std.testing.expectError(error.OutOfMemory, allocator.realloc(bytes, 150));
+        try std.testing.expectEqual(@as(u64, 100), pool.snapshot().host_bytes);
+        try std.testing.expectEqual(@as(usize, 100), scoped.live);
+        try std.testing.expectEqual(@as(u8, 0x5a), bytes[99]);
+        pool.limits.host_bytes = 250;
+        bytes = try allocator.realloc(bytes, 150);
+        try std.testing.expectEqual(@as(u64, 250), pool.high_water.host_bytes);
+        try std.testing.expectEqual(@as(u64, 150), pool.snapshot().host_bytes);
+        try std.testing.expectEqual(@as(u8, 0x5a), bytes[99]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scoped.live);
 }

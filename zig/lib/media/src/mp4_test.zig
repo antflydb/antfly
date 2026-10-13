@@ -245,3 +245,39 @@ test "fragmented mp4 bad offsets missing tfdt and admission failures release met
     try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
 }
+
+test "MP4 packet indexes retain exact shared bytes instead of configured ceiling" {
+    inline for (.{ clips[1], fragmented_clip }) |bytes| {
+        var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 16 * 1024 } };
+        var src = input(bytes);
+        src.admission_pool = &pool;
+        {
+            var reader = try mp4.Reader.init(a, &src, .{});
+            defer reader.deinit();
+            const retained = reader.packets.len * @sizeOf(mp4.Packet);
+            try std.testing.expectEqual(retained, reader.index_reservation.resources.host_bytes);
+            try std.testing.expectEqual(retained + src.retained_bytes, pool.snapshot().host_bytes);
+            try std.testing.expect(retained < reader.limits.max_index_bytes);
+            try std.testing.expect(pool.high_water.host_bytes >= retained and pool.high_water.host_bytes <= pool.limits.host_bytes);
+        }
+        try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    }
+}
+fn indexAdmissionAllocationRun(allocator: std.mem.Allocator) !void {
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 16 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var src = input(fragmented_clip);
+    src.allocator = allocator;
+    src.admission_pool = &pool;
+    var reader = try mp4.Reader.init(allocator, &src, .{});
+    defer reader.deinit();
+}
+test "MP4 index allocation and shared admission failures release construction owners" {
+    try std.testing.checkAllAllocationFailures(a, indexAdmissionAllocationRun, .{});
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 64 } };
+    var src = input(fragmented_clip);
+    src.admission_pool = &pool;
+    try std.testing.expectError(error.SharedAdmissionExceeded, mp4.Reader.init(a, &src, .{}));
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+}

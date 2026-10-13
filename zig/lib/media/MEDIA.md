@@ -1221,3 +1221,21 @@ field/dynamic stream parity, repeated parameter planning, incremental append
 decoding, cross-window projection reuse and the full non-CUDA scope remain active.
 
 See [qualification receipts](../video/testdata/live/reader-selection-validation/README.md).
+
+
+### Charge retained MP4 indexes by allocation
+
+MP4 readers charge packet/list allocations during construction, including old/new
+buffer overlap for moving growth. Denied growth preserves the old allocation;
+cleanup releases every construction charge. After temporary lists are freed,
+the retained reservation equals the final packet-array bytes. Metadata leases
+remain separately admitted. The configured index limit still bounds returned
+packets; it is no longer reserved in full for every buffered live unit.
+
+The six-fragment Sintel coordinator comparison preserves exact window payload
+digests and reduces peak admitted host bytes from 101,990,501 to 1,328,885.
+This is admission accounting rather than an RSS or throughput claim. macOS and
+actual Linux ARM64 pass 142 media and nine HTTP tests, including allocation
+failure, shared denial and forced-copy overlap checks.
+
+See [qualification receipts](testdata/index-admission-validation/README.md).
