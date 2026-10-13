@@ -221,6 +221,171 @@ test "relational index system typed restore admits declared domains before gener
     defer valid.deinit(parsed.arena.allocator());
 }
 
+test "relational index system JSONB physical display is distinct from streaming semantic identity" {
+    const a = std.testing.allocator;
+    const content = @import("document_content_hash.zig");
+    const Case = struct { input: []const u8, physical: []const u8 };
+    const cases = [_]Case{
+        .{ .input = "1.20", .physical = "1.20" },
+        .{ .input = "1.200e2", .physical = "120.0" },
+        .{ .input = "-0.00", .physical = "0.00" },
+        .{ .input = "-0e999999", .physical = "0" },
+        .{ .input = "{\"z\":1.20,\"aa\":1.2000}", .physical = "{\"aa\":1.2000,\"z\":1.20}" },
+        .{ .input = "{\"source\":1.200,\"1.2\":\"3.40\"}", .physical = "{\"1.2\":\"3.40\",\"source\":1.200}" },
+        .{ .input = "[1.20,1.2,1e-20,true,null,\"\\\"9000\\\"\"]", .physical = "[1.20,1.2,0.00000000000000000001,true,null,\"\\\"9000\\\"\"]" },
+    };
+    const Run = struct {
+        fn run(fault_alloc: std.mem.Allocator, input: []const u8, expected: []const u8) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, fault_alloc, input, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            const physical = try content.canonicalJsonStorageValueAlloc(fault_alloc, parsed.value);
+            defer fault_alloc.free(physical);
+            try std.testing.expectEqualStrings(expected, physical);
+            const semantic = try content.canonicalJsonValueAlloc(fault_alloc, parsed.value);
+            defer fault_alloc.free(semantic);
+            var streamed = std.crypto.hash.Blake3.init(.{});
+            streamed.update("preceding row fields");
+            var before: [32]u8 = undefined;
+            streamed.final(&before);
+            content.hashCanonicalJsonStorageBytes(fault_alloc, &streamed, physical) catch |err| {
+                var after: [32]u8 = undefined;
+                streamed.final(&after);
+                try std.testing.expectEqualSlices(u8, &before, &after);
+                return err;
+            };
+            var direct = std.crypto.hash.Blake3.init(.{});
+            direct.update("preceding row fields");
+            direct.update("j");
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, semantic.len, .little);
+            direct.update(&size);
+            direct.update(semantic);
+            var lhs: [32]u8 = undefined;
+            var rhs: [32]u8 = undefined;
+            streamed.final(&lhs);
+            direct.final(&rhs);
+            try std.testing.expectEqualSlices(u8, &lhs, &rhs);
+        }
+    };
+    for (cases) |case| {
+        try Run.run(a, case.input, case.physical);
+        var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ case.input, case.physical });
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .string = "\x00" }));
+    try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .number_string = "1e131072" }));
+}
+
+test "relational index system JSONB restore rejects alternate physical bytes without changing semantic identity" {
+    const a = std.testing.allocator;
+    const schema_api = @import("../../schema/mod.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const store = @import("relational_store.zig");
+    var validator = try schema_api.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const table = try schema_api.deriveRuntimeTableSchema(a, validator.schema);
+    defer @import("../schema.zig").freeSchema(a, table);
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var left = try mapper.PreparedRelationalWrite.init(a, "r", "{\"payload\":1.20}", validator, table, &layout);
+    defer left.deinit(a);
+    var right = try mapper.PreparedRelationalWrite.init(a, "r", "{\"payload\":1.2}", validator, table, &layout);
+    defer right.deinit(a);
+    try left.finalizeMetadata(0);
+    try right.finalizeMetadata(0);
+    try std.testing.expect(!std.mem.eql(u8, left.packed_row, right.packed_row));
+    try std.testing.expectEqualSlices(u8, &left.semantic_hash, &right.semantic_hash);
+    try store.validateCanonicalValueForSchemaAndLayout(a, left.packed_row, table, &layout);
+    try store.validateCanonicalValueForSchemaAndLayout(a, right.packed_row, table, &layout);
+    const ordinal: u32 = @intCast(layout.ordinalForName(table.relational_columns, "payload").?);
+    // A valid physical checksum and matching logical digest cannot authorize
+    // exponent syntax or whitespace in stored cells. The trusted preparation
+    // encoder constructs the adversarial fixture without weakening validation.
+    for ([_][]const u8{ "1.20e0", " 1.20", "1.20 " }) |noncanonical| {
+        const physical = try codec.serializePreparedOrdinalDeferredHash(a, table.version, table.relational_columns, &.{
+            .{ .ordinal = ordinal, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = noncanonical } },
+        }, &layout);
+        defer a.free(physical);
+        try codec.finalizeOrdinalMetadata(physical, left.semantic_hash, 0);
+        try std.testing.expectError(error.NonCanonicalRelationalRow, store.validateCanonicalValueForSchemaAndLayout(a, physical, table, &layout));
+        try std.testing.expectError(error.NonCanonicalRelationalRow, codec.validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(a, physical, table, &layout));
+    }
+}
+
+test "relational index system JSONB semantic hashing scratch is independent of payload size" {
+    const a = std.testing.allocator;
+    const content = @import("document_content_hash.zig");
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const encoded = try std.fmt.allocPrint(a, "{{\"n\":1.200,\"text\":\"{s}\"}}", .{payload});
+    defer a.free(encoded);
+    var memory: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 8192 };
+    var streamed = std.crypto.hash.Blake3.init(.{});
+    try content.hashCanonicalJsonStorageBytes(memory.allocator(), &streamed, encoded);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expect(memory.peak < 8192);
+    const semantic = try std.fmt.allocPrint(a, "{{\"n\":1.2,\"text\":\"{s}\"}}", .{payload});
+    defer a.free(semantic);
+    var expected = std.crypto.hash.Blake3.init(.{});
+    expected.update("j");
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, semantic.len, .little);
+    expected.update(&size);
+    expected.update(semantic);
+    var lhs: [32]u8 = undefined;
+    var rhs: [32]u8 = undefined;
+    streamed.final(&lhs);
+    expected.final(&rhs);
+    try std.testing.expectEqualSlices(u8, &lhs, &rhs);
+}
+
+test "relational index system JSONB scale survives LSM reopen and strict portable restore" {
+    const a = std.testing.allocator;
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("jsonb-scale-reopen");
+    defer directory.cleanup();
+    var target = try TestDirectory.init("jsonb-scale-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(a,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(db.core.schema.?.requires_jsonb_display);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"payload\":{\"source\":1.200e2,\"nested\":[1.20,-0.00]}}" }} });
+        try @import("../portable_backup.zig").exportPortable(a, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(a, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_jsonb_display);
+        try std.testing.expectEqual(@as(u32, 29), db.core.table_catalog.schema_format_version);
+        const bytes = (try db.get(a, "row")).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        const payload = parsed.value.object.get("payload").?;
+        try std.testing.expectEqualStrings("120.0", payload.object.get("source").?.number_string);
+        const items = payload.object.get("nested").?.array.items;
+        try std.testing.expectEqualStrings("1.20", items[0].number_string);
+        try std.testing.expectEqualStrings("0.00", items[1].number_string);
+        var work: @import("../../sql/json_order.zig").Budget = .{};
+        const text = try @import("../../sql/jsonb_text.zig").format(a, payload, 1024, &work);
+        defer a.free(text);
+        try std.testing.expectEqualStrings("{\"nested\": [1.20, 0.00], \"source\": 120.0}", text);
+    }
+}
+
 test "relational index system NUMERIC public scalar constraints survive LSM reopen and portable restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-public-scalar");

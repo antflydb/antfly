@@ -4334,6 +4334,7 @@ fn buildRelationalRowValueFromParsedInternal(
             column: runtime_schema.RelationalColumn,
             found: std.json.Value,
             json_literal_null: bool,
+            preserve_json_display: bool,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
@@ -4375,7 +4376,10 @@ fn buildRelationalRowValueFromParsedInternal(
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.is_json) blk: {
-                const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
+                const encoded = if (preserve_json_display)
+                    try document_content_hash.canonicalJsonStorageValueAlloc(output_alloc, found)
+                else
+                    try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
@@ -4416,6 +4420,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 for (json_null_fields) |name| {
                     if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
                 } else false,
+                table_schema.requires_jsonb_display,
                 &owned,
             ));
         }
@@ -4442,7 +4447,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 return std.mem.lessThan(u8, schema_columns[lhs.ordinal].name, schema_columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(cells.items, table_schema);
+        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(scratch, cells.items, table_schema);
         std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
         break :blk digest;
     } else blk: {
@@ -4472,6 +4477,7 @@ fn buildRelationalRowValueFromParsedInternal(
             target += 1;
         }
         const digest = try document_content_hash.hashRelationalIndexedCellsCanonical(
+            scratch,
             cells.items,
             table_schema,
             physical_layout.hash_ordinals,

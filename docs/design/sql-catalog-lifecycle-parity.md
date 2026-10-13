@@ -4328,3 +4328,69 @@ Formatting, source-catalog freshness, license headers, the 2,053-file Apache
 boundary and unchanged original inventory integrity passed. Cache GC was
 previewed only; nothing was deleted. No OpenAPI contract changed, so this
 checkpoint does not require SDK regeneration or claim new public activation.
+
+### Preserve JSONB display independently of logical row identity
+
+Physical JSON cells now retain PostgreSQL numeric display scale. An isolated
+PostgreSQL 18 oracle confirmed that 1.20 prints as 1.20, 1.200e2 as 120.0,
+and -0.00 as 0.00, while 1.20 and 1.2 compare equal. This matters for both
+ordinary row reads and future durable jsonb_extract_path_text expressions.
+The former semantic JSON canonicalizer remains unchanged: using it for physical
+encoding would irreversibly discard that observable information.
+
+Schema format 29 adds requires_jsonb_display, derived from relational public
+schemas with JSON-encoded properties. Catalog admission fences older readers;
+schema decoding checks the wire flag before allocation. Document text-index
+projections do not inherit this row-storage capability. Physical JSON retains
+the existing lexical key order and canonical string syntax, expands numeric
+exponents, and preserves decimal scale. PostgreSQL SQL text output remains a
+separate formatter with PostgreSQL's length/byte object-key ordering.
+
+Logical row hashing still uses the original length-framed canonical JSON
+identity. From authenticated physical bytes it streams numeric normalization,
+first counting semantic bytes and then feeding the hash, without constructing
+a DOM or payload-sized canonical copy. Per-number scratch is reused. A native
+regression hashes a 1 MiB text payload with less than 8 KiB peak scratch and
+checks the digest against an independent canonical-byte construction.
+
+Restore establishes canonical physical representation before comparing the
+semantic hash. Both field-local validation and materializing validation reject
+alternate whitespace/exponent encodings even with a valid physical checksum
+and matching logical digest. Actual prepared rows preserve different physical
+bytes for 1.20 and 1.2 while retaining the same semantic digest. LSM reopen and
+portable restore preserve numeric display in nested JSON values.
+
+With origin/main 543203fbef merged, the full SQL Debug gate passed 1,024 tests
+with three existing skips and no failures/leaks. Native Debug before the final
+two adversarial regressions passed 232 tests without failures/leaks; the final
+focused JSONB Debug gate passed eight tests, including both added regressions.
+The first adversarial fixture was rejected by the strict public encoder before
+restore; the corrected fixture uses the trusted preparation encoder and
+finalizes checksums explicitly. No production validator was relaxed.
+
+This is a storage prerequisite, not public durable-JSON activation. Compiler
+guards, immutable JSON literal identity, shared CHECK/index operand ownership,
+rewrite evaluation, public capability/lowering, and complete distributed
+activation still need implementation and qualification. New expression semantics
+must receive a capability distinct from the published display-storage fence.
+No original case receives inventory credit from these storage regressions.
+
+The PostgreSQL boundary probe also found and corrected a pre-existing shared
+JSONB formatter bug: positive exponents do not give zero a large integer
+weight, and leading fractional zeroes do not count toward significant integer
+digits. PostgreSQL accepts 0e999999, 0e1073741823, 0.1e131072 and
+0.0001e131075; it rejects 0e1073741824, 0e-16384 and 1e131072 with
+SQLSTATE 22003. Formatter regressions distinguish those numeric-domain errors
+from a caller's output/work ceiling. Negative zero retains display scale but
+not its sign. Streaming semantic hashing publishes its continuation only after
+both passes succeed; allocation-failure sweeps verify that an existing hash of
+preceding row fields is unchanged on failure.
+
+Final reviewed-source qualification passed the complete SQL Debug gate:
+799 main-owner plus 226 linked tests, three existing skips, zero failures/leaks,
+21/21 steps. Complete native Debug passed 233 main-owner plus one linked test,
+zero failures/leaks, 50/50 steps. Formatting, source-catalog freshness, license
+headers, the 2,053-file Apache boundary and original inventory integrity passed.
+The original inventory remains 479 implemented / 136 rejected / 73 superseded /
+898 unresolved; public durable-JSON activation and original sql-0671 remain open.
+No OpenAPI contract changed in this storage checkpoint.

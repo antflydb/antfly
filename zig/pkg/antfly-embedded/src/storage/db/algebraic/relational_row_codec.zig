@@ -736,7 +736,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
             const column = table_schema.relational_columns[cell.ordinal];
             const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
             if (cell.is_json and !cell.is_null) {
-                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                const canonical = if (table_schema.requires_jsonb_display) try document_content_hash.canonicalJsonStorageValueAlloc(root_alloc, logical) else try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
                 if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
             }
             try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
@@ -747,7 +747,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
                 return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(cells, table_schema);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(alloc, cells, table_schema);
         if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
     } else {
         const cells = try alloc.alloc(?Cell, table_schema.relational_columns.len);
@@ -758,7 +758,7 @@ pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
             const column = table_schema.relational_columns[cell.ordinal];
             const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
             if (cell.is_json and !cell.is_null) {
-                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                const canonical = if (table_schema.requires_jsonb_display) try document_content_hash.canonicalJsonStorageValueAlloc(root_alloc, logical) else try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
                 if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
             }
             try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);

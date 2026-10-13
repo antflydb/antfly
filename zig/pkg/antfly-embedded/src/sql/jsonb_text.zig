@@ -37,24 +37,31 @@ pub fn format(a: std.mem.Allocator, value: Json, limit: usize, work: *Budget) ![
     return output;
 }
 
-fn number(raw: []const u8, writer: *std.Io.Writer, limit: usize, work: *Budget) !void {
-    _ = @import("../common/json_number.zig").Number.parse(raw) orelse return error.SqlTypeMismatch;
+/// PostgreSQL's observable numeric display, shared with physical JSONB cells.
+/// Unlike semantic hashing, this retains the result's decimal display scale.
+pub fn number(raw: []const u8, writer: *std.Io.Writer, limit: usize, work: *Budget) !void {
+    const parsed = @import("../common/json_number.zig").Number.parse(raw) orelse return error.SqlTypeMismatch;
     try work.consume(raw.len);
     const start: usize = @intFromBool(raw[0] == '-');
     const end = std.mem.indexOfAny(u8, raw, "eE") orelse raw.len;
     const body = raw[start..end];
     const point = std.mem.indexOfScalar(u8, body, '.') orelse body.len;
     const digits = body.len - @intFromBool(point != body.len);
-    const exponent: i64 = if (end == raw.len) 0 else std.fmt.parseInt(i64, raw[end + 1 ..], 10) catch return error.SqlProgramLimitExceeded;
+    const exponent: i64 = if (end == raw.len) 0 else std.fmt.parseInt(i64, raw[end + 1 ..], 10) catch return error.SqlNumericOutOfRange;
+    // PostgreSQL's numeric input parser bounds the exponent independently of
+    // the result's weight, even for zero.
+    if (exponent > std.math.maxInt(i32) / 2 or exponent < -(std.math.maxInt(i32) / 2)) return error.SqlNumericOutOfRange;
     const places = std.math.add(i64, @intCast(point), exponent) catch return error.SqlProgramLimitExceeded;
     const scale = if (places < digits) std.math.sub(i64, @intCast(digits), places) catch return error.SqlProgramLimitExceeded else 0;
-    if (places > 131072 or scale > 16383) return error.SqlProgramLimitExceeded;
-    const size: usize = @intCast(@max(places, 1) + scale + @intFromBool(scale != 0) + @as(i64, @intCast(start)));
+    const zero = parsed.first == parsed.end;
+    // Leading fractional zeroes do not contribute to integer weight. Nor
+    // does a positive exponent make a zero datum require a huge zero run.
+    const integer_places: i128 = if (zero) 0 else @max(parsed.adjustment + exponent, 0);
+    if (integer_places > 131072 or scale > 16383) return error.SqlNumericOutOfRange;
+    const integer_size: i128 = @max(integer_places, 1);
+    const size: usize = @intCast(integer_size + @as(i128, scale) + @intFromBool(scale != 0) + @intFromBool(start != 0 and !zero));
     if (size > limit) return error.SqlProgramLimitExceeded;
     try work.consume(size);
-    const zero = for (body) |byte| {
-        if (byte != '0' and byte != '.') break false;
-    } else true;
     if (zero) {
         try writer.writeByte('0');
         if (scale != 0) {
@@ -88,6 +95,32 @@ fn number(raw: []const u8, writer: *std.Io.Writer, limit: usize, work: *Budget) 
         if (ordinal >= places) try writer.writeByte(byte);
         ordinal += 1;
     }
+}
+
+test "SQL JSONB numeric text bounds normalized weight and preserves zero display scale" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "0e131072", "-0e999999", "0e1073741823" }) |raw| {
+        var work: Budget = .{};
+        const text = try format(a, .{ .number_string = raw }, 1, &work);
+        defer a.free(text);
+        try std.testing.expectEqualStrings("0", text);
+    }
+    for ([_][]const u8{ "0.1e131072", "0.0001e131075" }) |raw| {
+        var work: Budget = .{};
+        const text = try format(a, .{ .number_string = raw }, 131072, &work);
+        defer a.free(text);
+        try std.testing.expectEqual(@as(usize, 131072), text.len);
+        try std.testing.expectEqual(@as(u8, '1'), text[0]);
+        for (text[1..]) |byte| try std.testing.expectEqual(@as(u8, '0'), byte);
+    }
+    for ([_][]const u8{ "1e131072", "0e-16384", "0e1073741824" }) |raw| {
+        var work: Budget = .{};
+        try std.testing.expectError(error.SqlNumericOutOfRange, format(a, .{ .number_string = raw }, 1024 * 1024, &work));
+    }
+    var work: Budget = .{};
+    const scaled = try format(a, .{ .number_string = "-0.00" }, 4, &work);
+    defer a.free(scaled);
+    try std.testing.expectEqualStrings("0.00", scaled);
 }
 
 test "SQL JSONB text formatting owns exact output and cleans allocation and cancellation failures" {

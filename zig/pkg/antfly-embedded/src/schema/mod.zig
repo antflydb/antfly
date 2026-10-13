@@ -781,6 +781,14 @@ pub fn documentPropertyUsesJsonEncoding(property: impl.DocumentProperty) bool {
     return impl.documentPropertyUsesJsonEncoding(property);
 }
 
+fn requiresJsonbDisplay(schema: ParsedTableSchema) bool {
+    if (schema.storage_mode != .relational) return false;
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (documentPropertyUsesJsonEncoding(property)) return true;
+    };
+    return false;
+}
+
 pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
 pub const documentNumberToF64 = impl.documentNumberToF64;
@@ -1396,6 +1404,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
         .requires_text_expressions = requiresTextExpressions(schema),
         .requires_numeric_functions = requiresNumericFunctions(schema),
+        .requires_jsonb_display = requiresJsonbDisplay(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1428,6 +1437,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
         .requires_text_expressions = requiresTextExpressions(schema),
         .requires_numeric_functions = requiresNumericFunctions(schema),
+        .requires_jsonb_display = requiresJsonbDisplay(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

@@ -141,7 +141,7 @@ pub fn hashRelationalPreparedValuesCanonicalWithOrdinals(
         if (column.is_json or column.column_type == .json) {
             if (canonical_json_values) |canonical_values| {
                 const canonical = canonical_values[ordinal] orelse return error.InvalidBatchRequest;
-                hashCanonicalJsonBytes(&hasher, canonical);
+                if (table_schema.requires_jsonb_display) try hashCanonicalJsonStorageBytes(alloc, &hasher, canonical) else hashCanonicalJsonBytes(&hasher, canonical);
             } else {
                 try hashRelationalColumnValue(alloc, &hasher, value, column);
             }
@@ -158,7 +158,7 @@ pub fn hashRelationalPreparedValuesCanonicalWithOrdinals(
 /// The cell type is intentionally generic to keep the logical hash layer from
 /// depending on the physical row codec.
 pub fn hashRelationalCellsWithOrdinals(
-    _: std.mem.Allocator,
+    alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
     hash_ordinals: []const u32,
@@ -180,7 +180,7 @@ pub fn hashRelationalCellsWithOrdinals(
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(&hasher, cell, column);
+        try hashRelationalCellCanonical(alloc, &hasher, cell, column, table_schema.requires_jsonb_display);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -192,6 +192,7 @@ pub fn hashRelationalCellsWithOrdinals(
 /// keeping both work and scratch proportional to row density instead of schema
 /// width. JSON cell bytes must already be canonical.
 pub fn hashRelationalSparseCellsCanonical(
+    alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
 ) !Digest {
@@ -213,7 +214,7 @@ pub fn hashRelationalSparseCellsCanonical(
         const column = table_schema.relational_columns[cell.ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(&hasher, cell, column);
+        try hashRelationalCellCanonical(alloc, &hasher, cell, column, table_schema.requires_jsonb_display);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -223,6 +224,7 @@ pub fn hashRelationalSparseCellsCanonical(
 /// Dense preparation supplies its worker-local inverse ordinal map. Missing
 /// columns use maxInt(u32); no per-column search or extra Cell array is needed.
 pub fn hashRelationalIndexedCellsCanonical(
+    alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
     hash_ordinals: []const u32,
@@ -246,7 +248,7 @@ pub fn hashRelationalIndexedCellsCanonical(
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(&hasher, cells[index], column);
+        try hashRelationalCellCanonical(alloc, &hasher, cells[index], column, table_schema.requires_jsonb_display);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -254,16 +256,18 @@ pub fn hashRelationalIndexedCellsCanonical(
 }
 
 fn hashRelationalCellCanonical(
+    alloc: std.mem.Allocator,
     hasher: *std.crypto.hash.Blake3,
     cell: anytype,
     column: runtime_schema.RelationalColumn,
+    preserve_display: bool,
 ) !void {
     if (cell.is_null) {
         hasher.update("n");
         return;
     }
     if (column.is_json or column.column_type == .json) {
-        hashJsonCellBytes(hasher, cell.value.bytes_val);
+        if (preserve_display) try hashCanonicalJsonStorageBytes(alloc, hasher, cell.value.bytes_val) else hashJsonCellBytes(hasher, cell.value.bytes_val);
         return;
     }
     switch (column.column_type) {
@@ -315,25 +319,94 @@ fn hashCanonicalJsonBytes(hasher: *std.crypto.hash.Blake3, encoded: []const u8) 
     hashBytes(hasher, encoded);
 }
 
+/// Physical JSON has canonical key/string syntax but preserves numeric scale.
+/// Stream only numeric normalization into the existing length-framed semantic
+/// hash. No DOM, key sorting, or payload-sized canonical buffer is constructed.
+pub fn hashCanonicalJsonStorageBytes(alloc: std.mem.Allocator, hasher: *std.crypto.hash.Blake3, encoded: []const u8) !void {
+    var count: std.Io.Writer.Discarding = .init(&.{});
+    try writeCanonicalJsonStorageSemantic(alloc, &count.writer, encoded);
+    // Publish the continuation only after both passes succeed. Faulted or
+    // canceled preparation must not leave a caller's shared hash half-framed.
+    var staged = hasher.*;
+    staged.update("j");
+    hashInt(&staged, u64, count.count);
+    var buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .initHasher(staged, &buffer);
+    try writeCanonicalJsonStorageSemantic(alloc, &sink.writer, encoded);
+    try sink.writer.flush();
+    hasher.* = sink.hasher;
+}
+
+fn writeCanonicalJsonStorageSemantic(alloc: std.mem.Allocator, writer: *std.Io.Writer, encoded: []const u8) !void {
+    var scanner: std.json.Scanner = .initCompleteInput(alloc, encoded);
+    defer scanner.deinit();
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var copied: usize = 0;
+    while (true) {
+        const token = try scanner.next();
+        switch (token) {
+            .number => |raw| {
+                const end = scanner.cursor;
+                if (end < raw.len or end - raw.len < copied) return error.InvalidBatchRequest;
+                try writer.writeAll(encoded[copied .. end - raw.len]);
+                if (!scratch.reset(.retain_capacity)) return error.OutOfMemory;
+                try writeCanonicalJsonNumber(scratch.allocator(), writer, raw);
+                copied = end;
+            },
+            .end_of_document => {
+                try writer.writeAll(encoded[copied..]);
+                return;
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn canonicalJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return canonicalJsonEncodedValueAlloc(alloc, value, false);
+}
+
+/// Physical JSONB preserves display scale while semantic hashes deliberately
+/// erase it. Both representations retain the same canonical object-key order.
+pub fn canonicalJsonStorageValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    @import("../../sql/json_order.zig").validateTextDomain(value, &work, 0) catch |err| return switch (err) {
+        error.SqlProgramLimitExceeded => error.RelationalRowResultTooLarge,
+        error.SqlTypeMismatch => error.InvalidBatchRequest,
+        else => err,
+    };
+    // Exponent expansion is bounded before an allocating writer can grow past
+    // the row ceiling. Include sorting scratch and allocator growth capacity;
+    // a caller arena may retain temporary frees until the row is retired.
+    var memory: @import("../../sql/memory_budget.zig") = .{ .backing = alloc, .limit = 16 * 1024 * 1024, .monotonic = true };
+    return canonicalJsonEncodedValueAlloc(memory.allocator(), value, true) catch |err| return switch (err) {
+        error.OutOfMemory => if (memory.isExhausted()) error.RelationalRowResultTooLarge else err,
+        error.SqlProgramLimitExceeded => error.RelationalRowResultTooLarge,
+        error.SqlTypeMismatch, error.SqlNumericOutOfRange => error.InvalidBatchRequest,
+        else => err,
+    };
+}
+
+fn canonicalJsonEncodedValueAlloc(alloc: std.mem.Allocator, value: std.json.Value, preserve_display: bool) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
     // This writer only targets an allocating memory buffer, never external IO.
     // Preserve allocation-failure semantics for callers' quota/fault handling.
-    writeCanonicalJsonValue(alloc, &writer.writer, value) catch |err| return switch (err) {
+    writeCanonicalJsonValue(alloc, &writer.writer, value, preserve_display) catch |err| return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
     return try writer.toOwnedSlice();
 }
 
-fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value) !void {
+fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value, preserve_display: bool) !void {
     switch (value) {
         .array => |array| {
             try writer.writeByte('[');
             for (array.items, 0..) |item, index| {
                 if (index != 0) try writer.writeByte(',');
-                try writeCanonicalJsonValue(alloc, writer, item);
+                try writeCanonicalJsonValue(alloc, writer, item, preserve_display);
             }
             try writer.writeByte(']');
         },
@@ -349,11 +422,11 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
                 if (key_index != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(key, .{}, writer);
                 try writer.writeByte(':');
-                try writeCanonicalJsonValue(alloc, writer, object.get(key).?);
+                try writeCanonicalJsonValue(alloc, writer, object.get(key).?, preserve_display);
             }
             try writer.writeByte('}');
         },
-        .number_string => |number| try writeCanonicalJsonNumber(alloc, writer, number),
+        .number_string => |number| try writeCanonicalJsonEncodedNumber(alloc, writer, number, preserve_display),
         .float => |number| {
             // The same logical JSONB value can arrive as a native float or
             // an exact parsed number token. Normalize both with the identical
@@ -363,10 +436,16 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             const coefficient = try parts.coefficientText(&coefficient_buffer);
             var buffer: [800]u8 = undefined;
             const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() }) catch unreachable;
-            try writeCanonicalJsonNumber(alloc, writer, raw);
+            try writeCanonicalJsonEncodedNumber(alloc, writer, raw, preserve_display);
         },
         else => try std.json.Stringify.value(value, .{}, writer),
     }
+}
+
+fn writeCanonicalJsonEncodedNumber(alloc: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8, preserve_display: bool) !void {
+    if (!preserve_display) return writeCanonicalJsonNumber(alloc, writer, raw);
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    try @import("../../sql/jsonb_text.zig").number(raw, writer, 16 * 1024 * 1024, &work);
 }
 
 /// Emit one exact JSON number in a unique scientific representation without
