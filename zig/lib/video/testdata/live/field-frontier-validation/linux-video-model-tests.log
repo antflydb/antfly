@@ -1,0 +1,41 @@
+1/40 inference_internal.test.embeddinggemma2 video module declarations...OK
+2/40 pipelines.embedding_gemma2.test.embeddinggemma2 video rows preserve image audio and frame ordering...OK
+3/40 pipelines.embedding_gemma2.test_0...OK
+4/40 pipelines.embedding_gemma2.test.embeddinggemma2 video live window validates sampling before entering a model session...OK
+5/40 pipelines.embedding_gemma2.test.embeddinggemma2 video live pump checks cancellation before entering model admission...OK
+6/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video sampling maps presentation order and uniform long clips...OK
+7/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video repeated samples reuse projection and validate color declarations...OK
+8/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 model VFR qualification preserves pinned average FPS indices and compressed pixels...OK
+9/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video HDR rendering requires consistent gamut and transfer...OK
+10/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM inspection uses decoded visible picture sampling...OK
+11/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video logical field partition selection and timestamp windows...OK
+12/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video admission rejects all container paths before model execution...OK
+13/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight bounds temporary owners and plans geometry instead of maximum slots...OK
+14/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight allocation failures release metadata decoder and admission owners...OK
+15/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer prepares before model gate and drains an abandoned full queue...OK
+16/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer failure preserves error and releases partial owners...OK
+17/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer allocation failure drains metadata and prepared patches...OK
+18/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cancellation before consumer entry joins and drains producer...OK
+19/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM presentation and container colour reach model preparation...OK
+20/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video native TS sampling and preflight preserve MP4 pictures...OK
+21/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video TS producer preserves prepared MP4 patches and drains owners...OK
+22/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache producer skips fully cached decode and preparation for every container...OK
+23/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache abandoned producer restores borrowed entries under backpressure...OK
+24/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video borrowed packet preparation matches container and leaves caller read state untouched...OK
+25/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 Metal video borrowed reader preparation matches container on completed device work...SKIP
+26/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source sampling preserves VFR picture identity after preroll eviction...OK
+27/40 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source sampling excludes unfinished future fields...OK
+28/40 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache borrows survive eviction pressure and preserve exact ownership...OK
+29/40 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache shared admission denies additional request owners...OK
+30/40 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache allocation denial returns the retained lease...OK
+31/40 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 Metal video cache survives compute wrappers without intermediate downloads...SKIP
+32/40 runtime.root.test_0...OK
+33/40 runtime.kv.root.test_0...OK
+34/40 gguf.root.test_0...OK
+35/40 ops.metal_compute.test.embeddinggemma2 Metal video buffer survives producer destruction and enters resident linear...SKIP
+36/40 ops.metal_compute.test.embeddinggemma2 Metal video producer prepares while compute lease is held and drains on abandonment...SKIP
+37/40 backends.backends.test_0...OK
+38/40 runtime.moe.root.test_0...OK
+39/40 runtime.scheduler.root.test_0...OK
+40/40 runtime.tier.root.test_0...OK
+36 passed; 4 skipped; 0 failed.

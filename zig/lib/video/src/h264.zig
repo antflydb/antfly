@@ -115,9 +115,12 @@ pub const Picture = struct {
     chroma_format: u8,
     independent_plane: ?u2 = null,
 };
+pub const PendingPicture = struct { first_packet: usize, pts: i64 };
 pub const PictureObserver = struct {
     context: *anyopaque,
     accept: *const fn (*anyopaque, Picture) anyerror!void,
+    /// Allocation-free notification before reconstruction owners are released.
+    pending: ?*const fn (*anyopaque, PendingPicture) void = null,
 };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
@@ -1355,6 +1358,11 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     const snapshot_size = reference_size + @sizeOf(Workspace.State);
     var workspaces: [16]?Workspace = @splat(null);
     defer for (&workspaces) |*slot| if (slot.*) |*workspace| workspace.deinit(allocator);
+    defer if (options.picture_observer) |observer| if (observer.pending) |notify| {
+        for (workspaces) |slot| if (slot) |workspace| {
+            if (workspace.active and !workspace.complete and workspace.pts != null) notify(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = workspace.pts.? });
+        };
+    };
     workspaces[0] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
     var references = @import("h264_references.zig").StateFor(Sample){ .chroma_format = cfg.chroma_format };
     defer references.deinit(allocator);
@@ -1432,6 +1440,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                         // A fresh IDR starts a new pairing generation. Requested
                         // incomplete pictures cannot silently disappear at reset.
                         if (prefix.idr) for (&workspaces) |*slot| if (slot.*) |*workspace| {
+                            if (workspace.active and !workspace.complete and options.picture_observer != null and options.picture_observer.?.pending != null) return error.UnfinishedVideoPictureAtReset;
                             if (workspace.active and workspace.wanted()) return error.IncompleteVideoPicture;
                             if (workspace.snapshot != null) {
                                 workspace.releaseSnapshot(allocator);

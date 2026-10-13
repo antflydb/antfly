@@ -55,6 +55,7 @@ pub const Coordinator = struct {
     start_ns: ?i64 = null,
     sealed_ns: ?i64 = null,
     tail_ns: i64 = 0,
+    pending_ns: ?i64 = null,
     ordinal: usize = 0,
     finished: bool = false,
     epoch_committed: bool = false,
@@ -111,19 +112,13 @@ pub const Coordinator = struct {
             const last = view.reader.packets[view.reader.packets.len - 1];
             sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
         } else {
-            const cfg = try h264.configParse(self.allocator, view.reader.track.avcc);
-            defer cfg.groups.deinit(self.allocator);
-            if (cfg.frame_only and !view.reader.track.inband_parameter_sets) {
-                // Full decode validates IDR syntax and complete logical pictures.
-                var logical = try pictures.index(self.allocator, &view.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
-                defer logical.deinit();
-                if (logical.pictures.len != 0) {
-                    // Validated scheduling contract: PTS >= DTS and monotone
-                    // decode clocks bound every subsequently admitted picture.
-                    const last = view.reader.packets[view.reader.packets.len - 1];
-                    sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
-                }
-            }
+            var logical = try pictures.streaming(self.allocator, &view.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
+            defer logical.deinit();
+            const last = view.reader.packets[view.reader.packets.len - 1];
+            var frontier = try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale);
+            if (logical.pending_pts) |pts| frontier = @min(frontier, try ns(pts, view.reader.track.timescale));
+            sealed = @max(sealed orelse 0, frontier);
+            self.pending_ns = if (logical.pending_pts) |pts| try ns(pts, view.reader.track.timescale) else null;
         }
         self.count += 1;
         self.retained_bytes += bytes;
@@ -136,11 +131,13 @@ pub const Coordinator = struct {
     /// Explicit presentation watermark for layouts without an automatic proof.
     /// Late subsequent pictures are rejected before advancing retention state.
     pub fn seal(self: *Coordinator, end_ns: i64) !void {
+        if (self.pending_ns) |pending| if (end_ns > pending) return error.InvalidLiveWatermark;
         if (self.count == 0 or end_ns > self.tail_ns or end_ns < (self.sealed_ns orelse self.start_ns orelse 0)) return error.InvalidLiveWatermark;
         self.sealed_ns = end_ns;
     }
     pub fn finish(self: *Coordinator) !void {
         try self.options.window.stream.control.check();
+        if (self.pending_ns != null) return error.IncompleteVideoPicture;
         self.finished = true;
         if (self.count != 0) self.sealed_ns = self.tail_ns;
     }
@@ -163,9 +160,9 @@ pub const Coordinator = struct {
             logical_sampling = window.reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes;
         }
         if (logical_sampling) {
-            var logical = try pictures.index(self.allocator, &window.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
+            var logical = try pictures.streaming(self.allocator, &window.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
             defer logical.deinit();
-            if (logical.pictures.len == 0) return error.EmptyVideo;
+            if (logical.pending_pts) |pts| if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * window.reader.track.timescale) return error.InvalidLiveWatermark;
             for (logical.pictures) |picture| {
                 const time = @as(i128, picture.pts) * std.time.ns_per_s;
                 eligible = eligible or (time >= @as(i128, start) * window.reader.track.timescale and time < @as(i128, end) * window.reader.track.timescale);
@@ -198,7 +195,7 @@ pub const Coordinator = struct {
             }
         } else {
             var reader = prepared.window.reader;
-            var logical = try pictures.index(self.allocator, &reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
+            var logical = try pictures.streaming(self.allocator, &reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
             defer logical.deinit();
             for (logical.pictures) |picture| {
                 if (try ns(picture.pts, reader.track.timescale) > end) continue;
@@ -266,6 +263,7 @@ pub const Coordinator = struct {
                 self.start_ns = null;
                 self.sealed_ns = null;
                 self.tail_ns = 0;
+                self.pending_ns = null;
                 self.finished = false;
                 self.epoch_committed = false;
             }
@@ -487,4 +485,57 @@ test "live coordinator timing violations fail before transfer or payload reads" 
     try std.testing.expectError(error.UnsupportedLiveTiming, flow.append(&unit));
     try std.testing.expect(unit != null and flow.count == 0);
     try std.testing.expectEqual(reads, unit.?.reader.input.reads);
+}
+
+fn fieldUnit(a: std.mem.Allocator, bytes: []const u8, at: usize) !media.live_mp4.Segment {
+    const identity = try a.dupe(u8, "field-unit");
+    errdefer a.free(identity);
+    const backing = try media.stream.Snapshot.copy(a, identity, &.{bytes}, .{});
+    errdefer backing.deinit();
+    var reader = try media.mp4.Reader.init(a, &backing.input, .{});
+    errdefer reader.deinit();
+    const packet = reader.packets[at];
+    const selected = try a.dupe(media.mp4.Packet, &.{packet});
+    a.free(reader.packets);
+    reader.packets = selected;
+    // A monotone published decode clock, with no negative composition offset.
+    reader.packets[0].dts = @intCast(at);
+    reader.packets[0].pts = @intCast(at);
+    reader.packets[0].duration = 1;
+    return .{ .backing = backing, .reader = reader, .identity = identity, .ordinal = at, .epoch = 0, .identity_reservation = .{} };
+}
+
+test "live coordinator unfinished fields cap automatic and explicit watermarks" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.mp4");
+    var source = media.source.Source{ .allocator = a, .identity = "fields", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 4 });
+    defer flow.deinit();
+    var saw_pending = false;
+    var saw_ready = false;
+    for (0..reader.packets.len) |at| {
+        var unit: ?media.live_mp4.Segment = try fieldUnit(a, bytes, at);
+        defer if (unit) |*value| value.deinit();
+        try flow.append(&unit);
+        try std.testing.expect(unit == null);
+        if (flow.pending_ns) |pending| {
+            saw_pending = true;
+            try std.testing.expect(flow.sealed_ns.? <= pending);
+            try std.testing.expectError(error.InvalidLiveWatermark, flow.seal(pending + 1));
+            try std.testing.expectError(error.IncompleteVideoPicture, flow.finish());
+            try std.testing.expect(!flow.finished);
+        }
+        if (try flow.prepare()) |value| {
+            var prepared = value;
+            defer prepared.deinit();
+            saw_ready = true;
+            if (flow.pending_ns) |pending| try std.testing.expect(prepared.source_end_ns <= pending);
+            try flow.commit(&prepared);
+        }
+    }
+    try std.testing.expect(saw_pending and saw_ready);
+    try std.testing.expectEqual(@as(?i64, null), flow.pending_ns);
+    try flow.finish();
 }

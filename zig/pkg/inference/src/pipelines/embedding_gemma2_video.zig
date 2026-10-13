@@ -57,8 +57,19 @@ pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader,
         if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes) {
             // Index completed assemblies rather than transport members.
             var mutable = reader.*;
-            var logical = try video.h264_pictures.index(a, &mutable, .{});
+            var logical = if (sampling == .source_timestamps)
+                try video.h264_pictures.streaming(a, &mutable, .{})
+            else
+                try video.h264_pictures.index(a, &mutable, .{});
             defer logical.deinit();
+            if (sampling == .source_timestamps) {
+                // A live window may carry an unfinished future field pair as
+                // decoder context, but never sample inside its pending barrier.
+                if (logical.pending_pts) |pts| {
+                    const end = sampling.source_timestamps.end_ns orelse return error.InvalidLiveWatermark;
+                    if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * logical.timescale) return error.InvalidLiveWatermark;
+                }
+            }
             if (sampling == .reference) return logical.select();
             const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
             defer a.free(metadata);
@@ -1672,4 +1683,31 @@ test "embeddinggemma2 video source sampling preserves VFR picture identity after
     const tail = try selectWithSampling(a, &reader, sampling);
     defer a.free(tail);
     try std.testing.expectEqualSlices(usize, &.{1}, tail);
+}
+
+test "embeddinggemma2 video source sampling excludes unfinished future fields" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/h264-paff-adaptive-packets-8-1.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "future-fields" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const packets = reader.packets;
+    defer reader.packets = packets;
+    var checked = false;
+    for (1..packets.len) |end| {
+        reader.packets = packets[0..end];
+        var logical = try video.h264_pictures.streaming(a, &reader, .{});
+        defer logical.deinit();
+        const pending = logical.pending_pts orelse continue;
+        if (logical.pictures.len == 0) continue;
+        const barrier = try media.timeline.rescale(pending, logical.timescale, std.time.ns_per_s);
+        if (barrier <= 0) continue;
+        const selected = try selectWithSampling(a, &reader, .{ .source_timestamps = .{ .end_ns = barrier } });
+        defer a.free(selected);
+        try std.testing.expect(selected.len > 0);
+        for (selected) |id| try std.testing.expect(id < logical.pending_first_packet.?);
+        try std.testing.expectError(error.InvalidLiveWatermark, selectWithSampling(a, &reader, .{ .source_timestamps = .{ .end_ns = barrier + 1 } }));
+        checked = true;
+    }
+    try std.testing.expect(checked);
 }

@@ -1,0 +1,14 @@
+1/13 live_window_test_root.test_0...OK
+2/13 src.live_windows.test.live packet window joins units with independently owned source metadata and leases...OK
+3/13 src.live_windows.test.live packet window releases every failing allocation and shared reservation...OK
+4/13 src.live_windows.test.live packet window rejects mixed epochs duplicate clocks and packet bounds...OK
+5/13 src.live_coordinator.test.live coordinator derives validated progressive decode clock windows and commits eviction transactionally...OK
+6/13 src.live_coordinator.test.live coordinator capacity and watermark failures retain incoming unit ownership...OK
+7/13 src.live_coordinator.test.live coordinator pumps reloads and preserves fetched units across capacity retry...OK
+8/13 src.live_coordinator.test.live coordinator drains old epoch before accepting reset presentation clocks...OK
+9/13 src.live_coordinator.test.live coordinator allocation failures release decoder snapshots units and shared admission...OK
+10/13 src.live_coordinator.test.live coordinator emits explicit empty intervals without dropping future presentation samples...OK
+11/13 src.live_coordinator.test.live coordinator timing violations fail before transfer or payload reads...OK
+12/13 src.live_coordinator.test.live coordinator unfinished fields cap automatic and explicit watermarks...OK
+13/13 src.sampling.test.source timestamp sampling retains rational VFR boundaries across preroll eviction...OK
+All 13 tests passed.

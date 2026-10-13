@@ -24,6 +24,8 @@ pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []h264.Picture,
     timescale: u32,
+    pending_pts: ?i64 = null,
+    pending_first_packet: ?usize = null,
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.pictures);
         self.* = undefined;
@@ -56,6 +58,13 @@ const Collector = struct {
     pictures: std.ArrayList(h264.Picture) = .empty,
     planes: std.ArrayList(u8) = .empty,
     limit: usize,
+    pending_pts: ?i64 = null,
+    pending_first_packet: ?usize = null,
+    fn pending(raw: *anyopaque, picture: h264.PendingPicture) void {
+        const self: *Collector = @ptrCast(@alignCast(raw));
+        self.pending_pts = if (self.pending_pts) |old| @min(old, picture.pts) else picture.pts;
+        self.pending_first_packet = if (self.pending_first_packet) |old| @min(old, picture.first_packet) else picture.first_packet;
+    }
     fn accept(raw: *anyopaque, picture: h264.Picture) !void {
         const self: *Collector = @ptrCast(@alignCast(raw));
         if (picture.independent_plane) |plane| {
@@ -101,6 +110,14 @@ fn codedEnds(reader: *media.mp4.Reader, begin: usize, end: usize, max_packet: us
 }
 fn discard(_: *anyopaque, _: usize, _: *const h264.Frame) !void {}
 pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
+    return indexMode(a, reader, options, false);
+}
+/// Completed logical pictures plus a conservative pending-picture barrier.
+/// Corruption, resource failures and abandoned pictures at reset remain errors.
+pub fn streaming(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
+    return indexMode(a, reader, options, true);
+}
+fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, partial: bool) !Index {
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
@@ -108,7 +125,7 @@ pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) 
     defer collector.pictures.deinit(a);
     defer collector.planes.deinit(a);
     var decode = options.decode;
-    decode.picture_observer = .{ .context = &collector, .accept = Collector.accept };
+    decode.picture_observer = .{ .context = &collector, .accept = Collector.accept, .pending = if (partial) Collector.pending else null };
     if (reader.track.inband_parameter_sets) {
         const session = try dynamic.Session.init(a, reader, decode);
         defer session.deinit();
@@ -118,13 +135,29 @@ pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) 
             try selectors.appendSlice(a, &ends);
         };
         if (selectors.items.len == 0) return error.EmptyVideo;
-        _ = try session.decodeSelected(selectors.items, &collector, discard);
+        _ = session.decodeSelected(selectors.items, &collector, discard) catch |err| caught: {
+            if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
+            break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
+        };
     } else {
         const ends = try codedEnds(reader, 0, reader.packets.len, decode.max_packet_bytes) orelse return error.EmptyVideo;
-        _ = try h264.decodeSelected(a, reader, &ends, decode, &collector, discard);
+        _ = h264.decodeSelected(a, reader, &ends, decode, &collector, discard) catch |err| caught: {
+            if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
+            break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
+        };
     }
-    for (collector.planes.items) |mask| if (mask != 0 and mask != 7) return error.IncompleteVideoPicture;
-    return .{ .allocator = a, .pictures = try collector.pictures.toOwnedSlice(a), .timescale = reader.track.timescale };
+    var kept: usize = 0;
+    for (collector.pictures.items, collector.planes.items) |picture, mask| {
+        if (mask != 0 and mask != 7) {
+            if (!partial) return error.IncompleteVideoPicture;
+            Collector.pending(&collector, .{ .first_packet = picture.first_packet, .pts = picture.pts });
+        } else {
+            collector.pictures.items[kept] = picture;
+            kept += 1;
+        }
+    }
+    collector.pictures.items.len = kept;
+    return .{ .allocator = a, .pictures = try collector.pictures.toOwnedSlice(a), .timescale = reader.track.timescale, .pending_pts = collector.pending_pts, .pending_first_packet = collector.pending_first_packet };
 }
 
 test "AVC logical picture index counts field pairs partitions and configuration epochs" {
@@ -136,6 +169,10 @@ test "AVC logical picture index counts field pairs partitions and configuration 
         var pictures = try index(a, &reader, .{});
         defer pictures.deinit();
         try std.testing.expect(pictures.pictures.len > 0);
+        var live = try streaming(a, &reader, .{});
+        defer live.deinit();
+        try std.testing.expectEqual(@as(?i64, null), live.pending_pts);
+        try std.testing.expectEqualSlices(h264.Picture, pictures.pictures, live.pictures);
         if (std.mem.eql(u8, name, "h264-jm-partitions") or std.mem.eql(u8, name, "h264-jm-separate")) try std.testing.expectEqual(@as(usize, 4), pictures.pictures.len);
         if (std.mem.eql(u8, name, "h264-dynamic-geometry")) {
             try std.testing.expectEqual(@as(usize, 3), pictures.pictures.len);
@@ -160,7 +197,47 @@ test "AVC logical index bounds callback metadata and releases shared decode admi
     try std.testing.expectError(error.ResourceLimitExceeded, index(a, &reader, .{ .max_pictures = 0 }));
     try std.testing.expectEqual(before, pool.snapshot().host_bytes);
     try std.testing.expectError(error.ResourceLimitExceeded, index(a, &reader, .{ .max_packets = 0 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, streaming(a, &reader, .{ .max_pictures = 0 }));
+    try std.testing.expectEqual(before, pool.snapshot().host_bytes);
     var pictures = try index(a, &reader, .{});
     defer pictures.deinit();
     try std.testing.expectEqual(before, pool.snapshot().host_bytes);
+}
+
+test "AVC streaming index holds incomplete field pairs until their mate arrives" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-paff-adaptive-packets-8-1", "h264-paff-interleaved-fragments-10-2" }) |name| {
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        const packets = reader.packets;
+        defer reader.packets = packets;
+        var saw_pending = false;
+        var saw_completed = false;
+        for (1..packets.len + 1) |end| {
+            reader.packets = packets[0..end];
+            var logical = try streaming(a, &reader, .{});
+            defer logical.deinit();
+            if (logical.pending_pts != null) {
+                saw_pending = true;
+                try std.testing.expect(logical.pending_first_packet.? < end);
+                if (end == 1) try std.testing.expectError(error.IncompleteVideoPicture, index(a, &reader, .{}));
+            }
+            saw_completed = saw_completed or logical.pictures.len != 0;
+            if (end == packets.len) try std.testing.expectEqual(@as(?i64, null), logical.pending_pts);
+        }
+        try std.testing.expect(saw_pending and saw_completed);
+    }
+}
+
+test "AVC streaming index rejects corrupt NALs rather than manufacturing a pending tail" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4"));
+    defer a.free(bytes);
+    var source = media.source.Source{ .allocator = a, .identity = "corrupt-tail", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const header = @as(usize, @intCast(reader.packets[0].offset)) + reader.track.nal_length_bytes;
+    bytes[header] |= 128;
+    try std.testing.expectError(error.MalformedVideoPacket, streaming(a, &reader, .{}));
 }

@@ -1046,11 +1046,11 @@ uses prepare/commit: fallible probing happens before cursor advancement, and
 inference failure leaves the same window available. Completed windows retain
 independent packet/configuration/identity storage after preroll eviction.
 
-Automatic frontiers currently cover MJPEG and static progressive AVC. AVC
-frontiers require full picture validation and the enforced scheduling contract
+Automatic frontiers cover MJPEG and supported AVC. AVC
+frontiers require native picture validation and the enforced scheduling contract
 `PTS >= DTS`; subsequent units must follow monotone decode clocks and cannot
 arrive before a sealed presentation point. Field-coded and in-band configuration
-streams use explicit watermarks or final EOF. Empty source intervals are explicit
+streams hold the frontier at unfinished assemblies. Empty source intervals are explicit
 gap events, rather than invented embeddings. Exact source-time sampling avoids
 changes in selection when the retained preroll origin moves.
 
@@ -1058,8 +1058,8 @@ changes in selection when the retained preroll origin moves.
 entry, commits after successful inference and reports source clocks and copied
 HLS/DASH timing. A null outer result means no ready window; a returned event with
 null embedding marks an empty interval. Conservative model admission covers
-window staging, validation and decode work. Automatic field/dynamic frontiers,
-pretrained streamed-window parity, projection reuse and reduction of repeated
+window staging, validation and decode work. Broader field/dynamic pretrained
+streamed-window parity, projection reuse and reduction of repeated
 frontier decoding remain open. Receipts are in
 `../video/testdata/live/coordinator-validation`.
 
@@ -1084,6 +1084,29 @@ Source, fixture, binary and oracle receipts live in
 adapter/complete-clip inference on a shared host; file acquisition/model load,
 peak memory and sustained throughput are outside this timing scope.
 
-Broader field/dynamic layouts, automatic frontiers for those layouts, larger
+Broader pretrained field/dynamic layouts and larger
 stream corpora, cross-window projection reuse and reducing repeated frontier
 decode work remain required by the full active non-CUDA objective.
+
+
+### Streaming AVC assembly barriers
+
+Automatic live watermarks now use the native logical-picture walk for field-coded
+and in-band configuration AVC too. `h264_pictures.streaming` returns completed
+pictures and the earliest pending picture's timestamp/packet. The decode-clock
+frontier is capped at that timestamp until its remaining fields/slices arrive.
+Explicit watermarks cannot cross an open assembly, and EOF with an unfinished
+picture fails without finishing the coordinator. An IDR cannot silently discard
+an unfinished streaming assembly. Corrupt NALs, missing data partitions and
+resource failures remain errors.
+
+Source-time model sampling accepts completed earlier windows with unfinished
+future field context, but rejects a window crossing the pending barrier. Ordinary
+reference and clip-relative decoding keep their existing behavior. Tests cover
+interleaved 10-bit 4:2:2 fields split across published units, adaptive 8-bit field
+pairs, source sampling, complete dynamic geometry and separate-plane/partition
+indexes. These are generated-fixture correctness checks; pretrained field/dynamic
+stream parity and reducing repeated GOP validation remain required. No codec or
+transport runtime dependency is added.
+
+Qualification: `zig/lib/video/testdata/live/field-frontier-validation`.
