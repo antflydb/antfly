@@ -316,10 +316,11 @@ pub const CatalogDdl = struct {
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", generated_name: bool = false },
-    add_check: struct { name: []const u8, expression: *const Scalar },
+    add_unique: struct { name: []const u8, columns: []const []const u8, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
+    add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false },
     add_foreign_key: struct {
         name: []const u8,
+        name_generated: bool = false,
         columns: []const []const u8,
         parent: []const u8,
         parent_columns: []const []const u8,
@@ -329,12 +330,23 @@ pub const SchemaChange = union(enum) {
         deferrable: bool = false,
         timing: []const u8 = "immediate",
     },
-    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null },
+    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null, nulls_not_distinct: bool = false },
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
+
+    /// Provenance is internal compiler data, never inferred from the spelling
+    /// of an identifier or persisted as an editable public-schema attribute.
+    pub fn generatedConstraintName(self: SchemaChange) ?[]const u8 {
+        return switch (self) {
+            .add_unique => |rule| if (rule.name_generated) rule.name else null,
+            .add_check => |rule| if (rule.name_generated) rule.name else null,
+            .add_foreign_key => |rule| if (rule.name_generated) rule.name else null,
+            else => null,
+        };
+    }
 };
 pub const PolicyDdl = struct {
     action: enum { create, alter, drop, enable, disable },

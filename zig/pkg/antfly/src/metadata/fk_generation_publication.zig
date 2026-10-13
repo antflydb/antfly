@@ -28,6 +28,20 @@ pub const Digest = [32]u8;
 pub const max_owners = 4096;
 pub const max_constraints = 128;
 pub const max_bytes = 2 * 1024 * 1024;
+/// Explicit in durable plans/commands: never reinterpret legacy Raft entries.
+pub const CatalogCoverage = @import("antfly_local_sources").schema_relational_declarations.CatalogCoverage;
+
+fn writeCoverageFields(value: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        const include = if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else true;
+        if (include) {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+    }
+    try writer.endObject();
+}
 
 pub fn schemaHasForeignKeys(alloc: std.mem.Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
@@ -66,11 +80,11 @@ test "FK generation pending keys preserve numeric order" {
 }
 
 pub fn tableLockKey(buf: []u8, metadata_group_id: u64, table_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_table_lock:{d}:{d}", .{ metadata_group_id, table_id });
+    return @import("table_lifecycle_lock.zig").key(buf, metadata_group_id, table_id);
 }
 
 pub fn tableLockPrefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_table_lock:{d}:", .{metadata_group_id});
+    return @import("table_lifecycle_lock.zig").prefix(buf, metadata_group_id);
 }
 
 pub const initial_prefix = "\x00\x00__metadata__:fk_initial_create:";
@@ -269,6 +283,36 @@ pub const Plan = struct {
     child_ranges: []const records.RangeRecord,
     child_fences: []const topology.Fence,
     parents: []const Parent,
+    /// Admission is checked before reserving the successor schema. The plan
+    /// digest binds it through owner receipts, cancellation and restart.
+    constraint_name_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
+    catalog_coverage: CatalogCoverage = .legacy,
+
+    /// Proposal-time only: old committed plans still replay under their exact
+    /// identities, but an old producer must not admit a new CHECK-blind job.
+    /// New producers take the zero-allocation fast path.
+    pub fn requireAdmissionCoverage(self: Plan) !void {
+        if (self.catalog_coverage == .checks_v1) return;
+        const Shape = struct { checks: ?[]const struct {} = null };
+        for ([_][]const u8{ self.child_before.schema_json, self.child_after.schema_json }) |bytes| {
+            var buffer: [4096]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            const schema = std.json.parseFromSliceLeaky(Shape, fixed.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidGenerationPublication;
+            if (schema.checks) |checks| if (checks.len != 0) return error.TableTopologyProtocolUpgradeRequired;
+        }
+    }
+
+    pub fn jsonStringify(self: Plan, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Plan).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
         if (std.mem.allEqual(u8, &self.id, 0) or self.child_before.table_id == 0 or
@@ -288,6 +332,24 @@ pub const Plan = struct {
         if (before.storage_mode != .relational or after.storage_mode != .relational or
             after.version != next_version)
             return error.InvalidGenerationPublication;
+        if (self.catalog_coverage == .checks_v1) {
+            const shape = @import("schema_publication_shape.zig");
+            try shape.requireTableImages(alloc, self.child_before, self.child_after);
+            try shape.requireSchemaDelta(alloc, self.child_before.schema_json, self.child_after.schema_json, &.{ "version", "foreign_keys" });
+        }
+        if (self.constraint_name_guard) |guard| {
+            guard.validate() catch return error.InvalidGenerationPublication;
+            const admission = guard.constraint_name_admission orelse return error.InvalidGenerationPublication;
+            if (guard.owner.table_id != self.child_before.table_id or guard.owner.schema_version != before.version or
+                admission.names[0].kind != .foreign_key) return error.InvalidGenerationPublication;
+            var digest_before: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(self.child_before.schema_json, &digest_before, .{});
+            if (!std.mem.eql(u8, &digest_before, &guard.owner.schema_digest)) return error.InvalidGenerationPublication;
+            admission.validateSchema(alloc, self.child_after.schema_json) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidGenerationPublication;
+            };
+        }
         // A schema version may require a successor full-text incarnation.
         // Verify the entire successor index catalog against the deterministic
         // DDL derivation, rather than allowing unrelated index/runtime edits
@@ -310,14 +372,15 @@ pub const Plan = struct {
         const incarnation = try integrity_catalog.incarnationFromTableId(self.child_before.table_id);
         if (!std.mem.eql(u8, &prior_catalog.incarnation, &incarnation) or
             prior_catalog.schema_version != before.version) return error.InvalidGenerationPublication;
-        var compiled_before = try compileCatalog(alloc, before, self.child_before.table_id, null);
+        var compiled_before = try compileCatalogWithCoverage(alloc, before, self.child_before.table_id, null, self.catalog_coverage);
         defer compiled_before.deinit();
         if (!std.mem.eql(u8, &prior_catalog.schema_digest, &compiled_before.catalog.schema_digest)) return error.InvalidGenerationPublication;
+        if (self.catalog_coverage == .checks_v1 and !std.mem.eql(u8, &prior_catalog.checks_digest, &compiled_before.catalog.checks_digest)) return error.InvalidGenerationPublication;
         for (compiled_before.catalog.bindings) |binding| {
             const observed = prior_catalog.find(binding.definition.kind, binding.definition.name) orelse return error.InvalidGenerationPublication;
             if (!std.mem.eql(u8, &observed.definition.fingerprint, &binding.definition.fingerprint)) return error.InvalidGenerationPublication;
         }
-        var compiled_after = try compileCatalog(alloc, after, self.child_after.table_id, catalog_bytes);
+        var compiled_after = try compileCatalogWithCoverage(alloc, after, self.child_after.table_id, catalog_bytes, self.catalog_coverage);
         defer compiled_after.deinit();
         const before_foreign = try before.relationalForeignKeyDefinitions(alloc);
         defer if (before_foreign.len > 0) alloc.free(before_foreign);
@@ -421,9 +484,9 @@ pub const Plan = struct {
         defer before.deinit(alloc);
         var after = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child_after.schema_json);
         defer after.deinit(alloc);
-        var old_compiled = try compileCatalog(alloc, before, self.child_before.table_id, null);
+        var old_compiled = try compileCatalogWithCoverage(alloc, before, self.child_before.table_id, null, self.catalog_coverage);
         defer old_compiled.deinit();
-        var next_compiled = try compileCatalog(alloc, after, self.child_after.table_id, old_bytes);
+        var next_compiled = try compileCatalogWithCoverage(alloc, after, self.child_after.table_id, old_bytes, self.catalog_coverage);
         defer next_compiled.deinit();
         var next_digest: Digest = undefined;
         std.crypto.hash.Blake3.hash(next_compiled.value, &next_digest, .{});
@@ -537,7 +600,24 @@ pub const InitialCreatePlan = struct {
     logical_name: []const u8,
     namespace_id: u64,
 
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: InitialCreatePlan, alloc: std.mem.Allocator) !void {
+        if (self.constraint_name_admission) |admission| {
+            if (admission.namespace_id != self.namespace_id) return error.InvalidGenerationPublication;
+            try admission.validateSchema(alloc, self.child.schema_json);
+        }
         if (std.mem.allEqual(u8, &self.id, 0) or self.catalog_id < 3 or self.namespace_id == 0 or
             self.logical_name.len == 0 or self.logical_name.len > 256 or
             self.child.table_id == 0 or self.child.name.len == 0 or
@@ -556,7 +636,7 @@ pub const InitialCreatePlan = struct {
         const fks = try parsed.relationalForeignKeyDefinitions(alloc);
         defer if (fks.len > 0) alloc.free(fks);
         if (fks.len == 0 or fks.len > max_constraints) return error.InvalidGenerationPublication;
-        var compiled = try compileCatalog(alloc, parsed, self.child.table_id, null);
+        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, .legacy);
         defer compiled.deinit();
         try table_manager.validateCompleteKeyspaceRanges(self.child_ranges);
         for (self.child_ranges) |range| if (range.table_id != self.child.table_id) return error.InvalidGenerationPublication;
@@ -700,7 +780,7 @@ pub const InitialCreatePlan = struct {
     pub fn candidateIdentity(self: InitialCreatePlan, alloc: std.mem.Allocator) !CandidateIdentity {
         var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child.schema_json);
         defer parsed.deinit(alloc);
-        var compiled = try compileCatalog(alloc, parsed, self.child.table_id, null);
+        var compiled = try compileCatalogWithCoverage(alloc, parsed, self.child.table_id, null, .legacy);
         defer compiled.deinit();
         var json_digest: Digest = undefined;
         std.crypto.hash.Blake3.hash(self.child.schema_json, &json_digest, .{});
@@ -815,6 +895,19 @@ pub const InitialCreatePrepareRequest = struct {
     /// Fully normalized create definition; metadata assigns physical identity
     /// and computes owner ranges from its current catalog/fence cut.
     candidate: records.TableRecord,
+    /// Trusted compiler provenance, never a flag inside the public schema.
+    generated_constraint_names: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: InitialCreatePrepareRequest, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePrepareRequest).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const InitialCreatePrepare = struct {
@@ -827,6 +920,18 @@ pub const InitialCreatePrepare = struct {
     transition_generation: u64,
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: InitialCreatePrepare, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePrepare).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const InitialChildDecision = struct {
@@ -1205,20 +1310,8 @@ fn foreignParent(foreign: anytype, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn compileCatalog(alloc: std.mem.Allocator, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, table_id: u64, previous: ?[]const u8) !integrity_catalog.Update {
-    const schema_api = @import("antfly_local_sources").schema_mod;
-    const native_schema = @import("antfly_local_sources").storage_schema;
-    const declarations = @import("antfly_local_sources").schema_relational_declarations;
-    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer native_schema.freeSchema(alloc, runtime);
-    const bytes = try native_schema.serializeSchema(alloc, runtime);
-    defer alloc.free(bytes);
-    var digest: Digest = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
-    const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
-    defer declarations.freeDefinitions(alloc, definitions);
-    return integrity_catalog.prepare(alloc, previous, try integrity_catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions);
-}
+pub const compileCatalog = @import("antfly_local_sources").schema_relational_declarations.compileCatalog;
+pub const compileCatalogWithCoverage = @import("antfly_local_sources").schema_relational_declarations.compileCatalogWithCoverage;
 
 /// Canonical helper for the API plan builder. Names in the returned slice are
 /// owned by `alloc`; a request arena can release them with the full plan.
@@ -1362,9 +1455,15 @@ pub const Command = struct {
     plan: ?Plan = null,
     source_receipt: ?@import("../api/relational_fk_generation_publication.zig").SourceReceipt = null,
     parent_receipt: ?@import("../api/relational_fk_generation_publication.zig").Receipt = null,
+    catalog_coverage: CatalogCoverage = .legacy,
+
+    pub fn jsonStringify(self: Command, writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
 
     pub fn validateShape(self: Command) !void {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or self.child_table_id == 0) return error.InvalidGenerationPublication;
+        if (self.plan) |plan| if (plan.catalog_coverage != self.catalog_coverage) return error.InvalidGenerationPublication;
         switch (self.action) {
             .begin => if (self.expected_revision != 0 or self.plan == null or self.source_receipt != null or self.parent_receipt != null or
                 !std.mem.eql(u8, &self.plan_id, &self.plan.?.id) or self.child_table_id != self.plan.?.child_before.table_id) return error.InvalidGenerationPublication,
@@ -1438,6 +1537,7 @@ pub const Publication = struct {
     pub fn apply(self: Publication, alloc: std.mem.Allocator, command: Command) !Publication {
         try command.validateShape();
         if (command.action == .begin or command.child_table_id != self.plan.child_before.table_id or
+            command.catalog_coverage != self.plan.catalog_coverage or
             !std.mem.eql(u8, &command.plan_id, &self.plan.id) or
             command.expected_revision != self.revision) return error.GenerationPublicationChanged;
         var next = self;
@@ -1583,6 +1683,11 @@ pub const SourceDecision = struct {
     child_after: records.TableRecord,
     child_catalog_before_b64: []const u8,
     child_range: records.RangeRecord,
+    catalog_coverage: CatalogCoverage = .legacy,
+
+    pub fn jsonStringify(self: SourceDecision, writer: anytype) !void {
+        try writeCoverageFields(self, writer);
+    }
 };
 
 test "FK generation publication rejects an unbound or empty plan" {
@@ -1599,6 +1704,86 @@ test "FK generation publication rejects an unbound or empty plan" {
         .parents = &.{},
     };
     try std.testing.expectError(error.InvalidGenerationPublication, plan.validate(std.testing.allocator));
+}
+
+test "FK generation publication catalog preserves independently compiled owner CHECK coverage" {
+    const alloc = std.testing.allocator;
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    var owner_validator = try schema_api.CompiledTableValidator.initParsed(alloc, parsed);
+    defer owner_validator.deinit(alloc);
+    const owner_digest = owner_validator.execution.checks.?.fingerprint();
+    try std.testing.expect(!std.mem.allEqual(u8, &owner_digest, 0));
+    var compiled = try compileCatalog(alloc, parsed, 101, null);
+    defer compiled.deinit();
+    try std.testing.expectEqualSlices(u8, &owner_digest, &compiled.catalog.checks_digest);
+    var legacy = try compileCatalogWithCoverage(alloc, parsed, 101, null, .legacy);
+    defer legacy.deinit();
+    try std.testing.expect(std.mem.allEqual(u8, &legacy.catalog.checks_digest, 0));
+    try std.testing.expect(!std.mem.eql(u8, legacy.value, compiled.value));
+    // A harmless schema epoch change must retain CHECK and UNIQUE coverage.
+    parsed.version = 2;
+    var next = try compileCatalog(alloc, parsed, 101, compiled.value);
+    defer next.deinit();
+    try std.testing.expectEqualSlices(u8, &owner_digest, &next.catalog.checks_digest);
+    try std.testing.expectEqual(compiled.catalog.find(.unique, "pk").?.generation, next.catalog.find(.unique, "pk").?.generation);
+}
+
+test "FK generation publication catalog coverage preserves legacy plan and command bytes" {
+    const a = std.testing.allocator;
+    const plan: Plan = .{
+        .id = @splat(1),
+        .child_before = .{ .table_id = 101, .name = "child" },
+        .child_after = .{ .table_id = 101, .name = "child" },
+        .child_catalog_before_b64 = "catalog",
+        .child_ranges = &.{},
+        .child_fences = &.{},
+        .parents = &.{},
+    };
+    const before = try std.json.Stringify.valueAlloc(a, .{ .id = plan.id, .child_before = plan.child_before, .child_after = plan.child_after, .child_catalog_before_b64 = plan.child_catalog_before_b64, .child_ranges = plan.child_ranges, .child_fences = plan.child_fences, .parents = plan.parents }, .{});
+    defer a.free(before);
+    const after = try std.json.Stringify.valueAlloc(a, plan, .{});
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    var marked = plan;
+    marked.catalog_coverage = .checks_v1;
+    const marked_bytes = try std.json.Stringify.valueAlloc(a, marked, .{});
+    defer a.free(marked_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, marked_bytes, "\"catalog_coverage\":\"checks_v1\"") != null);
+    var command: Command = .{ .plan_id = plan.id, .child_table_id = 101, .expected_revision = 0, .action = .begin, .plan = plan };
+    const command_bytes = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(command_bytes);
+    const command_before = try std.json.Stringify.valueAlloc(a, .{ .plan_id = command.plan_id, .child_table_id = command.child_table_id, .expected_revision = command.expected_revision, .action = command.action, .plan = command.plan, .source_receipt = command.source_receipt, .parent_receipt = command.parent_receipt }, .{});
+    defer a.free(command_before);
+    try std.testing.expectEqualSlices(u8, command_before, command_bytes);
+    command.plan = marked;
+    try std.testing.expectError(error.InvalidGenerationPublication, command.validateShape());
+    command.catalog_coverage = .checks_v1;
+    try command.validateShape();
+}
+
+test "FK generation publication catalog rejects new CHECK blind admission without reinterpreting old plans" {
+    var plan: Plan = .{
+        .id = @splat(1),
+        .child_before = .{ .table_id = 101, .name = "child", .schema_json = "{\"checks\":[]}" },
+        .child_after = .{ .table_id = 101, .name = "child", .schema_json = "{}" },
+        .child_catalog_before_b64 = "catalog",
+        .child_ranges = &.{},
+        .child_fences = &.{},
+        .parents = &.{},
+    };
+    try plan.requireAdmissionCoverage();
+    plan.child_before.schema_json = "{\"checks\":[{\"name\":\"positive\"}]}";
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, plan.requireAdmissionCoverage());
+    plan.child_before.schema_json = "{}";
+    plan.child_after.schema_json = "{\"checks\":[{\"name\":\"positive\"}]}";
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, plan.requireAdmissionCoverage());
+    plan.catalog_coverage = .checks_v1;
+    try plan.requireAdmissionCoverage();
 }
 
 test "self-FK generation plan binds both roles to one exact dual owner fence" {
@@ -1638,6 +1823,58 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
         .parents = &.{.{ .table = table, .ranges = &.{range}, .fences = &.{fence}, .transitions = &.{derived[0].transition} }},
     };
     try plan.validate(alloc);
+    // The new coverage contract also binds the whole schema-only postimage,
+    // not just its table ID and FK/index generation digests.
+    var checked = plan;
+    checked.catalog_coverage = .checks_v1;
+    checked.child_after.read_schema_json = before_json;
+    try checked.validate(alloc);
+    var forged_images = checked;
+    forged_images.child_after.description = "unrelated metadata mutation";
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    forged_images = checked;
+    forged_images.child_after.read_schema_json = after_json;
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    forged_images = checked;
+    forged_images.child_after.read_schema_json = "";
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    for ([_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "\"type\":\"integer\"", .to = "\"type\":\"number\"" },
+        .{ .from = "\"foreign_keys\"", .to = "\"checks\":[{\"name\":\"extra\",\"column\":\"id\",\"op\":\"gt\",\"value\":0}],\"foreign_keys\"" },
+    }) |edit| {
+        forged_images = checked;
+        forged_images.child_after.schema_json = try std.mem.replaceOwned(u8, alloc, after_json, edit.from, edit.to);
+        try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    }
+    // Adding a nullable field must not change already issued digest inputs.
+    const legacy_json = try std.json.Stringify.valueAlloc(alloc, .{ .id = plan.id, .child_before = plan.child_before, .child_after = plan.child_after, .child_catalog_before_b64 = plan.child_catalog_before_b64, .child_ranges = plan.child_ranges, .child_fences = plan.child_fences, .parents = plan.parents }, .{});
+    try std.testing.expectEqualStrings(legacy_json, try std.json.Stringify.valueAlloc(alloc, plan, .{}));
+    var named = plan;
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(before_json, &schema_digest, .{});
+    named.constraint_name_guard = .{
+        .target = .{ .name = "nodes" },
+        .logical_table = "nodes",
+        .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = schema_digest, .kind = .table },
+        .incarnation = @splat(1),
+        .constraint_name_admission = .{ .namespace_id = 1, .names = &.{.{ .name = "self_fk", .kind = .foreign_key }} },
+    };
+    try named.validate(alloc);
+    const named_json = try std.json.Stringify.valueAlloc(alloc, named, .{});
+    const recovered = try std.json.parseFromSliceLeaky(Plan, alloc, named_json, .{ .allocate = .alloc_always });
+    try recovered.validate(alloc);
+    try std.testing.expectEqualStrings("self_fk", recovered.constraint_name_guard.?.constraint_name_admission.?.names[0].name);
+    try std.testing.expectEqualDeep(try named.digest(alloc), try recovered.digest(alloc));
+    try std.testing.expect(!std.mem.eql(u8, &(try plan.digest(alloc)), &(try named.digest(alloc))));
+    var bad_named = named;
+    bad_named.constraint_name_guard.?.owner.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
+    bad_named = named;
+    bad_named.constraint_name_guard.?.constraint_name_admission.?.names = &.{.{ .name = "pk", .kind = .unique }};
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
+    bad_named = named;
+    bad_named.constraint_name_guard.?.constraint_name_admission.?.names = &.{.{ .name = "missing_fk", .kind = .foreign_key }};
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
     var wrong_role = fence;
     wrong_role.role = .child_generation_source;
     var invalid = plan;

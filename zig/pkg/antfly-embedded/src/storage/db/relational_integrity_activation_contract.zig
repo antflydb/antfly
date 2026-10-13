@@ -45,6 +45,21 @@ pub fn generationSet(catalog: catalog_mod.Catalog) integrity.Digest {
     return result;
 }
 
+/// Selected root datums and null provenance from one immutable primary-row
+/// observation. Coordinators authenticate markers against their pinned schema
+/// before evaluation; JSON alone cannot carry the original SQL null bits.
+pub const Row = struct {
+    key: []const u8,
+    json: []const u8,
+    version: u64,
+    expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
+
+    pub fn nativeJsonSkipField(row: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "json_null_fields") and row.json_null_fields.len == 0;
+    }
+};
+
 pub fn hasActive(catalog: catalog_mod.Catalog) bool {
     if (hasChecks(catalog)) return true;
     for (catalog.bindings) |binding| if (!binding.retired) return true;

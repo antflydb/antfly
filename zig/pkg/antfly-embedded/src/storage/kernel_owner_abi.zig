@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 76;
+pub const abi_version: u32 = 77;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1187,6 +1187,24 @@ pub const NativeFkGenerationControlRequest = extern struct {
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
 };
+
+/// Private compiled-owner entry point. The receiving server independently
+/// authenticates the coordinator and obtains a fresh metadata owner decision.
+/// Admission supplies raw immutable inputs; physical IDs are chosen locally.
+pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, cancel_intent = 6, cancel_cleanup = 7, cancel_gc_page = 8, cancel_admit = 9, cancel_fence = 10, cancel_reserve = 11, cancel_inspect = 12, cancel_claim_gc_page = 13, claims = 14, _ };
+pub const NativeIndexOwnerControlRequest = extern struct {
+    version: u32 = abi_version,
+    operation: NativeIndexOwnerOperation,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    manifest: BorrowedBytes = .{},
+};
+
+pub extern fn antfly_storage_owner_native_index_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeIndexOwnerControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_native_fk_generation_control_json(
     owner: ?*anyopaque,

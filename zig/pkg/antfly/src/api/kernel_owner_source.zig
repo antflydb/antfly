@@ -54,6 +54,8 @@ const table_write_source = @import("antfly_local_sources").api_table_write_sourc
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("antfly_local_sources").common_config;
+const native_index_control = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+const index_owner_job = @import("antfly_local_sources").storage_db_relational_index_owner_job;
 const scraping = @import("antfly_scraping");
 
 /// Native owner controls use the platform monotonic clock. In particular on
@@ -61,6 +63,44 @@ const scraping = @import("antfly_scraping");
 /// budget once, before both cold owner acquisition and the compiled boundary.
 fn platformDeadlineContext(context: request_operation.RequestContext) !request_operation.RequestContext {
     return context.platformDeadline();
+}
+
+test "native index owner adapter rejects cancellation deadline and foreign group before acquisition" {
+    // Deliberately uninitialized: all failures must precede catalog/owner access.
+    var source: ProvisionedKernelOwnerSource = undefined;
+    const identity: native_index_control.Identity = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .namespace = .{ .table_id = 101, .shard_id = 102, .range_id = 103 },
+        .owner_group_id = 7,
+    };
+    var signal = std.atomic.Value(bool).init(true);
+    const cancelled: request_operation.RequestContext = .{
+        .cancellation = request_operation.CancellationToken.fromAtomic(&signal),
+    };
+    const expired: request_operation.RequestContext = .{ .deadline_ns = 0 };
+    inline for (.{ cancelled, expired }) |context| {
+        const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
+        try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
+        try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerControlAtRoot(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerClaims(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerClaimsAtRoot(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.collectNativeIndexOwnerClaimGarbage(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.admitCanceledNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
+        try std.testing.expectError(expected, source.applyCanceledNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerCancellationState(std.testing.allocator, 7, "rows", identity, context));
+    }
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, source.nativeIndexOwnerState(std.testing.allocator, 8, "rows", identity, .{}));
+    try std.testing.expectError(error.InvalidPrivateIndexInputs, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "", .{}));
 }
 
 test "distributed txn native lookup read-index rejects leader loss before storage execution" {
@@ -3550,6 +3590,418 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         defer response.deinit();
         return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
+    }
+
+    /// Pin the exact physical owner for the whole private operation. This is
+    /// a storage adapter, not metadata authorization: callers must independently
+    /// obtain publication permission before dispatching a mutation here.
+    fn acquireNativeIndexOwner(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !Lease {
+        try context.ensureActive();
+        try identity.validate();
+        if (identity.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+        const normalized = try platformDeadlineContext(context);
+        var lease = try self.acquireWithControls(group_id, table_name, .{
+            .allow_deferred_catalog = true,
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation = normalized.cancellation,
+        });
+        errdefer lease.deinit();
+        if (lease.entry.identity.table_id != identity.namespace.table_id or
+            lease.entry.identity.shard_id != identity.namespace.shard_id or
+            lease.entry.identity.range_id != identity.namespace.range_id)
+            return error.IdentityNamespaceMismatch;
+        try context.ensureActive();
+        return lease;
+    }
+
+    /// Claim bytes and expected binding are not a remote capability. The
+    /// authenticated receiver independently obtains current metadata permission
+    /// before calling this leased physical adapter. Kernel apply rechecks the
+    /// durable job, actual receiving range and cancellation in its transaction.
+    /// Retain the physical root from the lease that committed these claims.
+    /// This is provenance, not enrollment or a signed publication receipt.
+    pub const RootedNativeIndexOwnerClaims = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native_index_control.ClaimOutcome),
+
+        pub fn deinit(self: *RootedNativeIndexOwnerClaims) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn applyNativeIndexOwnerClaimsAtRoot(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.ClaimCommand,
+        context: request_operation.RequestContext,
+    ) !RootedNativeIndexOwnerClaims {
+        try context.ensureActive();
+        try command.validate();
+        const binding = command.binding;
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = binding.id,
+            .plan_digest = binding.plan_digest,
+            .owner_digest = binding.owner_digest,
+            .ordinal = binding.ordinal,
+            .namespace = binding.fence.namespace,
+            .owner_group_id = binding.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native_index_control.max_claim_wire_bytes) return error.TransactionTooLarge;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerClaimsJson(table_name, encoded);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(native_index_control.ClaimOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(command);
+        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+    }
+
+    pub fn applyNativeIndexOwnerClaims(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.ClaimCommand,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.ClaimOutcome) {
+        // Transfer the owned result without reconstructing its physical root
+        // from another lookup. Signing callers must use the rooted operation.
+        return (try self.applyNativeIndexOwnerClaimsAtRoot(alloc, group_id, table_name, command, context)).outcome;
+    }
+
+    pub fn nativeIndexOwnerState(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(?index_owner_job.Binding) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerStateJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(?index_owner_job.Binding, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    pub fn nativeIndexOwnerCancellationState(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(index_owner_job.CancellationState) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCancellationStateJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(index_owner_job.CancellationState, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    /// The generation is observed from the same pinned physical owner that
+    /// recovered the cut, never from a later routing/status lookup. This is not
+    /// an attestation: pending outcomes still carry no publishable receipt, and
+    /// enrollment, replica placement and signing remain the receiver's duties.
+    pub const RootedNativeIndexOwnerReceipt = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(?native_index_control.Outcome),
+
+        pub fn deinit(self: *RootedNativeIndexOwnerReceipt) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn nativeIndexOwnerReceiptAtRoot(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: native_index_control.ReceiptRequest,
+        context: request_operation.RequestContext,
+    ) !RootedNativeIndexOwnerReceipt {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerReceiptJson(table_name, encoded);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (parsed.value) |value| try value.validateRecovery(request);
+        return .{
+            .root_generation = lease.entry.generation,
+            .outcome = parsed,
+        };
+    }
+
+    pub fn nativeIndexOwnerReceipt(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: native_index_control.ReceiptRequest,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(?native_index_control.Outcome) {
+        // Transfer the parsed response; this observational caller does not
+        // sign it and must not reconstruct a generation from another lookup.
+        return (try self.nativeIndexOwnerReceiptAtRoot(alloc, group_id, table_name, request, context)).outcome;
+    }
+
+    /// Queue shared GC at the leased physical owner, not a canceled ACK.
+    pub fn cleanupNativeIndexOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupOutcome) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCleanupJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(native_index_control.CleanupOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    /// One bounded derived-artifact page at the exact leased physical owner.
+    /// A committed page is not converted into a request-cancellation failure.
+    pub fn collectNativeIndexOwnerGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupMaintenanceOutcome) {
+        return self.collectNativeIndexOwnerDerivedGarbage(alloc, group_id, table_name, identity, context, false);
+    }
+
+    pub fn collectNativeIndexOwnerClaimGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.ClaimCleanupMaintenanceOutcome) {
+        return self.collectNativeIndexOwnerDerivedGarbage(alloc, group_id, table_name, identity, context, true);
+    }
+
+    fn collectNativeIndexOwnerDerivedGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+        comptime claims: bool,
+    ) !std.json.Parsed(if (claims) native_index_control.ClaimCleanupMaintenanceOutcome else native_index_control.CleanupMaintenanceOutcome) {
+        const Outcome = if (claims) native_index_control.ClaimCleanupMaintenanceOutcome else native_index_control.CleanupMaintenanceOutcome;
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = if (claims) try lease.owner().nativeIndexOwnerClaimGcJson(table_name, encoded) else try lease.owner().nativeIndexOwnerGcJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    /// Persist intent at the leased physical owner; this is not a canceled ACK.
+    pub fn cancelNativeIndexOwnerIntent(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        intent: native_index_control.Admission,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CancellationOutcome) {
+        try context.ensureActive();
+        try intent.validate();
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = intent.id,
+            .plan_digest = intent.plan_digest,
+            .owner_digest = intent.owner_digest,
+            .ordinal = intent.ordinal,
+            .namespace = intent.fence.namespace,
+            .owner_group_id = intent.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, intent, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCancellationJson(table_name, encoded);
+        defer response.deinit();
+        // Cancellation observed after commit must not erase durable progress.
+        return std.json.parseFromSlice(native_index_control.CancellationOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    pub fn admitNativeIndexOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        admission: native_index_control.Admission,
+        manifest: []const u8,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.Outcome) {
+        return self.admitNativeIndexOwnerImpl(alloc, group_id, table_name, admission, manifest, context, false);
+    }
+
+    pub fn admitCanceledNativeIndexOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        admission: native_index_control.Admission,
+        manifest: []const u8,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupOutcome) {
+        return self.admitNativeIndexOwnerImpl(alloc, group_id, table_name, admission, manifest, context, true);
+    }
+
+    fn admitNativeIndexOwnerImpl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        admission: native_index_control.Admission,
+        manifest: []const u8,
+        context: request_operation.RequestContext,
+        comptime canceling: bool,
+    ) !std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome) {
+        try context.ensureActive();
+        if (manifest.len == 0 or manifest.len > native_index_control.Prepared.max_manifest_bytes)
+            return error.InvalidPrivateIndexInputs;
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = admission.id,
+            .plan_digest = admission.plan_digest,
+            .owner_digest = admission.owner_digest,
+            .ordinal = admission.ordinal,
+            .namespace = admission.fence.namespace,
+            .owner_group_id = admission.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, admission, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = if (canceling)
+            try lease.owner().nativeIndexOwnerCancellationAdmissionJson(table_name, encoded, manifest)
+        else
+            try lease.owner().nativeIndexOwnerAdmissionJson(table_name, encoded, manifest);
+        defer response.deinit();
+        // A committed pending outcome must survive cancellation observed after
+        // the ABI returns. Do not turn durable success into a retry-looking error.
+        return std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    /// Keep the applying lease's root with its owned committed outcome. A
+    /// subsequent status lookup may already refer to a replacement root.
+    pub const RootedNativeIndexOwnerControl = RootedNativeControl(false);
+
+    fn RootedNativeControl(comptime canceling: bool) type {
+        return struct {
+            root_generation: u64,
+            outcome: std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome),
+
+            pub fn deinit(self: *@This()) void {
+                self.outcome.deinit();
+                self.* = undefined;
+            }
+        };
+    }
+
+    pub fn applyNativeIndexOwnerControlAtRoot(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+    ) !RootedNativeIndexOwnerControl {
+        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, false);
+    }
+
+    pub fn applyNativeIndexOwnerControl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.Outcome) {
+        return (try self.applyNativeIndexOwnerControlAtRoot(alloc, group_id, table_name, command, context)).outcome;
+    }
+
+    pub fn applyCanceledNativeIndexOwnerControl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupOutcome) {
+        return (try self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, true)).outcome;
+    }
+
+    fn applyNativeIndexOwnerControlImpl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+        comptime canceling: bool,
+    ) !RootedNativeControl(canceling) {
+        try context.ensureActive();
+        try command.validate();
+        const operation: abi.NativeIndexOwnerOperation = switch (command.effect) {
+            .fenced => if (canceling) .cancel_fence else .fence,
+            .reserved => if (canceling) .cancel_reserve else .reserve,
+            else => return error.InvalidPrivateIndexOwnerJob,
+        };
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = command.binding.id,
+            .plan_digest = command.binding.plan_digest,
+            .owner_digest = command.binding.owner_digest,
+            .ordinal = command.binding.ordinal,
+            .namespace = command.binding.fence.namespace,
+            .owner_group_id = command.binding.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerControlJson(table_name, operation, encoded);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (!canceling) try parsed.value.validateFor(command);
+        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
     }
 
     pub fn applyFkGenerationNative(

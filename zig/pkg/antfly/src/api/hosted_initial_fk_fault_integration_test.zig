@@ -76,10 +76,11 @@ pub fn mountedInitialFault(leadership_transfer: bool) !void {
     return mountedInitialScenario(if (leadership_transfer) .transfer else .restart);
 }
 
-pub const Scenario = enum { restart, transfer, cancel_offline, published_obsolete };
+pub const Scenario = enum { restart, transfer, generated_transfer, cancel_offline, published_obsolete };
 
 pub fn mountedInitialScenario(scenario: Scenario) !void {
     const leadership_transfer = scenario != .restart;
+    const generated = scenario == .generated_transfer;
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const internal_secret = "hosted-fk-internal-service-secret-v1";
@@ -303,9 +304,11 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     // A rejected initial MATCH PARTIAL create must not leave a hidden child
     // or an orphaned generation publication behind. Keep this assertion even
     // while the coordinated publication path remains publicly guarded.
-    const child_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/children", .{base});
+    const child_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, if (generated) "/db/v1/sql" else "/db/v1/tables/children" });
     defer alloc.free(child_uri);
-    const child_body =
+    const child_body = if (generated)
+        \\{"statement":"CREATE TABLE children (id BIGINT NOT NULL, pa BIGINT, pb BIGINT, FOREIGN KEY (pa, pb) REFERENCES parents (a, b) MATCH PARTIAL)"}
+    else
         \\{"num_shards":1,"schema":{"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"partial_parent","child_columns":["pa","pb"],"parent_table":"parents","parent_columns":["a","b"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"pa":{"type":"integer","nullable":true},"pb":{"type":"integer","nullable":true}},"required":["id"],"additionalProperties":false}}}}}
     ;
     const driver = http_server.ApiHttpServer.FkInitialCreateTestDriver;
@@ -322,10 +325,18 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     });
     defer child_response.deinit(alloc);
 
+    if (child_response.status != 202) std.debug.print("initial FK admission failed status={d} body={s}\n", .{ child_response.status, child_response.body });
     try std.testing.expectEqual(@as(u16, 202), child_response.status);
-    var accepted = try std.json.parseFromSlice(struct { table_id: []const u8 }, alloc, child_response.body, .{ .ignore_unknown_fields = true });
+    var accepted = try std.json.parseFromSlice(struct {
+        table_id: ?[]const u8 = null,
+        ddl_receipt: ?struct { table_id: []const u8 } = null,
+    }, alloc, child_response.body, .{ .ignore_unknown_fields = true });
     defer accepted.deinit();
-    const child_id = try std.fmt.parseInt(u64, accepted.value.table_id, 10);
+    const child_id = try std.fmt.parseInt(u64, if (generated)
+        (accepted.value.ddl_receipt orelse return error.MissingSqlDdlReceipt).table_id
+    else
+        accepted.value.table_id orelse return error.MissingCreatedTableIdentity, 10);
+    if (generated) try expectGeneratedForeignName(alloc, &metadata, child_id);
     var restarted = false;
     var transferred = false;
     var hidden_voters_ready = false;
@@ -566,6 +577,25 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         if (table.table_id == child_id) children += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), children);
+    if (generated) try expectGeneratedForeignName(alloc, &metadata, child_id);
+}
+
+fn expectGeneratedForeignName(alloc: std.mem.Allocator, metadata: *metadata_runtime.Server, child_id: u64) !void {
+    const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
+    const bytes = try source.systemCatalog(alloc, .{
+        .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s,
+        .fk_generation_publication_authority = true,
+    }, .{ .fk_initial_create_status = child_id });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(publication.InitialPublication, alloc, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try parsed.value.plan.validate(alloc);
+    try std.testing.expectEqualDeep(try parsed.value.plan.digest(alloc), parsed.value.plan_digest);
+    const admission = parsed.value.plan.constraint_name_admission orelse return error.MissingConstraintNameAdmission;
+    try std.testing.expectEqual(@as(usize, 1), admission.names.len);
+    try std.testing.expectEqual(.foreign_key, admission.names[0].kind);
+    try std.testing.expectEqualStrings("children_pa_pb_fkey", admission.names[0].name);
+    try admission.validateSchema(alloc, parsed.value.plan.child.schema_json);
 }
 
 test "mounted initial FK lost replies and cold owner restart before release" {

@@ -126,6 +126,9 @@ pub const RequestContext = struct {
     /// Internal body-bound authorization for fenced FK schema publication.
     /// Never accepted from public SQL or a client-provided catalog payload.
     fk_generation_publication_authority: bool = false,
+    /// Granted by authenticated, body-bound internal index-owner reads only.
+    /// Never reconstructed from a public SQL or serialized request payload.
+    index_publication_authority: bool = false,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,

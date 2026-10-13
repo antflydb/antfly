@@ -67,7 +67,7 @@ pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig") };
+    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), clock_values: ?catalog.Clock.Frame };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -92,6 +92,7 @@ pub const Result = struct {
 
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
+        state.clock_values = null;
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
         state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -124,7 +125,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     try backend.vtable.checkpoint(backend.ptr);
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
     defer if (pinned_settings) |*view| view.deinit();
-    var statement_backend = backend;
+    var statement_backend = try backend.pinStatementClock();
     if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
@@ -132,12 +133,19 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
         statement_backend.settings_view = &pinned_settings.?;
     }
     const state = try alloc.create(Result.State);
+    errdefer alloc.destroy(state);
+    state.clock_values = if (statement_backend.statement_clock) |view| try catalog.Clock.Frame.init(view) else null;
     state.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
     var result = Result{ .state = state, .output = undefined };
-    errdefer result.deinit();
+    errdefer {
+        state.regex_execution.deinit();
+        state.arena.deinit();
+        std.debug.assert(state.budget.live == 0);
+    }
+    statement_backend.clock_values = if (state.clock_values) |*frame| frame else null;
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
@@ -358,7 +366,7 @@ pub const Context = struct {
             const values = try scratch.allocator().alloc(Datum, row.len);
             for (row, values, self.binding.columns, 0..) |value_, *cell, column, ordinal| {
                 if (column.type == .array) return error.InvalidSqlBackendResponse;
-                cell.* = try describe.coerceDatum(scratch.allocator(), .{ .value = value_, .sql_null = if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, .patterns = if (output.pattern_sources) |sources| sources[index][ordinal] else null }, column.type, column.element_type);
+                cell.* = try describe.coerceDatum(scratch.allocator(), Datum.fromParts(value_, if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, if (output.pattern_sources) |sources| sources[index][ordinal] else null), column.type, column.element_type);
             }
             try sink.append(sink.ptr, values);
         }
@@ -383,6 +391,10 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.temporal() != null) {
+            var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            return .{ .string = try self.arena.dupe(u8, try @import("scalar.zig").formatTimestampResult(datum, kind, &text)) };
+        }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
             if (checked.sql_null) return .null;
@@ -1661,6 +1673,10 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
 /// independently prepared MERGE images. Never encode a typed array's JSON
 /// placeholder or retain payloads borrowed from an evaluator's scratch arena.
 pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
+    if (datum.temporal() != null) {
+        try datum.validateTemporal();
+        return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
+    }
     const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
     const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
     if (checked.sql_null) {

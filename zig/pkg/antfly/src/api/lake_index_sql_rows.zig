@@ -440,7 +440,7 @@ const Owner = struct {
                     if (positions[rank] != null) return error.InvalidNativeLakeRowIndex;
                     for (request.fields, cells) |field, *cell| {
                         const value = try page.cell(sa, row, field);
-                        cell.* = .{ .value = value.value, .sql_null = value.sql_null, .patterns = value.patterns };
+                        cell.* = value;
                     }
                     positions[rank] = try self.ordered_store.?.append(cells);
                 }
@@ -1134,7 +1134,7 @@ fn dynamicBoundKey(a: A, tuple: local.storage_db_relational_index_keys.TuplePlan
             // placeholder is not data, and cross-domain narrowing is unproven.
             if (bound.column_type != .numeric) return null;
             value.* = .{ .numeric = try local.sql_numeric_binary.encodeAlloc(&ctx, number.*) };
-        } else if (datum.array != null or datum.patterns != null or (!datum.sql_null and datum.value == .null)) return null else value.* = try local.schema_relational_checks.valueFromJson(a, bound.column_type, if (datum.sql_null) .null else datum.value, true);
+        } else if (datum.array != null or datum.patterns() != null or (!datum.sql_null and datum.value == .null)) return null else value.* = try local.schema_relational_checks.valueFromJson(a, bound.column_type, if (datum.sql_null) .null else datum.value, true);
     }
     var encoded: std.ArrayList(u8) = .empty;
     _ = try tuple.appendValuesWithContext(a, &encoded, values, &ctx);

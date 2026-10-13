@@ -545,8 +545,36 @@ pub const RaftApplyStore = struct {
     pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
     }
+    pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_decision = request });
+    }
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
+    }
+    pub fn fkInitialCreatePrepareJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare_with_deadline = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
+    pub fn prepareConstraintNamesJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.ConstraintNamePreparation, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .constraint_name_prepare = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
+    pub fn checkConstraintNamesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.ConstraintNameCheck, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const normalized = try context.platformDeadline();
+        const ready = try self.catalogProjection(bool, alloc, group_id, .{ .constraint_name_check = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        try context.ensureActive();
+        if (!ready) return error.InvalidCatalogRecord;
+    }
+    pub fn preflightFkGenerationNameAdmission(self: *RaftApplyStore, group_id: u64, plan: fk_generation_publication.Plan) !void {
+        if (plan.constraint_name_guard == null) return;
+        const ready = try self.catalogProjection(bool, self.alloc, group_id, .{ .fk_generation_name_admission = plan });
+        if (!ready) return error.InvalidCatalogRecord;
     }
     pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
         const result = try self.projection(contract.InitialFkPreflight, .{

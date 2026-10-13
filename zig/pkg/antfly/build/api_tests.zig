@@ -38,6 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [2]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2133,31 +2134,44 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
         .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
-    const sql_primary_key_rewrite_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
+    const sql_owner_lifecycle_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_sql_owner_lifecycle_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configureConsumer(b, sql_primary_key_rewrite_test_mod);
-    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, sql_primary_key_rewrite_test_mod, options.lmdb_engine, true);
-    sql_primary_key_rewrite_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
-    sql_primary_key_rewrite_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
-    sql_primary_key_rewrite_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-    const pk_usermgr_storage = b.createModule(.{
+    test_imports.configureConsumer(b, sql_owner_lifecycle_test_mod);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, sql_owner_lifecycle_test_mod, options.lmdb_engine, true);
+    sql_owner_lifecycle_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    sql_owner_lifecycle_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    sql_owner_lifecycle_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const sql_owner_usermgr_storage = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
         .optimize = optimize,
     });
-    pk_usermgr_storage.addImport("antfly_root", sql_primary_key_rewrite_test_mod);
-    pk_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
-    sql_primary_key_rewrite_test_mod.addImport("usermgr_storage", pk_usermgr_storage);
-    const sql_primary_key_rewrite_tests = b.addTest(.{
-        .root_module = sql_primary_key_rewrite_test_mod,
-        .filters = &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"},
+    sql_owner_usermgr_storage.addImport("antfly_root", sql_owner_lifecycle_test_mod);
+    sql_owner_usermgr_storage.addImport("antfly_platform", antfly_imports.platform);
+    sql_owner_lifecycle_test_mod.addImport("usermgr_storage", sql_owner_usermgr_storage);
+    // Compile the expensive linked-control owner once; each gate selects its
+    // own runtime campaign and independently requires no skips.
+    const sql_owner_lifecycle_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL regular unique index build failure is atomic" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
+    const sql_primary_key_rewrite_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"});
+    sql_primary_key_rewrite_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
-        .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
+        .dependOn(&sql_primary_key_rewrite_run.step);
+    const sql_index_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original unique indexes enforce exact postimages across owner restart"});
+    sql_index_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
+        .dependOn(&sql_index_lifecycle_run.step);
+    const sql_index_atomicity_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL regular unique index build failure is atomic"});
+    sql_index_atomicity_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-index-build-atomicity-test", "Run regular unique-index build rejection and repaired resubmission qualification")
+        .dependOn(&sql_index_atomicity_run.step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,
@@ -2197,8 +2211,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "mounted initial FK hidden three voter owner transfers before release", "hosted initial FK real services and facade retain all required capabilities" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const hosted_initial_fk_transfer_run = addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests);
+    hosted_initial_fk_transfer_run.addArg("--require-no-skips");
     b.step("antfly-api-hosted-initial-fk-transfer-test", "Run hidden initial-child three-voter Raft leadership transfer")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests).step);
+        .dependOn(&hosted_initial_fk_transfer_run.step);
     const hosted_initial_fk_offline_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial FK canceled offline replica returns and signs exact unlink ACK", "mounted initial FK published obsolete released replica retires without canceling current owner", "hosted initial FK real services and facade retain all required capabilities" },
@@ -2238,10 +2254,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const hosted_fk_lifecycle_run = addFilteredTestRunArtifact(b, hosted_fk_drop_tests);
     b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+        .dependOn(&hosted_fk_lifecycle_run.step);
     b.step("antfly-api-hosted-fk-truncate-test", "Run mounted external-parent FK generation retirement and restart")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+        .dependOn(&hosted_fk_lifecycle_run.step);
     const hosted_graph_truncate_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{"mounted hosted graph TRUNCATE"},
@@ -2441,6 +2458,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,
@@ -2458,7 +2476,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_owner_lifecycle_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

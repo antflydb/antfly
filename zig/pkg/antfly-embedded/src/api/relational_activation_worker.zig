@@ -120,6 +120,12 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         // Yield without advancing this checkpoint so parent repair/validation
         // can run before a later supervisor tick retries this page.
         if (err == error.ConstraintActivationPending) return .idle;
+        // Page-local expression admission is shared across rows. Retry a
+        // smaller page, but never persist quota exhaustion as an invalid row.
+        if (err == error.RelationalExpressionBudgetExceeded) {
+            if (budget.shrink(parsed.value.rows.len)) return .shrink;
+            return err;
+        }
         // A repeated absence diagnostic is not progress. The next supervisor
         // tick (or embedded call) rechecks it, while admitting guarded repairs.
         if (err == error.ForeignKeyParentMissing and progress.state == .validating and std.mem.eql(u8, progress.failure, "ForeignKeyParentMissing")) return .idle;

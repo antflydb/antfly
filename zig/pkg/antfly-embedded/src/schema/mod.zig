@@ -154,6 +154,16 @@ pub const CompiledTableValidator = struct {
         }
     }
 
+    pub fn prepareTypedValueWithNulls(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !impl.PreparedJsonNulls {
+        if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        const prepared = try impl.prepareTypedDocumentWithNulls(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        errdefer prepared.deinit(owned_alloc);
+        if (self.execution.expressions != null) {
+            if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        }
+        return prepared;
+    }
+
     fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         if (value.* != .object) return;
         for (self.uuid_columns) |name| {
@@ -266,6 +276,8 @@ test "relational index system SQL public arrays bind precise storage and coerce 
         try std.testing.expect(!column.is_json);
         try std.testing.expectEqual(storage_schema.RelationalJsonKind.none, column.json_kind);
     }
+    try std.testing.expect(runtime.requires_jsonb_array_display);
+    try std.testing.expect(!runtime.requires_json_expressions);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"a":{"dimensions":[{"length":2,"lower_bound":-3}],"values":["9007199254740993",null],"sql_nulls":[false,true]},"f":{"dimensions":[{"length":3,"lower_bound":1}],"values":[0.1,"NaN","Infinity"],"sql_nulls":[false,false,false]},"j":{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]}}
     , .{ .parse_numbers = false });
@@ -771,6 +783,57 @@ pub fn documentPropertyUsesJsonEncoding(property: impl.DocumentProperty) bool {
     return impl.documentPropertyUsesJsonEncoding(property);
 }
 
+fn requiresJsonbDisplay(schema: ParsedTableSchema) bool {
+    if (schema.storage_mode != .relational) return false;
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (documentPropertyUsesJsonEncoding(property)) return true;
+    };
+    return false;
+}
+
+fn jsonbArrayJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("sql_type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "jsonb")) {
+        if (expression.object.get("type")) |ty| if (ty == .string and std.mem.eql(u8, ty.string, "sql_array")) return true;
+        if (expression.object.get("op")) |op| if (op == .string and std.mem.eql(u8, op.string, "array")) return true;
+    };
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (jsonbArrayJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn jsonbArrayWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.sql_type == .jsonb and (expression.type == .sql_array or expression.op == .array)) return true;
+    if (expression.args) |args| for (args) |arg| if (jsonbArrayWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresJsonbArrayDisplay(schema: ParsedTableSchema) bool {
+    if (schema.storage_mode != .relational) return false;
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (property.field_type) |kind| {
+            if (std.mem.eql(u8, kind, "sql_array") and property.sql_type == .jsonb) return true;
+        }
+    };
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (jsonbArrayWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (jsonbArrayWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (jsonbArrayWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (jsonbArrayJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
 pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
 pub const documentNumberToF64 = impl.documentNumberToF64;
@@ -796,6 +859,174 @@ fn typedNumericWire(expression: anytype, depth: usize, predicate: bool) bool {
     if ((!predicate and expression.sql_type != null) or expressionCapabilityOp(@tagName(expression.op), predicate)) return true;
     if (expression.args) |args| for (args) |arg| if (typedNumericWire(arg, depth + 1, predicate)) return true;
     return false;
+}
+
+fn requiresConstantIndexPredicates(schema: ParsedTableSchema) bool {
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.where orelse &.{}) |condition| if (condition.constant != null) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+        for (constraint.where orelse &.{}) |condition| if (condition.constant != null) return true;
+    };
+    return false;
+}
+
+fn textExpressionJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and
+        (std.mem.eql(u8, op.string, "replace") or std.mem.eql(u8, op.string, "md5"))) return true;
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (textExpressionJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn textExpressionWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.op == .replace or expression.op == .md5) return true;
+    if (expression.args) |args| for (args) |arg| if (textExpressionWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresTextExpressions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (textExpressionWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (textExpressionWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (textExpressionWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (textExpressionJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
+fn numericFunctionName(name: []const u8) bool {
+    return std.meta.stringToEnum(@import("../sql/numeric_functions.zig").Function, name) != null;
+}
+
+fn numericFunctionJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and numericFunctionName(op.string)) return true;
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (numericFunctionJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn numericFunctionWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (numericFunctionName(@tagName(expression.op))) return true;
+    if (expression.args) |args| for (args) |arg| if (numericFunctionWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresNumericFunctions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (numericFunctionWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (numericFunctionWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (numericFunctionWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (numericFunctionJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
+test "relational index system SQL durable numeric capability covers every declaration owner" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE t (n numeric, g numeric GENERATED ALWAYS AS (round(n,2)) STORED)",
+        "CREATE TABLE t (n numeric DEFAULT sqrt(2::numeric))",
+        "CREATE TABLE t (n numeric, CHECK (sign(n) >= 0))",
+        "CREATE TABLE t (n double precision, g double precision GENERATED ALWAYS AS (ceil(n)) STORED)",
+    }) |sql| {
+        var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+        defer a.free(bytes);
+        var parsed = try parseValidatedTableSchema(a, bytes);
+        defer parsed.deinit(a);
+        const runtime = try deriveRuntimeTableSchema(a, parsed);
+        defer storage_schema.freeSchema(a, runtime);
+        const checks_layout = try deriveRelationalCheckLayout(a, parsed);
+        defer storage_schema.freeSchema(a, checks_layout);
+        try std.testing.expect(runtime.requires_numeric_functions);
+        try std.testing.expect(checks_layout.requires_numeric_functions);
+        const serialized = try storage_schema.serializeSchema(a, runtime);
+        defer a.free(serialized);
+        const restored = try storage_schema.deserializeSchema(a, serialized);
+        defer storage_schema.freeSchema(a, restored);
+        try std.testing.expect(restored.requires_numeric_functions);
+    }
+}
+
+test "relational index system SQL durable numeric capability covers index and UNIQUE keys" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "CREATE INDEX n_idx ON t ((round(n,2)))", "CREATE UNIQUE INDEX n_idx ON t ((round(n,2)))" }) |sql| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var create = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE t (n numeric)", .{});
+        defer create.deinit();
+        const base = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(owned, create.statement.create_table);
+        var public = try std.json.parseFromSliceLeaky(std.json.Value, owned, base, .{ .parse_numbers = false });
+        var index = try @import("../sql/compiler.zig").compile(a, sql, .{});
+        defer index.deinit();
+        _ = try @import("../sql/schema_ddl.zig").apply(owned, &public, index.statement.catalog_ddl);
+        const encoded = try std.json.Stringify.valueAlloc(owned, public, .{});
+        var parsed = try parseValidatedTableSchema(a, encoded);
+        defer parsed.deinit(a);
+        const runtime = try deriveRuntimeTableSchema(a, parsed);
+        defer storage_schema.freeSchema(a, runtime);
+        try std.testing.expect(runtime.requires_numeric_functions);
+        if (std.mem.indexOf(u8, sql, "UNIQUE") != null) {
+            // Isolate the constraint owner: an accompanying physical index
+            // must not be the only reason the capability is detected.
+            var unique_only = parsed;
+            unique_only.relational_indexes = null;
+            try std.testing.expect(requiresNumericFunctions(unique_only));
+        }
+    }
+}
+
+test "relational index system SQL durable text capability covers every declaration owner" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (md5(s)) STORED)",
+        "CREATE TABLE t (s text DEFAULT md5('x'))",
+        "CREATE TABLE t (s text, CHECK (md5(s) <> ''))",
+        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (replace(s,'a','b')) STORED)",
+    }) |sql| {
+        var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+        defer a.free(bytes);
+        var parsed = try parseValidatedTableSchema(a, bytes);
+        defer parsed.deinit(a);
+        const runtime = try deriveRuntimeTableSchema(a, parsed);
+        defer storage_schema.freeSchema(a, runtime);
+        const checks_layout = try deriveRelationalCheckLayout(a, parsed);
+        defer storage_schema.freeSchema(a, checks_layout);
+        try std.testing.expect(runtime.requires_text_expressions);
+        try std.testing.expect(checks_layout.requires_text_expressions);
+        const serialized = try storage_schema.serializeSchema(a, runtime);
+        defer a.free(serialized);
+        const restored = try storage_schema.deserializeSchema(a, serialized);
+        defer storage_schema.freeSchema(a, restored);
+        try std.testing.expect(restored.requires_text_expressions);
+    }
 }
 
 fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
@@ -1215,6 +1446,11 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
+        .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
+        .requires_text_expressions = requiresTextExpressions(schema),
+        .requires_numeric_functions = requiresNumericFunctions(schema),
+        .requires_jsonb_display = requiresJsonbDisplay(schema),
+        .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1244,6 +1480,11 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .requires_array_expressions = requiresArrayExpressions(schema),
         .requires_array_constructors = requiresArrayConstructors(schema),
+        .requires_constant_index_predicates = requiresConstantIndexPredicates(schema),
+        .requires_text_expressions = requiresTextExpressions(schema),
+        .requires_numeric_functions = requiresNumericFunctions(schema),
+        .requires_jsonb_display = requiresJsonbDisplay(schema),
+        .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

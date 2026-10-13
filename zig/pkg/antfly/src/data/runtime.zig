@@ -1324,6 +1324,7 @@ const RaftTableApplyStateMachine = struct {
         integrity_handoff_destination_reset_required,
         RelationalExpressionOverflow,
         RelationalExpressionDivisionByZero,
+        SqlInvalidPowerArgument,
         RelationalExpressionBudgetExceeded,
         InvalidRelationalExpressionInput,
         InvalidRelationalGeneratedValue,
@@ -6720,6 +6721,8 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_parent = .{ .ptr = self, .execute_fn = fkGenerationParentControl };
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
+        api_server_cfg.relational_index_claims = .{ .ptr = self, .execute_fn = nativeIndexClaimsControl };
+        api_server_cfg.relational_index_control = .{ .ptr = self, .execute_fn = nativeIndexOwnerControl };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -11280,9 +11283,9 @@ pub const DataServer = struct {
         defer before_schema.deinit(scratch);
         var after_schema = try schema.parseValidatedTableSchema(scratch, decision.child_after.schema_json);
         defer after_schema.deinit(scratch);
-        var old_compiled = try publication.compileCatalog(scratch, before_schema, request.child_table_id, null);
+        var old_compiled = try publication.compileCatalogWithCoverage(scratch, before_schema, request.child_table_id, null, decision.catalog_coverage);
         defer old_compiled.deinit();
-        var next_compiled = try publication.compileCatalog(scratch, after_schema, request.child_table_id, old_bytes);
+        var next_compiled = try publication.compileCatalogWithCoverage(scratch, after_schema, request.child_table_id, old_bytes, decision.catalog_coverage);
         defer next_compiled.deinit();
         var next_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(next_compiled.value, &next_digest, .{});
@@ -11435,7 +11438,7 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &catalog_digest, &decision.catalog_digest)) return error.IntegrityCatalogChanged;
         var parsed = try schema.parseValidatedTableSchema(scratch, decision.child.schema_json);
         defer parsed.deinit(scratch);
-        var compiled = try publication.compileCatalog(scratch, parsed, request.child_table_id, null);
+        var compiled = try publication.compileCatalogWithCoverage(scratch, parsed, request.child_table_id, null, .legacy);
         defer compiled.deinit();
         if (!std.mem.eql(u8, compiled.value, catalog_bytes) or
             !std.mem.eql(u8, &compiled.catalog.schema_digest, &decision.schema_digest)) return error.IntegrityCatalogChanged;
@@ -11604,6 +11607,59 @@ pub const DataServer = struct {
         }
         try receipt.validate(request);
         return receipt;
+    }
+
+    fn nativeIndexClaimsControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.ClaimRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.ClaimResult {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try request.validate(group_id);
+        // Native ordered effects are not interchangeable with data-Raft
+        // proposals. Never dispatch them through an unconfigured authority.
+        if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
+        const owners = try self.ensureKernelOwnerSource();
+        return antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
+    }
+
+    fn nativeIndexOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try request.validate(group_id);
+        // This native receiver cannot borrow a data-Raft leader's authority.
+        if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
+        const owners = try self.ensureKernelOwnerSource();
+        var result = try antfly.public_api.relational_index_owner_execution.step(alloc, owners, &self.status_source, table_name, request, context);
+        // The effect may already be committed. A missing/replaced signing key
+        // must not turn that progress into an apparent failed mutation.
+        if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
+        return result;
+    }
+
+    fn signNativeIndexOwnerResult(self: *DataServer, alloc: std.mem.Allocator, result: *antfly.public_api.relational_index_owner_execution.Result) void {
+        const registration = self.store_registration orelse {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const runtime = self.ensureBackendRuntime() catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const io = runtime.apiIo() orelse {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        // Only load the existing physical-root key. Creating a replacement
+        // after applying an effect could attest it under a different root.
+        const root = @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const reporter = self.reporterIncarnation() catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        result.signNative(root, registration.node_id, registration.store_id, reporter) catch |err| {
+            result.signingFailed(if (err == error.IndexOwnerReceiptChanged or err == error.InvalidGenerationPublication) .authority_changed else .signing_failed);
+        };
     }
 
     fn installRowPolicyControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.row_policy_install.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.row_policy_install.Response {
@@ -18862,6 +18918,10 @@ pub const DataServer = struct {
             registration,
         );
         defer antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        // Publish the new observation only after coordinated decoder readiness.
+        // Metadata rechecks that barrier before proposing its first V19 report;
+        // requiring prior activation here would prevent that first report.
+        metadata_runtime_status_protocol.projectSourceAuthority(runtime_statuses, snapshot.status.runtime_status_protocol_ready_version);
         overlayLiveRuntimeGroupFacts(group_statuses, runtime_statuses);
         try self.annotateLocalPlacementStatus(
             group_statuses,
@@ -28895,6 +28955,7 @@ fn runtimeStatusReportFromLocalStatus(
         .target_observation_revision = status.metadata.target_observation_revision,
         .target_observation_complete = status.metadata.target_observation_complete,
         .schema_epoch = if (try antfly.metadata.table_provisioner.indexlessSchemaEpochRequired(alloc, table)) status.stats.schema_epoch else 0,
+        .source_authority = status.metadata.source_authority,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
         .disk_bytes_known = status.disk_bytes_known,
@@ -33924,6 +33985,37 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "boundary dispatcher preserves native index claim conflicts and capability failures across runtime units" {
+            const abi = @import("antfly_runtime_abi");
+            const VTable = struct { apply: *const fn (*const anyerror) anyerror!u64 };
+            const TestBoundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+            const Callbacks = struct {
+                fn apply(err: *const anyerror) anyerror!u64 {
+                    return err.*;
+                }
+                fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+                    return TestBoundary.local_dispatch(contract, callback, args, output);
+                }
+            };
+            for ([_]anyerror{ error.UnsupportedNativeIndexOwner, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled, error.InvalidPrivateIndexClaimReceipt, error.UniqueConstraintViolation }) |err| {
+                try std.testing.expectError(err, TestBoundary.call("apply", &Callbacks.foreign, &Callbacks.apply, .{&err}));
+            }
+        }
+        test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
+            var server: DataServer = undefined;
+            const control: antfly.public_api.relational_index_owner_execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
+            const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
+            var signal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .deadline_ns = 0 }));
+            try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 8, control, .{}));
+            try std.testing.expectError(error.Canceled, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
+            server.api_server_cfg = .{ .deployment_mode = .standalone };
+            server.data_raft = @ptrFromInt(4096);
+            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{}));
+            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
+        }
         test "system catalog runtime observation targets its group and preserves errors" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const Fake = struct {

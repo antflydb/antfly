@@ -293,18 +293,121 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const relation_namespace_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
+        .filters = &.{ "system catalog relation namespace transaction", "system catalog restore reconciliation", "relation mutation ownership" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const index_publication_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "relational index publication", "snapshot key registry" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_publication_run = addFilteredTestRunArtifact(b, index_publication_tests);
+    const index_publication_step = b.step("antfly-relational-index-publication-test", "Verify immutable UNIQUE plans, durable admission, namespace rollback and recovery faults");
+    index_publication_step.dependOn(&index_publication_run.step);
+    const index_publication_barrier_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"relational index publication admission requires its own coordinated decoder floor"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    index_publication_step.dependOn(&addFilteredTestRunArtifact(b, index_publication_barrier_tests).step);
+    const index_owner_ack_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational index publication ACK", "system catalog read identity" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_owner_ack_step = b.step("antfly-relational-index-ack-test", "Verify authenticated index owner receipt submission and exact ambiguous-outcome observation");
+    index_owner_ack_step.dependOn(&index_publication_run.step);
+    index_owner_ack_step.dependOn(&addFilteredTestRunArtifact(b, index_owner_ack_http_tests).step);
+    const owner_authority_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const owner_authority_step = b.step("antfly-native-owner-authority-test", "Verify durable source observations, wire profiles and root receipt authority");
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_tests).step);
+    const owner_authority_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "runtime status source authority", "runtime status exposes only released compatibility profiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_service_tests).step);
+    const lifecycle_lock_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "table lifecycle lock", "generation lock freezes the table cut", "index build lock freezes the table cut" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const lifecycle_lock_run = addFilteredTestRunArtifact(b, lifecycle_lock_tests);
+    b.step("antfly-table-lifecycle-lock-test", "Verify shared FK/index table locks and metadata writer exclusion")
+        .dependOn(&lifecycle_lock_run.step);
+    const index_candidate_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"relational index candidate"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_candidate_run = addFilteredTestRunArtifact(b, index_candidate_tests);
+    b.step("antfly-relational-index-candidate-test", "Verify independent private UNIQUE schema and catalog candidates")
+        .dependOn(&index_candidate_run.step);
+    const fk_name_admission_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably", "system catalog relation namespace transaction activated generated FK begin", "FK generation publication catalog" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
+        .dependOn(&addFilteredTestRunArtifact(b, fk_name_admission_tests).step);
+    const checks_identity_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"system catalog CHECK identity decoder barrier"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-checks-catalog-identity-test", "Verify CHECK-aware FK metadata admission and owner ACK decoder barriers")
+        .dependOn(&addFilteredTestRunArtifact(b, checks_identity_decoder_tests).step);
+    const rewrite_name_admission_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_rewrite_name_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, rewrite_name_admission_mod, true, true);
+    const rewrite_name_admission_tests = b.addTest(.{
+        .root_module = rewrite_name_admission_mod,
+        .filters = &.{ "relational integrity restore staging rewrite intent binds original schema source pin and immutable target", "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability", "system catalog relation namespace transaction generated addition races publish and recover under activated occupancy", "metadata raft apply store activated primary rewrite" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-rewrite-generated-name-admission-test", "Verify primary-key rewrite naming guard recovery and frozen intent binding")
+        .dependOn(&addFilteredTestRunArtifact(b, rewrite_name_admission_tests).step);
+    const relation_command_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_command_test_mod, true, true);
+    const relation_command_tests = b.addTest(.{ .root_module = relation_command_test_mod, .filters = &.{"system catalog relation"} });
+    b.step("system-catalog-reconciliation-command-test", "Verify bounded catalog control framing and decoder/activation floors")
+        .dependOn(&b.addRunArtifact(relation_command_tests).step);
+    const relation_worker_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_worker_test_mod, true, true);
+    const relation_worker_tests = b.addTest(.{ .root_module = relation_worker_test_mod, .filters = &.{ "relation reconciliation worker", "relation publication preparation", "relation publication proof pool" } });
+    b.step("system-catalog-reconciliation-worker-test", "Verify bounded publication preparation and capability-preserving coordinator scheduling")
+        .dependOn(&b.addRunArtifact(relation_worker_tests).step);
     const relation_coordinator_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement" },
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement", "system catalog hidden FK prepare preserves definite naming diagnostics" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
         .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
+    const naming_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "system catalog hidden FK prepare preserves definite naming diagnostics" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generated-name-coordinator-test", "Verify naming decoder barriers and definite read-only preparation diagnostics")
+        .dependOn(&addFilteredTestRunArtifact(b, naming_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
@@ -358,8 +461,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
+    b.step("antfly-sql-read-admission-test", "Verify SQL read admission availability without weakening error or mutation semantics")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_read_admission_tests).step);
+    const sql_index_ddl_run = addFilteredTestRunArtifact(b, sql_index_ddl_tests);
+    const sql_index_ddl_inventory = b.addRunArtifact(sql_index_ddl_tests);
+    sql_index_ddl_inventory.addArg("--list-tests");
+    const sql_index_ddl_audit = b.addSystemCommand(&.{"python3"});
+    sql_index_ddl_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL index DDL drops the exact qualified owner without a catalog snapshot",
+        "SQL catalog ALTER submits native schema CAS without client generations",
+        "httpx SQL catalog original null uniqueness declarations use real leader admission and restart",
+        "httpx SQL catalog originals commit through native authority and recover topology",
+        "httpx SQL catalog diagnostics preserve authority and uncertain commits are not replayed",
+    }) |required| sql_index_ddl_audit.addArgs(&.{ "--filter", required });
+    sql_index_ddl_audit.addArg("--inventory");
+    sql_index_ddl_audit.addFileArg2(sql_index_ddl_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_index_ddl_run.step.dependOn(&sql_index_ddl_audit.step);
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
-        .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
+        .dependOn(&sql_index_ddl_run.step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -589,6 +710,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const relational_index_page_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational index build pages", "relational index system ready publication waits", "relational index system prepared writer reserves", "relational index system ordinary tuple replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const relational_index_page_step = b.step("antfly-relational-index-pages-test", "Verify bounded public/private index pages, frozen source CAS and pre-generation writer drain");
+    relational_index_page_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_page_tests).step);
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
@@ -1764,6 +1892,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
         "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
         "httpx FK source control rejects missing service token in legacy internal mode",
+        "httpx private index claims",
+        "private index claim client",
+        "httpx private index control",
+        "private index control client",
         "hidden generation handoff receipt requires exact scoped read-index request",
         "hidden generation handoff identity requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
@@ -2521,6 +2653,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&index_candidate_run.step);
+    unit_test_step.dependOn(&lifecycle_lock_run.step);
+    unit_test_step.dependOn(&index_publication_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
@@ -4594,6 +4729,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // These are the same run nodes as the focused aliases: real owner
+    // lifecycle coverage must execute in CI, without duplicate DAG campaigns.
+    for (api_tests_addTests_result.run_sql_owner_lifecycle_tests) |run| {
+        integration_test_step.dependOn(&run.step);
+    }
     // Keep document-identity regressions in the owning integration suite.
     // The mixed lifecycle artifact remains intact so removing its public
     // shortcut does not discard metadata, cache, or distributed-query cases.
@@ -4810,6 +4950,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone native index owner catalog calls",
             "standalone shared catalog resumes private restore and publishes atomically",
             "standalone standby catalog create rejects before contended locks",
             "offline migration rejects authoritative metadata",
@@ -5961,6 +6102,47 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const index_publication_progress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/relational_index_publication_progress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_index_publication_progress_tests = b.addRunArtifact(index_publication_progress_tests);
+    b.step("relational-index-publication-progress-test", "Run bounded index publication, cancellation and receipt CAS contracts")
+        .dependOn(&run_index_publication_progress_tests.step);
+    db_test_step.dependOn(&run_index_publication_progress_tests.step);
+    unit_test_step.dependOn(&run_index_publication_progress_tests.step);
+    const native_index_candidate_mod = makeLmdbModule(b, "pkg/antfly-embedded/src/relational_index_candidate_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    antfly_imports.configureEmbedded(b, native_index_candidate_mod, true);
+    antfly_imports.storage_boundary.configureSources(native_index_candidate_mod, false, false);
+    const native_index_candidate_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index candidate", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const native_index_candidate_run = addFilteredTestRunArtifact(b, native_index_candidate_tests);
+    relational_index_page_step.dependOn(&native_index_candidate_run.step);
+    b.step("relational-index-candidate-test", "Verify native private UNIQUE candidate compilation without server dependencies")
+        .dependOn(&native_index_candidate_run.step);
+    const private_claim_transfer_tests = b.addTest(.{
+        .root_module = restore_owner_test_mod,
+        .filters = &.{ "relational integrity transfer validates borrowed action jobs", "relational integrity topology handoff transfers routed companions" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const private_claim_transfer_step = b.step("antfly-private-claim-transfer-test", "Verify private claim ownership, borrowed companions and routed handoff");
+    private_claim_transfer_step.dependOn(&native_index_candidate_run.step);
+    private_claim_transfer_step.dependOn(&addFilteredTestRunArtifact(b, private_claim_transfer_tests).step);
+    db_test_step.dependOn(&native_index_candidate_run.step);
+    unit_test_step.dependOn(&native_index_candidate_run.step);
+    const native_index_catalog_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index catalog", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("relational-index-catalog-test", "Verify native ordered catalog allocation, recovery and private reservation contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, native_index_catalog_tests).step);
     const v02_upgrade_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },

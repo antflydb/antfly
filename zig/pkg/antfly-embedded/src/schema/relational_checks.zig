@@ -207,7 +207,15 @@ pub const Set = struct {
     }
 
     pub fn firstViolationJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?usize {
-        if (try self.firstJsonWithExecution(execution, value, false)) |failure| return failure.index;
+        if (try self.firstJsonWithExecution(execution, value, null, false)) |failure| return failure.index;
+        return null;
+    }
+
+    /// The typed preparation boundary authenticates names against the pinned
+    /// schema and retains this owner through validation. A JSON document alone
+    /// has no authority to distinguish a present JSON null from SQL NULL.
+    pub fn firstViolationTypedJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: *@import("../sql/row_value.zig").JsonNulls) !?usize {
+        if (try self.firstJsonWithExecution(execution, value, nulls, false)) |failure| return failure.index;
         return null;
     }
 
@@ -220,28 +228,35 @@ pub const Set = struct {
     }
 
     pub fn firstFailureJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?Failure {
-        return self.firstJsonWithExecution(execution, value, true);
+        return self.firstJsonWithExecution(execution, value, null, true);
+    }
+
+    pub fn firstFailureTypedJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: *@import("../sql/row_value.zig").JsonNulls) !?Failure {
+        return self.firstJsonWithExecution(execution, value, nulls, true);
     }
 
     fn firstJson(self: *const Set, alloc: Allocator, value: std.json.Value, activation: bool) !?Failure {
         var budget: usize = expressions.max_allocated_bytes;
         var execution = expressions.Execution.init(alloc, &budget);
-        return self.firstJsonWithExecution(&execution, value, activation);
+        return self.firstJsonWithExecution(&execution, value, null, activation);
     }
 
-    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls, activation: bool) !?Failure {
         try execution.charge(0);
         var owner: expressions.ExecutionScratch = undefined;
         owner.init(execution);
         defer owner.deinit();
-        return self.firstJsonInner(execution, value, activation) catch |err| return owner.failure(err);
+        return self.firstJsonInner(execution, value, nulls, activation) catch |err| return owner.failure(err);
     }
 
-    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls, activation: bool) !?Failure {
         if (value != .object) return error.InvalidBatchRequest;
+        var input: expressions.PreparedInput = undefined;
+        try input.initJson(execution, value, nulls);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
             try execution.charge(1);
-            const result = plan.evaluateJsonWithExecution(execution, value) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };
@@ -285,9 +300,12 @@ pub const Set = struct {
     }
 
     fn firstRowInner(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        var input: expressions.PreparedInput = undefined;
+        try input.initRow(execution, row);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
             try execution.charge(1);
-            const result = plan.evaluateRowWithExecution(execution, row) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };

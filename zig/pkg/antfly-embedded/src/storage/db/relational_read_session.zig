@@ -94,15 +94,19 @@ pub const Session = struct {
             if (output_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
             const key = try alloc.dupe(u8, write.key);
             errdefer alloc.free(key);
-            // Generated values can replace a submitted literal JSON null
-            // with SQL NULL. Return provenance from the prepared authority.
+            // Defaults/generated values can both create and retire JSON null
+            // datums. Derive provenance from actual prepared cells, not the
+            // submitted marker list. Iterate present cells once (including
+            // sparse rows); never parse JSON or scan absent schema columns.
             const typed = try prepared.typedView(view.tableSchema().*, view.physicalLayout());
             var null_names = std.ArrayListUnmanaged([]const u8).empty;
             defer null_names.deinit(alloc);
-            for (write.json_null_fields) |name| {
-                const ordinal = typed.ordinalForName(name) orelse return error.InvalidBatchRequest;
-                const cell = (try typed.findCell(ordinal)) orelse continue;
-                if (!cell.is_null) try null_names.append(alloc, name);
+            var cells = try typed.cellIterator();
+            while (try cells.next()) |cell| {
+                const column = typed.table_schema.relational_columns[cell.ordinal];
+                if (column.is_json and column.json_kind == .any and !cell.is_null and
+                    std.mem.eql(u8, cell.value.bytes_val, "null"))
+                    try null_names.append(alloc, column.name);
             }
             const nulls = try types.cloneJsonNullFields(alloc, null_names.items);
             out.* = .{ .key = key, .value = value, .json_null_fields = nulls };

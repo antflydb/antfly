@@ -19,6 +19,441 @@ const rows = @import("relational_rows.zig");
 const mapper = @import("document_mapper.zig");
 const alloc = std.testing.allocator;
 
+test "relational index system cold generated JSON verification preserves SQL null and shared ownership" {
+    const a = std.testing.allocator;
+    const expressions = @import("../../schema/relational_expression.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const Execution = expressions.Execution;
+    const Set = expressions.Set;
+    const Allocator = std.mem.Allocator;
+    const max_allocated_bytes = expressions.max_allocated_bytes;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const set = validator.execution.expressions.?;
+    var layout = try codec.PhysicalLayout.init(a, set.table);
+    defer layout.deinit();
+    const ordinal: u32 = @intCast(layout.ordinalForName(set.table.relational_columns, "g").?);
+    const sql_null = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &.{
+        .{ .ordinal = ordinal, .path = "g", .value_type = .bytes_val, .is_json = true, .is_null = true, .value = .{ .bytes_val = "" } },
+    }, @splat(0));
+    defer a.free(sql_null);
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &bytes);
+    execution.numeric.max_input_bytes = 0;
+    // No JSON decoding is required for SQL NULL; a present JSON null is not
+    // interchangeable with this generated result.
+    try set.verifyRowWithExecution(&execution, try codec.ordinalRowView(sql_null, set.table, &layout));
+    const wide: [1024]u8 = @splat('x');
+    const text = try std.fmt.allocPrint(a, "\"{s}\"", .{wide});
+    defer a.free(text);
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.Canceled;
+        }
+    };
+    for ([_][]const u8{ "null", text }) |json| {
+        const physical = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &.{
+            .{ .ordinal = ordinal, .path = "g", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = json } },
+        }, @splat(0));
+        defer a.free(physical);
+        const row = try codec.ordinalRowView(physical, set.table, &layout);
+        bytes = max_allocated_bytes;
+        execution = Execution.init(a, &bytes);
+        var observed: Control = .{};
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &observed;
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRowWithExecution(&execution, row));
+        for (1..observed.polls + 1) |cut| {
+            bytes = max_allocated_bytes;
+            execution = Execution.init(a, &bytes);
+            var canceled: Control = .{ .fail_at = cut };
+            execution.numeric.checkpoint = Control.poll;
+            execution.numeric.ptr = &canceled;
+            try std.testing.expectError(error.Canceled, set.verifyRowWithExecution(&execution, row));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, set.verifyRowWithExecution(&execution, row));
+        }
+        const Run = struct {
+            fn run(fault_alloc: Allocator, owner: *const Set, input: codec.OrdinalRowView) !void {
+                owner.verifyRow(fault_alloc, input) catch |err| {
+                    if (err == error.InvalidRelationalGeneratedValue) return;
+                    return err;
+                };
+                return error.TestExpectedError;
+            }
+        };
+        try Run.run(a, set, row);
+        var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ set, row });
+    }
+}
+
+test "relational index system public JSON expressions remain gated until grammar and lowering activate" {
+    const a = std.testing.allocator;
+    const api = @import("../../schema/mod.zig");
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"n\":1.20}}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}",
+        "{\"op\":\"column\",\"column\":\"source\"}",
+    }) |expression| {
+        const definition = try std.fmt.allocPrint(
+            a,
+            "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"generated_columns\":[{{\"column\":\"g\",\"expression\":{s}}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"g\":{{\"type\":\"json\",\"nullable\":true}},\"source\":{{\"type\":\"json\",\"nullable\":true}}}},\"additionalProperties\":false}}}}}}}}",
+            .{expression},
+        );
+        defer a.free(definition);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, api.CompiledTableValidator.init(a, definition));
+    }
+}
+
+test "relational index system typed document expression preparation retains authoritative root null provenance" {
+    const a = std.testing.allocator;
+    const expressions = @import("../../schema/relational_expression.zig");
+    const operands = @import("../../sql/row_value.zig");
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const set = validator.execution.expressions.?;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"g\":null,\"payload\":null}", .{});
+    var bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(region.allocator(), &bytes);
+    var roots: operands.JsonRow = undefined;
+    roots.initRegion(region.allocator(), bytes, &execution.numeric);
+    defer roots.deinit();
+    try roots.bindAdmission(&bytes);
+    var nulls: operands.JsonNulls = undefined;
+    nulls.initRegion(region.allocator(), bytes, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&bytes);
+    // Both source markers are legitimate root JSON datums. The generated SQL
+    // NULL result replaces g's submitted semantics; unrelated payload survives.
+    try nulls.import(&.{ "g", "payload" });
+    try set.applyTypedJsonWithExecution(&execution, &document, &roots, &nulls);
+    try std.testing.expect(!try nulls.contains("g"));
+    try std.testing.expect(try nulls.contains("payload"));
+    try std.testing.expectEqual(@as(usize, 1), (try nulls.snapshot()).len);
+    try std.testing.expectEqual(std.json.Value.null, document.object.get("g").?);
+    try std.testing.expectEqual(@as(usize, 0), roots.memory.footprint());
+    try std.testing.expectEqual(@as(usize, 0), roots.decodes);
+    var other_bytes: usize = expressions.max_allocated_bytes;
+    var other = expressions.Execution.init(region.allocator(), &other_bytes);
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, set.applyTypedJsonWithExecution(&other, &document, &roots, &nulls));
+    try std.testing.expect(try nulls.contains("payload"));
+}
+
+test "relational index system typed preparation encodes derived null authority and rejects forged restore" {
+    const a = std.testing.allocator;
+    const schema_api = @import("../../schema/mod.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    var validator = try schema_api.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const table = try schema_api.deriveRuntimeTableSchema(a, validator.schema);
+    defer @import("../schema.zig").freeSchema(a, table);
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const Run = struct {
+        fn run(fault_alloc: std.mem.Allocator, compiled: schema_api.CompiledTableValidator, runtime: @import("../schema.zig").TableSchema, physical: *const codec.PhysicalLayout) !void {
+            var prepared = try mapper.PreparedRelationalWrite.initTyped(fault_alloc, fault_alloc, fault_alloc, false, "r", "{\"g\":null,\"payload\":null}", compiled, runtime, physical, &.{ "g", "payload" }, false);
+            defer prepared.deinit(fault_alloc);
+            try prepared.finalizeMetadata(0);
+            const row = try codec.ordinalRowView(prepared.packed_row, runtime, physical);
+            const g = (try row.findCell(@intCast(physical.ordinalForName(runtime.relational_columns, "g").?))).?;
+            const payload = (try row.findCell(@intCast(physical.ordinalForName(runtime.relational_columns, "payload").?))).?;
+            try std.testing.expect(g.is_null);
+            try std.testing.expect(!payload.is_null);
+            try std.testing.expectEqualStrings("null", payload.value.bytes_val);
+        }
+    };
+    try Run.run(a, validator, table, &layout);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ validator, table, &layout });
+    var restored = try mapper.PreparedRelationalWrite.initTyped(a, a, a, false, "r", "{\"g\":null,\"payload\":null}", validator, table, &layout, &.{"payload"}, true);
+    defer restored.deinit(a);
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, mapper.PreparedRelationalWrite.initTyped(a, a, a, false, "r", "{\"g\":null,\"payload\":null}", validator, table, &layout, &.{ "g", "payload" }, true));
+    for ([_][]const []const u8{ &.{ "payload", "payload" }, &.{"missing"} }) |names| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"g\":null,\"payload\":null}", .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, names, false));
+    }
+}
+
+test "relational index system document SQL null normalization shares typed schema preparation" {
+    const a = std.testing.allocator;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-generated-json-null");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{},"payload":{}},"additionalProperties":false}}}}
+    );
+    const options: db_mod.types.ScanOptions = .{ .relational_query = .{ .fields = &.{ "g", "payload" }, .schema_version = 1 } };
+    const session = try db.openDocumentReadSession(a, "", "", options);
+    defer session.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const normalized = try session.normalizeRows(arena.allocator(), &.{.{ .key = "r", .value = "{\"g\":null,\"payload\":null}", .json_null_fields = &.{"payload"} }});
+    try std.testing.expectEqual(@as(usize, 1), normalized[0].json_null_fields.len);
+    try std.testing.expectEqualStrings("payload", normalized[0].json_null_fields[0]);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, normalized[0].value, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.contains("g"));
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("payload").?);
+    // Match sql_execution's document commit adapter: the JSON representation
+    // now owns null semantics, so relational-only transport markers are not
+    // forwarded to native document batch admission.
+    try db.batch(.{ .writes = &.{.{ .key = normalized[0].key, .value = normalized[0].value }} });
+    const reader = try db.openDocumentReadSession(a, "", "", options);
+    defer reader.deinit();
+    var page = try reader.next(a, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, page.rows[0].sql_nulls.?);
+}
+
+test "relational index system typed restore admits declared domains before generated verification" {
+    const a = std.testing.allocator;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"column","column":"n"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"g":{"type":"integer","x-antfly-sql-type":"int16"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    for ([_][]const u8{ "{\"n\":32768,\"g\":32768}", "{\"n\":\"bad\",\"g\":0}" }) |input| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{}, true));
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":1,\"g\":1,\"j\":null}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{"j"}, true));
+    const valid = try validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{}, true);
+    defer valid.deinit(parsed.arena.allocator());
+}
+
+test "relational index system JSONB physical display is distinct from streaming semantic identity" {
+    const a = std.testing.allocator;
+    const content = @import("document_content_hash.zig");
+    const Case = struct { input: []const u8, physical: []const u8 };
+    const cases = [_]Case{
+        .{ .input = "1.20", .physical = "1.20" },
+        .{ .input = "1.200e2", .physical = "120.0" },
+        .{ .input = "-0.00", .physical = "0.00" },
+        .{ .input = "-0e999999", .physical = "0" },
+        .{ .input = "{\"z\":1.20,\"aa\":1.2000}", .physical = "{\"aa\":1.2000,\"z\":1.20}" },
+        .{ .input = "{\"source\":1.200,\"1.2\":\"3.40\"}", .physical = "{\"1.2\":\"3.40\",\"source\":1.200}" },
+        .{ .input = "[1.20,1.2,1e-20,true,null,\"\\\"9000\\\"\"]", .physical = "[1.20,1.2,0.00000000000000000001,true,null,\"\\\"9000\\\"\"]" },
+    };
+    const Run = struct {
+        fn run(fault_alloc: std.mem.Allocator, input: []const u8, expected: []const u8) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, fault_alloc, input, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            const physical = try content.canonicalJsonStorageValueAlloc(fault_alloc, parsed.value);
+            defer fault_alloc.free(physical);
+            try std.testing.expectEqualStrings(expected, physical);
+            const semantic = try content.canonicalJsonValueAlloc(fault_alloc, parsed.value);
+            defer fault_alloc.free(semantic);
+            var streamed = std.crypto.hash.Blake3.init(.{});
+            streamed.update("preceding row fields");
+            var before: [32]u8 = undefined;
+            streamed.final(&before);
+            content.hashCanonicalJsonStorageBytes(fault_alloc, &streamed, physical) catch |err| {
+                var after: [32]u8 = undefined;
+                streamed.final(&after);
+                try std.testing.expectEqualSlices(u8, &before, &after);
+                return err;
+            };
+            var direct = std.crypto.hash.Blake3.init(.{});
+            direct.update("preceding row fields");
+            direct.update("j");
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, semantic.len, .little);
+            direct.update(&size);
+            direct.update(semantic);
+            var lhs: [32]u8 = undefined;
+            var rhs: [32]u8 = undefined;
+            streamed.final(&lhs);
+            direct.final(&rhs);
+            try std.testing.expectEqualSlices(u8, &lhs, &rhs);
+        }
+    };
+    for (cases) |case| {
+        try Run.run(a, case.input, case.physical);
+        var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ case.input, case.physical });
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .string = "\x00" }));
+    try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .number_string = "1e131072" }));
+}
+
+test "relational index system JSONB restore rejects alternate physical bytes without changing semantic identity" {
+    const a = std.testing.allocator;
+    const schema_api = @import("../../schema/mod.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const store = @import("relational_store.zig");
+    var validator = try schema_api.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const table = try schema_api.deriveRuntimeTableSchema(a, validator.schema);
+    defer @import("../schema.zig").freeSchema(a, table);
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var left = try mapper.PreparedRelationalWrite.init(a, "r", "{\"payload\":1.20}", validator, table, &layout);
+    defer left.deinit(a);
+    var right = try mapper.PreparedRelationalWrite.init(a, "r", "{\"payload\":1.2}", validator, table, &layout);
+    defer right.deinit(a);
+    try left.finalizeMetadata(0);
+    try right.finalizeMetadata(0);
+    try std.testing.expect(!std.mem.eql(u8, left.packed_row, right.packed_row));
+    try std.testing.expectEqualSlices(u8, &left.semantic_hash, &right.semantic_hash);
+    try store.validateCanonicalValueForSchemaAndLayout(a, left.packed_row, table, &layout);
+    try store.validateCanonicalValueForSchemaAndLayout(a, right.packed_row, table, &layout);
+    const ordinal: u32 = @intCast(layout.ordinalForName(table.relational_columns, "payload").?);
+    // A valid physical checksum and matching logical digest cannot authorize
+    // exponent syntax or whitespace in stored cells. The trusted preparation
+    // encoder constructs the adversarial fixture without weakening validation.
+    for ([_][]const u8{ "1.20e0", " 1.20", "1.20 " }) |noncanonical| {
+        const physical = try codec.serializePreparedOrdinalDeferredHash(a, table.version, table.relational_columns, &.{
+            .{ .ordinal = ordinal, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = noncanonical } },
+        }, &layout);
+        defer a.free(physical);
+        try codec.finalizeOrdinalMetadata(physical, left.semantic_hash, 0);
+        try std.testing.expectError(error.NonCanonicalRelationalRow, store.validateCanonicalValueForSchemaAndLayout(a, physical, table, &layout));
+        try std.testing.expectError(error.NonCanonicalRelationalRow, codec.validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(a, physical, table, &layout));
+    }
+}
+
+test "relational index system JSONB semantic hashing scratch is independent of payload size" {
+    const a = std.testing.allocator;
+    const content = @import("document_content_hash.zig");
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const encoded = try std.fmt.allocPrint(a, "{{\"n\":1.200,\"text\":\"{s}\"}}", .{payload});
+    defer a.free(encoded);
+    var memory: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 8192 };
+    var streamed = std.crypto.hash.Blake3.init(.{});
+    try content.hashCanonicalJsonStorageBytes(memory.allocator(), &streamed, encoded);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expect(memory.peak < 8192);
+    const semantic = try std.fmt.allocPrint(a, "{{\"n\":1.2,\"text\":\"{s}\"}}", .{payload});
+    defer a.free(semantic);
+    var expected = std.crypto.hash.Blake3.init(.{});
+    expected.update("j");
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, semantic.len, .little);
+    expected.update(&size);
+    expected.update(semantic);
+    var lhs: [32]u8 = undefined;
+    var rhs: [32]u8 = undefined;
+    streamed.final(&lhs);
+    expected.final(&rhs);
+    try std.testing.expectEqualSlices(u8, &lhs, &rhs);
+}
+
+test "relational index system JSONB array scale update survives LSM reopen and portable restore" {
+    const a = std.testing.allocator;
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("jsonb-array-scale-reopen");
+    defer directory.cleanup();
+    var target = try TestDirectory.init("jsonb-array-scale-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(a,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(db.core.schema.?.requires_jsonb_array_display);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        // Equal logical values with different display scale must still replace
+        // their physical postimage; the content hash is not a write dedup key.
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"j":{"dimensions":[{"length":3,"lower_bound":-2}],"values":[1.2,null,null],"sql_nulls":[false,false,true]}}
+        }} });
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"j":{"dimensions":[{"length":3,"lower_bound":-2}],"values":[1.20,null,null],"sql_nulls":[false,false,true]}}
+        }} });
+        try @import("../portable_backup.zig").exportPortable(a, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(a, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_jsonb_array_display);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        const bytes = (try db.get(a, "row")).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var array = try @import("../../sql/array_wire.zig").decode(a, .jsonb, parsed.value.object.get("j").?, .{});
+        defer array.deinit();
+        try std.testing.expectEqual(@as(i32, -2), array.value.dimensions[0].lower);
+        try std.testing.expectEqualStrings("1.20", array.value.elements[0].value.number_string);
+        try std.testing.expect(array.value.elements[1].value == .null and !array.value.elements[1].sql_null);
+        try std.testing.expect(array.value.elements[2].sql_null);
+    }
+}
+
+test "relational index system JSONB scale survives LSM reopen and strict portable restore" {
+    const a = std.testing.allocator;
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("jsonb-scale-reopen");
+    defer directory.cleanup();
+    var target = try TestDirectory.init("jsonb-scale-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(a,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(db.core.schema.?.requires_jsonb_display);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"payload\":{\"source\":1.200e2,\"nested\":[1.20,-0.00]}}" }} });
+        try @import("../portable_backup.zig").exportPortable(a, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(a, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_jsonb_display);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        try std.testing.expectEqual(@import("../schema.zig").storage_format_version, db.core.table_catalog.schema_format_version);
+        const bytes = (try db.get(a, "row")).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        const payload = parsed.value.object.get("payload").?;
+        try std.testing.expectEqualStrings("120.0", payload.object.get("source").?.number_string);
+        const items = payload.object.get("nested").?.array.items;
+        try std.testing.expectEqualStrings("1.20", items[0].number_string);
+        try std.testing.expectEqualStrings("0.00", items[1].number_string);
+        var work: @import("../../sql/json_order.zig").Budget = .{};
+        const text = try @import("../../sql/jsonb_text.zig").format(a, payload, 1024, &work);
+        defer a.free(text);
+        try std.testing.expectEqualStrings("{\"nested\": [1.20, 0.00], \"source\": 120.0}", text);
+    }
+}
+
 test "relational index system NUMERIC public scalar constraints survive LSM reopen and portable restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-public-scalar");

@@ -307,6 +307,7 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
             // can refer to an action job sorted after all reference records.
             // Each retry verifies one bounded cursor page, never a full scan.
             if (state.value.ready) return;
+            const transfer_view = try integrity.TransferView.init(txn);
             var cursor = try txn.openCursor();
             var cursor_closed = false;
             defer if (!cursor_closed) cursor.close();
@@ -334,7 +335,8 @@ pub fn apply(alloc: Allocator, txn: anytype, fence: topology.Fence, command: Com
                 const parent = try verified_parents.getOrPut(alloc, parsed_key.address.claimKey());
                 if (parent.found_existing and parsed_key.kind == .reference) {
                     _ = try integrity.validateTransferRecord(entry.key, entry.value);
-                } else try integrity.validateTransferredCompanions(txn, entry.key, entry.value);
+                    try transfer_view.validateCompanion(txn, parsed_key, @splat(0));
+                } else try integrity.validateTransferredCompanionsWithView(txn, entry.key, entry.value, transfer_view);
                 @memcpy(next_buf[0..entry.key.len], entry.key);
                 next = next_buf[0..entry.key.len];
                 inspected += 1;

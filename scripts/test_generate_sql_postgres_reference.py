@@ -3420,9 +3420,7 @@ class PostgresReferenceTest(unittest.TestCase):
                         self.assertEqual(
                             cursor.pgresult.get_value(0, 0).hex(), case["binary"]
                         )
-                    payload = Payload(
-                        bytes.fromhex(case.get("native_binary", case["binary"]))
-                    )
+                    payload = Payload(bytes.fromhex(case["binary"]))
                     with psycopg.RawCursor(self.db) as cursor:
                         cursor.execute("SELECT $1 = (" + case["sql"] + ")", [payload])
                         self.assertEqual(cursor.fetchone(), (True,))
@@ -3989,12 +3987,18 @@ class PostgresReferenceTest(unittest.TestCase):
             (
                 "jsonb",
                 r'{"null",NULL,"[1,2]","{\"k\":\"a\\\\b\"}"}',
-                r'{"null",NULL,"[1,2]","{\"k\":\"a\\\\b\"}"}',
+                r'{"null",NULL,"[1, 2]","{\"k\": \"a\\\\b\"}"}',
             ),
             ("text", "{}", "{}"),
         ]
         for kind, source, emitted in cases:
             with self.subTest(kind=kind), self.db.transaction(force_rollback=True):
+                self.assertEqual(
+                    (emitted,),
+                    self.db.execute(
+                        f"SELECT (%s::{kind}[])::text", (source,)
+                    ).fetchone(),
+                )
                 self.assertEqual(
                     (True,),
                     self.db.execute(

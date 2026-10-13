@@ -2024,7 +2024,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

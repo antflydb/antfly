@@ -1187,6 +1187,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // restore continues rebuilding target claims from canonical primary rows.
     if (source_copy != null) {
         const integrity = @import("db/relational_integrity_contract.zig");
+        const companions = @import("db/relational_integrity.zig");
+        const transfer_view = try companions.TransferView.init(scan);
         var integrity_batch: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
         defer deinitKeyValueBatch(alloc, &integrity_batch);
         var integrity_bytes: usize = 0;
@@ -1196,7 +1198,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
             try out.cancellation.check();
             if (source_range) |range| if (!range.contains(&(try integrity.parseKey(item.key)).address.routing)) continue;
             _ = try integrity.validateTransferRecord(item.key, item.value);
-            try @import("db/relational_integrity.zig").validateTransferredCompanions(scan, item.key, item.value);
+            try companions.validateTransferredCompanionsWithView(scan, item.key, item.value, transfer_view);
             if (integrity_catalog == null) return error.IntegrityCatalogChanged;
             try integrity_batch.append(alloc, .{ .key = try alloc.dupe(u8, item.key), .value = try alloc.dupe(u8, item.value) });
             integrity_bytes += item.key.len + item.value.len;

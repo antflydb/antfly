@@ -32,6 +32,39 @@ mutex: std.atomic.Mutex = .unlocked,
 admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
 admission_exhausted: bool = false,
 
+/// Sequential row/program admission across independently retained regions.
+/// Unlike live-allocation callbacks, retirement never refunds parent-arena
+/// capacity. begin/finish bracket every operation that can grow the region.
+/// Both the memory owner and remaining counter must outlive this binding.
+pub const RegionAdmission = struct {
+    memory: *Budget,
+    remaining: *usize,
+    ceiling: usize,
+    admitted: usize,
+
+    pub fn init(memory: *Budget, remaining: *usize) !RegionAdmission {
+        const used = memory.footprint();
+        if (used > remaining.*) return error.SqlProgramLimitExceeded;
+        remaining.* -= used;
+        return .{ .memory = memory, .remaining = remaining, .ceiling = memory.limit, .admitted = used };
+    }
+
+    pub fn begin(self: *RegionAdmission) void {
+        self.finish();
+        self.memory.lock();
+        defer self.memory.mutex.unlock();
+        // Previously admitted peak/spent capacity remains available for reuse;
+        // only growth beyond it competes with other row/program regions.
+        self.memory.limit = @min(self.ceiling, self.admitted +| self.remaining.*);
+    }
+
+    pub fn finish(self: *RegionAdmission) void {
+        const used = self.memory.footprint();
+        self.remaining.* -|= used -| self.admitted;
+        self.admitted = @max(self.admitted, used);
+    }
+};
+
 pub fn finishAdmission(self: *Budget) void {
     self.lock();
     defer self.mutex.unlock();

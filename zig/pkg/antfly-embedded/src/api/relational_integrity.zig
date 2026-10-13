@@ -484,6 +484,58 @@ test "distributed txn typed integrity expansion matches composite parent claim w
     try std.testing.expectError(error.ForeignKeyMatchFullViolation, child.expand(alloc, &.{.{ .key = "c2", .after = partial_row }}));
 }
 
+fn sqlUniqueNullClaims(alloc: Allocator, not_distinct: bool) !void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const sql = if (not_distinct)
+        "CREATE TABLE items (tenant BIGINT, email TEXT, UNIQUE NULLS NOT DISTINCT (tenant, email))"
+    else
+        "CREATE TABLE items (tenant BIGINT, email TEXT, UNIQUE NULLS DISTINCT (tenant, email))";
+    var compiled = try @import("../sql/compiler.zig").compile(alloc, sql, .{});
+    defer compiled.deinit();
+    const json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+    defer alloc.free(json);
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, json);
+    defer parsed.deinit(alloc);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(a, parsed);
+    const definitions = try parsed.relationalUniqueDefinitions(a);
+    try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    try std.testing.expectEqual(not_distinct, definitions[0].nulls_not_distinct);
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(alloc, schema) };
+    defer view.release();
+    var plan = try Plan.init(alloc, "items", view, &.{.{ .generation = @splat(7), .definition = definitions[0] }}, &.{});
+    defer plan.deinit();
+    // Both rows have the same logical tuple containing NULLs. Their physical
+    // primary identities differ; only DISTINCT permits separate witnesses.
+    const bytes = try codec.serializeOrdinal(alloc, view.version(), view.tableSchema().relational_columns, &.{}, @splat(0));
+    defer alloc.free(bytes);
+    const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+    var first = try plan.expand(alloc, &.{.{ .key = "first", .after = row }});
+    defer first.deinit();
+    var second = try plan.expand(alloc, &.{.{ .key = "second", .after = row }});
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.commands.len);
+    try std.testing.expectEqual(@as(usize, 1), second.commands.len);
+    try std.testing.expectEqual(not_distinct, std.mem.eql(u8, first.commands[0].command.operation.establish.tuple, second.commands[0].command.operation.establish.tuple));
+    const selected = try plan.bindConflictTarget(alloc, &.{ "tenant", "email" }, &.{});
+    defer alloc.free(selected);
+    const addresses = try plan.conflictAddresses(alloc, selected, row);
+    defer {
+        for (addresses) |address| alloc.free(address.tuple);
+        alloc.free(addresses);
+    }
+    try std.testing.expectEqual(@as(usize, @intFromBool(not_distinct)), addresses.len);
+    if (not_distinct) try std.testing.expectEqualSlices(u8, first.commands[0].command.operation.establish.tuple, addresses[0].tuple);
+}
+
+test "SQL UNIQUE null clauses share distributed claims and conflict arbiters" {
+    for ([_]bool{ false, true }) |not_distinct| {
+        try sqlUniqueNullClaims(std.testing.allocator, not_distinct);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sqlUniqueNullClaims, .{not_distinct});
+    }
+}
+
 test "distributed txn partial unique integrity claims and SQL inference share typed membership proofs" {
     const alloc = std.testing.allocator;
     const schema = @import("../storage/schema.zig");

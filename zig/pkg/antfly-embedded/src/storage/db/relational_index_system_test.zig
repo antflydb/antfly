@@ -32,6 +32,575 @@ test {
     _ = @import("antfly_server_test_sources").local_test_sources.storage_retained_read_registry;
 }
 
+test "relational index build pages native owner control preserves committed cuts through standby replay and reopen" {
+    const api = @import("../../schema/mod.zig");
+    const compiler = @import("../../schema/relational_declarations.zig");
+    const catalog = @import("relational_integrity_catalog.zig");
+    const candidates = @import("relational_index_candidate.zig");
+    const jobs = @import("relational_index_owner_job.zig");
+    const effects = @import("replication_effects.zig");
+    const authority = @import("../source_authority.zig");
+    const contract = @import("replication_contract.zig");
+    const outboxes = @import("durable_outbox.zig");
+    const outbox_store = @import("durable_outbox_store.zig");
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Publisher = struct {
+        fail: bool = true,
+        payload: ?[]u8 = null,
+        attempts: usize = 0,
+        completed: usize = 0,
+        barrier: *Barrier,
+        lsn: u64 = 2,
+
+        fn next(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.lsn;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 101, .shard_id = 11, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: outboxes.Kind, _: []const u8, _: @import("doc_identity.zig").Namespace) !u64 {
+            return error.UnexpectedNonDurablePublication;
+        }
+        fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, _: @import("doc_identity.zig").Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(outboxes.Kind.restore_batch, kind);
+            try std.testing.expectEqual(self.lsn, pending.from_lsn);
+            if (self.payload) |previous| {
+                try std.testing.expectEqualSlices(u8, previous, pending.payload);
+            } else self.payload = try alloc.dupe(u8, pending.payload);
+            self.attempts += 1;
+            if (self.fail) return error.TestPublicationUnavailable;
+            return pending.from_lsn;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            // Checkpoint capture must not be blocked by a lease held while
+            // waiting for standby acknowledgement.
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
+            capture.release();
+            self.completed += 1;
+        }
+        fn asMirror(self: *@This()) contract.AsyncBatchMirror {
+            return .{
+                .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } },
+                .mutation_barrier = self.barrier,
+                .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true },
+            };
+        }
+    };
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var primary_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-primary");
+    defer primary_dir.cleanup();
+    var standby_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-standby");
+    defer standby_dir.cleanup();
+    const options: db_mod.OpenOptions = .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 },
+    };
+    var primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    defer primary.close();
+    var barrier: Barrier = .{};
+    var publisher: Publisher = .{ .barrier = &barrier };
+    defer if (publisher.payload) |bytes| alloc.free(bytes);
+    // The borrowed publisher must be detached before its fixture is destroyed.
+    defer primary.local_execution.replication_async_batch_mirror = null;
+    var standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    defer standby.close();
+    var parsed = try api.parseValidatedTableSchema(alloc, before);
+    defer parsed.deinit(alloc);
+    var prior = try compiler.compileCatalog(alloc, parsed, 101, null);
+    defer prior.deinit();
+    for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+        try db.setSchemaJson(alloc, before);
+        try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+    }
+    var candidate = try candidates.Candidate.prepare(alloc, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    var prepared = try primary.prepareNativeIndexOwnerAdmission(.{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = options.identity_namespace.?, .catalog_digest = @import("relational_index_inputs.zig").digest(prior.value) },
+        .candidate_digest = @import("relational_index_inputs.zig").digest(candidate.next.value),
+        .reservation_digest = @import("relational_index_inputs.zig").digest(candidate.reservation.value),
+    }, candidate.inputs.bytes);
+    defer prepared.deinit();
+    const binding = prepared.command.binding;
+    const receipt_identity: db_mod.DB.NativeIndexOwnerIdentity = .{
+        .id = binding.id,
+        .plan_digest = binding.plan_digest,
+        .owner_digest = binding.owner_digest,
+        .ordinal = binding.ordinal,
+        .namespace = binding.fence.namespace,
+        .owner_group_id = binding.fence.owner_group_id,
+    };
+    try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationAdmission(db_mod.DB.NativeIndexOwnerAdmission.fromBinding(binding), candidate.inputs.bytes));
+    try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationControl(.{ .effect = .fenced, .binding = binding }));
+    const untouched = try primary.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(.native, untouched.source.kind);
+    try std.testing.expect(untouched.intent == null and untouched.binding == null and untouched.cleanup == null);
+    for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
+        var control = if (effect == .admitted)
+            try primary.prepareNativeIndexOwnerControl(prepared.command)
+        else
+            try primary.prepareNativeIndexOwnerControl(.{ .effect = effect, .binding = binding });
+        defer control.deinit();
+        try control.preparePayload();
+        if (effect == .fenced) {
+            const input_key = @import("relational_index_inputs.zig").key;
+            const saved = try primary.core.store.get(alloc, input_key);
+            defer alloc.free(saved);
+            try primary.core.store.putBatch(&.{}, &.{input_key});
+            try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.applyPreparedNativeIndexOwnerControl(&control, null));
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try authority.load(&txn)).?.sequence);
+            try std.testing.expect(try jobs.nativeEffectPosition(&txn, binding, .fenced) == null);
+            try primary.core.store.putBatch(&.{.{ .key = input_key, .value = saved }}, &.{});
+        }
+        if (effect == .reserved) {
+            // A distinct effect has its own transport LSN and payload. Its
+            // successful foreground ACK exercises lease release in apply,
+            // rather than only during the explicit recovery call below.
+            alloc.free(publisher.payload.?);
+            publisher.payload = null;
+            publisher.lsn = 3;
+        }
+        if (effect != .admitted) primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        const outcome = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
+        try outcome.validateFor(control.command);
+        try std.testing.expect(!outcome.duplicate);
+        if (effect == .fenced) {
+            try std.testing.expect(outcome.replication_pending);
+            try std.testing.expectEqualStrings("TestPublicationUnavailable", outcome.error_name.?);
+            try std.testing.expect(outcome.receipt == null);
+            try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 0), publisher.completed);
+            var pending = try outbox_store.readPending(alloc, primary.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+            {
+                // A stale clear hint (or a commit racing the flush) cannot
+                // certify an effect whose outbox is present in its snapshot.
+                const maybe = primary.local_execution.durable_replication_outbox_maybe.swap(false, .acq_rel);
+                defer primary.local_execution.durable_replication_outbox_maybe.store(maybe, .release);
+                const primary_pending = primary.async_context.primary_replication_outbox_pending.swap(false, .acq_rel);
+                defer primary.async_context.primary_replication_outbox_pending.store(primary_pending, .release);
+                const proof = (try primary.nativeIndexOwnerReceipt(.{ .identity = receipt_identity, .effect = .fenced })).?;
+                try std.testing.expect(proof.replication_pending);
+                try std.testing.expect(proof.receipt == null);
+                try std.testing.expectEqualStrings("ReplicationOutboxPending", proof.error_name.?);
+                try std.testing.expectEqual(outcome.position, proof.position);
+                try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
+                try std.testing.expect(primary.local_execution.durable_replication_outbox_maybe.load(.acquire));
+            }
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
+        } else {
+            try std.testing.expect(!outcome.replication_pending);
+            try std.testing.expect(outcome.error_name == null);
+            try std.testing.expectEqual(effect != .admitted, outcome.receipt != null);
+            if (effect == .reserved) {
+                try std.testing.expectEqual(@as(usize, 3), publisher.attempts);
+                try std.testing.expectEqual(@as(usize, 2), publisher.completed);
+            }
+        }
+        const payload = try control.finalizePayload(outcome.position);
+        if (effect == .reserved) try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
+        if (effect == .fenced) {
+            try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
+            primary.local_execution.replication_async_batch_mirror = null;
+            primary.close();
+            primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+            publisher.fail = false;
+            primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+            try primary.flushDurableReplicationOutboxes();
+            try std.testing.expectEqual(@as(usize, 2), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 1), publisher.completed);
+            var pending = try outbox_store.readPending(alloc, primary.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expect(pending.isEmpty());
+            primary.local_execution.replication_async_batch_mirror = null;
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&txn)).?.sequence);
+            try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
+        }
+        const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = ordinal + 1, .previous_lsn = ordinal, .payload = payload };
+        var decoded = try effects.decodeBatchMutationRequest(alloc, record);
+        defer decoded.deinit();
+        var mixed = decoded.value;
+        mixed.request.writes = &.{.{ .key = "smuggled", .value = "{}" }};
+        try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(mixed));
+        mixed = decoded.value;
+        mixed.ordinary_raft_entry = .{ .term = 1, .index = 1 };
+        try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(mixed));
+        const unknown = try std.fmt.allocPrint(alloc, "{s},\"unknown_control\":true}}", .{payload[0 .. payload.len - 1]});
+        defer alloc.free(unknown);
+        var invalid_record = record;
+        invalid_record.payload = unknown;
+        try std.testing.expectError(error.InvalidBatchRequest, effects.decodeBatchMutationRequest(alloc, invalid_record));
+        var gap = try replication_ingress.normalizeBatch(decoded.value);
+        gap.index_owner_control.?.position.sequence += 1;
+        gap.receipt = .{ .native = gap.index_owner_control.?.position };
+        try std.testing.expectError(error.OnlineSourceScopeChanged, standby.applyReplicatedBatch(gap, record.lsn));
+        try std.testing.expectEqual(@as(u64, ordinal), try standby.replicationAppliedSequence());
+        try replication_ingress.applyRecord(&standby, record);
+        try replication_ingress.applyRecord(&standby, record);
+        const primary_retry = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
+        try primary_retry.validateFor(control.command);
+        try std.testing.expect(primary_retry.duplicate);
+        try std.testing.expectEqual(outcome.position, primary_retry.position);
+        try std.testing.expectEqual(effect != .admitted, primary_retry.receipt != null);
+        if (effect != .admitted) {
+            const recovered = (try primary.nativeIndexOwnerReceipt(.{ .identity = receipt_identity, .effect = if (effect == .fenced) .fenced else .reserved })).?;
+            const receipt_request: @import("relational_index_owner_control.zig").ReceiptRequest = .{ .identity = receipt_identity, .effect = if (effect == .fenced) .fenced else .reserved };
+            try recovered.validateRecovery(receipt_request);
+            try recovered.validateFor(control.command);
+            var corrupt = recovered;
+            corrupt.position.sequence += 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateRecovery(receipt_request));
+            corrupt = recovered;
+            corrupt.receipt.?.evidence_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.receipt.?.owner.ordinal += 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.receipt.?.candidate_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateRecovery(receipt_request));
+            corrupt = recovered;
+            corrupt.replication_pending = true;
+            corrupt.error_name = "ReplicationOutboxPending";
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt = recovered;
+            corrupt.error_name = "OutOfMemory";
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            corrupt.receipt = null;
+            // A committed effect with failed proof lookup remains recoverable
+            // progress; it must not be turned into a rollback-looking error.
+            try corrupt.validateFor(control.command);
+            corrupt = recovered;
+            corrupt.binding.inputs_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, corrupt.validateFor(control.command));
+            var foreign = receipt_request;
+            foreign.identity.owner_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, recovered.validateRecovery(foreign));
+            foreign = receipt_request;
+            foreign.effect = if (effect == .fenced) .reserved else .fenced;
+            try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, recovered.validateRecovery(foreign));
+            try std.testing.expect(!recovered.replication_pending);
+            try std.testing.expect(recovered.duplicate);
+            try std.testing.expectEqual(outcome.position, recovered.position);
+            try std.testing.expectEqual(try primary_retry.receipt.?.digest(), try recovered.receipt.?.digest());
+        }
+        if (effect == .reserved) {
+            try std.testing.expectEqual(@as(usize, 3), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 2), publisher.completed);
+        }
+        try std.testing.expectEqual(@as(u64, ordinal + 1), try standby.replicationAppliedSequence());
+        var txn = try standby.core.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
+        try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&txn)).?.sequence);
+        try std.testing.expectError(error.NotFound, txn.get(&internal.ordered_document_applied_entry_key));
+    }
+    // Prepare first, then let a newer ordinary transport receipt win. The
+    // apply-lock recheck must suppress the old effect and retain the newer LSN.
+    var stale = try standby.prepareNativeIndexOwnerControl(.{ .effect = .fenced, .binding = binding });
+    defer stale.deinit();
+    try standby.recordReplicationApplied(100);
+    const skipped = try standby.applyPreparedNativeIndexOwnerControl(&stale, .{ .position = .{ .namespace = options.identity_namespace.?, .sequence = 2 }, .lsn = 99 });
+    try std.testing.expect(skipped.duplicate);
+    try std.testing.expectEqual(@as(u64, 100), try standby.replicationAppliedSequence());
+    standby.close();
+    standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    var txn = try standby.core.store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 100), try standby.replicationAppliedSequence());
+    try std.testing.expectEqual(jobs.Phase.reserved, (try jobs.load(&txn)).?.phase);
+    // Private reservation must not publish the candidate schema.
+    try std.testing.expectEqual(@as(u32, 1), standby.core.schema.?.version);
+
+    // An owner may receive cancellation before its first admission. The
+    // durable intent must survive that jobless restart and replay atomically
+    // with its native cut, source fence, transport marker and outbox.
+    var cancel_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-primary");
+    defer cancel_dir.cleanup();
+    var follower_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-standby");
+    defer follower_dir.cleanup();
+    var cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    defer cancel_primary.close();
+    var follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    defer follower.close();
+    for ([_]*db_mod.DB{ &cancel_primary, &follower }) |db| {
+        try db.setSchemaJson(alloc, before);
+        try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+    }
+    var cancel_barrier: Barrier = .{};
+    var cancel_publisher: Publisher = .{ .barrier = &cancel_barrier, .lsn = 1 };
+    defer if (cancel_publisher.payload) |bytes| alloc.free(bytes);
+    defer cancel_primary.local_execution.replication_async_batch_mirror = null;
+    const cancellation = @import("relational_index_cancellation_intent.zig");
+    const intent = cancellation.Intent.fromBinding(binding);
+    var pending_cancel = try cancel_primary.prepareNativeIndexOwnerCancellation(intent);
+    defer pending_cancel.deinit();
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    const canceled = try cancel_primary.applyPreparedNativeIndexOwnerCancellation(&pending_cancel, null);
+    try std.testing.expect(canceled.replication_pending);
+    try std.testing.expect(!canceled.duplicate);
+    const intent_status = try cancel_primary.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(canceled.position, intent_status.intent.?.position);
+    try std.testing.expect(intent_status.binding == null and intent_status.admitted == null);
+    var foreign_identity = receipt_identity;
+    foreign_identity.id[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, cancel_primary.nativeIndexOwnerCancellationState(foreign_identity));
+    try std.testing.expectEqualStrings("TestPublicationUnavailable", canceled.error_name.?);
+    {
+        var read = try cancel_primary.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.load(&read) == null);
+        try std.testing.expectEqual(canceled.position, (try cancellation.load(&read)).?.position);
+        try jobs.verifyRecovery(alloc, &read, null);
+    }
+    const cancel_payload = try pending_cancel.finalizePayload(canceled.position);
+    try std.testing.expectEqualSlices(u8, cancel_payload, cancel_publisher.payload.?);
+    cancel_primary.local_execution.replication_async_batch_mirror = null;
+    cancel_primary.close();
+    cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    cancel_publisher.fail = false;
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    try cancel_primary.flushDurableReplicationOutboxes();
+    try std.testing.expectEqual(@as(usize, 2), cancel_publisher.attempts);
+    try std.testing.expectEqual(@as(usize, 1), cancel_publisher.completed);
+    {
+        var pending = try outbox_store.readPending(alloc, cancel_primary.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expect(pending.isEmpty());
+    }
+    const retried = try cancel_primary.applyPreparedNativeIndexOwnerCancellation(&pending_cancel, null);
+    try std.testing.expect(retried.duplicate);
+    try std.testing.expect(!retried.replication_pending);
+    try std.testing.expectEqual(canceled.position, retried.position);
+    const cancel_record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = cancel_payload };
+    var cancel_decoded = try effects.decodeBatchMutationRequest(alloc, cancel_record);
+    defer cancel_decoded.deinit();
+    var smuggled = cancel_decoded.value;
+    smuggled.request.writes = &.{.{ .key = "smuggled", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(smuggled));
+    smuggled = cancel_decoded.value;
+    smuggled.ordinary_raft_entry = .{ .term = 1, .index = 1 };
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(smuggled));
+    const extra_field = try std.fmt.allocPrint(alloc, "{s},\"unknown_control\":true}}", .{cancel_payload[0 .. cancel_payload.len - 1]});
+    defer alloc.free(extra_field);
+    var unknown_cancel = cancel_record;
+    unknown_cancel.payload = extra_field;
+    try std.testing.expectError(error.InvalidBatchRequest, effects.decodeBatchMutationRequest(alloc, unknown_cancel));
+    const union_boundary = std.mem.indexOf(u8, cancel_payload, "},\"position\":{").?;
+    var cleanup_binding = binding;
+    cleanup_binding.phase = .reserved;
+    const binding_json = try std.json.Stringify.valueAlloc(alloc, cleanup_binding, .{});
+    defer alloc.free(binding_json);
+    const mixed_effects = try std.fmt.allocPrint(alloc, "{s},\"cancel_cleanup\":{s}{s}", .{ cancel_payload[0..union_boundary], binding_json, cancel_payload[union_boundary..] });
+    defer alloc.free(mixed_effects);
+    // Valid JSON, but not one typed effect. Do not accidentally accept the
+    // first arm and silently discard a second operation from the same frame.
+    var valid_json = try std.json.parseFromSlice(std.json.Value, alloc, mixed_effects, .{});
+    defer valid_json.deinit();
+    unknown_cancel.payload = mixed_effects;
+    if (effects.decodeBatchMutationRequest(alloc, unknown_cancel)) |accepted_value| {
+        var accepted = accepted_value;
+        accepted.deinit();
+        return error.MixedNativeIndexEffectsAccepted;
+    } else |err| if (err == error.OutOfMemory) return err;
+    var cancel_gap = try replication_ingress.normalizeBatch(cancel_decoded.value);
+    cancel_gap.index_owner_control.?.position.sequence += 1;
+    cancel_gap.receipt = .{ .native = cancel_gap.index_owner_control.?.position };
+    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cancel_gap, 1));
+    try std.testing.expectEqual(@as(u64, 0), try follower.replicationAppliedSequence());
+    try replication_ingress.applyRecord(&follower, cancel_record);
+    try replication_ingress.applyRecord(&follower, cancel_record);
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    try std.testing.expectEqual(@as(u64, 1), try follower.replicationAppliedSequence());
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.load(&read) == null);
+        try jobs.verifyRecovery(alloc, &read, null);
+        try std.testing.expectEqual(canceled.position, (try cancellation.load(&read)).?.position);
+        try std.testing.expectEqual(canceled.position.sequence, (try authority.load(&read)).?.sequence);
+    }
+    var late_admission = try follower.prepareNativeIndexOwnerAdmission(intent, candidate.inputs.bytes);
+    defer late_admission.deinit();
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, follower.applyPreparedNativeIndexOwnerControl(&late_admission, null));
+
+    // Drain and burn now use the real DB commit/outbox/replay pipeline too.
+    // Each committed mirror failure retains its exact payload and cut; ordinary
+    // controls remain canceled and none of these outcomes has a receipt field.
+    for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
+        alloc.free(cancel_publisher.payload.?);
+        cancel_publisher.payload = null;
+        cancel_publisher.lsn = 2 + ordinal;
+        cancel_publisher.fail = true;
+        var canceled_control = if (effect == .admitted)
+            try cancel_primary.prepareNativeIndexOwnerCancellationAdmission(intent, candidate.inputs.bytes)
+        else
+            try cancel_primary.prepareNativeIndexOwnerCancellationControl(.{ .effect = effect, .binding = binding });
+        defer canceled_control.deinit();
+        const progress_outcome = try cancel_primary.applyPreparedNativeIndexOwnerCancellationControl(&canceled_control, null);
+        try std.testing.expect(progress_outcome.replication_pending);
+        try std.testing.expect(!progress_outcome.duplicate);
+        try std.testing.expectEqual(@as(u64, 2 + ordinal), progress_outcome.position.sequence);
+        const progress_payload = try canceled_control.finalizePayload(progress_outcome.position);
+        try std.testing.expectEqualSlices(u8, progress_payload, cancel_publisher.payload.?);
+        cancel_publisher.fail = false;
+        try cancel_primary.flushDurableReplicationOutboxes();
+        const duplicate_progress = try cancel_primary.applyPreparedNativeIndexOwnerCancellationControl(&canceled_control, null);
+        try std.testing.expect(duplicate_progress.duplicate);
+        try std.testing.expectEqual(progress_outcome.position, duplicate_progress.position);
+        var progress_record = cancel_record;
+        progress_record.lsn = 2 + ordinal;
+        progress_record.previous_lsn = 1 + ordinal;
+        progress_record.payload = progress_payload;
+        var decoded_progress = try effects.decodeBatchMutationRequest(alloc, progress_record);
+        defer decoded_progress.deinit();
+        try std.testing.expect(decoded_progress.value.index_owner_control.?.effect == .cancel_control);
+        var progress_gap = try replication_ingress.normalizeBatch(decoded_progress.value);
+        progress_gap.index_owner_control.?.position.sequence += 1;
+        progress_gap.receipt = .{ .native = progress_gap.index_owner_control.?.position };
+        try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(progress_gap, progress_record.lsn));
+        try std.testing.expectEqual(progress_record.previous_lsn, try follower.replicationAppliedSequence());
+        try replication_ingress.applyRecord(&follower, progress_record);
+        try replication_ingress.applyRecord(&follower, progress_record);
+        follower.close();
+        follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+        try std.testing.expectEqual(progress_record.lsn, try follower.replicationAppliedSequence());
+        const status = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+        try std.testing.expectEqual(@as(u64, 2 + ordinal), status.source.sequence);
+        try std.testing.expectEqual(canceled.position, status.intent.?.position);
+        try std.testing.expectEqual(@as(u64, 2), status.admitted.?.sequence);
+        try std.testing.expectEqual(ordinal >= 1, status.fenced != null);
+        try std.testing.expectEqual(ordinal >= 2, status.reserved != null);
+        if (status.fenced) |cut| try std.testing.expectEqual(@as(u64, 3), cut.sequence);
+        if (status.reserved) |cut| try std.testing.expectEqual(@as(u64, 4), cut.sequence);
+        try std.testing.expect(status.cleanup == null and !status.artifacts_retired);
+    }
+    alloc.free(cancel_publisher.payload.?);
+    cancel_publisher.payload = null;
+    cancel_publisher.lsn = 5;
+    cancel_publisher.fail = true;
+    var cleanup = try cancel_primary.prepareNativeIndexOwnerCleanup(receipt_identity);
+    defer cleanup.deinit();
+    const admitted_cleanup = try cancel_primary.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    try std.testing.expect(admitted_cleanup.replication_pending);
+    try std.testing.expect(!admitted_cleanup.duplicate);
+    try std.testing.expectEqual(@as(u64, 5), admitted_cleanup.position.sequence);
+    const cleanup_payload = try cleanup.finalizePayload(admitted_cleanup.position);
+    try std.testing.expectEqualSlices(u8, cleanup_payload, cancel_publisher.payload.?);
+    cancel_primary.local_execution.replication_async_batch_mirror = null;
+    cancel_primary.close();
+    cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    cancel_publisher.fail = false;
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    try cancel_primary.flushDurableReplicationOutboxes();
+    const duplicate_cleanup = try cancel_primary.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    try std.testing.expect(duplicate_cleanup.duplicate);
+    try std.testing.expectEqual(admitted_cleanup.position, duplicate_cleanup.position);
+    var cleanup_record = cancel_record;
+    cleanup_record.lsn = 5;
+    cleanup_record.previous_lsn = 4;
+    cleanup_record.payload = cleanup_payload;
+    var decoded_cleanup = try effects.decodeBatchMutationRequest(alloc, cleanup_record);
+    defer decoded_cleanup.deinit();
+    try std.testing.expect(decoded_cleanup.value.index_owner_control.?.effect == .cancel_cleanup);
+    var cleanup_gap = try replication_ingress.normalizeBatch(decoded_cleanup.value);
+    cleanup_gap.index_owner_control.?.position.sequence += 1;
+    cleanup_gap.receipt = .{ .native = cleanup_gap.index_owner_control.?.position };
+    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cleanup_gap, 5));
+    try std.testing.expectEqual(@as(u64, 4), try follower.replicationAppliedSequence());
+    try replication_ingress.applyRecord(&follower, cleanup_record);
+    try replication_ingress.applyRecord(&follower, cleanup_record);
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
+    const queued = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(@as(u64, 5), queued.cleanup.?.sequence);
+    try std.testing.expect(queued.claim_allocation != null);
+    try std.testing.expect(!queued.artifacts_retired);
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(admitted_cleanup.position, (try jobs.CancellationCleanupRecord.decode(try read.get(jobs.cancellation_cleanup_key))).position);
+        try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&read, binding));
+        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+    }
+
+    // Standby-local derived cleanup must not weaken ordinary admission. An
+    // unrelated queued generation is untouched by the targeted worker.
+    const Denied = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var denied_context: u8 = 0;
+    follower.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    defer follower.local_execution.replication_write_gate = null;
+    const gc = @import("relational_index_gc.zig");
+    try std.testing.expect(binding.index.generation > 1);
+    const unrelated: records.Id = .{ .generation = binding.index.generation - 1, .slot = binding.index.slot };
+    try std.testing.expect(std.mem.order(u8, &gc.key(unrelated), &gc.key(binding.index)) == .lt);
+    try follower.core.store.putBatch(&.{.{ .key = &gc.key(unrelated), .value = &gc.initial(unrelated) }}, &.{});
+    try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
+    const first_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(first_page.advanced);
+    try std.testing.expect(!first_page.artifacts_retired);
+    // Resume the admitted generation after a restart between bounded phases.
+    follower.local_execution.replication_write_gate = null;
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    follower.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    const final_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(final_page.advanced);
+    try std.testing.expect(final_page.artifacts_retired);
+    const duplicate_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(!duplicate_page.advanced);
+    try std.testing.expect(duplicate_page.artifacts_retired);
+    const retired_status = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expect(retired_status.artifacts_retired);
+    try std.testing.expect(retired_status.binding != null);
+    try std.testing.expectEqual(@as(u64, 5), retired_status.source.sequence);
+    try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
+    try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireCancellationArtifactsRetired(&read, binding);
+        try std.testing.expectEqualSlices(u8, &gc.initial(unrelated), try read.get(&gc.key(unrelated)));
+        try std.testing.expectEqual(@as(u64, 5), (try authority.require(&read, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace))).sequence);
+        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+    }
+}
+
 test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {
     const storage_schema = @import("../schema.zig");
     const catalog = @import("table_catalog.zig");
@@ -823,6 +1392,53 @@ test "relational index system typed JSON null survives preparation normalization
     for (committed_page.rows) |row| try std.testing.expectEqualSlices(bool, &.{ false, true }, row.sql_nulls.?);
     try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "bad", .value = input_write.value, .json_null_fields = &.{ "payload", "payload" } }} }));
     try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "bad", .value = input_write.value, .json_null_fields = &.{"missing"} }} }));
+}
+
+test "relational index system activation projection transports only present JSON null markers" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("activation-json-provenance");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"j":{"type":"json"},"s":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"j\":null,\"s\":null}", .json_null_fields = &.{"j"} },
+        .{ .key = "b", .value = "{\"j\":{},\"s\":null}" },
+    } });
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{ "j", "s" }, .include_primary_digest = true });
+    defer reader.deinit();
+    var page = try reader.nextPage(alloc, db.backend_runtime.io(), .{});
+    defer page.deinit();
+    const Row = @import("relational_integrity_activation_contract.zig").Row;
+    const wire_rows = try alloc.alloc(Row, page.rows.len);
+    defer alloc.free(wire_rows);
+    for (wire_rows, page.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
+    const Response = struct {
+        rows: []const Row,
+        pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try @import("relational_integrity_json.zig").write(response, stream);
+        }
+    };
+    const wire = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = wire_rows }, .{});
+    defer alloc.free(wire);
+    var parsed = try std.json.parseFromSlice(struct {
+        rows: []const @import("../../api/relational_integrity_commit.zig").BackfillRow,
+    }, alloc, wire, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.rows.len);
+    const first = parsed.value.rows[0];
+    const second = parsed.value.rows[1];
+    try std.testing.expectEqualStrings("a", first.key);
+    try std.testing.expectEqual(@as(usize, 1), first.json_null_fields.len);
+    try std.testing.expectEqualStrings("j", first.json_null_fields[0]);
+    try std.testing.expect(first.expected_content_digest != null);
+    try std.testing.expectEqualStrings("b", second.key);
+    try std.testing.expectEqual(@as(usize, 0), second.json_null_fields.len);
+    try std.testing.expect(second.expected_content_digest != null);
+    // Empty metadata adds no wire field; omitting it must still decode as the
+    // empty marker set, never turn a SQL NULL into present JSON null.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "\"json_null_fields\""));
 }
 
 test "relational index system typed JSON null obeys composed JSON constraints" {
@@ -1771,6 +2387,209 @@ test "relational index system partial membership discharges uncovered predicates
         try std.testing.expectEqual(if (case.expected_probes == 0) case.expected_rows else @as(usize, 0), page.index_only_rows);
     }
     std.debug.print("partial-index uncovered membership predicate rows=128 primary_probes=0 residual_fallback_probes=128\n", .{});
+}
+
+test "relational index system SQL durable numeric functions survive LSM reopen and portable restore" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("durable-numeric-index");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("durable-numeric-restored");
+    defer target.cleanup();
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        var create = try @import("../../sql/compiler.zig").compile(alloc, "CREATE TABLE t (id integer, n numeric, g numeric GENERATED ALWAYS AS (round(n,2)) STORED, d numeric DEFAULT trunc(9.876::numeric,2), CHECK (sqrt(n) >= 0))", .{});
+        defer create.deinit();
+        const schema_bytes = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(alloc, create.statement.create_table);
+        defer alloc.free(schema_bytes);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var public = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), schema_bytes, .{ .parse_numbers = false });
+        var index = try @import("../../sql/compiler.zig").compile(alloc, "CREATE INDEX tenant_id ON t ((round(n,2))) INCLUDE (id,n,g,d)", .{});
+        defer index.deinit();
+        _ = try @import("../../sql/schema_ddl.zig").apply(arena.allocator(), &public, index.statement.catalog_ddl);
+        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), public, .{});
+        try seed.setSchemaJson(alloc, encoded);
+        try std.testing.expect(seed.core.schema.?.requires_numeric_functions);
+        try seed.batch(.{ .writes = &.{
+            .{ .key = "r1", .value = "{\"id\":1,\"n\":9007199254740993.255}" },
+            .{ .key = "r2", .value = "{\"id\":2,\"n\":1.255}" },
+        } });
+        _ = try ready(&seed);
+        try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_numeric_functions);
+        _ = try ready(db);
+        const generation = (try db.relationalIndexBuildStatus("tenant_id")).generation;
+        var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "n", "g", "d" } });
+        defer reader.deinit();
+        var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        for (page.rows) |row| {
+            const object = row.typed.?.object;
+            const value = object.get("g").?;
+            const expected: []const u8 = if (object.get("id").?.integer == 1) "9007199254740993.26" else "1.26";
+            try std.testing.expectEqualStrings(expected, if (value == .number_string) value.number_string else value.string);
+            const default = object.get("d").?;
+            try std.testing.expectEqualStrings("9.87", if (default == .number_string) default.number_string else default.string);
+        }
+        try std.testing.expectError(error.SqlInvalidPowerArgument, db.batch(.{ .writes = &.{
+            .{ .key = "not-committed", .value = "{\"id\":3,\"n\":2}" },
+            .{ .key = "invalid", .value = "{\"id\":4,\"n\":-1}" },
+        } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "r2", .value = "{\"id\":2,\"n\":2.345}" }} });
+        try std.testing.expectEqual(generation, (try db.relationalIndexBuildStatus("tenant_id")).generation);
+    }
+}
+
+test "relational index system durable text indexes and CHECKs survive LSM reopen and portable restore" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("durable-text-index");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("durable-text-restored");
+    defer target.cleanup();
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        try seed.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"result_type":"string","expression":{"op":"md5","args":[{"op":"replace","args":[{"op":"column","column":"payload"},{"op":"literal","type":"string","value":"old"},{"op":"literal","type":"string","value":"new"}]}]}}],"include_columns":["id","payload"]}],"checks":[{"name":"payload_required","expression":{"op":"is_not_null","args":[{"op":"md5","args":[{"op":"column","column":"payload"}]}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"payload":{"type":"keyword","nullable":true}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(seed.core.schema.?.requires_text_expressions);
+        try seed.batch(.{ .writes = &.{
+            .{ .key = "r1", .value = "{\"id\":1,\"payload\":\"old one\"}" },
+            .{ .key = "r2", .value = "{\"id\":2,\"payload\":\"héllo\"}" },
+            .{ .key = "r3", .value = "{\"id\":3,\"payload\":\"\"}" },
+        } });
+        _ = try ready(&seed);
+        try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_text_expressions);
+        _ = try ready(db);
+        const generation = (try db.relationalIndexBuildStatus("tenant_id")).generation;
+        {
+            var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" } });
+            defer reader.deinit();
+            var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+            defer page.deinit();
+            try std.testing.expect(!page.more);
+            try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+            try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+            var seen: [3]bool = @splat(false);
+            for (page.rows) |row| {
+                const id = row.typed.?.object.get("id").?.integer;
+                try std.testing.expect(id >= 1 and id <= 3);
+                const ordinal: usize = @intCast(id - 1);
+                try std.testing.expect(!seen[ordinal]);
+                seen[ordinal] = true;
+                try std.testing.expectEqualStrings(([_][]const u8{ "old one", "héllo", "" })[ordinal], row.typed.?.object.get("payload").?.string);
+            }
+        }
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{
+            .{ .key = "not-committed", .value = "{\"id\":4,\"payload\":\"valid\"}" },
+            .{ .key = "invalid", .value = "{\"id\":5,\"payload\":null}" },
+        } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "r1", .value = "{\"id\":1,\"payload\":\"old changed\"}" }} });
+        try std.testing.expectEqual(generation, (try db.relationalIndexBuildStatus("tenant_id")).generation);
+        var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" } });
+        defer reader.deinit();
+        var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        var updated = false;
+        for (page.rows) |row| if (row.typed.?.object.get("id").?.integer == 1) {
+            try std.testing.expect(!updated);
+            updated = true;
+            try std.testing.expectEqualStrings("old changed", row.typed.?.object.get("payload").?.string);
+        };
+        try std.testing.expect(updated);
+    }
+}
+
+test "relational index system SQL immutable index constant membership survives LSM reopen and portable restore" {
+    for ([_]bool{ true, false }) |constant| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("constant-index-membership");
+        defer directory.cleanup();
+        var target = try @import("../../common/test_directory.zig").TestDirectory.init("constant-index-restored");
+        defer target.cleanup();
+        var archive: std.ArrayList(u8) = .empty;
+        defer archive.deinit(alloc);
+        const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+        {
+            var seed = try db_mod.DB.open(alloc, directory.path(), options);
+            defer seed.close();
+            const definition = try std.json.Stringify.valueAlloc(alloc, .{
+                .version = 1,
+                .storage_mode = "relational",
+                .default_type = "row",
+                .relational_indexes = &.{.{ .name = "tenant_id", .keys = &.{.{ .column = "id" }}, .include_columns = &.{"payload"}, .where = &.{.{ .constant = constant }} }},
+                .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = .{ .id = .{ .type = "integer" }, .payload = .{ .type = "keyword" } }, .additionalProperties = false } } },
+            }, .{});
+            defer alloc.free(definition);
+            try seed.setSchemaJson(alloc, definition);
+            try seed.batch(.{ .writes = &.{
+                .{ .key = "r1", .value = "{\"id\":1,\"payload\":\"one\"}" },
+                .{ .key = "r2", .value = "{\"id\":2,\"payload\":\"two\"}" },
+                .{ .key = "r3", .value = "{\"id\":3,\"payload\":\"three\"}" },
+            } });
+            _ = try ready(&seed);
+            try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+        }
+        var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+        defer reopened.close();
+        var restored = try db_mod.DB.open(alloc, target.path(), options);
+        defer restored.close();
+        try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+        for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+            _ = try ready(db);
+            const progress = try db.relationalIndexBuildStatus("tenant_id");
+            const prefix = try records.forwardPrefix(.{ .generation = progress.generation, .slot = progress.slot });
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var item = try cursor.seekAtOrAfter(&prefix);
+            var count: usize = 0;
+            while (item) |entry| : (item = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, &prefix)) break;
+                _ = try records.forwardOwnership(entry.key);
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, if (constant) 3 else 0), count);
+            if (!constant) try std.testing.expectError(error.PartialIndexPredicateNotImplied, db.beginRelationalRows(alloc, .{ .index = "tenant_id" }));
+            var reader = try db.beginRelationalRows(alloc, .{
+                .index = "tenant_id",
+                .fields = &.{ "id", "payload" },
+                .conditions = if (constant) &.{} else &.{ .{ .column = "id", .op = .gt, .value = .{ .integer = 0 } }, .{ .column = "id", .op = .lte, .value = .{ .integer = 0 } } },
+            });
+            defer reader.deinit();
+            var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+            defer page.deinit();
+            try std.testing.expect(!page.more);
+            try std.testing.expectEqual(@as(usize, if (constant) 3 else 0), page.rows.len);
+            try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        }
+    }
 }
 
 fn partialCount(db: *db_mod.DB) !usize {

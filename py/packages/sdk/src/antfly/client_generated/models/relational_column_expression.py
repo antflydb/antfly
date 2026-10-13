@@ -25,8 +25,25 @@ class RelationalColumnExpression:
             division truncates toward zero. Overflow and division by zero reject
             the write. Arithmetic and string operations propagate null. ASCII case
             operations leave non-ASCII bytes unchanged. No volatile functions are
-            accepted. Allocated results are bounded to 1 MiB each. Allocations
-            and byte-comparison operand work share a 4 MiB evaluation budget per
+            accepted. Allocated results are bounded to 1 MiB each.
+            The replace operation takes three text arguments and performs literal,
+            non-overlapping replacement; an empty search string leaves the input
+            unchanged. md5 takes one text argument and returns 32 lowercase hex
+            characters (a SQL compatibility fingerprint, not a security primitive).
+            Both are strict in SQL NULL and require reader capability version 27,
+            including when nested inside scalar/boolean expressions. Literal search
+            patterns are prepared with immutable plans; matching, copies and dynamic
+            pattern preparation share invocation work/cancellation admission.
+            Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+            reader capability version 28, even when nested in boolean programs.
+            They take one NUMERIC or float64 argument; abs also preserves integer
+            widths and float32. round and trunc optionally accept an int32 scale
+            as a second argument only for NUMERIC. Operands must already have their
+            resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+            round uses ties away from zero; float64 round uses ties to even. All
+            selected arguments evaluate before strict NULL propagation. NUMERIC
+            execution never converts through float and shares invocation admission.
+            Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
             row and expression set. An integer literal may use a decimal string
             for exact int64 transport; blob uses base64 and datetime uses the
             normal relational datetime representation.

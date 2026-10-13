@@ -314,7 +314,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    // SQL declaration lowering must agree with the distributed integrity
+    // planner, which lives outside sql/. Keep that cross-layer regression in
+    // this gate rather than leaving it silently outside the selected corpus.
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "schema deserialization cleans initialized mappings on allocation failure" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
@@ -337,6 +340,25 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const constraint_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/constraint_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_constraint_name_tests = b.addRunArtifact(constraint_name_tests);
+    constraint_name_tests.root_module.addImport("antfly_platform", platform_mod);
+    b.step("system-catalog-constraint-name-test", "Test bounded PostgreSQL-compatible generated constraint names")
+        .dependOn(&run_constraint_name_tests.step);
+    run_sql_tests.step.dependOn(&run_constraint_name_tests.step);
+    const naming_wire_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/constraint_name_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_naming_wire_tests = b.addRunArtifact(naming_wire_tests);
+    b.step("system-catalog-naming-wire-test", "Test fixed-memory naming capability projection")
+        .dependOn(&run_naming_wire_tests.step);
+    run_sql_tests.step.dependOn(&run_naming_wire_tests.step);
     const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
         .target = target,

@@ -300,7 +300,7 @@ fn resultAdmission(elements: usize, rank_: usize, limits: Limits) !void {
 
 fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     try budget.consume(1);
-    if (element.patterns != null or element.array != null) return error.SqlTypeMismatch;
+    if (element.patterns() != null or element.array != null or element.temporal() != null) return error.SqlTypeMismatch;
     if (element.numeric != null and (kind != .numeric or element.sql_null or element.value != .null)) return error.SqlTypeMismatch;
     if (element.sql_null) {
         if (element.value != .null) return error.InvalidSqlArrayShape;

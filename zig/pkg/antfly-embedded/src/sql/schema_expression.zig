@@ -19,6 +19,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 const Json = std.json.Value;
+const ImmutableContext = enum { generation, index_key, index_predicate };
 
 fn nativeType(kind: ast.ColumnType, identity: ?@import("array_value.zig").ElementType) []const u8 {
     return if (kind == .array) "sql_array" else if (kind == .number and identity == .numeric) "numeric" else if (kind == .uuid) "string" else @tagName(kind);
@@ -66,6 +67,7 @@ fn json(alloc: std.mem.Allocator, input: anytype) !Json {
 }
 
 fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Datum) !Json {
+    if (value.temporal() != null) return error.UnsupportedSqlShape;
     const kind = result.kind orelse return error.SqlTypeMismatch;
     const identity = result.element_type;
     if (kind == .array) return json(alloc, .{
@@ -107,21 +109,56 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
 const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
+    return lowerTypedPolicy(alloc, schema, expression, expected, null, .{});
+}
+
+pub fn lowerIndexKey(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, limits: @import("immutable_plan.zig").Limits) !Lowered {
+    return lowerTypedPolicy(alloc, schema, expression, null, .index_key, limits);
+}
+
+fn lowerTypedPolicy(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
     const properties = try @import("schema_columns.zig").properties(schema);
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
         const column = try @import("schema_columns.zig").column(name, property);
         try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
     }
-    return lowerColumns(alloc, columns.items, expression, expected);
+    return lowerColumnsPolicy(alloc, columns.items, expression, expected, immutable, limits);
 }
 
 pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
+    return lowerColumnsPolicy(alloc, columns, expression, expected, null, .{});
+}
+
+fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     var program = try scalar.bindExpected(alloc, expression, columns, &.{}, expected, .{});
     defer program.deinit();
     if (program.parameter_types.len != 0) return error.InvalidSqlParameters;
+    var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, &program, limits) else null;
+    defer if (plan) |*value| value.deinit();
+    if (plan) |*value| if (value.nodes[program.root].volatility != .immutable) return switch (immutable.?) {
+        .generation => error.SqlMutableGenerationExpression,
+        .index_key => error.SqlMutableIndexExpression,
+        .index_predicate => error.SqlMutableIndexPredicate,
+    };
     const values = try alloc.alloc(Json, program.instructions.len);
-    for (program.instructions, values, 0..) |instruction, *out, instruction_index| {
+    for (program.instructions, values, 0..) |original, *out, instruction_index| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+        var instruction = original;
+        if (plan) |*value| {
+            const node = value.nodes[instruction_index];
+            if (!node.reachable) continue;
+            if (node.alias) |target| {
+                out.* = try promoteNumeric(alloc, values[target], program.instructions[target].type, instruction.type);
+                continue;
+            }
+            if (value.constants[instruction_index]) |known| {
+                out.* = try inputLiteral(alloc, instruction.type, known);
+                continue;
+            }
+            instruction.operation = node.operation;
+        }
         // Unknown NULL acquires its precise domain from its consumer below.
         const kind = instruction.type.kind orelse if (nullLiteral(instruction)) .string else return error.SqlTypeMismatch;
         // Explicit builtin identities survive the physical result domain.
@@ -242,17 +279,22 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     .upper => "upper_ascii",
                     .coalesce => "coalesce",
                     .mod => "modulo",
+                    .replace => "replace",
+                    .md5 => "md5",
+                    inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @tagName(tag),
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
                 if (part.function == .mod and kind != .integer and instruction.type.element_type != .numeric) return error.UnsupportedSqlShape;
-                for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce or part.function == .mod)
+                for (args, part.args, 0..) |*arg, index, position| arg.* = if ((part.function == .round or part.function == .trunc) and position == 1)
+                    try promoteNumeric(alloc, values[index], program.instructions[index].type, .{ .kind = .integer, .element_type = .int32 })
+                else if (part.function == .coalesce or part.function == .mod or part.function == .abs or part.function == .ceil or part.function == .floor or part.function == .round or part.function == .trunc or part.function == .sign or part.function == .sqrt)
                     try promoteNumeric(alloc, values[index], program.instructions[index].type, instruction.type)
                 else
                     values[index];
                 if (part.function == .coalesce and args.len == 1) break :blk args[0];
                 var result = try json(alloc, .{ .op = op, .args = args });
-                if (part.function == .mod) if (instruction.type.element_type) |identity| try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+                if (part.function == .mod or part.function == .abs or part.function == .ceil or part.function == .floor or part.function == .round or part.function == .trunc or part.function == .sign or part.function == .sqrt) if (instruction.type.element_type) |identity| try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
                 break :blk result;
             },
             .cast => |part| blk: {
@@ -356,17 +398,22 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
 }
 
-/// Persist an assignment program, not its current result. Arithmetic and casts
-/// retain write-time failures, while literal input coercion uses the same
-/// declared-type admission as existing defaults. Callers provide the complete
-/// candidate schema so forward base-column references bind deterministically.
+/// DEFAULT retains arithmetic failures until write time. Stored generation
+/// first simplifies demanded immutable constants, matching PostgreSQL DDL
+/// failure timing, then persists only the live assignment program. Callers
+/// provide the complete candidate schema so forward base references bind.
 pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool) !Json {
+    return lowerAssignmentWithLimits(alloc, schema, expression, column, generated, .{});
+}
+
+pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool, limits: @import("immutable_plan.zig").Limits) !Json {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (generated) try rejectGeneratedReferences(schema, column.name, expression);
     if (expression.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, expression.literal, column.type, column.element_type);
     const lowered = (if (generated)
-        lowerTyped(alloc, schema, expression, column.type)
+        lowerTypedPolicy(alloc, schema, expression, column.type, .generation, limits)
     else
-        lowerColumns(alloc, &.{}, expression, column.type)) catch |err| switch (err) {
+        lowerColumnsPolicy(alloc, &.{}, expression, column.type, null, limits)) catch |err| switch (err) {
         error.UnknownColumn => return error.UndefinedColumn,
         else => return err,
     };
@@ -381,6 +428,159 @@ pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *cons
     if (lowered.type != column.type) return error.SqlAssignmentTypeMismatch;
     if (column.type == .array and lowered.element_type != column.element_type) return error.UnsupportedSqlShape;
     return lowered.expression;
+}
+
+test "SQL generated immutable planning prunes dead stable calls and preserves PostgreSQL admission" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try json(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .s = .{ .type = "keyword" }, .t = .{ .type = "datetime" } } } } } });
+    for ([_]struct { sql: []const u8, kind: ast.ColumnType }{
+        .{ .sql = "concat(s, 'x')", .kind = .string },
+        .{ .sql = "concat_ws('-', s, 'x')", .kind = .string },
+        .{ .sql = "now()", .kind = .datetime },
+        .{ .sql = "CURRENT_TIMESTAMP", .kind = .datetime },
+        .{ .sql = "s::timestamptz", .kind = .datetime },
+        .{ .sql = "t::text", .kind = .string },
+    }) |case| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, case.sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlMutableGenerationExpression, lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = case.kind }, true));
+    }
+    for ([_][]const u8{
+        "CASE WHEN false THEN concat(s, 'x') ELSE 'ok' END",
+        "coalesce('ok', concat(s, 'x'))",
+        "coalesce(NULL::text, 'ok', concat(s, 'x'))",
+    }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .string }, true);
+        try std.testing.expectEqualStrings("literal", lowered.object.get("op").?.string);
+        try std.testing.expectEqualStrings("ok", lowered.object.get("value").?.string);
+    }
+    for ([_][]const u8{ "coalesce(s, 'ok', concat(s, 'x'))", "CASE WHEN s IS NULL THEN 'ok' WHEN true THEN 'yes' ELSE concat(s, 'x') END" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .string }, true);
+        const encoded = try std.json.Stringify.valueAlloc(a, lowered, .{});
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "concat") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "column") != null);
+    }
+    var absorbed = try compiler.compileScalar(std.testing.allocator, "s IS NULL OR concat(s, 'x') IS NULL OR true", .{});
+    defer absorbed.deinit();
+    const folded = try lowerAssignment(a, schema, absorbed.expression, .{ .name = "g", .type = .boolean }, true);
+    try std.testing.expectEqual(true, folded.object.get("value").?.bool);
+}
+
+test "SQL generated immutable planning matches independent PostgreSQL DDL contracts" {
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, std.testing.allocator, @embedFile("fixtures/sql_generated_expression_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 42), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        var parsed = try @import("compiler.zig").compile(std.testing.allocator, entry.sql, .{});
+        defer parsed.deinit();
+        const schema = @import("ddl_runtime.zig").createSchemaAlloc(std.testing.allocator, parsed.statement.create_table) catch |err| {
+            if (entry.sqlstate) |state| {
+                try std.testing.expectEqualStrings(state, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("generated expression rejected: {s}: {t}\n", .{ entry.sql, err });
+            return err;
+        };
+        defer std.testing.allocator.free(schema);
+        try std.testing.expect(entry.sqlstate == null);
+    }
+}
+
+test "SQL immutable index planning matches independent PostgreSQL admission contracts" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        base_sql: []const u8,
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, a, @embedFile("fixtures/sql_index_planning_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 24), fixture.value.entries.len);
+    var base = try @import("compiler.zig").compile(a, fixture.value.base_sql, .{});
+    defer base.deinit();
+    const bytes = try @import("ddl_runtime.zig").createSchemaAlloc(a, base.statement.create_table);
+    defer a.free(bytes);
+    for (fixture.value.entries) |entry| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var schema = try std.json.parseFromSliceLeaky(Json, owned, bytes, .{ .parse_numbers = false });
+        var compiled = try @import("compiler.zig").compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        _ = @import("schema_ddl.zig").apply(owned, &schema, compiled.statement.catalog_ddl) catch |err| {
+            if (entry.sqlstate) |state| {
+                try std.testing.expectEqualStrings(state, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("index planning unexpectedly rejected {s}: {s}\n", .{ entry.sql, @errorName(err) });
+            return err;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        // The generated public wire contract must accept persisted variants.
+        const encoded = try std.json.Stringify.valueAlloc(owned, schema, .{});
+        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, encoded);
+        defer parsed.deinit(a);
+        const definitions = (try parsed.relationalIndexDefinitions(owned)).?;
+        try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    }
+}
+
+test "SQL immutable index public declarations reject ambiguous and incomplete membership" {
+    const a = std.testing.allocator;
+    const base = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}}}}},\"relational_indexes\":[{\"name\":\"probe_idx\",\"keys\":[{\"column\":\"n\"}],\"where\":[{s}]}]}";
+    for ([_][]const u8{
+        "{}",
+        "{\"column\":\"n\"}",
+        "{\"op\":\"eq\"}",
+        "{\"column\":\"\",\"op\":\"eq\"}",
+        "{\"column\":\"n\",\"op\":\"eq\",\"collation\":\"\"}",
+        "{\"constant\":false,\"column\":\"n\"}",
+        "{\"constant\":false,\"op\":\"eq\"}",
+        "{\"constant\":false,\"value\":0}",
+        "{\"constant\":false,\"collation\":\"C\"}",
+    }) |condition| {
+        const encoded = try std.mem.replaceOwned(u8, a, base, "{s}", condition);
+        defer a.free(encoded);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, @import("../schema/mod.zig").parseValidatedTableSchema(a, encoded));
+    }
+}
+
+test "SQL generated immutable planning retains binding errors and PostgreSQL constant failure timing" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try json(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .s = .{ .type = "keyword" } } } } } });
+    for ([_][]const u8{ "1 / 0", "CASE WHEN s IS NULL THEN 1 ELSE 1 / 0 END" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlDivisionByZero, lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .integer }, true));
+    }
+    for ([_][]const u8{ "CASE WHEN false THEN 1 / 0 ELSE 1 END", "coalesce(1, 1 / 0)" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .integer }, true);
+        try std.testing.expectEqualStrings("cast", lowered.object.get("op").?.string);
+        try std.testing.expectEqualStrings("int64", lowered.object.get("sql_type").?.string);
+        try std.testing.expectEqualStrings("1", lowered.object.get("args").?.array.items[0].object.get("value").?.number_string);
+    }
+    var unknown = try compiler.compileScalar(std.testing.allocator, "CASE WHEN false THEN missing ELSE 'ok' END", .{});
+    defer unknown.deinit();
+    try std.testing.expectError(error.UndefinedColumn, lowerAssignment(a, schema, unknown.expression, .{ .name = "g", .type = .string }, true));
+    var self_reference = try compiler.compileScalar(std.testing.allocator, "CASE WHEN false THEN g ELSE 'ok' END", .{});
+    defer self_reference.deinit();
+    try std.testing.expectError(error.SqlInvalidGenerationExpression, lowerAssignment(a, schema, self_reference.expression, .{ .name = "g", .type = .string }, true));
+    var ordinary_default = try compiler.compileScalar(std.testing.allocator, "1 / 0", .{});
+    defer ordinary_default.deinit();
+    _ = try lowerAssignment(a, schema, ordinary_default.expression, .{ .name = "g", .type = .integer }, false);
+    try std.testing.expectEqual(scalar.Volatility.immutable, scalar.Function.to_timestamp.volatility());
 }
 
 fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const ast.Scalar) anyerror!void {
@@ -420,7 +620,11 @@ fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const 
 }
 
 pub fn lowerIndexPredicate(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar) ![]const Json {
-    const lowered = try lowerTyped(alloc, schema, expression, .boolean);
+    return lowerIndexPredicateWithLimits(alloc, schema, expression, .{});
+}
+
+pub fn lowerIndexPredicateWithLimits(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, limits: @import("immutable_plan.zig").Limits) ![]const Json {
+    const lowered = try lowerTypedPolicy(alloc, schema, expression, .boolean, .index_predicate, limits);
     if (lowered.type != .boolean) return error.SqlTypeMismatch;
     const native = lowered.expression;
     const expressions = @import("../schema/relational_expression.zig");
@@ -464,6 +668,14 @@ fn appendPredicate(alloc: std.mem.Allocator, predicates: *std.ArrayList(Json), p
 
 fn collectPredicates(alloc: std.mem.Allocator, expression: Json, negated: bool, predicates: *std.ArrayList(Json), execution: *@import("../schema/relational_expression.zig").Execution) anyerror!void {
     const operation = expression.object.get("op").?.string;
+    if (std.mem.eql(u8, operation, "literal")) {
+        const value = expression.object.get("value") orelse Json.null;
+        if (value != .null and value != .bool) return error.SqlTypeMismatch;
+        // NOT UNKNOWN remains UNKNOWN; WHERE admits only TRUE.
+        if (value == .null or value.bool == negated)
+            try appendPredicate(alloc, predicates, try json(alloc, .{ .constant = false }));
+        return;
+    }
     if (std.mem.eql(u8, operation, "column")) {
         try appendPredicate(alloc, predicates, try json(alloc, .{ .column = expression.object.get("column").?.string, .op = "eq", .value = !negated }));
         return;
@@ -859,6 +1071,55 @@ test "SQL schema partial index constant bounds match PostgreSQL domains and erro
     }
 }
 
+test "SQL durable numeric functions lower and execute independent PostgreSQL contracts" {
+    const a = std.testing.allocator;
+    const native = @import("../schema/relational_expression.zig");
+    const storage = @import("../storage/schema.zig");
+    const exact = @import("numeric_value.zig");
+    const Entry = struct { domain: enum { numeric, float64 }, input: ?[]const u8, sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var exercised: usize = 0;
+    for (fixture.value.entries) |entry| {
+        // Durable float cells currently admit finite values only. NUMERIC has
+        // its own exact special-value representation; do not alias the two.
+        const floating: ?f64 = if (entry.domain == .float64 and entry.input != null) try @import("builtin_cast.zig").floatValue(f64, .{ .string = entry.input.? }) else null;
+        if (floating) |value| if (!std.math.isFinite(value)) continue;
+        exercised += 1;
+        errdefer std.debug.print("durable numeric oracle: {s}\n", .{entry.sql});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const schema = try json(owned, .{ .storage_mode = "relational", .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .n = .{ .type = "number", .@"x-antfly-sql-type" = if (entry.domain == .numeric) "numeric" else "float64" } } } } } });
+        const sql = try std.mem.replaceOwned(u8, owned, entry.sql, "$1", "n");
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        const lowered = try lower(owned, schema, compiled.expression, null);
+        const columns = [_]storage.RelationalColumn{.{ .name = "n", .path = "n", .column_type = if (entry.domain == .numeric) .numeric else .number, .sql_element_type = if (entry.domain == .numeric) .numeric else .float64, .allows_null = true }};
+        var plan = try native.Plan.init(a, .{ .relational_columns = &columns }, lowered, if (entry.domain == .numeric) .numeric else .number);
+        defer plan.deinit();
+        var bytes: usize = native.max_allocated_bytes;
+        var execution = native.Execution.init(owned, &bytes);
+        const input: native.Value = if (entry.input == null) .null else if (entry.domain == .numeric) try native.numericJson(&execution, .{ .string = entry.input.? }) else .{ .number = floating.? };
+        const result = plan.evaluateWithExecution(&execution, &.{input}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(entry.expected == null, result == .null);
+        if (result == .null) continue;
+        if (entry.domain == .numeric) {
+            var output = try @import("numeric_binary.zig").decodeCanonical(&execution.numeric, result.numeric);
+            defer output.deinit();
+            try std.testing.expectEqualStrings(entry.expected.?, try exact.format(&execution.numeric, output.value));
+        } else {
+            var hex: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(entry.expected.?, try std.fmt.bufPrint(&hex, "{x:0>16}", .{@as(u64, @bitCast(result.number))}));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 189), exercised);
+}
+
 test "SQL schema partial bounds never fold columns or erase comparison promotions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -868,7 +1129,6 @@ test "SQL schema partial bounds never fold columns or erase comparison promotion
     , .{});
     for ([_][]const u8{
         "n > n+1",
-        "n > CASE WHEN true THEN 1.0 ELSE n END",
         "CAST(n AS double precision)>1.0",
         "n > CAST(1 AS real)",
         "n > 1.0 OR n < 2.0",
@@ -877,6 +1137,16 @@ test "SQL schema partial bounds never fold columns or erase comparison promotion
         defer compiled.deinit();
         try std.testing.expectError(error.UnsupportedSqlShape, lowerIndexPredicate(a, schema, compiled.expression));
     }
+    // Demand-aware planning may eliminate an unreachable column operand,
+    // but must retain the bound's exact NUMERIC domain and comparison.
+    var simplified = try @import("compiler.zig").compileScalar(a, "n > CASE WHEN true THEN 1.0 ELSE n END", .{});
+    defer simplified.deinit();
+    const predicates = try lowerIndexPredicate(a, schema, simplified.expression);
+    try std.testing.expectEqual(@as(usize, 1), predicates.len);
+    try std.testing.expectEqualStrings("n", predicates[0].object.get("column").?.string);
+    try std.testing.expectEqualStrings("gt", predicates[0].object.get("op").?.string);
+    const bound = predicates[0].object.get("value").?;
+    try std.testing.expectEqualStrings("1.0", if (bound == .string) bound.string else bound.number_string);
 }
 
 test "SQL schema conditional expressions enforce durable branch admission" {

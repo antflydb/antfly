@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 64;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -736,6 +736,25 @@ pub const Status = enum(u32) {
     sql_feature_not_supported = 776,
     catalog_publication_proof_pending = 777,
     seed_replica_policy_mismatch = 778,
+    catalog_occupancy_not_ready = 779,
+    immutable_relational_index_definition_conflict = 780,
+    invalid_index_publication_candidate = 781,
+    invalid_private_index_cancellation = 782,
+    invalid_private_index_claim_inventory = 783,
+    invalid_private_index_claim_receipt = 784,
+    invalid_private_index_inputs = 785,
+    invalid_private_index_native_receipt = 786,
+    invalid_private_index_owner_job = 787,
+    invalid_relational_index_progress = 788,
+    missing_relational_index_definitions = 789,
+    private_index_cancellation_pending = 790,
+    private_index_cancellation_required = 791,
+    private_index_job_required = 792,
+    private_index_owner_job_changed = 793,
+    private_index_publication_canceled = 794,
+    private_index_publication_required = 795,
+    relational_index_catalog_schema_mismatch = 796,
+    sql_invalid_power_argument = 797,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -774,6 +793,12 @@ pub const FailureIdentity = extern struct {
         return self.error_name[0..@min(self.error_name_len, failure_error_name_capacity)];
     }
 };
+
+test "concurrent main and SQL statuses retain distinct wire identities" {
+    const std_test = @import("std");
+    try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.catalog_occupancy_not_ready));
+}
 
 test "released main Status identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(10_000);

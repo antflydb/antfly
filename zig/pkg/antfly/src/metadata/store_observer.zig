@@ -529,6 +529,26 @@ pub fn reportsDurablyEqual(
         runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
 }
 
+test "store observer durable projection includes schema epochs and source authority cuts" {
+    const a = std.testing.allocator;
+    const before: table_manager.RuntimeGroupStatusReport = .{ .schema_epoch = 1 };
+    var after = before;
+    try std.testing.expect(runtimeStatusEqual(before, after, true));
+    after.schema_epoch = 2;
+    try std.testing.expect(!runtimeStatusEqual(before, after, true));
+    after = before;
+    after.source_authority = .{ .kind = .native, .namespace = @splat(1), .sequence = 7 };
+    try std.testing.expect(!runtimeStatusEqual(before, after, true));
+    var cloned = try table_manager.cloneRuntimeGroupStatusReport(a, after);
+    defer table_manager.freeRuntimeGroupStatusReport(a, cloned);
+    try std.testing.expect(runtimeStatusEqual(after, cloned, true));
+    cloned.source_authority.?.sequence += 1;
+    try std.testing.expect(!runtimeStatusEqual(after, cloned, true));
+    var changed = after;
+    changed.source_authority.?.kind = .raft;
+    try std.testing.expect(!runtimeStatusEqual(after, changed, true));
+}
+
 pub fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
@@ -547,6 +567,8 @@ pub fn runtimeStatusEqual(
         lhs.status_generation != rhs.status_generation or
         lhs.target_observation_revision != rhs.target_observation_revision or
         lhs.target_observation_complete != rhs.target_observation_complete or
+        lhs.schema_epoch != rhs.schema_epoch or
+        !std.meta.eql(lhs.source_authority, rhs.source_authority) or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
         lhs.disk_bytes_known != rhs.disk_bytes_known or

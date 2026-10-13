@@ -26,6 +26,45 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const describe_sql = @import("antfly_local_sources").sql_describe;
 const native = @import("antfly_local_sources").sql_runtime;
 const catalog = @import("antfly_local_sources").sql_catalog;
+// Called only after principal/session ownership checks. The raw begin time
+// belongs to durable metadata, never to the request's SQL parameter envelope.
+fn cursorStatementClock(source: catalog.Clock.Source, statement: catalog.Clock.Instant, transaction_start_ns: ?u64) !catalog.Clock.View {
+    const view: catalog.Clock.View = .{
+        .source = source,
+        .statement = statement,
+        .transaction = if (transaction_start_ns) |ns| try catalog.Clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, ns), 1000)) else statement,
+    };
+    try view.validate();
+    return view;
+}
+
+test "SQL statement clock pgwire portals retain owner time without resampling on pages" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return if (self.calls == 1) 20_000_000_123 else -1;
+        }
+    };
+    var fake: Fake = .{};
+    const source: catalog.Clock.Source = .{ .callback = .{ .ptr = &fake, .now = Fake.sample } };
+    const statement = try source.sample();
+    const explicit = try cursorStatementClock(source, statement, 10_000_000_999);
+    const implicit = try cursorStatementClock(source, statement, null);
+    for (0..1000) |_| {
+        const page = explicit;
+        try std.testing.expectEqual(@as(?i128, 10_000_000_000), (try page.value(.transaction, 6)).unixNanoseconds());
+        try std.testing.expectEqual(@as(?i128, 20_000_000_000), (try page.value(.statement, 6)).unixNanoseconds());
+    }
+    try std.testing.expectEqual(statement.micros, implicit.transaction.micros);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(?i128, -1000), (try explicit.value(.wall, 6)).unixNanoseconds());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectError(error.InvalidTransactionClock, cursorStatementClock(source, try catalog.Clock.Instant.init(std.math.maxInt(i64)), null));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
 const ast = @import("antfly_local_sources").sql_ast;
 const operation = @import("antfly_local_sources").api_operation;
 const usermgr = @import("../usermgr/mod.zig");
@@ -334,6 +373,45 @@ test "pgwire native array page delivery preserves dimensions NULLs and exact int
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
+test "SQL transaction timestamp pgwire pages preserve exact native values and reject relabeling" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const temporal = sources.sql_temporal_value;
+            for ([_]i64{ -946_684_800_000_001, temporal.end_timestamp - 1, std.math.minInt(i64), std.math.maxInt(i64) }) |micros| {
+                const value: temporal.Value = .{ .timestamp_tz = try temporal.Timestamp.init(micros) };
+                var values = [_]sources.sql_scalar.Datum{sources.sql_scalar.Datum.typedTemporal(&value)};
+                var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                    .arena = std.heap.ArenaAllocator.init(a),
+                    .columns = &.{.{ .name = "t", .type = .datetime }},
+                    .values = .{ .rows = &.{&values} },
+                    .exhausted = true,
+                } };
+                defer owner.page.deinit();
+                const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
+                try std.testing.expect(!cell.sql_null);
+                const bytes = try wire_values.encode(alloc, .datetime, 1, cell.value);
+                try std.testing.expectEqual(@as(usize, 8), bytes.len);
+                try std.testing.expectEqual(micros, std.mem.readInt(i64, bytes[0..8], .big));
+                const text = try wire_values.encode(alloc, .datetime, 0, cell.value);
+                var expected: [sources.sql_temporal_text.output_capacity]u8 = undefined;
+                try std.testing.expectEqualStrings(try sources.sql_temporal_text.format(value, &expected), text);
+                values[0].sql_null = true;
+                try std.testing.expectError(error.SqlTypeMismatch, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
+                values[0] = .{ .sql_null = true };
+                try std.testing.expect((try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0)).sql_null);
+                const wrong: temporal.Value = .{ .timestamp = try temporal.Timestamp.init(micros) };
+                values[0] = sources.sql_scalar.Datum.typedTemporal(&wrong);
+                try std.testing.expectError(error.UnsupportedSqlShape, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
@@ -358,6 +436,9 @@ const OwnedRead = struct {
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
+        const statement_source: catalog.Clock.Source = .{ .io = server.embedding_provider_runtime.io };
+        const statement_instant = try statement_source.sample();
+        var transaction_start_ns: ?u64 = null;
         var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
         var diagnostic: compiler.Diagnostic = .{};
@@ -408,6 +489,7 @@ const OwnedRead = struct {
             defer state.deinit(server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
+            transaction_start_ns = state.begin_timestamp;
             self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
             if (state.metadata.accepted_lake_reads) {
                 if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
@@ -423,6 +505,8 @@ const OwnedRead = struct {
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
+        stream_backend.statement_clock = try cursorStatementClock(statement_source, statement_instant, transaction_start_ns);
+        stream_backend.transaction_start = stream_backend.statement_clock.?.transaction;
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
@@ -566,14 +650,18 @@ const OwnedRead = struct {
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.temporal() != null) {
+                const instant = try @import("antfly_local_sources").sql_scalar.timestampResult(value, self.page.columns[column].type);
+                return .{ .value = try wire_values.timestampEnvelope(alloc, instant), .sql_null = false };
+            }
             if (value.array) |array| {
                 const definition = self.page.columns[column];
-                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
+                if (value.sql_null or value.value != .null or value.patterns() != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
                 return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
             }
             if (value.numeric) |number| {
                 const definition = self.page.columns[column];
-                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
+                if (value.sql_null or value.value != .null or value.patterns() != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
                 const exact = @import("antfly_local_sources").sql_numeric_value;
                 var context: exact.Context = .{ .alloc = alloc };
                 return .{ .value = .{ .string = try exact.format(&context, number.*) }, .sql_null = false };
@@ -1003,18 +1091,16 @@ fn normalizeParameters(alloc: std.mem.Allocator, input: []const std.json.Value, 
     for (input, types, 0..) |value, kind, index| {
         if (kind != .datetime or value == .null or value == .string) continue;
         if (normalized == null) normalized = try alloc.dupe(std.json.Value, input);
-        normalized.?[index] = .{ .string = try storage_schema.formatDateTimeNsAlloc(alloc, try wire_values.timestampNanos(value)) };
+        normalized.?[index] = .{ .string = try @import("antfly_local_sources").datetime.formatDateTimeSignedNsAlloc(alloc, try wire_values.timestampNanos(value)) };
     }
     return normalized orelse input;
 }
 
 fn datetimeResult(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    if (value == .null) return value;
-    const nanos = if (value == .string)
-        storage_schema.parseDateTimeToNs(value.string) orelse return error.InvalidSqlBackendResponse
-    else
-        try wire_values.timestampNanos(value);
-    return wire_values.timestampValue(alloc, nanos);
+    return wire_values.timestampResult(alloc, value) catch |err| switch (err) {
+        error.InvalidResult => error.InvalidSqlBackendResponse,
+        else => err,
+    };
 }
 
 fn wireType(kind: ast.ColumnType) !wire.Type {
@@ -1669,22 +1755,22 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // Native storage accepts unsigned nanoseconds; the high case must not
-    // narrow through i64 even though the PostgreSQL wire uses signed micros.
-    for ([_]u64{ 0, 946684800000000000, 18000000000123456000, std.math.maxInt(u64) / 1000 * 1000 }) |nanos| {
+    // Exact signed time crosses the legacy native datetime adapter without
+    // narrowing, including pre-Unix values and positive values beyond i64.
+    for ([_]i128{ -1_000, -31_536_000_000_000_000, 0, 946684800000000000, 18000000000123456000, std.math.maxInt(u64) / 1000 * 1000 }) |nanos| {
         const wire_value = try wire_values.timestampValue(alloc, nanos);
         const bytes = try wire_values.encode(alloc, .datetime, 1, wire_value);
         const decoded = try wire_values.decode(alloc, 1184, 1, bytes);
         const parameters = try normalizeParameters(alloc, &.{decoded}, &.{.datetime});
         const coerced = try describe_sql.coerce(parameters[0], .datetime);
         try std.testing.expect(coerced == .string);
-        try std.testing.expectEqual(@as(?u64, nanos), storage_schema.parseDateTimeToNs(coerced.string));
+        try std.testing.expectEqual(@as(?i128, nanos), @import("antfly_local_sources").datetime.parseDateTimeToSignedNs(coerced.string));
         // The native SELECT representation is ISO; the adapter normalizes just
         // that owned cell and then produces the exact original binary micros.
         const returned = try datetimeResult(alloc, coerced);
         try std.testing.expectEqualSlices(u8, bytes, try wire_values.encode(alloc, .datetime, 1, returned));
         const text = try wire_values.encode(alloc, .datetime, 0, returned);
-        try std.testing.expectEqual(@as(?u64, nanos), storage_schema.parseDateTimeToNs(text));
+        try std.testing.expectEqual(@as(?i128, nanos), (try wire_values.timestampFromValue(.{ .string = text })).unixNanoseconds());
     }
     const text_value = std.json.Value{ .string = "2000-01-01T01:00:00+01:00" };
     const text_parameters = try normalizeParameters(alloc, &.{ text_value, .null }, &.{ .datetime, .datetime });
@@ -1695,5 +1781,5 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     const too_precise = try datetimeResult(alloc, .{ .string = "2000-01-01T00:00:00.000000001Z" });
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
-    try std.testing.expectError(error.InvalidSqlBackendResponse, datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" }));
+    try std.testing.expectEqual(@as(i128, -31_536_000_000_000_000), try wire_values.timestampNanos(try datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" })));
 }

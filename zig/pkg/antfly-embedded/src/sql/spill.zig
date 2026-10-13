@@ -505,9 +505,15 @@ const Encoder = struct {
     fn cells(self: *Encoder, values: []const Datum) anyerror!void {
         try self.word(values.len);
         for (values) |value| {
+            try value.validateTemporal();
             try self.append(&.{@intFromBool(value.sql_null)});
-            if (value.numeric) |number| {
-                if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            if (value.temporal()) |temporal| {
+                var frame: [16]u8 = undefined;
+                const bytes = try @import("temporal_value.zig").encode(temporal.*, &frame);
+                try self.append(&.{ 11, @backingInt(temporal.kind()) });
+                try self.text(bytes);
+            } else if (value.numeric) |number| {
+                if (value.sql_null or value.array != null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
                 const numeric = @import("numeric_value.zig");
                 const binary = @import("numeric_binary.zig");
                 var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
@@ -520,7 +526,7 @@ const Encoder = struct {
                 var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
                 try binary.encode(&context, number.*, &writer);
             } else if (value.array) |array| {
-                if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+                if (value.sql_null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
                 const validated = try @import("array_value.zig").Value.init(array.element_type, array.dimensions, array.elements, if (self.manager) |manager| manager.array_limits else .{});
                 if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
                 try self.append(&.{ 9, @backingInt(array.element_type) });
@@ -530,7 +536,7 @@ const Encoder = struct {
                     try self.word(@bitCast(@as(i64, dimension.lower)));
                 }
                 try self.cells(array.elements);
-            } else if (value.patterns) |pattern| {
+            } else if (value.patterns()) |pattern| {
                 const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
                 try self.append(&.{8});
                 try self.word(id);
@@ -620,7 +626,16 @@ const Decoder = struct {
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
+            if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                const temporal = @import("temporal_value.zig");
+                const kind = std.enums.fromInt(temporal.Kind, try self.byte()) orelse return error.InvalidSqlSpill;
+                const decoded = temporal.decode(kind, try self.take(try self.count())) catch return error.InvalidSqlSpill;
+                const owned = try self.a.create(temporal.Value);
+                owned.* = decoded;
+                value.* = Datum.typedTemporal(owned);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
                 value.* = try self.numeric(flag);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 9) {
                 self.position += 1;
@@ -657,7 +672,7 @@ const Decoder = struct {
                 self.position += 1;
                 const id = try self.word();
                 if (flag != 0) return error.InvalidSqlSpill;
-                value.* = .{ .sql_null = false, .patterns = try (self.manager orelse return error.InvalidSqlSpill).patternAt(id) };
+                value.* = Datum.fromParts(.null, false, try (self.manager orelse return error.InvalidSqlSpill).patternAt(id));
             } else value.* = .{ .sql_null = flag == 1, .value = try self.json(0) };
         }
         return values;
@@ -740,12 +755,38 @@ pub const ColumnarBlock = struct {
     }
 };
 const columnar_v1_magic = "NCB\x01";
+
+test "SQL temporal spill decoder rejects malformed flags kinds frames and truncations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bytes: [27]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[0..8], 1, .little);
+    bytes[9] = 11;
+    bytes[10] = @backingInt(@import("temporal_value.zig").Kind.timestamp);
+    std.mem.writeInt(u64, bytes[11..19], 8, .little);
+    var valid: Decoder = .{ .a = arena.allocator(), .bytes = &bytes };
+    const decoded = try valid.cells();
+    try std.testing.expectEqual(@as(i64, 0), decoded[0].temporal().?.timestamp.micros);
+    for (0..bytes.len) |len| {
+        var truncated: Decoder = .{ .a = arena.allocator(), .bytes = bytes[0..len] };
+        try std.testing.expectError(error.InvalidSqlSpill, truncated.cells());
+    }
+    for ([_]usize{ 8, 10, 11 }) |index| {
+        var bad = bytes;
+        bad[index] = 255;
+        var decoder: Decoder = .{ .a = arena.allocator(), .bytes = &bad };
+        try std.testing.expectError(error.InvalidSqlSpill, decoder.cells());
+    }
+    std.mem.writeInt(i64, bytes[19..27], @import("temporal_value.zig").end_timestamp, .big);
+    var out_of_range: Decoder = .{ .a = arena.allocator(), .bytes = &bytes };
+    try std.testing.expectError(error.InvalidSqlSpill, out_of_range.cells());
+}
 pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usize) ![]u8 {
     if (rows.len == 0 or rows.len > 256 or rows[0].values.len > 1024 or rows[0].keys.len > 256) return error.InvalidSqlSpill;
     for (rows) |row| {
         if (row.values.len != rows[0].values.len or row.keys.len != rows[0].keys.len) return error.InvalidSqlSpill;
-        for (row.values) |value| if (value.patterns != null) return error.InvalidSqlSpill;
-        for (row.keys) |value| if (value.patterns != null) return error.InvalidSqlSpill;
+        for (row.values) |value| if (value.patterns() != null) return error.InvalidSqlSpill;
+        for (row.keys) |value| if (value.patterns() != null) return error.InvalidSqlSpill;
     }
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(a);
@@ -894,7 +935,7 @@ pub const Sequential = struct {
         }
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns != null or value.array != null or value.numeric != null) return 255;
+        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -949,7 +990,8 @@ pub const Sequential = struct {
             var kind: ?u8 = null;
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
-                if (value.sql_null or (value.value == .null and value.patterns == null and value.array == null and value.numeric == null)) continue;
+                try value.validateTemporal();
+                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
@@ -1392,9 +1434,21 @@ pub const Sequential = struct {
             const types = @import("../storage/rowsource/types.zig");
             if (column >= self.width()) return error.InvalidSqlSpill;
             const count_rows = self.count();
+            const expected: u8 = switch (kind) {
+                .bool => 1,
+                .i64 => 2,
+                .f64 => 3,
+                .bytes, .json => 5,
+                else => return error.InvalidSqlSpill,
+            };
+            const encoded = if (self.encoded) |block| block.values[column] else null;
+            if (encoded) |stored| switch (stored.values) {
+                .fixed => |fixed| if (fixed.kind != expected) return error.InvalidSqlSpill,
+                .dictionary => |dictionary| if (dictionary.kind != expected) return error.InvalidSqlSpill,
+                else => {},
+            };
             const nulls = try a.alloc(u8, count_rows);
             errdefer a.free(nulls);
-            const encoded = if (self.encoded) |block| block.values[column] else null;
             for (nulls, 0..) |*flag, row_index| {
                 if (encoded) |stored| {
                     if (stored.values != .dynamic) {
@@ -1408,13 +1462,6 @@ pub const Sequential = struct {
                 }
                 flag.* = @intFromBool((try self.cell(row_index, column)).sql_null);
             }
-            const expected: u8 = switch (kind) {
-                .bool => 1,
-                .i64 => 2,
-                .f64 => 3,
-                .bytes, .json => 5,
-                else => return error.InvalidSqlSpill,
-            };
             if (encoded) |stored| {
                 if (stored.values == .dictionary and kind != .json and kind != .bool) {
                     const dictionary = stored.values.dictionary;
@@ -2566,7 +2613,7 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             bytes.items[10] = kind;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL typed array row and column spill preserve dimensions and NULL provenance" {
@@ -3259,7 +3306,7 @@ test "SQL native immutable column blocks reject truncation versions and callback
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bad, 4096));
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes, bytes.len - 1));
     var callback: scalar.PatternSet = undefined;
-    const callback_rows = [_]Row{.{ .values = &.{.{ .patterns = &callback, .sql_null = false }}, .keys = &.{}, .ordinal = 0 }};
+    const callback_rows = [_]Row{.{ .values = &.{Datum.fromParts(.null, false, &callback)}, .keys = &.{}, .ordinal = 0 }};
     try std.testing.expectError(error.InvalidSqlSpill, encodeColumnarBlockAlloc(a, &callback_rows, 4096));
 }
 

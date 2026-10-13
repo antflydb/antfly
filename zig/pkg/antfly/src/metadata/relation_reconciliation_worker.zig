@@ -20,6 +20,7 @@
 const std = @import("std");
 const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const control = @import("relation_reconciliation_command.zig");
+const protocol = @import("topology_protocol.zig");
 
 pub const Receipt = struct { term: u64, index: u64 };
 pub const Leader = struct { term: u64, applied_index: u64 };
@@ -28,6 +29,8 @@ pub const Preparation = union(enum) {
     pending,
     /// One capability activation was appended, not waited for.
     activated: Receipt,
+    /// Exact observed adoption/upgrade after durable all-voter activation.
+    migrate: control.Command,
     /// Local proof preparation completed for this exact observed cut.
     publish: control.Publication,
 };
@@ -227,18 +230,41 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
 /// by CAS, including terminal failures; unchanged failed epochs stay stopped.
 /// Alternate collection and forward work whenever both are available.
 pub fn nextIntent(work: r.Work, group: u64, prefer_gc: bool) !?control.Command {
+    return nextIntentWithCoverage(work, group, prefer_gc, .relations);
+}
+fn nextIntentWithCoverage(work: r.Work, group: u64, prefer_gc: bool, desired: r.Coverage) !?control.Command {
     const source_epoch = work.epoch orelse return null;
     if (work.current) |state| if (state.group_id != group) return error.InvalidCatalogRecord;
     if (work.garbage) |retired| if (retired.generation.group_id != group) return error.InvalidCatalogRecord;
     if (prefer_gc) if (work.garbage) |retired| return .{ .garbage = retired };
     if (work.current) |state| {
-        if (!state.epoch.eql(source_epoch)) return .{ .start = .{
-            .next = try r.State.init(group, try r.nextJobId(&state), source_epoch),
+        const coverage: r.Coverage = if (state.coverage == .constraint_names or desired == .constraint_names) .constraint_names else .relations;
+        if (!state.epoch.eql(source_epoch) or state.coverage != coverage) return .{ .start = .{
+            .next = try r.State.initWithCoverage(group, try r.nextJobId(&state), source_epoch, coverage),
             .prior = state,
         } };
         if (state.failure == .none and state.phase != .ready) return .{ .advance = state };
-    } else return .{ .start = .{ .next = try r.State.init(group, try r.nextJobId(null), source_epoch) } };
+    } else return .{ .start = .{ .next = try r.State.initWithCoverage(group, try r.nextJobId(null), source_epoch, desired) } };
     return if (work.garbage) |retired| .{ .garbage = retired } else null;
+}
+
+/// The host must first durably activate this exact protected membership.
+/// Coverage upgrades always create a fresh generation, never relabel a seal.
+pub fn coverageMigration(work: r.Work, group: u64, activation: protocol.Activation) !?control.Command {
+    try control.validateActivation(activation);
+    if (activation.version != protocol.constraint_occupancy_version or group == 0) return error.TableTopologyProtocolUpgradeRequired;
+    const source_epoch = work.epoch orelse {
+        if (work.current != null or work.root != null or work.garbage != null) return error.InvalidCatalogRecord;
+        return .{ .adopt = activation };
+    };
+    var identity: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&identity, &activation.incarnation) catch return error.InvalidCatalogRecord;
+    if (!std.mem.eql(u8, &source_epoch.incarnation, &identity)) return error.CatalogGenerationChanged;
+    if (work.current) |state| {
+        if (state.group_id != group) return error.InvalidCatalogRecord;
+        if (state.coverage == .constraint_names) return null;
+    }
+    return nextIntentWithCoverage(work, group, false, .constraint_names);
 }
 
 pub const Worker = struct {
@@ -300,7 +326,23 @@ pub const Worker = struct {
             if (!std.meta.eql(preparation.publish.state, state) or !state.epoch.eql(source) or
                 !std.meta.eql(preparation.publish.prior, work.root)) return error.CatalogGenerationChanged;
         }
-        const command: control.Command = if (preparation == .publish and !(self.prefer_gc and work.garbage != null))
+        if (preparation == .migrate) {
+            const command = preparation.migrate;
+            switch (command) {
+                .adopt => |proof| {
+                    const expected = (try coverageMigration(work, group, proof)) orelse return error.CatalogGenerationChanged;
+                    if (!std.meta.eql(expected, command)) return error.CatalogGenerationChanged;
+                },
+                .start => |request| {
+                    const expected = (try nextIntentWithCoverage(work, group, false, .constraint_names)) orelse return error.CatalogGenerationChanged;
+                    if (request.next.coverage != .constraint_names or !std.meta.eql(expected, command)) return error.CatalogGenerationChanged;
+                },
+                else => return error.InvalidCatalogRecord,
+            }
+        }
+        const command: control.Command = if (preparation == .migrate)
+            preparation.migrate
+        else if (preparation == .publish and !(self.prefer_gc and work.garbage != null))
             .{ .publish = preparation.publish }
         else
             (try nextIntent(work, group, self.prefer_gc)) orelse return false;
@@ -351,6 +393,83 @@ const Fake = struct {
     }
 };
 const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 1 };
+
+test "relation reconciliation worker coverage migration adopts then replaces rather than relabeling seals" {
+    const proof: protocol.Activation = .{ .version = protocol.constraint_occupancy_version, .incarnation = std.fmt.bytesToHex(epoch.incarnation, .lower), .member_count = 3, .membership_fingerprint = @splat(7) };
+    const empty: r.Work = .{ .epoch = null, .current = null, .root = null };
+    const adopt = (try coverageMigration(empty, 41, proof)).?;
+    try std.testing.expectEqual(protocol.constraint_occupancy_version, adopt.requiredDecoderVersion());
+    try std.testing.expect(std.meta.eql(proof, adopt.adopt));
+    var work: r.Work = .{ .epoch = epoch, .current = null, .root = null };
+    const initial = (try coverageMigration(work, 41, proof)).?.start;
+    try std.testing.expect(initial.prior == null);
+    try std.testing.expectEqual(r.Coverage.constraint_names, initial.next.coverage);
+    var legacy = try r.State.init(41, try r.nextJobId(null), epoch);
+    legacy.phase = .ready;
+    work.current = legacy;
+    work.root = r.Generation.of(&legacy);
+    const replacement = (try coverageMigration(work, 41, proof)).?.start;
+    try std.testing.expect(std.meta.eql(legacy, replacement.prior.?));
+    try std.testing.expect(std.mem.order(u8, &replacement.next.job_id, &legacy.job_id) == .gt);
+    try std.testing.expectEqual(r.Phase.building, replacement.next.phase);
+    try std.testing.expectEqual(r.Coverage.constraint_names, replacement.next.coverage);
+    work.current = replacement.next;
+    try std.testing.expect((try coverageMigration(work, 41, proof)) == null);
+    var wrong = proof;
+    wrong.incarnation[0] = 'f';
+    try std.testing.expectError(error.CatalogGenerationChanged, coverageMigration(work, 41, wrong));
+    wrong = proof;
+    wrong.version = protocol.relation_reconciliation_version;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, coverageMigration(empty, 41, wrong));
+    var malformed = empty;
+    malformed.root = r.Generation.of(&legacy);
+    try std.testing.expectError(error.InvalidCatalogRecord, coverageMigration(malformed, 41, proof));
+}
+
+test "relation reconciliation worker migration fences leader loss and ambiguous appends without speculative progress" {
+    const proof: protocol.Activation = .{ .version = protocol.constraint_occupancy_version, .incarnation = std.fmt.bytesToHex(epoch.incarnation, .lower), .member_count = 3, .membership_fingerprint = @splat(7) };
+    var host: Fake = .{ .work = .{ .epoch = null, .current = null, .root = null }, .lose_term = true };
+    host.preparation = .{ .migrate = (try coverageMigration(host.work, 41, proof)).? };
+    var worker: Worker = .{};
+    try std.testing.expectError(error.NotLeader, worker.step(&host, 41, 0));
+    try std.testing.expectEqual(@as(usize, 0), host.appends);
+    try std.testing.expect(worker.pending == null);
+    host.lose_term = false;
+    host.ambiguous = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, worker.step(&host, 41, round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.appends);
+    try std.testing.expect(worker.pending == null);
+    // Resolve uncertainty from durable work, not a speculative local epoch.
+    host.work.epoch = epoch;
+    host.preparation = .{ .migrate = (try coverageMigration(host.work, 41, proof)).? };
+    host.ambiguous = false;
+    try std.testing.expect(try worker.step(&host, 41, 2 * round_interval_ns));
+    try std.testing.expect(host.last.? == .start);
+}
+
+test "relation reconciliation worker migration waits for receipts and rejects stale or unrelated preparations" {
+    const proof: protocol.Activation = .{ .version = protocol.constraint_occupancy_version, .incarnation = std.fmt.bytesToHex(epoch.incarnation, .lower), .member_count = 3, .membership_fingerprint = @splat(7) };
+    var host: Fake = .{ .work = .{ .epoch = null, .current = null, .root = null } };
+    host.preparation = .{ .migrate = (try coverageMigration(host.work, 41, proof)).? };
+    var worker: Worker = .{};
+    try std.testing.expect(try worker.step(&host, 41, 0));
+    try std.testing.expect(!try worker.step(&host, 41, round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.appends);
+    host.cut.?.applied_index = 1;
+    host.work.epoch = epoch;
+    // The observed successor fences a duplicate adoption before append.
+    try std.testing.expectError(error.CatalogGenerationChanged, worker.step(&host, 41, 2 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.appends);
+    host.preparation = .{ .migrate = (try coverageMigration(host.work, 41, proof)).? };
+    try std.testing.expect(try worker.step(&host, 41, 3 * round_interval_ns));
+    host.cut.?.applied_index = 2;
+    host.work.current = host.last.?.start.next;
+    try std.testing.expectError(error.CatalogGenerationChanged, worker.step(&host, 41, 4 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 2), host.appends);
+    host.preparation = .{ .migrate = .{ .advance = host.work.current.? } };
+    try std.testing.expectError(error.InvalidCatalogRecord, worker.step(&host, 41, 5 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 2), host.appends);
+}
 
 const ScanHost = struct {
     a: std.mem.Allocator = std.testing.allocator,
@@ -580,6 +699,21 @@ test "relation reconciliation worker publication pool releases preparation on ev
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fault.run, .{});
+}
+
+test "relation reconciliation worker preserves occupancy coverage when source epochs advance" {
+    const prior = try r.State.initWithCoverage(41, try r.nextJobId(null), epoch, .constraint_names);
+    var changed = epoch;
+    changed.revision += 1;
+    const command = (try nextIntent(.{ .epoch = changed, .current = prior, .root = null }, 41, false)).?;
+    try std.testing.expectEqual(r.Coverage.constraint_names, command.start.next.coverage);
+    try std.testing.expectEqual(r.Coverage.constraint_names, command.start.prior.?.coverage);
+    try std.testing.expect(command.start.next.epoch.eql(changed));
+    try std.testing.expectEqual(@import("topology_protocol.zig").constraint_occupancy_version, command.requiredDecoderVersion());
+    const legacy = try r.State.init(41, prior.job_id, epoch);
+    const old = (try nextIntent(.{ .epoch = changed, .current = legacy, .root = null }, 41, false)).?;
+    try std.testing.expectEqual(r.Coverage.relations, old.start.next.coverage);
+    try std.testing.expectEqual(@import("topology_protocol.zig").relation_reconciliation_version, old.requiredDecoderVersion());
 }
 
 test "relation reconciliation worker budgets pending work and alternates GC" {

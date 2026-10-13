@@ -469,13 +469,20 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
 
     for ([_][]const u8{
         "CREATE TABLE parents (id BIGINT PRIMARY KEY)",
-        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT)",
-    }) |statement| {
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT positive_child CHECK (id > 0))",
+    }, [_][]const u8{ "parents", "children" }) |statement, name| {
+        recovery_fixture.awaitAbsentRelation(alloc, io, &metadata, .{ .name = name }) catch |err| {
+            try meta_raft.checkFailure();
+            try meta_control.checkFailure();
+            try data_raft.checkFailure();
+            try data_control.checkFailure();
+            return err;
+        };
         var response = try sql(alloc, transport, &headers, base, statement);
         defer response.deinit(alloc);
         // CREATE may acknowledge catalog admission before owner readiness.
         // The authoritative table barriers below must still complete.
-        if (response.status != 200 and response.status != 202) std.debug.print("hosted FK create status={d}\n", .{response.status});
+        if (response.status != 200 and response.status != 202) std.debug.print("hosted FK create status={d} statement={s} body={s}\n", .{ response.status, statement, response.body[0..@min(response.body.len, 2048)] });
         try std.testing.expect(response.status == 200 or response.status == 202);
     }
     const parent_id = try awaitTable(alloc, io, transport, &headers, base, "parents");

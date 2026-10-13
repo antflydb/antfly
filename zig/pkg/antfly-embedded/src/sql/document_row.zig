@@ -82,7 +82,9 @@ pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnTyp
     return physical;
 }
 
-fn propertyType(property: anytype) ast.ColumnType {
+/// Shared declared-domain classification for document SQL reads and typed
+/// preparation. JSON arrays are distinct from SQL arrays, including jsonb[].
+pub fn propertyType(property: anytype) ast.ColumnType {
     if (property.field_type) |name| if (std.mem.eql(u8, name, "sql_array")) return .array;
     if (comptime @hasField(@TypeOf(property), "sql_type")) {
         if (property.sql_type == .uuid) return .uuid;

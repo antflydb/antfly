@@ -3288,6 +3288,9 @@ fn stripRuntimeDenseNativeStatus(record: *metadata_table_manager.StoreRecord) vo
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
     for (record.runtime_statuses) |status| {
+        if (status.source_authority != null) return metadata_runtime_status_protocol.source_authority_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
@@ -3311,6 +3314,9 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
 /// and cannot be erased merely to cross an older proposal boundary. Embedding
 /// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
+    for (record.runtime_statuses) |status| {
+        if (status.source_authority != null) return metadata_runtime_status_protocol.source_authority_record_version;
+    }
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
@@ -3378,26 +3384,59 @@ fn runtimeStatusProtocolVersionReady(service: anytype, required_version: u16) bo
 }
 
 fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
-    if (required_version == metadata_runtime_status_protocol.v0_2_0_record_version)
-        return required_version;
-    if (runtimeStatusProtocolVersionReady(service, required_version)) return required_version;
-    if (required_version == metadata_runtime_status_protocol.current_record_version and
-        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.framed_index_record_version))
-        return metadata_runtime_status_protocol.framed_index_record_version;
-    if (metadata_runtime_status_protocol.profileSatisfies(required_version, metadata_runtime_status_protocol.framed_index_record_version) and
-        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.inference_diagnostics_record_version))
-        return metadata_runtime_status_protocol.inference_diagnostics_record_version;
-    if (runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.positional_record_version))
-        return metadata_runtime_status_protocol.positional_record_version;
+    const candidates = [_]u16{
+        metadata_runtime_status_protocol.current_record_version,
+        metadata_runtime_status_protocol.schema_epoch_record_version,
+        metadata_runtime_status_protocol.framed_index_record_version,
+        metadata_runtime_status_protocol.inference_diagnostics_record_version,
+        metadata_runtime_status_protocol.positional_record_version,
+    };
+    for (candidates) |candidate| {
+        if (metadata_runtime_status_protocol.profileSatisfies(required_version, candidate) and runtimeStatusProtocolVersionReady(service, candidate)) return candidate;
+    }
     return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
 /// New wire shapes must never be appended merely because the leader can
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
+fn carriesConstraintNameAdmission(bytes: []const u8) bool {
+    return @import("constraint_name_wire.zig").requiresOccupancy(bytes, relation_catalog.max_command_bytes);
+}
+
+test "relation mutation admission projects naming capability without materializing schema bytes" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 64 * 1024);
+    defer a.free(large);
+    @memset(large, '"');
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .child = .{ .schema_json = large }, .constraint_name_admission = @as(?u64, null) } }, .{});
+    defer a.free(legacy);
+    try std.testing.expect(!carriesConstraintNameAdmission(legacy));
+    const named = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .child = .{ .schema_json = large }, .constraint_name_admission = .{ .namespace_id = 2, .names = &.{"unused projection"} } } }, .{});
+    defer a.free(named);
+    try std.testing.expect(carriesConstraintNameAdmission(named));
+    try std.testing.expect(!carriesConstraintNameAdmission("{\"version\":1,\"constraint_name_admission\":null}"));
+    for ([_][]const u8{ "{", "{\"version\":2}", "{\"plan\":{\"constraint_name_admission\":{}}}" }) |invalid|
+        try std.testing.expect(carriesConstraintNameAdmission(invalid));
+}
+
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
-        return metadata_topology_protocol.relation_mutation_version;
+    if (command == .begin_relational_index_publication or command == .ack_relational_index_publication)
+        return metadata_topology_protocol.index_publication_admission_version;
+    if (command == .apply_fk_generation_publication and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_generation_publication, fk_generation_publication.max_bytes))
+        return metadata_topology_protocol.checks_catalog_identity_version;
+    if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_fk_initial_create and carriesConstraintNameAdmission(command.apply_fk_initial_create))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_fk_generation_publication and carriesConstraintNameAdmission(command.apply_fk_generation_publication))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .create_restore_job_with_staging and carriesConstraintNameAdmission(command.create_restore_job_with_staging.plan_json))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_restore_staging and carriesConstraintNameAdmission(command.apply_restore_staging))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard|
+        return if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();
@@ -3472,6 +3511,26 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
 }
 
+test "relational index publication admission requires its own coordinated decoder floor" {
+    const command: metadata_storage.TransitionCommand = .{ .begin_relational_index_publication = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_admission_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(command) > metadata_topology_protocol.checks_catalog_identity_version);
+    const ack: metadata_storage.TransitionCommand = .{ .ack_relational_index_publication = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_admission_version, transitionRequiredCoordinatedDecoderVersion(ack));
+}
+
+test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
+    const protocol = metadata_topology_protocol;
+    const marked: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":null}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(marked));
+    const named: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(named));
+    const legacy: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
+    try std.testing.expectEqual(protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(legacy));
+    const unknown: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"future\"}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(unknown));
+}
+
 pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
     return transitionRequiredCoordinatedDecoderVersion(command) != 0;
 }
@@ -3536,8 +3595,8 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 
 /// Capability observation alone does not install the apply-side barrier. Own
 /// and observe its durable receipt before admitting the user's guarded write.
-fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext) !void {
-    const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.relation_mutation_version);
+fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext, required_version: u16) !void {
+    const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     const activation: metadata_topology_protocol.Activation = .{
         .version = readiness.required_version,
         .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
@@ -3590,19 +3649,22 @@ fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metada
     const readiness = try service.cachedCoordinatedDecoderReadiness(required_version);
     for (commands) |command| if (command == .apply_relation_reconciliation) {
         const intent = try @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation);
-        if (intent == .publish) {
-            const activation = intent.publish.activation;
-            // Bind the wire proof to the exact admission token that is
-            // revalidated under the runtime lock through append. This also
-            // closes the shrink-to-one-member cached-readiness shortcut.
-            if (readiness.metadata_incarnation == null or activation.version > readiness.required_version or
-                !std.meta.eql(activation.incarnation, readiness.metadata_incarnation.?) or
-                activation.member_count != readiness.protected_member_count or
-                !std.meta.eql(activation.membership_fingerprint, readiness.protected_membership_fingerprint))
-                return error.TableTopologyProtocolUpgradeRequired;
-        }
+        try validateRelationCapabilityProof(intent, readiness);
     };
     return .{ .readiness = readiness, .source_mutation = has_source };
+}
+
+fn validateRelationCapabilityProof(intent: @import("relation_reconciliation_command.zig").Command, readiness: TableTopologyProtocolReadiness) !void {
+    if (intent != .adopt and intent != .publish) return;
+    // Bind both migration and publication to the exact admission token that
+    // is revalidated under the runtime lock through append. A cached decoder
+    // floor does not authorize stale incarnation or shrink-to-one proofs.
+    try intent.validateCapabilityAdmission(.{
+        .version = readiness.required_version,
+        .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+        .member_count = readiness.protected_member_count,
+        .membership_fingerprint = readiness.protected_membership_fingerprint,
+    });
 }
 
 fn validateRelationSourceDecoderFloor(service: anytype, expected: CoordinatedDecoderAdmission) !void {
@@ -4308,8 +4370,46 @@ fn runRelationReconciliationRound(service: anytype) !void {
         pub fn observe(self: *@This()) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
             return self.store.relationReconciliationWork(self.service.metadata_group_id);
         }
+        const ActivationPreparation = union(enum) { appended: relation_worker.Receipt, ready: metadata_topology_protocol.Activation };
+        fn prepareActivation(self: *@This(), required: u16, leader_cut: relation_worker.Leader) !ActivationPreparation {
+            const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
+            const readiness = try self.service.observeTableTopologyProtocolReadyWithContext(request, required);
+            if (readiness.term != leader_cut.term) return error.NotLeader;
+            const activation: metadata_topology_protocol.Activation = .{
+                .version = readiness.required_version,
+                .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+                .member_count = readiness.protected_member_count,
+                .membership_fingerprint = readiness.protected_membership_fingerprint,
+            };
+            const durable = try self.store.topologyActivation(self.service.metadata_group_id);
+            if (durable == null or !durable.?.satisfies(activation)) {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                const bytes = try std.json.Stringify.valueAlloc(self.service.alloc, activation, .{});
+                defer self.service.alloc.free(bytes);
+                try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
+                return .{ .appended = self.finishAppend(try self.service.proposeTopologyActivationWithReceipt(bytes, readiness)) };
+            }
+            return .{ .ready = activation };
+        }
         pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, leader_cut: relation_worker.Leader, now_ns: u64) !relation_worker.Preparation {
             self.service.relation_publication_preparation.cancel();
+            // Enable only when this binary advertises complete occupancy
+            // support. Each round appends at most one activation/adoption/CAS;
+            // no apply wait or unbounded migration runs on this control lane.
+            if (metadata_topology_protocol.current_version >= metadata_topology_protocol.constraint_occupancy_version and
+                (work.epoch == null or work.current == null or work.current.?.coverage != .constraint_names))
+            {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                var activation = switch (try self.prepareActivation(metadata_topology_protocol.constraint_occupancy_version, leader_cut)) {
+                    .appended => |receipt| return .{ .activated = receipt },
+                    .ready => |value| value,
+                };
+                // The durable barrier may be newer; this wire intent attests
+                // its own exact floor and protected membership, not a future
+                // adoption format this decoder does not know.
+                activation.version = metadata_topology_protocol.constraint_occupancy_version;
+                return if (try relation_worker.coverageMigration(work, self.service.metadata_group_id, activation)) |command| .{ .migrate = command } else .idle;
+            }
             const state = work.current orelse {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
                 return .idle;
@@ -4323,29 +4423,17 @@ fn runRelationReconciliationRound(service: anytype) !void {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
                 return .idle;
             };
-            const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
-            const readiness = try self.service.observeTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.relation_publication_version);
-            if (readiness.term != leader_cut.term) return error.NotLeader;
-            const activation: metadata_topology_protocol.Activation = .{
-                .version = readiness.required_version,
-                .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
-                .member_count = readiness.protected_member_count,
-                .membership_fingerprint = readiness.protected_membership_fingerprint,
+            const required = @import("relation_reconciliation_command.zig").publicationVersion(state.coverage);
+            const activation = switch (try self.prepareActivation(required, leader_cut)) {
+                .appended => |receipt| return .{ .activated = receipt },
+                .ready => |value| value,
             };
-            const durable_activation = try self.store.topologyActivation(self.service.metadata_group_id);
-            if (durable_activation == null or !durable_activation.?.satisfies(activation)) {
-                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
-                const bytes = try std.json.Stringify.valueAlloc(self.service.alloc, activation, .{});
-                defer self.service.alloc.free(bytes);
-                try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
-                return .{ .activated = self.finishAppend(try self.service.proposeTopologyActivationWithReceipt(bytes, readiness)) };
-            }
             const proof = (try self.store.stepRelationPublicationProof(state, now_ns)) orelse return .pending;
             self.service.relation_publication_preparation.proof = .{ .state = proof.state, .applied_index = proof.applied_index, .root = proof.root };
             // The publication command attests its own fixed decoder floor;
             // durable activation may protect a newer writer capability.
             var publication_activation = activation;
-            publication_activation.version = metadata_topology_protocol.relation_publication_version;
+            publication_activation.version = required;
             return .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = publication_activation } };
         }
         pub fn cancelPublication(self: *@This()) void {
@@ -4355,17 +4443,18 @@ fn runRelationReconciliationRound(service: anytype) !void {
             try self.store.expireRelationPublicationProofs(now_ns);
         }
         pub fn propose(self: *@This(), command: @import("relation_reconciliation_command.zig").Command, term: u64) !relation_worker.Receipt {
-            const bytes = try command.encodeAlloc(self.service.alloc);
-            defer self.service.alloc.free(bytes);
             const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
-            const transition: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = bytes };
             // Background intents consume only local cached/durable capability
             // evidence. A membership change yields to a later preparation
             // round rather than entering a network/activation/apply wait here.
             const readiness = try self.service.cachedCoordinatedDecoderReadiness(command.requiredDecoderVersion());
             if (readiness.term != term) return error.NotLeader;
+            try validateRelationCapabilityProof(command, readiness);
             try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
             try request.ensureActive();
+            const bytes = try command.encodeAlloc(self.service.alloc);
+            defer self.service.alloc.free(bytes);
+            const transition: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = bytes };
             return self.append(transition, term);
         }
         fn append(self: *@This(), transition: metadata_storage.TransitionCommand, term: u64) !relation_worker.Receipt {
@@ -6799,7 +6888,7 @@ pub const MetadataService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context);
+        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -9410,11 +9499,7 @@ pub const MetadataHttpService = struct {
             &membership_fingerprint,
         );
         self.runtime_status_protocol_ready_fingerprint = membership_fingerprint;
-        self.runtime_status_protocol_ready_version = if (same_membership and
-            self.runtime_status_protocol_ready_version == metadata_runtime_status_protocol.current_record_version)
-            metadata_runtime_status_protocol.current_record_version
-        else
-            ready_version;
+        self.runtime_status_protocol_ready_version = metadata_runtime_status_protocol.mergeReadyVersion(same_membership, self.runtime_status_protocol_ready_version, ready_version);
     }
 
     fn probeRuntimeStatusProtocol(
@@ -9845,7 +9930,7 @@ pub const MetadataHttpService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context);
+        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -13381,6 +13466,27 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{});
     try relation_service.propose(&.{relation_mutation_command});
     try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    var naming_command = relation_mutation_command;
+    naming_command.compare_and_replace_table.relation_guard.?.owner.kind = .table;
+    naming_command.compare_and_replace_table.relation_guard.?.target.name = plain.name;
+    naming_command.compare_and_replace_table.relation_guard.?.constraint_name_admission = .{ .namespace_id = 2, .names = &.{.{ .name = "items_id_check", .kind = .check }} };
+    const naming_version = metadata_topology_protocol.constraint_occupancy_version;
+    try naming_command.compare_and_replace_table.relation_guard.?.validate();
+    try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(naming_command));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&relation_service, naming_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{naming_command}));
+    try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    const naming_catalog: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"version\":2,\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}" };
+    const naming_fk: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}" };
+    const naming_generation: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}}" };
+    const naming_rewrite: metadata_storage.TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = "1", .value = "{}", .plan_json = "{\"constraint_name_guard\":{}}" } };
+    const naming_restore: metadata_storage.TransitionCommand = .{ .apply_restore_staging = "{\"plan\":{\"constraint_name_guard\":{}}}" };
+    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk, naming_generation, naming_rewrite, naming_restore }) |named| {
+        try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(named));
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{named}));
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{ legacy, named }));
+        try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    }
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
     const root_bound_store: metadata_table_manager.StoreRecord = .{
@@ -13465,11 +13571,12 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     mixed.cache.cached.?.readiness.term += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
     try std.testing.expectEqual(@as(usize, 4), mixed.appended);
+    const adoption_readiness = try Fake.proof(metadata_topology_protocol.relation_reconciliation_version);
     const relation_bytes = try (@import("relation_reconciliation_command.zig").Command{ .adopt = .{
-        .version = metadata_topology_protocol.relation_reconciliation_version,
-        .incarnation = "0123456789abcdef0123456789abcdef".*,
-        .member_count = 3,
-        .membership_fingerprint = @splat(7),
+        .version = adoption_readiness.required_version,
+        .incarnation = adoption_readiness.metadata_incarnation.?,
+        .member_count = adoption_readiness.protected_member_count,
+        .membership_fingerprint = adoption_readiness.protected_membership_fingerprint,
     } }).encodeAlloc(std.testing.allocator);
     defer std.testing.allocator.free(relation_bytes);
     const relation_command: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = relation_bytes };
@@ -13480,6 +13587,17 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     source_peers.member_versions = &.{ 31, 31, 31 };
     try ensureCoordinatedDecoderWithContext(&source_peers, relation_command, .{});
     try source_peers.propose(&.{relation_command});
+    var stale_adoption = try @import("relation_reconciliation_command.zig").Command.decode(relation_bytes);
+    stale_adoption.adopt.member_count = 1;
+    const shrunk_adoption = try stale_adoption.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(shrunk_adoption);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source_peers.propose(&.{.{ .apply_relation_reconciliation = shrunk_adoption }}));
+    stale_adoption.adopt.member_count = 3;
+    stale_adoption.adopt.membership_fingerprint[0] ^= 1;
+    const moved_adoption = try stale_adoption.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(moved_adoption);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source_peers.propose(&.{.{ .apply_relation_reconciliation = moved_adoption }}));
+    try std.testing.expectEqual(@as(usize, 1), source_peers.appended);
     const before_adoption = try prepareCoordinatedDecoderAdmission(&source_peers, &.{legacy});
     // After adoption, even the unchanged legacy table wire format must not
     // bypass the writer capability floor. Final admission remains cached-only.
@@ -13792,6 +13910,37 @@ test "metadata service transition commands negotiate runtime status payload vers
         metadata_table_manager.native_generation_restore_protocol_version,
         current_command.upsert_store.native_generation_restore_version,
     );
+}
+
+test "runtime status source authority requires V19 without regressing schema epoch negotiation" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        ready: u16,
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            return metadata_runtime_status_protocol.profileSatisfies(self.ready, required);
+        }
+    };
+    var statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .schema_epoch = 7,
+        .source_authority = .{ .kind = .native, .namespace = @splat(1), .sequence = 9 },
+    }};
+    const record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .runtime_statuses = &statuses };
+    inline for (.{ @as(u16, 17), @as(u16, 18), @as(u16, 20) }) |version| {
+        var service: FakeService = .{ .ready = version };
+        var owned: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned));
+        try std.testing.expect(owned == null);
+    }
+    var service: FakeService = .{ .ready = metadata_runtime_status_protocol.current_record_version };
+    var owned: ?metadata_table_manager.StoreRecord = null;
+    defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
+    const accepted = try runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned);
+    try std.testing.expectEqualDeep(statuses[0].source_authority, accepted.upsert_store.runtime_statuses[0].source_authority);
+    try std.testing.expectEqual(metadata_runtime_status_protocol.schema_epoch_record_version, highestSupportedRuntimeStatusVersion(&service, metadata_runtime_status_protocol.schema_epoch_record_version));
+    statuses[0].source_authority = null;
+    service.ready = metadata_runtime_status_protocol.schema_epoch_record_version;
+    _ = try runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned);
 }
 
 test "runtime status native authority cannot downgrade to inference-only V16" {
@@ -15422,19 +15571,25 @@ fn reportStoreStatusesWithCapabilities(
     const framed_profile_required = vector_projection_transition_possible or
         native_storage_transition_possible or relational_topology_transition_possible;
     var schema_epoch_required = false;
+    var source_authority_required = false;
     for (reports) |report| {
         for (report.runtime_statuses) |status| {
             if (status.schema_epoch != 0) schema_epoch_required = true;
+            if (status.source_authority != null) source_authority_required = true;
         }
     }
-    const native_required_version = if (schema_epoch_required)
+    const native_required_version = if (source_authority_required)
+        metadata_runtime_status_protocol.source_authority_record_version
+    else if (schema_epoch_required)
         metadata_runtime_status_protocol.schema_epoch_record_version
     else if (framed_profile_required)
         metadata_runtime_status_protocol.framed_index_record_version
     else
         required_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, native_required_version);
-    if (schema_epoch_required and supported_version != metadata_runtime_status_protocol.schema_epoch_record_version)
+    if (source_authority_required and !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.source_authority_record_version))
+        return error.RuntimeStatusProtocolUnavailable;
+    if (schema_epoch_required and !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.schema_epoch_record_version))
         return error.RuntimeStatusProtocolUnavailable;
     if (framed_profile_required and
         !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version))
@@ -18847,6 +19002,10 @@ test "relation reconciliation worker HTTP capability observation does not append
         .transport = .{ .snapshot = .{ .root_dir = snapshots } },
     } }, .{ .http = .{ .http = .{ .host = .{ .descriptor_factory = factory.iface() } } } }, .{ .observe_local_replica_root = false });
     defer svc.deinit();
+    // Isolate observation from the background migration that now adopts
+    // occupancy automatically. The probe itself must still append nothing,
+    // publish no cache entry and leave durable activation absent.
+    svc.relation_reconciliation_worker.next_round_at_ns = std.math.maxInt(u64);
     _ = try svc.ensureMetadataReplica(.{ .group_id = group, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
     try svc.campaignMetadataGroup();
     for (0..8) |_| try svc.runRound();
@@ -18969,7 +19128,8 @@ test "relation reconciliation worker activates and publishes verified roots in r
     try std.testing.expect(rebuilt.root != null and rebuilt.garbage == null);
     try std.testing.expect(!std.meta.eql(failed.current.?.job_id, rebuilt.current.?.job_id));
     const publication_activation = (try store.topologyActivation(group)).?;
-    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, publication_activation.version);
+    try std.testing.expectEqual(r.Coverage.constraint_names, rebuilt.current.?.coverage);
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, publication_activation.version);
     try std.testing.expectEqualSlices(u8, &proof.membership_fingerprint, &publication_activation.membership_fingerprint);
     // A live producer mutation invalidates the old candidate cut, then the
     // worker builds, verifies, swaps and collects its replacement.
@@ -19006,7 +19166,7 @@ test "relation reconciliation worker activates and publishes verified roots in r
     }, .{});
     defer a.free(stale_activation);
     try std.testing.expectError(error.NotLeader, svc.proposeTopologyActivationWithReceipt(stale_activation, stale_membership));
-    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, (try store.topologyActivation(group)).?.version);
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
     const reply = try catalog_operations.call(&svc, a, .{ .setting_admin = true }, replace_call);
     defer a.free(reply);
     var result = try std.json.parseFromSlice(catalog_calls.RelationReplacementResult, a, reply, .{});
@@ -19036,7 +19196,9 @@ test "relation reconciliation worker activates and publishes verified roots in r
     const dropped = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "shared_key" }} });
     defer dropped.deinit(a);
     try std.testing.expect(dropped.relations[0] == null);
-    try std.testing.expectEqual(metadata_topology_protocol.relation_mutation_version, (try store.topologyActivation(group)).?.version);
+    // A legacy-shaped source write must inherit, never downgrade, the
+    // namespace's activated occupancy floor after the index is retired.
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
     svc.lockRuntime();
     defer svc.unlockRuntime();
     try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());

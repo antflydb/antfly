@@ -1111,6 +1111,471 @@ test "capi system write cursor sees pending catalog rows and preserves abort" {
     try std.testing.expectError(error.NotFound, read.get("catalog:b"));
 }
 
+test "storage owner native index rejects prior ABI before dereferencing request fields" {
+    var response: kernel_owner_abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, server_api.storageOwnerNativeIndexControlJson(null, &.{
+        .version = 0,
+        .operation = .admit,
+        .table_name = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .request_json = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .manifest = .{ .ptr = @ptrFromInt(1), .len = 1 },
+    }, &response));
+    try std.testing.expect(response.ptr == null);
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+test "storage owner native index receipt snapshot guards every durable outbox form" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const outboxes = local.storage_db_durable_outbox;
+    const pending = local.storage_db_durable_outbox_store;
+    var directory = try TestDirectory.init("native-index-receipt-snapshot");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+    });
+    defer db.close();
+    const versioned = try outboxes.durableReplicationOutboxKeyAlloc(a, .restore_batch, 7, 1, "pending");
+    defer a.free(versioned);
+    for ([_][]const u8{ outboxes.replication_batch_outbox_key, outboxes.replication_replay_outbox_key, outboxes.replication_schema_outbox_key, versioned }) |key| {
+        var before = try db.core.store.beginReadTxn();
+        defer before.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        // Even corrupt/empty obligations fail closed; presence must not require
+        // allocating or decoding the potentially schema-sized payload.
+        try db.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        var during = try db.core.store.beginReadTxn();
+        defer during.abort();
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        try db.core.store.putBatch(&.{}, &.{key});
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        var after = try db.core.store.beginReadTxn();
+        defer after.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&after));
+    }
+}
+
+test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try TestDirectory.init("native-index-capi");
+    defer directory.cleanup();
+    var handle: Handle = .{
+        .alloc = a,
+        .db = try db_mod.DB.open(a, directory.path(), .{
+            .start_optional_runtimes = false,
+            .primary_backend = .{ .lsm = .{} },
+            .online_source_authority = .native,
+            .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 },
+        }),
+        .storage_owner_table_name = @constCast("items"),
+        .storage_owner_group_id = 11,
+    };
+    defer handle.db.close();
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    try handle.db.setSchemaJson(a, before);
+    var schema = try local.schema_mod.parseValidatedTableSchema(a, before);
+    defer schema.deinit(a);
+    var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+    defer prior.deinit();
+    try handle.db.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(a, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    var prior_digest: [32]u8 = undefined;
+    var candidate_digest: [32]u8 = undefined;
+    var reservation_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prior.value, &prior_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.next.value, &candidate_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.reservation.value, &reservation_digest, .{});
+    const header: db_mod.DB.NativeIndexOwnerAdmission = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = handle.db.core.identity_namespace, .catalog_digest = prior_digest },
+        .candidate_digest = candidate_digest,
+        .reservation_digest = reservation_digest,
+    };
+    const json = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(json);
+    const identity: db_mod.DB.NativeIndexOwnerIdentity = .{
+        .id = header.id,
+        .plan_digest = header.plan_digest,
+        .owner_digest = header.owner_digest,
+        .ordinal = header.ordinal,
+        .namespace = header.fence.namespace,
+        .owner_group_id = header.fence.owner_group_id,
+    };
+    const identity_json = try std.json.Stringify.valueAlloc(a, identity, .{});
+    defer a.free(identity_json);
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    const inspection: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .inspect,
+        .table_name = .fromSlice("items"),
+        .request_json = .fromSlice(identity_json),
+    };
+    {
+        var status_request = inspection;
+        status_request.operation = .cancel_inspect;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &status_request, &response));
+        const status_response = response;
+        defer freeRawBuffer(status_response.ptr, status_response.len);
+        var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+        defer status.deinit();
+        try std.testing.expectEqual(.native, status.value.source.kind);
+        try std.testing.expect(status.value.intent == null and status.value.binding == null and status.value.cleanup == null);
+    }
+    // An absent job cannot attest native mode in a Raft-owned namespace.
+    {
+        const authority = local.storage_source_authority;
+        var txn = try handle.db.core.store.beginReadTxn();
+        const original = (try authority.load(&txn)).?;
+        txn.abort();
+        var raft = original;
+        raft.kind = .raft;
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &raft.encode() }}, &.{});
+        try std.testing.expectError(error.OnlineSourceScopeChanged, handle.db.nativeIndexOwnerState(identity));
+        try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response) != .ok);
+        try std.testing.expect(response.ptr == null);
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &original.encode() }}, &.{});
+    }
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+    try std.testing.expectEqualStrings("null", response.slice());
+    freeRawBuffer(response.ptr, response.len);
+    var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .admit,
+        .table_name = .fromSlice("wrong-table"),
+        .request_json = .fromSlice(json),
+        .manifest = .fromSlice(candidate.inputs.bytes),
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.table_name = .fromSlice("items");
+    request.operation = @fromBackingInt(@intCast(99));
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.operation = .admit;
+    const manifest = request.manifest;
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = manifest;
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    var admitted = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+    defer admitted.deinit();
+    freeRawBuffer(response.ptr, response.len);
+    try std.testing.expect(!admitted.value.duplicate);
+    try std.testing.expect(admitted.value.receipt == null);
+    try std.testing.expectEqual(@as(u64, 1), admitted.value.position.sequence);
+    const binding = admitted.value.binding;
+    for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .fence, .reserve }, 2..) |operation, sequence| {
+        const command: db_mod.DB.NativeIndexOwnerCommand = .{ .effect = if (operation == .fence) .fenced else .reserved, .binding = binding };
+        const command_json = try std.json.Stringify.valueAlloc(a, command, .{});
+        defer a.free(command_json);
+        request.operation = operation;
+        request.request_json = .fromSlice(command_json);
+        // Non-admission controls must not introduce replacement schema inputs.
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        request.manifest = .{};
+        handle.storage_owner_group_id = 99;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        handle.storage_owner_group_id = 11;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const effect_response = response;
+        defer freeRawBuffer(effect_response.ptr, effect_response.len);
+        var outcome = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+        defer outcome.deinit();
+        try std.testing.expect(!outcome.value.duplicate);
+        try std.testing.expectEqual(@as(u64, sequence), outcome.value.position.sequence);
+        try std.testing.expect(outcome.value.receipt != null);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+        const state_response = response;
+        defer freeRawBuffer(state_response.ptr, state_response.len);
+        const Binding = @TypeOf(binding);
+        var observed = try std.json.parseFromSlice(?Binding, a, response.slice(), .{});
+        defer observed.deinit();
+        try std.testing.expectEqual(if (operation == .fence) local.storage_db_relational_index_owner_job.Phase.fencing else .reserved, observed.value.?.phase);
+        try std.testing.expectEqual(binding.inputs_digest, observed.value.?.inputs_digest);
+        const receipt_json = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerReceiptRequest{
+            .identity = identity,
+            .effect = if (operation == .fence) .fenced else .reserved,
+        }, .{});
+        defer a.free(receipt_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &.{
+            .operation = .receipt,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(receipt_json),
+        }, &response));
+        const recovered_response = response;
+        defer freeRawBuffer(recovered_response.ptr, recovered_response.len);
+        var recovered = try std.json.parseFromSlice(?db_mod.DB.NativeIndexOwnerOutcome, a, recovered_response.slice(), .{});
+        defer recovered.deinit();
+        try std.testing.expect(recovered.value.?.duplicate);
+        try std.testing.expect(!recovered.value.?.replication_pending);
+        try std.testing.expectEqual(outcome.value.position, recovered.value.?.position);
+        try std.testing.expectEqual(try outcome.value.receipt.?.digest(), try recovered.value.?.receipt.?.digest());
+        request.manifest = .fromSlice(candidate.inputs.bytes);
+    }
+    // Exercise the actual ordered DB path and normalized standby ingress.
+    // This does not authenticate/activate a mounted distributed producer.
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const tuple = "compiled\x00\xff\x80-owner-claim";
+        var text = tuple.*;
+        var prepared_claims = try handle.db.prepareNativeIndexOwnerClaims(.{
+            .binding = reserved_binding,
+            .claims = &.{.{
+                .tuple = &text,
+                .parent_table = "items",
+                .parent_key = "claim-owner",
+                .schema_version = binding.physical_candidate.schema_version,
+            }},
+        });
+        defer prepared_claims.deinit();
+        @memset(&text, 'x');
+        try prepared_claims.preparePayload();
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared_claims.command, .{});
+        defer a.free(encoded);
+        var claim_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+            .operation = .claims,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(encoded),
+        };
+        var claim_response: kernel_owner_abi.OwnedBytes = .{};
+        claim_request.manifest = .fromSlice("not-permitted");
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.manifest = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const claimed_buffer = claim_response;
+        defer freeRawBuffer(claimed_buffer.ptr, claimed_buffer.len);
+        var parsed_claimed = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, claimed_buffer.slice(), .{});
+        defer parsed_claimed.deinit();
+        const claimed = parsed_claimed.value;
+        try claimed.validateFor(prepared_claims.command);
+        var invalid_receipt = claimed;
+        invalid_receipt.position.namespace.range_id += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.duplicate = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.replication_pending = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        try std.testing.expect(!claimed.duplicate and !claimed.replication_pending);
+        try std.testing.expectEqual(@as(usize, 1), claimed.claims_added);
+        try std.testing.expectEqual(@as(u64, 4), claimed.position.sequence);
+        const duplicate = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
+        try std.testing.expect(duplicate.duplicate);
+        try std.testing.expectEqual(claimed.position, duplicate.position);
+        {
+            var stale = prepared_claims.command;
+            stale.binding.id[0] ^= 1;
+            const rejected = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.private_index_owner_job_changed, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+            stale.binding = prepared_claims.command.binding;
+            stale.binding.fence.owner_group_id += 1;
+            const wrong_owner = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(wrong_owner);
+            claim_request.request_json = .fromSlice(wrong_owner);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            var different = prepared_claims.command.claims[0];
+            different.parent_key = "conflicting-owner";
+            const rejected = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{ .binding = reserved_binding, .claims = &.{different} }, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.unique_constraint_violation, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            const forged = try std.json.Stringify.valueAlloc(a, .{ .binding = reserved_binding, .claims = prepared_claims.command.claims, .position = claimed.position }, .{});
+            defer a.free(forged);
+            claim_request.request_json = .fromSlice(forged);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        // Claim bodies have their own bounded lane, not the fixed 32-KiB
+        // control-header limit. Oversized lengths fail before pointer access.
+        claim_request.request_json = .{ .len = local.storage_db_relational_index_owner_control.max_claim_wire_bytes + 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.request_json = .{ .len = 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        const padded = try a.alloc(u8, 32 * 1024 + encoded.len);
+        defer a.free(padded);
+        @memset(padded[0 .. 32 * 1024], ' ');
+        @memcpy(padded[32 * 1024 ..], encoded);
+        claim_request.request_json = .fromSlice(padded);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const retried_buffer = claim_response;
+        defer freeRawBuffer(retried_buffer.ptr, retried_buffer.len);
+        var retried = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, retried_buffer.slice(), .{});
+        defer retried.deinit();
+        try std.testing.expect(retried.value.duplicate);
+        try std.testing.expectEqual(claimed.position, retried.value.position);
+        const Frame = local.storage_db_relational_index_owner_control.Frame;
+        var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: Frame }, a, try prepared_claims.finalizePayload(claimed.position), .{});
+        defer wire.deinit();
+        try std.testing.expectEqualSlices(u8, tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        var corrupt_frame = wire.value.index_owner_control;
+        corrupt_frame.position.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = corrupt_frame, .receipt = .{ .native = corrupt_frame.position } }, 2));
+        try std.testing.expectEqual(@as(u64, 1), try handle.db.replicationAppliedSequence());
+    }
+    var foreign = identity;
+    foreign.id[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, handle.db.nativeIndexOwnerState(foreign));
+    foreign = identity;
+    foreign.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, handle.db.nativeIndexOwnerState(foreign));
+    try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+
+    request.operation = .cancel_intent;
+    request.request_json = .fromSlice(json);
+    // Cancellation has a fixed identity header, never replacement inputs.
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    var cancel_position: @FieldType(db_mod.DB.NativeIndexOwnerCancellationOutcome, "position") = undefined;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cancel_response = response;
+        defer freeRawBuffer(cancel_response.ptr, cancel_response.len);
+        // Strict decoding also proves no publication receipt was returned.
+        var canceled = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, cancel_response.slice(), .{});
+        defer canceled.deinit();
+        try std.testing.expectEqual(attempt != 0, canceled.value.duplicate);
+        try std.testing.expect(!canceled.value.replication_pending);
+        try std.testing.expectEqual(@as(u64, 5), canceled.value.position.sequence);
+        cancel_position = canceled.value.position;
+    }
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+        .online_source_authority = .native,
+        .identity_namespace = header.fence.namespace,
+    });
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const recovered_cancel_response = response;
+    defer freeRawBuffer(recovered_cancel_response.ptr, recovered_cancel_response.len);
+    var recovered_cancel = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, recovered_cancel_response.slice(), .{});
+    defer recovered_cancel.deinit();
+    try std.testing.expect(recovered_cancel.value.duplicate);
+    try std.testing.expectEqual(cancel_position, recovered_cancel.value.position);
+    var late = try handle.db.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+    defer late.deinit();
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, handle.db.applyPreparedNativeIndexOwnerControl(&late, null));
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const encoded = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{
+            .binding = reserved_binding,
+            .claims = &.{.{ .tuple = "late-claim", .parent_table = "items", .parent_key = "late-owner", .schema_version = binding.physical_candidate.schema_version }},
+        }, .{});
+        defer a.free(encoded);
+        var rejected: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_publication_canceled, server_api.storageOwnerNativeIndexControlJson(id, &.{ .operation = .claims, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded) }, &rejected));
+        try std.testing.expect(rejected.ptr == null);
+    }
+    request.operation = .cancel_cleanup;
+    request.request_json = .fromSlice(identity_json);
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cleanup_response = response;
+        defer freeRawBuffer(cleanup_response.ptr, cleanup_response.len);
+        var cleanup = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCleanupOutcome, a, cleanup_response.slice(), .{});
+        defer cleanup.deinit();
+        try std.testing.expectEqual(attempt != 0, cleanup.value.duplicate);
+        try std.testing.expect(!cleanup.value.replication_pending);
+        try std.testing.expectEqual(@as(u64, 6), cleanup.value.position.sequence);
+        try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
+    }
+    const Denied = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var denied_context: u8 = 0;
+    handle.db.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    defer handle.db.local_execution.replication_write_gate = null;
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const gc_response = response;
+        defer freeRawBuffer(gc_response.ptr, gc_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexCleanupMaintenanceOutcome, a, gc_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt < 2, progress.value.advanced);
+        try std.testing.expectEqual(attempt > 0, progress.value.artifacts_retired);
+    }
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_claim_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const claim_response = response;
+        defer freeRawBuffer(claim_response.ptr, claim_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexClaimCleanupMaintenanceOutcome, a, claim_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt == 0, progress.value.advanced);
+        try std.testing.expect(progress.value.claims_retired);
+    }
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        const authority = local.storage_source_authority;
+        const clock = try authority.require(&read, .native, local.storage_db_online_source_contract.namespaceBytes(header.fence.namespace));
+        try std.testing.expectEqual(@as(u64, 6), clock.sequence);
+    }
+    request.operation = .cancel_inspect;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const status_response = response;
+    defer freeRawBuffer(status_response.ptr, status_response.len);
+    var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+    defer status.deinit();
+    try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+    try std.testing.expect(status.value.claims_retired);
+    try std.testing.expect(status.value.claim_allocation != null);
+    try std.testing.expectEqual(@as(u64, 6), status.value.cleanup.?.sequence);
+    try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
+}
+
 test "storage owner open rejects prior ABI before reading expanded request fields" {
     var owner: ?*anyopaque = @ptrFromInt(1);
     const old_request: kernel_owner_abi.OpenRequest = .{

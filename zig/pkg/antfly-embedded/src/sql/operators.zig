@@ -40,6 +40,8 @@ pub fn compareRows(left: Row, right: Row, orders: []const Order) !std.math.Order
     if (left.keys.len != orders.len or right.keys.len != orders.len) return error.InvalidSqlBackendResponse;
     if (left.normalized) |l| if (right.normalized) |r| if (@import("sort_key.zig").compare(l, r)) |order| return if (order == .eq) std.math.order(left.ordinal, right.ordinal) else order;
     for (left.keys, right.keys, orders) |a, b, order| {
+        try a.validateTemporal();
+        try b.validateTemporal();
         if (a.sql_null or b.sql_null) {
             if (a.sql_null and b.sql_null) continue;
             const nulls_first = order.nulls_first orelse order.descending;
@@ -419,6 +421,7 @@ pub const Aggregate = struct {
     }
 
     pub fn update(self: *Aggregate, value: Datum) !void {
+        try value.validateTemporal();
         if (value.sql_null) {
             if (self.patterns) |state| {
                 if (!state.has_null) {
@@ -1606,8 +1609,14 @@ pub const Grouped = struct {
 };
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
+    try value.validateTemporal();
+    if (value.temporal()) |temporal| {
+        const owned = try alloc.create(@import("temporal_value.zig").Value);
+        owned.* = temporal.*;
+        return Datum.typedTemporal(owned);
+    }
     if (value.numeric) |number| {
-        if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        if (value.sql_null or value.array != null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
         const exact = @import("numeric_value.zig");
         var ctx: exact.Context = .{ .alloc = alloc };
         try exact.validateCanonical(&ctx, number.*);
@@ -1618,7 +1627,7 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
         return Datum.typedNumeric(owned);
     }
     if (value.array) |array| {
-        if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        if (value.sql_null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
         const owned = try alloc.create(@import("array_value.zig").Value);
         const dimensions = try alloc.dupe(@import("array_value.zig").Dimension, array.dimensions);
         const elements = try alloc.alloc(Datum, array.elements.len);
@@ -1629,7 +1638,139 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
         owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
         return Datum.typedArray(owned);
     }
-    return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null, .patterns = value.patterns };
+    return Datum.fromParts(try cloneJson(alloc, value.value, 0), value.sql_null, value.patterns());
+}
+
+fn temporalOperatorOwnershipScenario(a: Allocator) !void {
+    const temporal = @import("temporal_value.zig");
+    const values = [_]temporal.Value{
+        .{ .date = .{ .days = temporal.min_date } },
+        .{ .date = .{ .days = 0 } },
+        .{ .time = .{ .micros = temporal.micros_per_day } },
+        .{ .time_tz = .{ .time = .{ .micros = 3_600_000_000 }, .seconds_west = -3600 } },
+        .{ .time_tz = .{ .time = .{ .micros = 0 }, .seconds_west = 0 } },
+        .{ .timestamp = .{ .micros = temporal.end_timestamp - 1 } },
+        .{ .timestamp_tz = .{ .micros = -946_684_800_000_001 } },
+        .{ .interval = .{ .months = 1 } },
+        .{ .interval = .{ .days = 30 } },
+        .{ .interval = .{ .days = 31 } },
+        .{ .interval = .{ .micros = std.math.minInt(i64) } },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var store = @import("typed_store.zig").Store.init(a);
+    defer store.deinit();
+    var cells: [values.len]Datum = undefined;
+    var rows: [values.len]Row = undefined;
+    for (&values, &cells, &rows, 0..) |*value, *cell, *row, i| {
+        cell.* = try cloneDatum(owned, Datum.typedTemporal(value));
+        try std.testing.expect(cell.temporal().? != value);
+        try std.testing.expectEqual(@as(usize, @sizeOf(Datum) + @sizeOf(temporal.Value)), try datumBytes(cell.*));
+        _ = try store.append(&.{cell.*});
+        const retained = try store.cell(owned, i, 0);
+        try std.testing.expect(retained.temporal().? != cell.temporal().?);
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(cell.*, retained));
+        try std.testing.expect(try store.equal(owned, i, &.{cell.*}, false));
+        row.* = .{ .values = cells[i..][0..1], .keys = cells[i..][0..1], .ordinal = i };
+    }
+    const spill = @import("spill.zig");
+    const bytes = try spill.encodeColumnarBlockAlloc(a, &rows, 16 << 10);
+    defer a.free(bytes);
+    const restored = try spill.decodeColumnarBlockInArena(owned, bytes, 16 << 10);
+    for (cells, 0..) |cell, i| {
+        const value = try restored.cell(i, 0);
+        try std.testing.expect(!value.sql_null and value.temporal() != null and value.value == .null);
+        try std.testing.expect(value.temporal().? != cell.temporal().?);
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(cell, value));
+        try std.testing.expectEqual(try scalar.semanticHashDatum(cell), try scalar.semanticHashDatum(value));
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(cell, try restored.keyCell(i, 0)));
+    }
+    for ([_]bool{ false, true }) |descending| {
+        const orders = [_]Order{.{ .descending = descending }};
+        for (cells) |left| for (cells) |right| {
+            if (left.temporal().?.kind() != right.temporal().?.kind()) continue;
+            const expected = try compareRows(.{ .values = &.{}, .keys = &.{left}, .ordinal = 0 }, .{ .values = &.{}, .keys = &.{right}, .ordinal = 0 }, &orders);
+            const keys = @import("sort_key.zig");
+            const left_key = keys.encode(&.{left}, &orders) orelse return error.MissingTemporalSortKey;
+            const right_key = keys.encode(&.{right}, &orders) orelse return error.MissingTemporalSortKey;
+            try std.testing.expectEqual(expected, keys.compare(left_key, right_key).?);
+        };
+    }
+    const spec: AggregateSpec = .{ .kind = .min };
+    const join = try HashJoin.create(a, .{});
+    defer join.deinit();
+    const membership = try TupleMembership.create(a, 1, .{}, null);
+    defer membership.deinit();
+    for (cells[7..10]) |cell| {
+        try join.add(&.{cell}, &.{cell});
+        try membership.add(&.{cell});
+    }
+    try membership.seal();
+    try std.testing.expectEqual(@import("tuple_membership.zig").Truth.yes, try membership.probe(&.{cells[8]}));
+    var probe = try join.probe(&.{cells[8]});
+    var matches: usize = 0;
+    while (try probe.next()) |match| {
+        const materialized = try match.materializeValues(owned);
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(cells[8], materialized[0]));
+        matches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), matches);
+    var minimum = try Aggregate.initTyped(a, spec.kind, spec.input_type, null);
+    defer minimum.deinit();
+    var distinct = try Aggregate.initTyped(a, .count, null, null);
+    distinct.distinct = true;
+    defer distinct.deinit();
+    for (cells[7..10]) |cell| {
+        try minimum.update(cell);
+        try distinct.update(cell);
+    }
+    try std.testing.expectEqual(@as(i64, 2), (try distinct.finish()).value.integer);
+    const partials = try @import("aggregate_partial.zig").encode(a, &.{minimum});
+    defer {
+        for (partials) |partial| a.free(partial.value.string);
+        a.free(partials);
+    }
+    var resumed = try @import("aggregate_partial.zig").decode(a, partials[0], spec);
+    defer resumed.deinit();
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(try minimum.finish(), try resumed.finish()));
+}
+
+test "SQL temporal operator ownership sort distinct spill and aggregate checkpoints" {
+    try temporalOperatorOwnershipScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, temporalOperatorOwnershipScenario, .{});
+}
+
+test "SQL temporal Datums reject mixed payloads and preserve bounded ingress" {
+    const temporal = @import("temporal_value.zig");
+    const value: temporal.Value = .{ .interval = .{ .months = 1 } };
+    const equivalent: temporal.Value = .{ .interval = .{ .days = 30 } };
+    const cell = Datum.typedTemporal(&value);
+    for ([_]Datum{
+        .{ .extension_kind = .temporal, .extension = &value },
+        .{ .extension_kind = .temporal, .extension = &value, .sql_null = false, .value = .{ .string = "wrong" } },
+    }) |bad| {
+        try std.testing.expectError(error.SqlTypeMismatch, scalar.compareDatums(bad, cell));
+        try std.testing.expectError(error.SqlTypeMismatch, scalar.semanticHashDatum(bad));
+        try std.testing.expectError(error.SqlTypeMismatch, cloneDatum(std.testing.allocator, bad));
+    }
+    try std.testing.expectError(error.SqlTypeMismatch, @import("array_value.zig").Value.init(.jsonb, &.{.{ .length = 1, .lower = 1 }}, &.{cell}, .{}));
+    try std.testing.expect((try @import("vector_eval.zig").binary(.eq, cell, Datum.typedTemporal(&equivalent))).value.bool);
+    try std.testing.expectError(error.SqlTypeMismatch, @import("vector_eval.zig").binary(.add, cell, cell));
+    try std.testing.expectError(error.UnsupportedSqlShape, @import("describe.zig").coerceDatum(std.testing.allocator, cell, .datetime, null));
+    var bytes: [16]u8 = undefined;
+    const binary = try temporal.encode(value, &bytes);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var work: @import("array_value.zig").Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, scalar.temporalBinaryLeaky(none.allocator(), .interval, binary, &work));
+    work = .{};
+    try std.testing.expectError(error.OutOfMemory, scalar.temporalBinaryLeaky(none.allocator(), .interval, binary, &work));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    work = .{};
+    const parsed = try scalar.temporalBinaryLeaky(arena.allocator(), .interval, binary, &work);
+    try std.testing.expect(!parsed.sql_null and parsed.temporal() != null and parsed.value == .null);
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(parsed, cell));
 }
 
 fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
@@ -1653,6 +1794,8 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
     };
 }
 pub fn datumBytes(value: Datum) anyerror!usize {
+    try value.validateTemporal();
+    if (value.temporal() != null) return @sizeOf(Datum) + @sizeOf(@import("temporal_value.zig").Value);
     if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| {
         var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
@@ -2218,8 +2361,8 @@ test "SQL pattern sets spill distinct state and preserve reusable quantified nul
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const result = (try group.nextResult(arena.allocator())).?;
-    try std.testing.expectEqual(@as(usize, 2001), result.aggregates[0].patterns.?.count);
-    try std.testing.expectEqual(@as(usize, 2000), result.aggregates[1].patterns.?.count);
+    try std.testing.expectEqual(@as(usize, 2001), result.aggregates[0].patterns().?.count);
+    try std.testing.expectEqual(@as(usize, 2000), result.aggregates[1].patterns().?.count);
     const operand: ast.Scalar = .{ .literal = .{ .string = "absent" } };
     const patterns: ast.Scalar = .{ .column = "p" };
     const no: ast.Scalar = .{ .literal = .{ .boolean = false } };

@@ -148,6 +148,17 @@ pub const Catalog = struct {
             if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 24 and schema.requires_array_expressions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 27 and schema.requires_text_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 29 and schema.requires_jsonb_display) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 30 and schema.requires_json_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 31) {
+                if (schema.requires_jsonb_array_display) return error.UnsupportedTableCapabilityVersion;
+                for (schema.relational_columns) |column| {
+                    if (column.column_type == .sql_array and column.sql_element_type == .jsonb) return error.UnsupportedTableCapabilityVersion;
+                }
+            }
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };
@@ -179,6 +190,71 @@ test "relational index system catalog fences exact NUMERIC programs with integra
     const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = true };
     var catalog: Catalog = .{ .schema_format_version = 20, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    catalog.schema_format_version = schema_mod.storage_format_version;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL durable text catalog fences expression readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_text_expressions = true };
+    var catalog: Catalog = .{ .schema_format_version = 26, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_text_expressions = false;
+    try catalog.validateForSchema(table);
+    table.requires_text_expressions = true;
+    catalog.schema_format_version = 27;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system JSON expression capability fences catalog readers independently of storage" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    var catalog: Catalog = .{ .schema_format_version = 29, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_json_expressions = false;
+    try catalog.validateForSchema(table);
+    table.requires_json_expressions = true;
+    catalog.schema_format_version = 30;
+    try catalog.validateForSchema(table);
+    const loaded = try Catalog.decode(&catalog.encode());
+    try loaded.validateForSchema(table);
+}
+
+test "relational index system JSONB display capability fences catalog readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true };
+    var catalog: Catalog = .{ .schema_format_version = 28, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_jsonb_display = false;
+    try catalog.validateForSchema(table);
+    table.requires_jsonb_display = true;
+    catalog.schema_format_version = 29;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL durable numeric functions fence catalog readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_functions = true };
+    var catalog: Catalog = .{ .schema_format_version = 27, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_numeric_functions = false;
+    try catalog.validateForSchema(table);
+    table.requires_numeric_functions = true;
+    catalog.schema_format_version = 28;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL immutable index catalog fences constant predicate readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_constant_index_predicates = true };
+    var catalog: Catalog = .{ .schema_format_version = 25, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_constant_index_predicates = false;
+    try catalog.validateForSchema(table);
+    table.requires_constant_index_predicates = true;
     catalog.schema_format_version = schema_mod.storage_format_version;
     try catalog.validateForSchema(table);
     const restored = try Catalog.decode(&catalog.encode());

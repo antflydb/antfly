@@ -111,6 +111,9 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    /// Signed startup-only reporter CAS for the already admitted native root.
+    /// Possession cannot enroll a key or authorize a publication ACK.
+    native_registration: ?@import("../standalone_native_owner.zig").Registration = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -241,9 +244,17 @@ pub const SystemCatalogCommand = struct {
     mutation: system_catalog.Mutation,
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        // Keep legacy frames byte-for-byte shaped as before while capability
+        // 34 is not activated. Old decoders must not see even a null new field.
+        if (self.constraint_name_admission == null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update });
+        try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission });
+    }
 };
 
-pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
@@ -251,6 +262,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_fk_generation_publication,
+        .begin_relational_index_publication,
         .apply_fk_initial_create,
         .upsert_table,
         .compare_and_replace_table,
@@ -300,7 +312,12 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_owner_decision: @import("../relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
+    fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
+    constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
+    constraint_name_check: struct { request: system_catalog.ConstraintNameCheck, deadline_ns: ?u64 = null },
     fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_status: u64,
     fk_generation_table_locked: u64,

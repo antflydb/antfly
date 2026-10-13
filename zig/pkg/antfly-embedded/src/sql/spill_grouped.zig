@@ -481,7 +481,7 @@ pub const Grouped = struct {
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
         const aggregates = if (exact) try @import("aggregate_partial.zig").encode(out, states) else try out.alloc(Datum, states.len);
         if (!exact) for (states, @constCast(aggregates), pattern_sets) |*state, *copy, set| {
-            copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
+            copy.* = if (set) |patterns| Datum.fromParts(.null, false, &patterns.interface) else try operators.cloneDatum(out, try state.finish());
         };
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };

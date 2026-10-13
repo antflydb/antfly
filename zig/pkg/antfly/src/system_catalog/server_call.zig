@@ -78,7 +78,12 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+    relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
+    constraint_name_prepare: domain.ConstraintNamePrepareRequest,
+    constraint_name_check: domain.ConstraintNameCheck,
     fk_initial_child_decision: @import("../metadata/fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
     fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
@@ -111,7 +116,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate => true,
+            .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -133,6 +138,9 @@ pub const Call = union(enum) {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_owner_decision,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
             .fk_initial_create_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_status,
@@ -145,10 +153,40 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        return self == .mutate or self == .fk_initial_retirement_ack or
-            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+        return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or
+            (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self.requiresAdministrativeGrant());
+    }
+
+    pub fn isRelationalIndexOwnerCall(self: @This()) bool {
+        return self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status;
     }
 };
+
+test "relational index publication ACK calls require body bound authority and distinguish mutations from status" {
+    const abi = @import("antfly_runtime_abi");
+    const VTable = struct { submit: *const fn (*const anyerror) anyerror!u64 };
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    const Callbacks = struct {
+        fn submit(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+        fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return Boundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.InvalidIndexOwnerReceipt, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expectError(err, Boundary.call("submit", &Callbacks.foreign, &Callbacks.submit, .{&err}));
+    }
+    const ack: Call = .{ .relational_index_owner_ack = undefined };
+    const status: Call = .{ .relational_index_owner_ack_status = undefined };
+    for ([_]Call{ ack, status }) |call| {
+        try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!call.requiresAdministrativeGrant());
+        try std.testing.expect(call.isRelationalIndexOwnerCall());
+    }
+    try std.testing.expect(ack.isMutation());
+    try std.testing.expect(!status.isMutation());
+}
 
 test "system catalog policy publication status is a service-only read, not a setting grant" {
     const status: Call = .{ .policy_publication_status = 7 };
@@ -160,6 +198,16 @@ test "system catalog policy publication status is a service-only read, not a set
     try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "system catalog relational index owner decision requires a body bound read grant and cannot mutate" {
+    const call: Call = .{ .relational_index_owner_decision = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence } };
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.requiresAdministrativeGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, std.testing.allocator,
+        \\{"relational_index_owner_decision":{"table_id":1,"group_id":2,"id":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"operation":"fence","index_publication_authority":true}}
+    , .{}));
 }
 
 test "store-root enrollment status is an admin-bound read, not a mutation" {
@@ -186,6 +234,11 @@ test "native lake lifecycle calls bind private read and mutation grants" {
 }
 
 test "system catalog relation replacement requires a body-bound administrative mutation grant" {
+    for ([_]Call{ .{ .constraint_name_prepare = undefined }, .{ .constraint_name_check = undefined } }) |prepare| {
+        try std.testing.expect(prepare.requiresAdministrativeGrant());
+        try std.testing.expect(!prepare.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!prepare.isMutation());
+    }
     const call: Call = .{ .relation_replace = undefined };
     try std.testing.expect(call.requiresAdministrativeGrant());
     try std.testing.expect(call.isMutation());

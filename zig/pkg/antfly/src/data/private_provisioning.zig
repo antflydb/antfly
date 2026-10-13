@@ -61,7 +61,7 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
         var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
-        var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
+        var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalogWithCoverage(alloc, parsed, table.table_id, null, .legacy);
         defer compiled.deinit();
         std.crypto.hash.Blake3.hash(compiled.value, &digest, .{});
         if (!std.mem.eql(u8, &digest, &descriptor.catalog_digest) or

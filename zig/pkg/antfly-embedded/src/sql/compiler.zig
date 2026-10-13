@@ -141,6 +141,48 @@ fn lexicalError(kind: lexer.LexErrorKind) Error {
     };
 }
 
+/// NUMBER tokens already have PostgreSQL separator validation from the lexer.
+/// Zig accepts separators between digits, but not immediately after a radix
+/// prefix; remove only that permitted separator without allocating a copy.
+fn parseIntegerToken(comptime T: type, text: []const u8) std.fmt.ParseIntError!T {
+    const radix: u8 = if (text.len > 2 and text[0] == '0') switch (text[1]) {
+        'x', 'X' => 16,
+        'o', 'O' => 8,
+        'b', 'B' => 2,
+        else => 0,
+    } else 0;
+    if (radix == 0) return std.fmt.parseInt(T, text, 10);
+    const start: usize = if (text[2] == '_') 3 else 2;
+    return std.fmt.parseInt(T, text[start..], radix);
+}
+
+test "SQL PostgreSQL nondecimal integer literals preserve exact signed values" {
+    const queries = [_][]const u8{ "0x_6", "0o_6", "0b_110", "0x6e0", "0XFF_FF", "-0x_8000_0000_0000_0000", "1_000" };
+    const expected = [_]i64{ 6, 6, 6, 1760, 65535, std.math.minInt(i64), 1000 };
+    for (queries, expected) |sql, value_| {
+        var compiled = try compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(value_, compiled.expression.literal.integer);
+    }
+}
+
+test "SQL transaction timestamp syntax retains labels quoted columns and unsupported warning boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "SELECT CURRENT_TIMESTAMP", "SELECT CURRENT_TIMESTAMP(6)", "SELECT CURRENT_TIMESTAMP(0x6)", "SELECT CURRENT_TIMESTAMP(0x_6)", "SELECT CURRENT_TIMESTAMP(0o6)", "SELECT CURRENT_TIMESTAMP(0b110)" }) |sql| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualStrings("current_timestamp", compiled.statement.select.columns[0].alias.?);
+        try std.testing.expectEqualStrings("$current_timestamp", compiled.statement.select.columns[0].expression.?.call.name);
+    }
+    var quoted = try compileScalar(a, "\"current_timestamp\"", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("current_timestamp", quoted.expression.column);
+    for ([_][]const u8{ "CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP(-1)", "CURRENT_TIMESTAMP(1.5)", "CURRENT_TIMESTAMP($1)", "CURRENT_TIMESTAMP(1 + 1)" }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "CURRENT_TIMESTAMP(7)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "CURRENT_TIMESTAMP(0xe)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compileScalar(a, "\"$current_timestamp\"(6)", .{}));
+}
+
 test "SQL escape string diagnostics retain PostgreSQL SQLSTATEs" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileScalar(a, "E'\\u12'", .{}));
@@ -387,7 +429,7 @@ const Parser = struct {
         self.pos += 1;
         const radix = t.text.len > 2 and t.text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", t.text[1]) != null;
         if (!radix and std.mem.indexOfAny(u8, t.text, ".eE") != null) return self.numericLiteral(t.text, negative);
-        const magnitude = std.fmt.parseInt(u64, t.text, 0) catch return self.numericLiteral(t.text, negative);
+        const magnitude = parseIntegerToken(u64, t.text) catch return self.numericLiteral(t.text, negative);
         if (negative) {
             if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.numericLiteral(t.text, negative);
             if (magnitude == @as(u64, std.math.maxInt(i64)) + 1) return .{ .integer = std.math.minInt(i64) };
@@ -516,6 +558,22 @@ const Parser = struct {
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime } });
+        } else if (self.keyword(.current_timestamp)) {
+            var precision: i64 = 6;
+            if (self.take(.lparen)) {
+                if (!self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
+                const text = self.tokens[self.pos].text;
+                const radix = text.len > 2 and text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", text[1]) != null;
+                if (!radix and std.mem.indexOfAny(u8, text, ".eE") != null) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
+                precision = parseIntegerToken(i64, text) catch return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision is outside the supported domain");
+                self.pos += 1;
+                try self.expect(.rparen);
+                // PostgreSQL clamps >6 with a WARNING. Do not silently omit
+                // that observable contract until notice delivery is wired.
+                if (precision > 6) return self.fail(error.UnsupportedSqlShape, "CURRENT_TIMESTAMP precision warnings are not yet supported");
+            }
+            const arg = try self.scalarNode(.{ .literal = .{ .integer = precision } });
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_timestamp", .args = try self.alloc.dupe(*const ast.Scalar, &.{arg}) } });
         } else if (self.keyword(.case)) {
             const base = if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.when)) null else try self.scalar(depth + 1, 0);
             var branches: std.ArrayList(ast.Scalar.Branch) = .empty;
@@ -529,7 +587,12 @@ const Parser = struct {
             const otherwise = if (self.keyword(.@"else")) try self.scalar(depth + 1, 0) else null;
             try self.expectKeyword(.end);
             left = try self.scalarNode(.{ .case_when = .{ .branches = try branches.toOwnedSlice(self.alloc), .otherwise = otherwise } });
-        } else if ((self.peek(.minus) or self.peek(.plus)) and !(self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number)) {
+        } else if ((self.peek(.minus) or self.peek(.plus)) and !(self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number and
+            (self.pos + 2 >= self.tokens.len or self.tokens[self.pos + 2].kind != .colon_colon)))
+        {
+            // A postfix cast binds before unary sign. Folding a signed token
+            // first would admit overflowing positive casts and erase -0.0.
+            // Plain signed literals still use value() for exact int64 minima.
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });
@@ -1690,7 +1753,7 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
             .case_when => "case",
             else => null,
         };
@@ -1821,38 +1884,6 @@ const Parser = struct {
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
     }
 
-    fn generatedConstraintName(self: *Parser, table: []const u8, columns: []const []const u8, label: []const u8, constraints: []const ast.SchemaChange) Error![]const u8 {
-        const addition = try std.mem.join(self.alloc, "_", columns);
-        // Keep generated PostgreSQL identifiers within 63 UTF-8 bytes, balancing
-        // table/column components and preserving the semantic suffix.
-        for (0..constraints.len + 1) |ordinal| {
-            const suffix = if (ordinal == 0) label else try std.fmt.allocPrint(self.alloc, "{s}{d}", .{ label, ordinal });
-            const separators: usize = if (addition.len == 0) 1 else 2;
-            var table_len = table.len;
-            var addition_len = addition.len;
-            while (table_len + addition_len > 63 - suffix.len - separators) {
-                if (table_len > addition_len) table_len -= 1 else addition_len -= 1;
-            }
-            while (table_len != 0 and table_len < table.len and table[table_len] & 0xc0 == 0x80) table_len -= 1;
-            while (addition_len != 0 and addition_len < addition.len and addition[addition_len] & 0xc0 == 0x80) addition_len -= 1;
-            const generated_name = if (addition.len == 0)
-                try std.fmt.allocPrint(self.alloc, "{s}_{s}", .{ table[0..table_len], suffix })
-            else
-                try std.fmt.allocPrint(self.alloc, "{s}_{s}_{s}", .{ table[0..table_len], addition[0..addition_len], suffix });
-            const used = for (constraints) |constraint| {
-                const prior = switch (constraint) {
-                    .add_unique => |v| v.name,
-                    .add_check => |v| v.name,
-                    .add_foreign_key => |v| v.name,
-                    else => continue,
-                };
-                if (std.mem.eql(u8, generated_name, prior)) break true;
-            } else false;
-            if (!used) return generated_name;
-        }
-        return error.SqlLimitExceeded;
-    }
-
     pub fn createTable(self: *Parser) Error!ast.CreateTable {
         const if_not_exists = self.keyword(.@"if");
         if (if_not_exists) {
@@ -1863,7 +1894,6 @@ const Parser = struct {
         try self.expect(.lparen);
         var columns = std.ArrayList(ast.Column).empty;
         var constraints = std.ArrayList(ast.SchemaChange).empty;
-        var unnamed = std.ArrayList(struct { index: usize, column: ?[]const u8 }).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
             try self.node();
@@ -1873,8 +1903,8 @@ const Parser = struct {
                 continue;
             }
             if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
-                try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = null });
-                try constraints.append(self.alloc, try self.constraintDefinition(""));
+                const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_constraint_{d}", .{constraints.items.len});
+                try constraints.append(self.alloc, generatedConstraint(try self.constraintDefinition(constraint_name)));
                 if (!self.take(.comma)) break;
                 continue;
             }
@@ -1904,39 +1934,22 @@ const Parser = struct {
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
-                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = "", .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .name_generated = true, .primary = true } }));
                 } else if (self.keyword(.unique)) {
-                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = "", .columns = try self.alloc.dupe([]const u8, &.{column}) } }));
+                    const nulls_not_distinct = try self.uniqueNulls();
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .name_generated = true, .nulls_not_distinct = nulls_not_distinct } }));
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
                 } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES"))) {
-                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
-                    try constraints.append(self.alloc, try self.inlineConstraint("", column));
+                    const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_inline_{d}", .{constraints.items.len});
+                    try constraints.append(self.alloc, generatedConstraint(try self.inlineConstraint(constraint_name, column)));
                 } else break;
             }
             try columns.append(self.alloc, definition);
             if (!self.take(.comma)) break;
         }
         try self.expect(.rparen);
-        // Backing indexes share a namespace across tables. Pick table-based
-        // names after parsing all declarations, including explicit names that
-        // occur later in the statement; generic ordinal names collide as soon
-        // as the authoritative relation catalog is active.
-        for (unnamed.items) |entry| {
-            const constraint = &constraints.items[entry.index];
-            switch (constraint.*) {
-                .add_unique => |*unique| {
-                    unique.name = try self.generatedConstraintName(table.table, if (unique.primary) &.{} else unique.columns, if (unique.primary) "pkey" else "key", constraints.items);
-                    unique.generated_name = true;
-                },
-                .add_foreign_key => |*fk| fk.name = try self.generatedConstraintName(table.table, fk.columns, "fkey", constraints.items),
-                .add_check => |*check| check.name = try self.generatedConstraintName(table.table, if (entry.column) |column| &.{column} else &.{}, "check", constraints.items),
-                else => unreachable,
-            }
-        }
         const tablespace = if (self.keyword(.tablespace)) try self.identifier() else null;
         var has_primary = false;
         for (constraints.items) |constraint| if (constraint == .add_unique and constraint.add_unique.primary) {
@@ -1951,7 +1964,132 @@ const Parser = struct {
                 } else return self.fail(error.InvalidSqlSyntax, "primary key references an unknown column");
             }
         };
+        try self.normalizeUniqueConstraints(&constraints);
+        try self.disambiguateGeneratedConstraintLabels(constraints.items);
         return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace };
+    }
+
+    /// Match PostgreSQL's CREATE index-constraint normalization before name
+    /// selection: PRIMARY wins equivalent UNIQUE declarations; otherwise the
+    /// first equivalent index wins. A named duplicate can supply an anonymous
+    /// survivor's name. Policy differences and ordered keys remain distinct.
+    fn normalizeUniqueConstraints(self: *Parser, constraints: *std.ArrayList(ast.SchemaChange)) Error!void {
+        const Rule = @FieldType(ast.SchemaChange, "add_unique");
+        const Context = struct {
+            pub fn hash(_: @This(), rule: Rule) u64 {
+                var digest = std.hash.Wyhash.init(0);
+                digest.update(&.{ @intFromBool(rule.nulls_not_distinct), @intFromBool(rule.deferrable) });
+                digest.update(rule.timing);
+                var length: [8]u8 = undefined;
+                for (rule.columns) |column| {
+                    std.mem.writeInt(u64, &length, column.len, .little);
+                    digest.update(&length);
+                    digest.update(column);
+                }
+                return digest.final();
+            }
+            pub fn eql(_: @This(), left: Rule, right: Rule) bool {
+                if (left.nulls_not_distinct != right.nulls_not_distinct or left.deferrable != right.deferrable or
+                    !std.mem.eql(u8, left.timing, right.timing) or left.columns.len != right.columns.len) return false;
+                for (left.columns, right.columns) |l, r| if (!std.mem.eql(u8, l, r)) return false;
+                return true;
+            }
+        };
+        var count: usize = 0;
+        for (constraints.items) |constraint| if (constraint == .add_unique) {
+            count += 1;
+        };
+        if (count < 2) return;
+        var indexes: std.HashMapUnmanaged(Rule, usize, Context, 80) = .empty;
+        defer indexes.deinit(self.alloc);
+        // Grow with distinct indexes, not redundant declarations. Thousands
+        // of equivalent clauses should not preallocate thousands of entries.
+        try indexes.ensureTotalCapacity(self.alloc, @intCast(@min(count, 16)));
+        const keep = try self.alloc.alloc(bool, constraints.items.len);
+        defer self.alloc.free(keep);
+        @memset(keep, true);
+        // Seed PRIMARY first even if it was declared after a UNIQUE.
+        for (constraints.items, 0..) |constraint, index| if (constraint == .add_unique and constraint.add_unique.primary) {
+            indexes.putAssumeCapacity(constraint.add_unique, index);
+        };
+        for (constraints.items, 0..) |constraint, index| {
+            if (constraint != .add_unique or constraint.add_unique.primary) continue;
+            const slot = try indexes.getOrPut(self.alloc, constraint.add_unique);
+            if (!slot.found_existing) {
+                slot.value_ptr.* = index;
+                continue;
+            }
+            const survivor = &constraints.items[slot.value_ptr.*].add_unique;
+            if (survivor.name_generated and !constraint.add_unique.name_generated) {
+                survivor.name = constraint.add_unique.name;
+                survivor.name_generated = false;
+            }
+            keep[index] = false;
+        }
+        var length: usize = 0;
+        for (constraints.items, keep) |constraint, retained| if (retained) {
+            constraints.items[length] = constraint;
+            length += 1;
+        };
+        constraints.items.len = length;
+    }
+
+    /// These are compiler identities, not final catalog names. Reserve every
+    /// explicit spelling before assigning generated identities, including
+    /// declarations later in the statement. Never rename an explicit name or
+    /// infer provenance from a prefix. A single increasing fallback counter
+    /// bounds aggregate collision probes by the number of reserved labels.
+    fn disambiguateGeneratedConstraintLabels(self: *Parser, constraints: []ast.SchemaChange) Error!void {
+        var has_generated = false;
+        for (constraints) |constraint| if (constraint.generatedConstraintName() != null) {
+            has_generated = true;
+            break;
+        };
+        if (!has_generated) return;
+        var occupied: std.StringHashMapUnmanaged(bool) = .empty;
+        defer occupied.deinit(self.alloc);
+        // False reserves an original generated spelling; true means explicit
+        // or already assigned. At most one fallback is added per constraint.
+        try occupied.ensureTotalCapacity(self.alloc, @intCast(constraints.len * 2));
+        for (constraints) |constraint| {
+            if (constraint.generatedConstraintName() != null) continue;
+            const label = switch (constraint) {
+                .add_unique => |rule| rule.name,
+                .add_check => |rule| rule.name,
+                .add_foreign_key => |rule| rule.name,
+                else => continue,
+            };
+            // Duplicate explicit names remain an admission error; this pass
+            // must not hide them by changing the user's declaration.
+            occupied.putAssumeCapacity(label, true);
+        }
+        // Reserve existing generated spellings too, so a fallback cannot
+        // steal a later generated identity and cause unnecessary renaming.
+        for (constraints) |constraint| if (constraint.generatedConstraintName()) |label| {
+            if (!occupied.contains(label)) occupied.putAssumeCapacity(label, false);
+        };
+        var suffix: usize = 0;
+        for (constraints) |*constraint| {
+            const original = constraint.generatedConstraintName() orelse continue;
+            const assigned = occupied.getPtr(original).?;
+            if (!assigned.*) {
+                assigned.* = true;
+                continue;
+            }
+            var buffer: [48]u8 = undefined;
+            const replacement = while (true) {
+                const label = std.fmt.bufPrint(&buffer, "sql_generated_{d}", .{suffix}) catch unreachable;
+                suffix += 1;
+                if (!occupied.contains(label)) break try self.alloc.dupe(u8, label);
+            };
+            occupied.putAssumeCapacity(replacement, true);
+            switch (constraint.*) {
+                .add_unique => |*rule| rule.name = replacement,
+                .add_check => |*rule| rule.name = replacement,
+                .add_foreign_key => |*rule| rule.name = replacement,
+                else => unreachable,
+            }
+        }
     }
 
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
@@ -1975,6 +2113,11 @@ const Parser = struct {
                 if (self.keyword(.constraint)) {
                     ddl.action = .alter_schema;
                     ddl.schema_change = try self.tableConstraint();
+                    return ddl;
+                }
+                if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
+                    ddl.action = .alter_schema;
+                    ddl.schema_change = generatedConstraint(try self.constraintDefinition("sql_constraint_0"));
                     return ddl;
                 }
                 _ = self.keyword(.column);
@@ -2146,9 +2289,12 @@ const Parser = struct {
             }
             try self.expect(.rparen);
         }
+        const nulls_not_distinct = try self.uniqueNulls();
+        if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.nulls) or self.tokens[self.pos].isKeyword(.include)))
+            return self.fail(error.InvalidSqlSyntax, "duplicate or misplaced index NULLS/INCLUDE clause");
         const partial_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (partial_predicate) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate, .nulls_not_distinct = nulls_not_distinct } } };
     }
 
     fn schemaDefault(self: *Parser) Error!*const ast.Scalar {
@@ -2238,9 +2384,27 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported foreign key action");
     }
 
+    fn generatedConstraint(change: ast.SchemaChange) ast.SchemaChange {
+        var result = change;
+        switch (result) {
+            .add_unique => |*rule| rule.name_generated = true,
+            .add_check => |*rule| rule.name_generated = true,
+            .add_foreign_key => |*rule| rule.name_generated = true,
+            else => unreachable,
+        }
+        return result;
+    }
+
     fn tableConstraint(self: *Parser) Error!ast.SchemaChange {
         const constraint_name = try self.identifier();
         return self.constraintDefinition(constraint_name);
+    }
+
+    fn uniqueNulls(self: *Parser) Error!bool {
+        if (!self.keyword(.nulls)) return false;
+        const not_distinct = self.keyword(.not);
+        try self.expectKeyword(.distinct);
+        return not_distinct;
     }
 
     fn uniqueTiming(self: *Parser, change: ast.SchemaChange) Error!ast.SchemaChange {
@@ -2263,6 +2427,7 @@ const Parser = struct {
             } else break;
         }
         if (std.mem.eql(u8, result.add_unique.timing, "deferred") and !result.add_unique.deferrable) return self.fail(error.InvalidSqlSyntax, "INITIALLY DEFERRED requires DEFERRABLE");
+        if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.nulls)) return self.fail(error.InvalidSqlSyntax, "constraint NULLS clause must follow UNIQUE");
         return result;
     }
 
@@ -2272,7 +2437,10 @@ const Parser = struct {
             try self.expectKeyword(.key);
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } });
         }
-        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns } });
+        if (self.keyword(.unique)) {
+            const nulls_not_distinct = try self.uniqueNulls();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .nulls_not_distinct = nulls_not_distinct } });
+        }
         if (self.peek(.identifier) and self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
         return self.foreignKeyDefinition(constraint_name, columns);
     }
@@ -2282,7 +2450,10 @@ const Parser = struct {
             try self.expectKeyword(.key);
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .primary = true } });
         }
-        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList() } });
+        if (self.keyword(.unique)) {
+            const nulls_not_distinct = try self.uniqueNulls();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .nulls_not_distinct = nulls_not_distinct } });
+        }
         if (self.keyword(.check)) {
             try self.expect(.lparen);
             const expression = try self.scalar(0, 0);
@@ -2595,6 +2766,24 @@ test "compiler deferred uniqueness and constraint timing are explicit" {
     try std.testing.expectEqualStrings("Other", named.statement.set_constraints.names[1]);
 }
 
+test "constraint name provenance distinguishes explicit identifiers from generated placeholders" {
+    const cases = [_]struct { sql: []const u8, generated: []const bool }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE, CHECK (id > 0), FOREIGN KEY (id) REFERENCES parent (id))", .generated = &.{ true, true, true, true } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY, email TEXT CONSTRAINT sql_unique_1 UNIQUE, CONSTRAINT sql_constraint_2 CHECK (id > 0), CONSTRAINT sql_inline_3 FOREIGN KEY (id) REFERENCES parent (id))", .generated = &.{ false, false, false, false } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0) REFERENCES parent (id), email TEXT, UNIQUE (email), PRIMARY KEY (id))", .generated = &.{ true, true, true, true } },
+    };
+    for (cases) |case| {
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const constraints = compiled.statement.create_table.constraints;
+        try std.testing.expectEqual(case.generated.len, constraints.len);
+        for (constraints, case.generated) |constraint, generated| try std.testing.expectEqual(generated, constraint.generatedConstraintName() != null);
+    }
+    var altered = try compile(std.testing.allocator, "ALTER TABLE t ADD CONSTRAINT sql_unique_0 UNIQUE (email)", .{});
+    defer altered.deinit();
+    try std.testing.expect(altered.statement.catalog_ddl.schema_change.?.generatedConstraintName() == null);
+}
+
 test "policy DDL parses draft definitions and never accepts publication commands" {
     var created = try compile(std.testing.allocator, "CREATE POLICY tenant_filter ON public.accounts AS RESTRICTIVE FOR UPDATE TO tenant_admin USING (tenant_id = 7) WITH CHECK (tenant_id = 7)", .{});
     defer created.deinit();
@@ -2625,6 +2814,72 @@ test "policy DDL parses draft definitions and never accepts publication commands
     try std.testing.expectEqual(.disable, disabled.statement.policy_ddl.action);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR INSERT USING (true)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR SELECT WITH CHECK (true)", .{}));
+}
+
+test "compiler UNIQUE null semantics retain PostgreSQL clause ordering" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { sql: []const u8, not_distinct: bool }{
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (email) NULLS NOT DISTINCT", .not_distinct = true },
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (email) NULLS DISTINCT", .not_distinct = false },
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (lower(email)) INCLUDE (id) NULLS NOT DISTINCT WHERE email IS NULL", .not_distinct = true },
+        .{ .sql = "CREATE INDEX email_lookup ON items (email) NULLS NOT DISTINCT", .not_distinct = true },
+    }) |case| {
+        var compiled = try compile(alloc, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.not_distinct, compiled.statement.catalog_ddl.schema_change.?.create_index.nulls_not_distinct);
+    }
+    for ([_]struct { sql: []const u8, not_distinct: bool }{
+        .{ .sql = "CREATE TABLE items (email TEXT UNIQUE NULLS NOT DISTINCT)", .not_distinct = true },
+        .{ .sql = "CREATE TABLE items (email TEXT CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED)", .not_distinct = true },
+        .{ .sql = "CREATE TABLE items (email TEXT, UNIQUE NULLS DISTINCT (email))", .not_distinct = false },
+        .{ .sql = "CREATE TABLE items (email TEXT, CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT (email))", .not_distinct = true },
+    }) |case| {
+        var compiled = try compile(alloc, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.not_distinct, compiled.statement.create_table.constraints[0].add_unique.nulls_not_distinct);
+    }
+    var altered = try compile(alloc, "ALTER TABLE items ADD CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT (email) DEFERRABLE INITIALLY DEFERRED", .{});
+    defer altered.deinit();
+    const constraint = altered.statement.catalog_ddl.schema_change.?.add_unique;
+    try std.testing.expect(constraint.nulls_not_distinct and constraint.deferrable);
+    try std.testing.expectEqualStrings("deferred", constraint.timing);
+    for ([_][]const u8{
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS NOT",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS FIRST",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS DISTINCT NULLS DISTINCT",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS NOT DISTINCT INCLUDE (id)",
+        "CREATE TABLE items (email TEXT PRIMARY KEY NULLS NOT DISTINCT)",
+        "ALTER TABLE items ADD CONSTRAINT bad UNIQUE (email) NULLS NOT DISTINCT",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(alloc, sql, .{}));
+}
+
+test "compiler original uniqueness null clauses retain unchanged source contracts" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer parsed.deinit();
+    var covered: usize = 0;
+    for (parsed.value.object.get("entries").?.array.items) |entry| {
+        const id = entry.object.get("id").?.string;
+        const not_distinct = std.mem.eql(u8, id, "sql-0692");
+        const constraint = std.mem.eql(u8, id, "sql-0731");
+        if (!not_distinct and !constraint and !std.mem.eql(u8, id, "sql-0706")) continue;
+        var compiled = try compile(alloc, entry.object.get("sql").?.string, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        if (constraint) {
+            try std.testing.expect(!ddl.schema_change.?.add_unique.nulls_not_distinct);
+            try std.testing.expect(!ddl.schema_change.?.add_unique.deferrable);
+            try std.testing.expectEqualStrings("immediate", ddl.schema_change.?.add_unique.timing);
+            try std.testing.expectEqualStrings("usage_records", ddl.name.table);
+        } else {
+            try std.testing.expectEqual(not_distinct, ddl.schema_change.?.create_index.nulls_not_distinct);
+            try std.testing.expect(ddl.schema_change.?.create_index.unique);
+            try std.testing.expectEqualStrings("usage_records", ddl.index_table.?.table);
+        }
+        covered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), covered);
+    // Compiler evidence is not mounted activation or original-case credit.
 }
 
 test "compiler index DDL retains namespace ownership and distributed statement contracts" {
@@ -3277,33 +3532,16 @@ test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX recency", .{}));
 }
 
-test "compiler unnamed constraints use table and column names without declaration collisions" {
+test "compiler leaves anonymous constraint identities for native admission" {
     var first = try compile(std.testing.allocator, "CREATE TABLE p1 (id TEXT PRIMARY KEY)", .{});
     defer first.deinit();
-    var second = try compile(std.testing.allocator, "CREATE TABLE p2 (id TEXT PRIMARY KEY)", .{});
-    defer second.deinit();
-    try std.testing.expectEqualStrings("p1_pkey", first.statement.create_table.constraints[0].add_unique.name);
-    try std.testing.expect(first.statement.create_table.constraints[0].add_unique.generated_name);
-    try std.testing.expectEqualStrings("p2_pkey", second.statement.create_table.constraints[0].add_unique.name);
-    var child = try compile(std.testing.allocator, "CREATE TABLE child (id TEXT PRIMARY KEY, p TEXT REFERENCES p1(id), n BIGINT CHECK (n > 0), UNIQUE (n), UNIQUE (n), CONSTRAINT child_n_key CHECK (n < 100))", .{});
-    defer child.deinit();
-    const constraints = child.statement.create_table.constraints;
-    try std.testing.expectEqualStrings("child_pkey", constraints[0].add_unique.name);
-    try std.testing.expectEqualStrings("child_p_fkey", constraints[1].add_foreign_key.name);
-    try std.testing.expectEqualStrings("child_n_check", constraints[2].add_check.name);
-    try std.testing.expectEqualStrings("child_n_key1", constraints[3].add_unique.name);
-    try std.testing.expectEqualStrings("child_n_key2", constraints[4].add_unique.name);
-    try std.testing.expectEqualStrings("child_n_key", constraints[5].add_check.name);
+    try std.testing.expect(first.statement.create_table.constraints[0].generatedConstraintName() != null);
+    try std.testing.expect(!first.statement.create_table.columns[0].nullable);
     var explicit = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT CONSTRAINT exact_name PRIMARY KEY)", .{});
     defer explicit.deinit();
-    try std.testing.expect(!explicit.statement.create_table.constraints[0].add_unique.generated_name);
-}
-
-test "compiler generated constraint names clip long UTF-8 identifiers at codepoint boundaries" {
-    var declaration = try compile(std.testing.allocator, "CREATE TABLE \"éééééééééééééééééééééééééééééé\" (\"éééééééééééééééééééééééééééééé\" TEXT UNIQUE)", .{});
-    defer declaration.deinit();
-    const name = declaration.statement.create_table.constraints[0].add_unique.name;
-    try std.testing.expect(name.len <= 63);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(name));
-    try std.testing.expect(std.mem.endsWith(u8, name, "_key"));
+    try std.testing.expect(explicit.statement.create_table.constraints[0].generatedConstraintName() == null);
+    try std.testing.expectEqualStrings("exact_name", explicit.statement.create_table.constraints[0].add_unique.name);
+    var table_key = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT, PRIMARY KEY(id))", .{});
+    defer table_key.deinit();
+    try std.testing.expect(!table_key.statement.create_table.columns[0].nullable);
 }

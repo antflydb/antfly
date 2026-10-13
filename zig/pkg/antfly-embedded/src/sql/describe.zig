@@ -925,9 +925,15 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// Typed internal boundaries must never coerce an array's JSON placeholder.
 /// Array element descriptors are part of the type, not inferred from values.
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+    if (raw.temporal() != null) {
+        try raw.validateTemporal();
+        if (kind == .datetime and element_type == null and raw.temporal().?.kind() == .timestamp_tz) return raw;
+        // Other temporal types still require exact schema/type activation.
+        return error.UnsupportedSqlShape;
+    }
     if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
     if (raw.numeric) |value| {
-        if (kind != .number or element_type != .numeric or raw.sql_null or raw.value != .null or raw.array != null or raw.patterns != null) return error.SqlTypeMismatch;
+        if (kind != .number or element_type != .numeric or raw.sql_null or raw.value != .null or raw.array != null or raw.patterns() != null) return error.SqlTypeMismatch;
         var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
         try @import("numeric_value.zig").validateCanonical(&context, value.*);
         return raw;
@@ -943,7 +949,7 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
         return @import("scalar.zig").numericTextLeaky(alloc, text, &work);
     }
     if (raw.array) |array| {
-        if (kind != .array or element_type == null or element_type.? != array.element_type or raw.sql_null or raw.value != .null or raw.patterns != null) return error.SqlTypeMismatch;
+        if (kind != .array or element_type == null or element_type.? != array.element_type or raw.sql_null or raw.value != .null or raw.patterns() != null) return error.SqlTypeMismatch;
         return raw;
     }
     if (kind == .array and (!raw.sql_null or element_type == null)) return error.SqlTypeMismatch;

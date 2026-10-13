@@ -374,6 +374,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,
+        error.SqlInvalidPowerArgument,
         error.RelationalExpressionBudgetExceeded,
         error.InvalidRelationalExpressionInput,
         error.InvalidRelationalGeneratedValue,

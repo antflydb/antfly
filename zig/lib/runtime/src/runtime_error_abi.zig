@@ -728,7 +728,62 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    sql_index_already_exists,
+    sql_constraint_already_exists,
+    program_limit_exceeded,
+    catalog_occupancy_not_ready,
+    unsupported_native_index_owner,
+    invalid_private_index_claim_inventory,
+    invalid_private_index_claim_receipt,
+    private_index_owner_job_changed,
+    private_index_publication_canceled,
+    private_index_job_required,
+    private_index_publication_required,
+    invalid_private_index_owner_job,
+    invalid_private_index_inputs,
+    relational_index_catalog_schema_mismatch,
+    invalid_index_publication_candidate,
+    immutable_relational_index_definition_conflict,
+    private_index_cancellation_pending,
+    private_index_cancellation_required,
+    invalid_private_index_cancellation,
+    invalid_private_index_native_receipt,
+    invalid_relational_index_progress,
+    missing_relational_index_definitions,
+    index_owner_receipt_changed,
+    invalid_index_owner_receipt,
+    sql_invalid_power_argument,
 };
+
+test "native index claim failures preserve typed callback boundary identities" {
+    const cases = .{
+        .{ error.UnsupportedNativeIndexOwner, Code.unsupported },
+        .{ error.InvalidPrivateIndexClaimInventory, Code.invalid_argument },
+        .{ error.InvalidPrivateIndexClaimReceipt, Code.corrupt },
+        .{ error.PrivateIndexOwnerJobChanged, Code.conflict },
+        .{ error.PrivateIndexPublicationCanceled, Code.conflict },
+        .{ error.PrivateIndexJobRequired, Code.retryable },
+        .{ error.PrivateIndexPublicationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexOwnerJob, Code.corrupt },
+        .{ error.InvalidPrivateIndexInputs, Code.corrupt },
+        .{ error.RelationalIndexCatalogSchemaMismatch, Code.conflict },
+        .{ error.InvalidIndexPublicationCandidate, Code.invalid_argument },
+        .{ error.ImmutableRelationalIndexDefinitionConflict, Code.conflict },
+        .{ error.PrivateIndexCancellationPending, Code.retryable },
+        .{ error.PrivateIndexCancellationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexCancellation, Code.corrupt },
+        .{ error.InvalidPrivateIndexNativeReceipt, Code.corrupt },
+        .{ error.InvalidRelationalIndexProgress, Code.corrupt },
+        .{ error.MissingRelationalIndexDefinitions, Code.corrupt },
+        .{ error.IndexOwnerReceiptChanged, Code.conflict },
+        .{ error.InvalidIndexOwnerReceipt, Code.invalid_argument },
+    };
+    inline for (cases) |entry| {
+        const result = statusFromError(entry[0]);
+        try std.testing.expectEqual(@backingInt(entry[1]), result.code);
+        try std.testing.expectEqual(entry[0], errorFromStatus(result));
+    }
+}
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
@@ -853,8 +908,13 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlInvalidPowerArgument => status(.invalid_argument, .sql_invalid_power_argument),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
+        error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
+        error.SqlConstraintAlreadyExists => status(.already_exists, .sql_constraint_already_exists),
+        error.ProgramLimitExceeded => status(.invalid_argument, .program_limit_exceeded),
+        error.CatalogOccupancyNotReady => status(.retryable, .catalog_occupancy_not_ready),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -984,6 +1044,26 @@ pub fn statusFromError(err: anyerror) Status {
         error.ForeignKeyParentMissing => status(.conflict, .foreign_key_parent_missing),
         error.ForeignKeyReferenced => status(.conflict, .foreign_key_referenced),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
+        error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
+        error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
+        error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
+        error.PrivateIndexOwnerJobChanged => status(.conflict, .private_index_owner_job_changed),
+        error.PrivateIndexPublicationCanceled => status(.conflict, .private_index_publication_canceled),
+        error.PrivateIndexJobRequired => status(.retryable, .private_index_job_required),
+        error.PrivateIndexPublicationRequired => status(.retryable, .private_index_publication_required),
+        error.InvalidPrivateIndexOwnerJob => status(.corrupt, .invalid_private_index_owner_job),
+        error.InvalidPrivateIndexInputs => status(.corrupt, .invalid_private_index_inputs),
+        error.RelationalIndexCatalogSchemaMismatch => status(.conflict, .relational_index_catalog_schema_mismatch),
+        error.InvalidIndexPublicationCandidate => status(.invalid_argument, .invalid_index_publication_candidate),
+        error.ImmutableRelationalIndexDefinitionConflict => status(.conflict, .immutable_relational_index_definition_conflict),
+        error.PrivateIndexCancellationPending => status(.retryable, .private_index_cancellation_pending),
+        error.PrivateIndexCancellationRequired => status(.retryable, .private_index_cancellation_required),
+        error.InvalidPrivateIndexCancellation => status(.corrupt, .invalid_private_index_cancellation),
+        error.InvalidPrivateIndexNativeReceipt => status(.corrupt, .invalid_private_index_native_receipt),
+        error.InvalidRelationalIndexProgress => status(.corrupt, .invalid_relational_index_progress),
+        error.MissingRelationalIndexDefinitions => status(.corrupt, .missing_relational_index_definitions),
+        error.IndexOwnerReceiptChanged => status(.conflict, .index_owner_receipt_changed),
+        error.InvalidIndexOwnerReceipt => status(.invalid_argument, .invalid_index_owner_receipt),
         error.PreparedGenerationChanged => status(.conflict, .prepared_generation_changed),
         error.PreparedReadSetChanged => status(.conflict, .prepared_read_set_changed),
         error.ForeignKeyActionMismatch => status(.conflict, .foreign_key_action_mismatch),
@@ -1553,8 +1633,13 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_invalid_power_argument => "SqlInvalidPowerArgument",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
+        .sql_index_already_exists => "SqlIndexAlreadyExists",
+        .sql_constraint_already_exists => "SqlConstraintAlreadyExists",
+        .program_limit_exceeded => "ProgramLimitExceeded",
+        .catalog_occupancy_not_ready => "CatalogOccupancyNotReady",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
@@ -1682,6 +1767,26 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .foreign_key_parent_missing => "ForeignKeyParentMissing",
         .foreign_key_referenced => "ForeignKeyReferenced",
         .unique_constraint_violation => "UniqueConstraintViolation",
+        .unsupported_native_index_owner => "UnsupportedNativeIndexOwner",
+        .invalid_private_index_claim_inventory => "InvalidPrivateIndexClaimInventory",
+        .invalid_private_index_claim_receipt => "InvalidPrivateIndexClaimReceipt",
+        .private_index_owner_job_changed => "PrivateIndexOwnerJobChanged",
+        .private_index_publication_canceled => "PrivateIndexPublicationCanceled",
+        .private_index_job_required => "PrivateIndexJobRequired",
+        .private_index_publication_required => "PrivateIndexPublicationRequired",
+        .invalid_private_index_owner_job => "InvalidPrivateIndexOwnerJob",
+        .invalid_private_index_inputs => "InvalidPrivateIndexInputs",
+        .relational_index_catalog_schema_mismatch => "RelationalIndexCatalogSchemaMismatch",
+        .invalid_index_publication_candidate => "InvalidIndexPublicationCandidate",
+        .immutable_relational_index_definition_conflict => "ImmutableRelationalIndexDefinitionConflict",
+        .private_index_cancellation_pending => "PrivateIndexCancellationPending",
+        .private_index_cancellation_required => "PrivateIndexCancellationRequired",
+        .invalid_private_index_cancellation => "InvalidPrivateIndexCancellation",
+        .invalid_private_index_native_receipt => "InvalidPrivateIndexNativeReceipt",
+        .invalid_relational_index_progress => "InvalidRelationalIndexProgress",
+        .missing_relational_index_definitions => "MissingRelationalIndexDefinitions",
+        .index_owner_receipt_changed => "IndexOwnerReceiptChanged",
+        .invalid_index_owner_receipt => "InvalidIndexOwnerReceipt",
         .prepared_generation_changed => "PreparedGenerationChanged",
         .prepared_read_set_changed => "PreparedReadSetChanged",
         .foreign_key_action_mismatch => "ForeignKeyActionMismatch",
@@ -2304,6 +2409,14 @@ test "catalog publication preparation preserves explicit retry identity across a
     var forged = pending;
     forged.code = @backingInt(Code.corrupt);
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+        var mismatched = encoded;
+        mismatched.code = @backingInt(Code.corrupt);
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(mismatched));
+    }
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {

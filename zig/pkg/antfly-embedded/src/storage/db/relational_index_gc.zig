@@ -27,6 +27,10 @@ const Allocator = std.mem.Allocator;
 pub const prefix = "\x00\x00__metadata__:relational_index_retired:";
 const max_cursor = 1024 * 1024;
 pub const max_pending_generations: usize = 2 * catalog.max_index_count;
+// One extra generation may be queued by the sole canceled private owner job.
+// Its exact intent, burned binding and durable admission marker guard retries;
+// ordinary churn cannot consume this cancellation-only headroom.
+pub const max_total_pending_generations: usize = max_pending_generations + 1;
 
 /// Admission is bounded independently of table size. The caller's catalog
 /// transaction owns the queue decision and its insertions atomically. Refuse
@@ -119,6 +123,16 @@ pub const Page = struct {
     }
 
     pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype) !?Page {
+        return prepareSelected(alloc, io, core, null);
+    }
+
+    /// Cancellation must not wait behind the unrelated public retirement queue.
+    /// Selection is a point lookup; scanning retains the same bounded engine.
+    pub fn prepareGeneration(alloc: Allocator, io: ?std.Io, core: anytype, id: records.Id) !?Page {
+        return prepareSelected(alloc, io, core, id);
+    }
+
+    fn prepareSelected(alloc: Allocator, io: ?std.Io, core: anytype, selected: ?records.Id) !?Page {
         if (io) |runtime| try runtime.checkCancel();
         const namespace = core.schemaNamespaceGeneration();
         var pinned = core.relational_indexes.acquire() orelse return null;
@@ -132,9 +146,19 @@ pub const Page = struct {
         const owner = try jobs.ownership(&read);
         var cursor = try read.openCursor();
         defer cursor.close();
-        const pending = (try cursor.seekAtOrAfter(prefix)) orelse return null;
-        if (!std.mem.startsWith(u8, pending.key, prefix)) return null;
-        const id = try records.Id.decode(pending.key[prefix.len..]);
+        const Selection = struct { id: records.Id, value: []const u8 };
+        const pending: Selection = if (selected) |id| blk: {
+            const value = read.get(&key(id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            break :blk .{ .id = id, .value = value };
+        } else blk: {
+            const entry = (try cursor.seekAtOrAfter(prefix)) orelse return null;
+            if (!std.mem.startsWith(u8, entry.key, prefix)) return null;
+            break :blk .{ .id = try records.Id.decode(entry.key[prefix.len..]), .value = entry.value };
+        };
+        const id = pending.id;
         for (pinned.plan.boundIndexes()) |index| if (index.id().mapKey() == id.mapKey())
             return error.ActiveRelationalIndexRetirement;
         const expected = try page_alloc.dupe(u8, pending.value);
@@ -179,29 +203,36 @@ pub const Page = struct {
 
     /// Caller owns apply-exclusive and the snapshot/hot-standby mutation leases.
     pub fn commit(self: *Page, core: anytype) !void {
-        if (self.consumed) return error.RelationalIndexPageConsumed;
-        self.consumed = true;
-        if (core.schemaNamespaceGeneration() != self.namespace or !core.relational_indexes.isCurrent(self.pinned))
-            return error.PreparedGenerationChanged;
         var manager = try core.initTxnManager();
         defer manager.deinit();
         try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.id));
         var txn = try core.store.beginWriteTxn();
         errdefer txn.abort();
-        if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(&txn)))) return error.PreparedGenerationChanged;
+        try self.stage(core, &txn);
+        try txn.commit();
+    }
+
+    /// Compose deletion with the caller's authority checks in one transaction.
+    /// Caller owns apply-exclusive, checks maintenance intent conflicts before
+    /// opening the writer, and aborts the transaction on every staging error.
+    pub fn stage(self: *Page, core: anytype, txn: anytype) !void {
+        if (self.consumed) return error.RelationalIndexPageConsumed;
+        self.consumed = true;
+        if (core.schemaNamespaceGeneration() != self.namespace or !core.relational_indexes.isCurrent(self.pinned))
+            return error.PreparedGenerationChanged;
+        if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(txn)))) return error.PreparedGenerationChanged;
         const record_key = key(self.id);
         const actual = txn.get(&record_key) catch |err| switch (err) {
             error.NotFound => return error.PreparedGenerationChanged,
             else => return err,
         };
         if (!std.mem.eql(u8, self.expected, actual)) return error.PreparedGenerationChanged;
-        for (self.deletes) |item| try remove(&txn, item);
+        for (self.deletes) |item| try remove(txn, item);
         if (self.next) |continuation| try txn.put(&record_key, continuation) else {
-            try remove(&txn, &jobs.progressKey(self.id));
-            try remove(&txn, &maintenance.controlKey(self.id));
+            try remove(txn, &jobs.progressKey(self.id));
+            try remove(txn, &maintenance.controlKey(self.id));
             try txn.delete(&record_key);
         }
-        try txn.commit();
     }
 };
 

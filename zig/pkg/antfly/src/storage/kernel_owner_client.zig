@@ -523,6 +523,116 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeIndexOwnerAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .admit);
+    }
+
+    pub fn nativeIndexOwnerCancellationAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .cancel_admit);
+    }
+
+    fn nativeIndexOwnerAdmissionImpl(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8, operation: abi.NativeIndexOwnerOperation) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(header_json),
+            .manifest = .fromSlice(manifest),
+        }, &response.buffer));
+        return response;
+    }
+
+    /// Private kernel delivery only; metadata permission and the actual leased
+    /// hash-owner placement must be established by the server receiver.
+    pub fn nativeIndexOwnerClaimsJson(self: *Owner, table_name: []const u8, command_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .claims,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .inspect,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCancellationStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_inspect,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerReceiptJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .receipt,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCleanupJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_cleanup,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_gc_page);
+    }
+
+    pub fn nativeIndexOwnerClaimGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_claim_gc_page);
+    }
+
+    fn nativeIndexOwnerDerivedGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8, comptime operation: abi.NativeIndexOwnerOperation) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerCancellationJson(self: *Owner, table_name: []const u8, intent_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_intent,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(intent_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerControlJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, command_json: []const u8) !Response {
+        if (operation != .fence and operation != .reserve and operation != .cancel_fence and operation != .cancel_reserve) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_fk_generation_control_json(self.handle, &.{

@@ -31,6 +31,356 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "native index owner adapter inspects cold native ownership and rejects foreign namespaces" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_incarnation = "61616161616161616161616161616161".*, .metrics = .{} },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 101,
+                    .name = "items",
+                    .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}",
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7501, .table_id = 101, .range_id = 7501, .start_key = "", .end_key = null }}),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    var catalog = Catalog{};
+    const identity: local.storage_db_relational_index_owner_control.Identity = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .namespace = .{ .table_id = 101, .shard_id = 7501, .range_id = 7501 },
+        .owner_group_id = 7501,
+    };
+    // Repeat from a fully closed source: neither the decoded status nor the
+    // native mode proof may depend on a retained process-local job or lease.
+    for (0..2) |_| {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        defer owners.deinit();
+        var state = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
+        defer state.deinit();
+        try std.testing.expect(state.value == null);
+        var receipt = try owners.nativeIndexOwnerReceipt(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
+        defer receipt.deinit();
+        try std.testing.expect(receipt.value == null);
+        var rooted = try owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
+        defer rooted.deinit();
+        try std.testing.expect(rooted.outcome.value == null);
+        try std.testing.expectEqual(table_reads.backend_current_root_generation, rooted.root_generation);
+        var foreign = identity;
+        foreign.namespace.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerState(alloc, 7501, "items", foreign, .{}));
+        try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = foreign, .effect = .fenced }, .{}));
+        var after_rejection = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
+        defer after_rejection.deinit();
+        try std.testing.expect(after_rejection.value == null);
+    }
+}
+
+test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const execution = @import("../api/relational_index_owner_execution.zig");
+    const progress = local.storage_db_relational_index_publication_progress;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var plan = try publication.testing.plan(scratch);
+    @constCast(plan.owners)[0].receipt_authority = .native;
+    const Catalog = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+        ranges: [1]metadata_table_manager.RangeRecord,
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 13, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                .tables = &self.tables,
+                .ranges = &self.ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    const Metadata = struct {
+        value: publication.OwnerDecision,
+        admission_reads: usize = 0,
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(context.index_publication_authority);
+            var value = self.value;
+            if (call.relational_index_owner_decision.projection == .permission)
+                value.inputs = null
+            else
+                self.admission_reads += 1;
+            return std.json.Stringify.valueAlloc(a, value, .{});
+        }
+    };
+    var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range} };
+    const group = plan.owners[0].range.group_id;
+    const RootGeneration = struct {
+        fn read(ptr: *anyopaque, _: u64) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    // Choose a non-default descriptor generation, then recover the actual
+    // persisted cut from that root after all process-local owners are closed.
+    var root_generation: u64 = 7;
+    const request: execution.Request = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .operation = .fence };
+    var prepared: ?publication.Prepared = null;
+    defer if (prepared) |*value| value.deinit();
+    var metadata: Metadata = undefined;
+    var reserved_receipt: progress.Receipt = undefined;
+    {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
+        defer owners.deinit();
+        // Read the actual newly provisioned owner's epoch and catalog instead
+        // of guessing them from the metadata fixture's synthetic defaults.
+        var catalog_response = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_integrity_catalog = true }, .stale)).?;
+        defer catalog_response.deinit(alloc);
+        const observed = try std.json.parseFromSliceLeaky(struct { catalog: []const u8, schema_version: u32, table_id: []const u8 }, scratch, catalog_response.json, .{ .allocate = .alloc_always });
+        try std.testing.expectEqual(@as(u32, 1), observed.schema_version);
+        var identity_response = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .stale)).?;
+        defer identity_response.deinit(alloc);
+        const identity = try std.json.parseFromSliceLeaky(local.storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{});
+        const predecessor = try scratch.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(observed.catalog));
+        try std.base64.standard.Decoder.decode(predecessor, observed.catalog);
+        var predecessor_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(predecessor, &predecessor_digest, .{});
+        try std.testing.expectEqual(identity.catalog_digest, predecessor_digest);
+        @constCast(plan.owners)[0].admission_epoch = identity.next_epoch;
+        @constCast(plan.owners)[0].catalog_digest = identity.catalog_digest;
+        plan.catalog_before_b64 = observed.catalog;
+        prepared = try plan.prepare(alloc);
+        metadata = .{ .value = .{
+            .metadata_group_id = 13,
+            .metadata_incarnation = @splat('1'),
+            .head = prepared.?.head,
+            .owner = prepared.?.owners[0],
+            .disposition = .execute,
+            .dispatch = try std.json.parseFromSliceLeaky(publication.Dispatch, scratch, prepared.?.dispatch[0], .{ .allocate = .alloc_always }),
+            .inputs = try std.json.parseFromSliceLeaky(publication.Inputs, scratch, prepared.?.inputs, .{ .allocate = .alloc_always }),
+        } };
+        var admitted = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer admitted.deinit();
+        try std.testing.expect(admitted == .applied);
+        try std.testing.expect(admitted.rootGeneration() == null);
+        try std.testing.expect(admitted.outcome().?.receipt == null);
+        try std.testing.expect(!admitted.outcome().?.replication_pending);
+        var fenced = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer fenced.deinit();
+        try std.testing.expect(fenced == .controlled);
+        try std.testing.expectEqual(root_generation, fenced.rootGeneration().?);
+        const fence_receipt = fenced.outcome().?.receipt.?;
+        try std.testing.expectEqual(.fenced, fence_receipt.action);
+        try std.testing.expect(fence_receipt.position == .native);
+        var recovered_fence = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer recovered_fence.deinit();
+        try std.testing.expect(recovered_fence == .recovered);
+        try std.testing.expectEqual(root_generation, recovered_fence.recovered.root_generation);
+        try std.testing.expectEqual(try fence_receipt.digest(), try recovered_fence.outcome().?.receipt.?.digest());
+        // This metadata driver simulates permission progression only. Root
+        // signature/enrollment verification is not bypassed in production.
+        const next = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, fence_receipt);
+        metadata.value.head = next.head;
+        metadata.value.owner = next.owner;
+        var reserve_request = request;
+        reserve_request.operation = .reserve;
+        var reserved = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
+        defer reserved.deinit();
+        try std.testing.expect(reserved == .controlled);
+        try std.testing.expectEqual(root_generation, reserved.rootGeneration().?);
+        reserved_receipt = reserved.outcome().?.receipt.?;
+        try std.testing.expectEqual(.reserved, reserved_receipt.action);
+        try std.testing.expect(reserved_receipt.position.native.sequence > fence_receipt.position.native.sequence);
+        var public_schema = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_topology_json = "{\"mode\":\"public_schema\"}" }, .stale)).?;
+        defer public_schema.deinit(alloc);
+        const schema_json = try std.json.parseFromSliceLeaky([]const u8, scratch, public_schema.json, .{ .allocate = .alloc_always });
+        const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, schema_json, .{});
+        try std.testing.expectEqual(@as(i64, 1), schema_value.object.get("version").?.integer);
+    }
+    {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
+        defer owners.deinit();
+        var reserve_request = request;
+        reserve_request.operation = .reserve;
+        var recovered = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
+        defer recovered.deinit();
+        try std.testing.expect(recovered == .recovered);
+        try std.testing.expectEqual(root_generation, recovered.recovered.root_generation);
+        try std.testing.expect(recovered.outcome().?.duplicate);
+        try std.testing.expectEqual(try reserved_receipt.digest(), try recovered.outcome().?.receipt.?.digest());
+        try std.testing.expectEqual(reserved_receipt.position.native.sequence, recovered.outcome().?.position.sequence);
+        var observed = (try owners.writeSource().localRuntimeStatusGroupLocal(alloc, group, plan.before.name)) orelse return error.MissingOwnerObservation;
+        defer observed.deinit(alloc);
+        const authority = observed.metadata.source_authority orelse return error.MissingOwnerObservation;
+        try std.testing.expectEqual(.native, authority.kind);
+        try std.testing.expectEqualSlices(u8, &local.storage_db_online_source_contract.namespaceBytes(reserved_receipt.owner.namespace), &authority.namespace);
+        try std.testing.expect(authority.sequence >= reserved_receipt.position.native.sequence);
+        try std.testing.expectEqual(root_generation, observed.metadata.lsm_root_generation);
+        try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+        // Exercise cancellation through the actual leased compiled owner, not
+        // a synthetic source callback. Metadata/RPC authentication is a
+        // separate gate; these operations prove the private storage boundary.
+        const native = local.storage_db_relational_index_owner_control;
+        var canceled_binding = recovered.outcome().?.binding;
+        var claim_binding = canceled_binding;
+        claim_binding.phase = .reserved;
+        const claim_command: native.ClaimCommand = .{
+            .binding = claim_binding,
+            .claims = &.{.{ .tuple = "leased\x00\xff\x80-claim", .parent_table = plan.before.name, .parent_key = "leased-owner", .schema_version = claim_binding.physical_candidate.schema_version }},
+        };
+        var rooted_claim = try owners.applyNativeIndexOwnerClaimsAtRoot(alloc, group, plan.before.name, claim_command, .{});
+        defer rooted_claim.deinit();
+        try std.testing.expectEqual(root_generation, rooted_claim.root_generation);
+        const claimed = rooted_claim.outcome.value;
+        try std.testing.expect(!claimed.duplicate and claimed.claims_added == 1);
+        try std.testing.expectEqual(reserved_receipt.position.native.sequence + 1, claimed.position.sequence);
+        var duplicate_claim = try owners.applyNativeIndexOwnerClaims(alloc, group, plan.before.name, claim_command, .{});
+        defer duplicate_claim.deinit();
+        try std.testing.expect(duplicate_claim.value.duplicate);
+        try std.testing.expectEqual(claimed.position, duplicate_claim.value.position);
+        var rooted_duplicate = try owners.applyNativeIndexOwnerClaimsAtRoot(alloc, group, plan.before.name, claim_command, .{});
+        defer rooted_duplicate.deinit();
+        try std.testing.expectEqual(rooted_claim.root_generation, rooted_duplicate.root_generation);
+        try std.testing.expect(rooted_duplicate.outcome.value.duplicate);
+        try std.testing.expectEqual(claimed.position, rooted_duplicate.outcome.value.position);
+        // Advance the independently read metadata permission to build, then
+        // exercise the receiver against this actual compiled reserved owner.
+        const build_permission = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, reserved_receipt);
+        metadata.value.head = build_permission.head;
+        metadata.value.owner = build_permission.owner;
+        const delivery: execution.ClaimRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .claims = claim_command.claims };
+        var received = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, delivery, .{});
+        defer received.deinit();
+        try std.testing.expect(received == .applied);
+        try std.testing.expectEqual(rooted_claim.root_generation, received.applied.root_generation);
+        try std.testing.expect(received.applied.outcome.value.duplicate);
+        try std.testing.expectEqual(claimed.position, received.applied.outcome.value.position);
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owners.applyNativeIndexOwnerClaims(alloc, group + 1, plan.before.name, claim_command, .{}));
+        // Control commands carry the admitted preimage, even when inspection
+        // recovered the durable reserved postimage. Never relax that guard.
+        canceled_binding.phase = .fencing;
+        const intent = native.Admission.fromBinding(canceled_binding);
+        metadata.value.head = try metadata.value.head.cancel(metadata.value.head.revision, .requested);
+        const cancel_request: execution.CancellationRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group };
+        var cancel_result = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+        defer cancel_result.deinit();
+        try std.testing.expect(cancel_result == .intent);
+        const canceled = cancel_result.intent.value;
+        try std.testing.expect(canceled.position.sequence > reserved_receipt.position.native.sequence);
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, owners.applyNativeIndexOwnerClaims(alloc, group, plan.before.name, claim_command, .{}));
+        var manifest = try metadata.value.inputs.?.prepareNativeManifest(alloc, metadata.value.head);
+        defer manifest.deinit();
+        var canceled_admission = try owners.admitCanceledNativeIndexOwner(alloc, group, plan.before.name, intent, manifest.bytes, .{});
+        defer canceled_admission.deinit();
+        try std.testing.expect(canceled_admission.value.duplicate);
+        inline for (.{ .fenced, .reserved }) |effect| {
+            var canceled_control = try owners.applyCanceledNativeIndexOwnerControl(alloc, group, plan.before.name, .{ .effect = effect, .binding = canceled_binding }, .{});
+            defer canceled_control.deinit();
+            try std.testing.expect(canceled_control.value.duplicate);
+            if (effect == .reserved) try std.testing.expectEqual(reserved_receipt.position.native.sequence, canceled_control.value.position.sequence);
+        }
+        var cleanup_result = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+        defer cleanup_result.deinit();
+        try std.testing.expect(cleanup_result == .cleanup);
+        const cleanup = cleanup_result.cleanup.value;
+        try std.testing.expect(cleanup.position.sequence > canceled.position.sequence);
+        const owner_identity: native.Identity = .{
+            .id = intent.id,
+            .plan_digest = intent.plan_digest,
+            .owner_digest = intent.owner_digest,
+            .ordinal = intent.ordinal,
+            .namespace = intent.fence.namespace,
+            .owner_group_id = group,
+        };
+        // GC is time-sliced and may also be advanced by background maintenance.
+        // Assert bounded convergence and idempotence, not a fixed page count.
+        var retired = false;
+        for (0..16) |_| {
+            var gc = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+            defer gc.deinit();
+            if (gc == .retired) {
+                retired = true;
+                break;
+            }
+            try std.testing.expect(gc == .gc or gc == .claim_gc);
+            if (gc == .gc) try std.testing.expect(gc.gc.value.advanced or gc.gc.value.artifacts_retired);
+            if (gc == .claim_gc) try std.testing.expect(gc.claim_gc.value.advanced or gc.claim_gc.value.claims_retired);
+        }
+        try std.testing.expect(retired);
+        var claims = try owners.collectNativeIndexOwnerClaimGarbage(alloc, group, plan.before.name, owner_identity, .{});
+        defer claims.deinit();
+        try std.testing.expect(!claims.value.advanced and claims.value.claims_retired);
+        var repeated = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+        defer repeated.deinit();
+        try std.testing.expect(repeated == .retired);
+        var status = try owners.nativeIndexOwnerCancellationState(alloc, group, plan.before.name, owner_identity, .{});
+        defer status.deinit();
+        try std.testing.expectEqual(canceled.position, status.value.intent.?.position);
+        try std.testing.expectEqual(cleanup.position, status.value.cleanup.?);
+        try std.testing.expectEqual(cleanup.position.sequence, status.value.source.sequence);
+        try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+        try std.testing.expect(status.value.claims_retired);
+        try std.testing.expect(status.value.claim_allocation != null);
+        try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+        // A subsequent routing/root switch must not relabel the already
+        // recovered receipt as belonging to the replacement physical root.
+        root_generation += 1;
+        try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
+    }
+}
+
 test "cold warmup reopens transient owners without disturbing resident siblings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -18,11 +18,12 @@
 //! does it commit independently of the caller's metadata write transaction.
 const std = @import("std");
 const A = std.mem.Allocator;
+pub const constraint_naming = @import("constraint_names.zig");
 pub const max_claims = 8192;
 pub const max_name_bytes = 256;
 const key_prefix = "\x00\x00__metadata_derived__:sql_relation_names:v1:";
 
-pub const Kind = enum(u8) { table = 1, index = 2, constraint_index = 3 };
+pub const Kind = enum(u8) { table = 1, index = 2, constraint_index = 3, constraint_name = 4 };
 pub const Phase = enum(u8) { reserved = 1, active = 2, retiring = 3 };
 pub const Owner = struct {
     table_id: u64,
@@ -195,6 +196,25 @@ pub const Entry = struct {
 pub const Key = struct {
     namespace_id: u64,
     name: []const u8,
+    /// Zero denotes an exclusive table/index relation. A nonzero qualifier
+    /// denotes a nonexclusive constraint-name membership for this table.
+    /// These extended keys require occupancy-capable publication authority;
+    /// accepting the codec is not proof that an existing root covers them.
+    membership_table_id: u64 = 0,
+    pub fn dupe(self: Key, a: A) !Key {
+        var result = self;
+        result.name = try a.dupe(u8, self.name);
+        return result;
+    }
+    pub fn validateEntry(self: Key, value: Entry) !void {
+        try self.validate();
+        try value.validate();
+        for ([_]?Owner{ value.active, value.pending }) |optional| if (optional) |owner| {
+            if (self.membership_table_id == 0) {
+                if (owner.kind == .constraint_name) return error.InvalidCatalogRecord;
+            } else if (owner.kind != .constraint_name or owner.table_id != self.membership_table_id) return error.InvalidCatalogRecord;
+        };
+    }
     pub fn validate(self: Key) !void {
         if (self.namespace_id == 0 or self.name.len == 0 or self.name.len > max_name_bytes or
             std.mem.indexOfScalar(u8, self.name, 0) != null or !std.unicode.utf8ValidateSlice(self.name)) return error.InvalidCatalogName;
@@ -222,12 +242,14 @@ pub const Key = struct {
         try self.validate();
         if (group_id == 0) return error.InvalidCatalogRecord;
         const prefix = key_prefix;
-        const bytes = try a.alloc(u8, prefix.len + 18 + self.name.len);
+        const name_end = prefix.len + 18 + self.name.len;
+        const bytes = try a.alloc(u8, name_end + @as(usize, if (self.membership_table_id == 0) 0 else 8));
         @memcpy(bytes[0..prefix.len], prefix);
         std.mem.writeInt(u64, bytes[prefix.len..][0..8], group_id, .big);
         std.mem.writeInt(u64, bytes[prefix.len + 8 ..][0..8], self.namespace_id, .big);
         std.mem.writeInt(u16, bytes[prefix.len + 16 ..][0..2], @intCast(self.name.len), .big);
-        @memcpy(bytes[prefix.len + 18 ..], self.name);
+        @memcpy(bytes[prefix.len + 18 .. name_end], self.name);
+        if (self.membership_table_id != 0) std.mem.writeInt(u64, bytes[name_end..][0..8], self.membership_table_id, .big);
         return bytes;
     }
     /// Borrow the logical name from an authenticated effect key. A relation
@@ -238,8 +260,11 @@ pub const Key = struct {
         const tail = bytes[key_prefix.len..];
         if (tail.len < 18 or group_id == 0 or std.mem.readInt(u64, tail[0..8], .big) != group_id) return error.InvalidCatalogRecord;
         const length = std.mem.readInt(u16, tail[16..18], .big);
-        if (tail.len != 18 + @as(usize, length)) return error.InvalidCatalogRecord;
-        const key: Key = .{ .namespace_id = std.mem.readInt(u64, tail[8..16], .big), .name = tail[18..] };
+        const name_end = 18 + @as(usize, length);
+        if (tail.len != name_end and tail.len != name_end + 8) return error.InvalidCatalogRecord;
+        const table_id = if (tail.len == name_end) 0 else std.mem.readInt(u64, tail[name_end..][0..8], .big);
+        if (tail.len != name_end and table_id == 0) return error.InvalidCatalogRecord;
+        const key: Key = .{ .namespace_id = std.mem.readInt(u64, tail[8..16], .big), .name = tail[18..name_end], .membership_table_id = table_id };
         try key.validate();
         return key;
     }
@@ -255,12 +280,12 @@ pub const Claim = struct {
             if (self.pending != null) return error.InvalidCatalogRecord;
             break :blk .{ .pending = self.owner };
         } else .{ .active = self.owner, .pending = self.pending };
-        try value.validate();
+        try self.key.validateEntry(value);
         if (self.reservation and value.pending == null) return error.InvalidCatalogRecord;
         return value;
     }
     pub fn fromEntry(key: Key, value: Entry) !@This() {
-        try value.validate();
+        try key.validateEntry(value);
         if (value.active) |owner| return .{ .key = key, .owner = owner, .pending = value.pending };
         return .{ .key = key, .owner = value.pending orelse return error.InvalidCatalogRecord };
     }
@@ -272,6 +297,67 @@ pub const Claim = struct {
 pub const TableCut = struct {
     arena: std.heap.ArenaAllocator,
     claims: []const Claim,
+    /// Nonexclusive schema memberships, NOT relation claims. Generated names
+    /// avoid CHECK/FK names too, but equal constraint names on different
+    /// tables must neither collide nor shadow a table/index lookup.
+    constraint_memberships: []const ConstraintMembership = &.{},
+    membership_projection: bool = false,
+    membership_claims: ?[]const Claim = null,
+
+    pub const ConstraintMembership = struct {
+        key: Key,
+        table_id: u64,
+        schema_version: u32,
+        schema_digest: [32]u8,
+        phase: Phase,
+        publication_id: [16]u8,
+        pub fn claim(self: @This()) !Claim {
+            var key = self.key;
+            if (self.table_id == 0 or key.membership_table_id != 0) return error.InvalidCatalogRecord;
+            key.membership_table_id = self.table_id;
+            const result: Claim = .{ .key = key, .owner = .{ .table_id = self.table_id, .schema_version = self.schema_version, .schema_digest = self.schema_digest, .phase = self.phase, .publication_id = self.publication_id, .kind = .constraint_name } };
+            _ = try result.entry();
+            return result;
+        }
+    };
+
+    /// Prepare the combined typed cut once. Its names borrow this cut's owned
+    /// arena, and the temporary lookup map is released before returning.
+    /// This is source preparation, not proof of durable occupancy activation.
+    pub fn claimsIncludingConstraints(self: *TableCut) ![]const Claim {
+        if (!self.membership_projection) return error.CatalogOccupancyNotReady;
+        if (self.membership_claims) |cached| return cached;
+        if (self.constraint_memberships.len == 0) {
+            self.membership_claims = self.claims;
+            return self.claims;
+        }
+        const a = self.arena.allocator();
+        var result: std.ArrayList(Claim) = .empty;
+        try result.ensureTotalCapacity(a, @min(max_claims, self.claims.len + self.constraint_memberships.len));
+        try result.appendSlice(a, self.claims);
+        var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
+        defer scratch.deinit();
+        var positions: std.HashMapUnmanaged(Key, usize, Context, 80) = .empty;
+        try positions.ensureTotalCapacity(scratch.allocator(), @intCast(@min(max_claims, self.constraint_memberships.len)));
+        for (self.constraint_memberships) |membership| {
+            const next = try membership.claim();
+            const found = positions.getOrPutAssumeCapacity(next.key);
+            if (found.found_existing) {
+                // A same-table successor retains the predecessor's active
+                // slot and adds an independently fenced pending slot.
+                const existing = &result.items[found.value_ptr.*];
+                if (existing.owner.phase != .active or existing.pending != null or next.owner.phase != .reserved) return error.InvalidCatalogRecord;
+                existing.pending = next.owner;
+                _ = try existing.entry();
+            } else {
+                if (result.items.len == max_claims) return error.CatalogCommandTooLarge;
+                found.value_ptr.* = result.items.len;
+                try result.append(a, next);
+            }
+        }
+        self.membership_claims = try result.toOwnedSlice(a);
+        return self.membership_claims.?;
+    }
 
     pub const Definition = struct {
         namespace_id: u64,
@@ -287,11 +373,17 @@ pub const TableCut = struct {
     /// Old-only names remain active until cutover; shared names retain both
     /// owners, and new-only names carry a reservation without an active owner.
     pub fn initSuccessor(a: A, predecessor: ?Definition, successor: Definition) !TableCut {
+        return initSuccessorMode(a, predecessor, successor, false);
+    }
+    pub fn initSuccessorWithConstraintMemberships(a: A, predecessor: ?Definition, successor: Definition) !TableCut {
+        return initSuccessorMode(a, predecessor, successor, true);
+    }
+    fn initSuccessorMode(a: A, predecessor: ?Definition, successor: Definition, comptime with_memberships: bool) !TableCut {
         if (successor.phase != .reserved) return error.InvalidCatalogRecord;
         if (predecessor) |before| if (before.phase != .active) return error.InvalidCatalogRecord;
-        var pending = try init(a, successor);
+        var pending = try initMode(a, successor, with_memberships);
         defer pending.deinit();
-        var output: TableCut = if (predecessor) |before| try init(a, before) else .{ .arena = std.heap.ArenaAllocator.init(a), .claims = &.{} };
+        var output: TableCut = if (predecessor) |before| try initMode(a, before, with_memberships) else .{ .arena = std.heap.ArenaAllocator.init(a), .claims = &.{}, .membership_projection = with_memberships };
         errdefer output.deinit();
         const owned = output.arena.allocator();
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -307,11 +399,21 @@ pub const TableCut = struct {
                 result.items[index].pending = claim.owner;
             } else {
                 if (result.items.len == max_claims) return error.CatalogCommandTooLarge;
-                const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) };
+                const key = try claim.key.dupe(owned);
                 try result.append(owned, .{ .key = key, .owner = claim.owner });
             }
         }
         output.claims = try result.toOwnedSlice(owned);
+        // Active and reserved memberships have separate lifetime/fencing.
+        // Retain both even for a shared name: cutover must not retire the
+        // successor when it removes the predecessor's occupancy.
+        var memberships = std.ArrayList(ConstraintMembership).fromOwnedSlice(@constCast(output.constraint_memberships));
+        for (pending.constraint_memberships) |membership| {
+            var copy = membership;
+            copy.key.name = try owned.dupe(u8, membership.key.name);
+            try memberships.append(owned, copy);
+        }
+        output.constraint_memberships = try memberships.toOwnedSlice(owned);
         return output;
     }
     // A names-only projection skips column definitions, expressions, display
@@ -321,17 +423,34 @@ pub const TableCut = struct {
         relational_indexes: ?[]const struct { name: []const u8 } = null,
         unique_constraints: ?[]const struct { name: []const u8, origin: ?[]const u8 = null } = null,
     };
+    const MembershipSchemaNames = struct {
+        version: u32 = 0,
+        relational_indexes: @FieldType(SchemaNames, "relational_indexes") = null,
+        unique_constraints: @FieldType(SchemaNames, "unique_constraints") = null,
+        checks: ?[]const struct { name: []const u8 } = null,
+        foreign_keys: ?[]const struct { name: []const u8 } = null,
+    };
     pub fn init(a: A, definition: Definition) !TableCut {
+        return initMode(a, definition, false);
+    }
+    /// The caller must publish these memberships with the relation cut, using
+    /// the same generation and source epoch. Until that producer is wired,
+    /// ordinary relation-only readers pay no parsing/allocation overhead.
+    pub fn initWithConstraintMemberships(a: A, definition: Definition) !TableCut {
+        return initMode(a, definition, true);
+    }
+    fn initMode(a: A, definition: Definition, comptime with_memberships: bool) !TableCut {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
         // Temporary parsing storage is reclaimed before returning the cut.
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        const schema: SchemaNames = if (definition.schema_json.len == 0)
+        const Names = if (with_memberships) MembershipSchemaNames else SchemaNames;
+        const schema: Names = if (definition.schema_json.len == 0)
             .{}
         else
-            std.json.parseFromSliceLeaky(SchemaNames, scratch.allocator(), definition.schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            std.json.parseFromSliceLeaky(Names, scratch.allocator(), definition.schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidCatalogRecord,
             };
@@ -373,7 +492,29 @@ pub const TableCut = struct {
                 try append(owned, &claims, definition.namespace_id, name, owner);
             }
         }
-        return .{ .arena = arena, .claims = try claims.toOwnedSlice(owned) };
+        var memberships: std.ArrayList(ConstraintMembership) = .empty;
+        if (with_memberships) {
+            const checks = schema.checks orelse &.{};
+            const foreign_keys = schema.foreign_keys orelse &.{};
+            if (checks.len > max_claims or foreign_keys.len > max_claims or
+                uniques.len + checks.len + foreign_keys.len > max_claims) return error.CatalogCommandTooLarge;
+            var constraint_names: std.StringHashMapUnmanaged(void) = .empty;
+            for (uniques) |unique| {
+                if (unique.origin) |origin| if (std.mem.eql(u8, origin, "index")) continue;
+                try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, unique.name);
+            }
+            for (checks) |check| try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, check.name);
+            for (foreign_keys) |foreign| try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, foreign.name);
+        }
+        return .{ .arena = arena, .claims = try claims.toOwnedSlice(owned), .constraint_memberships = try memberships.toOwnedSlice(owned), .membership_projection = with_memberships };
+    }
+    fn appendMembership(a: A, scratch: A, memberships: *std.ArrayList(ConstraintMembership), names: *std.StringHashMapUnmanaged(void), definition: Definition, version: u32, digest: [32]u8, name: []const u8) !void {
+        const key: Key = .{ .namespace_id = definition.namespace_id, .name = name };
+        try key.validate();
+        // Occupancy is a set, independent of the declaration's constraint
+        // category. Schema validation owns duplicate-declaration diagnostics.
+        if ((try names.getOrPut(scratch, name)).found_existing) return;
+        try memberships.append(a, .{ .key = .{ .namespace_id = key.namespace_id, .name = try a.dupe(u8, name) }, .table_id = definition.table_id, .schema_version = version, .schema_digest = digest, .phase = definition.phase, .publication_id = definition.publication_id });
     }
     pub fn deinit(self: *TableCut) void {
         self.arena.deinit();
@@ -391,10 +532,15 @@ const Context = struct {
     pub fn hash(_: Context, key: Key) u64 {
         var h = std.hash.Wyhash.init(key.namespace_id);
         h.update(key.name);
+        if (key.membership_table_id != 0) {
+            var suffix: [8]u8 = undefined;
+            std.mem.writeInt(u64, &suffix, key.membership_table_id, .big);
+            h.update(&suffix);
+        }
         return h.final();
     }
     pub fn eql(_: Context, left: Key, right: Key) bool {
-        return left.namespace_id == right.namespace_id and std.mem.eql(u8, left.name, right.name);
+        return left.namespace_id == right.namespace_id and left.membership_table_id == right.membership_table_id and std.mem.eql(u8, left.name, right.name);
     }
 };
 const Map = EntryMap;
@@ -420,9 +566,9 @@ pub const EntryPlan = struct {
         const copy = try owned.alloc(Change, changes.len);
         for (changes, copy) |change, *next| {
             try change.key.validate();
-            try change.before.validate();
-            try change.after.validate();
-            const key: Key = .{ .namespace_id = change.key.namespace_id, .name = try owned.dupe(u8, change.key.name) };
+            try change.key.validateEntry(change.before);
+            try change.key.validateEntry(change.after);
+            const key = try change.key.dupe(owned);
             if (seen.getOrPutAssumeCapacity(key).found_existing) return error.InvalidCatalogRecord;
             next.* = .{ .key = key, .before = change.before, .after = change.after };
         }
@@ -469,7 +615,7 @@ pub const EntryPlan = struct {
     }
     fn observed(reader: anytype, key: Key) !Entry {
         const current = (try reader.getEntry(key)) orelse return .{};
-        try current.validate();
+        try key.validateEntry(current);
         if (current.empty()) return error.InvalidCatalogRecord;
         return current;
     }
@@ -533,10 +679,12 @@ pub fn EntryStore(comptime Txn: type, comptime Keyspace: type) type {
                 if (err == error.NotFound) return null;
                 return err;
             };
-            return try Entry.decode(bytes);
+            const value = try Entry.decode(bytes);
+            try key.validateEntry(value);
+            return value;
         }
         pub fn putEntry(self: *@This(), key: Key, entry: Entry) !void {
-            try key.validate();
+            try key.validateEntry(entry);
             const encoded = try entry.encode();
             const encoded_key = try self.keys.keyAlloc(self.alloc, key);
             defer self.alloc.free(encoded_key);
@@ -562,18 +710,23 @@ pub fn Store(comptime Txn: type) type {
             return if (try self.getEntry(key)) |entry| entry.active else null;
         }
         pub fn getEntry(self: *@This(), key: Key) !?Entry {
+            if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
             const value = self.txn.get(bytes) catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
-            return try Entry.decode(value);
+            const entry = try Entry.decode(value);
+            try key.validateEntry(entry);
+            return entry;
         }
         pub fn putClaim(self: *@This(), key: Key, owner: Owner) !void {
             try self.putEntry(key, try (Claim{ .key = key, .owner = owner }).entry());
         }
         pub fn putEntry(self: *@This(), key: Key, entry: Entry) !void {
+            if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
+            try key.validateEntry(entry);
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
             const value = try entry.encode();
@@ -583,6 +736,7 @@ pub fn Store(comptime Txn: type) type {
             try self.deleteEntry(key);
         }
         pub fn deleteEntry(self: *@This(), key: Key) !void {
+            if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
             try self.txn.delete(bytes);
@@ -625,7 +779,7 @@ pub const Plan = struct {
                 if (claim.reservation) return error.InvalidCatalogRecord;
                 try claim.key.validate();
                 const entry = try claim.entry();
-                const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };
+                const key = try claim.key.dupe(a);
                 list.appendAssumeCapacity(try Claim.fromEntry(key, entry));
             }
         }
@@ -672,7 +826,7 @@ pub const Plan = struct {
             if (claim.reservation) return error.InvalidCatalogRecord;
             try claim.key.validate();
             const entry = try claim.entry();
-            const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };
+            const key = try claim.key.dupe(a);
             const found = map.getOrPutAssumeCapacity(key);
             if (found.found_existing) return if (proposed) error.CatalogAlreadyExists else error.InvalidCatalogRecord;
             found.value_ptr.* = entry;
@@ -967,6 +1121,217 @@ test "catalog relation effect keys decode canonically and reject cross-group rec
 }
 fn testClaim(namespace: u64, name: []const u8, table: u64, version: u32, kind: Kind) Claim {
     return .{ .key = .{ .namespace_id = namespace, .name = name }, .owner = .{ .table_id = table, .schema_version = version, .schema_digest = @splat(@intCast(version)), .kind = kind } };
+}
+
+test "catalog typed membership keys preserve canonical relation prefixes and owner identity" {
+    const a = std.testing.allocator;
+    const relation: Key = .{ .namespace_id = 2, .name = "quoted.constraint:名" };
+    var membership = relation;
+    membership.membership_table_id = 7;
+    const plain = try relation.storageKeyAlloc(a, 41);
+    defer a.free(plain);
+    const encoded = try membership.storageKeyAlloc(a, 41);
+    defer a.free(encoded);
+    try std.testing.expectEqual(plain.len + 8, encoded.len);
+    try std.testing.expect(std.mem.startsWith(u8, encoded, plain));
+    const decoded = (try Key.fromStorageKey(encoded, 41)).?;
+    try std.testing.expect(Context.eql(.{}, membership, decoded));
+    try std.testing.expect(!Context.eql(.{}, relation, decoded));
+    const owner: Owner = .{ .table_id = 7, .schema_version = 3, .schema_digest = @splat(2), .kind = .constraint_name };
+    try membership.validateEntry(.{ .active = owner });
+    try std.testing.expectError(error.InvalidCatalogRecord, relation.validateEntry(.{ .active = owner }));
+    var wrong = owner;
+    wrong.table_id = 8;
+    try std.testing.expectError(error.InvalidCatalogRecord, membership.validateEntry(.{ .active = wrong }));
+    wrong = owner;
+    wrong.kind = .constraint_index;
+    try std.testing.expectError(error.InvalidCatalogRecord, membership.validateEntry(.{ .active = wrong }));
+    for (1..8) |missing| try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded[0 .. encoded.len - missing], 41));
+    // Removing the whole qualifier yields a valid *relation* key; its paired
+    // membership owner is rejected, so truncation cannot change key classes.
+    const truncated = (try Key.fromStorageKey(encoded[0..plain.len], 41)).?;
+    try std.testing.expectError(error.InvalidCatalogRecord, truncated.validateEntry(.{ .active = owner }));
+    @memset(encoded[plain.len..], 0);
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded, 41));
+}
+
+test "catalog typed membership plans share atomic CAS without exclusive relation collisions" {
+    const a = std.testing.allocator;
+    var first = testClaim(2, "shared", 7, 1, .constraint_name);
+    first.key.membership_table_id = 7;
+    var second = testClaim(2, "shared", 8, 1, .constraint_name);
+    second.key.membership_table_id = 8;
+    const relation = testClaim(2, "shared", 9, 1, .table);
+    var plan = try Plan.init(a, &.{}, &.{ first, second, relation });
+    defer plan.deinit();
+    var store: TestStore = .{};
+    defer store.rows.deinit(a);
+    try plan.apply(&store);
+    try std.testing.expectEqual(@as(usize, 3), store.rows.items.len);
+    try std.testing.expect((try store.getClaim(first.key)).?.eql(first.owner));
+    try std.testing.expect((try store.getClaim(second.key)).?.eql(second.owner));
+    try std.testing.expect((try store.getClaim(relation.key)).?.eql(relation.owner));
+    var retire = try Plan.init(a, &.{first}, &.{});
+    defer retire.deinit();
+    try retire.apply(&store);
+    try std.testing.expect((try store.getEntry(first.key)) == null);
+    try std.testing.expect((try store.getClaim(second.key)).?.eql(second.owner));
+    try std.testing.expect((try store.getClaim(relation.key)).?.eql(relation.owner));
+    const writes = store.writes;
+    try std.testing.expectError(error.CatalogGenerationChanged, retire.apply(&store));
+    try std.testing.expectEqual(writes, store.writes);
+    var forged = second;
+    forged.key.membership_table_id = 10;
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.init(a, &.{}, &.{forged}));
+    var duplicate = try Plan.init(a, &.{}, &.{second});
+    defer duplicate.deinit();
+    try std.testing.expectError(error.CatalogAlreadyExists, duplicate.apply(&store));
+    try std.testing.expectEqual(writes, store.writes);
+}
+
+test "catalog typed membership plans retain qualified keys after source retirement and allocation faults" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var plan = blk: {
+                const name = try a.dupe(u8, "shared");
+                defer a.free(name);
+                var first = testClaim(2, name, 7, 1, .constraint_name);
+                first.key.membership_table_id = 7;
+                var second = testClaim(2, name, 8, 1, .constraint_name);
+                second.key.membership_table_id = 8;
+                const relation = testClaim(2, name, 9, 1, .table);
+                break :blk try Plan.init(a, &.{}, &.{ first, second, relation });
+            };
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(usize, 3), plan.after.len);
+            for (plan.after, [_]u64{ 7, 8, 0 }) |claim, expected| {
+                try std.testing.expectEqualStrings("shared", claim.key.name);
+                try std.testing.expectEqual(expected, claim.key.membership_table_id);
+                _ = try claim.entry();
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "catalog constraint occupancy includes nonrelation names without cross-table exclusivity" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":9,"relational_indexes":[{"name":"access"}],"unique_constraints":[{"name":"pk"},{"name":"access","origin":"index"}],"checks":[{"name":"check_only"},{"name":"shared"}],"foreign_keys":[{"name":"fk_only"},{"name":"shared"}]}
+    ;
+    const definition: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema };
+    var cut = try TableCut.initWithConstraintMemberships(a, definition);
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cut.claims.len);
+    try std.testing.expectEqual(@as(usize, 4), cut.constraint_memberships.len);
+    const names = [_][]const u8{ "pk", "check_only", "shared", "fk_only" };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &digest, .{});
+    for (cut.constraint_memberships, names) |membership, name| {
+        try std.testing.expectEqualStrings(name, membership.key.name);
+        try std.testing.expectEqual(@as(u64, 2), membership.key.namespace_id);
+        try std.testing.expectEqual(@as(u64, 7), membership.table_id);
+        try std.testing.expectEqual(@as(u32, 9), membership.schema_version);
+        try std.testing.expectEqualSlices(u8, &digest, &membership.schema_digest);
+        try std.testing.expectEqual(Phase.active, membership.phase);
+        const membership_claim = try membership.claim();
+        try std.testing.expectEqual(membership.table_id, membership_claim.key.membership_table_id);
+        try std.testing.expectEqual(Kind.constraint_name, membership_claim.owner.kind);
+        for (cut.claims) |claim| if (!std.mem.eql(u8, name, "pk")) try std.testing.expect(!Context.eql(.{}, membership.key, claim.key));
+    }
+    var other = definition;
+    other.table_id = 8;
+    other.name = "other";
+    var second = try TableCut.initWithConstraintMemberships(a, other);
+    defer second.deinit();
+    // These equal namespace/name pairs intentionally belong to two tables.
+    for (cut.constraint_memberships, second.constraint_memberships) |left, right| {
+        try std.testing.expect(Context.eql(.{}, left.key, right.key));
+        try std.testing.expect(left.table_id != right.table_id);
+    }
+    var ordinary = try TableCut.init(a, definition);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ordinary.constraint_memberships.len);
+}
+
+test "catalog constraint occupancy bounds aggregate declarations before constructing memberships" {
+    const a = std.testing.allocator;
+    var schema: std.ArrayList(u8) = .empty;
+    defer schema.deinit(a);
+    try schema.appendSlice(a, "{\"checks\":[");
+    for (0..max_claims) |i| {
+        if (i != 0) try schema.append(a, ',');
+        try schema.appendSlice(a, "{\"name\":\"shared\"}");
+    }
+    try schema.appendSlice(a, "]}");
+    var definition: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema.items };
+    var cut = try TableCut.initWithConstraintMemberships(a, definition);
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cut.constraint_memberships.len);
+    try std.testing.expectEqualStrings("shared", cut.constraint_memberships[0].key.name);
+    // Bound total declaration work, not only the deduplicated output size:
+    // thousands of repeated constraints must not bypass admission budgets.
+    schema.items.len -= 1;
+    try schema.appendSlice(a, ",\"foreign_keys\":[{\"name\":\"other\"}]}");
+    definition.schema_json = schema.items;
+    try std.testing.expectError(error.CatalogCommandTooLarge, TableCut.initWithConstraintMemberships(a, definition));
+    // Existing relation lookups still ignore nonrelation declarations.
+    var ordinary = try TableCut.init(a, definition);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ordinary.claims.len);
+}
+
+test "catalog constraint occupancy successor owns both fenced schema cuts" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var cut = blk: {
+                const before_schema = try a.dupe(u8, "{\"version\":1,\"checks\":[{\"name\":\"old\"},{\"name\":\"shared\"}]}");
+                defer a.free(before_schema);
+                const after_schema = try a.dupe(u8, "{\"version\":2,\"foreign_keys\":[{\"name\":\"new\"},{\"name\":\"shared\"}]}");
+                defer a.free(after_schema);
+                break :blk try TableCut.initSuccessorWithConstraintMemberships(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = before_schema }, .{ .namespace_id = 3, .table_id = 8, .name = "items", .schema_json = after_schema, .phase = .reserved, .publication_id = @splat(9) });
+            };
+            defer cut.deinit();
+            const combined = try cut.claimsIncludingConstraints();
+            try std.testing.expectEqual(@as(usize, 6), combined.len);
+            try std.testing.expect(combined.ptr == (try cut.claimsIncludingConstraints()).ptr);
+            try std.testing.expectEqual(@as(usize, 4), cut.constraint_memberships.len);
+            const expected = [_][]const u8{ "old", "shared", "new", "shared" };
+            for (cut.constraint_memberships, expected, 0..) |membership, name, i| {
+                try std.testing.expectEqualStrings(name, membership.key.name);
+                try std.testing.expectEqual(@as(u64, if (i < 2) 7 else 8), membership.table_id);
+                try std.testing.expectEqual(@as(u64, if (i < 2) 2 else 3), membership.key.namespace_id);
+                try std.testing.expectEqual(@as(u32, if (i < 2) 1 else 2), membership.schema_version);
+                try std.testing.expectEqual(if (i < 2) Phase.active else Phase.reserved, membership.phase);
+                try std.testing.expect(std.mem.allEqual(u8, &membership.publication_id, if (i < 2) 0 else 9));
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.expectError(error.InvalidCatalogName, TableCut.initWithConstraintMemberships(std.testing.allocator, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"checks\":[{\"name\":\"\"}]}" }));
+}
+
+test "catalog constraint occupancy preparation coalesces same-table successors and never certifies absent projections" {
+    const a = std.testing.allocator;
+    var cut = try TableCut.initSuccessorWithConstraintMemberships(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"version\":1,\"checks\":[{\"name\":\"shared\"},{\"name\":\"old\"}]}" }, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"version\":2,\"checks\":[{\"name\":\"shared\"},{\"name\":\"new\"}]}", .phase = .reserved, .publication_id = @splat(9) });
+    defer cut.deinit();
+    const claims = try cut.claimsIncludingConstraints();
+    try std.testing.expectEqual(@as(usize, 4), claims.len);
+    const shared = try claims[1].entry();
+    try std.testing.expectEqual(@as(u64, 7), claims[1].key.membership_table_id);
+    try std.testing.expectEqual(@as(u32, 1), shared.active.?.schema_version);
+    try std.testing.expectEqual(@as(u32, 2), shared.pending.?.schema_version);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(9)), &shared.pending.?.publication_id);
+    try std.testing.expect((try claims[2].entry()).pending == null);
+    try std.testing.expect((try claims[3].entry()).active == null);
+    var ordinary = try TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "" });
+    defer ordinary.deinit();
+    try std.testing.expectError(error.CatalogOccupancyNotReady, ordinary.claimsIncludingConstraints());
+    var empty = try TableCut.initWithConstraintMemberships(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "" });
+    defer empty.deinit();
+    try std.testing.expect((try empty.claimsIncludingConstraints()).ptr == empty.claims.ptr);
 }
 
 test "catalog table cuts preserve constraint and index provenance without duplicating unique index relations" {
@@ -1403,6 +1768,13 @@ test "catalog relation ownership transaction adapter persists exact fenced recor
     try std.testing.expectError(error.InvalidCatalogRecord, store.getClaim(claim.key));
     try store.deleteClaim(claim.key);
     try std.testing.expect((try store.getClaim(claim.key)) == null);
+    var membership = testClaim(2, "same", 11, 9, .constraint_name);
+    membership.key.membership_table_id = 11;
+    const count = txn.rows.count();
+    try std.testing.expectError(error.CatalogOccupancyNotReady, store.getEntry(membership.key));
+    try std.testing.expectError(error.CatalogOccupancyNotReady, store.putClaim(membership.key, membership.owner));
+    try std.testing.expectError(error.CatalogOccupancyNotReady, store.deleteEntry(membership.key));
+    try std.testing.expectEqual(count, txn.rows.count());
 }
 
 test "catalog relation ownership unchanged cuts issue no writes and rename preserves unrelated owners" {

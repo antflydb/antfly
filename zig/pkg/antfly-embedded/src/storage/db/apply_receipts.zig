@@ -88,6 +88,18 @@ pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.Doc
     return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
 }
 
+/// Read within the caller's write transaction so duplicate admission and the
+/// mutation/receipt commit share one serialized view. Consume borrowed bytes
+/// immediately: a subsequent transaction read may reuse its scratch buffer.
+pub fn readReplicationAppliedSequenceTxn(txn: anytype) !u64 {
+    const raw = txn.get(internal_keys.replication_applied_lsn_key[0..]) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (raw.len != replication_applied_lsn_value_len) return error.CorruptReplicationAppliedSequence;
+    return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
+}
+
 test "storage.hot_standby apply receipts preserve independent Raft and HA encodings" {
     var ordered_buf: [ordered_apply_receipt_value_len]u8 = undefined;
     var replication_buf: [replication_applied_lsn_value_len]u8 = undefined;

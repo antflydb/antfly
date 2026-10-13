@@ -2117,6 +2117,7 @@ pub const MetadataHttpServer = struct {
         context.setting_admin = admin_grant;
         context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
         context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
+        context.index_publication_authority = parsed.value.isRelationalIndexOwnerCall();
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
         const identity_reader = if (!parsed.value.isMutation())
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
@@ -5388,6 +5389,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         reads: usize = 0,
         replace_identity: bool = false,
         status_reads: usize = 0,
+        index_reads: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -5412,6 +5414,13 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.status_reads += 1;
                 try std.testing.expect(context.row_policy_install_authority);
+                try std.testing.expect(!context.setting_admin);
+            }
+            if (call.isRelationalIndexOwnerCall()) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.index_reads += 1;
+                try std.testing.expect(context.index_publication_authority);
+                try std.testing.expect(!context.fk_generation_publication_authority);
                 try std.testing.expect(!context.setting_admin);
             }
             return alloc.dupe(u8, "{}");
@@ -5524,6 +5533,90 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     var changed = try server.metadataSystemCatalog(&changed_ctx);
     defer changed.deinit();
     try std.testing.expectEqual(@as(u16, 403), changed.status.code);
+    const index_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .relational_index_owner_decision = .{
+        .table_id = 1,
+        .group_id = 2,
+        .id = @splat(3),
+        .operation = .fence,
+    } }, .{});
+    defer alloc.free(index_body);
+    const index_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, index_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(index_grant);
+    var index_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+    defer index_request.deinit();
+    try index_request.setBody(index_body);
+    try index_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+    try index_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+    try index_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try index_request.headers.append(service_auth.header_name, service_token);
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try index_request.headers.append(authority.header_name, index_grant);
+    {
+        var granted_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer granted_ctx.deinit();
+        var granted = try server.metadataSystemCatalog(&granted_ctx);
+        defer granted.deinit();
+        try std.testing.expectEqual(@as(u16, 200), granted.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.index_reads);
+    const index_ack = try @import("relational_index_publication.zig").testing.fencedAck();
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    for ([_]Call{ .{ .relational_index_owner_ack = index_ack }, .{ .relational_index_owner_ack_status = index_ack } }) |call| {
+        const ack_body = try std.json.Stringify.valueAlloc(alloc, call, .{});
+        defer alloc.free(ack_body);
+        var ack_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+        defer ack_request.deinit();
+        try ack_request.setBody(ack_body);
+        try ack_request.headers.append(service_auth.header_name, service_token);
+        try ack_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try ack_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try ack_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        {
+            var denied_ctx = httpx.Context.init(alloc, std.testing.io, &ack_request);
+            defer denied_ctx.deinit();
+            var denied = try server.metadataSystemCatalog(&denied_ctx);
+            defer denied.deinit();
+            try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+        }
+        const grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, ack_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(grant);
+        try ack_request.headers.append(authority.header_name, grant);
+        var granted_ctx = httpx.Context.init(alloc, std.testing.io, &ack_request);
+        defer granted_ctx.deinit();
+        var granted = try server.metadataSystemCatalog(&granted_ctx);
+        defer granted.deinit();
+        try std.testing.expectEqual(@as(u16, 200), granted.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.index_reads);
+    const other_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .relational_index_owner_decision = .{
+        .table_id = 1,
+        .group_id = 2,
+        .id = @splat(3),
+        .operation = .cancel,
+    } }, .{});
+    defer alloc.free(other_body);
+    try index_request.setBody(other_body);
+    {
+        var denied_ctx = httpx.Context.init(alloc, std.testing.io, &index_request);
+        defer denied_ctx.deinit();
+        var denied = try server.metadataSystemCatalog(&denied_ctx);
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.index_reads);
 }
 
 test "system catalog forwarding retains its executor clock and tighter ingress deadline" {

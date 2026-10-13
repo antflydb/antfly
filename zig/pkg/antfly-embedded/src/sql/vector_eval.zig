@@ -394,7 +394,7 @@ const ColumnInput = struct {
             }
             for (self.page.selection, 0..) |physical, row| {
                 const value = try native.values.cell(std.heap.page_allocator, physical, index);
-                if (value.patterns != null) return false;
+                if (value.patterns() != null) return false;
                 if (!value.sql_null) {
                     const exact = switch (value.value) {
                         .integer => definition.type == .integer or definition.type == .number,
@@ -504,8 +504,9 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
     return vectors[0];
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
+    try value.validateTemporal();
     if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
-    if (value.array != null or value.numeric != null) return error.SqlTypeMismatch;
+    if (value.array != null or value.numeric != null or value.temporal() != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;
         const matches = value.value == .bool and value.value.bool == target;
@@ -530,13 +531,15 @@ fn comparison(op: Binary) bool {
     };
 }
 pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
+    try left.validateTemporal();
+    try right.validateTemporal();
     if (op == .is_distinct or op == .is_not_distinct) {
         const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compareDatums(left, right)) == .eq;
         return Datum.json(.{ .bool = equal == (op == .is_not_distinct) });
     }
     if (left.sql_null or right.sql_null) return .{};
     if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compareDatums(left, right)));
-    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null) return error.SqlTypeMismatch;
+    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null or left.temporal() != null or right.temporal() != null) return error.SqlTypeMismatch;
     // Arithmetic shares the scalar overflow/division/finite-number contract.
     // JSON null is a value for comparison, but remains null in arithmetic.
     if (left.value == .null or right.value == .null) return .{};

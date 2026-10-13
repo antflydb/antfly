@@ -37,6 +37,12 @@ describe("relational index request validation", () => {
       { keys: [] },
       { keys: [{ column: "id" }, { column: "id" }] },
       { include_columns: ["id"] },
+      { where: [{ constant: null }] },
+      { where: [{ constant: 0 }] },
+      { where: [{ constant: false, column: "id" }] },
+      { where: [{ constant: false, op: "eq" }] },
+      { where: [{ constant: false, value: 0 }] },
+      { where: [{ constant: false, collation: "C" }] },
       { where: [{ column: "id", op: "__proto__" }] },
       { where: [{ column: "id", op: "is_null", value: 1 }] },
       { where: [{ column: "id", op: "eq", value: { literal: 1 } }] },
@@ -47,6 +53,14 @@ describe("relational index request validation", () => {
       { version: 1 },
     ])
       expect(() => validateCreateIndexRequestRelationships({ ...config, ...invalid })).toThrow();
+  });
+  it("preserves constant false and true membership without comparison fields", () => {
+    for (const constant of [false, true]) {
+      const request = { ...config, where: [{ constant }] };
+      const before = JSON.stringify(request);
+      expect(() => validateCreateIndexRequestRelationships(request)).not.toThrow();
+      expect(JSON.stringify(request)).toBe(before);
+    }
   });
   it("accepts mixed expression keys without mutating exact literals or INCLUDED inputs", () => {
     const expression = {

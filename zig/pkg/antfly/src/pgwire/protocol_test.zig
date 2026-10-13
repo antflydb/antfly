@@ -463,7 +463,7 @@ test "pgwire Parse Bind Execute retain inferred and declared array parameter ide
         defer source.deinit();
         var encoded: std.Io.Writer.Allocating = .init(a);
         defer encoded.deinit();
-        if (format == 0) try sources.sql_array_text.encode(source.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source.value, &encoded.writer, .{});
+        if (format == 0) try sources.sql_array_text.encode(a, source.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(a, source.value, &encoded.writer, .{});
         var bind_payload: std.Io.Writer.Allocating = .init(a);
         defer bind_payload.deinit();
         try bind_payload.writer.writeAll("p\x00q\x00");

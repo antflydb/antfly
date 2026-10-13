@@ -2,6 +2,21 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-digest-read": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-digest-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "digest_read", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_digest_read_campaign_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
+    "sql-digest-kernels": {
+      "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=SQL PostgreSQL scalar kernels", "-Dtest-filter=SQL affix and digest kernels", "-Dtest-filter=SQL digest scaling"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-original-aggregate-reads": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls"],
       "cwd": "zig",
@@ -2796,8 +2811,30 @@
     },
     {
       "id": "sql-0257",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original MD5 projection, predicate, ordering and parameter execute through mounted native HTTP with the complete nonempty PostgreSQL result. The isolated source-backed ACTIVE profile preserves duplicate matches, case-sensitive nonmatches, SQL NULL and UTF-8 text. Shared scalar tests verify strict signatures, typed outputs, bounded work/cancellation, fixed output space and allocation-fault cleanup.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results",
+          "gate": "sql-original-digest-read"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results",
+          "gate": "sql-postgres-digest-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL digest scaling retains constant output space and cleans allocation failures",
+          "gate": "sql-digest-kernels"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors",
+          "gate": "sql-postgres-text-reference"
+        }
+      ]
     },
     {
       "id": "sql-0258",

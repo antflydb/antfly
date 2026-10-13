@@ -30,6 +30,25 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
+    .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },
+    .{ .status = .invalid_index_publication_candidate, .err = error.InvalidIndexPublicationCandidate },
+    .{ .status = .invalid_private_index_cancellation, .err = error.InvalidPrivateIndexCancellation },
+    .{ .status = .invalid_private_index_claim_inventory, .err = error.InvalidPrivateIndexClaimInventory },
+    .{ .status = .invalid_private_index_claim_receipt, .err = error.InvalidPrivateIndexClaimReceipt },
+    .{ .status = .invalid_private_index_inputs, .err = error.InvalidPrivateIndexInputs },
+    .{ .status = .invalid_private_index_native_receipt, .err = error.InvalidPrivateIndexNativeReceipt },
+    .{ .status = .invalid_private_index_owner_job, .err = error.InvalidPrivateIndexOwnerJob },
+    .{ .status = .invalid_relational_index_progress, .err = error.InvalidRelationalIndexProgress },
+    .{ .status = .missing_relational_index_definitions, .err = error.MissingRelationalIndexDefinitions },
+    .{ .status = .private_index_cancellation_pending, .err = error.PrivateIndexCancellationPending },
+    .{ .status = .private_index_cancellation_required, .err = error.PrivateIndexCancellationRequired },
+    .{ .status = .private_index_job_required, .err = error.PrivateIndexJobRequired },
+    .{ .status = .private_index_owner_job_changed, .err = error.PrivateIndexOwnerJobChanged },
+    .{ .status = .private_index_publication_canceled, .err = error.PrivateIndexPublicationCanceled },
+    .{ .status = .private_index_publication_required, .err = error.PrivateIndexPublicationRequired },
+    .{ .status = .relational_index_catalog_schema_mismatch, .err = error.RelationalIndexCatalogSchemaMismatch },
+    .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
     .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
     .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
@@ -981,12 +1000,50 @@ pub fn validateForTest() !void {
     try std.testing.expectError(error.CallbackReadOnly, relay.finish(.ha_read_only_standby));
 }
 
+test "native private index control errors retain distinct compiled identities" {
+    const errors = [_]anyerror{
+        error.ImmutableRelationalIndexDefinitionConflict,
+        error.InvalidIndexPublicationCandidate,
+        error.InvalidPrivateIndexCancellation,
+        error.InvalidPrivateIndexClaimInventory,
+        error.InvalidPrivateIndexClaimReceipt,
+        error.InvalidPrivateIndexInputs,
+        error.InvalidPrivateIndexNativeReceipt,
+        error.InvalidPrivateIndexOwnerJob,
+        error.InvalidRelationalIndexProgress,
+        error.MissingRelationalIndexDefinitions,
+        error.PrivateIndexCancellationPending,
+        error.PrivateIndexCancellationRequired,
+        error.PrivateIndexJobRequired,
+        error.PrivateIndexOwnerJobChanged,
+        error.PrivateIndexPublicationCanceled,
+        error.PrivateIndexPublicationRequired,
+        error.RelationalIndexCatalogSchemaMismatch,
+    };
+    for (errors) |expected| {
+        const status = statusFromError(expected);
+        try std.testing.expect(status != .internal);
+        try std.testing.expectError(expected, statusToError(status));
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 14);
+        try validateFailureEnvelope(status, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
+    }
+}
+
 test "seed replica policy mismatch survives compiled runtime boundaries" {
     try std.testing.expectEqual(abi.Status.seed_replica_policy_mismatch, statusFromError(error.SeedReplicaPolicyMismatch));
     try std.testing.expectError(error.SeedReplicaPolicyMismatch, statusToError(.seed_replica_policy_mismatch));
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    try std.testing.expectEqual(abi.Status.sql_invalid_power_argument, statusFromError(error.SqlInvalidPowerArgument));
+    try std.testing.expectError(error.SqlInvalidPowerArgument, statusToError(.sql_invalid_power_argument));
+    // Typed occupancy is a publication precondition, not an undeclared
+    // provider defect or proof of an uncertain admitted mutation.
+    const occupancy = failureFromError(error.CatalogOccupancyNotReady, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.catalog_occupancy_not_ready, occupancy.status);
+    try validateFailureEnvelope(occupancy.status, &occupancy, abi.abi_version);
+    try std.testing.expectError(error.CatalogOccupancyNotReady, statusToError(occupancy.status));
     // A stale FK attachment must remain a semantic rejection across the
     // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
     // replicated apply entry and stall every later proposal on that owner.

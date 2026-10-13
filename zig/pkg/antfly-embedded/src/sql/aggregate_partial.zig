@@ -112,9 +112,10 @@ const Encoder = struct {
         try self.raw(value);
     }
     fn datum(self: *Encoder, value: Datum) !void {
-        if (value.patterns != null) return error.InvalidSqlSpill;
+        try value.validateTemporal();
+        if (value.patterns() != null) return error.InvalidSqlSpill;
         if (value.sql_null) return self.raw(&.{0});
-        if (value.array != null or value.numeric != null) {
+        if (value.array != null or value.numeric != null or value.temporal() != null) {
             // Reuse the portable typed-block codec; a typed value's scalar
             // JSON placeholder is not its value or its element identity.
             const encoded = try @import("spill.zig").encodeColumnarBlockAlloc(self.a, &.{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }}, 16 << 20);
@@ -190,7 +191,7 @@ const Decoder = struct {
                 const block = try @import("spill.zig").decodeColumnarBlockInArena(self.a, try self.text(), 16 << 20);
                 if (block.count() != 1 or block.values.len != 1 or block.keys.len != 0) return error.InvalidSqlSpill;
                 const value = try block.cell(0, 0);
-                if (value.sql_null or (value.array == null and value.numeric == null)) return error.InvalidSqlSpill;
+                if (value.sql_null or (value.array == null and value.numeric == null and value.temporal() == null)) return error.InvalidSqlSpill;
                 break :blk value;
             },
             else => error.InvalidSqlSpill,
@@ -230,7 +231,7 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
 }
 
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
-    if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
+    if (value.sql_null or value.patterns() != null or value.value != .string) return error.InvalidSqlSpill;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
@@ -268,8 +269,9 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
             .integer => selected.value == .integer,
             .number => selected.numeric != null or selected.value == .integer or selected.value == .float,
             .boolean => selected.value == .bool,
-            .string, .datetime, .uuid => selected.value == .string,
-            .json => true,
+            .string, .uuid => selected.value == .string,
+            .datetime => selected.value == .string or (selected.temporal() != null and selected.temporal().?.kind() == .timestamp_tz),
+            .json => selected.temporal() == null,
             .array => selected.array != null,
         };
         if (!valid) return error.InvalidSqlSpill;

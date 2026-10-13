@@ -57,6 +57,20 @@ pub const Context = struct {
             return;
         }
         self.remaining -= count;
+        try self.pollCheckpoint(count);
+    }
+
+    /// Poll an already-admitted operation without spending its quota twice.
+    /// Parent ownership and sticky cancellation are identical to charge().
+    pub fn pollCheckpoint(self: *Context, count: u64) !void {
+        if (self.failure) |err| return err;
+        if (self.parent) |parent| {
+            parent.pollCheckpoint(count) catch |err| {
+                self.failure = err;
+                return err;
+            };
+            return;
+        }
         if (count >= 256 -| self.since_poll) {
             self.since_poll = 0;
             if (self.checkpoint) |poll| poll(self.ptr) catch |err| {

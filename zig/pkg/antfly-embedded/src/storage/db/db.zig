@@ -184,6 +184,7 @@ test {
 
 const change_journal_mod = @import("derived/change_journal.zig");
 const replication_effects_mod = @import("replication_effects.zig");
+const native_index_control = @import("relational_index_owner_control.zig");
 
 const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
@@ -3314,6 +3315,98 @@ pub const DB = struct {
         try self.enforceReplicationWriteGate();
         try page.commit(self.core);
         return true;
+    }
+
+    pub const NativeIndexCleanupMaintenanceOutcome = native_index_control.CleanupMaintenanceOutcome;
+
+    /// Derived private-generation cleanup may run on a standby without opening
+    /// ordinary write admission. Exact durable cancellation, allocation burns
+    /// and cleanup admission are rechecked in the deletion transaction. This
+    /// does not advance the source clock or release the publication fence.
+    pub fn collectCanceledNativeIndexGarbageStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexCleanupMaintenanceOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforcePortableRuntimeGate();
+        const jobs = @import("relational_index_owner_job.zig");
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try jobs.requireCancellationCleanup(&read, binding);
+        }
+        var page = try relational_index_gc.Page.prepareGeneration(self.alloc, self.backend_runtime.io(), self.core, binding.index);
+        defer if (page) |*value| value.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (page) |*value| {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try jobs.requireCancellationCleanup(&txn, binding);
+            // Admission proved drain before persisting its cut. The exact
+            // still-active source fence prevents new topology-sensitive work;
+            // rechecking the durable proof above avoids a transaction scan on
+            // every bounded page while retaining the same committing guard.
+            try value.stage(self.core, &txn);
+            const retired = value.next == null;
+            if (retired) try jobs.requireCancellationArtifactsRetired(&txn, binding);
+            try txn.commit();
+            return .{ .advanced = true, .artifacts_retired = retired };
+        }
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireCancellationArtifactsRetired(&read, binding);
+        return .{ .advanced = false, .artifacts_retired = true };
+    }
+
+    pub const NativeIndexClaimCleanupMaintenanceOutcome = native_index_control.ClaimCleanupMaintenanceOutcome;
+
+    /// Standby-safe derived cleanup. Scope and the held cancellation fence are
+    /// revalidated in the deletion transaction; no source cut/ACK is invented.
+    pub fn collectCanceledNativeIndexClaimsStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexClaimCleanupMaintenanceOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforcePortableRuntimeGate();
+        const claims = @import("relational_index_private_claims.zig");
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        var page = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try claims.GcPage.prepare(self.alloc, self.backend_runtime.io(), &read, binding);
+        };
+        defer if (page) |*value| value.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (page) |*value| {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try value.stage(&txn);
+            const retired = if (claims.requireRetired(&txn, binding)) |_| true else |err| switch (err) {
+                error.PrivateIndexCancellationPending => false,
+                else => return err,
+            };
+            try txn.commit();
+            return .{ .advanced = true, .claims_retired = retired };
+        }
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        try claims.requireRetired(&read, binding);
+        return .{ .advanced = false, .claims_retired = true };
     }
 
     /// Retry only the observed failed generation. Healthy/building retries
@@ -7838,6 +7931,50 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        if (mutation.index_owner_control) |frame| {
+            try frame.validate();
+            if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
+            try replication_effects_mod.validateIndexOwnerPayload(.{ .schema_version = native_index_control.envelope_version, .request = mutation.request, .index_owner_control = frame });
+            if (try self.replicationMutationAlreadyApplied(sequence)) return;
+            switch (frame.effect) {
+                .claims => |command| {
+                    var prepared = self.prepareNativeIndexOwnerClaims(command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerClaims(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .control => |command| {
+                    var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
+                        // Another replay may retire inputs during preparation.
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .cancel_control => |command| {
+                    var prepared = self.prepareNativeIndexOwnerCancellationControl(command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellationControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .cancel_intent => |intent| {
+                    var prepared = try self.prepareNativeIndexOwnerCancellation(intent);
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellation(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .cancel_cleanup => |binding| {
+                    var prepared = try native_index_control.PreparedCleanup.init(self.alloc, binding);
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCleanup(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+            }
+            return;
+        }
         var request = mutation.request;
         var options: BatchExecutionOptions = .{
             .validate_range_ownership = false,
@@ -7855,6 +7992,248 @@ pub const DB = struct {
             .none => request.sync_level = .write,
         }
         try self.batchInternal(request, null, options);
+    }
+
+    pub const NativeIndexOwnerAdmission = native_index_control.Admission;
+    pub const NativeIndexOwnerCommand = native_index_control.Command;
+    pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
+    pub const NativeIndexOwnerOutcome = native_index_control.Outcome;
+    pub const PreparedNativeIndexOwnerCancellation = native_index_control.PreparedCancellation;
+    pub const NativeIndexOwnerCancellationOutcome = native_index_control.CancellationOutcome;
+    pub const NativeIndexOwnerIdentity = native_index_control.Identity;
+    pub const NativeIndexOwnerReceiptRequest = native_index_control.ReceiptRequest;
+
+    pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational_index_owner_job.zig").Binding {
+        try expected.validate();
+        if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_index_owner_job.zig").inspectNative(&txn, expected);
+    }
+
+    pub const NativeIndexOwnerCancellationState = @import("relational_index_owner_job.zig").CancellationState;
+
+    pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
+        try expected.validate();
+        if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_index_owner_job.zig").inspectCancellation(&txn, expected);
+    }
+
+    /// Receipt recovery never recompiles a candidate or creates another source
+    /// cut. Publication waits precede the immutable read snapshot; its outbox
+    /// check closes the flush-versus-new-commit race without an apply lock.
+    pub fn nativeIndexOwnerReceipt(self: *DB, request: NativeIndexOwnerReceiptRequest) !?NativeIndexOwnerOutcome {
+        try request.identity.validate();
+        if (!request.identity.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        // Reject foreign jobs and non-native authority before triggering any
+        // recovery. Recheck in the final snapshot after the publication wait.
+        if (try self.nativeIndexOwnerState(request.identity) == null) return null;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        var recovery_error: ?[]const u8 = null;
+        self.ensureDurableReplicationStartupBarrier() catch |err| {
+            recovery_error = @errorName(err);
+        };
+        if (recovery_error == null) self.flushDurableReplicationOutboxes() catch |err| {
+            recovery_error = @errorName(err);
+        };
+        var needs_recovery = false;
+        defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
+        try self.enforceReplicationWriteGate();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const jobs = @import("relational_index_owner_job.zig");
+        const binding = (try jobs.inspectNative(&txn, request.identity)) orelse return null;
+        const effect: jobs.NativeEffect = switch (request.effect) {
+            .fenced => .fenced,
+            .reserved => .reserved,
+        };
+        const position = (try jobs.nativeEffectPosition(&txn, binding, effect)) orelse return null;
+        var outcome: NativeIndexOwnerOutcome = .{ .binding = binding, .position = position, .duplicate = true };
+        if (recovery_error != null or try durable_outbox_store.hasPendingTxn(&txn)) {
+            outcome.replication_pending = true;
+            outcome.error_name = recovery_error orelse "ReplicationOutboxPending";
+            // The snapshot, not a possibly stale hint, establishes this debt.
+            self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+            needs_recovery = true;
+            return outcome;
+        }
+        outcome.receipt = try jobs.nativeReceipt(&txn, binding, effect);
+        return outcome;
+    }
+
+    pub fn prepareNativeIndexOwnerAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerControl {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return native_index_control.Prepared.admission(self.alloc, view, &txn, header, manifest);
+    }
+
+    pub fn prepareNativeIndexOwnerControl(self: *DB, command: NativeIndexOwnerCommand) !PreparedNativeIndexOwnerControl {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return native_index_control.Prepared.control(self.alloc, view, &txn, command);
+    }
+
+    const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
+
+    pub const NativeIndexOwnerClaimCommand = native_index_control.ClaimCommand;
+    pub const NativeIndexOwnerClaimOutcome = native_index_control.ClaimOutcome;
+    pub const PreparedNativeIndexOwnerClaims = native_index_control.PreparedClaims;
+
+    pub fn prepareNativeIndexOwnerClaims(self: *DB, command: NativeIndexOwnerClaimCommand) !PreparedNativeIndexOwnerClaims {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return PreparedNativeIndexOwnerClaims.init(self.alloc, &read, command);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerClaims(self: *DB, prepared: *PreparedNativeIndexOwnerClaims, replay: ?NativeIndexReplay) !NativeIndexOwnerClaimOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    pub const PreparedNativeIndexOwnerCancellationControl = native_index_control.PreparedCancellationControl;
+
+    pub fn prepareNativeIndexOwnerCancellationAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerCancellationControl {
+        try header.validate();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const cancellation = @import("relational_index_cancellation_intent.zig");
+        const intent = (try cancellation.load(&txn)) orelse return error.PrivateIndexCancellationRequired;
+        if (!intent.intent.eql(header)) return error.PrivateIndexOwnerJobChanged;
+        var prepared = try native_index_control.Prepared.admission(self.alloc, view, &txn, header, manifest);
+        errdefer prepared.deinit();
+        return native_index_control.PreparedCancellationControl.init(self.alloc, &txn, prepared);
+    }
+
+    pub fn prepareNativeIndexOwnerCancellationControl(self: *DB, command: NativeIndexOwnerCommand) !PreparedNativeIndexOwnerCancellationControl {
+        try command.validate();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        try @import("relational_index_cancellation_intent.zig").requireCanceled(&txn, command.binding);
+        var prepared = try native_index_control.Prepared.control(self.alloc, view, &txn, command);
+        errdefer prepared.deinit();
+        return native_index_control.PreparedCancellationControl.init(self.alloc, &txn, prepared);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCancellationControl(self: *DB, prepared: *PreparedNativeIndexOwnerCancellationControl, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
+        return PreparedNativeIndexOwnerCancellation.init(self.alloc, intent);
+    }
+
+    pub const PreparedNativeIndexOwnerCleanup = native_index_control.PreparedCleanup;
+    pub const NativeIndexOwnerCleanupOutcome = native_index_control.CleanupOutcome;
+
+    pub fn prepareNativeIndexOwnerCleanup(self: *DB, identity: NativeIndexOwnerIdentity) !PreparedNativeIndexOwnerCleanup {
+        // Public/private ABI requests supply only immutable identity. Physical
+        // allocations come from this actual owner snapshot and are rechecked
+        // in the shared apply transaction, never selected by the caller.
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        return PreparedNativeIndexOwnerCleanup.init(self.alloc, binding);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCleanup(self: *DB, prepared: *PreparedNativeIndexOwnerCleanup, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCancellation(self: *DB, prepared: *PreparedNativeIndexOwnerCancellation, replay: ?NativeIndexReplay) !NativeIndexOwnerCancellationOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// Private owner execution. Metadata authorization belongs to the receiving
+    /// server, not to a caller-set flag. The replay capability is supplied only
+    /// by committed standby ingress, never by ordinary batch decoding.
+    pub fn applyPreparedNativeIndexOwnerControl(self: *DB, prepared: *PreparedNativeIndexOwnerControl, replay: ?NativeIndexReplay) !NativeIndexOwnerOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// One commit/replication machinery for native index controls and intent.
+    /// Preparation owns its off-lock payload; only its bounded effect stages
+    /// under apply-exclusive, together with the transport marker and outbox.
+    fn applyPreparedNativeIndexEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try prepared.validate();
+        if (!prepared.namespace().eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        if (replay) |value| {
+            if (value.lsn == 0) return error.InvalidControlReceiptPosition;
+            try prepared.validateReplay(value.position);
+        }
+        var replication_mutation = if (replay == null) self.acquireReplicationMutationShared() else null;
+        defer if (replication_mutation) |*lease| lease.release();
+        const mirrored = replay == null and self.local_execution.replication_async_batch_mirror != null;
+        if (replay == null) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+            if (self.local_execution.replication_async_metadata_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
+            if (mirrored) try prepared.preparePayload();
+        }
+        var outcome: @TypeOf(prepared.*).ApplyOutcome = undefined;
+        {
+            var mutation = self.core.snapshot_admission.acquireMutation();
+            defer mutation.release();
+            var replay_mutation = try self.acquireSnapshotReplayMutation();
+            defer replay_mutation.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (replay == null) try self.enforceReplicationWriteGate();
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            if (replay) |value| {
+                // Recheck in the same serialized transaction as the effect.
+                // The off-lock fast path cannot prevent a newer replay from
+                // committing while this command is being prepared.
+                const current = try apply_receipts.readReplicationAppliedSequenceTxn(&txn);
+                if (current >= value.lsn) {
+                    txn.abort();
+                    return prepared.replayDuplicateOutcome(value.position);
+                }
+            }
+            const forwarded: ?@import("receipt_position.zig").Native = if (replay) |value| value.position else null;
+            outcome = try prepared.stage(self.core, &txn, forwarded);
+            if (replay) |value| {
+                var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
+            if (mirrored and !outcome.duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(outcome.position));
+            try txn.commit();
+        }
+        // Snapshot/commit barriers must not be held across publication or an
+        // acknowledgement wait. A committed outbox remains an explicit pending
+        // result, not an ambiguous rollback-looking API error.
+        if (replication_mutation) |*lease| lease.release();
+        replication_mutation = null;
+        if (mirrored) self.flushDurableReplicationOutboxes() catch |err| {
+            outcome.replication_pending = true;
+            outcome.error_name = @errorName(err);
+            self.scheduleDurableReplicationOutboxRecovery();
+            return outcome;
+        };
+        if (replay == null and prepared.hasPublicationReceipt()) {
+            var txn = self.core.store.beginReadTxn() catch |err| {
+                outcome.error_name = @errorName(err);
+                return outcome;
+            };
+            defer txn.abort();
+            prepared.populateReceipt(&txn, &outcome) catch |err| {
+                outcome.error_name = @errorName(err);
+                return outcome;
+            };
+        }
+        return outcome;
     }
 
     /// Reconcile an ordered source inventory before applying its mutation.
@@ -18415,10 +18794,10 @@ pub const DB = struct {
             })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
-            const Row = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 };
+            const Row = @import("relational_integrity_activation_contract.zig").Row;
             const rows = try alloc.alloc(Row, page.rows.rows.len);
             defer alloc.free(rows);
-            for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest };
+            for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
             const Response = struct {
                 rows: []const Row,
                 command: activation.Command,
@@ -24324,6 +24703,7 @@ pub const DB = struct {
             .namespace = self.core.identity_namespace,
             .catalog_digest = digest,
             .next_epoch = try @import("relational_integrity_topology.zig").nextEpoch(&read),
+            .catalog_checks_identity_supported = true,
             .generation_handoff_receipt_authority = handoff_authority,
             .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
                 nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.backend_runtime.filesystemIo() != null and
@@ -34612,17 +34992,36 @@ pub const DB = struct {
     }
 
     pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        const observation = (try self.runtimeStatusObservationConsistentIfAvailable(alloc)) orelse return null;
+        return observation.stats;
+    }
+
+    pub const RuntimeStatusObservation = struct {
+        stats: types.DBStats,
+        source_authority: ?@import("../source_authority.zig").State = null,
+    };
+
+    /// Never wait for an apply writer while retaining a shared owner lease.
+    /// Sample the durable source cut under the same apply guard as the stats;
+    /// a later mutation may advance it, but cannot make this cut optimistic.
+    pub fn runtimeStatusObservationConsistentIfAvailable(self: *DB, alloc: Allocator) !?RuntimeStatusObservation {
         if (self.open_mode == .status_only) {
-            return try self.statusOnlyStats(alloc);
+            return .{ .stats = try self.statusOnlyStats(alloc) };
         }
 
         if (!self.core.tryLockApplyShared()) return null;
-        var result = self.statsLocked(alloc) catch |err| {
-            self.core.unlockApplyShared();
-            return err;
+        var result: RuntimeStatusObservation = blk: {
+            defer self.core.unlockApplyShared();
+            const stats_value = try self.statsLocked(alloc);
+            errdefer types.freeDBStats(alloc, stats_value);
+            var txn = try self.core.store.beginReadTxn();
+            defer txn.abort();
+            const authority = @import("../source_authority.zig");
+            const state = try authority.load(&txn);
+            if (state) |value| _ = try authority.require(&txn, value.kind, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            break :blk .{ .stats = stats_value, .source_authority = state };
         };
-        self.core.unlockApplyShared();
-        self.overlayRuntimeStatusRuntimeBestEffort(&result);
+        self.overlayRuntimeStatusRuntimeBestEffort(&result.stats);
         return result;
     }
 

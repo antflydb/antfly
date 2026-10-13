@@ -1438,6 +1438,8 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_generation_parent_suffix, httpx.Handler.bind(self, internalGroupFkGenerationParent));
         try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
+        try server.post(table_prefix ++ routes.relational_index_claims_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexClaims));
+        try server.post(table_prefix ++ routes.relational_index_control_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexControl));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
@@ -2508,6 +2510,51 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 503, "initial FK child must be retried"),
         };
         return ctx.json(receipt);
+    }
+
+    fn internalGroupRelationalIndexClaims(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, true);
+    }
+
+    fn internalGroupRelationalIndexControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, false);
+    }
+
+    fn internalGroupRelationalIndexOwner(self: *AntflyApiHandler, ctx: *httpx.Context, comptime claims: bool) !httpx.Response {
+        // No tokenless migration exception for private index mutations.
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const execution = @import("relational_index_owner_execution.zig");
+        const budget_header = ctx.header(if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header) orelse return textResponse(ctx, 400, "private index operation budget required");
+        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index operation budget");
+        if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index operation budget");
+        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index operation deadline expired");
+        const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        context.deadline_io = null;
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index operation required");
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (body.len > (if (claims) native.max_claim_wire_bytes else execution.max_control_request_bytes)) return textResponse(ctx, 413, "private index operation too large");
+        var parsed = std.json.parseFromSlice(if (claims) execution.ClaimRequest else execution.Request, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, "private index operation decoder unavailable"),
+            else => textResponse(ctx, 400, "invalid private index operation"),
+        };
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid private index operation scope");
+        const port = (if (claims) self.api_server.cfg.relational_index_claims else self.api_server.cfg.relational_index_control) orelse return textResponse(ctx, 503, "private index owner receiver unavailable");
+        var result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, context) catch |err| return switch (err) {
+            error.UnsupportedNativeIndexOwner => textResponse(ctx, 501, @errorName(err)),
+            error.UniqueConstraintViolation => textResponse(ctx, 409, @errorName(err)),
+            error.GenerationPublicationChanged, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled => textResponse(ctx, 409, @errorName(err)),
+            error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
+            else => textResponse(ctx, 503, @errorName(err)),
+        };
+        defer result.deinit();
+        return ctx.json(if (claims) result.response() else try result.response());
     }
 
     fn internalGroupRowPolicyInstall(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5579,19 +5626,24 @@ pub const AntflyApiHandler = struct {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
+                        if (value.temporal() != null) try value.validateTemporal();
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
+                        } else if (value.temporal() != null) {
+                            var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                            const exact = try @import("antfly_local_sources").sql_scalar.formatTimestampResult(value, definition.type, &text);
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else if (value.array) |array| {
-                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
                         } else if (value.numeric) |number| {
-                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
                             const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
-                        } else if (value.patterns) |patterns| {
+                        } else if (value.patterns()) |patterns| {
                             try writer.writer.writeByte('[');
                             var offset: u64 = 0;
                             var first = true;
@@ -13690,6 +13742,289 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
 }
 
+test "httpx SQL generated immutable planning preserves PostgreSQL stored rows after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        inputs: []const struct { s: ?[]const u8, n: ?i64 },
+        entries: []const struct { sql: []const u8, type: []const u8, sqlstate: ?[]const u8, rows: []const ?[]const u8 = &.{} },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var admitted: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.sqlstate != null) continue;
+        admitted += 1;
+        var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-immutable");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try local.sql_compiler.compile(alloc, entry.sql, .{});
+        defer compiled.deinit();
+        const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+        {
+            var seed = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer seed.close();
+            try seed.setSchemaJson(alloc, schema);
+            const writes = try a.alloc(db_mod.types.BatchWrite, fixture.value.inputs.len);
+            for (fixture.value.inputs, writes, 0..) |input, *write, i| write.* = .{
+                .key = try std.fmt.allocPrint(a, "r{d}", .{i}),
+                .value = try std.json.Stringify.valueAlloc(a, .{ .s = input.s, .n = input.n, .t = "2026-01-01T00:00:00Z" }, .{}),
+            };
+            try seed.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        }
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const Source = @import("sql_parity_sources.zig").Tables(1);
+        var source: Source = .{
+            .records = .{.{ .table_id = 7, .name = "generated_probe", .schema_json = schema }},
+            .reads = .{table_reads.BoundTableReadSource.init("generated_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+        };
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT s, n, g, CAST(g AS text) AS generated_value FROM generated_probe ORDER BY n NULLS FIRST\"}";
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("generated row read rejected: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        try std.testing.expectEqual(entry.rows.len, result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 4), result.value.columns.len);
+        const expected_type: sql_wire.SQLColumnType = if (std.mem.eql(u8, entry.type, "text")) .string else if (std.mem.eql(u8, entry.type, "int")) .integer else .boolean;
+        try std.testing.expectEqual(expected_type, result.value.columns[2].type);
+        for (result.value.rows, result.value.sql_nulls.?, entry.rows, fixture.value.inputs) |row, flags, expected, input| {
+            try std.testing.expectEqual(input.s == null, flags[0]);
+            if (input.s) |text| try std.testing.expectEqualStrings(text, row[0].string);
+            try std.testing.expectEqual(input.n == null, flags[1]);
+            if (input.n) |number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, row[1].string, 10));
+            try std.testing.expectEqual(expected == null, flags[2]);
+            try std.testing.expectEqual(expected == null, flags[3]);
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[3].string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 27), admitted);
+}
+
+test "httpx SQL generated immutable planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "generated_input", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("generated_input", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("generated rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 15), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
+test "httpx SQL immutable index planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        base_sql: []const u8,
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_index_planning_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-index-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var base = try local.sql_compiler.compile(alloc, fixture.value.base_sql, .{});
+    defer base.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, base.statement.create_table);
+    defer alloc.free(schema);
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "index_probe", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("index_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    const Catalog = struct {
+        fn run(raw: *anyopaque, a: std.mem.Allocator, control: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *Source = @ptrCast(@alignCast(raw));
+            if (call != .resolve_many or call.resolve_many.relations.len == 0)
+                return Source.systemCatalog(raw, a, control, call);
+            try control.ensureActive();
+            // Test-only immutable relation cut, not production publication
+            // authority. Mutation callbacks remain deliberately unavailable.
+            const domain = local.system_catalog_domain;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const relations = try arena.allocator().alloc(?domain.ResolvedRelation, call.resolve_many.relations.len);
+            @memset(relations, null);
+            const table = self.records[0];
+            var parsed_schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed_schema.deinit(a);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
+            for (call.resolve_many.relations, relations) |target, *resolved| {
+                if (!std.mem.eql(u8, target.database, "default") or !std.mem.eql(u8, target.namespace, "public") or !std.mem.eql(u8, target.name, table.name)) continue;
+                var value = domain.ResolvedTable.fromTable(table);
+                value.query_definition = domain.QueryDefinition.fromTable(table);
+                resolved.* = .{ .table = value, .logical_table = table.name, .owner = .{ .table_id = table.table_id, .schema_version = parsed_schema.version, .schema_digest = digest, .kind = .table } };
+            }
+            return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 7, .tables = &.{}, .relations = relations, .relation_epoch = .{ .revision = 7, .incarnation = @splat(7) } }, .{});
+        }
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Catalog.run, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("index rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
+test "httpx SQL transaction timestamp results retain typed values through public streaming" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-transaction-time");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "u1", .value = "{\"id\":\"u1\"}" }}, .timestamp_ns = 42 });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT CURRENT_TIMESTAMP AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM usage_records WHERE id=$1",
+        "SELECT now() AS planned_at_ns, transaction_timestamp() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM usage_records WHERE id=$1",
+        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1 ORDER BY id",
+    }) |sql| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = sql, .parameters = .{"u1"} }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("transaction timestamp rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqualStrings("planned_at_ns", result.value.columns[0].name);
+        for (result.value.columns, result.value.rows[0], result.value.sql_nulls.?[0]) |column_, value, is_null| {
+            try std.testing.expectEqual(.datetime, column_.type);
+            try std.testing.expect(!is_null);
+            try std.testing.expectEqualStrings(result.value.rows[0][0].string, value.string);
+            const parsed = try local.sql_temporal_text.parseCanonical(.timestamp_tz, value.string);
+            try std.testing.expect(parsed.timestamp_tz.micros != std.math.minInt(i64) and parsed.timestamp_tz.micros != std.math.maxInt(i64));
+        }
+    }
+}
+
+test "httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results" {
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.digest_read_reference;
+    const profile = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer profile.deinit();
+    try std.testing.expectEqual(@as(usize, 1), profile.value.entries.len);
+    try std.testing.expectEqualStrings("sql-0257", profile.value.entries[0].id);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-digest-original");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.Stringify.valueAlloc(a, profile.value.profile.schema, .{});
+    try db.setSchemaJson(alloc, schema);
+    const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+    for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &.{"sql-0257"}, reference_bytes);
+}
+
 test "httpx SQL joined source RETURNING preserves native array storage and PostgreSQL images" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");
@@ -14326,6 +14661,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // an output alias is not an input variable inside ORDER BY arithmetic.
     for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
     try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
+    try @import("sql_parity_reference.zig").runScalarKernels(alloc, &handler);
     {
         const parity = @import("sql_parity_reference.zig");
         const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
@@ -15524,7 +15860,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer source_array.deinit();
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();
-            if (format == 0) try sources.sql_array_text.encode(source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source_array.value, &encoded.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(alloc, source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(alloc, source_array.value, &encoded.writer, .{});
             var array_request = request;
             array_request.statement = "SELECT $1::bigint[] a,cardinality($1) n FROM usage_records LIMIT 1";
             array_request.parameter_types = if (declared) &.{.array} else &.{};
@@ -16614,6 +16950,238 @@ test "httpx hidden handoff receipt rejects public caller even in legacy internal
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 401), response.status.code);
     }
+}
+
+test "httpx private index claims require explicit service authentication and bounded identity-only payloads" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        batches: usize = 0,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.ClaimRequest, context: operation_contract.RequestContext) !execution.ClaimResult {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(usize, 1), value.claims.len);
+            try std.testing.expectEqualStrings("tuple\x00\xff\x80", value.claims[0].tuple);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            self.batches += 1;
+            // Transport fixture only, not a real completed build or ACK.
+            return .acknowledged;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "private-index-test-secret-0123456789";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .relational_index_claims = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/relational-index-claims");
+    defer request.deinit();
+    const value: execution.ClaimRequest = .{
+        .table_id = 1,
+        .group_id = 7,
+        .id = @splat(3),
+        .claims = &.{.{ .tuple = "tuple\x00\xff\x80", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }},
+    };
+    const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try request.setBody(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    try request.headers.append(internal_service_auth.header_name, token);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try request.headers.append(execution.claim_remaining_ms_header, "1000");
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        ctx.application_deadline_ns = 0;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 408), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.batches);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    }
+    var wrong = value;
+    wrong.group_id += 1;
+    const wrong_body = try std.json.Stringify.valueAlloc(alloc, wrong, .{});
+    defer alloc.free(wrong_body);
+    try request.setBody(wrong_body);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.batches);
+    var many: [129]@typeInfo(@FieldType(execution.ClaimRequest, "claims")).pointer.child = @splat(value.claims[0]);
+    wrong = value;
+    wrong.claims = &many;
+    const many_body = try std.json.Stringify.valueAlloc(alloc, wrong, .{});
+    defer alloc.free(many_body);
+    try request.setBody(many_body);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.batches);
+    var mounted: HttpxE2eServer = undefined;
+    try mounted.init(alloc, &api_server);
+    defer mounted.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try mounted.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-claims", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.claim_remaining_ms_header, "1000" } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 2), fixture.batches);
+}
+
+test "httpx private index control requires explicit service authority and mounts bounded fence reserve requests" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        effects: usize = 0,
+        operation: @FieldType(execution.Request, "operation") = .fence,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.Request, context: operation_contract.RequestContext) !execution.Result {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(self.operation, value.operation);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            self.effects += 1;
+            // An authenticated transport fixture, not proof of a real build.
+            return .acknowledged;
+        }
+        fn expectStatus(handler: *AntflyApiHandler, request: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupRelationalIndexControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "private-control-test-secret-0123456789";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .relational_index_control = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/relational-index-control");
+    defer request.deinit();
+    var value: execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
+    const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(body);
+    try request.setBody(body);
+    try Fixture.expectStatus(&handler, &request, 401, null);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    try request.headers.append(internal_service_auth.header_name, token);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    try Fixture.expectStatus(&handler, &request, 408, 0);
+    const unknown = try std.fmt.allocPrint(alloc, "{s},\"authority\":true}}", .{body[0 .. body.len - 1]});
+    defer alloc.free(unknown);
+    try request.setBody(unknown);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.setBody(body);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "30001");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "0");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    value.group_id = 8;
+    const foreign = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(foreign);
+    try request.setBody(foreign);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    const oversized = try alloc.alloc(u8, execution.max_control_request_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    try request.setBody(oversized);
+    try Fixture.expectStatus(&handler, &request, 413, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.effects);
+    value.group_id = 7;
+    inline for (.{ .fence, .reserve }) |action| {
+        value.operation = action;
+        fixture.operation = action;
+        const action_body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(action_body);
+        try request.setBody(action_body);
+        try Fixture.expectStatus(&handler, &request, 200, null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.effects);
+    fixture.operation = .fence;
+    var mounted: HttpxE2eServer = undefined;
+    try mounted.init(alloc, &api_server);
+    defer mounted.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try mounted.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-control", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.control_remaining_ms_header, "1000" } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 3), fixture.effects);
 }
 
 test "httpx FK source control rejects missing service token in legacy internal mode" {

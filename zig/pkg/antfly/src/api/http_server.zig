@@ -1708,6 +1708,8 @@ pub const ApiHttpServerConfig = struct {
     fk_generation_parent: ?@import("relational_fk_generation_publication.zig").Port = null,
     fk_generation_source: ?@import("relational_fk_generation_publication.zig").SourcePort = null,
     fk_initial_child: ?@import("relational_fk_generation_publication.zig").InitialChildPort = null,
+    relational_index_claims: ?@import("relational_index_owner_execution.zig").ClaimPort = null,
+    relational_index_control: ?@import("relational_index_owner_execution.zig").ControlPort = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -5444,6 +5446,7 @@ pub const ApiHttpServer = struct {
             .plan_id = value.plan.id,
             .child_table_id = value.plan.child_before.table_id,
             .expected_revision = value.revision,
+            .catalog_coverage = value.plan.catalog_coverage,
             .action = undefined,
         };
         switch (target) {
@@ -5602,13 +5605,17 @@ pub const ApiHttpServer = struct {
     /// checks, read-index owner identities, and exact AIC binding happen in
     /// the builder; metadata rechecks the entire cut at Raft apply.
     pub fn beginFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8) !FkGenerationBegin {
+        return self.beginFkGenerationPublicationWithConstraintNameGuard(alloc, context, identity, before, proposed_schema_json, null);
+    }
+
+    pub fn beginFkGenerationPublicationWithConstraintNameGuard(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, guard: ?system_catalog.RelationMutationGuard) !FkGenerationBegin {
         if (self.cfg.deployment_mode == .standalone and
             (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
             return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const plan = try @import("fk_generation_plan_builder.zig").build(self, a, context, identity, before, proposed_schema_json);
+        const plan = try @import("fk_generation_plan_builder.zig").buildWithConstraintNameGuard(self, a, context, identity, before, proposed_schema_json, guard);
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,
@@ -5858,6 +5865,7 @@ pub const ApiHttpServer = struct {
                         error.RelationalCheckViolation,
                         error.RelationalExpressionOverflow,
                         error.RelationalExpressionDivisionByZero,
+                        error.SqlInvalidPowerArgument,
                         error.RelationalExpressionBudgetExceeded,
                         error.RelationalIndexKeyTooLarge,
                         error.InvalidRelationalExpressionInput,
@@ -13834,6 +13842,7 @@ pub const ApiHttpServer = struct {
             error.InvalidBatchRequest,
             error.RelationalExpressionOverflow,
             error.RelationalExpressionDivisionByZero,
+            error.SqlInvalidPowerArgument,
             error.RelationalExpressionBudgetExceeded,
             error.InvalidRelationalExpressionInput,
             error.InvalidRelationalGeneratedValue,
@@ -17008,6 +17017,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handleSchemaRewrite(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, default_columns: []const []const u8) !contextual_operations.OwnedResponse {
+        return self.handleSchemaRewriteWithConstraintNameGuard(before, proposed, idempotency_key, identity, context, default_columns, null);
+    }
+
+    pub fn handleSchemaRewriteWithConstraintNameGuard(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, default_columns: []const []const u8, guard: ?system_catalog.RelationMutationGuard) !contextual_operations.OwnedResponse {
         try ensureTableOperationActive(context);
         if (self.cfg.auth_enabled and identity == null) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires table administrator authorization");
         var snapshot = (try self.source.adminSnapshot()) orelse return contextualRetryableJsonErrorResponse(self.alloc, 503, "schema rewrite metadata is unavailable");
@@ -17082,7 +17095,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
-        const plan = try admission.buildWithPolicies(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns });
+        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns }, guard);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
         const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);

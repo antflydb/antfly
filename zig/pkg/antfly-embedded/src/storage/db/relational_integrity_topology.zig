@@ -42,10 +42,14 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
 pub fn current(txn: anytype) !?Fence {
     const bytes = (try optional(txn, fence_key)) orelse return null;
     const fence = try Fence.decode(bytes);
+    if (fence.role == .index_build) try @import("relational_index_owner_job.zig").requireActive(txn, fence);
     // Range publication can atomically close admission by writing the exact
     // completion receipt in its existing metadata batch. The stale physical
     // fence is harmless and is overwritten by a later higher-epoch begin.
-    if (try optional(txn, receipt_key)) |receipt| if ((try Fence.decode(receipt)).eql(fence)) return null;
+    if (try optional(txn, receipt_key)) |receipt| if ((try Fence.decode(receipt)).eql(fence)) {
+        if (fence.role == .index_build) return error.PrivateIndexPublicationRequired;
+        return null;
+    };
     return fence;
 }
 
@@ -89,6 +93,28 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
 }
 
 pub fn stageBeginWithHandoff(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
+    if (fence.role == .index_build) return error.PrivateIndexJobRequired;
+    return stageBeginImpl(txn, fence, handoff);
+}
+
+/// Called only after the exact owner job binding is staged in this transaction.
+/// Generic topology commands cannot acquire or release private-index authority.
+pub fn stagePrivateIndexBegin(txn: anytype, fence: Fence) !void {
+    if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_index_owner_job.zig").requireFencing(txn, fence);
+    return stageBeginImpl(txn, fence, null);
+}
+
+/// A never-visited cancellation closes ordinary admission before schema-sized
+/// inputs are fetched. Its durable intent is exact owner authority, not a job
+/// absence ACK. Generic begin/release/cancel remain unable to bypass it.
+pub fn stagePrivateIndexCancellationIntent(txn: anytype, fence: Fence) !void {
+    if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_index_cancellation_intent.zig").requireFence(txn, fence);
+    return stageBeginImpl(txn, fence, null);
+}
+
+fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
@@ -209,6 +235,7 @@ pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected:
 /// Final release must share the ownership/cutover transaction. Persist a
 /// checksummed receipt so delayed control commands cannot resurrect a fence.
 pub fn stageRelease(txn: anytype, expected: Fence) !void {
+    if (expected.role == .index_build) return error.PrivateIndexPublicationRequired;
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     // Publication must activate the exact pending parent generations before
     // lifting the write fence. Until that path exists, release fails closed.
@@ -228,6 +255,7 @@ pub fn stageRelease(txn: anytype, expected: Fence) !void {
 /// Cancelling an ambiguously delivered begin consumes its epoch even if the
 /// begin has not arrived yet. Never releases another live lifecycle owner.
 pub fn stageCancel(txn: anytype, expected: Fence) !void {
+    if (expected.role == .index_build) return error.PrivateIndexCancellationRequired;
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     _ = try expected.encode();
     if (try current(txn)) |actual| {

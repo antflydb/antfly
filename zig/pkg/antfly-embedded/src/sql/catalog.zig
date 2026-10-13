@@ -272,7 +272,7 @@ pub const Row = struct {
             if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
             const result = cells.values[index];
             if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
-            if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
+            if (result.array != null and (result.sql_null or result.value != .null or result.patterns() != null)) return error.InvalidSqlBackendResponse;
             if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
             return result;
         }
@@ -282,7 +282,7 @@ pub const Row = struct {
         const value = self.value.object.values()[index];
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
-        return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
+        return @import("scalar.zig").Datum.fromParts(value, sql_null, if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null);
     }
 
     fn validateTyped(self: Row) !void {
@@ -501,8 +501,8 @@ pub const Ddl = union(enum) {
         schema_json: []const u8,
         if_not_exists: bool,
         tablespace: ?[]const u8 = null,
-        /// Only compiler-generated backing index names may be disambiguated.
-        /// Explicit SQL names remain exact catalog declarations.
+        /// Compiler-owned provenance for admission-time name selection.
+        /// Explicit user names must never be included or silently renamed.
         generated_constraint_names: []const []const u8 = &.{},
     },
     drop_table: ast.DropTable,
@@ -545,7 +545,17 @@ pub const AggregatePartialCursor = struct {
     close: *const fn (*anyopaque) void,
 };
 
+pub const Clock = @import("statement_clock.zig");
 pub const Backend = struct {
+    /// Trusted execution source and authorized durable transaction start.
+    /// Neither is populated from SQL parameters, request JSON or cached plans.
+    clock_source: ?Clock.Source = null,
+    transaction_start: ?Clock.Instant = null,
+    /// Value-owned by this statement/cursor. Child adapters copy it unchanged.
+    statement_clock: ?Clock.View = null,
+    /// Immutable typed precision slots borrowed from the result/cursor owner.
+    /// A child adapter preserves this address; it must never cache it in plans.
+    clock_values: ?*const Clock.Frame = null,
     error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
@@ -601,6 +611,27 @@ pub const Backend = struct {
     /// Every later scan can fork the same owner-issued cut and retain its
     /// route/range proof in the mutation's atomic commit read set.
     dynamic_statement_read_set: bool = false,
+
+    /// Capture once at execution admission. Describe never calls this method.
+    /// Ingress pins before selecting a cursor or materializing fallback.
+    pub fn pinStatementClock(self: Backend) !Backend {
+        var pinned = self;
+        if (self.statement_clock) |view| {
+            try view.validate();
+            if (self.clock_values) |frame| if (!frame.matches(view)) return error.InvalidTransactionClock;
+            if (self.transaction_start) |start| {
+                if (start.micros != view.transaction.micros) return error.InvalidTransactionClock;
+            }
+            return pinned;
+        }
+        if (self.clock_values != null) return error.InvalidTransactionClock;
+        const source = self.clock_source orelse if (self.execution_io) |io| Clock.Source{ .io = io } else {
+            if (self.transaction_start != null) return error.SqlClockUnavailable;
+            return pinned;
+        };
+        pinned.statement_clock = try Clock.View.capture(source, self.transaction_start);
+        return pinned;
+    }
 
     pub const VTable = struct {
         /// Native opaque identity, generated once before mutation admission.

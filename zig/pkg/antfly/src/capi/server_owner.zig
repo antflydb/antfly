@@ -1937,9 +1937,29 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.fkGenerationPublicationSourceDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .relational_index_owner_decision => |input| {
+                    const value = handle.store.relationalIndexOwnerDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .fk_initial_create_prepare => |input| {
                     const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .fk_generation_name_admission => |input| {
+                    handle.store.preflightFkGenerationNameAdmission(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .fk_initial_create_prepare_with_deadline => |input| {
+                    const value = handle.store.fkInitialCreatePrepareJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .constraint_name_prepare => |input| {
+                    const value = handle.store.prepareConstraintNamesJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .constraint_name_check => |input| {
+                    handle.store.checkConstraintNamesWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
                 },
                 .fk_initial_child_decision => |input| {
                     const value = handle.store.fkInitialChildDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -3947,6 +3967,202 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+/// No ordinary-batch decoding or caller-selected replay position enters this
+/// boundary. Metadata permission is independently checked by the server worker;
+/// durable local job/catalog checks remain authoritative for each storage effect.
+pub fn storageOwnerNativeIndexControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeIndexOwnerControlRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.operation == .claims) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (request.manifest.len != 0 or request.request_json.len == 0 or request.request_json.ptr == null or
+            request.request_json.len > native.max_claim_wire_bytes) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimCommand, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .invalid_argument,
+        };
+        defer parsed.deinit();
+        if (parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var prepared_claims = handle.db.prepareNativeIndexOwnerClaims(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+        defer prepared_claims.deinit();
+        return applyNativeIndexPreparedResponse(handle, &prepared_claims, out_response);
+    }
+    // Headers/bindings contain only fixed-size identities. Large schema inputs
+    // remain raw borrowed bytes rather than another JSON/base64 representation.
+    if (request.request_json.len == 0 or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.operation == .receipt) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerReceiptRequest, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.identity.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const state = handle.db.nativeIndexOwnerReceipt(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+        const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, state, .{}) catch |err| return storageOwnerStatusFromError(err);
+        out_response.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
+    if (request.operation == .inspect) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const state = handle.db.nativeIndexOwnerState(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+        const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, state, .{}) catch |err| return storageOwnerStatusFromError(err);
+        out_response.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
+    if (request.operation == .cancel_inspect) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const state = handle.db.nativeIndexOwnerCancellationState(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+        defer response.deinit();
+        return response.finish(state, out_response);
+    }
+    if (request.operation == .cancel_admit or request.operation == .cancel_fence or request.operation == .cancel_reserve) {
+        var prepared = if (request.operation == .cancel_admit) blk: {
+            if (request.manifest.len == 0 or request.manifest.len > db_mod.DB.PreparedNativeIndexOwnerControl.max_manifest_bytes) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerCancellationAdmission(parsed.value, request.manifest.slice()) catch |err|
+                return storageOwnerStatusFromError(err);
+        } else blk: {
+            if (request.manifest.len != 0) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCommand, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const effect: @FieldType(db_mod.DB.NativeIndexOwnerCommand, "effect") = if (request.operation == .cancel_fence) .fenced else .reserved;
+            if (parsed.value.effect != effect or parsed.value.inputs_b64 != null or
+                parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerCancellationControl(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+        };
+        defer prepared.deinit();
+        return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+    }
+    if (request.operation == .cancel_gc_page or request.operation == .cancel_claim_gc_page) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+        defer response.deinit();
+        if (request.operation == .cancel_claim_gc_page) {
+            const outcome = handle.db.collectCanceledNativeIndexClaimsStep(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+            return response.finish(outcome, out_response);
+        }
+        const outcome = handle.db.collectCanceledNativeIndexGarbageStep(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        return response.finish(outcome, out_response);
+    }
+    if (request.operation == .cancel_cleanup) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var cleanup = handle.db.prepareNativeIndexOwnerCleanup(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer cleanup.deinit();
+        return applyNativeIndexPreparedResponse(handle, &cleanup, out_response);
+    }
+    if (request.operation == .cancel_intent) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var cancellation = handle.db.prepareNativeIndexOwnerCancellation(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer cancellation.deinit();
+        return applyNativeIndexPreparedResponse(handle, &cancellation, out_response);
+    }
+    var prepared = switch (request.operation) {
+        .admit => blk: {
+            if (request.manifest.len == 0 or request.manifest.len > db_mod.DB.PreparedNativeIndexOwnerControl.max_manifest_bytes) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerAdmission(parsed.value, request.manifest.slice()) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .fence, .reserve => blk: {
+            if (request.manifest.len != 0) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCommand, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const effect: @FieldType(db_mod.DB.NativeIndexOwnerCommand, "effect") = if (request.operation == .fence) .fenced else .reserved;
+            if (parsed.value.effect != effect or parsed.value.inputs_b64 != null or
+                parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerControl(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        else => return .invalid_argument,
+    };
+    defer prepared.deinit();
+    return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+}
+
+/// All bounded native-index mutation responses reserve ownership before commit.
+/// Serialization and transfer do not allocate after the durable mutation.
+const NativeIndexResponse = struct {
+    buffer: ?[]u8,
+
+    fn init() !NativeIndexResponse {
+        return .{ .buffer = try std.heap.c_allocator.alloc(u8, 32 * 1024) };
+    }
+
+    fn deinit(self: *NativeIndexResponse) void {
+        if (self.buffer) |buffer| std.heap.c_allocator.free(buffer);
+        self.* = undefined;
+    }
+
+    fn finish(self: *NativeIndexResponse, outcome: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
+        const buffer = self.buffer.?;
+        var writer: std.Io.Writer = .fixed(buffer);
+        std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
+        // The C allocator guarantees in-place shrink, unlike general allocators.
+        const resized = std.heap.c_allocator.resize(buffer, writer.end);
+        std.debug.assert(resized);
+        out_response.* = .{ .ptr = buffer.ptr, .len = writer.end };
+        self.buffer = null;
+        return .ok;
+    }
+};
+
+fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
+    var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+    defer response.deinit();
+    const outcome = (if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellationControl)
+        handle.db.applyPreparedNativeIndexOwnerCancellationControl(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCleanup)
+        handle.db.applyPreparedNativeIndexOwnerCleanup(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellation)
+        handle.db.applyPreparedNativeIndexOwnerCancellation(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerClaims)
+        handle.db.applyPreparedNativeIndexOwnerClaims(prepared, null)
+    else
+        handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
+        return storageOwnerStatusFromError(err);
+    return response.finish(outcome, out_response);
+}
+
 pub fn storageOwnerNativeFkGenerationControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeFkGenerationControlRequest,
@@ -5750,6 +5966,11 @@ pub fn storageOwnerRuntimeStatusJson(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
 
+    const observation = (handle.db.runtimeStatusObservationConsistentIfAvailable(handle.alloc) catch |err|
+        return storageOwnerStatusFromError(err)) orelse return .busy;
+    var observation_owned = true;
+    defer if (observation_owned) db_mod.types.freeDBStats(handle.alloc, observation.stats);
+
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
         .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
@@ -5762,8 +5983,7 @@ pub fn storageOwnerRuntimeStatusJson(
         // consistency barrier. Never retain the shared owner lease while
         // waiting for an apply writer: structural reconciliation may need its
         // exclusive lease to advance the exact work holding that writer.
-        .stats = (handle.db.runtimeStatusStatsConsistentIfAvailable(handle.alloc) catch |err|
-            return storageOwnerStatusFromError(err)) orelse return .busy,
+        .stats = observation.stats,
         .lsm_storage_stats = .{
             .maintenance = handle.db.snapshotLsmMaintenanceStats(),
             .write = handle.db.snapshotLsmWriteStats(),
@@ -5771,6 +5991,7 @@ pub fn storageOwnerRuntimeStatusJson(
             .maintenance_debt_hint = handle.db.lsmMaintenanceDebtHint(),
         },
     };
+    observation_owned = false;
     defer status.deinit(handle.alloc);
     status.replaceMetadata(.{
         .updated_at_ns = antfly.platform_time.monotonicNs(),
@@ -5779,6 +6000,7 @@ pub fn storageOwnerRuntimeStatusJson(
         .lsm_root_generation = handle.storage_owner_root_generation,
         .target_observation_revision = runtime_status.observedSourceTargetSequence(status.stats),
         .target_observation_complete = true,
+        .source_authority = observation.source_authority,
     });
     const response = std.json.Stringify.valueAlloc(handle.alloc, status, .{
         .emit_null_optional_fields = false,

@@ -86,6 +86,10 @@ pub fn applyCallback(ctx: *anyopaque, record: record_mod.RecordView) !void {
 /// Preserve envelope provenance precedence after version-specific validation.
 /// DB receives one receipt rather than interpreting the wire's optional fields.
 pub fn normalizeBatch(payload: effects.BatchMutationPayload) !@import("replicated_mutation.zig").Batch {
+    if (payload.index_owner_control) |frame| {
+        try effects.validateIndexOwnerPayload(payload);
+        return .{ .request = .{}, .index_owner_control = frame, .receipt = .{ .native = frame.position } };
+    }
     return .{ .request = payload.request, .receipt = if (payload.native_topology_position) |position|
         .{ .native = position }
     else if (payload.ordinary_raft_entry orelse payload.artifact_publication_raft_entry orelse payload.artifact_publication_transport_raft_entry orelse payload.merge_proof_adoption_raft_entry orelse payload.artifact_catalog_raft_entry orelse payload.initial_child_raft_entry orelse payload.graph_retirement_raft_entry orelse payload.restore_generation_admission_raft_entry) |entry|
