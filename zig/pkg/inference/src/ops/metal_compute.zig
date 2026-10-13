@@ -26995,7 +26995,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         active_frame = false;
         for (choices, request.output_token_ids) |token, *output| output.* = @intCast(token);
         if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) {
-            var matrix_logits = try self.borrowedMetalTensorFromCt(logits);
+            const borrowed_logits = try self.borrowedMetalTensorFromCt(logits);
+            var matrix_logits = try borrowed_logits.retainedCopy();
+            defer matrix_logits.deinit();
             const values = try matrix_logits.toHostSlice();
             for (request.items, 0..) |item, row| {
                 const summary = try ocrLogitSummary(values[row * request.vocab_size ..][0..request.vocab_size], request.suppress_token_ids);
@@ -27012,8 +27014,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var canonical_logits = try ocrRowwisePrepared(ctx, self, canonical_norm, request.final_lm_head_slot, request.hidden_size, request.vocab_size, null);
             defer canonical_logits.deinit();
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
-            var matrix_norm = try self.borrowedMetalTensorFromCt(final_hidden);
-            var matrix_logits = try self.borrowedMetalTensorFromCt(logits);
+            const borrowed_norm = try self.borrowedMetalTensorFromCt(final_hidden);
+            var matrix_norm = try borrowed_norm.retainedCopy();
+            defer matrix_norm.deinit();
+            const borrowed_logits = try self.borrowedMetalTensorFromCt(logits);
+            var matrix_logits = try borrowed_logits.retainedCopy();
+            defer matrix_logits.deinit();
             try reportOcrParity(request, "final-norm", request.layer_count, request.hidden_size, &matrix_norm, &canonical_norm);
             try reportOcrParity(request, "logits", request.layer_count, request.vocab_size, &matrix_logits, &canonical_logits);
             const a = try matrix_logits.toHostSlice();

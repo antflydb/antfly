@@ -1790,6 +1790,7 @@ pub fn forwardGreedyTokensBatch(
         if (!supportsDirectGemmaRuntime(cfg, configured_layers, item.decode_context) or
             item.decode_context.attention_mode != .paged_decode or item.decode_context.query_sequence_len != 1) return null;
     }
+    if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL") and getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) return error.UnsupportedBackend;
     const choices = try allocator.alloc(u32, items.len);
     var success = false;
     defer if (!success) allocator.free(choices);
