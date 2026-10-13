@@ -52802,6 +52802,54 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
     }
 }
 
+// Canonical row-one projection + sumsq + norm + residual for an OCR cohort.
+// Keep this tail per row; gate/up remains a single batched dispatch.
+int termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(
+    termite_metal_decode_runtime *runtime,
+    size_t linear_slot, size_t norm_slot,
+    void *input_handle, size_t input_offset,
+    void *residual_handle, size_t residual_offset,
+    size_t rows, size_t in_dim, size_t hidden_size, float eps,
+    void *output_handle, size_t output_offset
+) {
+    if (runtime == NULL || runtime->active_frame_cb == nil ||
+        input_handle == NULL || residual_handle == NULL || output_handle == NULL) return -1;
+    if (rows == 0 || rows > 8u || in_dim == 0 || hidden_size == 0 ||
+        in_dim > UINT32_MAX || hidden_size > UINT32_MAX) return -2;
+    if (norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY ||
+        !runtime->rms_norm_slot_prepared[norm_slot] ||
+        runtime->rms_norm_hidden_sizes[norm_slot] != hidden_size) return -3;
+    termite_metal_quant_linear_slot_view view;
+    if (termite_metal_decode_runtime_require_quant_linear_slot(runtime,
+            TERMITE_METAL_QUANT_FORMAT_Q4_0, linear_slot, in_dim, hidden_size, &view) != 0) return -4;
+    id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
+    id<MTLBuffer> residual = (__bridge id<MTLBuffer>)residual_handle;
+    id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+    if (input_offset > input.length || rows * in_dim * sizeof(float) > input.length - input_offset ||
+        residual_offset > residual.length || rows * hidden_size * sizeof(float) > residual.length - residual_offset ||
+        output_offset > output.length || rows * hidden_size * sizeof(float) > output.length - output_offset) return -5;
+    id<MTLBuffer> projected = runtime->hot_hidden_buffers[3];
+    if (projected == nil || projected.length < hidden_size * sizeof(float) ||
+        projected == input || projected == residual || projected == output) return -5;
+    const BOOL project_f16 = termite_metal_q4_0_linear_rms_add_f16_project_enabled() &&
+        runtime->rms_norm_add_f16_input_pipeline != nil &&
+        runtime->q4_0_reduce_f16_output_pipeline != nil;
+    for (size_t row = 0; row < rows; ++row) {
+        const int status = termite_metal_encode_quant_linear_rms_add_planned_1x(
+            runtime, runtime->active_frame_cb, TERMITE_METAL_QUANT_FORMAT_Q4_0,
+            TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+            project_f16 ? TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F16 : TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+            (__bridge id<MTLBuffer>)input_handle, input_offset + row * in_dim * sizeof(float),
+            &view, projected, 0, in_dim, hidden_size, norm_slot,
+            (__bridge id<MTLBuffer>)residual_handle, residual_offset + row * hidden_size * sizeof(float),
+            (__bridge id<MTLBuffer>)output_handle, output_offset + row * hidden_size * sizeof(float),
+            eps, 0, 1.0f, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION,
+            TERMITE_METAL_COMPUTE_REGION_ATTENTION_PROJECT, -6);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
 static int termite_metal_decode_runtime_encode_attention_quantized_residual_k_slot(
     termite_metal_decode_runtime *runtime,
     uint32_t attention_quant_format,

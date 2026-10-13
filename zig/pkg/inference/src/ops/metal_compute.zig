@@ -21280,11 +21280,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             attention_linear_input = attention_linear_input_owned.?;
             try self.maybeDumpDecodeStageTensor("attn-pre", attention_layer_index, attention_linear_input, attention_input_size);
         }
+        var canonical_attention_residual: ?MetalTensor = null;
+        defer if (canonical_attention_residual) |*tensor| tensor.deinit();
+        if (request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and
+            getenvBool("TERMITE_METAL_Q4_0_BATCH_INVARIANT") and
+            request.attention_post_linear_rms_norm_slot != null)
+        {
+            canonical_attention_residual = try metal_runtime.decoderRuntimeApplyCanonicalQ4LinearRmsAdd(self.provider_impl, .{
+                .input = attention_linear_input,
+                .residual = residual_mt,
+                .linear_slot = request.attention_linear_slot,
+                .norm_slot = request.attention_post_linear_rms_norm_slot.?,
+                .rows = @as(usize, @intCast(attention_linear_input.dim(0))),
+                .in_dim = attention_input_size,
+                .hidden_size = request.hidden_size,
+                .eps = request.eps,
+            });
+        }
         var projected: MetalTensor = undefined;
         {
             const projection_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .attention_project);
             defer self.endActivePlannedComputeScope(projection_scope);
-            projected = if (request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and attn_out.dim(0) > 1 and getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT"))
+            projected = if (canonical_attention_residual) |tensor|
+                try tensor.retainedCopy()
+            else if (request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and attn_out.dim(0) > 1 and getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT"))
                 try ocrRowwisePrepared(@ptrCast(self), self, attention_linear_input, request.attention_linear_slot, attention_input_size, request.hidden_size, null)
             else
                 (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
@@ -21301,7 +21320,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 };
         }
         defer projected.deinit();
-        try self.maybeDumpDecodeStageTensor("attn-proj", attention_layer_index, projected, request.hidden_size);
+        if (canonical_attention_residual == null) try self.maybeDumpDecodeStageTensor("attn-proj", attention_layer_index, projected, request.hidden_size);
 
         var attn_post: MetalTensor = undefined;
         var attn_res: MetalTensor = undefined;
@@ -21309,7 +21328,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         {
             const residual_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.rms_norm, .ffn_norm);
             defer self.endActivePlannedComputeScope(residual_scope);
-            attn_post = if (request.attention_post_linear_rms_norm_slot) |slot|
+            attn_post = if (canonical_attention_residual != null)
+                try projected.retainedCopy()
+            else if (request.attention_post_linear_rms_norm_slot) |slot|
                 (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
                     .slot = slot,
                     .input = projected,
@@ -21325,19 +21346,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else
                 try projected.retainedCopy();
             errdefer attn_post.deinit();
-            try self.maybeDumpDecodeStageTensor("attn-post", attention_layer_index, attn_post, request.hidden_size);
+            if (canonical_attention_residual == null) try self.maybeDumpDecodeStageTensor("attn-post", attention_layer_index, attn_post, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
-            attn_res = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
-                .lhs = attn_post,
-                .rhs = residual_mt,
-                .dim = request.hidden_size,
-            }, &self.timing_stats)) orelse {
-                if (trace_quant) std.debug.print(
-                    "metal-prefill-staged-null layer={d} reason=attention-residual-add hidden={d} lhs_device={} rhs_device={}\n",
-                    .{ attention_layer_index, request.hidden_size, attn_post.isDevice(), residual_mt.isDevice() },
-                );
-                return null;
-            };
+            attn_res = if (canonical_attention_residual) |tensor|
+                try tensor.retainedCopy()
+            else
+                (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                    .lhs = attn_post,
+                    .rhs = residual_mt,
+                    .dim = request.hidden_size,
+                }, &self.timing_stats)) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=attention-residual-add hidden={d} lhs_device={} rhs_device={}\n",
+                        .{ attention_layer_index, request.hidden_size, attn_post.isDevice(), residual_mt.isDevice() },
+                    );
+                    return null;
+                };
             errdefer attn_res.deinit();
             try self.maybeDumpDecodeStageTensor("attn-residual", attention_layer_index, attn_res, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);

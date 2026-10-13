@@ -9210,6 +9210,42 @@ pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: a
     return null;
 }
 
+extern fn termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    linear_slot: usize,
+    norm_slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    residual_handle: ?*anyopaque,
+    residual_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    hidden_size: usize,
+    eps: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+
+/// Preserve the framed singleton attention projection/norm/residual family.
+pub fn decoderRuntimeApplyCanonicalQ4LinearRmsAdd(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!hasActiveFrame(runtime) or !request.input.isDevice() or !request.residual.isDevice()) return null;
+    if (request.rows == 0 or request.rows > 8 or request.in_dim == 0 or request.hidden_size == 0) return null;
+    if (request.linear_slot >= decoder_runtime_linear_slot_capacity or
+        request.norm_slot >= decoder_runtime_rms_norm_slot_capacity) return null;
+    if (!self.raw_linear_slot_bias_is_zero[request.linear_slot] or
+        ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.in_dim, request.hidden_size) != .q4_0) return null;
+    if (request.input.ndim() != 2 or request.residual.ndim() != 2 or
+        @as(usize, @intCast(request.input.dim(0))) != request.rows or @as(usize, @intCast(request.input.dim(1))) != request.in_dim or
+        @as(usize, @intCast(request.residual.dim(0))) != request.rows or @as(usize, @intCast(request.residual.dim(1))) != request.hidden_size) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &.{ @intCast(request.rows), @intCast(request.hidden_size) });
+    errdefer output.deinit();
+    const status = termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(runtime, request.linear_slot, request.norm_slot, request.input.deviceHandle(), request.input.deviceByteOffset(), request.residual.deviceHandle(), request.residual.deviceByteOffset(), request.rows, request.in_dim, request.hidden_size, request.eps, output.deviceHandle(), output.deviceByteOffset());
+    if (status == 0) return output;
+    output.deinit();
+    return null;
+}
+
 pub fn decoderRuntimeApplyRmsNormAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -37327,6 +37363,47 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
             try waitFrame(runtime);
             const single_values = try tensorHostSlice(&single);
             for (single_values, packed_values[row * tail_dim ..][0..tail_dim]) |a, b|
+                try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        }
+        const gate_values = try tensorHostSlice(&gated);
+        try beginFrame(runtime);
+        var fused_rows = (try decoderRuntimeApplyCanonicalQ4LinearRmsAdd(&provider, .{
+            .input = gated,
+            .residual = residual,
+            .linear_slot = @as(usize, 62),
+            .norm_slot = @as(usize, 12),
+            .rows = rows,
+            .in_dim = intermediate_size,
+            .hidden_size = hidden_size,
+            .eps = @as(f32, 1e-5),
+        })) orelse return error.UnexpectedNull;
+        defer fused_rows.deinit();
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        const fused_values = try tensorHostSlice(&fused_rows);
+        // Read references in reverse order to catch accidental cross-row state.
+        for (0..rows) |index| {
+            const row = rows - 1 - index;
+            var single_input = try testDeviceTensorFromSlice(runtime, gate_values[row * intermediate_size ..][0..intermediate_size], &.{ 1, intermediate_size });
+            defer single_input.deinit();
+            var single_residual = try testDeviceTensorFromSlice(runtime, residual_data[row * hidden_size ..][0..hidden_size], &.{ 1, hidden_size });
+            defer single_residual.deinit();
+            try beginFrame(runtime);
+            var single = (try decoderRuntimeApplyCanonicalQ4LinearRmsAdd(&provider, .{
+                .input = single_input,
+                .residual = single_residual,
+                .linear_slot = @as(usize, 62),
+                .norm_slot = @as(usize, 12),
+                .rows = @as(usize, 1),
+                .in_dim = intermediate_size,
+                .hidden_size = hidden_size,
+                .eps = @as(f32, 1e-5),
+            })) orelse return error.UnexpectedNull;
+            defer single.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            const single_values = try tensorHostSlice(&single);
+            for (single_values, fused_values[row * hidden_size ..][0..hidden_size]) |a, b|
                 try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
         }
         try beginFrame(runtime);
