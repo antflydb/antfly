@@ -1,6 +1,6 @@
 # Antfly
 
-Antfly is a search-and-inference database written in Zig. One engine carries full-text (BM25), dense, sparse, and late-interaction vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
+Antfly is a search-and-inference database written in Zig. One engine carries full-text (BM25), dense, and sparse vector indexes plus graph traversal over the same table, and the models that chunk, embed, rerank, transcribe, OCR, and extract run inside the process. Embeddings, chunks, entities, and graph edges are generated automatically as you write data, and built-in RAG agents tie it together. The same engine runs as a single `.aflite` file, a single node with a hot standby, a multi-Raft cluster, or serverless over object storage.
 
 ![Quickstart](https://cdn.antfly.io/quickstart.gif)
 
@@ -21,7 +21,7 @@ make build && ./antfly standalone
 docker run -p 127.0.0.1:8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 ```
 
-These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/auth.md#secure-deployment), then configure TLS at a reverse proxy.
+These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/reference/auth.md#secure-deployment), then configure TLS at a reverse proxy.
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
 
@@ -65,23 +65,23 @@ The standalone server uses the same Apache engine under ELv2. See [LICENSING.md]
 
 ## Features
 
-- **Hybrid search** — full-text (BM25), dense vectors ([RaBitQ](https://arxiv.org/abs/2405.12497)-compressed with [SPFresh](https://arxiv.org/abs/2410.14452)-style updates), sparse vectors ([SPLADE](https://arxiv.org/abs/2107.05720)), and [late interaction](https://arxiv.org/abs/2004.12832) (ColQwen2), fused with [reciprocal rank](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) or relative score fusion in one query
+- **Hybrid search** — full-text (BM25), dense vectors ([RaBitQ](https://arxiv.org/abs/2405.12497)-compressed with [SPFresh](https://arxiv.org/abs/2410.14452)-style updates), and sparse vectors ([SPLADE](https://arxiv.org/abs/2107.05720)), fused with [reciprocal rank](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) or relative score fusion in one query
 - **Full-text search** — Lucene-style segments with [highlighting](zig/pkg/antfly-embedded/src/search/highlight.zig), geo, regex, wildcard, and fuzzy queries, plus English and ten [Snowball](https://snowballstem.org/) stemmer languages
 - **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/reference/toon-format.md) document rendering to cut prompt tokens
 - **Query-builder agent** — turns a natural-language question into a structured Antfly query, with [evaluation metrics](go/pkg/evalaf) to measure retrieval quality
 - **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly-embedded/src/graph) over your data
 - **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
-- **Reranking** — cross-encoder reranking with score-based pruning to cut the noise
+- **Reranking** — cross-encoder and [late-interaction](https://arxiv.org/abs/2004.12832) ([ColBERT](zig/pkg/inference/RERANKING.md), ColQwen2) reranking with score-based pruning to cut the noise
 - **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
 - **Document TTL** — automatic [document expiration](docs/guides/ttl-example.md) so you don't have to clean up yourself
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
 - **CLI** — one `antfly` binary for the server, tables, queries, backups, auth, and the [model registry](docs/guides/inference.mdx) (`antfly inference pull owner/model`)
 - **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/reference/secrets.md) instead of putting them in config
-- **Object storage** — the [serverless engine](docs/reference/s3-storage.md) keeps artifacts, manifests, WAL, and catalog state in S3-compatible storage (S3, MinIO, R2) or Google Cloud Storage
-- **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
+- **Object storage** — the [serverless engine](docs/reference/s3-storage.md) (unreleased) keeps artifacts, manifests, WAL, and catalog state in S3-compatible storage (S3, MinIO, R2) or Google Cloud Storage
+- **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with kernels generated at build time and shipped as fatbins, plus an opt-in runtime kernel JIT for Metal and CUDA (`ANTFLY_INFERENCE_KERNEL_JIT_MODE`, off by default)
 - **Distributed** — multi-Raft consensus, key-range sharding and replication, online shard splits (automatic size-based split and merge is opt-in), cross-shard transactions, horizontal scaling
-- **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
+- **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage (unreleased)
 - **Embeddable** — a [C API](zig/pkg/antfly-embedded/src/capi) (`libantfly`), [embedded bindings](docs/reference/sdks.mdx#embedded-bindings) for [Go](go/pkg/embedded), [Python](py/packages/embedded), [Rust](rs/crates/embedded), and [TypeScript](ts/packages/embedded), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
 - **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly-embedded/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
