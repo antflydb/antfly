@@ -2014,6 +2014,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
+    // The aggregate owns unit work; corpus-scale storage benchmarks retain
+    // their release-scale owner. Keep focused introducer coverage unchanged.
+    const run_unit_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
+    addRuntimeSkipTestFilters(run_unit_introducer_tests, &release_scale_test_filters);
     const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
     introducer_test_step.dependOn(&run_introducer_tests.step);
 
@@ -5060,7 +5064,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);
-    unit_test_step.dependOn(&run_introducer_tests.step);
+    unit_test_step.dependOn(&run_unit_introducer_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     // Data storage has its own root module, so the root-module `storage.` union
