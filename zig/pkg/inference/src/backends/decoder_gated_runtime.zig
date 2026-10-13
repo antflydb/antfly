@@ -1843,7 +1843,19 @@ pub fn forwardGreedyTokensBatch(
         .output_token_ids = token_ids[0..items.len],
     };
     if (!try cb.decoderRuntimeDecodeBatch(&request)) return null;
-    for (choices, token_ids[0..items.len]) |*choice, token| choice.* = @intCast(token);
+    for (choices, token_ids[0..items.len], items) |*choice, token, item| {
+        if (token < 0 or token >= cfg.vocab_size) return error.InvalidModelOutput;
+        var selected = token;
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CONFIRM_EOS") and cfg.isEosToken(@intCast(token))) {
+            // The batched suffix has written this input token's KV already.
+            // Recompute the same position without appending another slot. A
+            // canonical singleton checks termination before a page is retired.
+            selected = (try forwardGreedyTokenPreparedOnly(cb, allocator, cfg, configured_layers, item.token_id, item.seq_len, item.decode_context)) orelse return error.UnsupportedBackend;
+            if (selected < 0 or selected >= cfg.vocab_size) return error.InvalidModelOutput;
+            if (getenvBool("TERMITE_METAL_TRACE_GEMMA4_OCR_STOP")) std.debug.print("metal-ocr-stop-check: seq={d} batched={d} canonical={d} replaced={}\n", .{ item.seq_len, token, selected, selected != token });
+        }
+        choice.* = @intCast(selected);
+    }
     success = true;
     return choices;
 }
