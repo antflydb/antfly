@@ -119,8 +119,10 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"], "1")
         flags, _, _ = sweep.flags_for("cohort4w8optimizedprofile")
         self.assertEqual(flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"], "0")
+        self.assertEqual(flags["TERMITE_METAL_STAGE_TIMING_DECODE_STRIDE"], "65")
+        self.assertEqual(flags["TERMITE_METAL_STAGE_TIMING_DECODE_MAX"], "16")
         parsed = sweep.profile(
-            "metal_ocr_gpu_stages: scope=sampled_backbone_frames complete=1 frames=2 gpu_ns=3 ffn_ns=2\nmetal_ocr_cohort_overhead: rows=4 canonical_heads_wall_ns=10 carrier_allocations=3 carrier_reuses=8\n"
+            "metal_ocr_gpu_stages: scope=sampled_decode_frames complete=1 frames=2 gpu_ns=3 ffn_ns=2\nmetal_ocr_cohort_overhead: rows=4 canonical_heads_wall_ns=10 carrier_allocations=3 carrier_reuses=8\n"
         )
         self.assertEqual(parsed["metal_ocr_gpu_stages"][0]["frames"], 2)
         self.assertEqual(parsed["metal_ocr_cohort_overhead"][0]["carrier_reuses"], 8)

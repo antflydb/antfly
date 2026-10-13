@@ -113,6 +113,9 @@ def flags_for(case):
         if variant in {"invariantprofile", "headprofile", "optimizedprofile"}:
             flags["TERMITE_METAL_STAGE_TIMING"] = "1"
             flags["TERMITE_METAL_STAGE_TIMING_ROOFLINE"] = "0"
+            # An odd cadence samples both backbone and optional head frames.
+            flags["TERMITE_METAL_STAGE_TIMING_DECODE_STRIDE"] = "65"
+            flags["TERMITE_METAL_STAGE_TIMING_DECODE_MAX"] = "16"
         if variant in {"share", "fused", "reuse", "optimized", "optimizedprofile"}:
             flags["TERMITE_METAL_Q4_0_BATCH_SHARED"] = "1"
         if variant in {

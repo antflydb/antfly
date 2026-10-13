@@ -26743,6 +26743,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             hidden.dim(0) != @as(i32, @intCast(tokens.len)) or hidden.dim(1) != @as(i32, @intCast(width)) or
             metal_runtime.hasActiveFrame(runtime) or linear_slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
             self.provider_impl.raw_linear_slot_kinds[linear_slot] != .quantized) return false;
+        if (!metal_runtime.reserveArgmaxRows(self.provider_impl, tokens.len, vocab)) return false;
         var active = try self.beginPreparedDecoderRuntimeFrame(runtime);
         if (!active) return false;
         defer if (active) metal_runtime.cancelFrame(runtime) catch {};
@@ -26750,6 +26751,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer normed.deinit();
         var logits = try ocrRowwisePrepared(self, self, normed, linear_slot, width, vocab, null);
         defer logits.deinit();
+        // Row packing closes compute for its blits. Reopen the tail scope
+        // so argmax consumes this frame rather than flushing and restoring it.
+        try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.tail), .tail);
         var choices: [4]u32 = undefined;
         if (!try metal_runtime.argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(self.provider_impl, logits, 0, vocab, suppress, choices[0..tokens.len]))
             return error.NativeBatchedDecodeUnavailable;
@@ -42291,12 +42295,12 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
         var bias = try MetalTensor.ownedCloneFrom(&@as([vocab]f32, @splat(0)), &.{vocab});
         defer bias.deinit();
         var prep: ops.NativeQuantTimingStats = .{};
-        try std.testing.expect(try metal_runtime.decoderRuntimePrepareLinear(provider, .{ .slot = 0, .weight = dummy, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .in_dim = width, .out_dim = vocab, .retain_dense_fallback = false }, &prep));
+        if (!try metal_runtime.decoderRuntimePrepareLinear(provider, .{ .slot = 0, .weight = dummy, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .in_dim = width, .out_dim = vocab, .retain_dense_fallback = false }, &prep)) return error.OcrHeadFixtureLinearPreparationRejected;
         var norm: [width]f32 = undefined;
         for (&norm, 0..) |*v, i| v.* = 0.75 + @as(f32, @floatFromInt(i % 9)) / 32;
         const norm_ct = try cb.fromFloat32Shape(&norm, &.{width});
         defer cb.free(norm_ct);
-        try std.testing.expect(try cb.decoderRuntimePrepareRmsNorm(&.{ .slot = 0, .weight = norm_ct, .hidden_size = width }));
+        if (!try cb.decoderRuntimePrepareRmsNorm(&.{ .slot = 0, .weight = norm_ct, .hidden_size = width })) return error.OcrHeadFixtureNormPreparationRejected;
         var inputs: [rows * width]f32 = undefined;
         for (&inputs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + i / width * 19) % 53)) - 26)) / 16;
         const input_ct = try cb.fromFloat32Shape(&inputs, &.{ rows, width });
@@ -42309,14 +42313,14 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
             var view = try input.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
             defer view.deinit();
             var norm_stats: ops.NativeQuantTimingStats = .{};
-            var n = (try metal_runtime.decoderRuntimeApplyRmsNorm(provider, .{ .slot = 0, .input = view, .hidden_size = width, .eps = @as(f32, 1e-6) }, &norm_stats)) orelse return error.TestUnexpectedResult;
+            var n = (try metal_runtime.decoderRuntimeApplyRmsNorm(provider, .{ .slot = 0, .input = view, .hidden_size = width, .eps = @as(f32, 1e-6) }, &norm_stats)) orelse return error.OcrHeadFixtureOracleNormUnavailable;
             defer n.deinit();
-            var logits = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{ .slot = 0, .input = n, .in_dim = width, .out_dim = vocab })) orelse return error.TestUnexpectedResult;
+            var logits = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{ .slot = 0, .input = n, .in_dim = width, .out_dim = vocab })) orelse return error.OcrHeadFixtureOracleLinearUnavailable;
             defer logits.deinit();
             @memcpy(reference_logits[row * vocab ..][0..vocab], try logits.toHostSlice());
-            reference_tokens[row] = @intCast((try metal_runtime.argmaxLogitsSuppressDevice(provider, logits, vocab, &.{ 0, 1, 2048 })) orelse return error.TestUnexpectedResult);
+            reference_tokens[row] = @intCast((try metal_runtime.argmaxLogitsSuppressDevice(provider, logits, vocab, &.{ 0, 1, 2048 })) orelse return error.OcrHeadFixtureOracleArgmaxUnavailable);
         }
-        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        if (!try cb.decoderRuntimeBeginFrame()) return error.OcrHeadFixtureFrameUnavailable;
         defer cb.decoderRuntimeCancelFrame() catch {};
         var n = try MetalCompute.ocrRowwisePrepared(&compute, &compute, input, 0, width, width, 1e-6);
         defer n.deinit();
@@ -42327,7 +42331,7 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
         for (reference_logits, values) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
         const before = metal_runtime.runtimeMemorySnapshot(runtime);
         var tokens: [rows]i64 = undefined;
-        try std.testing.expect(try compute.ocrCanonicalHeadFrame(input, 0, 0, width, vocab, 1e-6, &.{ 0, 1, 2048 }, &tokens));
+        if (!try compute.ocrCanonicalHeadFrame(input, 0, 0, width, vocab, 1e-6, &.{ 0, 1, 2048 }, &tokens)) return error.OcrHeadFixtureCohortUnavailable;
         try std.testing.expectEqualSlices(i64, &reference_tokens, &tokens);
         try std.testing.expectEqual(before.frame_submit_count + 1, metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count);
         try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
