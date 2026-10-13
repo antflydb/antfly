@@ -38496,7 +38496,12 @@ test "graph maintenance commit handoff forks the old epoch without holding the v
         Hook.retained = null;
         defer nested.abort();
         _ = try nested.get(key);
-        const entry = (try Hook.retained_cursor.?.first()).?;
+        // The outgoing store also holds data-epoch metadata; seek the edge
+        // whose retained snapshot membership this test is checking.
+        const outgoing_key = try edgeKeyAlloc(a, "z", "g", "link", "a");
+        defer a.free(outgoing_key);
+        const entry = (try Hook.retained_cursor.?.seekAtOrAfter(outgoing_key)).?;
+        try std.testing.expectEqualStrings(outgoing_key, entry.key);
         try std.testing.expectEqualStrings("z", BorrowedEdgeKey.parse(entry.key, .out).?.source);
     }
 }
