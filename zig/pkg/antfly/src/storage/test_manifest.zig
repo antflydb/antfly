@@ -252,6 +252,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_promotion_runtime;
     _ = @import("antfly_local_sources").storage_db_publication;
     _ = @import("antfly_local_sources").storage_db_query_graph_exec;
+    _ = @import("antfly_local_sources").storage_db_query_document_authority;
     _ = @import("antfly_local_sources").storage_db_query_json_view;
     _ = @import("antfly_local_sources").storage_db_query_projection;
     _ = @import("antfly_local_sources").storage_db_query_relational_projection;
