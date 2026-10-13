@@ -148,7 +148,7 @@ curl -fsSL https://raw.githubusercontent.com/NandhaKishorM/laya/6a5819129eb22057
 uv run scripts/laya/laya_reference.py --common /tmp/laya-common.py --output /tmp/laya-reference
 cd zig
 ANTFLY_LAYA_REFERENCE=/tmp/laya-reference python3 tools/run_bounded_zig_build.py \
-  build inference-test -Dmetal=false -Dcuda=false -Donnx=false -- --test-filter 'laya '
+  build inference-test -Dmetal=false -Dcuda=false -- --test-filter 'laya '
 ```
 
 Parity tests skip when `ANTFLY_LAYA_REFERENCE` is unset. Set `ANTFLY_LAYA_METAL=1`
@@ -224,7 +224,7 @@ tested artifacts, hardware, and profiles.
 
 To reproduce the comparison, generate a reference with
 `scripts/laya/laya_export_reference.py`, then build `inference-test` with
-`-Dmetal=true -Dcuda=false -Donnx=false -Doptimize=fast` and the `laya `
+`-Dmetal=true -Dcuda=false -Doptimize=fast` and the `laya `
 test filter. Run each checkpoint precision separately:
 
 ```sh
@@ -365,7 +365,7 @@ from application-specific accuracy or throughput qualification.
 python3 scripts/laya/laya_training_reference.py --common /tmp/laya-common.py --fixture /tmp/laya-reference
 cd zig
 ANTFLY_LAYA_REFERENCE=/tmp/laya-reference python3 tools/run_bounded_zig_build.py \
-  --zig /path/to/zig-0.16.0 build inference-test -Dmetal=false -Dcuda=false -Donnx=false \
+  --zig /path/to/zig-0.16.0 build inference-test -Dmetal=false -Dcuda=false \
   -- --test-filter 'laya training'
 ```
 

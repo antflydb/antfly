@@ -1,13 +1,19 @@
+# Source Ownership Migration Qualification (September 2026)
+
+> Relocated verbatim from `zig/VECTOR_STORAGE_MIGRATION_FINDINGS.md` (lines 1–485 at commit 3ce5aff4ea) on 2026-10-12. Durable decisions were folded into [VECTOR_STORE.md](../../../../zig/VECTOR_STORE.md#qualification-and-remaining-scope) before the move.
+>
+> Relative links were re-based to this file's location. Paths under `.benchmark-results/` refer to untracked local benchmark output at the repository root.
+
 # Source ownership migration qualification
 
 The public interface is `antfly storage migrate` and the table-scoped
-`/storage/migrations` job API documented in [VECTOR_STORE.md](VECTOR_STORE.md).
+`/storage/migrations` job API documented in [VECTOR_STORE.md](../../../../zig/VECTOR_STORE.md).
 Qualification compares existing primary-LSM tables migrated online/offline with
 fresh vector-store tables. It does not change the table-creation default.
 
 ## Protocol
 
-[`scripts/qualify_vector_migration.py`](scripts/qualify_vector_migration.py) retains
+[`scripts/qualify_vector_migration.py`](../../../../zig/scripts/qualify_vector_migration.py) retains
 inputs, binary hashes, databases, progress, and results. The screen uses 768-D
 normalized synthetic vectors, cosine distance, default ANN settings, 256-document
 write batches, 1,000 updates and 1,000 deletes. Online churn happens after capture
@@ -463,7 +469,7 @@ approximate neighbors across an idle repair. Restart alone does not drain it.
 The earlier failures did not demonstrate missing source vectors or migration
 corruption, and repeated immediate queries were not a sufficient baseline gate.
 
-> **Relocated:** The `hbc_posting.refresh_pending` status-field semantics are documented in [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#status-and-metrics) (Status and metrics).
+> **Relocated:** The `hbc_posting.refresh_pending` status-field semantics are documented in [DENSE_INDEXING_LIFECYCLE.md](../../../../zig/DENSE_INDEXING_LIFECYCLE.md#status-and-metrics) (Status and metrics).
 
 The E2E fixture first activates the lazily opened owner with a query, then waits
 for fresh, complete status and a clean refresh certificate. Status-only cold

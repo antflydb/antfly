@@ -70,7 +70,6 @@ const RuntimeContext = struct {
             .metal => .metal,
             .cuda => .cuda,
             .pjrt => return error.UnexpectedPjrtBackend,
-            .onnx => return error.UnexpectedOnnxBackend,
             .wasm => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
@@ -377,6 +376,5 @@ fn forwardLastLogits(
 test "live model executor supports native and metal backends" {
     try std.testing.expect(supportsBackend(.native));
     try std.testing.expect(supportsBackend(.metal));
-    try std.testing.expect(!supportsBackend(.onnx));
     try std.testing.expect(!supportsBackend(.pjrt));
 }

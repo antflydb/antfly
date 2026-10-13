@@ -90,15 +90,13 @@ pub const AudioContext = enum {
     }
 };
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const BackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
     native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
@@ -111,7 +109,6 @@ pub const BackendRuntimes = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "native", "native", true },
-        .{ "onnx", "onnx", true },
         .{ "metal", "metal", true },
         .{ "cuda", "cuda", true },
         .{ "xla", "xla", true },
@@ -130,10 +127,6 @@ pub const BackendRuntimes = struct {
         try jw.beginObject();
         if (self.native) |value| {
             try jw.objectField("native");
-            try jw.write(value);
-        }
-        if (self.onnx) |value| {
-            try jw.objectField("onnx");
             try jw.write(value);
         }
         if (self.metal) |value| {
@@ -2327,7 +2320,7 @@ pub const GenerateRequest = struct {
     frequency_penalty: ?f32 = null,
     /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
     presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
     response_format: ?GenerateResponseFormat = null,
     /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
     grammar: ?[]const u8 = null,
@@ -2732,7 +2725,6 @@ pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 pub const ModelBackend = enum {
     auto,
     native,
-    onnx,
     metal,
     cuda,
     xla,
@@ -2743,7 +2735,6 @@ pub const ModelBackend = enum {
         const s = switch (self) {
             .auto => "auto",
             .native => "native",
-            .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
             .xla => "xla",
@@ -2761,7 +2752,6 @@ pub const ModelBackend = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "auto", .auto },
             .{ "native", .native },
-            .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
             .{ "xla", .xla },

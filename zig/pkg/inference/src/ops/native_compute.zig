@@ -3973,6 +3973,8 @@ fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
 
 fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
     if (shouldBorrowEmbeddingTensor(name)) return true;
+    if (self.borrow_typed_matrix_weights and tensor.shape.len == 2 and
+        (tensor.dtype == .f16 or tensor.dtype == .bf16)) return true;
     if (!self.borrow_bf16_linear_weights) return false;
     if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
     if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
@@ -4024,6 +4026,10 @@ fn tensorF32View(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !Weight
     return .{ .data = converted, .owned = converted };
 }
 
+/// Row count from which f16 source-tensor linears convert weight blocks to
+/// f32 and use system BLAS instead of the direct f16 kernel.
+const f16_direct_gemm_max_rows_with_blas: usize = 32;
+
 fn linearNoBiasSourceTensorChunked(
     self: *NativeCompute,
     input: []const f32,
@@ -4048,7 +4054,9 @@ fn linearNoBiasSourceTensorChunked(
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
     // the weight bandwidth -- the dominant cost for transformer linear ops.
-    if (tensor.dtype == .f16) {
+    // Prefill-sized inputs are compute-bound instead; with system BLAS the
+    // blocked f32 conversion below is several times faster there.
+    if (tensor.dtype == .f16 and (rows < f16_direct_gemm_max_rows_with_blas or !native.useBlas())) {
         if (tensor.asFloat16IfAligned()) |weight_f16| {
             try self.dispatchSgemmTransBF16Weights(
                 rows,
@@ -4235,6 +4243,10 @@ pub const NativeCompute = struct {
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
+    /// Borrow every resident 2-D f16/bf16 weight for typed GEMM. Only for
+    /// sessions whose 2-D weights are consumed exclusively by linear ops
+    /// (native Moondream reads its embedding table on the host).
+    borrow_typed_matrix_weights: bool = false,
     /// Granted only to immutable EmbeddingGemma2 inference sessions. The
     /// WeightStore owns admitted mirrors; request contexts only borrow them.
     cache_embeddinggemma2_bf16_weights: bool = false,

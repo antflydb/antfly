@@ -16,7 +16,6 @@
 //! Capabilities of offline artifact editing, independent of product backends.
 pub const link_libc = true;
 pub const enable_cuda = false;
-pub const enable_onnx = false;
 pub const enable_metal = false;
 pub const enable_pjrt = false;
 pub const enable_native = false;

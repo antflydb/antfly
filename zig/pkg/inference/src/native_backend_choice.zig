@@ -21,7 +21,6 @@ const ops = @import("ops/ops.zig");
 
 pub const Choice = enum {
     auto,
-    onnx,
     native,
     metal,
     cuda,
@@ -31,7 +30,6 @@ pub const Choice = enum {
 
 pub fn parse(value: []const u8) ?Choice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
@@ -54,7 +52,6 @@ pub fn withPreferredDefault(requested: Choice, preferred: Choice) Choice {
 
 pub fn validate(choice: Choice) !void {
     switch (choice) {
-        .onnx => if (!build_options.enable_onnx) return error.BackendUnavailable,
         .native => if (!build_options.enable_native) return error.BackendUnavailable,
         .metal => if (!build_options.enable_metal) return error.BackendUnavailable,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
@@ -72,7 +69,6 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{},
@@ -91,7 +87,6 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
 
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
-        .onnx => .onnx,
         .xla => .pjrt,
         .auto, .native, .metal, .cuda, .webgpu => null,
     };
@@ -111,7 +106,6 @@ pub fn validateRequiredCompiledBackend(
     const backend = switch (compiled_backend orelse return) {
         .native => backends.BackendType.native,
         .metal => backends.BackendType.metal,
-        .onnx => backends.BackendType.onnx,
         .pjrt => backends.BackendType.pjrt,
         .cuda => backends.BackendType.cuda,
         .wasm, .webgpu => backends.BackendType.wasm,
@@ -125,7 +119,6 @@ pub fn validateRequiredCompiledBackend(
 }
 
 pub fn compiledArtifactBackend(name: []const u8) !ops.BackendKind {
-    if (std.mem.eql(u8, name, "onnx")) return .onnx;
     if (std.mem.eql(u8, name, "xla")) return .pjrt;
     return error.UnsupportedCompileBackend;
 }
@@ -147,7 +140,7 @@ pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
 }
 
 test "parse accepts explicit compiled backends" {
-    try std.testing.expectEqual(Choice.onnx, parse("onnx").?);
+    try std.testing.expect(parse("onnx") == null);
     try std.testing.expectEqual(Choice.xla, parse("xla").?);
     try std.testing.expectEqual(Choice.xla, parse("pjrt").?);
     try std.testing.expectEqual(Choice.webgpu, parse("webgpu").?);
@@ -159,7 +152,6 @@ test "preferred default only replaces auto choice" {
 }
 
 test "compiledPartitionBackend maps explicit compiled backends" {
-    try std.testing.expectEqual(@as(?ops.BackendKind, .onnx), compiledPartitionBackend(.onnx));
     try std.testing.expectEqual(@as(?ops.BackendKind, .pjrt), compiledPartitionBackend(.xla));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.metal));
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackend(.webgpu));
@@ -185,7 +177,7 @@ test "required backend gates compiled backend execution" {
     try validateRequiredCompiledBackend(&manager, .native);
     try std.testing.expectError(
         error.RequiredBackendUnavailable,
-        validateRequiredCompiledBackend(&manager, .onnx),
+        validateRequiredCompiledBackend(&manager, .metal),
     );
 
     manager.required_backend = .pjrt;
@@ -198,7 +190,7 @@ test "required backend gates compiled backend execution" {
     manager.required_backend_invalid = true;
     try std.testing.expectError(
         error.InvalidRequiredBackend,
-        validateRequiredCompiledBackend(&manager, .onnx),
+        validateRequiredCompiledBackend(&manager, .pjrt),
     );
     try std.testing.expectError(
         error.InvalidRequiredBackend,
@@ -207,8 +199,8 @@ test "required backend gates compiled backend execution" {
 }
 
 test "compiled artifact backend names share required policy validation" {
-    try std.testing.expectEqual(ops.BackendKind.onnx, try compiledArtifactBackend("onnx"));
     try std.testing.expectEqual(ops.BackendKind.pjrt, try compiledArtifactBackend("xla"));
+    try std.testing.expectError(error.UnsupportedCompileBackend, compiledArtifactBackend("onnx"));
     try std.testing.expectError(error.UnsupportedCompileBackend, compiledArtifactBackend("cuda"));
 
     var manager = backends.SessionManager.init(std.testing.allocator);
@@ -216,7 +208,7 @@ test "compiled artifact backend names share required policy validation" {
     manager.required_backend_invalid = false;
     try std.testing.expectError(
         error.RequiredBackendUnavailable,
-        validateRequiredCompiledBackend(&manager, try compiledArtifactBackend("onnx")),
+        validateRequiredCompiledBackend(&manager, try compiledArtifactBackend("xla")),
     );
 }
 
@@ -224,9 +216,6 @@ test "explicit session preferences never silently fall back" {
     var manager = backends.SessionManager.init(std.testing.allocator);
     configureSessionPreference(&manager, .native);
     try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, manager.preferred_backends);
-
-    configureSessionPreference(&manager, .onnx);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{.onnx}, manager.preferred_backends);
 
     configureSessionPreference(&manager, .metal);
     if (build_options.enable_metal) {
