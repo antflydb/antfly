@@ -1363,8 +1363,13 @@ const long_document_geometry_cases = [_]LongDocumentCase{
     .{ .name = "shortest canonical fixture, windowed", .text = "Delete the temporary file." },
     .{ .name = "ENRICHMENTS.md realistic short paragraph, windowed (734 bytes/107 words)", .text = "Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream." },
     .{ .name = "LSM.md \"Read And Scan Work\" (~p95 real section size, 6.8KB)", .path = "../antfly/src/storage/lsm/LSM.md", .heading = "### Read And Scan Work" },
-    .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "../../VOPR.md", .heading = "### Completion-Claim Audit" },
-    .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "../../PDF.md", .heading = "## Review findings and required fixes" },
+    // Frozen, byte-for-byte snapshots (at commit 3ce5aff4ea) of two real
+    // design-doc sections, cut from the heading line up to (but excluding)
+    // the next line starting with '#', exactly as extractHeadingSection
+    // would. Frozen so editing zig/VOPR.md or zig/PDF.md never changes the
+    // measured geometry.
+    .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt" },
+    .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "testdata/gliner25/long_document_probe/pdf_review_findings.txt" },
     // Synthetic documents built by concatenating zig/PDF.md's two largest
     // real sections (verbatim, per a docsaf-accurate Go-side sweep of the
     // whole ingest corpus that also confirmed no single real section

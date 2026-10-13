@@ -32,7 +32,6 @@ const print = std.debug.print;
 
 const BackendChoice = enum {
     auto,
-    onnx,
     native,
     metal,
     cuda,
@@ -521,7 +520,6 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
@@ -534,7 +532,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
@@ -558,7 +555,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference embed <model-dir> [--backend auto|onnx|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: antfly inference embed <model-dir> [--backend auto|native|metal|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Runs local embedding and prints a JSON response to stdout.
         \\  Input order is preserved across repeated --text/--image/--audio flags.
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
@@ -605,7 +602,7 @@ test "parseArgs preserves multimodal input order" {
     try std.testing.expectEqual(@as(usize, 1), opts.order.items[3].index);
 }
 
-test "embed auto backend keeps external onnx runtime opt-in" {
+test "embed auto backend prefers Metal then native" {
     var session_manager = backends.SessionManager.init(std.testing.allocator);
     configureBackendPreference(&session_manager, .auto);
     if (build_options.enable_metal) {
@@ -613,8 +610,6 @@ test "embed auto backend keeps external onnx runtime opt-in" {
     } else {
         try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, session_manager.preferred_backends);
     }
-    configureBackendPreference(&session_manager, .onnx);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{.onnx}, session_manager.preferred_backends);
 }
 
 test "appendSparseEmbeddingJson writes cli sparse embedding shape" {

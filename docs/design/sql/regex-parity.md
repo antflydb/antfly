@@ -3,7 +3,7 @@
 Status: required target architecture and qualification plan, not a completion
 claim. The native replacement exists; exhaustive contract reconciliation does
 not. This document owns the remaining regex work. Original SQL-case evidence
-remains authoritative in [the parity inventory](../sql-parity-inventory.md).
+remains authoritative in [the parity inventory](parity-inventory.md).
 
 ## Contract and reference identity
 
@@ -45,7 +45,7 @@ Reference specifications:
 The replacement commit `f3d0a9071f` introduced `antfly_regex.captures` and removed
 the C engine/bridge. Existing byte/FST regex semantics are unchanged. The SQL
 adapter owns flag parsing, caches, replacements and diagnostics. Its current
-1,025 PostgreSQL 18 C-collation component contracts, allocation/cancellation
+1,062 PostgreSQL 18 C-collation component contracts (native and import-free WASM), allocation/cancellation
 tests, scaling checks and import-free WASM execution are useful baseline
 evidence, not exhaustive syntax or public-SQL certification.
 
@@ -56,44 +56,63 @@ absent implementation. Do not infer a confirmed defect from an audit target.
 
 ## Qualification progress
 
-### Implemented qualification foundation (2026-10-09)
+`scripts/check_sql_regex_parity.py` runs an independent `selection-v1` grammar
+campaign and a permanent regression-witness mode. Its default oracle major is
+19; `--oracle-major 18` yields compatibility-lane evidence only. Reference
+artifacts pin the server build, binary SHA-256, encoding/collation and timeout;
+the standalone `parity-probe` (`zig/lib/sql_regex/zig-out/bin/sql-regex-parity-probe`)
+verifies accepted results, complete character/capture spans and compile
+SQLSTATEs, and every live campaign proves a deliberately incorrect witness is
+detected. Oracle timeouts are inconclusive; native resource refusals remain
+mismatches.
 
-`scripts/check_sql_regex_parity.py` now provides an independent `selection-v1`
-grammar campaign and a permanent regression-witness mode. Its default oracle
-major is 19; explicitly selecting `--oracle-major 18` gives compatibility-lane
-evidence only. Reference artifacts pin the server build, binary SHA-256,
-encoding/collation and timeout. The standalone `parity-probe` verifies accepted
-results, complete character/capture spans and compile SQLSTATEs. Reports bind
-the exact witness bytes and probe binary. Every live campaign also proves that
-a deliberately incorrect witness is detected. Oracle timeouts are inconclusive;
-native resource refusals remain mismatches. Eight harness self-tests verify
-enumeration completeness, deterministic IDs, profile separation and rejection
-of truncated, foreign or unbound native reports.
+The qualified PostgreSQL 18.6 C/UTF8 run checks 24,575 distinct cases (all 390
+pattern templates against every binary subject through length three, boundary
+and rejection witnesses, and 5,000 seeded patterns, seed 19) with zero
+mismatches. That is exhaustive only within those bounds. Thirty-seven minimized
+witnesses in `zig/lib/sql_regex/src/testdata/selection-postgres.json` run in the
+native gate and twice in import-free WASM (1,062 combined component contracts);
+the scalar SQL fixture has 71 contracts. Match extent and empty-capture
+preference are distinct program metadata, not pattern-specific exceptions.
 
-The qualified PostgreSQL 18.6 C/UTF8 run checks 24,575 distinct cases: all 390
-declared pattern templates against every binary subject through length three
-and every valid start, additional boundary/rejection witnesses, and 5,000 seeded
-generated patterns (seed 19). It has zero mismatches. This is exhaustive within
-those explicit enumeration bounds, not exhaustive ARE grammar or PostgreSQL 19
-evidence. Discovery corrected fixed-bound preference inheritance, zero-bound
-elision, nullable capture participation, required zero-width participation,
-BRE anchor/star context, grouped assertions and complemented-shorthand newline
-membership. Match extent and empty-capture preference are now distinct program
-metadata rather than pattern-specific exceptions.
+Still unfinished: the machine-readable specification/upstream inventory,
+PostgreSQL 19 execution, broader grammar/backreference campaigns, automatic
+grammar-aware shrinking, non-C profiles, all public SQL surfaces, durable
+semantic-version activation and mandatory live-oracle CI lanes. The dated
+progress narrative is in [history](history/regex-implementation-log.md).
 
-Thirty-seven minimized accepted/rejected witnesses are committed in
-`zig/lib/sql_regex/src/testdata/selection-postgres.json`, with exact oracle
-identity. They run in the regular native gate and twice in import-free WASM
-(1,062 combined component contracts). Ten additional scalar witnesses verify
-function values, result OIDs and errors through SQL binding/execution; that
-scalar fixture now has 71 contracts. This is not mounted HTTP/pgwire or durable
-expression certification and does not change original SQL dispositions.
+## Current SQL regex surface
 
-Still unfinished: the complete machine-readable specification/upstream
-inventory, PostgreSQL 19 execution, broader grammar/backreference campaigns,
-automatic grammar-aware shrinking, non-C profiles, all public SQL surfaces,
-durable semantic-version activation and mandatory live-oracle CI lanes. The
-new campaign is a foundation for those requirements, not their completion.
+SQL uses the native Zig `antfly_regex.captures` interface in `lib/regex`; the
+vendored C engine and bridge were removed (`f3d0a9071f`). The byte/FST matcher
+used by search indexes is unchanged and separate. The SQL adapter owns flag
+parsing, error translation, bounded pattern/replacement caches and
+statement/cursor ownership.
+
+- The scalar binder implements PostgreSQL's text/int4 overloads of
+  `regexp_like`, `regexp_count`, `regexp_instr`, `regexp_substr` and
+  `regexp_replace`, preserving strict NULLs, lazy branches, Unicode character
+  positions, capture selection and ordered flags. The `~`, `~*`, `!~` and `!~*`
+  operators lower to the same prepared ARE session. Regex-array quantifiers
+  remain uncertified.
+- Statements and pull cursors own bounded matcher-lane pools; immutable prepared
+  plans never own mutable scratch. Lane allocations (including cache keys)
+  share the statement quota. Native callbacks check cancellation/deadlines,
+  and callback polling is amortized over 256 charged work units. Row-based
+  aggregate and UPDATE/DELETE predicates use the same statement-owned pool.
+- Each lane caches programs and immutable replacement templates separately;
+  replacement admission cannot evict a borrowed program. Templates are bounded
+  to eight entries and at most 256 KiB or one eighth of the lane cache budget,
+  with a bounded caller-owned fallback for larger templates. Pattern admission
+  reserves full compilation headroom.
+- The shared lexer decodes `E'...'` escape strings once during preparation
+  (byte escapes, Unicode scalars, surrogate pairs); ordinary strings keep
+  standard-conforming backslashes. Malformed Unicode escapes, invalid codepoints
+  and invalid decoded UTF-8/zero bytes keep distinct `22025`/`42601`/`22021`
+  diagnostics.
+- Only C collation is implemented; other collations must be implemented
+  explicitly rather than inheriting host locale. The broader native
+  complex-path work-accounting audit remains open.
 
 ## Contract inventory requirements
 

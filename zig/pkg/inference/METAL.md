@@ -887,7 +887,7 @@ Use these checks after changing Metal runtime behavior:
 
 ```sh
 zig build test-metal-gemma4-prefill-block-parity -Dmetal=true --summary failures
-zig build -Dmetal=true -Donnx=false --summary failures
+zig build -Dmetal=true --summary failures
 LIST_ONLY=1 bash pkg/inference/scripts/debug_metal_command.sh unit 'metal|Metal'
 RUN_MODE=isolated USE_PREBUILT_UNIT=1 bash pkg/inference/scripts/debug_metal_command.sh unit --api-validate 'metal|Metal'
 ./zig-out/bin/antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --max-tokens 4 --print-token-ids --print-timing

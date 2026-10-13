@@ -399,7 +399,6 @@ const FallbackNativeBackend = struct {
 fn backendKindForGraphPartition(kind: contracts.BackendKind) contracts.BackendKind {
     return switch (kind) {
         .metal => .metal,
-        .onnx => .onnx,
         .pjrt => .pjrt,
         .wasm => .wasm,
         .webgpu => .webgpu,

@@ -2,7 +2,7 @@
 
 ## Context
 
-Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently four backends exist: native (CPU), Metal (Apple Silicon), ONNX (runtime), and ORT GenAI.
+Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Native backends are CPU, Metal (Apple Silicon), and CUDA; ONNX models run on the same kernels through the native ONNX importer.
 
 Goal: enable antfly inference to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
 
@@ -555,32 +555,6 @@ GPU shader dispatch for the bottleneck ops added in Phases 10-13.
 
 **New externs in `wasm_extern.zig`:** `gpu_causal_attention` (no mask param), `gpu_cross_attention` (asymmetric dec_seq/enc_seq).
 
-### ONNX Runtime Web Integration
-Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongside native `antfly-inference.wasm`. Purely JS-side — no Zig changes needed.
-
-**Architecture:** Two independent WASM modules on the same page:
-- `antfly-inference.wasm` (~1.2 MB) — native Zig backend for SafeTensors/GGUF models
-- `ort-wasm-simd-threaded.wasm` (~6 MB gzipped) — pre-built ONNX Runtime from npm `onnxruntime-web`
-
-**JS API (lazy, optional — zero cost if not used):**
-- `initOnnx(ort, options)` — takes the `onnxruntime-web` module as argument
-- `loadOnnxModel(source, options)` — loads `.onnx` into `InferenceSession`, returns handle
-- `onnxInfer(handle, feeds)` — runs inference, accepts `{data, dims, type}` objects
-- `unloadOnnxModel(handle)` — releases session
-
-```javascript
-import * as ort from 'onnxruntime-web';
-const t = new InferenceWeb();
-await t.init('antfly-inference.wasm');
-await t.initOnnx(ort, { wasmPaths: '/wasm/' });
-const session = await t.loadOnnxModel('reranker.onnx', {
-  executionProviders: ['webgpu', 'wasm'],
-});
-const result = await t.onnxInfer(session, {
-  input_ids: { data: ids, dims: [1, 128], type: 'int64' },
-});
-```
-
 ### GPT Generative Support
 Browser-based text generation for GPT-2, LLaMA, Mistral, Phi, Qwen2, Gemma, Falcon, OPT, BLOOM.
 
@@ -867,11 +841,11 @@ Architecture code (`bert.zig`, `clip.zig`, `whisper.zig`, `clap.zig`, `florence.
 | `src/web/exports_wasm64.zig` | wasm64 profile shim over the shared export surface |
 | `src/ops/wasm_compute.zig` | ComputeBackend VTable — all ops via WASM SIMD, optional GPU dispatch |
 | `src/ops/wasm_extern.zig` | Extern declarations for WebGPU JS bridge (matmul, attention, causal attention, cross attention) |
-| `web/inference-web.js` | JS glue, `InferenceWeb` class — direct/worker mode, all model APIs, optional ONNX |
+| `web/inference-web.js` | JS glue, `InferenceWeb` class — direct/worker mode, all model APIs |
 | `web/test-wasm-path.mjs` | Shared test helper for resolving `antfly-inference-wasm32.wasm` / `antfly-inference-wasm64.wasm` with legacy fallback |
 | `web/test-wasm-runtime.mjs` | Shared Node test helper for ABI-safe WASM instantiation, alloc/free, and typed-array access |
 | `web/webgpu-ops.js` | `WebGPUOps` class — device init, 5 shader pipelines, compute dispatch, worker handler |
-| `web/inference-worker.js` | Web Worker for WASM with sync GPU downloads via `Atomics.wait()`, ONNX handlers |
+| `web/inference-worker.js` | Web Worker for WASM with sync GPU downloads via `Atomics.wait()` |
 | `web/shaders/matmul.wgsl` | Tiled 16x16 matmul: `C[M,N] = A[M,K] @ B[K,N]` |
 | `web/shaders/matmul_transb.wgsl` | Tiled 16x16 matmul with B transposed |
 | `web/shaders/attention.wgsl` | Fused attention: Q@K^T + scale + mask + softmax + @V |
@@ -1166,7 +1140,7 @@ That keeps the current `wasm32` path stable while creating a real seam for futur
 8. ~~**CLAP**~~ ✅ Done — HTS-AT audio encoder with conv2d, mel in WASM
 9. ~~**Florence-2**~~ ✅ Done — DaViT vision (windowed + channel attention) + BART decoder
 10. ~~**WebGPU for new ops**~~ ✅ Done — causal attention, cross attention, conv2d GPU dispatch
-11. ~~**ONNX Runtime Web**~~ ✅ Done — optional lazy integration for ONNX-only models
+11. ~~**ONNX Runtime Web**~~ Removed — the optional `onnxruntime-web` glue was dropped; ONNX models use the native ONNX importer
 12. ~~**GPT Generative**~~ ✅ Done — rope, GQA, autoregressive decode, GPT-2 Conv1D transpose
 13. ~~**f16 weight storage**~~ ✅ Done — on-the-fly dequant, halves memory
 14. ~~**Quantized GPU kernels**~~ ✅ Done — Q4_0/Q8_0 WGSL dequant shaders + CPU fallback

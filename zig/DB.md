@@ -9,489 +9,20 @@ For the canonical enrichment architecture and artifact identity contract, see
 
 ## DB Handle And Runtime Ownership Contract
 
-`DB.open()` must not make the caller's role ambiguous. A DB handle can be the
-authoritative write owner for a shard, the shared read owner for a visible
-generation, or a tightly scoped foreground maintenance handle. Those roles have
-different side-effect budgets and must be leased by the serving layer instead
-of opened ad hoc.
+`DB.open()` never leaves the caller's role ambiguous. A handle is exactly one of:
+the authoritative write owner for a shard, the shared read owner for a visible
+generation, or a foreground maintenance handle scoped to a transition. The
+serving layer leases these roles; callers do not open them ad hoc.
 
-The serving-layer target shape is:
+### Core Invariant
 
-- one cached write DB owner per table group
-- one cached read DB owner per table group and visible root generation
-- many read transactions, cursors, lookups, scans, queries, and status reads as
-  leases on that read owner
-- short-lived maintenance DB opens only inside a callback scoped to an
-  exclusive table/group transition lease; raw DB handles cannot escape the
-  callback
-
-Split/merge projection work uses a group-exclusive transition lease. It queues
-ahead of later writers, briefly drains reads while managed auto-bulk state is
-published, then reopens reads from the published generation for snapshot scan
-and repair. Sustained traffic therefore cannot starve a transition, and an
-instantaneous cache-idle probe is not used as quiescence.
-
-The important restriction is that "read profile" must not create a second cached
-DB identity over the same table-group root. Lookup, scan, query, and status may
-use different methods or lazy capabilities, but they should share the same read
-owner for a generation. Multiple independently cached DB instances over the
-same path duplicate index/cache/runtime state and make restore, drop, and schema
-mutation correctness depend on every caller remembering the same invalidation
-sequence.
-
-A point lookup is the narrow exception to routing all reads through the cached
-read owner: when the generation-matched writer/apply DB is already resident, the
-lookup leases that owner and reads its primary document store directly. It must
-not open the cached query DB merely to load one document, because doing so loads
-the complete index catalog and creates an additional backend generation over a
-path undergoing WAL publication and compaction. Query-only processes and cold
-groups fall back to the generation-owned read cache. The lookup source must
-return `null`, rather than adopt a mismatched owner, when its visible root
-generation or identity namespace does not match.
-
-Restore preparation and generation publication use separate capabilities.
-Preparation allows existing and new readers to continue against the live
-generation while Antfly imports, repairs, validates, and syncs an isolated
-sibling. It blocks new writes for the restore's full lifetime so acknowledged
-writes cannot be discarded when the prepared backup is published. Publication,
-drop, and in-place schema mutation use an exclusive
-transition lease that:
-
-- blocks new table reads and writes
-- drains existing read, write, and pending-open leases
-- invalidates read, write, startup-write, runtime-status, and shared
-  path-scoped storage caches for the affected generation
-- performs only the live file/catalog mutation and unavoidable live-generation
-  repair under the exclusive lease
-- publishes the new visible generation only after repair/invalidation complete
-
-Restore never reconstructs the live root in place. It acquires a process-wide
-preparation capability for the exact shard root, creates a unique sibling
-staging generation, imports and validates the primary store there, runs
-foreground derived/runtime repair against that staged path, closes and
-recursively syncs and seals the staged generation, and only then drains serving
-leases and promotes preparation to the exclusive publication capability. A
-prepare or repair failure destroys staging and leaves the live generation
-untouched. macOS and Linux use
-atomic directory exchange when a live generation exists. Platforms or
-filesystems without atomic exchange reject replacement before mutating the live
-namespace. After durable publication, the exchanged old root is submitted to
-the shared backend runtime's cleanup lane; recursive reclamation is not part of
-the admission-critical publication path.
-
-Backup publication has a separate immutable commit point. The caller's
-`backup_id` names only the create-once table manifest; shard artifacts live
-under a cryptographically random internal operation generation, so an
-interrupted attempt cannot make a later request reuse or overwrite stale bytes.
-Version 2 manifests record the explicit `native` or `portable` format and bind
-every shard's group, range, relative artifact path, byte count, and SHA-256
-digest. Portable digests cover the exact AFB bytes. Native digests cover a
-canonical tree encoding of sorted normalized paths, file sizes, and contents,
-which makes the identity independent of directory enumeration order while
-rejecting symlinks and other unsupported entries. Hashing is streaming with
-bounded memory and uses the server's shared I/O runtime.
-
-All shard transfers must complete before the manifest is conditionally
-published. For filesystem backups, every copied file is synced, destination
-directories are synced from leaves to root, and newly created ancestors are
-synced before the create-once manifest is file-synced, atomically renamed, and
-followed by a parent-directory sync. The manifest rename is therefore a real
-crash-durable commit point rather than only a namespace convention.
-
-Restore treats the manifest format as authoritative rather than guessing from a
-filename, rejects duplicate group or artifact identities and unbound artifacts,
-and copies both local and remote source content into an Antfly-owned staging
-root. It verifies that private copy before any importer or generation
-publication can consume it, so source mutation between verification and reopen
-cannot change the restored bytes. Portable archives are imported and counted
-block-by-block from a stable file descriptor; memory is bounded by one encoded
-block rather than the total archive size. A mismatch or source mutation is a
-terminal corrupt-backup result surfaced as an actionable integrity failure; the
-live generation and table definition remain unchanged. Restore accepts only the
-versioned, content-bound manifest; an unversioned or unsupported manifest fails
-closed before staging.
-
-External storage authority is preserved across distributed restore rather than
-collapsed into a URI. The ingress node resolves the caller's named
-`external_io` connection, checks `restore.read`, reads and validates the
-manifest once, and submits only the connection identifier plus the validated
-per-shard path, size, and digest to metadata. Credentials are never written to
-Raft. Each replica resolves that identifier against its local configuration
-before opening the artifact, so bucket, prefix, and capability policy remains
-effective at the node that performs I/O. The range restore intent, replica
-bootstrap record, local import marker, and completion progress all carry the
-same shard digest. Consequently retries and crash recovery are idempotent for
-specific immutable bytes, and stale completion from another artifact cannot
-clear or satisfy a newer intent.
-
-The low-level Raft host never resolves a backup URI or ambient credentials
-itself. It validates the bounded bootstrap identity and delegates restore I/O to
-the managed bootstrap owner, which carries the node configuration, secret
-store, capability requirement, and shared I/O runtime. A missing connection,
-missing owner, malformed relative path, or absent content digest fails closed
-before filesystem or object-store access.
-
-Restore identity is range-scoped; table definitions are not a second fallback
-source. Manifest admission sorts shard boundaries and requires every adjacent
-pair to meet exactly, rejecting gaps and overlaps before topology publication.
-Local import and repair progress use strict versioned JSON markers whose
-artifact digest is mandatory. Marker updates are file-synced, atomically
-renamed, and followed by a parent-directory sync, so partial writes cannot be
-interpreted as valid crash-recovery state.
-
-Data-Raft snapshot apply follows the same generation boundary. The apply path
-validates the canonical snapshot stream without materializing document values
-or a descriptor per document, builds a fresh staged DB in fixed-size borrowed
-batches, syncs and seals it, then atomically publishes it under a group-scoped
-generation capability. It never scans or deletes the old live table. Durable
-data-Raft projections are physically partitioned by group, while a root-level
-coordinator retains the single process writer authority. This makes snapshot
-replacement proportional to the incoming group snapshot and avoids rewriting,
-describing, or retaining keys for unrelated groups.
-The durable apply-store projection uses a per-group generation-preparation
-marker rather than holding its hash-stripe mutex while importing the snapshot.
-Operations for the target group wait; unrelated groups continue to apply and
-serve even when their IDs collide in the same lock stripe. Only reader drain,
-cached-owner retirement, atomic exchange, and allocation-free watermark
-publication execute under the stripe lock.
-Shared cache-generation bookkeeping is reserved before staging and advanced
-without allocation immediately after the namespace exchange, so no fallible
-bookkeeping step can leave the new root visible under the old cache identity.
-Schema validation is parsed once per snapshot and applied per bounded batch;
-derived replay remains durable in the staged generation for normal workers to
-resume after publication. Staging excludes only applies for the target group;
-other groups, including groups in the same table, continue serving and applying.
-Publication retires and drains only the target group's read/write owners and
-uses an exact group read-cache admission fence. Table-wide drop, schema, index,
-and restore transitions wait for every group preparation and retain table-wide
-epochs.
-
-The install's catalog inputs form one explicit contract: metadata Raft group
-identity, the metadata cluster's durable 128-bit incarnation, table identity,
-table name, schema, index catalog, range topology,
-and document-identity namespace are captured after group admission. The
-snapshot's encoded range must match that catalog range. Staging owns only this
-compact contract, not the complete admin snapshot, so its memory cost is
-independent of cluster catalog size. After
-serving leases drain, the candidate is atomically exchanged into the filesystem
-but remains outside serving admission. The catalog source then performs a Raft
-linearizable read; followers forward ReadIndex to the metadata leader and wait
-until the returned committed index is applied locally. The compact contract
-is compared on the metadata replica, so the publication request and allocation
-cost remain independent of the cluster catalog size. It must match that
-authoritative projection exactly. A mismatch atomically
-restores the retained prior root before admission reopens; a match commits the
-exchange and advances the visible generation. Metadata changes committed before
-the barrier therefore reject stale publication, while changes committed after
-it are correctly ordered after publication. Unrelated metadata changes do not
-force a retry.
-
-The fixed metadata Raft group id is not a cluster identity. Metadata initializes
-its incarnation exactly once through the replicated state machine; the singleton
-projection is included in Raft snapshots and therefore survives restart,
-leadership transfer, and replica replacement. Data nodes pin the first valid
-incarnation they observe. Every configured metadata endpoint, head/snapshot
-pair, and mutating control-plane request must prove the same incarnation before
-it can affect provisioning or generation publication. Missing, zero, or
-mismatched identities fail closed, preventing a mixed endpoint configuration
-from validating a candidate against an unrelated cluster with the same group id.
-
-`DB.restoreSnapshotToDeferredRuntimeRepair()` accepts a `StagedGeneration`
-capability and rejects a path that is not the capability's staging root. Raw
-path possession is therefore insufficient to mutate a serving root. Startup,
-provisioning, and API restore entry points all acquire their capability through
-the same process generation-lifecycle manager. `TableWriteSource.restoreTable()`
-acquires and releases the table-level restore reservation itself, so direct
-callers cannot omit write fencing. Cluster restore, which must hold that
-reservation across metadata replacement and remote snapshot staging, uses the
-explicit `restoreTableReserved()` operation while retaining the same reservation.
-For overwrite mode, cluster restore preserves the existing table ID, ranges,
-and target shard IDs. It stages source shard data into each target shard's
-sibling generation and repairs it using the backup's schema and index catalog.
-Only after that candidate is sealed does the exclusive transition atomically
-upsert the table definition and exchange the storage generation. A metadata
-publication is rolled back if storage publication fails before the namespace
-exchange; after exchange, durability uncertainty is a committed result and
-must not roll metadata back. Failed download, import, validation, or repair
-therefore leaves both the live definition and generation untouched.
-Definition publication and rollback are full-definition compare-and-swap
-mutations. A concurrent schema, index, placement, or restore-intent update
-therefore makes the transition fail closed instead of being overwritten by a
-stale publish or rollback.
-
-Restore completion is also a replicated compare-and-clear operation, not an
-ordinary range upsert. Its command carries the exact table, group, backup,
-location, connection, snapshot path, byte count, and digest observed by the
-completion evaluator. The state machine reloads the current range in the same
-transaction, clears only matching restore fields, and preserves the current
-range ID, boundaries, document-identity namespace, split epoch, and all other
-topology. A delayed completion for a superseded artifact is an idempotent no-op.
-
-The API lifecycle above the generation manager is a bounded durable job. Public
-job identifiers are opaque strings even though the local scheduler uses integer
-keys; this prevents JavaScript and JSON consumers from rounding a storage
-identity. Nonterminal jobs do not publish an expiry. Explicit idempotency keys
-are indexed by a hash of authenticated principal, operation scope, and target
-resource, so retries deduplicate within one authority boundary without causing
-cross-user or cross-table conflicts.
-
-Cluster-wide restore progress is represented by canonical inclusive ranges of
-table ordinals. The common sequential path updates one range regardless of
-table count, while sparse failures add only the required disjoint ranges. Antfly
-supports 4096 tables in one cluster backup/restore and verifies that limit before
-backup artifacts are emitted; explicit request lists remain bounded at 256.
-These limits keep request memory, response aggregation, and the replicated job
-record bounded while allowing large operational restores without the former
-256-table recovery ceiling.
-
-Queued structural reconciliation closes new write admission before draining
-current writers. This prevents continuous traffic from starving index/catalog
-convergence, while reads remain admitted against the currently published
-generation until the short publication transition begins.
-Each queued request owns one immutable catalog contract captured tentatively
-from a single admin snapshot: table identity, desired schema and index
-definitions, and the exact range and document-identity namespace for every
-group. Before using that plan and before declaring completion, production
-catalog sources validate a compact whole-table contract after a Raft
-linearizable-read barrier. The contract carries an order-independent SHA-256
-multiset digest and range count over the complete range records, so validation
-is allocation-free against the metadata owner's immutable projection, O(1) on
-the wire, and detects ranges added, removed, or mutated after capture. Metadata
-maintains this projection behind a catalog-only epoch: store reports, placement
-progress, and other control-plane traffic cannot evict it. A table or range
-change rebuilds the compact projection once; warm validation is O(1). The
-catalog projection is the sole owner of cloned table and range records. The
-volatile status projection owns only store, progress, placement, and transition
-records and advances on a separate epoch, avoiding duplicate catalog retention
-and cross-domain rebuilds.
-
-A dequeue advances at most a fixed number of pending groups, removes completed
-groups in O(1), and rotates busy groups rather than replaying successful work.
-One compact linearizable contract admits the quantum. Completed groups retain
-owned runtime observations until one post-mutation contract check accepts the
-entire quantum, after which the observations publish with the table epoch
-captured before storage work began. Productive quanta return to the queue tail
-without an artificial delay; a short delay applies only when every attempted
-group is blocked. A changed contract discards only the stale plan and rebuilds
-it on the next quantum; the write-admission reservation remains continuous
-throughout that handoff, and stale work cannot publish readiness for a replaced
-topology.
-Per-table dirty visibility tracking uses owned exact table identities rather
-than collision-prone hashes. Its lifetime is tied to write-cache ownership:
-eviction advances the table's read-cache epoch, and the last cache owner also
-invalidates cached runtime status and retires the dirty identity. A sibling
-startup or serving cache keeps the identity alive until it also evicts the
-table. Memory therefore scales with the bounded union of cache working sets,
-not with historical writes, while a draining lease that mutates after eviction
-re-marks itself through the normal visibility hook.
-Runtime-status ordering separates structure from content. The cache is an owned
-hash map by table with an inner hash map by group. Each table has an
-`invalidation_epoch` and logical `root_generation`; restore, drop, schema/index
-replacement, and visible-root transitions advance that epoch and remove the
-old group map. Routine writer status does not advance it. A live publisher
-captures the table epoch and a monotonic observation generation before opening
-or inspecting its DB, then publishes in O(1). Publication rejects only a stale
-table generation or an older observation for the same group, so activity on one
-table cannot starve another.
-
-A full refresh captures every catalog table epoch and one observation watermark
-under a short lock, collects DB status without the lock, and publishes all
-epoch-valid tables in one lock acquisition. A live observation newer than the
-watermark wins; older cached content does not indefinitely mask an authoritative
-refresh. Tables invalidated during collection are returned explicitly and only
-those tables are recollected. Catalog-wide absence removal uses a separate
-topology revision: if topology changed during collection, valid table updates
-still publish but removals are deferred. Partial retries never remove absent
-tables. Stable absence removal deletes the table state after advancing the
-global epoch allocator, keeping memory proportional to current tables and
-groups without allowing an old generation owner to republish if the name is
-later recreated.
-Writer ownership configuration is published under one ordered transition lock
-set: cache-open locks by address, then the source mutation lock, then cache
-lifecycle locks by address. Gate or mirror changes reserve both serving and
-startup cache retirement before changing any source field, retire both caches,
-and only then invalidate read/status observations and dirty identities. Every
-read and write cache entry reserves its retirement queue slot when installed,
-so the transition and final lease release are allocation-free. HA promotion
-also preflights both live and raft-apply write sources before consuming standby
-ownership; allocation pressure therefore fails promotion before irreversible
-state changes instead of leaving a partially rewired primary.
-Standby promotion transfers the already-open receive-log owner into the new
-primary after validating the configured paths, durable timeline-switch record,
-and slot store. It never opens a second writer over the same WAL root and does
-not introduce a close/reopen window between standby and primary ownership.
-This includes the embedded
-`BoundTableWriteSource`: it closes its current owner, restores into a sibling
-generation, publishes atomically, and reopens either the unchanged live
-generation after a pre-commit failure or the newly published generation after
-success. The provisioned serving path
-uses separate prepare and publish operations so all required repair completes
-before the namespace mutation. Startup/bootstrap convenience paths publish a
-validated primary generation with a durable repair marker, allowing the normal
-startup owner to resume derived repair after a crash. Replica bootstrap restore
-must finish before `ensureReplica()` activates the group; an active replica is
-never force-restored by raw path.
-
-Data-Raft placement reconciliation follows the same staged boundary. One
-reconcile-generation mutex serializes metadata snapshots, while the Raft owner
-mutex protects only live `MultiRaft` mutation. Under the owner mutex,
-reconciliation captures an immutable desired-state plan and marks any restore
-bootstrap as preparing. Restore I/O, descriptor construction, and replica
-catalog fsync then run without the owner mutex, so the dedicated Raft progress
-driver can continue elections, heartbeats, transport, and committed apply.
-Catalog admission is durable before a prepared descriptor is published.
-Reconciliation reacquires the owner mutex only to install or retire replicas,
-refresh peers, reconcile membership, and publish the exact apply-store group
-set. A preparation failure leaves the live runtime unchanged and the
-apply-store's conservative old-or-new admission set in place for retry.
-
-The dedicated Raft progress lane owns consensus progress and durable metadata
-projection, but it never mutates the in-memory split/merge transition
-controller. The control lane is the controller's sole writer: each control
-round hydrates it from durable projected transition records before observing or
-stepping work. This makes a projection update a durable wakeup rather than an
-ephemeral queue handoff, so a delayed control round, leadership change, or
-process restart cannot lose admitted transition work. Controller access is
-serialized independently from the Raft owner lock; transition storage and
-network I/O therefore cannot delay elections, heartbeats, or Ready processing.
-Each peer control RPC has a finite deadline and retries through the durable
-transition record, so an accepted connection that stops responding cannot
-permanently monopolize the control lane. Health and metrics read a separately
-published fixed-size controller snapshot and remain available while such an RPC
-is in flight. Transition readiness reads a projected topology snapshot rather
-than the rich admin snapshot; the latter may perform live transition
-observations and must never be called recursively by the controller.
-Replicated split observations read the durable data apply projection under its
-per-shard lock; they never wait for the corresponding action lane. Replicated
-split actions use fixed, group-sharded singleflight lanes and fail fast when
-the same lane is already active. An abandoned or timed-out RPC therefore
-cannot queue unbounded duplicate handlers, block observation of its own
-progress, or serialize transitions assigned to independent lanes.
-
-Publication errors are pre-commit errors. After a directory rename or exchange
-makes the new generation visible, publication returns either `durable` or
-`durability_uncertain` and the caller must finish cache invalidation and reopen
-admission bookkeeping in both cases. A post-commit sync failure must never enter
-the pre-commit abort or metadata-drop path. It is reported as committed with
-durability pending, while raft bootstrap remains inactive. Every staged
-candidate contains a durable two-phase publication record that moves into the
-live root during the namespace exchange. A `prepared` record names the exact
-retained sibling and causes startup to atomically restore that prior generation;
-this covers process death after exchange but before catalog validation. Catalog
-validation durably changes the record to `committed` before admission advances.
-DB open completes committed publication by syncing the parent namespace,
-submitting retained or abandoned sibling generations to the runtime cleanup
-lane, and clearing the record before the root is admitted. Cleanup failures
-leave the generated sibling name as durable retry debt for a later exclusive
-transition or process reconciliation; they do not block read admission. Every
-open DB retains a shared generation lease and a shared filesystem publication
-lock through `DB.close()`. An exclusive transition
-blocks new opens and cannot publish until all prior DB owners have closed.
-Reconciliation is cached only while a local reader retains the shared
-publication lock. The final reader invalidates the cache entry, so a later open
-must observe publication debt created by another process. The persistent sibling
-lock file also excludes overlapping restore publishers across processes.
-Cached read admission acquires the shared filesystem lock before registering
-the reader, then revalidates the process reconciliation evidence under the
-manager mutex. If the final prior reader drained while the lock was acquired,
-the opener releases the shared lock and retries through exclusive
-reconciliation; no process-local reader count can bridge a filesystem-lock gap.
-Stale-stage GC only considers names with
-Antfly's complete generated-stage grammar while holding that exclusive lock;
-it schedules marked abandoned candidates and markerless retired roots left by a
-completed exchange, while ignoring arbitrary prefix-matching directories. A
-manual runtime admits the reconciled read generation and downgrades the
-publication lock before recursively reclaiming the exact stale paths identified
-under exclusivity. This preserves bounded disk use without holding publication
-downtime across potentially large directory deletion.
-Retired-root deletion additionally holds one persistent cleanup lock per parent
-directory. Duplicate workers and separate processes therefore serialize only
-for the same table-group parent, while unrelated shards reclaim in parallel.
-After acquiring that lock each worker rechecks path existence, making an
-already reclaimed generation a successful idempotent outcome rather than a
-failed durable job.
-
-A restore whose namespace exchange committed but whose parent sync failed is
-reported as durability pending. Retrying the same backup is idempotent: Antfly
-matches the persisted backup, source location, shard, and repair-complete state,
-reconciles publication, and reports committed/durable. A retry against an
-unrelated existing table is rejected without modifying storage.
-
-The public restore-job journal mirrors that generation state instead of reducing
-it to success/failure. Before irreversible table work it persists one active
-manifest ordinal. Publication moves that ordinal to either a durability-pending
-or published compressed range, and replica convergence moves published ordinals
-to the completed range. The ranges are disjoint where ownership differs and are
-validated on load, keeping restart decisions explicit while bounding serialized
-state. A durability-pending table terminates the attempt with a committed/pending
-result; a later idempotent request reconciles the generation marker rather than
-blindly replacing or rejecting the visible table. Restore dispatch is likewise
-generation-fenced: leadership pauses FIFO admission, drains the old runtime
-owner, rebuilds durable attempts, publishes the new term, and only then reopens
-admission. Completion callbacks request another dispatch pass without blocking
-on the dispatcher that may be destroying them.
-
-Replacing an existing direct-path generation requires an atomic directory
-exchange; platforms or filesystems without that primitive reject publication
-before changing the live namespace. If the exchange is visible but its
-parent-directory sync fails, the previous generation remains under the staging
-name until reconciliation confirms the new namespace is durable and submits it
-for asynchronous cleanup.
-
-The current root layout is path-relative and may lazily open run files after a
-transaction starts. Preparation may overlap reads because it only touches the
-sibling root, but serving transitions still stop admission and drain old
-read/write owners before publication. Refcounts make close ordering safe, but
-they do not make a path swap safe beneath an old reader. A
-future zero-downtime transition must place each generation under an immutable
-versioned root and atomically publish a separate current-generation pointer;
-only then may generation N readers overlap preparation and publication of N+1.
-The direct-path layout also cannot make multiple shard directory swaps
-crash-atomic. Until table generations are published through one durable table
-generation pointer, table backup and restore reject multi-range manifests
-immediately after decoding, before metadata creation, remote shard transfer,
-staging, or publication.
-
-LSM manifests are relocatable generation metadata. On open, run paths are
-reconstructed from the current root and run identity instead of trusting an
-absolute path encoded before a snapshot copy or staging rename. Obsolete run
-paths are similarly rebased when they refer to the prior root's `runs/`
-directory.
-
-Shared caches must be invalidated by the table-group root, not only by the
-primary store path. Primary LSM caches and LSM-backed indexes can use path-prefix
-invalidation directly. Dense/HBC uses a shared cache namespace per concrete HBC
-index root, so the cache registers namespace-to-path ownership and table restore
-or drop invalidates every HBC namespace whose path is under the restored/dropped
-table-group root. Any future shared index cache should follow the same rule:
-cache keys may be engine-specific, but lifecycle invalidation is table-root
-scoped and owned by the generation transition.
-
-Shared HBC namespace-to-path registrations are reference counted by open index
-owners. A registration remains after the last owner closes only while retained
-cache entries still use it; clear, path invalidation, and subsequent index opens
-prune unowned registrations once those entries are gone. Per-namespace cache
-statistics are retired at the same boundary; only bounded live namespace state
-and cumulative global counters remain.
-
-The DB layer therefore separates three concepts:
+The DB layer separates three concepts:
 
 - storage capability: whether the handle can write the primary/index stores
 - runtime initialization: whether helper runtimes are constructed so foreground
   code can use their replay/apply logic
 - runtime worker ownership: whether background workers are started and allowed
   to keep running after open
-
-Restore repair is the important example. A restored shard with generated
-chunking or generated embeddings needs the enrichment runtime's replay logic to
-materialize chunk and embedding artifacts. It must not start every optional
-runtime worker just to get that capability, and it must not race a lookup/query
-open against half-published restored files. Instead, restore repair runs as
-foreground maintenance under the table generation transition, initializes only
-the required runtime services, drives generated enrichment replay, drains
-derived/index replay, syncs state, and closes before reads become visible again.
-
-The invariant is:
 
 ```text
 one background runtime owner per shard root
@@ -505,341 +36,501 @@ returned owned buffers are allocated in an explicit caller ownership domain
 foreground handles do not wait on background workers they did not start
 ```
 
-Current implementation maps this contract to generation-owned entries in
-`ProvisionedTableWriteCache` and `ProvisionedTableReadCache`, the process
-`generation_lifecycle` manager, and a local table generation transition around
-restore. Cache entries own their DB and are retired when invalidated; active
-leases keep retired entries alive until the last operation releases them. The
-transition holds the read-cache exclusive lease through staged restore, repair,
-and publication, invalidates/drains both write caches, and keeps maintenance
-opens uncached. A maintenance open is nevertheless created by, and remains
-inside, the active transition capability; no fallback path releases exclusivity
-and independently reopens the same root. Once an exclusive transition queues,
-new reads and writes wait behind it while already admitted reads drain, avoiding
-writer starvation under sustained query load. At the storage boundary, LSM
-transaction opens are rejected
-after generation close begins, backend close drains active transaction readers,
-and erased cursors retain their transaction box so transaction cleanup cannot
-free cursor snapshot state. Storage-backed status and schema-capability
-inspection are reads for lifecycle purposes: they acquire the same table read
-activity as lookup/query before opening a status-only DB. A transition drains
-those activities and blocks new status opens until the repaired generation is
-published. Cache-only status snapshots do not require a DB lease. In raft-backed
-serving, the apply state machine's write source is the canonical local write
-owner. Startup catch-up and other maintenance entry points resolve that owner
-before acquiring an activity lease or opening a DB; the startup cache is
-attached to that owner and is drained at the end of each catch-up operation. A
-forwarding API source must not create a second activity or cache domain over the
-same table-group path. Its read-preparation and primary-lookup interfaces must
-delegate to the canonical local write owner even when those interfaces were
-captured before owner attachment.
+### Read And Write Owners
 
-Data-Raft snapshot installation uses the narrower group generation transition.
-A preparation token serializes the target group's apply stream while allowing
-other group operations and table reads to continue. Publication then acquires a
-group-exclusive read-cache lease, retires only matching write/startup owners,
-drains their leases, exchanges the staged root, advances a reserved visible-root
-generation, and releases queued applies. The reservation itself owns a map
-reference, so topology pruning cannot remove generation bookkeeping during a
-fallible staging operation. Exchanged old apply roots are submitted to the
-shared backend runtime cleanup lane rather than reclaimed on the Raft apply
-critical path.
+Ownership rules:
 
-The Raft apply store's per-group DB owners are a bounded LRU cache, not a second
-unbounded storage registry. Owners and their LSM mutable state are charged to
-the provisioned node's shared `ResourceManager` under `lsm.in_memory_state`.
-Normal pressure retains the configured per-stripe bound, soft pressure shrinks
-it, and hard pressure retains only the most recently needed unpinned owner.
-Snapshot staging uses the same manager, so temporary generations cannot bypass
-the node memory policy. Eviction closes only the runtime owner; durable group
-files and apply watermarks remain available for transparent reopen.
+- Reads, cursors, lookups, scans, queries, and status reads are leases on the
+  one cached read owner for a table group and visible root generation. A "read
+  profile" never creates a second cached DB identity over the same root;
+  duplicate instances would duplicate index/cache/runtime state and make
+  restore, drop, and schema mutation depend on every caller's invalidation.
+- Maintenance DB opens exist only inside a callback scoped to an exclusive
+  table/group transition lease; raw handles cannot escape it, and no fallback
+  path releases exclusivity and reopens the same root.
+- Point-lookup exception: when the generation-matched writer/apply DB is
+  resident, a lookup leases it and reads its primary document store directly
+  instead of opening the query DB (which would load the full index catalog and
+  add a backend generation over a path under WAL publication and compaction).
+  Query-only processes and cold groups use the read cache. The lookup returns
+  `null` rather than adopt an owner whose visible root generation or identity
+  namespace does not match.
+- Split/merge projection uses a group-exclusive transition lease: it queues
+  ahead of later writers, briefly drains reads while managed auto-bulk state is
+  published, then reopens reads from the published generation for snapshot
+  scan and repair. An instantaneous cache-idle probe is never used as
+  quiescence.
+- Once an exclusive transition queues, new reads and writes wait behind it while
+  admitted reads drain, so sustained traffic cannot starve the transition.
+- Storage-backed status and schema-capability inspection are reads: they take
+  the same table read activity as lookup/query before opening a status-only
+  DB, and transitions drain them. Cache-only status snapshots need no lease.
+- In raft-backed serving, the apply state machine's write source is the
+  canonical local write owner. Startup catch-up and other maintenance resolve
+  that owner before acquiring an activity lease or opening a DB; the startup
+  cache attaches to it and drains at the end of each catch-up. A forwarding API
+  source never creates a second activity or cache domain over the same path; its
+  read-preparation and primary-lookup interfaces delegate to the canonical
+  owner even when captured before owner attachment.
 
-Placement reconciliation is a two-phase admission transition. Before fallible
-descriptor and host reconciliation, the apply store prepares exact new maps and
-admits the conservative union of old and new groups. Success commits exactly the
-new set; partial failure retains the union because the host may already have
-created or removed replicas, and the next metadata sync narrows it. Exact commit
-retires owners and cached summaries without heap allocation. An owner pinned by
-snapshot materialization or generation publication is marked retired, and the
-last reader or publisher performs final close. This keeps topology reconciliation
-independent of allocation pressure and slow snapshot consumers while making
-stale ownership bounded after the next successful sync.
+Implementation: generation-owned entries in `ProvisionedTableWriteCache` and
+`ProvisionedTableReadCache`, the process `generation_lifecycle` manager, and a
+local table generation transition around restore. Cache entries own their DB;
+invalidated entries are retired and stay alive until their last lease releases.
+At the storage boundary, LSM transaction opens are rejected once generation
+close begins, backend close drains active transaction readers, and erased
+cursors retain their transaction box.
 
-Split and merge control paths follow the same rule. Transition coordinators
-borrow the raft host's apply store and retain the managed destination or
-receiver DB lease for their full lifetime; observation never reopens either
-path. Pending destinations are leased by globally unique group ID so metadata
-publication and visible-root generation changes cannot hide an already-open
-writer behind a stale table label. A process-local transition admission lock
-serializes fallback coordinators while a destination is not yet published.
-Every durable transition record owns an immutable table contract and two
-explicit identity roles: `source_identity` for the source or merge donor, and
-`target_identity` for the split destination or merge receiver. A split records
-the same inherited identity in both roles; a merge records the donor and
-receiver independently. Phase updates must preserve the complete contract, and
-the binary and HTTP codecs require both roles. Runtime code selects a typed role
-at each open instead of inferring one identity from current topology, which may
-already have advanced past the transition.
+The Raft apply store's per-group DB owners are a bounded LRU charged to the
+node's shared `ResourceManager` under `lsm.in_memory_state`: normal pressure
+keeps the per-stripe bound, soft pressure shrinks it, and hard pressure keeps
+only the most recently needed unpinned owner. Snapshot staging uses the same
+manager. Eviction closes only the runtime owner; durable files and apply
+watermarks remain for transparent reopen.
 
-Reconciliation-authority handoff rehydrates projected intents with an owned
-copy of the durable contract and split boundary. It never reconstructs either
-from the new authority's desired catalog, and it can resume an admitted
-transition even when that desired catalog has already removed the table.
+### Restore Preparation And Publication
 
-Writer-cache admission validates the expected namespace before returning a
-lease. Normal source and target opens require an exact match. The sole relaxed
-case is an explicitly admitted merge identity reassignment: while holding
-exclusive transition admission, the receiver may be opened under its prior
-namespace only when its persisted table ID matches the contract table ID. The
-coordinator then performs the fenced reassignment before serving admission
-reopens. Cross-table mismatches and all unflagged mismatches fail closed. An
-idle mismatched owner is retired and closed before replacement; an active
-mismatch blocks the new open until its existing lease drains. This prevents a
-pre-publication destination open from becoming the serving writer for a
-differently namespaced range and gives rollback enough durable information to
-reopen the same-table receiver safely after restart.
+Restore flow, job, and manifest semantics are owned by
+[BACKUPS.md](BACKUPS.md); this section owns the DB generation boundary.
 
-Metadata reconciliation treats that contract as an active structural fence.
-Schema and index changes wait until every contract for the table is terminal.
-Range updates are fenced for each transition participant and its immediate
-range-boundary neighbors, preventing half of a coupled boundary update from
-publishing while allowing independent shard pairs in a large table to continue
-reconciling. A requested table drop retains the table, every range, and their
-placements until all transitions terminate; only then can normal removal
-proceed.
+Capabilities:
 
-Every destination bootstrap and catch-up batch carries a typed split replication
-context containing the metadata transition ID, source group, destination group,
-inherited identity namespace, operation kind, and source delta sequence where
-applicable. The context is encoded in the internal HTTP command and the
-data-Raft entry, validated against the catalog-visible source range on every
-replica, and used for the destination's first physical DB open. Public batch
-parsing rejects this internal context.
+- Preparation lets existing and new readers continue against the live
+  generation while Antfly imports, repairs, validates, and syncs an isolated
+  sibling. It blocks new writes for the restore's lifetime so acknowledged
+  writes cannot be discarded by publication.
+- Publication, drop, and in-place schema mutation take an exclusive transition
+  lease that blocks new reads and writes; drains read, write, and pending-open
+  leases; invalidates read, write, startup-write, runtime-status, and shared
+  path-scoped caches for the generation; performs only the live file/catalog
+  mutation and unavoidable live repair; and publishes the new visible
+  generation only after repair and invalidation complete.
 
-The destination stores the completed bootstrap identity and highest applied
-delta sequence in the document store. A completed bootstrap fences late chunk
-proposals; delta retries at or below the durable sequence are no-ops; and a
-forward sequence gap is rejected. Empty source deltas are sent as sequence
-barriers, so a gap can never be mistaken for an empty mutation. Document writes,
-range publication, bootstrap identity, and sequence advancement share the same
-DB apply lock and backend batch. The source acknowledges only after that commit,
-and its durable acknowledgement includes the same transition ID. Range buffers
-are prepared before commit and installed into the open DB allocation-free after
-success, leaving no post-commit error path that can split durable and in-memory
-ownership state.
+Generation rules:
 
-Placement changes must also make stale leadership self-healing without
-destabilizing membership expansion. A `draining` source and a `cutover_ready`
-target remain valid leaders until the expanded voter set converges. Once a
-leader enters `retiring`, local reconciliation transfers leadership to the
-lowest-ID retained voter before proposing self-removal. If the retiring leader
-has already disappeared, that same lowest-ID serving voter campaigns after
-placement reconciliation. Reconciliation resolves transport endpoints for the
-union of voters and learners before proposing membership changes; otherwise a
-committed learner can remain permanently unable to receive its log or snapshot.
-Internal leader-only routes return a typed
-unavailable response during that handoff. They do not leave survivors honoring
-a removed leader, trigger election storms during expansion, or collapse
-retryable topology churn into a generic HTTP failure.
+- Restore never reconstructs the live root in place. It acquires a process-wide
+  preparation capability for the exact shard root, creates a unique sibling
+  staging generation, imports and validates there, runs foreground
+  derived/runtime repair against the staged path, closes, recursively syncs,
+  and seals it, then drains serving leases and promotes to the publication
+  capability.
+- A prepare or repair failure destroys staging and leaves the live generation
+  untouched.
+- macOS and Linux publish with atomic directory exchange; platforms or
+  filesystems without it reject replacement before mutating the live namespace.
+- The exchanged old root goes to the shared backend runtime cleanup lane;
+  recursive reclamation is off the publication path. If the parent sync after a
+  visible exchange fails, the previous generation stays under the staging name
+  until reconciliation confirms durability and schedules cleanup.
+- `DB.restoreSnapshotToDeferredRuntimeRepair()` requires a `StagedGeneration`
+  capability and rejects any path that is not its staging root; raw path
+  possession cannot mutate a serving root. Startup, provisioning, and API
+  restore all acquire capabilities through the process generation-lifecycle
+  manager.
+- `TableWriteSource.restoreTable()` acquires and releases the table restore
+  reservation itself. Cluster restore, which holds the reservation across
+  metadata replacement and remote staging, uses `restoreTableReserved()`.
 
-Replicated source split lifecycle commands have one state-machine owner: the
-durable data-Raft apply store. They are transition-only entries and are never
-forwarded to the document DB executor. The apply store tracks its own durable
-entry watermark and filters overlapping committed prefixes before producing
-effects, so a Raft applied watermark that temporarily lags another state
-machine cannot apply `prepare` twice while advancing to `start`.
+Authority and identity rules:
 
-Metadata-Raft projection publication is commit-derived. The apply store stages
-owned projection signals, committed-key notifications, and split/merge deltas
-while the write transaction is open, then publishes them only after the batch
-and applied watermark commit. Allocation failure or transaction abort discards
-the complete staged outcome. A command rejected by monotonic identity or phase
-fencing is a durable no-op and therefore emits no runtime delta; production
-listeners and deterministic simulations consume this same committed outcome
-instead of reconstructing effects from requested commands. Batch apply,
-snapshot installation, and synchronous listener dispatch share one serialized
-publication lane, so consumers observe durable projection changes in commit
-order. The normal production apply path does not clone transition records when
-no caller requests the committed delta list.
+- External storage authority survives distributed restore as a named
+  `external_io` connection, not a URI. The ingress node checks `restore.read`,
+  validates the manifest once, and submits only the connection identifier plus
+  per-shard path, size, and digest to metadata. Credentials are never written to
+  Raft; each replica resolves the identifier against local configuration so
+  bucket, prefix, and capability policy apply where the I/O happens.
+- The low-level Raft host never resolves a backup URI or ambient credentials; it
+  validates the bootstrap identity and delegates I/O to the managed bootstrap
+  owner. A missing connection or owner, malformed relative path, or absent
+  digest fails closed before any filesystem or object-store access.
+- Range restore intent, replica bootstrap record, local import marker, and
+  completion progress carry the same shard digest, so retries and crash
+  recovery are idempotent per immutable artifact and stale completion cannot
+  satisfy a newer intent.
+- Restore identity is range-scoped; table definitions are not a fallback source.
+  Manifest admission sorts shard boundaries and rejects gaps and overlaps
+  before topology publication.
+- Import and repair progress markers are strict versioned JSON with a mandatory
+  artifact digest, written by file sync, atomic rename, and parent sync.
 
-Structural index/schema reconciliation is admitted by a linearizable,
-whole-table catalog contract containing metadata incarnation, table definition,
-and an order-independent digest of every range record. Metadata services build
-non-owning table/range maps and table topology digests once per stable catalog
-epoch; subsequent contract validation is O(1) and does not allocate or scan an
-admin snapshot. Remote data nodes use the same required internal validation
-route through a bounded pool of keep-alive clients sharing the process
-`BackendRuntime` API I/O lane. This preserves connection reuse and bounded
-concurrency without allocating an I/O runtime per request or serializing all
-control-plane traffic. Nodes fail closed if either group or whole-table fencing
-is unavailable.
+Overwrite and completion rules:
 
-User-visible table-definition mutation has a separate replicated admission
-fence. Each table owns an O(1) `TableTransitionFence` containing a monotonic
-generation and active split/merge count. Admitting or terminating a range
-transition updates that fence in the same metadata-Raft transaction as the
-transition record. Schema, index, enrichment, and other in-place table
-definition changes use compare-and-replace against both the expected table
-definition and the fence. Table deletion carries the observed inactive fence
-generation in its Raft command and waits for the committed absence; a transition
-admitted or completed in between makes the command a durable no-op and returns
-HTTP 409 instead of reporting a false success. A mutation racing an active or
-newly admitted transition cannot silently alter the contract retained by
-transition work. Admission is reciprocal: a new split
-or merge verifies the current table contract and participating range identities
-in the same Raft transaction that creates the transition. An older proposal
-therefore cannot become active after a newer schema or index definition commits.
-Progress upserts can only advance an already admitted transition. The fence is
-keyed by table, so unrelated tables neither scan nor invalidate one another.
+- Overwrite-mode cluster restore preserves the existing table ID, ranges, and
+  target shard IDs; it stages source data into each target's sibling generation
+  and repairs it with the backup's schema and index catalog. Only after sealing
+  does the exclusive transition upsert the definition and exchange the
+  generation.
+- Metadata publication rolls back only if storage publication fails before the
+  namespace exchange; after the exchange, durability uncertainty is a committed
+  result. Publication and rollback are full-definition compare-and-swap, so a
+  concurrent schema, index, placement, or restore-intent update fails the
+  transition closed.
+- Restore completion is a replicated compare-and-clear carrying the exact table,
+  group, backup, location, connection, snapshot path, byte count, and digest. It
+  clears only matching restore fields and preserves range ID, boundaries,
+  identity namespace, split epoch, and other topology; a delayed completion for
+  a superseded artifact is a no-op.
+- A committed exchange with a failed parent sync is reported as durability
+  pending. Retrying the same backup reconciles publication and reports
+  committed/durable; a retry against an unrelated existing table is rejected
+  without modifying storage.
+- The restore-job journal mirrors generation state: before irreversible work it
+  persists one active manifest ordinal; publication moves it to a
+  durability-pending or published range, and replica convergence moves it to
+  completed. Ranges are disjoint where ownership differs and validated on load.
+  Job IDs, idempotency scope, table limits (4096 per cluster, 256 per explicit
+  list), and range encoding are in
+  [BACKUPS.md](BACKUPS.md#durable-restore-jobs).
+- Restore dispatch is generation-fenced: leadership pauses FIFO admission,
+  drains the old runtime owner, rebuilds durable attempts, publishes the new
+  term, then reopens admission. Completion callbacks request another dispatch
+  pass instead of blocking on a dispatcher that may be destroying them.
 
-Each bounded reconciliation quantum receives one whole-table admission fence.
-It captures the table runtime-cache epoch before opening storage, retains owned
-observations for completed groups, performs one post-mutation linearizable
-catalog check, and publishes the accepted batch under one cache lock with that
-original epoch.
-Enqueueing any structural request first invalidates the table epoch, including
-deduplicated requests. Therefore a catalog change, restore/root transition, or
-newly enqueued structural mutation between validation and publication makes
-the observations stale; an unrelated table does not interfere. Per-group
-mutation remains bounded, with exactly two ReadIndex barriers per productive
-quantum rather than barriers per group.
+### Backup Publication
 
-Removing an active split or merge record is intentionally a no-op, not a
-cancellation protocol. Cancellation first commits rollback intent on the same
-transition identity, lets the transition owner restore source/receiver state,
-then commits the `rolled_back` terminal phase. Only a terminal record may be
-removed. Restart can therefore recover either an actionable rollback intent or
-a terminal record, never an absent active transition whose storage side effects
-remain live.
+Backup publication has a separate immutable commit point. Manifest formats
+are owned by [BACKUPS.md](BACKUPS.md): the table backup manifest (format
+version 2, explicit `native` or `portable`, every shard bound to its group,
+range, relative artifact path, byte count, and SHA-256 digest) and the canonical
+content-addressed repository of refs, manifests, seals, and blobs. The DB-layer
+rules are:
 
-Distributed split bootstrap uses an exact destination reservation keyed by
-transition identity, attempt epoch, byte range, and source delta sequence. A
-replayed begin for that same reservation is idempotent and cannot erase chunks
-written by another source-leader attempt. A newer sequence may replace an
-incomplete reservation and fences older writes; completion publishes only the
-exact reserved sequence. The source acknowledgement is proposed only after
-destination completion, so metadata cutover cannot authorize an empty or
-partially replaced destination generation.
+- shard artifacts live under a cryptographically random internal operation
+  generation, so an interrupted attempt cannot make a later request reuse or
+  overwrite stale bytes; the caller's `backup_id` names only the manifest
+- every shard transfer completes before the manifest is conditionally
+  published; filesystem backups sync each copied file, sync directories from
+  leaves to root, and file-sync, atomically rename, and parent-sync the
+  manifest, so the rename is a crash-durable commit point
+- native digests cover a canonical tree encoding of sorted normalized paths,
+  sizes, and contents (independent of enumeration order, rejecting symlinks);
+  portable digests cover the exact AFB bytes; hashing streams with bounded
+  memory on the shared I/O runtime
+- restore treats the manifest format as authoritative, rejects duplicate group
+  or artifact identities and unbound artifacts, copies local and remote content
+  into an Antfly-owned staging root, and verifies that private copy before any
+  importer or publication consumes it; portable archives import block-by-block
+  from a stable descriptor with memory bounded by one encoded block
+- a digest mismatch or source mutation is a terminal corrupt-backup integrity
+  failure that leaves the live generation and table definition unchanged; an
+  unversioned or unsupported manifest fails closed before staging
 
-A source group created before data-Raft projection has no apply watermark yet.
-Its first split preparation seeds the source snapshot and a synthetic index-zero
-watermark in one DocStore batch under the per-group apply lock. Index zero is
-reserved for this baseline; real Raft indexes remain unchanged. A replica
-replacement may instead inherit an authoritative document generation while its
-new local Raft projection contains only a bootstrap batch. In that case a
-non-null watermark does not prove that the projection includes the inherited
-documents.
+### Data-Raft Snapshot Install
 
-Split preparation reconciles an inherited generation only at an exact durable
-apply watermark. It first waits until the document state machine has applied
-through that watermark, acquires group-exclusive write admission, finishes
-managed bulk state, and scans one point-in-time transaction from the
-generation-owned writer. It does not hold the DB apply lock during the scan.
-Existing projected values are compared through a cursor instead of being
-materialized, and atomic replacement writes directly through one transaction
-instead of constructing another shard-sized write list.
+Data-Raft snapshot apply uses the same generation boundary:
 
-Successful reconciliation records the authoritative DB root's durable 128-bit
-incarnation beside the projection. This identity is persisted in the staged DB
-before generation sealing and atomic publication; it is stable across a process
-restart but regenerated whenever a physical root is replaced. A process-local
-visible-root generation is not sufficient because it restarts from zero. Later
-split handoffs use an O(1) durable fast-path check: both the root incarnation and
-the complete Raft watermark identity must match before the apply-store
-projection can be captured without rescanning the DB. Missing, zero, malformed,
-or mismatched incarnation markers fail closed. Snapshot installation naturally
-drops the marker with the replaced group generation. Normal-entry history and
-the watermark remain unchanged. If Raft advances during repair, publication
-fails and preparation retries from a new snapshot; only replicated split deltas
-may mutate an active projection.
+- The apply path validates the canonical snapshot stream without materializing
+  document values or per-document descriptors, builds a fresh staged DB in
+  fixed-size borrowed batches, syncs and seals it, and atomically publishes it
+  under a group-scoped generation capability. It never scans or deletes the old
+  live table.
+- Durable data-Raft projections are physically partitioned by group under one
+  root-level coordinator that keeps the single process writer authority, so
+  replacement cost is proportional to the incoming group snapshot.
+- The apply store uses a per-group generation-preparation marker instead of
+  holding its hash-stripe mutex during import. Target-group operations wait;
+  other groups, including colliding stripe members and groups in the same
+  table, keep applying and serving. Only reader drain, cached-owner retirement,
+  atomic exchange, and allocation-free watermark publication run under the
+  stripe lock.
+- Shared cache-generation bookkeeping is reserved before staging and advanced
+  without allocation right after the exchange, so the new root is never visible
+  under the old cache identity. The generation reservation owns a map reference,
+  so topology pruning cannot remove its bookkeeping mid-staging.
+- Schema validation is parsed once per snapshot and applied per batch; derived
+  replay stays durable in the staged generation for normal workers to resume.
+- Publication retires and drains only the target group's owners behind an exact
+  group read-cache admission fence. Table-wide drop, schema, index, and restore
+  transitions wait for every group preparation and keep table-wide epochs.
+- Exchanged old apply roots go to the backend runtime cleanup lane, off the
+  Raft apply critical path.
 
-The incarnation belongs to the core storage generation, not to a derived-index
-repair checkpoint. It is stored in an independently checksummed
-`root_identity.checkpoint`, written through the DB runtime's caller-owned
-`std.Io`, synced, and atomically renamed. The identity belongs to the directory,
-not the process-local visibility generation: cache fencing and in-place metadata
-reconciliation preserve it. Every newly staged directory creates its identity
-before sealing, so atomic publication carries the new identity with the root.
-First creation is serialized by a blocking OS file lock and rechecks the
-checkpoint after acquiring that lock. Concurrent first opens therefore observe
-one durable incarnation rather than retaining different random candidates.
-Derived checkpoint loss or repair cannot change storage identity. A physical
-generation replacement creates a new identity even when the logical contents
-and index catalog are unchanged.
+Catalog contract:
 
-This checkpoint applies only to `filesystem_managed` roots whose path is the
-published storage directory. Embedded and Lite DBs use `external_backend`: the
-path is a logical namespace while the enclosing single-file engine owns
-locking, durability, and publication. Those handles do not synthesize a
-directory incarnation and fail closed if a distributed projection asks for
-one.
+- The install captures metadata Raft group identity, the metadata cluster's
+  durable 128-bit incarnation, table identity and name, schema, index catalog,
+  range topology, and identity namespace after group admission. The snapshot's
+  encoded range must match the catalog range. Staging owns only this compact
+  contract, so memory is independent of catalog size.
+- After serving leases drain, the candidate is exchanged into the filesystem
+  but stays outside serving admission. The catalog source then performs a Raft
+  linearizable read (followers forward ReadIndex to the leader and wait for
+  local apply) and compares the compact contract on the metadata replica. A
+  mismatch restores the retained prior root before admission reopens; a match
+  commits the exchange and advances the visible generation. Unrelated metadata
+  changes do not force a retry.
+- The fixed metadata Raft group id is not a cluster identity. Metadata
+  initializes its incarnation exactly once through the replicated state
+  machine and includes it in Raft snapshots. Data nodes pin the first valid
+  incarnation they observe; every metadata endpoint, head/snapshot pair, and
+  mutating control-plane request must prove it before affecting provisioning or
+  publication. Missing, zero, or mismatched identities fail closed.
 
-Replica relocation and replica-count shrink use two committed membership
-phases. A `draining` source remains a voter, and may remain leader, while
-replacement learners hydrate and the expanded voter set stabilizes. Once any
-healthy leader proves that exact, non-joint expanded configuration, metadata
-publishes the final peer set and marks removed replicas `retiring`. Local Raft
-reconciliation then transfers a retiring leader to a retained voter before
-proposing contraction. That exact final peer set is latched in the retiring
-placement records; a later planner result cannot replace it midway through the
-phase. Newly proposed peers are deferred and omitted final peers are preserved
-until the phase completes. A retiring replica remains hosted and reports Raft
-status but is excluded from membership and client routing. Its placement row
-can be deleted after a healthy surviving leader proves the exact, non-joint
-final voter set. A healthy source that still reports itself as a voter continues
-to block deletion, but an unavailable removed source cannot deadlock cleanup
-forever. Metadata absence is the durable routing and ownership fence; local
-reconciliation removes the persisted Raft catalog record before retiring the DB
-owner. This prevents filesystem and cache retirement from racing a
-still-committed Raft member, including replication-factor-one moves. Membership
-planning indexes placement intent by `(group, node)` and runtime evidence by
-`(group, store)`. Hydration, cutover, and retirement accept evidence only from
-the exact store named by the placement. A zero store identity is usable only
-when the node has one unambiguous store; multi-store nodes fail closed. A
-duplicate store identity or duplicate `(store, group)` report is malformed
-evidence and also fails closed instead of choosing an order-dependent winner.
-A reconcile pass builds this evidence index once and remains linear in stores,
-status reports, and placements, with only replication-factor-bounded scans per
-retiring group.
+### Generation Publication And Durability
 
-Relocation hydration is proven by relocation generation, committed Raft apply
-boundary, logical document watermark, and stable voter identity. Source disk
-bytes are capacity telemetry, not a cutover predicate: compaction, segment
-layout, and cache state can make a logically equivalent target generation
-smaller or larger than its source. Physical-size comparison must therefore
-never strand an otherwise complete learner in replay.
+- Publication errors are pre-commit errors. Once a rename or exchange makes the
+  new generation visible, publication returns `durable` or
+  `durability_uncertain`, and the caller finishes cache invalidation and
+  admission bookkeeping in both cases. A post-commit sync failure never enters
+  the pre-commit abort or metadata-drop path; it reports committed with
+  durability pending and leaves raft bootstrap inactive.
+- Every staged candidate carries a durable two-phase publication record that
+  moves into the live root with the exchange. `prepared` names the retained
+  sibling, and startup atomically restores it (process death after exchange but
+  before catalog validation). Catalog validation durably writes `committed`
+  before admission advances.
+- DB open completes committed publication: it syncs the parent namespace,
+  submits retained or abandoned siblings to the runtime cleanup lane, and clears
+  the record before admitting the root. Cleanup failures leave the generated
+  sibling name as durable retry debt; they never block read admission.
+- Every open DB holds a shared generation lease and a shared filesystem
+  publication lock until `DB.close()`. An exclusive transition blocks new opens
+  and publishes only after all prior owners close. The persistent sibling lock
+  file also excludes overlapping restore publishers across processes.
+- Reconciliation is cached only while a local reader holds the shared lock; the
+  final reader invalidates it so a later open observes debt from another
+  process. Cached read admission takes the shared lock before registering the
+  reader, then revalidates under the manager mutex; if the last prior reader
+  drained meanwhile, the opener retries through exclusive reconciliation.
+- Stale-stage GC, under the exclusive lock, considers only names matching
+  Antfly's full generated-stage grammar: marked abandoned candidates and
+  markerless retired roots from a completed exchange. A manual runtime admits
+  the reconciled generation and downgrades the lock before recursively
+  reclaiming the identified paths.
+- Retired-root deletion holds one persistent cleanup lock per parent directory,
+  so duplicate workers serialize per table-group parent while unrelated shards
+  reclaim in parallel. Workers recheck existence after locking; an already
+  reclaimed generation is success.
+- The root layout is path-relative and may lazily open run files after a
+  transaction starts, so serving transitions stop admission and drain old
+  owners before publication (refcounts make close ordering safe, not a path
+  swap under a reader). Zero-downtime overlap of generation N readers with N+1
+  publication requires immutable versioned roots plus an atomically published
+  current-generation pointer.
+- Multiple shard directory swaps are not crash-atomic. Until table generations
+  publish through one durable table generation pointer, table backup and restore
+  reject multi-range manifests right after decoding.
+- LSM manifests are relocatable: on open, run paths are rebuilt from the current
+  root and run identity, and obsolete run paths under the prior root's `runs/`
+  are rebased.
 
-Transition observation reads the source phase, terminal fence,
-acknowledgement, and delta sequence atomically under one apply-store shard lock.
-It never seeds or scans the document DB. Observation and reconciliation fail
-fast with a retryable unavailable result while snapshot generation staging is
-active; they do not wait behind generation I/O and consume the HTTP worker pool.
-Managed data-Raft status collection follows the same ownership boundary: it
-uses writer-published runtime snapshots when available and conservative
-Raft/transition facts on a cold cache. It never opens an independent status DB
-over a Raft-owned root. Transition readiness comes from observations published
-by the transition owner into metadata, then from durable phase/snapshot facts;
-status paths never instantiate split or merge coordinators to inspect live
-roots. Non-Raft deployments may retain the bounded status-only open because no
-competing managed writer exists.
+### Shared Cache Invalidation
 
-Split execution dispatch follows ownership as well. A data-Raft server uses the
-replicated destination route. A server with an injected local transition runtime
-delegates to that runtime, and the non-Raft fallback creates a short-lived local
-coordinator under transition admission. Only the replicated path requires a
-destination URI; local execution must not fail merely because no remote route
-exists.
+- Shared caches are invalidated by table-group root, not only by primary store
+  path. Primary LSM caches and LSM-backed indexes use path-prefix invalidation.
+- Dense/HBC uses a cache namespace per HBC index root; the cache registers
+  namespace-to-path ownership, and restore or drop invalidates every namespace
+  under the table-group root. Future shared index caches follow the same rule:
+  engine-specific keys, table-root-scoped lifecycle owned by the generation
+  transition.
+- HBC namespace registrations are reference counted by open index owners and
+  outlive the last owner only while retained cache entries use them; clear,
+  path invalidation, and later opens prune unowned registrations.
+  Per-namespace statistics retire at the same boundary.
 
-Allocator ownership is part of the same lifetime contract. APIs that return
-owned storage/index buffers accept the allocator that must later free them, or
-carry their allocator in a typed owner. In particular, full-text stored-document
-decompression allocates directly in the request/result allocator instead of the
-segment reader's allocator; this prevents cached index generations and HTTP
-requests from crossing allocator domains during result teardown.
-Production HTTP server construction selects the process request allocator
-internally. Arbitrary request-allocator injection is test-only, so a new serving
-call site cannot accidentally recreate cross-allocator ownership by choosing an
-allocator with a different identity.
+### Restore Repair Runtime
+
+Restore repair (for example generated chunks or embeddings) runs as foreground
+maintenance under the table generation transition: it initializes only the
+required runtime services, drives generated enrichment replay, drains
+derived/index replay, syncs, and closes before reads become visible. It never
+starts every optional runtime worker and never races a lookup/query open against
+half-published files.
+
+### Structural Reconciliation
+
+- Queued structural reconciliation closes new write admission before draining
+  current writers, so traffic cannot starve index/catalog convergence; reads
+  stay admitted on the published generation until the short publication
+  transition.
+- Each queued request owns one immutable catalog contract captured from a single
+  admin snapshot: table identity, desired schema and index definitions, and the
+  exact range and identity namespace of every group. Before using the plan and
+  before declaring completion, the catalog source validates a compact
+  whole-table contract after a Raft linearizable-read barrier.
+- The contract is an order-independent SHA-256 multiset digest plus range count
+  over all range records: O(1) on the wire, allocation-free against the
+  metadata owner's immutable projection, and sensitive to ranges added,
+  removed, or mutated after capture.
+- The catalog projection advances on a catalog-only epoch and is the sole owner
+  of cloned table and range records; store reports, placement progress, and
+  other control traffic live in a separate status projection with its own epoch
+  and cannot evict it. Metadata builds non-owning table/range maps and topology
+  digests once per stable catalog epoch.
+- A dequeue advances at most a fixed number of pending groups, removes completed
+  groups in O(1), and rotates busy groups. One compact contract admits the
+  quantum; completed groups keep owned runtime observations until one
+  post-mutation contract check accepts the quantum, then publish with the table
+  epoch captured before storage work. Each productive quantum uses exactly two
+  ReadIndex barriers.
+- Productive quanta requeue at the tail with no delay; a short delay applies only
+  when every attempted group is blocked. A changed contract discards only the
+  stale plan; write admission stays reserved across the rebuild, and stale work
+  cannot publish readiness for a replaced topology.
+- Enqueueing any structural request, including a deduplicated one, invalidates
+  the table epoch first, so an intervening catalog change, root transition, or
+  new mutation makes the quantum's observations stale.
+- Remote data nodes validate through a required internal route using a bounded
+  pool of keep-alive clients on the process `BackendRuntime` API I/O lane. Nodes
+  fail closed if group or whole-table fencing is unavailable.
+
+User-visible table-definition mutation has a separate replicated fence:
+
+- Each table owns an O(1) `TableTransitionFence` (monotonic generation plus
+  active split/merge count), updated in the same metadata-Raft transaction as
+  the transition record.
+- Schema, index, enrichment, and other in-place definition changes
+  compare-and-replace against both the expected definition and the fence.
+- Table deletion carries the observed inactive fence generation and waits for
+  committed absence; an intervening transition makes it a durable no-op and
+  returns HTTP 409.
+- Admission is reciprocal: a new split or merge verifies the current table
+  contract and participating range identities in the transaction that creates
+  it, and progress upserts can only advance an admitted transition.
+
+### Runtime Status And Writer Ownership
+
+Dirty visibility and status cache:
+
+- Per-table dirty visibility tracking uses owned exact table identities, not
+  hashes. Write-cache eviction advances the table's read-cache epoch; the last
+  cache owner (serving or startup) also invalidates cached runtime status and
+  retires the identity. A draining lease that mutates after eviction re-marks
+  itself through the normal visibility hook.
+- The runtime-status cache is an owned map by table, then by group. Each table
+  has an `invalidation_epoch` and logical `root_generation`; restore, drop,
+  schema/index replacement, and visible-root transitions advance the epoch and
+  drop the group map, while routine writer status does not.
+- A live publisher captures the table epoch and a monotonic observation
+  generation before inspecting its DB and publishes in O(1); only a stale table
+  generation or an older observation for the same group is rejected.
+- A full refresh captures all table epochs and one observation watermark under a
+  short lock, collects without the lock, and publishes all epoch-valid tables in
+  one acquisition. Newer live observations win; tables invalidated during
+  collection are recollected individually.
+- Absence removal uses a separate topology revision: if topology changed during
+  collection, removals are deferred, and partial retries never remove tables.
+  Stable removal advances the global epoch allocator first, so an old owner
+  cannot republish into a recreated name.
+
+Writer ownership transitions:
+
+- Configuration is published under one ordered lock set: cache-open locks by
+  address, the source mutation lock, then cache lifecycle locks by address.
+  Gate or mirror changes reserve serving and startup cache retirement before
+  changing any source field, retire both caches, then invalidate read/status
+  observations and dirty identities. Cache entries reserve their retirement
+  queue slot at install, so transitions and final lease release are
+  allocation-free.
+- HA promotion preflights both live and raft-apply write sources before
+  consuming standby ownership, so allocation failure aborts before irreversible
+  changes. Promotion transfers the already-open receive-log owner after
+  validating paths, the durable timeline-switch record, and the slot store; it
+  never opens a second WAL writer or a close/reopen window.
+- Embedded `BoundTableWriteSource` restore closes its owner, restores into a
+  sibling, publishes atomically, and reopens the unchanged generation after a
+  pre-commit failure or the new one after success. Provisioned serving uses
+  separate prepare and publish operations. Startup/bootstrap paths publish a
+  validated primary generation with a durable repair marker so the startup
+  owner resumes derived repair after a crash.
+- Replica bootstrap restore finishes before `ensureReplica()` activates the
+  group; an active replica is never force-restored by raw path.
+
+### Placement Reconciliation
+
+Locking and admission:
+
+- One reconcile-generation mutex serializes metadata snapshots; the Raft owner
+  mutex protects only live `MultiRaft` mutation. Under the owner mutex,
+  reconciliation captures an immutable desired-state plan and marks restore
+  bootstraps preparing. Restore I/O, descriptor construction, and replica
+  catalog fsync run without it, so the Raft progress driver keeps elections,
+  heartbeats, transport, and apply going.
+- Catalog admission is durable before a prepared descriptor is published. The
+  owner mutex is reacquired only to install or retire replicas, refresh peers,
+  reconcile membership, and publish the apply-store group set.
+- Admission is two-phase: the apply store prepares the new maps and admits the
+  union of old and new groups; success commits exactly the new set, while
+  partial failure keeps the union until the next metadata sync narrows it.
+  Exact commit retires owners and cached summaries without allocation; an owner
+  pinned by snapshot materialization or publication is marked retired and
+  closed by its last user.
+
+Leadership and membership:
+
+- `draining` sources and `cutover_ready` targets stay valid leaders until the
+  expanded voter set converges. A `retiring` leader transfers leadership to the
+  lowest-ID retained voter before proposing self-removal; if it already
+  disappeared, that voter campaigns after reconciliation.
+- Reconciliation resolves transport endpoints for all voters and learners before
+  proposing membership changes, so a committed learner can always receive its
+  log or snapshot.
+- Internal leader-only routes return a typed unavailable response during
+  handoff rather than honoring a removed leader or returning a generic HTTP
+  failure.
+- Relocation and replica-count shrink use two committed phases. A `draining`
+  source stays a voter (and may lead) while learners hydrate. Once a healthy
+  leader proves the exact non-joint expanded configuration, metadata publishes
+  the final peer set and marks removed replicas `retiring`. That final set is
+  latched in the retiring placement records; new peers are deferred and omitted
+  final peers preserved until the phase completes.
+- A retiring replica stays hosted and reports Raft status but is excluded from
+  membership and routing. Its placement row is deleted after a healthy
+  surviving leader proves the exact final voter set; a healthy source still
+  reporting itself as voter blocks deletion, but an unavailable one cannot
+  deadlock cleanup.
+- Metadata absence is the durable routing and ownership fence: local
+  reconciliation removes the persisted Raft catalog record before retiring the
+  DB owner, including replication-factor-one moves.
+
+Evidence:
+
+- Placement intent is indexed by `(group, node)` and runtime evidence by
+  `(group, store)`; hydration, cutover, and retirement accept evidence only from
+  the exact named store. A zero store identity is usable only on a single-store
+  node. Duplicate store identities or `(store, group)` reports fail closed. The
+  evidence index is built once per pass, keeping reconciliation linear.
+- Relocation hydration is proven by relocation generation, committed Raft apply
+  boundary, logical document watermark, and stable voter identity. Source disk
+  bytes are capacity telemetry, never a cutover predicate.
+
+### Raft Progress, Control Lanes, And Metadata Projection
+
+- The Raft progress lane owns consensus progress and durable metadata projection
+  but never mutates the in-memory split/merge transition controller. The control
+  lane is the controller's sole writer and rehydrates it from durable projected
+  transition records each round, so a projection update is a durable wakeup
+  that survives delay, leadership change, or restart.
+- Controller access is serialized independently of the Raft owner lock;
+  transition storage and network I/O never delay elections, heartbeats, or
+  Ready processing.
+- Each peer control RPC has a finite deadline and retries through the durable
+  transition record. Health and metrics read a separately published fixed-size
+  controller snapshot. Transition readiness reads a projected topology snapshot,
+  never the rich admin snapshot (which may observe transitions and must not be
+  called recursively by the controller).
+- Replicated split observations read the durable data apply projection under its
+  per-shard lock and never wait on the action lane. Split actions use fixed,
+  group-sharded singleflight lanes that fail fast when busy.
+- Metadata-Raft projection publication is commit-derived: the apply store stages
+  projection signals, committed-key notifications, and split/merge deltas
+  during the write transaction and publishes them only after the batch and
+  applied watermark commit. Allocation failure or abort discards the staged
+  outcome; a command rejected by identity or phase fencing is a durable no-op
+  with no runtime delta.
+- Production listeners and simulations consume the same committed outcome.
+  Batch apply, snapshot install, and listener dispatch share one serialized
+  publication lane, so consumers see changes in commit order. Transition
+  records are not cloned unless a caller requests the delta list.
+
+### Allocator Ownership
+
+- APIs that return owned storage/index buffers accept the allocator that will
+  free them, or carry it in a typed owner. Full-text stored-document
+  decompression allocates in the request/result allocator, not the segment
+  reader's.
+- Production HTTP server construction selects the process request allocator
+  internally; request-allocator injection is test-only.
 
 ## Write Contract
 
@@ -858,162 +549,114 @@ current stored document.
 
 ## Derived Artifact Contract
 
-Derived artifacts are enrichment-owned, not index-owned.
+Derived artifacts are enrichment-owned, not index-owned. Public artifact
+identity (`ArtifactRef`, `artifact_id`) is defined in
+[ENRICHMENTS.md](ENRICHMENTS.md#artifact-identity-and-lookup); the document-key
+codec is in [DOCID.md](DOCID.md#key-layout). Internal artifact keys (constructors
+in `pkg/antfly-embedded/src/storage/internal_keys.zig`) never use textual
+`<doc>:e:` suffixes:
 
-Storage keys should use:
+```text
+user_ns | enc(doc) | 00 00 | 0x20 | enc(type) | 00 00 | enc(name) | 00 00 | <record suffix>
+```
 
-- `<doc>:e:<type>:<name>:...`
-
-Examples:
-
-- `<doc>:e:chunk:body_chunks_v1:0`
-- `<doc>:e:asset:ocr_text_v1`
-- `<doc>:e:embedding:body_dense_v1`
-
-This keeps artifact type explicit and allows one chunking or asset-output
-pass to feed multiple indexes without duplicating sidecar storage.
-Model-produced text, OCR, transcripts, classifications, entity extraction, and
-other derived payloads use the generic `asset` artifact type, with the specific
-media/schema encoded by `content_type`, artifact name, and enrichment metadata.
-
-Current first implementation:
-
-- chunk artifacts produced by the leased enrichment runtime
-- generator configs may declare `chunk_name`
-- chunk artifacts are stored under `<doc>:e:chunk:<chunk_name>:<chunk_id>`
-- overwrites and deletes clear stale chunk artifacts before regeneration
+- `0x20` is the artifact record kind; `type` is `chunk`, `asset`, `embedding`,
+  `graph`, or `resolution`.
+- chunk suffix: `0x30 | u32be(chunk_id)`; document units in assets add
+  `0x35 | enc(unit_id)`; an embedding derived from another artifact appends
+  `0x31 | enc(name)` to that artifact's key.
+- Every artifact for a document stays inside that document's key range, so
+  cleanup scans are bounded, and one chunking or asset pass can feed multiple
+  indexes without duplicate sidecar storage.
+- Model-produced text, OCR, transcripts, classifications, entity extraction, and
+  other derived payloads use the `asset` type; media/schema is carried by
+  `content_type`, artifact name, and enrichment metadata.
+- Chunk artifacts are produced by the leased enrichment runtime; generator
+  configs may declare `chunk_name`; overwrites and deletes clear stale chunks
+  before regeneration.
 
 ## Derived Coverage Accounting
 
-Derived artifacts and artifact-backed indexes need coverage accounting that is
-stronger than raw artifact or index-entry counts. A managed embeddings index can
-legitimately cover only a subset of table documents, for example a conditional
-media template over a mixed corpus, while a failed or lagging enrichment must
-not be hidden as "ready" simply because partial coverage is allowed.
+Coverage accounting is stronger than raw artifact or index-entry counts: a
+managed embeddings index may legitimately cover a subset of documents (for
+example a conditional media template), but a failed or lagging enrichment must
+never read as "ready".
 
-The DB-level invariant is:
+- Coverage measures whether every source unit of a derived generation reached a
+  terminal outcome.
+- Readiness is separate from health.
+- A partial index is never used as a full-table access path unless the query or
+  caller accepts that coverage (the partial-index precedent). Eligibility and
+  terminal outcomes are explicit, never inferred from template syntax or
+  artifact counts.
 
-- coverage measures whether every source unit for a derived generation reached a
-  terminal outcome
-- readiness is separate from health
-- query correctness must know when an index is partial, and should not treat a
-  partial index as a full-table access path unless the query or caller accepts
-  that coverage
-
-This follows the database precedent for partial indexes: eligibility is explicit
-and planners avoid using a partial index when doing so would produce an
-incomplete result set. For derived work, the corresponding rule is that
-eligibility and terminal outcomes are explicit, not inferred from template
-syntax or artifact counts.
+The status surface built on this model (`source_coverage`,
+`searchable_vectors`, `publication`, `activity`, and `index wait` predicates) is
+specified in
+[ENRICHMENTS.md](ENRICHMENTS.md#embeddings-lifecycle-status). Dense artifact
+counter bootstrap and counter/index mismatch handling are in
+[DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#artifact-counters-and-coverage).
 
 ### Coverage State
 
-Coverage is tracked per derived generation over logical source units, not over
-physical index entries. For the current embeddings API the source unit is one
-table document, including chunked embeddings: one document may produce many
-vectors but receives one `produced` outcome. This keeps the durable numerator
-comparable with the table-document denominator. Future artifact-to-artifact
-producers may use artifact identities only when their API exposes a matching
-source-total denominator. The coverage key identifies:
-
-- table or shard
-- derived artifact or index name
-- source artifact name, when the producer consumes another artifact stream
-- source unit identity
-- generation or config version
-
-Each source unit has one current outcome for that generation:
-
-- `pending`: not evaluated yet
-- `in_flight`: currently being evaluated
-- `produced`: artifact or index entry exists for the generation
-- `skipped`: evaluated and intentionally produced nothing
-- `terminal_failed`: evaluated and cannot produce after the configured policy
-  and retry budget
-- `stale`: an older generation result exists, but the current generation has not
-  completed for this source unit
-
-Aggregate status is derived from those durable per-source outcomes:
-
-- `source_total`
-- `eligible`
-- `produced`
-- `skipped`
-- `terminal_failed`
-- `retryable_failed`
-- `pending`
-- `in_flight`
-- `generation`
-- `complete`
-- `healthy`
-- `degraded`
-
-Completion is policy-specific. For the current document-level embeddings
-contract:
+- Coverage is tracked per derived generation over logical source units, not
+  physical entries. For embeddings the unit is one table document, including
+  chunked embeddings (many vectors, one `produced` outcome). Artifact-to-artifact
+  producers may use artifact identities only when their API exposes a matching
+  source-total denominator.
+- Coverage key: table or shard, derived artifact or index name, source artifact
+  name (for artifact-consuming producers), source unit identity, and generation
+  or config version.
+- Each source unit has exactly one current outcome: `pending`, `in_flight`,
+  `produced`, `skipped` (evaluated, intentionally nothing), `terminal_failed`
+  (policy and retry budget exhausted), or `stale` (only an older generation
+  result exists).
+- Aggregate status fields: `source_total`, `eligible`, `produced`, `skipped`,
+  `terminal_failed`, `retryable_failed`, `pending`, `in_flight`, `generation`,
+  `complete`, `healthy`, `degraded`.
 
 ```text
 strict complete      = produced >= source_total
 partial complete     = produced + skipped >= source_total
 best_effort complete = produced + skipped + terminal_failed >= source_total
+healthy              = complete and terminal_failed == 0
+degraded             = complete and terminal_failed > 0
 ```
 
-Counts are mutually exclusive per `(index, generation, source document)`. When
-the distributed observation is complete, `pending` is `source_total -
-min(source_total, covered-by-policy)`. When any expected shard observation is
-missing or unusable, the global pending count is unknown and the public status
-reports `pending: null`; it never presents an observed lower bound as an exact
-global count. Runtime replay debt remains an independent readiness gate. Health
-is stricter:
-
-```text
-healthy = complete and terminal_failed == 0
-degraded = complete and terminal_failed > 0
-```
-
-This keeps "no work remains" distinct from "all desired outputs exist".
-
-`source_total` comes from a durable range-local document cardinality maintained
-in the same primary write transaction as document identity. It is O(1) to read
-and does not depend on query-visible index entries. The identity namespace and
-its `live_ordinals` summary remain shared across split descendants, so they are
-not an ownership proof for an individual shard. Split preparation and
-finalization therefore rebase both the range cardinality and each active
-generation's mutually exclusive outcome counters from the documents and
-outcome markers retained by that range. A missing range counter is recovered by
-one bounded range scan, then subsequent inserts and deletes update it by the
-identity visibility delta in the caller's atomic primary batch.
-
-This distinction is required for chunked projections, where one source document
-may produce many physical vector entries. Distributed projections sum
-cardinality and outcomes only from fresh shard observations;
-`observation_complete` is false if any expected shard is missing, stale,
-remotely unknown, reports an incomplete counter summary, or reports a
-stored-config fingerprint different from the requested index config.
-An incomplete observation can never report complete or healthy coverage and
-includes structured reasons such as `missing_group`, `stale_group`,
-`summary_unavailable`, and `config_mismatch`. The configuration fingerprint is
-a versioned canonical hash of semantic generated-output configuration: object
-ordering, credentials, provider rate limits, and top-level execution batching
-are excluded. It is encoded as a fixed-width hexadecimal string at the API
-boundary and remains stable across shard-local marker generations, preventing
-rolling reconfiguration from combining outcomes that describe different
-indexes. An idempotent index mutation or an operational-only configuration
-change preserves the catalog-owned coverage incarnation while storing the new
-operational settings; a generated-output change assigns a fresh incarnation.
+- Counts are mutually exclusive per `(index, generation, source document)`. With
+  a complete distributed observation, `pending = source_total -
+  min(source_total, covered-by-policy)`; with any expected shard missing or
+  unusable, public status reports `pending: null`, never a lower bound as exact.
+- Runtime replay debt is an independent readiness gate.
+- `source_total` is a durable range-local document cardinality maintained in the
+  primary write transaction that maintains document identity; it is O(1) to read
+  and independent of index entries. Because the identity namespace and its
+  `live_ordinals` summary are shared across split descendants, split
+  preparation and finalization rebase the range cardinality and each active
+  generation's outcome counters from the documents and markers retained by the
+  range. A missing range counter is recovered by one bounded range scan, then
+  maintained by the identity visibility delta in the caller's batch.
+- Distributed projections sum cardinality and outcomes only from fresh shard
+  observations. `observation_complete` is false if any expected shard is
+  missing, stale, remotely unknown, reports an incomplete counter summary, or
+  reports a different stored-config fingerprint; incomplete observations never
+  report complete or healthy and carry reasons such as `missing_group`,
+  `stale_group`, `summary_unavailable`, and `config_mismatch`.
+- The config fingerprint is a versioned canonical hash of semantic
+  generated-output configuration (excluding object ordering, credentials,
+  provider rate limits, and top-level batching), encoded as fixed-width hex and
+  stable across shard-local marker generations. Idempotent or operational-only
+  changes keep the catalog-owned coverage incarnation; generated-output changes
+  assign a fresh one.
 
 ### Coverage Policy
 
-Derived configs should declare how missing or non-embeddable source units affect
-readiness:
-
-- `strict`: every eligible source unit must produce an output; skipped or failed
-  required units keep the derived artifact/index not ready
+- `strict`: every eligible source unit must produce; skipped or failed required
+  units keep the index not ready.
 - `partial`: intentional skips satisfy completion; terminal failures do not
-  satisfy healthy readiness
-- `best_effort`: intentional skips and terminal failures may satisfy completion,
-  but terminal failures make the status degraded
-
-The policy is explicit on each consuming managed embeddings index, for example:
+  satisfy healthy readiness.
+- `best_effort`: skips and terminal failures satisfy completion; terminal
+  failures make status degraded.
 
 ```json
 {
@@ -1023,43 +666,30 @@ The policy is explicit on each consuming managed embeddings index, for example:
 }
 ```
 
-Enrichment definitions do not independently expose coverage policy in the
-current API. They durably record producer outcomes; the consuming index decides
-which terminal outcomes satisfy its readiness contract. This avoids conflicting
-producer/index policies and gives one unambiguous status per index. A future
-artifact-level readiness API may add producer policy as a separate contract,
-but it must not silently override index policy.
-
-Today eligibility is an execution outcome: a managed template that renders no
-input records a durable `skipped` result. A future declarative eligibility
-predicate must be implemented consistently by planning, execution, repair, and
-status before it becomes public. Unknown `applies_when` configuration is
-rejected rather than silently ignored.
+- Policy is declared on each consuming managed embeddings index. Enrichment
+  definitions record producer outcomes only; a future artifact-level readiness
+  API may add producer policy but never overrides index policy.
+- Eligibility is an execution outcome today: a template that renders no input
+  records a durable `skipped`. A declarative eligibility predicate must be
+  implemented consistently by planning, execution, repair, and status before
+  it becomes public; unknown `applies_when` configuration is rejected.
 
 ### Publication Policy And Readiness
 
-Managed embeddings indexes separate publication availability from source
-coverage. `publication_policy` controls when a generation may answer queries;
-`coverage_policy` controls which source outcomes count as complete. A partial
-coverage policy does not authorize querying an unsafe generation.
+`publication_policy` controls when a generation may answer queries;
+`coverage_policy` controls which outcomes count as complete. A partial coverage
+policy never authorizes querying an unsafe generation.
 
-The publication policies are:
-
-- `progressive` is the default. A newly admitted canonical generation becomes
-  queryable after it has at least one physical entry and a durable,
-  generation-matching projection checkpoint beyond its admission fence. It
-  remains `queryable_partial` until coverage and replay are complete.
-- `atomic` preserves fail-closed construction. A shadow generation is built,
-  validated, and activated only after the complete-generation proof succeeds.
-
-The persisted representation is migration-free. An embeddings index whose
-stored configuration predates `publication_policy` is interpreted as
-`progressive`; there is no catalog rewrite, rebuild, warning, or operator
-action. Only an explicit `atomic` value requests the old initial-admission
-behavior. Externally supplied vector fields have no managed producer or
-coverage authority and do not use the managed partial-admission exception.
-
-Public readiness is authoritative:
+- `progressive` (default): a newly admitted canonical generation becomes
+  queryable once it has at least one physical entry and a durable,
+  generation-matching projection checkpoint beyond its admission fence, and
+  stays `queryable_partial` until coverage and replay complete.
+- `atomic`: a shadow generation is built, validated, and activated only after the
+  complete-generation proof succeeds.
+- Stored configs that predate `publication_policy` are read as `progressive`
+  with no catalog rewrite, rebuild, or operator action. Externally supplied
+  vector fields have no managed producer and never use the partial-admission
+  exception.
 
 | State | Queryable | Complete | Meaning |
 | --- | --- | --- | --- |
@@ -1068,273 +698,175 @@ Public readiness is authoritative:
 | `ready` | yes | yes | The desired incarnation is fully covered, current, and published. |
 | `failed` | no | no | Automatic progress requires corrective action. |
 
-`IndexReadinessStatus` includes `queryable`, `complete`, an opaque incarnation,
-and target and published revisions. Physical vector or sparse-entry counts are
-reported separately from generation-scoped source coverage; clients must not
-infer completeness from physical cardinality.
+- `IndexReadinessStatus` carries `queryable`, `complete`, an opaque
+  incarnation, and target and published revisions. Physical entry counts are
+  reported separately; clients never infer completeness from them.
+- `antfly index wait` predicates (`--until complete`,
+  `searchable-artifacts=N`, `source-covered=N|N%`) are defined in
+  [ENRICHMENTS.md](ENRICHMENTS.md#embeddings-lifecycle-status). Long waits
+  belong in the waiter, not in a held search request; search uses the best
+  safely published generation.
+- Initial materialization is durable build work, not repair debt: it reports
+  through backfill, coverage, publication, and activity, and query admission
+  stays fail-closed until the first safe publication. Repair and
+  action-required diagnostics are reserved for damaged generations and explicit
+  rebuilds.
+- Write synchronization is the derived-replay contract in
+  [ENRICHMENTS.md](ENRICHMENTS.md#derived-replay-and-indexing-contract):
+  `sync_level=full_index` waits for that write's derived-publication fences,
+  which is distinct from waiting for an initial backfill.
+- Partial visibility advances only at durable producer and index checkpoints,
+  never at embedding-provider batches. Index-before-load workloads expose
+  successive durable load revisions; a bootstrap scan of a pre-existing corpus
+  currently emits one final producer revision.
 
-`antfly index wait --until complete` waits for complete readiness. `antfly
-index wait --until searchable-artifacts=N` waits for at least N published,
-query-admitted result-bearing units for the same incarnation. Embeddings also
-support `--until source-covered=N` or `N%`; percentages use
-`covered / (source_total - skipped)`. Pending and failed sources remain in the
-denominator; an all-skipped index does not satisfy a positive coverage target.
-When a dense publication target is available, that
-threshold does not succeed until the matching physical publication is visible.
+Progressive publication invariants:
 
-Ordinary initial materialization is durable build work, not repair debt. It is
-reported through backfill, coverage, publication, and activity while query
-admission remains fail-closed until the first safe publication. Public repair
-and action-required diagnostics are reserved for damaged generations and
-explicit rebuild operations.
-Search uses the best safely published generation by default. Long waits belong
-in this waiter, not in a held search request.
-
-Write synchronization remains the derived-replay contract defined in
-[ENRICHMENTS.md](ENRICHMENTS.md#derived-replay-and-indexing-contract):
-`sync_level=write` may observe eventual index consistency, while
-`sync_level=full_index` waits for that write's configured derived-publication
-fences. A write fence is distinct from waiting for an initial corpus-wide
-backfill to complete.
-
-Partial visibility advances only at durable producer and index checkpoints; an
-embedding-provider batch is not a publication boundary. Index-before-load
-workloads expose successive durable load revisions as they catch up. A
-bootstrap scan of a corpus that predates index creation currently emits one
-final producer revision, so exposing its internal provider batches would first
-require splitting the scan into bounded durable producer revisions.
-
-Progressive publication obeys these invariants:
-
-1. A query reads exactly one generation. Models, dimensions, chunkers, and
+1. A query reads exactly one generation; models, dimensions, chunkers, and
    configuration incarnations are never mixed.
-2. A mutable shadow candidate is never queried. Progressive initial admission
-   publishes only canonical-generation durable checkpoints.
+2. A mutable shadow candidate is never queried; progressive admission publishes
+   only canonical-generation durable checkpoints.
 3. Partial admission applies only to the managed-admission repair that created
-   the incarnation, only under `progressive`, and only after a physical entry
-   is visible.
-4. Catalog configuration hash, coverage incarnation, projection checkpoint,
-   and replay fence must agree. Corrupt or untrusted state remains fail-closed.
-5. Replacement rebuilds keep serving the previous trustworthy generation until
-   atomic activation. With no trustworthy generation, the index stays
-   unavailable until the progressive-admission proof succeeds.
+   the incarnation, only under `progressive`, and only after a physical entry is
+   visible.
+4. Catalog configuration hash, coverage incarnation, projection checkpoint, and
+   replay fence must agree; corrupt or untrusted state fails closed.
+5. Replacement rebuilds serve the previous trustworthy generation until atomic
+   activation; with none, the index stays unavailable until the progressive
+   proof succeeds.
 
-The durable repair intent remains the owner of completion, restart recovery,
-and fallback shadow reconstruction after partial publication. It is retired
-only by the stronger complete-generation proof.
+The durable repair intent owns completion, restart recovery, and fallback shadow
+reconstruction after partial publication, and is retired only by the
+complete-generation proof.
 
-Dense and sparse indexes share generation, coverage, and replay fences, but
-their physical proofs match their storage engines:
+Physical proofs share generation, coverage, and replay fences:
 
-- Dense publication requires active HBC cardinality to match the durable
-  artifact target (or produced-source count for non-chunked data) and requires
-  no deferred posting repair.
-- Sparse derived batches apply transactionally before their checkpoint
-  advances. Partial publication therefore requires a clean matching checkpoint
-  and at least one live sparse document. Completion additionally requires
-  complete source outcomes and enough live sparse documents to cover produced
-  sources; chunking may make the physical count larger.
+- Dense: active HBC cardinality matches the durable artifact target (or
+  produced-source count for non-chunked data) with no deferred posting repair.
+- Sparse: derived batches apply transactionally before their checkpoint
+  advances. Partial publication needs a clean matching checkpoint and one live
+  sparse document; completion additionally needs complete source outcomes and
+  live sparse documents covering produced sources.
 
 For repeatable ANN comparisons on an unchanged corpus, also wait for
-`status.hbc_posting.refresh_pending == false` on a fresh, complete index status.
-This is a separate optimization-convergence signal: a bounded clean sweep has
-verified the current mutation epoch. Writes invalidate it, and reopen starts
-pending until another sweep. Dirty postings can serve exact member scoring
-while clean postings use approximate quantized candidates, so ordinary idle
-refresh can change the neighbor list without a source-vector change. A status
-probe alone may inspect and retire a cold owner; activate the table with a query
-before waiting for its background work. This signal does not freeze the index
-against concurrent writes or change query readiness.
+`status.hbc_posting.refresh_pending == false` on a fresh, complete status. This
+optimization-convergence signal means a bounded clean sweep verified the
+current mutation epoch; writes invalidate it and reopen starts pending. Idle
+refresh can change neighbor lists without source changes. A status probe alone
+may retire a cold owner, so activate the table with a query first. The signal
+neither freezes the index nor changes query readiness.
 
-Correctness and latency use separate verification gates. The 500-document
-regression requires complete coverage, idempotent replay, a complete second
-index, and a stable first index. A deterministic partial-publication test proves
-`queryable_partial`, semantic retrieval, generation and coverage metadata,
-restart safety, and the final transition to `ready`. Release benchmarks record
-time to first queryable result separately from time to complete.
-
-This readiness contract landed before the v0.2 API and SDK surface was
-released, so the OpenAPI enum and required fields changed in place and all
-generated clients moved together. Persisted-index compatibility is provided by
-the silent `progressive` default above.
+Verification gates: the 500-document regression requires complete coverage,
+idempotent replay, a complete second index, and a stable first index; a
+deterministic partial-publication test proves `queryable_partial`, retrieval,
+metadata, restart safety, and the transition to `ready`. Release benchmarks
+record time to first queryable result separately from time to complete.
 
 ### Readiness And Repair
 
-Runtime status must use coverage accounting instead of raw `doc_count >=
-table_doc_count` for managed derived indexes. In particular:
-
-- `rebuilding` and `backfill_active` remain true while coverage has pending or
-  in-flight source units
-- `replay_catch_up_required` reflects source/enrichment replay debt and must not
-  be cleared solely because at least one artifact or index entry exists
-- partial coverage can mark skipped units complete, but it cannot mask pending
-  enrichment work
-- terminal failures are visible through degraded status and reason counters
-
-Repair also needs durable source-unit outcomes. Aggregate counters are not
-enough, because repair must distinguish:
-
-- never evaluated
-- intentionally skipped
-- produced but lost
-- stale generation
-- terminal failure
-
-Coverage-gap repair should regenerate missing `produced` artifacts, leave
-current-generation `skipped` units alone, and retry or surface
-`terminal_failed` units according to policy.
-
-Per-source outcome markers are the durable source of truth. Generation-scoped
-`produced`, `skipped`, and `terminal_failed` aggregate counters are updated in
-the same DB apply-lock domain as replay mutations, and each marker/counter batch
-commits atomically. Outcome transitions remove any prior outcome and update all
-affected counters in that one batch. Generated enrichment applies `produced`
-only after publishing its replay record, and non-retryable isolated request
-errors publish `terminal_failed`; shared embedding failures fan that outcome out
-to every consuming index, while retryable failures remain pending. Direct
-field-backed vector indexes classify source writes as `produced` or `skipped` at
-the successful derived-index apply boundary. Replay windows carry mixed
-outcomes and persist them under one apply lock and one store transaction; batch
-mutation paths deduplicate source keys with hash sets, keeping cleanup linear in
-the number of distinct source units rather than quadratic in batch size.
-
-Each source uses one marker key whose value is the outcome enum. Transitions
-therefore require one point read and one marker write rather than probing one key
-per possible outcome. Aggregate counters remain separate and atomically updated;
-status loads the three counters with O(1) point reads and never scans source
-markers. A partial counter tuple is reported as degraded and incomplete. If
-counters require repair, a bounded maintenance scan reconstructs them from
-marker values outside the status path. External embedding writes participate in
-the same accounting:
-only a durably applied `_embeddings` value is `produced`, and a source without an
-external vector remains pending rather than being assumed covered.
-That pending coverage remains visible in status but does not make a usable
-external index report that it is rebuilding. External query readiness depends
-on current replay and published artifact visibility because callers are not
-required to supply a vector for every source document; coverage completeness is
-an independent diagnostic contract.
-
-Public status reports physical vector or sparse-entry `doc_count` separately
-from source coverage. Readiness must never substitute physical cardinality for
-the durable `produced` source count because chunked documents can create many
-entries and complete early under that approximation.
+- Runtime status uses coverage accounting, never `doc_count >= table_doc_count`,
+  for managed derived indexes: `rebuilding` and `backfill_active` stay true while
+  units are pending or in flight; `replay_catch_up_required` is never cleared
+  because one artifact exists; partial coverage never masks pending enrichment;
+  terminal failures surface through degraded status and reason counters.
+- Readiness never substitutes physical `doc_count` for the durable `produced`
+  count, because chunked documents create many entries.
+- Repair distinguishes never evaluated, intentionally skipped, produced but
+  lost, stale generation, and terminal failure. Coverage-gap repair regenerates
+  missing `produced` artifacts, leaves current `skipped` units alone, and
+  retries or surfaces `terminal_failed` per policy.
+- Per-source outcome markers are the source of truth: one marker key per source
+  whose value is the outcome enum (one point read and one write per
+  transition). Generation-scoped `produced`, `skipped`, and `terminal_failed`
+  counters update in the same apply-lock domain and atomic batch as the marker.
+  Status reads the three counters with O(1) point reads and never scans
+  markers; a partial counter tuple reports degraded and incomplete; counter
+  repair is a bounded maintenance scan outside the status path.
+- Generated enrichment applies `produced` only after publishing its replay
+  record. Non-retryable isolated request errors publish `terminal_failed`;
+  shared embedding failures fan out to every consuming index; retryable
+  failures stay pending.
+- Direct field-backed vector indexes classify writes as `produced` or `skipped`
+  at the derived-index apply boundary. Replay windows persist mixed outcomes
+  under one apply lock and transaction, deduplicating source keys with hash
+  sets so cleanup is linear in distinct sources.
+- External embedding writes: only a durably applied `_embeddings` value is
+  `produced`; a source without an external vector stays pending. That coverage
+  is visible but does not make a usable external index report rebuilding;
+  external query readiness depends on replay and published visibility.
 
 ### Managed Index Admission
 
-Adding an index to a non-empty managed table is a generation transition, not an
-ordinary catalog insert. The admission path uses a transactional outbox in the
-primary document store:
+Adding an index to a non-empty managed table is a generation transition using a
+transactional outbox in the primary document store:
 
 1. Under the DB apply lock, read the O(1) document-identity summary and capture
-   its live count, identity generation, configuration hash, and replay target.
-2. Commit the index catalog row and a fixed-size admission marker in one primary
-   store transaction. Do not synchronously scan or rebuild the corpus.
-3. Materialize that marker idempotently into the generation repair checkpoint.
-   Under `progressive`, the canonical worker may publish bounded durable
-   checkpoints while the repair intent remains pending. Under `atomic`, the
-   owner repair scheduler performs the bounded shadow rebuild and replay.
+   live count, identity generation, configuration hash, and replay target.
+2. Commit the catalog row and a fixed-size admission marker in one primary-store
+   transaction; never scan or rebuild synchronously.
+3. Materialize the marker idempotently into the generation repair checkpoint.
+   Under `progressive`, the canonical worker publishes bounded durable
+   checkpoints while the intent is pending; under `atomic`, the owner repair
+   scheduler performs the bounded shadow rebuild and replay.
 4. Keep the marker while repair is pending. Every DB open captures the marker
-   prefix once before catalog open. Writable open uses the O(1) name set to
-   suppress in-place backfill and recreate missing checkpoint state; read-only
-   and status opens use the same snapshot to evaluate the same fail-closed or
-   progressive serviceability proof.
-5. After the complete-generation proof succeeds (and, for `atomic`, after clean
-   shadow activation), delete the primary-store marker before removing the
-   checkpoint intent. A crash between those writes leaves redundant, resumable
-   repair state rather than an admitted generation without debt.
+   prefix once before catalog open; writable opens suppress in-place backfill
+   and recreate missing checkpoint state, and read-only/status opens evaluate
+   the same fail-closed or progressive serviceability proof.
+5. After the complete-generation proof (and, for `atomic`, clean shadow
+   activation), delete the marker before removing the checkpoint intent, so a
+   crash leaves redundant resumable repair rather than an admitted generation
+   without debt.
 
-Filesystem DBs publish the replica-local repair checkpoint beside the physical
-root with fsync and atomic rename. Externally owned roots such as `.aflite`
-publish the same checksummed checkpoint through the backend's atomic storage
-namespace. The physical lock key, not the logical container path, identifies
-the replica, and generation-owned asynchronous work borrows that stable
-location instead of retaining transient open options.
+Rules:
 
-Desired-state reconciliation that observes pending repair must enqueue the
-table-group route with the owner repair scheduler, even when admission occurred
-before the DB runtime hook was attached. Scheduler notifications are
-idempotent hints, not repair authority: the durable checkpoint determines what
-work remains, aggregate debt auditing retires routes after every intent clears,
-and bounded fallback discovery is recovery for a missed notification rather
-than the normal scheduling path.
-
-Provisioned live creation returns after the catalog commit and durable,
-target-scoped activation enqueue; it does not wait for the resident worker to
-finish its current inference kernel. The activation request owns cancellation
-of borrowed maintenance for every affected group across all retries. Repair
-checks that lease before opening a writer, so canceled no-op passes cannot race
-the structural owner for the same lock. These leases are reference-counted per
-group, so completing one of several overlapping index activations cannot resume
-repair underneath another. Status remains fenced as `activating`
-until the exact incarnation publishes an authoritative runtime observation.
-Direct embedded owners, which have no asynchronous control-plane lane, keep the
-explicit synchronous installation behavior.
-
-The identity generation captured by the marker is monotonic evidence. Recovery
-fails closed if the current identity summary regresses below it. Concurrent
-writes after admission are normal: repair targets at least the marker's replay
-sequence and raises that target to the current derived sequence when the durable
-intent is created. Existing repair IDs are reused, so reconciliation, restart,
-and scheduler retries cannot create duplicate rebuilds.
-
-Empty managed tables omit the marker but still use the managed no-backfill add
-path. The durable zero-live-document identity summary proves that generation
-complete at the current replay head without scanning document keys, including
-tombstone-heavy shards. Ordinary unmanaged DB callers retain the explicit
-synchronous-add behavior. This keeps the durable lifecycle protocol at the
-managed-table boundary instead of inferring migration debt from index
-cardinality or replay lag during every reconciliation pass.
-
-Index deletion uses catalog absence as its commit point. The catalog image
-without the index and deletion of its admission marker commit in one primary
-store transaction while repair remains quiesced and gated. Runtime roots,
-coverage metadata, and repair checkpoints are post-commit cleanup. A crash can
-therefore leave reclaimable files or an orphaned checkpoint, but cannot leave a
-query-visible catalog entry without admission proof. Writable startup removes
-checkpoint intents whose catalog entry is absent before workers start.
-
-Generated-artifact reclamation separates page arbitration from terminal
-filesystem ownership. Cleanup workers try to claim the short page mutex and
-return `busy` rather than waiting. A completed tombstone then acquires a distinct
-finalization lease, releases page arbitration, and performs checkpoint and
-directory deletion while the durable tombstone continues fencing same-name
-admission. Other indexes can keep draining metadata pages during that I/O. A
-crash or finalization error leaves the tombstone intact for idempotent retry, and
-manual runtimes without a timer leave contention for the next explicit
-maintenance poll instead of recursively resubmitting work.
-
-The in-memory identity summary is an optimization for status and query
-planning, not admission authority. Admission reads the durable O(1) primary
-summary under the apply lock because an HA mirror failure may occur after the
-primary commit but before the runtime cache is published. Normal query traffic
-does not read admission markers; only a query evaluating an in-memory repair
-gate performs a bounded point recheck to prove progressive serviceability or
-observe repair completion safely.
-
-Catalog admission and repair activation are separate safety proofs. Metadata
-cutover additionally requires a fresh target observation, complete document
-identity, and target full-text cardinality equal to the source live-document
-count. No status path may infer readiness solely from catalog presence.
+- Filesystem DBs publish the replica-local repair checkpoint beside the root
+  with fsync and atomic rename; externally owned roots such as `.aflite` publish
+  the same checksummed checkpoint through the backend's atomic namespace. The
+  physical lock key identifies the replica.
+- Reconciliation that observes pending repair enqueues the route with the owner
+  repair scheduler, even if admission predates the runtime hook. Notifications
+  are idempotent hints; the durable checkpoint is authority, and bounded
+  fallback discovery only recovers missed notifications.
+- Provisioned live creation returns after the catalog commit and a durable
+  target-scoped activation enqueue, with status fenced as `activating` until the
+  exact incarnation publishes. Activation cancellation leases are reference
+  counted per group (details in
+  [ENRICHMENTS.md](ENRICHMENTS.md#embeddings-lifecycle-status)). Embedded owners
+  keep synchronous installation.
+- The marker's identity generation is monotonic evidence; recovery fails closed
+  if the summary regresses below it. Repair targets at least the marker's replay
+  sequence, raised to the current derived sequence when the intent is created.
+  Existing repair IDs are reused, so retries never duplicate rebuilds.
+- Empty managed tables omit the marker but use the no-backfill add path; the
+  durable zero-live-document summary proves completion without scanning
+  (including tombstone-heavy shards). Unmanaged DB callers keep synchronous add.
+- Index deletion commits catalog absence and marker deletion in one primary
+  transaction while repair is quiesced. Runtime roots, coverage metadata, and
+  checkpoints are post-commit cleanup; writable startup removes intents whose
+  catalog entry is absent before workers start.
+- Generated-artifact reclamation separates page arbitration from filesystem
+  ownership: workers try the short page mutex and return `busy`; a completed
+  tombstone takes a separate finalization lease, releases the page, and deletes
+  checkpoints and directories while the tombstone fences same-name admission.
+  Failures leave the tombstone for idempotent retry; manual runtimes leave
+  contention to the next explicit poll.
+- The in-memory identity summary is an optimization, not admission authority:
+  admission reads the durable summary under the apply lock (an HA mirror failure
+  may follow the primary commit). Only a query evaluating an in-memory repair
+  gate rechecks markers with a bounded point read.
+- Metadata cutover additionally requires a fresh target observation, complete
+  document identity, and target full-text cardinality equal to the source live
+  count. No status path infers readiness from catalog presence.
 
 ### Scope
 
-The current durable marker, counter, and public readiness implementation applies
-to managed dense and sparse embeddings indexes. The common outcome model is the
-required contract for extending coverage accounting to other derived artifact
-producers and artifact-backed indexes:
-
-- embeddings
-- chunks
-- summaries
-- image, audio, PDF, and OCR extraction artifacts
-- graph extraction
-- artifact-backed dense and sparse vector indexes
-- algebraic or materialized derived indexes where source-unit coverage matters
-
-Full-text indexes usually have trivial full coverage, but can still project the
-same status shape with `eligible == source_total` when useful. The shared model
-should live below the public API so each producer can report comparable lifecycle
-state without pretending every index is document-count based.
+Durable markers, counters, and public readiness are implemented for managed
+dense and sparse embeddings indexes. The same outcome model is the required
+contract for extending coverage to chunks, summaries, image/audio/PDF/OCR
+extraction artifacts, graph extraction, artifact-backed vector indexes, and
+algebraic or materialized derived indexes. Full-text indexes may project the
+same shape with `eligible == source_total`. The shared model lives below the
+public API.
 
 ## Search Contract
 
@@ -1405,105 +937,59 @@ derived index mutation:
 3. append one batch-shaped derived-work record
 4. let per-index workers advance watermarks from that log
 
-The derived log is sequence-based and idempotent. Rebuild-from-docstore
-remains the fallback, not the normal replay path.
-
-Once every managed index has advanced past a sequence, the derived log may be
-truncated at the global minimum applied watermark.
+The derived log is sequence-based and idempotent. Rebuild-from-docstore is the
+fallback, not the normal replay path. The log may be truncated at the global
+minimum applied watermark once every managed index has passed a sequence. The
+replay and watermark contract between producers and consumers is in
+[ENRICHMENTS.md](ENRICHMENTS.md#derived-replay-and-indexing-contract).
 
 ### Sequence-Stamped Projection Checkpoints
 
-Every derived projection should publish a durable checkpoint that says exactly
-which base-data sequence is queryable through that projection. This applies to
-dense, sparse, full-text, graph, algebraic indexes, and enrichment scopes. The
-checkpoint is not an optimization; it is the restart contract.
+Every derived projection (dense, sparse, full-text, graph, algebraic, and
+enrichment scopes) publishes a durable checkpoint stating which base-data
+sequence is queryable through it. The checkpoint is the restart contract.
 
-The checkpoint must atomically couple:
+- It atomically couples the visible projection artifact/root/manifest/generation,
+  the highest applied derived-log sequence it covers, the projection status
+  (clean, rebuilding, degraded, repair-required), and the schema/config/version
+  identity needed to validate reuse.
+- On open, a clean checkpoint is served immediately and only the derived-log
+  tail after it is replayed. Startup never scans the primary store to prove a
+  cleanly published projection queryable; full scans are only for explicit
+  repair, incompatible metadata, interrupted rebuilds, or corruption markers.
+- The applied sequence lives in the same atomic publish domain as projection
+  effects. A separate applied-sequence row is insufficient unless the protocol
+  proves the sequence never advances past durable query-visible data.
+- The shared `ProjectionCheckpoint` format (applied sequence, status,
+  generation, config identity, compatibility version) and helpers that read,
+  validate, and atomically publish it with the owning artifact are implemented.
 
-- the visible projection artifact, root, manifest, or generation
-- the highest applied derived-log sequence covered by that artifact
-- the projection status: clean, rebuilding, degraded, or repair-required
-- the projection schema/config/version identity needed to validate reuse
+Per projection:
 
-On open, a clean checkpoint means the DB may serve the checkpointed projection
-immediately and replay only the derived-log tail after the checkpoint sequence.
-Startup must not scan the primary document store to prove that a durable,
-cleanly-published projection is queryable. Full corpus scans remain valid only
-for explicit repair, incompatible metadata, interrupted rebuilds, or corruption
-markers.
+- Dense/HBC (shipped): HBC metadata format version 2 carries the checkpoint;
+  saves update HBC metadata first, then the shared sidecar mirror (`AFPRJCP1`,
+  current-only), and reads prefer the HBC checkpoint when its config identity
+  is nonzero. Catch-up advances it only after durable artifact/root publication.
+- Enrichments (shipped): each scope checkpoints only after every source change
+  through the sequence has a durable artifact, skip, or failure/repair record,
+  and reports clean, degraded, or repair-required. Config identity is a
+  deterministic enrichment-catalog identity.
+- Dense artifact counters (shipped): durable target/completed rows written in
+  the same primary batch as artifact writes/deletes, classified by the shared
+  embedding artifact identity decoder so direct and chunk embeddings share one
+  O(1) startup coverage path; corpus recounts are repair-only.
+- Full-text, sparse, graph, and algebraic: not yet on the checkpoint API; see
+  [Open work](#open-work).
 
-The applied sequence must live in the same atomic publish domain as the
-projection effects. A separate applied-sequence row is not enough unless the
-write protocol can prove that, after a crash, the sequence never advances beyond
-the durable projection data visible to queries.
+Runtime rules:
 
-Shape by projection type:
-
-- dense/HBC: publishes the applied sequence, status, generation, and config
-  identity in the HBC metadata record; the same checkpoint is mirrored into the
-  shared sidecar for common status APIs and non-HBC tooling — shipped
-- enrichments: checkpoints each enrichment scope only after every source change
-  through the sequence has a durable artifact, durable skip, or durable
-  failure/repair record; external model side effects make clean versus degraded
-  status part of the contract — shipped
-- artifact counters: dense artifact target/completed counters are maintained
-  incrementally on artifact put/delete so coverage checks are O(1) during
-  normal startup, with corpus-wide recounts reserved for repair tooling —
-  shipped for dense; extending the same incremental-counter treatment to other
-  index types is tracked in [Open work](#open-work)
-- full-text, sparse, graph, and algebraic indexes: storing the applied
-  sequence in each index manifest or LSM/runtime-store manifest and publishing
-  it with the visible root is not yet done — see [Open work](#open-work)
-
-A shared `ProjectionCheckpoint` format (applied sequence, status, generation,
-config identity, and compatibility version) and the storage helpers that read,
-validate, and atomically publish a checkpoint with its owning projection
-artifact are implemented. Dense was migrated first: the HBC metadata publish
-path carries the checkpoint, dense catch-up advances it only after durable
-artifact/root publication, and a clean restart trusts the checkpoint plus
-replays the derived-log tail. Enrichment progress uses the same checkpoint
-semantics so a scope reports clean, degraded, or repair-required rather than
-only "last sequence seen". Normal-startup dense artifact recounts have been
-replaced by incremental counters, with full-store scans reserved for explicit
-repair paths. Read-cache churn is reduced so tail replay only invalidates
-query state when a visible root, generation, or config actually changes.
-
-Moving full-text, sparse, graph, and algebraic managed indexes onto the same
-checkpoint API through their existing typed index ownership boundaries has not
-happened yet; see [Open work](#open-work).
-
-Current implementation notes:
-
-- Dense/HBC metadata format version 2 carries the projection checkpoint fields
-  directly in the HBC metadata record. DB checkpoint saves update HBC metadata
-  first, then update the shared sidecar mirror; dense checkpoint reads prefer
-  the HBC metadata checkpoint when it has a nonzero config identity.
-- Shared sidecar checkpoint format `AFPRJCP1` is current-only and stores applied
-  sequence, status, generation, and config identity for all managed projection
-  types.
-- Enrichment progress uses checkpoint semantics for applied sequence and
-  clean/degraded/repair-required status, with a deterministic enrichment-catalog
-  config identity.
-- Normal dense startup trusts a clean, config-matching, caught-up HBC checkpoint
-  and does not run a primary document-store artifact recount. Recounts remain
-  repair/rebuild tooling for stale config identity, repair-required status,
-  interrupted rebuild state, corruption, or watermark regression.
-- Dense artifact target counters are durable metadata rows updated in the same
-  primary-store batch as artifact writes/deletes. Counter classification uses
-  the shared embedding artifact identity decoder, so direct document embeddings
-  and derived chunk embeddings feed the same O(1) startup coverage path.
-- Applied-sequence and runtime-status-only visibility notifications publish the
-  status snapshot without invalidating cached query DBs. Read-cache invalidation
-  remains reserved for visible-root/data publishes, blocking publish repair, and
-  explicit table invalidation.
-- Dense catch-up pacing sizes replay-window coalescing and catch-up session
-  reuse waits to the current derived-log tail. Small restart tails no longer pay
-  the full 256-record/2s coalesce window or 5s session-idle ceiling; those
-  ceilings remain available for large hot-ingest backlogs.
-
-The acceptance bar for this contract (clean-restart behavior, crash safety,
-repair-marker handling, and checkpoint metrics) is tracked in
-[Open work](#open-work).
+- Applied-sequence and status-only notifications publish status without
+  invalidating cached query DBs; read-cache invalidation is reserved for
+  visible-root/data publishes, blocking publish repair, and explicit table
+  invalidation.
+- Dense catch-up sizes replay-window coalescing and session-reuse waits to the
+  current derived-log tail; the 256-record/2s coalesce window and 5s
+  session-idle ceiling apply only to large hot-ingest backlogs.
 
 ## Runtime Ownership
 
@@ -1543,19 +1029,13 @@ Runtime-backed work follows these boundaries:
   maintenance/executor polling
 - DBs own fallback runtimes only when no node runtime is provided
 
-Current status:
-
-- `BackendRuntime` is heap-owned at node/server construction sites and borrowed
-  through DataServer, provisioned, hosted, metadata, and standalone DB open paths
-- derived replay, full-text merge, enrichment replay, TTL cleanup, transaction
-  recovery, and LSM background flush are under the shared runtime model
-- `DurableJobLane` has inline and threaded implementations
-- LSM has a typed adapter over the durable lane and blocks writers when bounded
-  deferred immutable queues are full
-- close/drain, inline/WASM-style progress, native threaded sharing, and
-  owner-scoped DB runtime tests cover the lifecycle contract
-- raft replica placement reconciliation remains foreground control-loop work,
-  while distributed transaction recovery is already runtime-owned
+Derived replay, full-text merge, enrichment replay, TTL cleanup, transaction
+recovery, and LSM background flush run under this model. `BackendRuntime` is
+heap-owned at node/server construction and borrowed by DataServer, provisioned,
+hosted, metadata, and standalone DB opens. `DurableJobLane` has inline and
+threaded implementations; the LSM adapter blocks writers when bounded deferred
+immutable queues are full. Raft replica placement reconciliation remains
+foreground control-loop work.
 
 ### CDC Runtime And Cutover Ownership
 
@@ -1627,20 +1107,11 @@ The current shape is:
 - snapshot export/restore and split semantics are backend-neutral, with
   backend-specific fast paths where useful
 
-DB-level durable-LSM coverage now proves the backend seam across:
-
-- basic read, write, and reopen
-- full-text persistence and reopen
-- derived replay on reopen
-- delete-index persistence
-- indexed deletes and overwrites
-- dense, sparse, and graph query flows
-- `_embeddings` and `_edges` document special-field mutations
-- split and merge cutover flows
-- snapshot restore
-- TTL lease-owned cleanup
-- named-query fusion and graph expansion
-- chunked dense-index and chunk-enrichment reopen flows
+DB-level durable-LSM coverage exercises the backend seam across reopen,
+full-text and derived replay, index deletion, indexed overwrites and deletes,
+dense/sparse/graph queries, `_embeddings`/`_edges` special fields, split and
+merge cutover, snapshot restore, TTL cleanup, named-query fusion and graph
+expansion, and chunked dense/enrichment reopen.
 
 ### Backend Contract
 
@@ -1698,54 +1169,39 @@ backends.
 
 ## Hot-Path Search Wire
 
-The hot-path search wire reduces Go/Zig boundary cost for local shard search by
-replacing generic JSON request/response payloads with a narrow internal binary
-codec for the hottest `coreDB.Search` shapes.
+The hot-path search wire is a narrow internal binary codec in the C API for the
+hottest local search shapes, so embedded callers avoid JSON request/response
+and per-hit allocation. The public HTTP API stays JSON, and richer search
+shapes stay on the JSON C API entry points.
 
-The public HTTP/store API stays JSON. Only the internal `coreDB` hot path moves
-to a binary codec.
+Entry points in
+[pkg/antfly-embedded/src/capi/db.zig](pkg/antfly-embedded/src/capi/db.zig),
+with the codec in `capi/search_wire.zig`:
 
-Initial shapes:
+| Entry point | Op | Shape |
+| --- | --- | --- |
+| `antfly_db_search_dense_wire` | `dense_search` (1) | dense kNN |
+| `antfly_db_search_text_match_wire` | `text_match_search` (2) | full-text `match` |
+| `antfly_db_search_text_term_wire` | `text_term_search` (3) | full-text `term` |
+| `antfly_db_search_text_match_phrase_wire` | `text_match_phrase_search` (4) | full-text `match_phrase` |
 
-- dense kNN
-- simple full-text without stored fields, aggregations, graph, explicit sort,
-  or cursor
-
-Principles:
-
-- keep JSON fallback for richer search shapes until coverage is complete
-- use a fixed header, append-only evolution, and offsets into trailing blobs
-  for variable-width fields
-- prefer packed IDs and packed hit metadata over per-hit allocation
-
-### Dense Search Wire
-
-A binary dense request/response codec lives in the Zig C API, exposed as a
-dense wire entrypoint from
-[pkg/antfly-embedded/src/capi/db.zig](pkg/antfly-embedded/src/capi/db.zig)
-(`antfly_db_search_dense_wire`), with a matching Go-side codec in the zigdb
-bridge. The narrowed dense path routes through the binary wire first, with the
-JSON path kept as fallback. Local dense search no longer marshals JSON on the
-hot path, and the Go adapter no longer rebuilds generic hit payloads before
-constructing `vectorindex.SearchResult`.
-
-### Simple Full-Text Search Wire
-
-A binary request/response codec covers `query_string`, `match`, `term`, and
-`match_phrase` (`antfly_db_search_text_match_wire`, `_text_term_wire`,
-`_text_match_phrase_wire` in `capi/db.zig`), limited to the first slice with no
-stored fields, aggregations, graph, explicit sort, or cursor. The narrowed
-simple-text path routes through the binary wire first, with JSON kept as
-fallback for richer full-text shapes. Local simple full-text search no longer
-pays JSON/base64 overhead on the hot path, and small full-text searches are no
-longer dominated by bridge overhead.
+Text shapes carry no stored fields, aggregations, graph, explicit sort, or
+cursor. The Go consumer is `go/pkg/embedded` (`DenseSearchWire`,
+`TextMatchWire`, and siblings over `include/antfly.h`).
 
 ### Search Wire Framing
 
-The internal search wire has a fixed `magic`/`version`/`op`/`flags` header,
-append-only evolution rules, and variable-width data in trailing blobs
-referenced by offset/length. Batch/multi-search support on top of this framing
-is not implemented yet; see [Open work](#open-work).
+All integers are little-endian. Every request and response starts with
+`magic` (`0x41464442`, "AFDB", u32), `version` (1, u16), and `op` (u16);
+requests then carry a u32 `flags` word before their fixed fields. Responses
+use one packed shape for every op: `total_hits`, `hit_count`, and `ids_len`
+(u32 each), then `hit_count` packed hits (`id_offset` u32, `id_len` u16,
+reserved u16, `score` f32), then the concatenated ID blob, then an optional
+8-byte `identity_read_generation` footer (see
+[DOCID.md](DOCID.md#identity-generations-and-read-snapshots)). Responses carry
+public IDs only, never document ordinals. Evolution is append-only: variable-width
+data lives in trailing blobs referenced by offset/length. Batch/multi-search
+on this framing is not implemented; see [Open work](#open-work).
 
 ## Shard Split Contract
 
@@ -1860,9 +1316,13 @@ silently omitting the other. Operators receive only the actionable compaction
 metrics: queued candidates, completions, and failures; payload volume, build
 timing, and detailed scheduler outcomes remain internal diagnostics.
 
-Transition observation reads only this already-open replicated control state.
-It does not open the live table DB, initialize indexes, or compete with the
-generation-owned writer. Destination bootstrap and catch-up apply through the
+Transition observation reads only this already-open replicated control state:
+the source phase, terminal fence, acknowledgement, and delta sequence,
+atomically under one apply-store shard lock. It never opens, seeds, or scans the
+live table DB, initializes indexes, or competes with the generation-owned
+writer. Observation and reconciliation fail fast with a retryable unavailable
+result while snapshot generation staging is active rather than consuming HTTP
+workers behind generation I/O. Destination bootstrap and catch-up apply through the
 destination Raft group, then acknowledge the resulting checkpoint through the
 source Raft group. Retries are idempotent and every transition RPC attempt is
 bounded so metadata reconciliation cannot starve metadata Raft heartbeats while
@@ -1874,6 +1334,164 @@ as the source delta sequence. Physical handoff scans treat the encoded range as
 an optimization and explicitly retain only primary documents owned by the
 source group; derived records and unrelated primary records are not lifecycle
 state.
+
+### Split And Merge Transition Ownership
+
+Split and merge control paths follow the same rule. Transition coordinators
+borrow the raft host's apply store and retain the managed destination or
+receiver DB lease for their full lifetime; observation never reopens either
+path. Pending destinations are leased by globally unique group ID so metadata
+publication and visible-root generation changes cannot hide an already-open
+writer behind a stale table label. A process-local transition admission lock
+serializes fallback coordinators while a destination is not yet published.
+Every durable transition record owns an immutable table contract and two
+explicit identity roles: `source_identity` for the source or merge donor, and
+`target_identity` for the split destination or merge receiver. A split records
+the same inherited identity in both roles; a merge records the donor and
+receiver independently. Phase updates must preserve the complete contract, and
+the binary and HTTP codecs require both roles. Runtime code selects a typed role
+at each open instead of inferring one identity from current topology, which may
+already have advanced past the transition.
+
+Reconciliation-authority handoff rehydrates projected intents with an owned
+copy of the durable contract and split boundary. It never reconstructs either
+from the new authority's desired catalog, and it can resume an admitted
+transition even when that desired catalog has already removed the table.
+
+Writer-cache admission validates the expected namespace before returning a
+lease. Normal source and target opens require an exact match. The sole relaxed
+case is an explicitly admitted merge identity reassignment: while holding
+exclusive transition admission, the receiver may be opened under its prior
+namespace only when its persisted table ID matches the contract table ID. The
+coordinator then performs the fenced reassignment before serving admission
+reopens. Cross-table mismatches and all unflagged mismatches fail closed. An
+idle mismatched owner is retired and closed before replacement; an active
+mismatch blocks the new open until its existing lease drains. This prevents a
+pre-publication destination open from becoming the serving writer for a
+differently namespaced range and gives rollback enough durable information to
+reopen the same-table receiver safely after restart.
+
+Metadata reconciliation treats that contract as an active structural fence.
+Schema and index changes wait until every contract for the table is terminal.
+Range updates are fenced for each transition participant and its immediate
+range-boundary neighbors, preventing half of a coupled boundary update from
+publishing while allowing independent shard pairs in a large table to continue
+reconciling. A requested table drop retains the table, every range, and their
+placements until all transitions terminate; only then can normal removal
+proceed.
+
+Every destination bootstrap and catch-up batch carries a typed split replication
+context containing the metadata transition ID, source group, destination group,
+inherited identity namespace, operation kind, and source delta sequence where
+applicable. The context is encoded in the internal HTTP command and the
+data-Raft entry, validated against the catalog-visible source range on every
+replica, and used for the destination's first physical DB open. Public batch
+parsing rejects this internal context.
+
+The destination stores the completed bootstrap identity and highest applied
+delta sequence in the document store. A completed bootstrap fences late chunk
+proposals; delta retries at or below the durable sequence are no-ops; and a
+forward sequence gap is rejected. Empty source deltas are sent as sequence
+barriers, so a gap can never be mistaken for an empty mutation. Document writes,
+range publication, bootstrap identity, and sequence advancement share the same
+DB apply lock and backend batch. The source acknowledges only after that commit,
+and its durable acknowledgement includes the same transition ID. Range buffers
+are prepared before commit and installed into the open DB allocation-free after
+success, leaving no post-commit error path that can split durable and in-memory
+ownership state.
+
+Replicated source split lifecycle commands have one state-machine owner: the
+durable data-Raft apply store. They are transition-only entries and are never
+forwarded to the document DB executor. The apply store tracks its own durable
+entry watermark and filters overlapping committed prefixes before producing
+effects, so a Raft applied watermark that temporarily lags another state
+machine cannot apply `prepare` twice while advancing to `start`.
+
+Removing an active split or merge record is intentionally a no-op, not a
+cancellation protocol. Cancellation first commits rollback intent on the same
+transition identity, lets the transition owner restore source/receiver state,
+then commits the `rolled_back` terminal phase. Only a terminal record may be
+removed. Restart can therefore recover either an actionable rollback intent or
+a terminal record, never an absent active transition whose storage side effects
+remain live.
+
+Distributed split bootstrap uses an exact destination reservation keyed by
+transition identity, attempt epoch, byte range, and source delta sequence. A
+replayed begin for that same reservation is idempotent and cannot erase chunks
+written by another source-leader attempt. A newer sequence may replace an
+incomplete reservation and fences older writes; completion publishes only the
+exact reserved sequence. The source acknowledgement is proposed only after
+destination completion, so metadata cutover cannot authorize an empty or
+partially replaced destination generation.
+
+A source group created before data-Raft projection has no apply watermark yet.
+Its first split preparation seeds the source snapshot and a synthetic index-zero
+watermark in one DocStore batch under the per-group apply lock. Index zero is
+reserved for this baseline; real Raft indexes remain unchanged. A replica
+replacement may instead inherit an authoritative document generation while its
+new local Raft projection contains only a bootstrap batch. In that case a
+non-null watermark does not prove that the projection includes the inherited
+documents.
+
+Split preparation reconciles an inherited generation only at an exact durable
+apply watermark. It first waits until the document state machine has applied
+through that watermark, acquires group-exclusive write admission, finishes
+managed bulk state, and scans one point-in-time transaction from the
+generation-owned writer. It does not hold the DB apply lock during the scan.
+Existing projected values are compared through a cursor instead of being
+materialized, and atomic replacement writes directly through one transaction
+instead of constructing another shard-sized write list.
+
+Successful reconciliation records the authoritative DB root's durable 128-bit
+incarnation beside the projection. This identity is persisted in the staged DB
+before generation sealing and atomic publication; it is stable across a process
+restart but regenerated whenever a physical root is replaced. A process-local
+visible-root generation is not sufficient because it restarts from zero. Later
+split handoffs use an O(1) durable fast-path check: both the root incarnation and
+the complete Raft watermark identity must match before the apply-store
+projection can be captured without rescanning the DB. Missing, zero, malformed,
+or mismatched incarnation markers fail closed. Snapshot installation naturally
+drops the marker with the replaced group generation. Normal-entry history and
+the watermark remain unchanged. If Raft advances during repair, publication
+fails and preparation retries from a new snapshot; only replicated split deltas
+may mutate an active projection.
+
+The incarnation belongs to the core storage generation, not to a derived-index
+repair checkpoint. It is stored in an independently checksummed
+`root_identity.checkpoint`, written through the DB runtime's caller-owned
+`std.Io`, synced, and atomically renamed. The identity belongs to the directory,
+not the process-local visibility generation: cache fencing and in-place metadata
+reconciliation preserve it. Every newly staged directory creates its identity
+before sealing, so atomic publication carries the new identity with the root.
+First creation is serialized by a blocking OS file lock and rechecks the
+checkpoint after acquiring that lock. Concurrent first opens therefore observe
+one durable incarnation rather than retaining different random candidates.
+Derived checkpoint loss or repair cannot change storage identity. A physical
+generation replacement creates a new identity even when the logical contents
+and index catalog are unchanged.
+
+This checkpoint applies only to `filesystem_managed` roots whose path is the
+published storage directory. Embedded and Lite DBs use `external_backend`: the
+path is a logical namespace while the enclosing single-file engine owns
+locking, durability, and publication. Those handles do not synthesize a
+directory incarnation and fail closed if a distributed projection asks for
+one.
+
+Managed data-Raft status collection follows the same ownership boundary: it
+uses writer-published runtime snapshots when available and conservative
+Raft/transition facts on a cold cache. It never opens an independent status DB
+over a Raft-owned root. Transition readiness comes from observations published
+by the transition owner into metadata, then from durable phase/snapshot facts;
+status paths never instantiate split or merge coordinators to inspect live
+roots. Non-Raft deployments may retain the bounded status-only open because no
+competing managed writer exists.
+
+Split execution dispatch follows ownership as well. A data-Raft server uses the
+replicated destination route. A server with an injected local transition runtime
+delegates to that runtime, and the non-Raft fallback creates a short-lived local
+coordinator under transition admission. Only the replicated path requires a
+destination URI; local execution must not fail merely because no remote route
+exists.
 
 ### Text Segment Handoff
 
@@ -1913,23 +1531,6 @@ Dense vector split and sparse index split are not yet at the same point; see
 This section consolidates genuinely unshipped or unconfirmed work from across
 this document.
 
-### Local shard Go/Zig data-plane boundary
-
-The document previously described a migration target of making `ZigCoreDB`
-the real local-shard backend while keeping a `StoreDB`-fronted Go `DB`
-interface stable for callers, with a three-phase data-plane migration (finish
-the hot data plane, port the local control plane, port remaining local
-features). Neither `ZigCoreDB` nor `StoreDB` appears anywhere in the current
-Go tree — only in this document and a historical TLA+ spec — so this section
-cannot be confirmed as either shipped or still the live target architecture.
-The closest living analog is `go/pkg/embedded`, which has a typed `Batch`
-and binary `DenseSearchWire`/`TextMatchWire`/etc. wire types consuming the
-`antfly_db_search_*_wire` C API (see [Hot-Path Search
-Wire](#hot-path-search-wire) above), but it is a single-node embedded DB with
-no range/split-state surface, not a distributed local shard. This needs
-maintainer confirmation before the roadmap language can be reconciled one way
-or the other.
-
 ### Search wire batch/multi-search support
 
 Batch/multi-search support on top of the existing search-wire framing (see
@@ -1951,16 +1552,12 @@ Relevant storage exists in `hbc_nodes`, `hbc_quant`, `hbc_vecs`, and
 destination rebuilds child dense indexes directly from HBC split-member plans
 and skips generic dense doc replay for handed-off child docs.
 
-However, synthetic HBC workloads are a warning: `kmeans` produced almost
-entirely mixed subtrees, `hilbert` was only slightly better, and measured
-full-rebuild and mixed-rebuild costs were nearly identical because there were
-effectively no reusable right-only dense subtrees. Batched child rebuild
-dropped dense rebuild cost sharply even without subtree reuse. A first
-doc-key-local leaf split heuristic slightly reduced mixed frontier for
-`kmeans`, but did not create reusable right-only subtrees; treat it as a
-secondary tuning lever rather than the main dense split strategy. The target
-of child dense split mostly reusing existing HBC subtrees, with full child
-vector reinsertion no longer the default split path, is not yet met.
+However, synthetic HBC workloads (`kmeans`, `hilbert`) produce almost entirely
+mixed subtrees, so subtree reuse saves little over a full child rebuild; batched
+child rebuild is the effective lever today, and doc-key-local leaf split
+heuristics are secondary tuning. The target of child dense split mostly reusing
+existing HBC subtrees, with full child vector reinsertion no longer the default
+split path, is not yet met.
 
 ### Sparse index split
 

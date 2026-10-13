@@ -679,7 +679,6 @@ zig build antfly capi \
   -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
-  -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
@@ -702,7 +701,6 @@ zig build antfly capi \
   -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
-  -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
@@ -717,14 +715,12 @@ Remove the cold directories afterward (`rm -rf .zig-cache/cold`).
 ```sh
 zig build antfly capi \
   -Doptimize=debug \
-  -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke antfly-standalone-runtime-test \
   -Doptimize=debug \
-  -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false
 
@@ -793,7 +789,6 @@ zig build antfly capi \
   -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
-  -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true \
