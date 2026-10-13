@@ -208,6 +208,10 @@ pub const Root = struct {
     /// Resumable delta: the published maintenance/serving baseline stays rooted.
     checkpoint_base: ?artifacts.ChunkRef = null,
     checkpoint_removed: []const []const u8 = &.{},
+    checkpoint_files: ?statistics.Ref = null,
+    checkpoint_file_count: u32 = 0,
+    checkpoint_removed_files: ?statistics.Ref = null,
+    checkpoint_removed_count: u32 = 0,
     serving_bytes: u64 = 0,
     pack_ownership: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
@@ -267,6 +271,13 @@ pub const Root = struct {
         if (self.checkpoint_base) |ref| {
             try text_directory.validateRef(ref, self.domain);
             if (self.serving != null or self.inventory_version != 1 or self.statistics_version != 1) return error.InvalidNativeLakeTextCorpus;
+        }
+        if (self.checkpoint_files) |ref| try ref.validate();
+        if (self.checkpoint_removed_files) |ref| try ref.validate();
+        if ((self.checkpoint_files == null) != (self.checkpoint_file_count == 0) or (self.checkpoint_removed_files == null) != (self.checkpoint_removed_count == 0) or self.checkpoint_file_count > max_segments or self.checkpoint_removed_count > max_segments) return error.InvalidNativeLakeTextCorpus;
+        if (self.checkpoint_files != null or self.checkpoint_removed_files != null) {
+            if (self.serving != null or self.compacted != null or self.inventory_version != 1 or self.statistics_version != 1 or self.manifests.len != 0 or self.file_groups.len != 0 or self.segments.len != 0 or self.checkpoint_removed.len != 0) return error.InvalidNativeLakeTextCorpus;
+            if (self.checkpoint_removed_files != null and self.checkpoint_base == null) return error.InvalidNativeLakeTextCorpus;
         }
         if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
         if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
@@ -337,6 +348,8 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     // V11 file records are single-page GC units; authenticate their population
     // before a paged mark traversal can authorize any deletion.
     if (ref.metadata_version >= 11 and root.inventory_version == 3 and (if (root.directories.files) |files| files.records else 0) != root.file_count) return error.InvalidNativeLakeTextCorpus;
+    if (root.checkpoint_files) |files| if (files.records != root.checkpoint_file_count) return error.InvalidNativeLakeTextCorpus;
+    if (root.checkpoint_removed_files) |files| if (files.records != root.checkpoint_removed_count) return error.InvalidNativeLakeTextCorpus;
     // Historical roots remain usable by recovery/retained readers. Reconciliation
     // only advertises the new identity and upgrades protocol-33 publications.
     root.version = metadata_version;
@@ -711,7 +724,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var seed_ref: ?artifacts.ChunkRef = null;
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
-            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
@@ -730,7 +743,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
-            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
             try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
             seed_artifact = declaration.artifact.artifact_id;
@@ -738,7 +751,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             break root;
         } else null;
         const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
-        const manifest_seed = if (seed) |root| !paged_seed and (root.manifests.len != 0 or root.checkpoint_base != null) and root.file_groups.len == 0 else false;
+        const manifest_seed = if (seed) |root| !paged_seed and (root.manifests.len != 0 or root.checkpoint_base != null or root.checkpoint_files != null) and root.file_groups.len == 0 else false;
         const reference_seed = paged_seed or manifest_seed;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
         defer previous_groups.deinit(a);
@@ -783,15 +796,33 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var input_bytes: usize = 0;
         const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
         @memset(file_manifests, null);
-        const delta_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
-        @memset(delta_manifests, null);
-        if (seed) |old| if (old.checkpoint_base != null) {
-            const delta_records = try checkpointDeltaFiles(a, ca, old, store.*, cancellation);
-            for (delta_records) |record| if (plan.by_id.get(record.file.id)) |index| {
-                delta_manifests[index] = record.manifest;
-            };
-        };
-
+        var checkpoint_files: ?statistics.Ref = if (seed) |old| old.checkpoint_files else null;
+        var checkpoint_ids: std.StringHashMapUnmanaged(void) = .empty;
+        defer checkpoint_ids.deinit(a);
+        var pending_files: std.ArrayList(text_directory.FileRecord) = .empty;
+        defer pending_files.deinit(a);
+        if (manifest_seed) {
+            const delta = try checkpointDeltaFiles(a, ca, seed.?, store.*, cancellation);
+            var kept: std.ArrayList(text_directory.FileRecord) = .empty;
+            defer kept.deinit(a);
+            var removed_delta: std.ArrayList(text_directory.FileRecord) = .empty;
+            defer removed_delta.deinit(a);
+            for (delta) |record| {
+                if (plan.by_id.contains(record.file.id)) {
+                    try checkpoint_ids.put(a, record.file.id, {});
+                    if (checkpoint_files == null) try kept.append(a, record);
+                } else if (checkpoint_files != null) try removed_delta.append(a, record);
+            }
+            // Removed pending files are subtracted from DF below; the next
+            // atomic save must remove them from the delta inventory as well.
+            checkpoint_files = try text_directory.publishFileRecords(a, store, kept.items, removed_delta.items, checkpoint_files, cancellation, provider.context.io.?);
+        }
+        var removed_records: std.ArrayList(text_directory.FileRecord) = .empty;
+        defer removed_records.deinit(a);
+        for (checkpoint_removed.items) |id| try removed_records.append(a, baseline_by_id.get(id).?);
+        const checkpoint_removed_files = if (removed_records.items.len != 0) try text_directory.publishFileRecords(a, store, removed_records.items, &.{}, null, cancellation, provider.context.io.?) else null;
+        var checkpoints_saved: usize = 0;
+        var checkpoint_time = @import("antfly_platform").time.monotonicNs();
         for (records) |record| if (plan.by_id.get(record.file.id)) |index| {
             file_manifests[index] = record.manifest;
         };
@@ -924,15 +955,23 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
             try df.flush();
-            // Each file remains resumable without rewriting the global tree.
-            // GC and recovery retain/authenticate both base and delta pages.
+            // Atomically checkpoint the completed file inventory and its DF
+            // state. Save the first file, then at most 64 files or five seconds
+            // of completed work; metadata traffic grows with the delta batch.
             if (provider.progress != null) {
-                var checkpoint_arena = std.heap.ArenaAllocator.init(a);
-                defer checkpoint_arena.deinit();
-                delta_manifests[file_ordinal] = file_manifests[file_ordinal];
-                const manifests = try presentManifests(checkpoint_arena.allocator(), if (baseline_ref != null) delta_manifests else file_manifests);
-                const partial: Root = .{ .checkpoint_base = baseline_ref, .checkpoint_removed = checkpoint_removed.items, .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
-                try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
+                try pending_files.append(a, .{ .file = .{ .id = file.id, .digest = file.digest, .key_width = file.key_width }, .manifest = file_manifests[file_ordinal].? });
+                const now = @import("antfly_platform").time.monotonicNs();
+                if (checkpoints_saved == 0 or pending_files.items.len >= 64 or now -| checkpoint_time >= 5 * std.time.ns_per_s) {
+                    var checkpoint_arena = std.heap.ArenaAllocator.init(a);
+                    defer checkpoint_arena.deinit();
+                    checkpoint_files = try text_directory.publishFileRecords(a, store, pending_files.items, &.{}, checkpoint_files, cancellation, provider.context.io.?);
+                    for (pending_files.items) |record| try checkpoint_ids.put(a, record.file.id, {});
+                    const partial: Root = .{ .checkpoint_base = baseline_ref, .checkpoint_files = checkpoint_files, .checkpoint_file_count = checkpoint_ids.count(), .checkpoint_removed_files = checkpoint_removed_files, .checkpoint_removed_count = @intCast(removed_records.items.len), .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe };
+                    try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
+                    pending_files.clearRetainingCapacity();
+                    checkpoints_saved += 1;
+                    checkpoint_time = now;
+                }
             }
         }
         global_statistics = try df.finish(df_pages.store(), global_statistics);
@@ -1212,6 +1251,8 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         const serving_root = try servingRoot(arena_.allocator(), backend, root, cancellation, null);
         try validateReuse(a, backend, serving_root, ref.artifact_id, context, cancellation);
     }
+    try validator.pages(root.checkpoint_files);
+    try validator.pages(root.checkpoint_removed_files);
     try validator.pages(root.pack_ownership);
     try validator.pages(root.term_statistics);
     for (root.statistics_deltas) |run| try validator.pages(run.page);
@@ -1230,10 +1271,14 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         try validator.certify(root_id);
         return;
     }
-    if (root.file_groups.len == 0 and root.manifests.len != 0) {
+    if (root.file_groups.len == 0 and (root.manifests.len != 0 or root.checkpoint_files != null)) {
+        var records_arena = std.heap.ArenaAllocator.init(a);
+        defer records_arena.deinit();
+        const checkpoint_records = try checkpointDeltaFiles(a, records_arena.allocator(), root, backend, cancellation);
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
-        for (root.manifests) |ref| {
+        for (checkpoint_records) |record| {
+            const ref = record.manifest;
             _ = file_arena.reset(.free_all);
             try validator.leaf(ref);
             const group = try loadFileManifest(file_arena.allocator(), backend, ref, root.domain, cancellation, null);
@@ -1275,6 +1320,7 @@ fn checkpointFiles(a: A, out: A, root: Root, records: []const text_directory.Fil
     var removed: std.StringHashMapUnmanaged(void) = .empty;
     defer removed.deinit(a);
     for (root.checkpoint_removed) |id| try removed.put(a, id, {});
+    if (root.checkpoint_removed_files != null) for (try checkpointRecords(out, root, root.checkpoint_removed_files, root.checkpoint_removed_count, store, cancellation)) |record| try removed.put(a, record.file.id, {});
     for (records) |record| if (!removed.contains(record.file.id)) {
         try merged.put(a, record.file.id, record);
     };
@@ -1284,7 +1330,14 @@ fn checkpointFiles(a: A, out: A, root: Root, records: []const text_directory.Fil
     for (result) |*record| record.* = it.next().?.*;
     return result;
 }
-fn checkpointDeltaFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+fn checkpointRecords(a: A, root: Root, ref: ?statistics.Ref, count: u32, store: stores.ArtifactStore, token: Cancellation) ![]const text_directory.FileRecord {
+    var directory = root;
+    directory.directories = .{ .files = ref };
+    directory.file_count = count;
+    return text_directory.fileRecords(a, directory, store, null, token);
+}
+pub fn checkpointDeltaFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+    if (root.checkpoint_files != null) return checkpointRecords(out, root, root.checkpoint_files, root.checkpoint_file_count, store, cancellation);
     const records = try out.alloc(text_directory.FileRecord, root.manifests.len);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1537,4 +1590,44 @@ test "external lake text compaction preserves all physical keys in input order" 
             }
         }
     }
+}
+
+test "external lake global frontier checkpoints page sixteen thousand files and retain old cuts" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("paged-native-checkpoint-scale");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(9), 1, std.testing.io);
+    const manifest_id = try store.upload_scope.?.artifactId(&std.fmt.bytesToHex(@as([32]u8, @splat(4)), .lower));
+    const manifest: artifacts.ChunkRef = .{ .artifact_id = &manifest_id, .checksum = &std.fmt.bytesToHex(@as([32]u8, @splat(4)), .lower), .byte_len = 1 };
+    const records = try ca.alloc(text_directory.FileRecord, 16384);
+    for (records, 0..) |*record, i| record.* = .{ .file = .{ .id = try std.fmt.allocPrint(ca, "file-{d:0>5}", .{i}), .digest = @splat(1) }, .manifest = manifest };
+    const files = try text_directory.publishFileRecords(a, &store, records, &.{}, null, .none, std.testing.io);
+    const root: Root = .{ .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .seekable = true, .statistics_version = 1, .checkpoint_files = files, .checkpoint_file_count = @intCast(records.len) };
+    try root.validate();
+    const encoded = try std.json.Stringify.valueAlloc(ca, root, .{});
+    try std.testing.expect(encoded.len < 16 * 1024);
+    const recovered = try checkpointDeltaFiles(a, ca, root, store, .none);
+    try std.testing.expectEqual(records.len, recovered.len);
+    var replacement = records[7];
+    replacement.file.digest = @splat(2);
+    const next = try text_directory.publishFileRecords(a, &store, &.{replacement}, records[0..3], files, .none, std.testing.io);
+    var resumed = root;
+    resumed.checkpoint_files = next;
+    resumed.checkpoint_file_count -= 3;
+    const updated = try checkpointDeltaFiles(a, ca, resumed, store, .none);
+    try std.testing.expectEqual(records.len - 3, updated.len);
+    var found = false;
+    for (updated) |record| if (std.mem.eql(u8, record.file.id, replacement.file.id)) {
+        found = true;
+        try std.testing.expectEqual(replacement.file.digest, record.file.digest);
+    };
+    try std.testing.expect(found);
+    // The old durable cut remains independently readable after COW mutation.
+    try std.testing.expectEqual(records.len, (try checkpointDeltaFiles(a, ca, root, store, .none)).len);
 }

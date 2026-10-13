@@ -198,7 +198,7 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
-pub const Pending = struct { lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+pub const Pending = struct { base_lsn: u64 = 0, lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
     var opened = try openQueue(a, binding, options);
@@ -224,7 +224,7 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
             }
         }
     }
-    return .{ .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
+    return .{ .base_lsn = cut, .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
 }
 
 test "external lake filesystem maintenance reads ingestion artifacts in the same namespace" {

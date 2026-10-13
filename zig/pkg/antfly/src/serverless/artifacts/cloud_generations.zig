@@ -604,25 +604,70 @@ pub const Writer = struct {
         return self.branch(node.children, changes, depth, token);
     }
     fn branch(self: *Writer, previous: []const Child, changes: []const Record, depth: u8, token: Token) !Ref {
+        const scheduler = local.sql_parallel_scheduler;
+        const Worker = struct {
+            fn run(writer: *Writer, prior: ?Ref, selected: []const Record, level: u8, cancellation: Token) anyerror!Ref {
+                return writer.update(prior, selected, level, cancellation);
+            }
+        };
+        var counts: [16]usize = @splat(0);
+        for (changes) |record| counts[slot(hash(record.id), depth)] += 1;
+        var offsets: [16]usize = undefined;
+        var total: usize = 0;
+        for (counts, 0..) |length, index| {
+            offsets[index] = total;
+            total += length;
+        }
+        const partitioned = try self.a.alloc(Record, changes.len);
+        defer self.a.free(partitioned);
+        var positions = offsets;
+        for (changes) |record| {
+            const index = slot(hash(record.id), depth);
+            partitioned[positions[index]] = record;
+            positions[index] += 1;
+        }
         var children: [16]Child = undefined;
         var owned: [16]?Ref = @splat(null);
         defer for (owned) |value| if (value) |ref| freeRef(self.a, ref);
-        var count: usize = 0;
-        for (0..16) |index| {
-            var selected: [leaf_records * 8]Record = undefined;
-            var length: usize = 0;
-            for (changes) |record| if (slot(hash(record.id), depth) == index) {
-                if (length == selected.len) return error.InvalidCloudGenerationMap;
-                selected[length] = record;
-                length += 1;
-            };
+        var tasks: [16]?scheduler.Task(anyerror!Ref) = @splat(null);
+        const io = try self.operationIo();
+        // Join before partition buffers and parent page arenas are released,
+        // including cancellation and a failed sibling. No partial root installs.
+        defer for (&tasks) |*handle| if (handle.*) |task_| {
+            var task = task_;
+            handle.* = null;
+            if (task.cancel(io)) |ref| freeRef(self.a, ref) else |_| {}
+        };
+        var submitted: usize = 0;
+        for (counts, 0..) |length, index| {
+            if (length == 0) continue;
             const prior = for (previous) |child| {
                 if (child.slot == index) break child.ref;
             } else null;
-            const ref = if (length != 0) changed: {
-                owned[index] = try self.update(prior, selected[0..length], depth + 1, token);
-                break :changed owned[index].?;
-            } else prior orelse continue;
+            const selected = partitioned[offsets[index]..][0..length];
+            // One level supplies ample independent I/O. Deeper recursion stays
+            // inline, bounding both live pages and task descriptors per writer.
+            if (depth == 0 and submitted < 8) {
+                if (scheduler.global().submitIoTransient(io, 2 * max_page_bytes, Worker.run, .{ self, prior, selected, depth + 1, token })) |task| {
+                    tasks[index] = task;
+                    submitted += 1;
+                    continue;
+                }
+            }
+            owned[index] = try self.update(prior, selected, depth + 1, token);
+        }
+        for (&tasks, 0..) |*handle, index| if (handle.*) |task_| {
+            var task = task_;
+            handle.* = null;
+            owned[index] = try task.await(io);
+        };
+        try token.check();
+        var count: usize = 0;
+        for (0..16) |index| {
+            const prior = for (previous) |child| {
+                if (child.slot == index) break child.ref;
+            } else null;
+            const ref = owned[index] orelse prior orelse continue;
             children[count] = .{ .slot = @intCast(index), .ref = ref };
             count += 1;
         }
@@ -669,6 +714,7 @@ test "external lake global frontier generation maps pin restart reads and rewrit
     const a = std.testing.allocator;
     const Provider = struct {
         memory: objectstore.MemoryClient,
+        mutex: std.atomic.Mutex = .unlocked,
         writes: usize = 0,
         serial: u64 = 0,
         fn client(self: *@This()) objectstore.Client {
@@ -677,16 +723,22 @@ test "external lake global frontier generation maps pin restart reads and rewrit
         fn noop(_: A, _: *anyopaque) void {}
         fn exists(raw: *anyopaque, bucket: []const u8, _: objectstore.BucketOptions) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            lock(&self.mutex);
+            defer self.mutex.unlock();
             var c = self.memory.client();
             return c.bucketExists(bucket);
         }
         fn make(raw: *anyopaque, bucket: []const u8, _: objectstore.BucketOptions) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            lock(&self.mutex);
+            defer self.mutex.unlock();
             var c = self.memory.client();
             return c.makeBucket(bucket);
         }
         fn put(raw: *anyopaque, alloc: A, bucket: []const u8, name: []const u8, body: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            lock(&self.mutex);
+            defer self.mutex.unlock();
             self.writes += 1;
             var c = self.memory.client();
             var result = try c.putObject(bucket, name, body, options);
@@ -702,6 +754,8 @@ test "external lake global frontier generation maps pin restart reads and rewrit
         }
         fn get(raw: *anyopaque, alloc: A, bucket: []const u8, name: []const u8, options: objectstore.GetOptions) !objectstore.GetResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            lock(&self.mutex);
+            defer self.mutex.unlock();
             var c = self.memory.client();
             c.allocator = alloc;
             const selected = if (options.version_id) |version| try std.fmt.allocPrint(alloc, "{s}@{s}", .{ name, version }) else try alloc.dupe(u8, name);
@@ -894,4 +948,77 @@ test "external lake global frontier cloud vacuum resumes from GC evidence and pr
         }
     }.check };
     try std.testing.expectError(error.Canceled, writer.vacuum(&store, cut, .{}, cancelled));
+}
+
+test "external lake global frontier cloud map siblings overlap before root publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const Gate = struct {
+        io: std.Io,
+        arrived: std.atomic.Value(u32) = .init(0),
+        active: std.atomic.Value(u32) = .init(0),
+        fail: bool = false,
+        both: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn put(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.active.fetchAdd(1, .acq_rel);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            if (self.arrived.fetchAdd(1, .acq_rel) == 1) self.both.set(self.io);
+            if (self.fail) {
+                try self.both.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+                return error.TestWriteFailed;
+            }
+            try self.release.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        }
+        fn build(writer: *Writer, records: []const Record) anyerror!Ref {
+            return writer.update(null, records, 0, .none);
+        }
+    };
+    var gate: Gate = .{ .io = io };
+    provider.put_hook = .{ .ptr = &gate, .call = Gate.put };
+    var memory: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = a };
+    const scope = try api.UploadScope.forPublication(@splat(1), 1, io);
+    var writer: Writer = .{ .a = memory.allocator(), .io = io, .reader = .{ .client = client, .bucket = "bucket", .prefix = "maps" }, .scope = scope, .complete = true };
+    defer writer.deinit();
+    var ids: [256][175]u8 = undefined;
+    var records: [256]Record = undefined;
+    for (&ids, &records, 0..) |*id, *record, i| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i, .big);
+        id.* = try scope.artifactId(&std.fmt.bytesToHex(hash(&bytes), .lower));
+        record.* = .{ .id = id, .bytes = 8, .generation = "payload" };
+    }
+    var build = try io.concurrent(Gate.build, .{ &writer, &records });
+    var joined = false;
+    defer if (!joined) {
+        if (build.cancel(io)) |ref| freeRef(writer.a, ref) else |_| {}
+    };
+    defer gate.release.set(io);
+    try gate.both.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    try std.testing.expect(writer.reader.root == null);
+    gate.release.set(io);
+    joined = true;
+    const root = try build.await(io);
+    defer freeRef(writer.a, root);
+    for (records) |record| {
+        var found = (try writer.reader.lookupAt(a, record.id, root, .none)).?;
+        defer found.deinit(a);
+        try std.testing.expectEqualStrings(record.generation, found.generation);
+    }
+    // A failed sibling preserves the installed root, disables completeness,
+    // and joins all provider operations before the caller regains ownership.
+    writer.reader.root = try cloneRef(writer.a, root);
+    gate.both = .unset;
+    gate.arrived.store(0, .release);
+    gate.fail = true;
+    for (records) |record| try writer.pending.append(writer.a, try record.clone(writer.a));
+    try std.testing.expectError(error.TestWriteFailed, writer.flush(.none));
+    try std.testing.expectEqual(@as(u32, 0), gate.active.load(.acquire));
+    try std.testing.expect(!writer.complete and writer.disabled);
+    try std.testing.expectEqualStrings(root.generation, writer.reader.root.?.generation);
 }

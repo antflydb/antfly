@@ -3614,3 +3614,58 @@ and completed GC evidence across restart and a later collection. All 14 selected
 real Parquet/Iceberg E2Es pass in 282.74 seconds. Object-store contracts, Apache
 source boundaries, license headers, changed-source formatting and Git whitespace
 checks pass. No archive-scale latency or live-provider qualification is claimed.
+
+## Paged checkpoints, reusable recent text, batched highlights and parallel map writes
+
+Reader protocol 40 fences workers before publication of paged build checkpoints.
+Completed file deltas and removed baseline identities live in authenticated COW
+file trees; checkpoint roots contain only tree references/counts, the published
+baseline reference and bounded signed DF runs. Legacy inline checkpoints remain
+recoverable. New builds save their first completed file immediately, then batch
+up to 64 completed files or five seconds at file boundaries. A checkpoint saves
+its inventory and DF cut together. A crash can replay the unsaved tail; queries
+continue to use the previous complete publication. Removing a file from an
+interrupted delta prunes its pending inventory and subtracts its DF contribution
+together. GC follows the pending file tree as posting owners and the baseline
+as canonical serving/maintenance ownership. The 16,384-file regression keeps the
+root under 16 KiB, resumes the paged inventory and verifies that replacement and
+removal preserve the earlier immutable cut.
+
+Accepted-WAL native text snapshots are now reused by the server. Cache keys bind
+credential/store identity, table identity, source, schema, index name/config and
+both ends of the immutable WAL range. Four admission lanes single-flight equal
+cuts. Cached snapshots retain no request metadata or authority; callers supply
+current analysis/schema metadata and private visibility masks. A 256 MiB shared
+heap accounts for retained snapshots, concurrent builders and retired snapshots
+still pinned by requests. Each build keeps its existing 64 MiB limit. Saturation
+uses a bounded private build charged to the same process resource manager;
+request cancellation never invalidates another request's immutable corpus.
+The cache joins the full-text residency accounting owner during lake preparation
+and closes after requests have quiesced. Physical shared cells now remember their
+own allocator, so private visibility cells can safely reference an immutable
+corpus allocated by a different owner. Tests cover concurrent equal-cut admission,
+eviction with live pins, cache pressure, different coverage cuts, cancellation,
+foreign allocator destruction and private masks.
+
+Stored-source highlights hydrate final winners in physical segment/document
+order using a compact permutation, while returned hits retain ranking order.
+Paged winners reopen each selected immutable segment once; smaller admitted
+corpora reuse their existing pin. A caller-owned stored decoder retains one
+block, so winners in that block share decompression. Hidden JSON input is released
+after each snippet. Native identity checks, original source projection, the
+publication reader lease and cancellation remain required. Existing real-file
+highlight cases cover hidden source fields, pagination, packed sources and
+restart; native decoder ownership tests assert one decode across repeated rows
+of the same block and release both physical and private allocation budgets.
+
+Generation-map updates partition changed records once and prepare independent
+root children through the shared I/O scheduler. At most eight child tasks are
+outstanding per writer; deeper radix work stays inline. Scheduler saturation
+executes required work inline. Every task is joined on success, failure or
+cancellation before partition buffers or page arenas are freed. Only the
+coordinated root is installed after all children succeed. The provider regression
+requires two sibling writes to enter before either may finish, then verifies all
+exact generation selectors under the resulting root. Scripted providers now
+serialize their internal object/version maps while allowing remote-operation
+hooks to overlap. No live-provider throughput or archive-scale latency result is
+claimed by these operation-count and ownership regressions.

@@ -19,11 +19,13 @@ const os = @import("objectstore");
 const A = std.mem.Allocator;
 pub const Provider = struct {
     memory: os.MemoryClient,
+    mutex: std.atomic.Mutex = .unlocked,
     versions: std.StringHashMapUnmanaged([]u8) = .empty,
     serial: u64 = 0,
     now_ms: u64 = 100,
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
+    put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     pub fn init(a: A) Provider {
         return .{ .memory = .init(a) };
@@ -54,6 +56,9 @@ pub const Provider = struct {
     }
     fn put(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, bytes: []const u8, options: os.PutOptions) !os.PutResult {
         const self = owner(raw);
+        if (self.put_hook) |hook| try hook.call(hook.ptr);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         var c = self.memory.client();
         var uploaded = try c.putObject(bucket, name, bytes, options);
         uploaded.deinit(c.allocator);
@@ -79,6 +84,8 @@ pub const Provider = struct {
     }
     fn get(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, options: os.GetOptions) !os.GetResult {
         const self = owner(raw);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         var c = self.memory.client();
         c.allocator = a;
         const version = options.version_id orelse self.versions.get(name);
@@ -94,6 +101,8 @@ pub const Provider = struct {
     }
     fn statOptions(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, options: os.StatOptions) !os.ObjectMetadata {
         const self = owner(raw);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         self.stats += 1;
         var c = self.memory.client();
         c.allocator = a;
@@ -109,6 +118,8 @@ pub const Provider = struct {
     }
     fn delete(raw: *anyopaque, bucket: []const u8, name: []const u8, options: os.DeleteOptions) !void {
         const self = owner(raw);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         if (self.now_ms < self.until_ms) return error.AccessDenied;
         const version = options.version_id orelse return error.UnexpectedCurrentNameDelete;
         const path = try std.fmt.allocPrint(self.memory.alloc, "{s}@{s}", .{ name, version });
@@ -127,6 +138,8 @@ pub const Provider = struct {
     }
     fn listVersions(raw: *anyopaque, a: A, bucket: []const u8, options: os.ListObjectVersionsOptions) !os.ListObjectVersionsResult {
         const self = owner(raw);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         var c = self.memory.client();
         c.allocator = a;
         var page = try c.listObjects(bucket, .{ .prefix = options.prefix, .recursive = true, .max_keys = 10_000 });

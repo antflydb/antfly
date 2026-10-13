@@ -473,7 +473,7 @@ test "external lake global frontier wrapped publication builds real Parquet pack
             try @import("lake_index_directory.zig").hydrate(scratch.allocator(), self.store.*, &hydrated, .none, null);
             for (hydrated.declarations) |entry| if (entry.artifact.kind == .text_segment) {
                 const partial = try corpus.loadRootDirectory(scratch.allocator(), self.store.*, entry.artifact, .none, null);
-                if (partial.checkpoint_base != null and partial.manifests.len != 0) {
+                if (partial.checkpoint_base != null and (partial.manifests.len != 0 or partial.checkpoint_files != null)) {
                     self.saw_base = true;
                     if (self.stop) return error.TestInterrupted;
                 }

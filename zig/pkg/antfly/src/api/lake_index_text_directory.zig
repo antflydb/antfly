@@ -300,6 +300,33 @@ pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGr
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     return update(a, pages.store(), groups, refs, removed, removed_refs, old, token, io);
 }
+/// Checkpoints need only compact file identities, never segment/routing trees.
+/// Changes are paged and applied to the previous immutable delta inventory.
+pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const FileRecord, removed: []const FileRecord, prior: ?tree.Ref, token: Cancellation, io: std.Io) !?tree.Ref {
+    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var check = token;
+    const Check = struct {
+        fn call(raw: *anyopaque) !void {
+            try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
+        }
+    };
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
+    defer manager.deinit();
+    var mutations = Mutations.init(a, &manager, pages.store());
+    defer mutations.deinit();
+    for ([_]bool{ true, false }) |deleting| for (if (deleting) removed else records) |record| {
+        try token.check();
+        const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
+        defer a.free(bytes);
+        // GC admits a compact file record as one authenticated leaf value.
+        if (bytes.len > chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+        try mutations.add(corpus.term_directory.identity(record.file.id), if (deleting) null else bytes, bytes.len);
+    };
+    return mutations.finish(prior);
+}
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
     var check = token;
     const Check = struct {

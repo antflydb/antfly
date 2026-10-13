@@ -62,6 +62,7 @@ pub const Overlay = struct {
     const RecentOwner = struct {
         a: A,
         budget: local.sql_memory_budget,
+        locked: local.sql_parallel_scheduler.LockedAllocator = undefined,
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(self.budget.live == 0);
@@ -72,13 +73,14 @@ pub const Overlay = struct {
         const owner = try a.create(RecentOwner);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = limit } };
+        owner.locked = .{ .backing = owner.budget.allocator() };
         return self.buildRecent(owner, name, analysis, schema, field, context) catch |err| {
             if (owner.budget.exhausted) return error.LakeOverlayTooLarge;
             return err;
         };
     }
     fn buildRecent(self: *const Overlay, owner: *RecentOwner, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
-        const a = owner.budget.allocator();
+        const a = owner.locked.allocator();
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
         try self.appendRecent(a, &writer, analysis, schema, field, context);
@@ -163,6 +165,7 @@ pub const Overlay = struct {
     const Owner = struct {
         a: A,
         base: search.PinnedTextSource,
+        recent: ?search.PinnedTextSource = null,
         preparation: ?*const local.search_search.TextNavigationPlan = null,
         context: local.serverless_query_lake_read_context.Context = .{},
         fn check(raw: *anyopaque) !void {
@@ -185,21 +188,34 @@ pub const Overlay = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = self.a;
             var base = self.base;
+            var held_recent = self.recent;
             a.destroy(self);
             base.deinit();
+            if (held_recent) |*pin| pin.deinit();
         }
     };
     /// The input pin transfers only on success. Tombstones have private shared
     /// cells, so archive readers cannot see another query's pending deletes.
     pub fn compose(self: *const Overlay, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+        var recent_pin = try self.recent(std.heap.page_allocator, base.name, base.text_analysis, base.runtime_schema, base.selected_field, context);
+        defer recent_pin.deinit();
+        recent_pin = try recent_pin.share(std.heap.page_allocator);
+        return composeRecent(base, excluded, recent_pin, context);
+    }
+    pub fn composeRecent(base: search.PinnedTextSource, excluded: *const Bitmap, recent_pin: search.PinnedTextSource, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
         const a = base.snapshot.inventoryAllocator();
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
         try shareMasked(a, &writer, base, excluded, context);
-        try self.appendRecent(a, &writer, base.text_analysis, base.runtime_schema, base.selected_field, context);
+        const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, recent_pin.snapshot.segments.len);
+        defer a.free(sources);
+        for (sources, 0..) |*source, ordinal| source.* = .{ .snapshot = recent_pin.snapshot, .ordinal = ordinal, .target_id = base.snapshot.segments.len + ordinal + 1 };
+        try writer.shareImmutableSegments(sources);
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
-        owner.* = .{ .a = a, .base = base };
+        var held = try recent_pin.clone();
+        errdefer held.deinit();
+        owner.* = .{ .a = a, .base = base, .recent = held };
         const snapshot = if (base.snapshot.read_context_check) |check|
             try writer.acquireSnapshotWithReadCapability(.{ .ptr = base.snapshot.read_context.?, .check = check, .io = base.snapshot.read_context_io })
         else if (base.read_context) |read_context|

@@ -850,7 +850,7 @@ test "merge mapper-built multi-field text segments" {
     try std.testing.expectEqualStrings("doc2", doc1.id);
     try std.testing.expectEqualStrings("doc3", doc2.id);
 
-    var seg_shared = index_mod.SegmentShared{ .ref_count = 1 };
+    var seg_shared = index_mod.SegmentShared{ .ref_count = 1, .allocator = alloc };
     var seg_entry: index_mod.SegmentEntry = .{
         .id = 0,
         .data = index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, merged)),

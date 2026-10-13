@@ -339,6 +339,16 @@ pub const Collector = struct {
                         const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = if (root.serving != null) @import("lake_index_native_text.zig").metadata_version else 10, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
                         if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
                     }
+                    try self.markPages(a, root.domain, root.checkpoint_removed_files, false);
+                    if (root.checkpoint_files) |files| {
+                        if (self.progress) |progress| {
+                            try progress.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = false } } });
+                        } else {
+                            try self.markPages(a, root.domain, files, false);
+                            const records = try @import("lake_index_native_text.zig").checkpointDeltaFiles(a, a, root, self.store, self.cancellation());
+                            for (records) |record| try self.markTextManifestMode(a, record.manifest, root.seekable, false);
+                        }
+                    }
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.segment_files, false);
