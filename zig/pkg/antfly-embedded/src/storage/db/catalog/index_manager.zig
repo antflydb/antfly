@@ -12351,7 +12351,10 @@ pub const IndexManager = struct {
             if (entry.eql(cfg)) return .updated_no_backfill;
             const reactivating = entry.retired;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
-            if (material_changed) cfg.resolution_generation = @max(try std.math.add(u64, entry.effectiveGeneration(), 1), cfg.effectiveGeneration());
+            // Source artifacts may have changed while execution was retired.
+            // Reactivation advances the internal clock so an old resolution's
+            // matching config generation cannot skip those source updates.
+            if (material_changed or reactivating) cfg.resolution_generation = @max(try std.math.add(u64, entry.effectiveGeneration(), 1), cfg.effectiveGeneration());
             // Once curated identities exist, merge_generation is the combined
             // revision clock. A config bump can equal a previous merge revision;
             // every change must still invalidate older resolution artifacts.

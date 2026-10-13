@@ -923,7 +923,9 @@ index retires its resolver, so rendering/query resolution returns not found and
 new source writes do not run that resolver. A shared declaring index keeps it
 active. Retired definitions retain merges and namespace fences in the portable
 catalog, including across backup/restore; re-add/rename reactivates them through
-the same namespace admission checks. Independently registered resolvers remain
+the same namespace admission checks. Reactivation advances the internal revision
+so source changes made while retired cannot reuse stale decisions. Independently
+registered resolvers remain
 active when an index is removed. Reapplying an older inline declaration records
 its ownership without changing its resolution revision. Retired identities use
 required catalog version 2, so libraries without lifecycle support reject them

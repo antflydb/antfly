@@ -308,7 +308,7 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert (
             db.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "concept/qwen_embedding"
         )
-        assert db.resolve_query("concepts", request)["resolution"]["config_generation"] == 2
+        assert db.resolve_query("concepts", request)["resolution"]["config_generation"] == 3
         assert len(db.edges("knowledge", "concept/qwen_embedding", "uses", 0)) == 1
         assert db.edges("knowledge", "concept/qwen", "uses", 0) == []
         for field, value in (("table", "other"), ("key_template", "other/{{ uslug _entity.text }}")):
@@ -457,7 +457,7 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
     with antfly_embedded.open_readonly(aflite_path) as db:
         result = db.resolve_query("concepts", request)
-        assert result["resolution"]["config_generation"] == 2
+        assert result["resolution"]["config_generation"] == 4
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
         assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
 
@@ -597,6 +597,12 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
             with pytest.raises(antfly_embedded.NotFoundError):
                 alpha.resolve_query("people", {"extraction": extraction})
             assert beta.render_resolver_key("people", render_mention)["key"] == "beta/ada"
+            # Updates while retired must be resolved on reactivation, even if
+            # an older resolution artifact has the same declarative generation.
+            updated = json.loads(json.dumps(extraction))
+            updated["entities"][1]["text"] = "Carol"
+            alpha.batch_json({"inserts": {"claim": {"kg": updated}}})
+            alpha.run_until_idle()
         # A backup made while retired must retain identity without reactivating it.
         backup = db.backup()
     restored_path = tmp_path / ("archived.aflite" if storage == antfly_embedded.Storage.LITE else "archived")
@@ -624,7 +630,9 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
             alpha.add_index(renamed)
             alpha.run_until_idle()
             assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
-            assert len(alpha.edges("knowledge_v2", "alpha/canonical", "knows", 0)) == 1
+            restored_edges = alpha.edges("knowledge_v2", "alpha/canonical", "knows", 0)
+            assert len(restored_edges) == 1
+            assert base64.b64decode(restored_edges[0]["target_b64"]).decode() == "alpha/carol"
     # Exact consumer pattern on two tables: reopen, reapply identical inline
     # configs on existing indexes, then render/resolve and check relation edges.
     with antfly_embedded.open_with_options(path, options) as db:
@@ -645,4 +653,7 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
                 endpoint = result["resolution"]["entities"][0]["doc_ref"]
                 assert endpoint["key"] == expected
                 assert endpoint["table"] == f"entities_{suffix}"
-                assert len(table.edges("knowledge", expected, "knows", 0)) == 1
+                edges = table.edges("knowledge", expected, "knows", 0)
+                assert len(edges) == 1
+                expected_target = "alpha/carol" if suffix == "alpha" else "beta/bob"
+                assert base64.b64decode(edges[0]["target_b64"]).decode() == expected_target

@@ -955,7 +955,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const rendered = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer rendered.deinit();
     try std.testing.expectEqualStrings("concept/qwen", rendered.value.object.get("key").?.string);
-    try std.testing.expectEqual(@as(i64, 2), rendered.value.object.get("config_generation").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), rendered.value.object.get("config_generation").?.integer);
     // Read-only handles can query aliases without canonical documents and
     // observe the same durable generation after reopening.
     api.antfly_db_close(id);
@@ -970,7 +970,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const resolution = queried.value.object.get("resolution").?.object;
     try std.testing.expectEqualStrings("concept/qwen", resolution.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("match", resolution.get("entities").?.array.items[0].object.get("decision").?.string);
-    try std.testing.expectEqual(@as(i64, 2), resolution.get("config_generation").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), resolution.get("config_generation").?.integer);
 }
 
 test "capi resolver config merge config advances revisions and protects key namespaces" {

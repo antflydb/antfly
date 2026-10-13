@@ -232,8 +232,8 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
     }
 }
 
-/// Undo buffer for the catalog mutations a native Lite AddIndex performs
-/// before (nested enrichments) and after (nested resolvers) `db.addIndex`.
+/// Undo buffer for the catalog mutations an embedded AddIndex performs
+/// before index admission (nested enrichments and resolvers).
 /// The C ABI admits one index per call with no transaction around the
 /// enrichment/resolver catalogs, so a rejected or partially failed AddIndex
 /// must restore the pre-call configuration itself: durably upserting an
