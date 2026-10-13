@@ -4185,3 +4185,13 @@ subsequent complete fmt-check passed; the two incoming Python formatter diffs
 were independently verified to preserve their ASTs. Cache GC was previewed only
 while unrelated worktrees had active builds; nothing was deleted. These are
 local correctness results, not remote CI or public durable JSON activation.
+
+Repository-header CI repair: remote run 38324716098 exposed a separate gate
+that the product-boundary audit does not cover. The repository-wide header
+checker reproduced 16 missing/noncanonical notices. Normalization preserves
+runtime bodies and the Unicode third-party notice; the Unicode table generator
+now emits the canonical first-party header itself. A regression test checks
+that emission contract without depending on the host Unicode version. All six
+license workflow commands passed locally, including 35 boundary, 12 header,
+three provenance and six asset tests. Python formatting and diff checks passed.
+This is CI hygiene, not SQL-case activation or new original-case credit.

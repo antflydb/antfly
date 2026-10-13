@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import io
 import tempfile
@@ -29,6 +30,34 @@ import license_headers as policy
 
 
 class LicenseHeaderTests(unittest.TestCase):
+    def test_unicode_slug_generator_emits_canonical_header(self):
+        # Inspect the literal emission contract without depending on the host
+        # Python Unicode database or regenerating the large normalization table.
+        generator = policy.ROOT / "zig/lib/resolver/tools/generate_unicode_slug.py"
+        tree = ast.parse(generator.read_text())
+        output = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "out"
+                for target in node.targets
+            )
+        )
+        header = ast.literal_eval(output.elts[0])
+        self.assertEqual(
+            header,
+            policy.render_header(
+                Path("unicode_slug_data.zig"), policy.read_header("apache")
+            ),
+        )
+        checked_in = (
+            policy.ROOT / "zig/lib/resolver/src/unicode_slug_data.zig"
+        ).read_text()
+        self.assertTrue(checked_in.startswith(header))
+        self.assertEqual(output.elts[1].id, "notice")
+        self.assertIn("// UNICODE LICENSE V3\n", checked_in[len(header) :])
+
     def test_product_groups(self):
         self.assertEqual(
             policy.group_for("zig/pkg/antfly-embedded/src/lite_main.zig", "all"),
