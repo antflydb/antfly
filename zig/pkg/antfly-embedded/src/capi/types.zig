@@ -251,9 +251,12 @@ pub const ErrorCode = enum(c_int) {
     /// succeed. See `antfly_db_run_until_idle_json`
     /// for the stuck index name and indexed/expected counters.
     stalled = 9,
-    /// The caller cancelled the call, by returning false from its progress
-    /// or stream callback.
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning false.
     cancelled = 10,
+    replacement_failed = 11,
+    replacement_pending = 12,
+    replacement_configuration_mismatch = 13,
     internal = 255,
 };
 
@@ -270,6 +273,9 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
         @backingInt(ErrorCode.stalled) => "ANTFLY_STALLED",
         @backingInt(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
+        @backingInt(ErrorCode.replacement_failed) => "ANTFLY_REPLACEMENT_FAILED",
+        @backingInt(ErrorCode.replacement_pending) => "ANTFLY_REPLACEMENT_PENDING",
+        @backingInt(ErrorCode.replacement_configuration_mismatch) => "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
         @backingInt(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -288,6 +294,9 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @backingInt(ErrorCode.stalled) => "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
         @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
+        @backingInt(ErrorCode.replacement_failed) => "replacement failed after its retry budget; inspect diagnostics and cancel before retrying",
+        @backingInt(ErrorCode.replacement_pending) => "index name is reserved by a pending replacement",
+        @backingInt(ErrorCode.replacement_configuration_mismatch) => "replacement configuration differs from the reserved request",
         @backingInt(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
@@ -347,8 +356,12 @@ pub fn mapError(err: anyerror) ErrorCode {
 fn classifyError(err: anyerror) ErrorCode {
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
+        error.IndexReplacementFailed => .replacement_failed,
+        error.IndexReplacementPending => .replacement_pending,
+        error.IndexReplacementConfigurationMismatch => .replacement_configuration_mismatch,
+        error.Canceled, error.Cancelled => .cancelled,
         error.VersionConflict => .version_conflict,
-        error.SqlFeatureNotSupported, error.UnsupportedResolverCatalogVersion => .unsupported,
+        error.SqlFeatureNotSupported, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
@@ -369,6 +382,13 @@ fn classifyError(err: anyerror) ErrorCode {
         error.InvalidResolverAlias,
         error.InvalidResolverAliasCycle,
         error.ResolverMergeNamespaceChange,
+        error.ResolverAlreadyExists,
+        error.ResolverArtifactAlreadyExists,
+        error.ResolverLabelRoutingConflict,
+        error.ResolverSourceArtifactImmutable,
+        error.ResolverArtifactImmutable,
+        error.InvalidResolverConfig,
+        error.ResolverIdentityActive,
         error.EmptyEntityKey,
         error.InvalidArgument,
         error.SqlArraySubscriptError,
@@ -466,6 +486,8 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ModelNotFound,
         => .invalid_argument,
         error.FileNotFound => .not_found,
+        error.Busy,
+        error.IndexArtifactCleanupPending,
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
@@ -561,4 +583,17 @@ test "capi C ABI retains codes for generic failures and copies contextual diagno
     clearLastError();
     try std.testing.expectEqual(ErrorCode.ok, lastErrorCode());
     try std.testing.expectEqualStrings("", std.mem.span(lastErrorDetail()));
+}
+
+test "capi query retry errors retain the busy ABI diagnostic" {
+    try std.testing.expectEqual(ErrorCode.busy, mapErrorContext(error.Busy, "resolver changed; retry"));
+    try std.testing.expectEqual(ErrorCode.busy, last_error_code);
+}
+
+test "capi resolver replacement preconditions have distinct ABI codes" {
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Cancelled));
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Canceled));
+    try std.testing.expectEqual(ErrorCode.replacement_failed, mapError(error.IndexReplacementFailed));
+    try std.testing.expectEqual(ErrorCode.replacement_pending, mapError(error.IndexReplacementPending));
+    try std.testing.expectEqual(ErrorCode.replacement_configuration_mismatch, mapError(error.IndexReplacementConfigurationMismatch));
 }

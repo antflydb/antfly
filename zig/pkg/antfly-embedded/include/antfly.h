@@ -41,9 +41,13 @@ typedef enum antfly_error_code {
     /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
      * and repair or reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
-    /* The caller cancelled the call by returning false from its progress or
-     * stream callback. */
+    /* The operation was cancelled, including a pending replacement or a
+     * progress/stream callback returning false. */
     ANTFLY_CANCELLED = 10,
+    /* Stable replacement precondition failures, distinct from malformed input. */
+    ANTFLY_REPLACEMENT_FAILED = 11,
+    ANTFLY_REPLACEMENT_PENDING = 12,
+    ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH = 13,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -347,6 +351,10 @@ antfly_error_code antfly_db_capabilities_json(antfly_db *db, antfly_buffer *out)
  * atomically replaces an existing destination.
  */
 antfly_error_code antfly_db_backup(antfly_db *db, antfly_buffer *out);
+/** Portable backup with optional {"tables":["default","healthy"]} scope.
+ * Explicit scope includes default and exactly the named tables. Full backup
+ * fails closed if any table is unavailable; it never silently omits data. */
+antfly_error_code antfly_db_backup_json(antfly_db *db, antfly_slice options_json, antfly_buffer *out);
 antfly_error_code antfly_db_import_backup(antfly_db *db, antfly_slice backup);
 antfly_error_code antfly_restore_backup_json(
     const char *dest_path,
@@ -457,19 +465,52 @@ antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resol
  * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
  * antfly_db_run_until_idle to re-resolve existing artifacts and replace mention edges.
  * Promotion-enabled resolvers also reconcile entity documents. Arbitrary application
- * references and manually supplied graph edges are not rewritten. */
+ * references and manually supplied graph edges are not rewritten.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
 
+/* Lists active and retired identities, including durable merges. */
+antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);
+/* Drops a retired identity and its merges; rejects an active identity.
+ * Existing resolution artifacts and promoted documents remain. Delete source
+ * documents to remove their artifacts; delete canonical rows explicitly only
+ * after checking other resolvers/application references.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+antfly_error_code antfly_db_drop_resolver_identity(antfly_db *db, antfly_slice resolver_name, bool *out_deleted);
 /** Set {table,key_template} and choose reset_merges:true (clears inline aliases too,
  * unless an explicit replacement aliases array is supplied) or
  * key_map:[{key,target},...] mapping every inline/durable alias endpoint.
  * A durable fence rejects stale inline namespaces/aliases even after reset.
  * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
- * Application-owned documents/references are not renamed. */
+ * Application-owned documents/references are not renamed.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
 
+/* Schema admission (add, replaces, delete, namespace changes and identity drop)
+ * may return ANTFLY_BUSY before mutation when replay/promotion is active for
+ * approximately 100 ms. Retry the identical request with bounded backoff.
+ * replaces registers a hidden resumable shadow and returns; the old graph
+ * serves until background activation. Identical requests are idempotent.
+ * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
+ * waits for activation; deadline BUSY leaves the accepted shadow running.
+ * Waiting releases admission between work quanta; cancellation returns
+ * ANTFLY_CANCELLED. Precondition failures are ANTFLY_REPLACEMENT_FAILED,
+ * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
+ * pending_work_stats_json reports progress, retry_count, retry_after_ns and
+ * last_error. Consecutive transient failures retry four times with persisted
+ * backoff; durable forward progress resets the consecutive budget. A separate
+ * lifetime ceiling permits at most 64 retries (total_retry_count/max_total_retries
+ * in status). Backward-clock deadlines are clamped to at most 3.2 seconds.
+ * ANTFLY_CANCELLED also covers interrupted IO/mutex admission; interruption of
+ * a call does not cancel accepted work. Inspect state if completion raced it. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
+/* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
+/** Cancel a running or failed shadow by its new name; idempotent. Leaves the
+ * serving index intact and schedules bounded shadow-artifact cleanup. Failed
+ * jobs do not retry or pin replay; cancel before registering a fresh attempt.
+ * delete_index on either name also cancels dependent replacements. */
+antfly_error_code antfly_db_cancel_replacement(antfly_db *db, antfly_slice name, bool *out_cancelled);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_add_enrichment_json(antfly_db *db, antfly_slice config_json);
 antfly_error_code antfly_db_delete_enrichment(

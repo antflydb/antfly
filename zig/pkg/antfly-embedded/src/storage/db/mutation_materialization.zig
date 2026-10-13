@@ -9748,6 +9748,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var changed_set = std.StringHashMapUnmanaged(void).empty;
             defer changed_set.deinit(alloc);
 
+            var resolved_assets: std.StringHashMapUnmanaged(void) = .empty;
+            defer {
+                var keys = resolved_assets.keyIterator();
+                while (keys.next()) |key| alloc.free(key.*);
+                resolved_assets.deinit(alloc);
+            }
+            for (changed_artifact_keys) |key| {
+                if (!internal_keys.isResolutionArtifactKey(key)) continue;
+                if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, key)) |asset| {
+                    const entry = resolved_assets.getOrPut(alloc, asset) catch |err| {
+                        alloc.free(asset);
+                        return err;
+                    };
+                    if (entry.found_existing) alloc.free(asset);
+                }
+            }
             for (changed_artifact_keys) |artifact_key| {
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
                     for (sources) |source| {
@@ -9761,34 +9777,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         };
                     }
                     for (changed.items) |key| try changed_set.put(alloc, key, {});
-                    // Relation edges materialize when the extraction artifact is
-                    // written, which is before its resolution artifacts exist, so
-                    // their first render carries local-id endpoints. A landed
-                    // resolution re-renders the owning extraction artifact with
-                    // canonical endpoints (graphEndpointResolutionsJsonAlloc); the
-                    // existing replacement semantics retire the stale local-id
-                    // edges. Depth-one recursion: the synthesized key is an asset
-                    // artifact, never another resolution key.
-                    if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, artifact_key)) |asset_key| {
-                        defer alloc.free(asset_key);
-                        const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, &.{asset_key}, index_name, options);
-                        defer alloc.free(rerendered);
-                        var idx: usize = 0;
-                        errdefer for (rerendered[idx..]) |key| alloc.free(key);
-                        while (idx < rerendered.len) {
-                            const key = rerendered[idx];
-                            if (changed_set.contains(key)) {
-                                alloc.free(key);
-                                idx += 1;
-                                continue;
-                            }
-                            try changed.append(alloc, key);
-                            idx += 1;
-                            try changed_set.put(alloc, key, {});
-                        }
-                    }
+                    // Canonical relation endpoints render once per asset after
+                    // the complete resolution batch below.
                     continue;
                 }
+                if (resolved_assets.contains(artifact_key)) continue;
                 var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
                 defer artifact_ref.deinit(alloc);
                 const source = blk: {
@@ -9954,6 +9947,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
 
+            // Resolve all mentions first, then render each affected extraction
+            // once using the complete canonical endpoint set.
+            var asset_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer asset_keys.deinit(alloc);
+            var assets = resolved_assets.keyIterator();
+            while (assets.next()) |key| try asset_keys.append(alloc, key.*);
+            if (asset_keys.items.len != 0) {
+                const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, asset_keys.items, index_name, options);
+                defer freeOwnedKeySlice(alloc, rerendered);
+                for (rerendered) |key| try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, key);
+            }
             return try changed.toOwnedSlice(alloc);
         }
 

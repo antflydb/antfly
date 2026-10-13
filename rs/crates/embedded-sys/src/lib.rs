@@ -500,6 +500,11 @@ unsafe extern "C" {
     ) -> antfly_error_code;
 
     pub fn antfly_db_backup(db: *mut antfly_db, out: *mut antfly_buffer) -> antfly_error_code;
+    pub fn antfly_db_backup_json(
+        db: *mut antfly_db,
+        options: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_import_backup(db: *mut antfly_db, backup: antfly_slice) -> antfly_error_code;
     pub fn antfly_restore_backup_json(
         dest_path: *const c_char,
@@ -651,6 +656,15 @@ unsafe extern "C" {
         resolver_name: antfly_slice,
         merge_json: antfly_slice,
     ) -> antfly_error_code;
+    pub fn antfly_db_list_resolver_identities_json(
+        db: *mut antfly_db,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_drop_resolver_identity(
+        db: *mut antfly_db,
+        name: antfly_slice,
+        out_deleted: *mut bool,
+    ) -> antfly_error_code;
     pub fn antfly_db_set_resolver_namespace_json(
         db: *mut antfly_db,
         resolver_name: antfly_slice,
@@ -661,6 +675,11 @@ unsafe extern "C" {
         config_json: antfly_slice,
     ) -> antfly_error_code;
     pub fn antfly_db_delete_index(
+        db: *mut antfly_db,
+        name: antfly_slice,
+        out_deleted: *mut bool,
+    ) -> antfly_error_code;
+    pub fn antfly_db_cancel_replacement(
         db: *mut antfly_db,
         name: antfly_slice,
         out_deleted: *mut bool,
@@ -962,3 +981,7 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
 }
+
+pub const ANTFLY_REPLACEMENT_FAILED: antfly_error_code = 11;
+pub const ANTFLY_REPLACEMENT_PENDING: antfly_error_code = 12;
+pub const ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH: antfly_error_code = 13;
