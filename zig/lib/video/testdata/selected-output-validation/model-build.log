@@ -1,0 +1,34 @@
+Build Summary: 20/20 steps succeeded; 45/45 tests passed
+bench-server success
++- install antfly-inference-bench-server success
+   +- compile exe antfly-inference-bench-server safe native success 6m MaxRSS:10G
+      +- WriteFile macos-sdk-libc.txt cached
+      +- WriteFile cached
+      +- compile obj antfly-build-info safe native cached 56ms MaxRSS:31M
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- options cached
+      +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+      +- options cached
+      +- run exe jit-source-identity (metal_identity.zig) cached
+      |  +- compile exe jit-source-identity safe native cached 65ms MaxRSS:31M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- WriteFile tokenizer.json cached
+      +- WriteFile video_prepare_shader.h cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+      |  +- compile exe patch_sentencepiece_proto safe native cached 60ms MaxRSS:31M
+      |  |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached
+      |  |  +- compile exe protoc-zig safe native cached 59ms MaxRSS:31M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options cached
+test-video-model success
++- run test 45 pass (45 total) 2s MaxRSS:74M
+   +- compile test safe native success 3m MaxRSS:3G
+      +- WriteFile macos-sdk-libc.txt (reused)
+      +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+      +- options (reused)
+      +- WriteFile tokenizer.json (reused)
+      +- WriteFile video_prepare_shader.h (reused)
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+

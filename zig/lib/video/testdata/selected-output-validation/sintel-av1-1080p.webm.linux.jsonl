@@ -1,0 +1,3 @@
+{"kind":"replay_copy","codec":"av1","iteration":0,"pictures":288,"selected_count":32,"copy_all_ns":2413948876,"selected_ns":2217266168,"packets":96,"copy_all_bytes":298598400,"selected_bytes":99532800,"skipped_outputs":64,"parity_checked":true}
+{"kind":"replay_copy","codec":"av1","iteration":1,"pictures":288,"selected_count":32,"copy_all_ns":2380070210,"selected_ns":2307044127,"packets":96,"copy_all_bytes":298598400,"selected_bytes":99532800,"skipped_outputs":64,"parity_checked":true}
+{"kind":"replay_copy","codec":"av1","iteration":2,"pictures":288,"selected_count":32,"copy_all_ns":2257237710,"selected_ns":2063616334,"packets":96,"copy_all_bytes":298598400,"selected_bytes":99532800,"skipped_outputs":64,"parity_checked":true}

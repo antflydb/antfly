@@ -1,0 +1,14 @@
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.codecs.fuzz_test.test.video fuzz AV1 Annex B framing reconstruction and cleanup" (28d56cde3bb6223e)
+Runs: 0 -> 101569
+Unique runs: 0 -> 1568
+Coverage: 0/47197 -> 3135/47197 (6.64%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 17s MaxRSS:8M
+   +- compile test safe native success 39s MaxRSS:1G
+

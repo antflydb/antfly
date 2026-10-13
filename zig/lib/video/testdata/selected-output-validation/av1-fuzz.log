@@ -1,0 +1,14 @@
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.codecs.fuzz_test.test.video fuzz AV1 reconstruction and native allocation cleanup" (cf86e47143fec1ba)
+Runs: 0 -> 102079
+Unique runs: 0 -> 2071
+Coverage: 0/47206 -> 6317/47206 (13.38%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 1m MaxRSS:17M
+   +- compile test safe native success 43s MaxRSS:1G
+

@@ -36,7 +36,7 @@ fn runFramed(codec: decoder.Codec, bytes: []const u8, framing: decoder.Av1Framin
         .control = .{ .context = &guard, .check_fn = Guard.check },
     }) catch return;
     defer session.destroy();
-    var batch = session.decode(bytes, 0, null) catch return;
+    var batch = session.decodeOutputs(bytes, 0, null, if (bytes[bytes.len - 1] & 1 == 0) .{ .indexes = &.{0} } else .none) catch return;
     defer batch.deinit();
     for (batch.frames) |frame| try frame.host().validate();
 }

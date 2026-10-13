@@ -26,8 +26,8 @@ const vp8 = @import("vp8.zig");
 const sampling = @import("sampling.zig");
 pub const Picture = struct { pts: i64, duration: ?u64, width: u32, height: u32 };
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
-pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0 };
-pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null };
+pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0, output_copy_bytes: u64 = 0, outputs_skipped: usize = 0 };
+pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false };
 pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []Picture,
@@ -365,6 +365,10 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
     } else {
         const session = try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, decoder_options);
         defer session.destroy();
+        defer if (options.replay_stats) |stats| {
+            stats.output_copy_bytes = session.output_stats.copied_bytes;
+            stats.outputs_skipped = session.output_stats.skipped_outputs;
+        };
         try session.initializeWebm(reader);
         if (restart.sequence) |span| {
             if (span.packet >= reader.packets.len) return error.InvalidPacketIndex;
@@ -386,7 +390,17 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             var lease = try reader.readPacket(packet_id);
             defer lease.deinit();
             watch.failed = false;
-            var batch = session.decode(lease.bytes, packet.pts, packet.duration_ns) catch |err| {
+            var output_ids: [64]usize = undefined;
+            var output_id_count: usize = 0;
+            if (selected) |ids| for (ids) |id| {
+                if (id < logical or id - logical >= decoder_options.max_output_frames) continue;
+                const local = id - logical;
+                if (std.mem.indexOfScalar(usize, output_ids[0..output_id_count], local) != null) continue;
+                output_ids[output_id_count] = local;
+                output_id_count += 1;
+            };
+            const output_selection: codecs.OutputSelection = if (options.copy_unselected_outputs) .all else if (packet.invisible) .none else if (selected != null) .{ .indexes = output_ids[0..output_id_count] } else .all;
+            var batch = session.decodeOutputs(lease.bytes, packet.pts, packet.duration_ns, output_selection) catch |err| {
                 if (!watch.failed) {
                     if (failure) |out| out.* = .{ .packet = packet_id, .logical = logical };
                 }
@@ -396,12 +410,16 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             try control.check();
             // Container-invisible packets still update codec references.
             if (packet.invisible) continue;
+            // Skipped native pictures advance logical identity exactly as owned
+            // outputs do; superframes/layers can publish several outputs per packet.
+            const consumed = if (selected != null and logical <= last) @min(batch.output_count, last - logical +| 1) else batch.output_count;
+            if (consumed > options.max_pictures -| logical) return error.ResourceLimitExceeded;
             for (batch.frames) |*frame| {
-                if (logical >= options.max_pictures) return error.ResourceLimitExceeded;
-                if (selected == null or std.mem.indexOfScalar(usize, selected.?, logical) != null) try accept(context, logical, frame);
-                logical += 1;
-                if (selected != null and logical > last) return;
+                const id = try std.math.add(usize, logical, frame.output_index);
+                if (selected == null or std.mem.indexOfScalar(usize, selected.?, id) != null) try accept(context, id, frame);
             }
+            logical = try std.math.add(usize, logical, batch.output_count);
+            if (selected != null and logical > last) return;
         }
     }
     if (selected != null and logical <= last) return error.InvalidPacketIndex;
@@ -975,4 +993,78 @@ test "WebM recovery VP9 transform overflow crash regression" {
         error.InvalidVideoData, error.UnrecoverableVideoData, error.RecoveryLimitExceeded => {},
         else => return err,
     };
+}
+
+test "WebM filtered replay preserves invisible preroll and superframe output identities" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+        count: usize = 0,
+        bytes: u64 = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.hash.update(std.mem.asBytes(&id));
+            self.hash.update(frame.bytes);
+            self.count += 1;
+            self.bytes += frame.bytes.len;
+        }
+        fn digest(self: *@This()) [32]u8 {
+            var out: [32]u8 = undefined;
+            self.hash.final(&out);
+            return out;
+        }
+    };
+    inline for (.{ "vp9", "av1" }) |name| {
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/vpx-av1/" ++ name ++ ".webm") } };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        reader.packets[0].invisible = true;
+        var expected = Capture{};
+        var actual = Capture{};
+        var full_stats = ReplayStats{};
+        var filtered_stats = ReplayStats{};
+        try walk(a, &reader, .{ .copy_unselected_outputs = true, .replay_stats = &full_stats }, &.{ 1, 1 }, &expected, Capture.accept);
+        try walk(a, &reader, .{ .replay_stats = &filtered_stats }, &.{ 1, 1 }, &actual, Capture.accept);
+        try std.testing.expectEqual(@as(usize, 1), actual.count);
+        try std.testing.expectEqualSlices(u8, &expected.digest(), &actual.digest());
+        try std.testing.expectEqual(full_stats.packets_decoded, filtered_stats.packets_decoded);
+        try std.testing.expectEqual(actual.bytes, filtered_stats.output_copy_bytes);
+        try std.testing.expect(filtered_stats.output_copy_bytes < full_stats.output_copy_bytes);
+        try std.testing.expect(filtered_stats.outputs_skipped >= 2);
+    }
+    const original = @embedFile("../testdata/vpx-av1/vp9.webm");
+    var source = media.source.Source{ .allocator = a, .identity = "superframe", .storage = .{ .borrowed = original } };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var first = try reader.readPacket(0);
+    defer first.deinit();
+    var second = try reader.readPacket(1);
+    defer second.deinit();
+    const bytes = try a.alloc(u8, original.len + first.bytes.len + second.bytes.len + 6);
+    defer a.free(bytes);
+    @memcpy(bytes[0..original.len], original);
+    const packet = bytes[original.len..];
+    const n = first.bytes.len;
+    const m = second.bytes.len;
+    @memcpy(packet[0..n], first.bytes);
+    @memcpy(packet[n..][0..m], second.bytes);
+    packet[n + m] = 0xc9;
+    std.mem.writeInt(u16, packet[n + m + 1 ..][0..2], @intCast(n), .little);
+    std.mem.writeInt(u16, packet[n + m + 3 ..][0..2], @intCast(m), .little);
+    packet[n + m + 5] = 0xc9;
+    source.storage = .{ .borrowed = bytes };
+    reader.packets[0].offset = original.len;
+    reader.packets[0].size = @intCast(packet.len);
+    var expected = Capture{};
+    var actual = Capture{};
+    var full_stats = ReplayStats{};
+    var filtered_stats = ReplayStats{};
+    try walk(a, &reader, .{ .copy_unselected_outputs = true, .replay_stats = &full_stats }, &.{ 1, 1 }, &expected, Capture.accept);
+    try walk(a, &reader, .{ .replay_stats = &filtered_stats }, &.{ 1, 1 }, &actual, Capture.accept);
+    try std.testing.expectEqual(@as(usize, 1), actual.count);
+    try std.testing.expectEqualSlices(u8, &expected.digest(), &actual.digest());
+    try std.testing.expectEqual(@as(usize, 1), filtered_stats.packets_decoded);
+    try std.testing.expectEqual(actual.bytes, filtered_stats.output_copy_bytes);
+    try std.testing.expectEqual(2 * actual.bytes, full_stats.output_copy_bytes);
+    try std.testing.expectEqual(@as(usize, 1), filtered_stats.outputs_skipped);
 }

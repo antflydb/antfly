@@ -247,6 +247,19 @@ test "VP9 AV1 superframe exposes every visible picture" {
             }
         }
     }
+    const filtered = try decoder.Session.create(std.testing.allocator, .vp9, .{});
+    defer filtered.destroy();
+    var chosen = try filtered.decodeOutputs(combined, 0, null, .{ .indexes = &.{ 1, 1 } });
+    defer chosen.deinit();
+    try std.testing.expectEqual(@as(usize, 2), chosen.output_count);
+    try std.testing.expectEqual(@as(usize, 1), chosen.frames.len);
+    try std.testing.expectEqual(@as(usize, 1), chosen.frames[0].output_index);
+    try std.testing.expectEqualSlices(u8, batch.frames[1].bytes, chosen.frames[0].bytes);
+    const limited = try decoder.Session.create(std.testing.allocator, .vp9, .{ .max_output_frames = 1 });
+    defer limited.destroy();
+    try std.testing.expectError(error.ResourceLimitExceeded, limited.decodeOutputs(combined, 0, null, .none));
+    try std.testing.expect(limited.failed);
+    try std.testing.expectEqual(@as(usize, 0), limited.owner.budget.live);
 }
 test "VP9 AV1 WebM reader routes coded packets and timestamps" {
     inline for (.{ "vp9", "av1" }) |name| {
@@ -559,4 +572,126 @@ test "AV1 Annex B cancellation and post-entry denial release normalization" {
     try std.testing.expect(denied.failed);
     try std.testing.expectEqual(@as(usize, 0), denied.owner.budget.live);
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+fn selectedOutputParity(coded: []const u8, codec: decoder.Codec, options: decoder.Options) !void {
+    const a = std.testing.allocator;
+    const baseline = try decoder.Session.create(a, codec, options);
+    defer baseline.destroy();
+    const selected = try decoder.Session.create(a, codec, options);
+    defer selected.destroy();
+    var at: usize = 32;
+    var packet: usize = 0;
+    var expected_bytes: u64 = 0;
+    var skipped: usize = 0;
+    while (at < coded.len) : (packet += 1) {
+        const size = std.mem.readInt(u32, coded[at..][0..4], .little);
+        at += 12;
+        const bytes = coded[at..][0..size];
+        at += size;
+        var expected = try baseline.decode(bytes, @intCast(packet), 123);
+        defer expected.deinit();
+        // A skipped key/reference output must still predict following outputs.
+        const selection: decoder.OutputSelection = switch (packet % 3) {
+            0 => .none,
+            1 => .{ .indexes = &.{0} },
+            else => .all,
+        };
+        var actual = try selected.decodeOutputs(bytes, @intCast(packet), 123, selection);
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.frames.len, actual.output_count);
+        var count: usize = 0;
+        for (expected.frames, 0..) |frame, i| {
+            const wanted = selection == .all or (selection == .indexes and i == 0);
+            if (!wanted) {
+                skipped += 1;
+                continue;
+            }
+            const item = actual.frames[count];
+            count += 1;
+            expected_bytes += frame.bytes.len;
+            try std.testing.expectEqual(i, item.output_index);
+            try std.testing.expectEqual(frame.pts_ns, item.pts_ns);
+            try std.testing.expectEqual(frame.duration_ns, item.duration_ns);
+            try std.testing.expectEqual(frame.width, item.width);
+            try std.testing.expectEqual(frame.height, item.height);
+            try std.testing.expectEqual(frame.bit_depth, item.bit_depth);
+            try std.testing.expectEqual(frame.chroma_format, item.chroma_format);
+            try std.testing.expectEqual(frame.color, item.color);
+            try std.testing.expectEqualSlices(u8, frame.bytes, item.bytes);
+        }
+        try std.testing.expectEqual(count, actual.frames.len);
+    }
+    try std.testing.expect(skipped > 0);
+    try std.testing.expect(expected_bytes > 0);
+    try std.testing.expectEqual(expected_bytes, selected.output_stats.copied_bytes);
+    try std.testing.expectEqual(skipped, selected.output_stats.skipped_outputs);
+    try std.testing.expect(selected.output_stats.copied_bytes < baseline.output_stats.copied_bytes);
+}
+test "VP9 AV1 filtered outputs preserve skipped references depth chroma grain and layers" {
+    inline for (fixtures) |name| try selectedOutputParity(@embedFile("../../testdata/vpx-av1/" ++ name ++ ".ivf"), if (std.mem.startsWith(u8, name, "vp9")) .vp9 else .av1, .{});
+    inline for (.{ "av1-c0-8", "av1-c0-12", "av1-c1-12", "av1-c2-8", "av1-c2-10", "av1-c2-12", "av1-c3-8", "av1-c3-10", "av1-c3-12", "av1-annex-b" }) |name|
+        try selectedOutputParity(@embedFile("../../testdata/av1-extended/" ++ name ++ ".ivf"), .av1, .{ .av1_framing = if (std.mem.eql(u8, name, "av1-annex-b")) .annex_b else .low_overhead });
+    for (0..2) |point| inline for (.{ true, false }) |layers| try selectedOutputParity(@embedFile("../../testdata/av1-extended/av1-svc.ivf"), .av1, .{ .av1_operating_point = @intCast(point), .av1_all_layers = layers });
+}
+test "VP9 AV1 skipped outputs use no output byte budget and selector errors remain retryable" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {
+        const session = try decoder.Session.create(std.testing.allocator, codec, .{ .max_output_bytes = 0 });
+        defer session.destroy();
+        const bytes = if (codec == .vp9) first("vp9") else first("av1");
+        try std.testing.expectError(error.InvalidPacketIndex, session.decodeOutputs(bytes, 0, null, .{ .indexes = &.{8} }));
+        try std.testing.expect(!session.failed);
+        var empty = try session.decodeOutputs(bytes, 0, null, .none);
+        defer empty.deinit();
+        try std.testing.expect(empty.output_count > 0);
+        try std.testing.expectEqual(@as(usize, 0), empty.frames.len);
+        try std.testing.expectEqual(@as(u64, 0), session.output_stats.copied_bytes);
+        try std.testing.expect(session.owner.budget.live > 0);
+    }
+}
+test "VP9 AV1 filtered allocation failures cancellation and corrupt output release owners" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+            fn run(a: std.mem.Allocator, c: decoder.Codec) !void {
+                const session = try decoder.Session.create(a, c, .{});
+                defer session.destroy();
+                var batch = try session.decodeOutputs(if (c == .vp9) first("vp9") else first("av1"), 0, null, .none);
+                defer batch.deinit();
+            }
+        }.run, .{codec});
+        var control = Cancellation{};
+        const session = try decoder.Session.create(std.testing.allocator, codec, .{ .control = .{ .context = &control, .check_fn = Cancellation.check } });
+        defer session.destroy();
+        const bytes = if (codec == .vp9) first("vp9") else first("av1");
+        control.calls = 0;
+        control.limit = 20;
+        try std.testing.expectError(error.Cancelled, session.decodeOutputs(bytes, 0, null, .none));
+        try std.testing.expect(session.failed);
+        try std.testing.expectEqual(@as(usize, 0), session.owner.budget.live);
+    }
+}
+
+test "VP9 AV1 corruption errors are preserved when every output is skipped" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {
+        const bytes = if (codec == .vp9) first("vp9") else first("av1");
+        var failures: usize = 0;
+        for ([_]usize{ 1, 4, 16, bytes.len / 2 }) |length| {
+            const all = try decoder.Session.create(std.testing.allocator, codec, .{});
+            defer all.destroy();
+            const none = try decoder.Session.create(std.testing.allocator, codec, .{});
+            defer none.destroy();
+            if (all.decode(bytes[0..length], 0, null)) |value| {
+                var expected = value;
+                defer expected.deinit();
+                var actual = try none.decodeOutputs(bytes[0..length], 0, null, .none);
+                defer actual.deinit();
+                try std.testing.expectEqual(expected.output_count, actual.output_count);
+            } else |err| {
+                try std.testing.expectError(err, none.decodeOutputs(bytes[0..length], 0, null, .none));
+                try std.testing.expectEqual(all.failed, none.failed);
+                failures += 1;
+            }
+        }
+        try std.testing.expect(failures > 0);
+    }
 }

@@ -20,7 +20,7 @@ const video = @import("mod.zig");
 extern fn av_benchmark_device_create() ?*anyopaque;
 extern fn av_benchmark_device_destroy(*anyopaque) void;
 extern fn av_benchmark_peak_rss() u64;
-const Mode = enum { decode, cpu, cpu_scalar, metal, hash, dump, index, index_reconstruct, index_compare, replay_compare };
+const Mode = enum { decode, cpu, cpu_scalar, metal, hash, dump, index, index_reconstruct, index_compare, replay_compare, replay_copy_compare };
 const Context = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -151,8 +151,8 @@ pub fn main(init: std.process.Init) !void {
         try benchmarkIndex(a, init.io, &writer.interface, &reader, &pool, mode, iterations, index_ns);
         return;
     }
-    if (mode == .replay_compare) {
-        try benchmarkReplay(a, init.io, &writer.interface, &reader, &pool, iterations);
+    if (mode == .replay_compare or mode == .replay_copy_compare) {
+        try benchmarkReplay(a, init.io, &writer.interface, &reader, &pool, iterations, mode == .replay_copy_compare);
         return;
     }
     var device: ?*anyopaque = null;
@@ -230,7 +230,8 @@ fn benchmarkIndex(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader:
     }
 }
 
-fn benchmarkReplay(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader: *media.webm.Reader, pool: *media.admission.Pool, iterations: usize) !void {
+fn benchmarkReplay(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader: *media.webm.Reader, pool: *media.admission.Pool, iterations: usize, copy_only: bool) !void {
+    if (copy_only and reader.track.codec == .vp8) return error.UnsupportedVideoCodec;
     const Record = struct { id: usize, pts: i64, duration: ?u64, width: u32, height: u32, depth: u8, chroma: u8, color: @FieldType(video.codecs.Frame, "color"), digest: [32]u8 };
     const Capture = struct {
         records: [32]Record = undefined,
@@ -256,17 +257,21 @@ fn benchmarkReplay(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader
         var replay = Capture{};
         var full_stats = video.webm_pictures.ReplayStats{};
         var seek_stats = video.webm_pictures.ReplayStats{};
-        var options = video.webm_pictures.Options{ .decoder = .{ .admission_pool = pool }, .replay_stats = &full_stats };
+        var options = video.webm_pictures.Options{ .decoder = .{ .admission_pool = pool }, .replay_stats = &full_stats, .copy_unselected_outputs = copy_only };
         const full_start = now(io);
-        try video.webm_pictures.walk(a, reader, options, selections[0..count], &baseline, Capture.accept);
+        if (copy_only) try video.webm_pictures.walkIndexed(a, reader, options, index, selections[0..count], &baseline, Capture.accept) else try video.webm_pictures.walk(a, reader, options, selections[0..count], &baseline, Capture.accept);
         const full_ns = now(io) - full_start;
         options.replay_stats = &seek_stats;
+        options.copy_unselected_outputs = false;
         const seek_start = now(io);
         try video.webm_pictures.walkIndexed(a, reader, options, index, selections[0..count], &replay, Capture.accept);
         const seek_ns = now(io) - seek_start;
         if (baseline.count != count or replay.count != count) return error.ReplayParityMismatch;
         for (baseline.records[0..count], replay.records[0..count]) |expected, actual| if (!std.meta.eql(expected, actual)) return error.ReplayParityMismatch;
-        try out.print("{{\"kind\":\"replay\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"first_selected\":{d},\"selected_count\":{d},\"full_ns\":{d},\"seek_ns\":{d},\"full_packets\":{d},\"seek_packets\":{d},\"first_packet\":{d},\"bootstrap_bytes\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, first, count, full_ns, seek_ns, full_stats.packets_decoded, seek_stats.packets_decoded, seek_stats.first_packet, seek_stats.bootstrap_bytes });
+        if (copy_only) {
+            if (full_stats.packets_decoded != seek_stats.packets_decoded) return error.ReplayParityMismatch;
+            try out.print("{{\"kind\":\"replay_copy\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"selected_count\":{d},\"copy_all_ns\":{d},\"selected_ns\":{d},\"packets\":{d},\"copy_all_bytes\":{d},\"selected_bytes\":{d},\"skipped_outputs\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, count, full_ns, seek_ns, full_stats.packets_decoded, full_stats.output_copy_bytes, seek_stats.output_copy_bytes, seek_stats.outputs_skipped });
+        } else try out.print("{{\"kind\":\"replay\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"first_selected\":{d},\"selected_count\":{d},\"full_ns\":{d},\"seek_ns\":{d},\"full_packets\":{d},\"seek_packets\":{d},\"first_packet\":{d},\"bootstrap_bytes\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, first, count, full_ns, seek_ns, full_stats.packets_decoded, seek_stats.packets_decoded, seek_stats.first_packet, seek_stats.bootstrap_bytes });
         try out.flush();
     }
 }

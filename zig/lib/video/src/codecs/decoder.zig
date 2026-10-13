@@ -32,6 +32,21 @@ pub const Frame = frame.Frame;
 pub const Batch = frame.Batch;
 pub const Codec = enum { vp9, av1 };
 pub const Av1Framing = enum { low_overhead, annex_b };
+/// Selection applies to native visible-output ordinals within one coded packet.
+/// Every coded part and output is still reconstructed, validated and drained.
+pub const OutputSelection = union(enum) {
+    all,
+    none,
+    indexes: []const usize,
+    fn contains(self: @This(), index: usize) bool {
+        return switch (self) {
+            .all => true,
+            .none => false,
+            .indexes => |ids| std.mem.indexOfScalar(usize, ids, index) != null,
+        };
+    }
+};
+pub const OutputStats = struct { native_outputs: usize = 0, skipped_outputs: usize = 0, copied_bytes: u64 = 0 };
 pub const Options = struct {
     av1_framing: Av1Framing = .low_overhead,
     av1_operating_point: u5 = 0,
@@ -59,6 +74,7 @@ pub const Session = struct {
     vp9_context: vp9.vpx_codec_ctx_t = .{},
     vp9_config: vp9.vpx_codec_dec_cfg_t = .{ .threads = 1 },
     references: header.References = @splat(null),
+    output_stats: OutputStats = .{},
     failed: bool = false,
     webm_initialized: bool = false,
     pub fn create(allocator: std.mem.Allocator, codec: Codec, options: Options) !*Session {
@@ -107,10 +123,20 @@ pub const Session = struct {
         self.vp9_context = .{};
     }
     pub fn decode(self: *Session, packet: []const u8, pts_ns: i64, duration_ns: ?u64) !Batch {
+        return self.decodeOutputs(packet, pts_ns, duration_ns, .all);
+    }
+    /// Skipping materialization never skips entropy decoding or reference updates.
+    /// Output byte limits apply to retained frames; native-output count limits
+    /// apply equally to selected and skipped pictures. Preflight is retryable.
+    pub fn decodeOutputs(self: *Session, packet: []const u8, pts_ns: i64, duration_ns: ?u64, selection: OutputSelection) !Batch {
         try self.options.control.check();
         if (self.failed) return error.InvalidDecoderSession;
         if (packet.len == 0) return error.InvalidVideoData;
         if (packet.len > self.options.max_packet_bytes or packet.len > std.math.maxInt(c_uint)) return error.ResourceLimitExceeded;
+        if (selection == .indexes) {
+            if (selection.indexes.len > self.options.max_output_frames) return error.ResourceLimitExceeded;
+            for (selection.indexes) |id| if (id >= self.options.max_output_frames) return error.InvalidPacketIndex;
+        }
         var parts: header.Parts = .{};
         var references = self.references;
         var normalized: ?annex_b.Units = null;
@@ -138,6 +164,7 @@ pub const Session = struct {
             frames.deinit();
         }
         var output_bytes: usize = 0;
+        var output_count: usize = 0;
         const scope = runtime.Scope.enter(&self.owner);
         defer scope.deinit();
         errdefer {
@@ -175,8 +202,16 @@ pub const Session = struct {
                     const v = if (picture.p.layout == 0) y else picture.data[2] orelse return error.InvalidVideoData;
                     const seq = picture.seq_hdr.*;
                     if (self.options.av1_operating_point >= seq.num_operating_points) return error.InvalidDecodeOptions;
+                    _ = try frame.validateLayout(@intCast(picture.p.w), @intCast(picture.p.h), @intCast(picture.p.bpc), @intCast(picture.p.layout), .{ @intCast(picture.stride[0]), @intCast(picture.stride[1]), @intCast(picture.stride[1]) });
+                    const output_index = try self.observeOutput(&output_count);
+                    if (!selection.contains(output_index)) {
+                        self.output_stats.skipped_outputs +|= 1;
+                        continue;
+                    }
                     var copy = try frame.copy(self.allocator, self.options.admission_pool, @intCast(picture.p.w), @intCast(picture.p.h), @intCast(picture.p.bpc), @intCast(picture.p.layout), .{ .full_range = seq.color_range != 0, .primaries = @intCast(seq.pri), .transfer = @intCast(seq.trc), .matrix = @intCast(seq.mtrx) }, .{ @ptrCast(y), @ptrCast(u), @ptrCast(v) }, .{ @intCast(picture.stride[0]), @intCast(picture.stride[1]), @intCast(picture.stride[1]) }, self.options.max_output_bytes - output_bytes);
                     errdefer copy.deinit();
+                    copy.output_index = output_index;
+                    self.output_stats.copied_bytes +|= copy.bytes.len;
                     try self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns);
                 }
             },
@@ -191,6 +226,12 @@ pub const Session = struct {
                     if (picture == null) break;
                     const p = picture.*;
                     if (p.stride[0] < 0 or p.stride[1] < 0 or p.stride[2] < 0 or p.x_chroma_shift > 1 or p.y_chroma_shift > 1 or (p.x_chroma_shift == 0 and p.y_chroma_shift != 0)) return error.UnsupportedVideoProfile;
+                    _ = try frame.validateLayout(p.d_w, p.d_h, @intCast(p.bit_depth), if (p.x_chroma_shift == 0) 3 else if (p.y_chroma_shift == 0) 2 else 1, .{ @intCast(p.stride[0]), @intCast(p.stride[1]), @intCast(p.stride[2]) });
+                    const output_index = try self.observeOutput(&output_count);
+                    if (!selection.contains(output_index)) {
+                        self.output_stats.skipped_outputs +|= 1;
+                        continue;
+                    }
                     var copy = try frame.copy(self.allocator, self.options.admission_pool, p.d_w, p.d_h, @intCast(p.bit_depth), if (p.x_chroma_shift == 0) 3 else if (p.y_chroma_shift == 0) 2 else 1, .{ .full_range = p.range != 0, .matrix = switch (p.cs) {
                         1, 3 => 6,
                         2 => 1,
@@ -200,6 +241,8 @@ pub const Session = struct {
                         else => 2,
                     } }, .{ p.planes[0], p.planes[1], p.planes[2] }, .{ @intCast(p.stride[0]), @intCast(p.stride[1]), @intCast(p.stride[2]) }, self.options.max_output_bytes - output_bytes);
                     errdefer copy.deinit();
+                    copy.output_index = output_index;
+                    self.output_stats.copied_bytes +|= copy.bytes.len;
                     try self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns);
                 }
             },
@@ -207,7 +250,14 @@ pub const Session = struct {
         try self.owner.result();
         try self.options.control.check();
         self.references = references;
-        return .{ .allocator = self.allocator, .frames = try frames.toOwnedSlice() };
+        return .{ .allocator = self.allocator, .frames = try frames.toOwnedSlice(), .output_count = output_count };
+    }
+    fn observeOutput(self: *Session, count: *usize) !usize {
+        if (count.* >= self.options.max_output_frames) return error.ResourceLimitExceeded;
+        const index = count.*;
+        count.* += 1;
+        self.output_stats.native_outputs +|= 1;
+        return index;
     }
     fn append(self: *Session, frames: *std.array_list.Managed(Frame), copy: *Frame, bytes: *usize, pts: i64, duration: ?u64) !void {
         if (frames.items.len >= self.options.max_output_frames) return error.ResourceLimitExceeded;

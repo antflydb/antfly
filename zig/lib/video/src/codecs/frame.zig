@@ -30,6 +30,8 @@ pub const Frame = struct {
     pts_ns: i64,
     duration_ns: ?u64,
     decode_high_water: usize,
+    /// Ordinal among this packet's native visible outputs, including skipped ones.
+    output_index: usize = 0,
     reservation: media.admission.Token = .{},
     pub fn deinit(self: *Frame) void {
         self.allocator.free(self.bytes);
@@ -47,6 +49,8 @@ pub const Frame = struct {
 pub const Batch = struct {
     allocator: std.mem.Allocator,
     frames: []Frame,
+    /// Native visible outputs drained, including outputs not materialized.
+    output_count: usize = 0,
     pub fn deinit(self: *Batch) void {
         for (self.frames) |*frame| frame.deinit();
         self.allocator.free(self.frames);
@@ -70,21 +74,27 @@ fn interleave(comptime T: type, out: []u8, u: []const u8, v: []const u8, samples
         @memcpy(out[(2 * i + 1) * n ..][0..n], v[i * n ..][0..n]);
     }
 }
-pub fn copy(allocator: std.mem.Allocator, pool: ?*media.admission.Pool, width: u32, height: u32, depth: u8, chroma: u8, color: Color, planes: [3][*]const u8, strides: [3]usize, limit: usize) !Frame {
+pub fn validateLayout(width: u32, height: u32, depth: u8, chroma: u8, strides: [3]usize) !usize {
     if (width == 0 or height == 0 or width > 16_384 or height > 16_384) return error.ResourceLimitExceeded;
     if ((depth != 8 and depth != 10 and depth != 12) or chroma > 3) return error.UnsupportedVideoProfile;
     const sample: usize = if (depth == 8) 1 else 2;
     const cw: usize = if (chroma == 3) width else (width + 1) / 2;
     const ch: usize = if (chroma >= 2) height else (height + 1) / 2;
+    if (strides[0] < width * sample or (chroma != 0 and (strides[1] < cw * sample or strides[2] < cw * sample))) return error.InvalidVideoData;
+    return @as(usize, width) * height * sample + (if (chroma == 0) @as(usize, 0) else cw * ch * 2 * sample);
+}
+pub fn copy(allocator: std.mem.Allocator, pool: ?*media.admission.Pool, width: u32, height: u32, depth: u8, chroma: u8, color: Color, planes: [3][*]const u8, strides: [3]usize, limit: usize) !Frame {
+    const total = try validateLayout(width, height, depth, chroma, strides);
+    const sample: usize = if (depth == 8) 1 else 2;
+    const cw: usize = if (chroma == 3) width else (width + 1) / 2;
+    const ch: usize = if (chroma >= 2) height else (height + 1) / 2;
     const y_size = @as(usize, width) * height * sample;
-    const uv_size = if (chroma == 0) 0 else cw * ch * 2 * sample;
-    const total = y_size + uv_size;
+
     if (total > limit) return error.ResourceLimitExceeded;
     var reservation = if (pool) |p| try p.acquire(.{ .host_bytes = total }) else media.admission.Token{};
     errdefer reservation.deinit();
     const bytes = try allocator.alloc(u8, total);
     errdefer allocator.free(bytes);
-    if (strides[0] < width * sample or (chroma != 0 and (strides[1] < cw * sample or strides[2] < cw * sample))) return error.InvalidVideoData;
     for (0..height) |y| @memcpy(bytes[y * width * sample ..][0 .. width * sample], planes[0][y * strides[0] ..][0 .. width * sample]);
     if (chroma != 0) for (0..ch) |y| {
         const out = bytes[y_size + y * cw * 2 * sample ..][0 .. cw * 2 * sample];

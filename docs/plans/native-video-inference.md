@@ -1457,3 +1457,23 @@ actual Linux ARM64 pass 142 media and nine HTTP tests, including allocation
 failure, shared denial and forced-copy overlap checks.
 
 See [qualification receipts](../../zig/lib/media/testdata/index-admission-validation/README.md).
+
+
+### Materialize only selected VP9/AV1 outputs
+
+Selected WebM replay now reconstructs and drains every dependency while copying
+only requested visible outputs. `Session.decodeOutputs` reports every native
+output count and preserves per-packet ordinals on owned frames. Superframes,
+scalable layers and container-invisible packets retain logical identity and
+reference state. Native output-count limits bound skipped pictures too; owned
+output-byte limits charge selected frames. Full materialization remains the
+differential oracle. Corruption and cancellation retain fail-closed cleanup.
+
+Matched real Sintel replay preserves selected pixels, metadata and packet counts
+on macOS and actual Linux ARM64. Output copies fall from 209.7 MB to 19.7 MB at
+480p and from 298.6 MB to 99.5 MB at 1080p. These are copied bytes, not RSS or a
+full-pipeline throughput claim. Fresh pretrained CPU/Metal WebM vectors and
+retrieval gates pass against pinned PyTorch. The original non-CUDA scope remains
+active; this does not add incremental live AVC validation or projection reuse.
+
+See [qualification receipts](../../zig/lib/video/testdata/selected-output-validation/README.md).
