@@ -3244,3 +3244,90 @@ representative archive latency or cloud request-count improvements. The storage
 format migrations and broader accepted vector/hybrid shapes remain outstanding
 as described above. Required cache GC ran; its 55-second guard stopped the
 unresponsive uv prune after Zig/Go cleanup, preserving active build caches.
+
+### PR #1112: accepted vector delivery and exact cloud retention primitives
+
+Eligible accepted dense, sparse and hybrid requests now use the same late source
+delivery admission as published requests. An overlay no longer forces a hybrid
+text component onto whole-corpus composition. The text component can use bounded
+recent/archive windows, while vector components retain their existing coherent,
+exact-WAL-cut recent generation jobs. Recent vectors still require readiness;
+this change does not substitute archive-only vector results during rebuilding.
+Source-dependent hierarchy shapes retain their existing fallback.
+
+The independently written 67-file Iceberg fixture now covers text, dense, sparse
+and combined dense/sparse hybrid requests. Replacement vectors use different
+coordinates from their archive images. Tests verify recent vector ranking,
+exclusion of stale replacement vectors, indexed archive/recent filters, narrow
+projection with hidden-field highlights, and identical retained results after
+restart. Retained vector requests use their own vector-qualified cut: a text-only
+cut that captured no recent vector declarations cannot acquire those declarations
+by using a later live WAL cut. Such a request remains readiness-gated.
+
+The provider interface now distinguishes exact-generation evidence from
+current-name protection:
+
+- S3 `GetObjectRetention` explicitly selects a non-null version and accepts only
+  `COMPLIANCE` retention. Governance mode and revocable holds cannot provide this
+  evidence. A contradictory response version declines evidence.
+- GCS metadata explicitly selects a positive generation, checks the returned
+  name/generation, and accepts only `retention.mode = Locked`. Ordinary bucket
+  retention observations are not silently promoted to this stronger contract.
+- Both require provider `Date`, parse expiry conservatively, and decline expired,
+  missing or malformed evidence. The provider clock upper bound charges HTTP
+  Date's whole-second precision and the complete request round trip. A fresh
+  clock probe is available independently of per-object retention reads; callers
+  must account for subsequent elapsed time and operation deadlines.
+- All three GCS upload paths now return their exact generation in `PutResult`,
+  including resumable uploads. Allocation-failure coverage verifies ownership.
+- Explicit generation reads reject contradictory response identities. S3 retains
+  the explicit selector when a compatible endpoint omits its version header.
+
+These are read-only capabilities. They do not change retention policies, enable
+cloud closure audit bypasses, or assert that R2 enforces S3 Object Lock. Existing
+complete cloud closure audits remain authoritative. Protocol qualification uses
+scripted transports; the two real-provider integration tests remain opt-in.
+
+The durable publication migration remains necessary before these primitives can
+produce cloud serving-closure certificates. In particular:
+
+1. A publication must authenticate a bounded, paged artifact-to-provider-generation
+   lookup, including exact generations for lookup pages themselves. Plain mutable
+   sidecars or a process-local verification cache cannot provide restart safety.
+2. Incremental publication must reuse sealed historical lookup roots and bound
+   new records by changed uploads. Any per-attempt inventory must close before
+   sealing; late uploads cannot become silently protected by its certificate.
+3. Query-local readers must bind the publication's lookup before selection,
+   directory loads, ranges and cache misses. Shared mutable store owners cannot
+   be rebound between concurrent readers. Recent generations and retained cuts
+   need their own authenticated bindings and lifetime protection.
+4. GC must retain lookup pages and exact generations through publication,
+   checkpoint, builder and reader authority, then retire the selected generations.
+   Deleting the current name or listing only live names is insufficient.
+5. A durable certificate must be authenticated by the publication, bind backend
+   identity and the entire generation-qualified closure, and expire at the
+   earliest witnessed retention time. Reuse requires a fresh provider-clock
+   observation. Unsupported evidence, errors or expiry retain the complete audit.
+
+Cross-source-file serving packs remain a separate unfinished format migration,
+with the physical spans, ownership, tie-ordering and qualification requirements
+specified above. The accepted-delivery change and provider primitives do not
+implement that migration.
+
+Qualification for source `71c4c36307` (accepted delivery `92b4e6a8a8`), still
+including main `f3fd4d3525`:
+
+- Final Debug server build: 48/48 steps; Debug lake integration: 156 shared plus
+  249 API tests (405 total); public HTTP: 33 tests, all without failures/leaks.
+- Provider suite: 89 tests pass in Debug and ReleaseFast; two opt-in live-provider
+  tests skip. Focused lake frontier/window suite: 13 pass in both build modes.
+- Final copied Debug server: all 11 Iceberg-module cases plus the wide-source
+  transform dependency fixture pass (12 E2Es total, 236 seconds).
+- Embedded boundary: 872 sources; Apache product boundary: 2,030 sources.
+  Changed Zig/Python formatting, unresolved-name checks and diff checks pass.
+- Latest fetch confirms main remains merged. Required cache GC completed Zig/Go
+  cleanup and skipped active caches; the 55-second watchdog stopped uv prune.
+
+These checks qualify the implemented delivery and provider contracts. They do
+not qualify live-provider retention enforcement or complete either persisted
+format migration identified above.
