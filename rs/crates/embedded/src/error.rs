@@ -55,7 +55,7 @@ pub enum Error {
     /// diagnostics and repair or reopen the database.
     Stalled,
     /// The operation was cancelled, including a pending replacement or a
-    /// progress/stream callback returning `false`.
+    /// progress/stream callback returning `false`, or an IO interruption.
     Cancelled,
     /// A replacement exhausted its consecutive or lifetime retry budget,
     /// or encountered a permanent error. Inspect its pending-work diagnostics.

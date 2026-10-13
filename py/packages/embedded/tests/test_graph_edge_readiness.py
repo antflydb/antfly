@@ -1317,3 +1317,54 @@ def test_replacement_wait_observes_cancellation(tmp_path, storage):
             with pytest.raises(antfly_embedded.CancelledError):
                 waiter.result(timeout=10)
         assert "old" in {i["name"] for i in db.list_indexes()}
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("finish", ["cancel", "swap"])
+def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, finish):
+    path = tmp_path / ("named-fence.aflite" if storage == antfly_embedded.Storage.LITE else "named-fence")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with _open_graph_test(path, options) as db:
+        db.create_table("source", {})
+        with db.open_table("source") as table:
+            table.add_index(graph)
+            table.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+            db.run_until_idle()
+            with pytest.raises(antfly_embedded.BusyError):
+                table.add_index(dict(graph, name="new", replaces="old", wait={"timeout_ms": 0}))
+            assert table.capabilities()["minimum_reader_version"] == 2
+            assert db.capabilities()["minimum_reader_version"] == 2
+            if finish == "cancel":
+                assert table.cancel_replacement("new")
+            else:
+                db.run_until_idle()
+            assert table.capabilities()["minimum_reader_version"] == 1
+            assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+        with db.open_table("source") as table:
+            assert table.capabilities()["minimum_reader_version"] == 1
+            names = {i["name"] for i in table.list_indexes()}
+            assert names & {"old", "new"} == {"old" if finish == "cancel" else "new"}
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
+    path = tmp_path / ("aggregate-fence.aflite" if storage == antfly_embedded.Storage.LITE else "aggregate-fence")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with _open_graph_test(path, options) as db:
+        db.create_table("source", {})
+        db.add_index(graph)
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+        db.run_until_idle()
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(graph, name="new", replaces="old", wait={"timeout_ms": 0}))
+        with db.open_table("source") as table:
+            table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
+        assert db.cancel_replacement("new")
+        assert db.capabilities()["minimum_reader_version"] == 2
+    with _open_graph_test(path, options) as db:
+        # Permanent aggregation is durable, even before opening the child.
+        assert db.capabilities()["minimum_reader_version"] == 2

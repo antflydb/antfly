@@ -11983,7 +11983,7 @@ pub const IndexManager = struct {
         var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
         while (row) |kv| : (row = try cursor.next()) {
             if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
-            try jobs.append(arena.allocator(), try std.json.parseFromSliceLeaky(GraphReplacementBuild, arena.allocator(), kv.value, .{ .allocate = .alloc_always }));
+            try jobs.append(arena.allocator(), try std.json.parseFromSliceLeaky(GraphReplacementBuild, arena.allocator(), kv.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }));
         }
         const owner = try alloc.create(std.heap.ArenaAllocator);
         owner.* = arena;
@@ -12037,6 +12037,31 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn requireReplacementGenerationOwnership(self: *IndexManager, txn: anytype, job: GraphReplacementBuild) !void {
+        const cfg = job.config orelse return error.InvalidIndexConfig;
+        if (job.generation == 0 or cfg.coverage_generation != job.generation or
+            cfg.kind != .graph or !std.mem.eql(u8, cfg.name, job.name))
+            return error.IndexReplacementConfigurationMismatch;
+        if (self.get(job.name)) |entry| {
+            if (entry.kind != .graph or entry.coverage_generation != job.generation)
+                return error.IndexReplacementConfigurationMismatch;
+        }
+        const raw = txn.get(index_catalog_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const configs = try deserializeCatalog(self.alloc, raw);
+        defer {
+            for (configs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(configs);
+        }
+        for (configs) |entry| {
+            if (std.mem.eql(u8, entry.name, job.name) and
+                (entry.kind != .graph or entry.coverage_generation != job.generation))
+                return error.IndexReplacementConfigurationMismatch;
+        }
+    }
+
     /// Retain only journal records not consumed by a shadow. Each bounded
     /// build/catch-up round advances this pin, allowing ordinary truncation.
     pub fn clampReplayForGraphReplacementBuilds(self: *IndexManager, store: anytype, effective: u64) !u64 {
@@ -12066,7 +12091,7 @@ pub const IndexManager = struct {
             var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
             while (row) |kv| : (row = try cursor.next()) {
                 if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
-                try builds.append(a, .{ .key = try a.dupe(u8, kv.key), .build = try std.json.parseFromSliceLeaky(GraphReplacementBuild, a, kv.value, .{ .allocate = .alloc_always }) });
+                try builds.append(a, .{ .key = try a.dupe(u8, kv.key), .build = try std.json.parseFromSliceLeaky(GraphReplacementBuild, a, kv.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) });
             }
         }
         for (builds.items) |item| {
@@ -22308,6 +22333,14 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        // Failure/cancellation must never retire a generation installed by a
+        // different writer. Check durable ownership too: this manager's serving
+        // catalog can be older than a foreign writer's publication.
+        for (jobs.value) |job| {
+            const retiring_reservation = std.mem.eql(u8, job.name, excluded_name) or
+                (self.get(excluded_name) != null and self.get(job.name) == null and std.mem.eql(u8, job.old, excluded_name));
+            if (retiring_reservation) try self.requireReplacementGenerationOwnership(&txn, job);
+        }
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
@@ -22530,8 +22563,8 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    /// Older writers do not retain shadow replay. Fence them only while
-    /// active shadows exist, preserving the authoritative feature epoch in a
+    /// Older writers do not retain shadow replay or honor reserved names. Fence
+    /// them while any reservation exists, preserving the feature epoch in a
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !u32 {
         const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
@@ -22546,16 +22579,8 @@ pub const IndexManager = struct {
         {
             var cursor = try txn.openCursor();
             defer cursor.close();
-            var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
-            while (row) |kv| : (row = try cursor.next()) {
-                if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
-                const parsed = try std.json.parseFromSlice(struct { phase: []const u8 = "building" }, self.alloc, kv.value, .{ .ignore_unknown_fields = true });
-                defer parsed.deinit();
-                if (!std.mem.eql(u8, parsed.value.phase, "failed")) {
-                    pending = true;
-                    break;
-                }
-            }
+            if (try cursor.seekAtOrAfter(graph_replacement_build_prefix)) |kv|
+                pending = std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix);
         }
         const version = if (pending) @max(authoritative, 2) else authoritative;
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
@@ -22574,6 +22599,55 @@ pub const IndexManager = struct {
             try txn.put(replacement_reader_base_key, if (authoritative == 1) "1" else "2");
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
         return version;
+    }
+
+    /// Permanent requirements exclude a temporary reservation fence. Parent
+    /// tables must aggregate this baseline, never the effective reader version.
+    pub fn authoritativeReaderVersion(self: *IndexManager, store: anytype) !u32 {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        return readAuthoritativeReaderVersion(&txn);
+    }
+
+    fn readAuthoritativeReaderVersion(txn: anytype) !u32 {
+        const raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+            error.NotFound => return resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version),
+            else => return err,
+        };
+        const version = try std.fmt.parseInt(u32, raw, 10);
+        if (version > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
+        return version;
+    }
+
+    /// Merge a child's permanent format requirement without turning our own
+    /// temporary fence into a permanent epoch, or losing the child's upgrade
+    /// when our last reservation is removed.
+    pub fn aggregateAuthoritativeReaderVersion(self: *IndexManager, store: anytype, required: u32) !void {
+        if (required == 1) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        const previous = try readAuthoritativeReaderVersion(&txn);
+        if (required <= previous) {
+            txn.abort();
+            return;
+        }
+        if (required > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
+        const current = try resolver_catalog.readMinimumReaderVersion(&txn, resolver_catalog.supported_reader_version);
+        const fenced = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (fenced != null) try txn.put(replacement_reader_base_key, if (required == 1) "1" else "2");
+        const version = @max(current, required);
+        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else "2");
+        try txn.commit();
+        self.minimum_reader_version.store(version, .release);
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
@@ -47665,4 +47739,88 @@ test "capi resolver routing dependencies include overlapping artifact scopes" {
             try std.testing.expect(!manager.routingChangedByRetirement(unrelated, &.{"people"}));
         }
     }
+}
+
+test "capi resolver failed reservation keeps its fence and rejects foreign generation cancellation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = config });
+    var prepared = try manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = config }, 0);
+    defer prepared.deinit(a);
+    {
+        const jobs = try manager.graphReplacementBuildsAlloc(&store, a);
+        defer jobs.deinit();
+        var failed = jobs.value[0];
+        failed.phase = .failed;
+        failed.last_error = "InvalidGraphArtifact";
+        try manager.failGraphReplacement(&store, failed);
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 1));
+        try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice([]resolver_catalog.ResolverConfig, a, try read.get(resolver_catalog_key), .{}));
+    }
+    // Intermediate builds may have persisted additional checkpoint fields.
+    // Both status discovery and crash recovery must tolerate those fields.
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        const marker = graph_replacement_build_prefix ++ "new";
+        const raw = try write.get(marker);
+        const extended = try std.fmt.allocPrint(a, "{s},\"previous_checkpoint_hint\":17}}", .{raw[0 .. raw.len - 1]});
+        defer a.free(extended);
+        try write.put(marker, extended);
+        try write.commit();
+    }
+    try manager.recoverGraphReplacementBuilds(&store);
+    try std.testing.expectEqual(@as(u64, 999), try manager.clampReplayForGraphReplacementBuilds(&store, 999));
+    // Model a legacy writer ignoring the reservation and publishing another
+    // generation. Keep manager stale to prove the check reads durable authority.
+    var foreign = try IndexManager.init(a, path);
+    defer foreign.deinit();
+    foreign.status_only_index_configs = try a.alloc(types.IndexConfig, 2);
+    foreign.status_only_index_configs[0] = try types.IndexConfig.clone(a, manager.get("old").?.*);
+    foreign.status_only_index_configs[1] = try types.IndexConfig.clone(a, .{ .name = "new", .kind = .graph, .config_json = config, .coverage_generation = prepared.coverage_generation + 1 });
+    const encoded = try serializeCatalog(a, &foreign);
+    defer a.free(encoded);
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(index_catalog_key, encoded);
+        try write.commit();
+    }
+    try std.testing.expect(manager.get("new") == null);
+    try std.testing.expectError(error.IndexReplacementConfigurationMismatch, manager.cancelGraphReplacement(&store, "new"));
+    // Implicit cancellation when deleting the old serving index is protected too.
+    try std.testing.expectError(error.IndexReplacementConfigurationMismatch, manager.remove(&store, "old"));
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualStrings(encoded, try read.get(index_catalog_key));
+    }
+    const remaining = try manager.graphReplacementBuildsAlloc(&store, a);
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(usize, 1), remaining.value.len);
+    try std.testing.expectEqual(.failed, remaining.value[0].phase);
+    // Remove the simulated foreign publication; cancellation now owns all
+    // affected generations and can safely remove the temporary fence.
+    const original = try serializeCatalog(a, &manager);
+    defer a.free(original);
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(index_catalog_key, original);
+        try write.commit();
+    }
+    try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+    try std.testing.expectEqual(@as(u32, 1), manager.minimum_reader_version.load(.acquire));
 }

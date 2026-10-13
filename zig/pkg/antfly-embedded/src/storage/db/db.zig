@@ -27496,9 +27496,9 @@ pub const DB = struct {
             // larger than 1024 can advance its durable checkpoint; it never
             // throws completed work away waiting for an initially small gap.
             while (candidate.sequence < target and db.graphReplacementWorkNow() < deadline) {
-                // Coalesce whole journal windows first: a hot document is
-                // reconstructed once even if it changed thousands of times.
-                // An interrupted large entry still uses its durable ordinal.
+                // Coalesce windows of at most 32 unique sources. Larger
+                // windows use per-entry batches and can revisit hot documents;
+                // an interrupted entry resumes at its durable source ordinal.
                 var next = candidate.sequence;
                 if (candidate.tail_source_cursor == 0)
                     next = try db.catchUpGraphReplacement(candidate.manager, cfg.name, candidate.sequence, target, 1024, deadline);
@@ -27770,6 +27770,10 @@ pub const DB = struct {
             var saved = original;
             const retry_now = self.replacementRetryNow();
             if (saved.retry_after_ns > retry_now +| replacement_max_backoff_ns) {
+                // Clock correction is local maintenance, not a replicated
+                // command. Leave queued jobs untouched when writes are denied
+                // or source authority requires ordered application.
+                if (!try self.canRunLocalGraphEndpointCleanup()) continue;
                 // Persist the correction once. Taking min(now + limit) only
                 // in memory on every poll would slide the deadline forever.
                 var owner = self.acquireReplicationMutationShared();
@@ -136360,25 +136364,20 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
     defer arena.deinit();
     var rows: std.ArrayList(types.BatchWrite) = .empty;
     for (0..128) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[]}" });
-    try db.batch(.{ .writes = rows.items });
-    var private = try index_manager_mod.IndexManager.initWithOptions(a, db.core.index_manager.base_path, db.index_backends);
-    defer private.deinit();
-    private.source_payload_store = db.core.index_manager.source_payload_store;
-    private.setIo(db.backend_runtime.io());
-    const cfg = job.config.?;
-    try private.registerReplacementIndex(db.core.store, cfg);
-    var prepared = DB.PreparedGraphReplacement{ .manager = &private, .sequence = job.applied_sequence, .activation_attempts = 8 };
-    defer if (prepared.entry) |*entry| private.destroyDetachedReplacementIndex(entry);
     const Check = struct {
         var database: *DB = undefined;
+        var writes: []const types.BatchWrite = &.{};
         var started: std.Io.Event = .unset;
         var done: std.Io.Event = .unset;
+        var thread: ?std.Thread = null;
         var failed: bool = false;
         var batches: usize = 0;
         var late_batch: bool = false;
+        var started_ns: u64 = 0;
         var finished_ns: u64 = 0;
         fn writer() void {
             const io = database.core.index_manager.checkpointIo();
+            started_ns = monotonicTimeNs();
             started.set(io);
             database.batch(.{ .writes = &.{.{ .key = "writer", .value = "{\"links\":[]}" }} }) catch {
                 failed = true;
@@ -136386,46 +136385,55 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
             finished_ns = monotonicTimeNs();
             done.set(io);
         }
+        fn activate(db_to_activate: *DB) anyerror!void {
+            // Introduce the tail after unlocked catch-up, immediately before
+            // the real addIndexForReconciliation activation acquires apply.
+            try db_to_activate.batch(.{ .writes = writes });
+        }
         fn batch(_: *DB, _: usize) void {
+            const io = database.core.index_manager.checkpointIo();
+            if (thread == null) {
+                thread = std.Thread.spawn(.{}, writer, .{}) catch @panic("spawn");
+                started.waitUncancelable(io);
+            }
+            if (done.isSet()) @panic("writer escaped production activation gate");
             late_batch = late_batch or DB.test_graph_replacement_work_now_ns.? >= 11 * std.time.ns_per_s;
             batches += 1;
             DB.test_graph_replacement_work_now_ns.? += 400 * std.time.ns_per_ms;
         }
     };
     Check.database = &db;
+    Check.writes = rows.items;
     Check.started = .unset;
     Check.done = .unset;
+    Check.thread = null;
     Check.failed = false;
     Check.batches = 0;
     Check.late_batch = false;
     DB.test_graph_replacement_work_now_ns = 10 * std.time.ns_per_s;
     defer DB.test_graph_replacement_work_now_ns = null;
+    DB.test_graph_replacement_before_activation = Check.activate;
+    defer DB.test_graph_replacement_before_activation = null;
     DB.test_graph_replacement_tail_batch = Check.batch;
     defer DB.test_graph_replacement_tail_batch = null;
+    defer if (Check.thread) |worker| worker.join();
+    try std.testing.expect(try db.advanceGraphReplacement());
     const io = db.core.index_manager.checkpointIo();
-    var thread: ?std.Thread = null;
-    defer if (thread) |worker| worker.join();
-    const started_ns = monotonicTimeNs();
-    {
-        db.core.lockApply();
-        defer db.core.unlockApply();
-        thread = try std.Thread.spawn(.{}, Check.writer, .{});
-        try Check.started.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
-        try std.testing.expectError(error.Busy, prepared.finish(&db, cfg));
-        try std.testing.expect(!Check.done.isSet());
-    }
-    try Check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
-    thread.?.join();
-    thread = null;
+    try Check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1500), .clock = .awake } });
+    Check.thread.?.join();
+    Check.thread = null;
     try std.testing.expect(!Check.failed);
-    try std.testing.expect(Check.finished_ns - started_ns < 2 * std.time.ns_per_s);
+    try std.testing.expect(Check.finished_ns - Check.started_ns < 1500 * std.time.ns_per_ms);
+    // A controlled work clock proves the actual escalation uses a 1 s budget,
+    // with one in-flight 400 ms batch permitted to overrun. No test-owned apply
+    // lock determines either the writer's release or the activation deadline.
     try std.testing.expectEqual(@as(usize, 3), Check.batches);
     try std.testing.expect(!Check.late_batch);
-    try std.testing.expectEqual(@as(usize, 96), prepared.tail_source_cursor);
-    try std.testing.expectEqual(job.applied_sequence, prepared.sequence);
+    try std.testing.expectEqual(@as(u64, 11_200 * std.time.ns_per_ms), DB.test_graph_replacement_work_now_ns.?);
     const progress = try db.graphReplacementStatusAlloc(a);
     defer progress.deinit();
     try std.testing.expectEqual(@as(usize, 96), progress.value[0].tail_source_cursor);
+    try std.testing.expectEqual(job.applied_sequence, progress.value[0].applied_sequence);
     try std.testing.expect(db.graphReplacementCommitted("old"));
     try std.testing.expect(!db.graphReplacementCommitted("new"));
 }
@@ -136471,4 +136479,43 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     try db.runUntilIdle();
     try db.waitGraphReplacement("new", 0);
     try std.testing.expectEqual(@as(f64, 0.4), db.core.index_manager.getResolver("concepts").?.min_confidence);
+}
+
+test "capi resolver replacement clock clamp skips denied and ordered writes" {
+    const a = std.testing.allocator;
+    for (0..3) |mode| {
+        var directory = try TestDirectory.init("replacement-clamp-gate");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+        defer db.close();
+        const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+        try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+        DB.test_graph_replacement_retry_now_ns = 50 * std.time.ns_per_s;
+        defer DB.test_graph_replacement_retry_now_ns = null;
+        const future = db.replacementRetryNow() + 9 * std.time.ns_per_hour;
+        {
+            const jobs = try db.graphReplacementStatusAlloc(a);
+            defer jobs.deinit();
+            var job = jobs.value[0];
+            job.retry_after_ns = future;
+            try db.core.index_manager.saveGraphReplacementBuild(db.core.store, job);
+        }
+        const Gate = struct {
+            fn deny(_: *const anyopaque) anyerror!void {
+                return error.NotLeader;
+            }
+        };
+        if (mode < 2) {
+            db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &mode, .check_fn = Gate.deny, .allows_background_work = mode == 0 } };
+        } else {
+            try graphTestApplyOrdered(&db, .{ .writes = &.{.{ .key = "replicated", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+        }
+        try std.testing.expect(try db.advanceGraphReplacement());
+        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", 2));
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        try std.testing.expectEqual(future, jobs.value[0].retry_after_ns);
+        try std.testing.expectEqual(@as(u32, 0), jobs.value[0].total_retry_count);
+    }
 }

@@ -150,18 +150,13 @@ fn persist(handle: *h.Handle) !void {
 
 pub fn noteReaderVersion(handle: *h.Handle) !void {
     const root = handle.parent_handle orelse handle;
-    const version = handle.database().core.index_manager.minimum_reader_version.load(.acquire);
-    const previous = root.db.core.index_manager.minimum_reader_version.load(.acquire);
-    if (version <= previous) return;
-    // Aggregate only actual format requirements in separate metadata; the
-    // longstanding table catalog wire shape stays readable by older readers.
-    var write = try root.db.core.store.beginWriteTxn();
-    errdefer write.abort();
-    const value = try std.fmt.allocPrint(root.alloc, "{d}", .{version});
-    defer root.alloc.free(value);
-    try write.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, value);
-    try write.commit();
-    root.db.core.index_manager.minimum_reader_version.store(version, .release);
+    if (root == handle) return;
+    const database = handle.database();
+    const version = try database.core.index_manager.authoritativeReaderVersion(database.core.store);
+    // Temporary fences belong to the child's reservation. Status combines the
+    // effective versions of loaded tables; only permanent format requirements
+    // are stamped into the root. Preserve a root reservation's baseline too.
+    try root.db.core.index_manager.aggregateAuthoritativeReaderVersion(root.db.core.store, version);
 }
 
 pub fn requireDatabase(handle: *h.Handle) !void {

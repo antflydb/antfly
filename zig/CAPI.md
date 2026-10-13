@@ -559,9 +559,21 @@ Pending replacements temporarily require reader version 2, because an older
 writer's journal cleanup does not honor shadow retention. Registration publishes
 this fence and a versioned resolver envelope with the build marker. Libraries
 that predate the epoch key reject that envelope through their strict parser;
-already-open Lite writers encounter it when refreshing their connection. Swap, cancellation and terminal failure remove
-the temporary fence with their catalog transaction once no active shadows remain.
+already-open Lite writers encounter it when refreshing their connection. Failed
+jobs release replay retention but keep their reservation fence until cancellation.
+Swap and cancellation remove the temporary fence in their catalog transaction
+once no reservations remain. Cancellation rejects a foreign serving generation
+with `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`, leaving the catalog and job intact.
 A separate baseline preserves any permanent reader requirement from resolver
-features; a plain completed replacement returns to version 1. This also excludes
+features; a plain completed replacement returns to version 1. Named tables
+aggregate permanent requirements into the root baseline; temporary child fences
+never become permanent root requirements. This also excludes
 older read-only handles during the build, since older libraries do not distinguish
 reader and writer compatibility epochs.
+
+In-process writers block on the apply lock during replacement activation: the
+ordinary work budget is 100 ms, escalating to about 1 s after eight attempts.
+The current batch and durability checkpoint may overrun that cooperative budget.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.

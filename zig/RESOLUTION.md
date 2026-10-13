@@ -1125,7 +1125,9 @@ increases to at most one second, still capped by an explicit wait deadline.
 Escalation always has a finite deadline: it yields and persists its cursor when
 that budget expires. A current batch (up to 32 sources), storage operation or
 fsync may overrun the cooperative budget, so this is not a hard wall-clock bound
-on writer latency. Sustained producers can require further bounded rounds; the
+on writer latency. In-process writers block on the apply lock for up to about
+one second during escalation, plus any in-flight batch and durability checkpoint.
+Sustained producers can require further bounded rounds; the
 old index keeps serving until the atomic swap. `activation_attempts` persists
 across reopen and is reported with replacement progress.
 Cutover coalesces windows containing at most 32 unique sources. Larger windows
@@ -1152,12 +1154,17 @@ races completion, inspect the index/job state. Storage/admission errors propagat
 its control IO rather than spinning. Replacement precondition errors have distinct
 codes in C, Python, Go and Rust: `ANTFLY_REPLACEMENT_FAILED`,
 `ANTFLY_REPLACEMENT_PENDING` and `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.
 A pending plain replacement temporarily raises the minimum reader version to 2
 and publishes a versioned resolver envelope. The envelope fences pre-epoch
 writers whose replay cleanup ignores shadow retention, including already-open
-Lite writers when they refresh before mutation or maintenance. Once the last
-active shadow swaps, fails or is cancelled, its catalog transaction removes the
-temporary fence. A separate baseline preserves permanent resolver-feature
+Lite writers when they refresh before mutation or maintenance. Failure releases replay retention but retains the name reservation and its
+compatibility fence. Once the last reservation swaps or is cancelled, its
+catalog transaction removes the temporary fence. Cancellation validates both
+in-memory and durable generation ownership before retiring anything; a foreign
+publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
 requirements: a plain completed replacement returns to version 1, while actual
 authoritative resolver features retain version 2.
 Deadline Busy means registration
@@ -1196,8 +1203,12 @@ original table catalog format and reader epoch 1; actual resolver format changes
 stamp the aggregate requirement in separate metadata. Authoritative feature
 epochs remain monotonic; removing a temporary replacement guard restores
 its authoritative baseline. Open loads the lightweight table catalog,
-then opens each table on demand. Named-table catalogs durably summarize the reader
-epoch. Background discovery isolates an unavailable table and reports its error
+then opens each table on demand. Named-table mutations aggregate only permanent
+format requirements into the root's authoritative baseline, including when the
+root itself has a temporary fence. Temporary guards remain scoped to their table
+reservations; status combines the effective cached epochs of loaded tables.
+Cancelling or completing a plain named-table replacement does not permanently
+upgrade the root. Background discovery isolates an unavailable table and reports its error
 in `unavailable_tables`; unrelated root/table reads remain available. Portable
 exports retain the stamp; imports validate it against supported versions and
 catalog requirements before publication. CI checks a real pinned pre-PR reader
