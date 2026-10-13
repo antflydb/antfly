@@ -2139,6 +2139,7 @@ fn tryBackendOwnedGreedyToken(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?i64 {
+    const trace_choices = gpt_config.hasPle() and !gpt_config.usesMoe() and getenvBool("ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES");
     var result = (try tryBackendOwnedGreedyTokenResult(
         cb,
         allocator,
@@ -2147,9 +2148,21 @@ fn tryBackendOwnedGreedyToken(
         token_id,
         seq_len,
         decode_context,
-        false,
+        trace_choices,
     )) orelse return null;
     defer result.deinit(cb);
+    if (trace_choices) {
+        // Read the actual singleton result without recomputing this position
+        // or replacing its KV. Matrix tracing likewise retains free-running
+        // history, unlike the canonical-prefix differential diagnostics.
+        const hidden = result.final_hidden orelse return error.UnexpectedNull;
+        const logits = (try cb.decoderRuntimeApplyLinear(&.{ .slot = finalLmHeadSlot(configured_layer_count), .input = hidden, .in_dim = gpt_config.hidden_size, .out_dim = gpt_config.vocab_size })) orelse return error.UnsupportedBackend;
+        defer cb.free(logits);
+        const values = try cb.toFloat32(logits, allocator);
+        defer allocator.free(values);
+        const summary = try @import("../util/ocr_parity.zig").ocrLogitSummary(values, gpt_config.suppressTokenIds());
+        std.debug.print("ocr-parity-singleton seq={d} input={d} token={d} runner_up={d} margin={e} top_logit={e} runner_up_logit={e} head_matches={}\n", .{ seq_len, token_id, result.token_id, summary.runner_up, summary.margin, values[summary.token], values[summary.runner_up], summary.token == result.token_id });
+    }
     return result.token_id;
 }
 

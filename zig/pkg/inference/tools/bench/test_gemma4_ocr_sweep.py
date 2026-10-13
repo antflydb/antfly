@@ -78,6 +78,18 @@ class SweepTests(unittest.TestCase):
         flags, _, _ = sweep.flags_for("mtp2frame")
         self.assertEqual(flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"], "1")
 
+    def test_post_attention_isolation_and_free_running_trace(self):
+        flags, batch, _ = sweep.flags_for("cohort4w4strict")
+        self.assertEqual(batch, 4)
+        for stage in ["QKV", "BLOCK", "PLE", "TAIL"]:
+            self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_" + stage], "1")
+        flags, _, _ = sweep.flags_for("cohort4w8attn")
+        self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT"], "1")
+        for case in ["singletontrace", "cohort4w4qkvtrace"]:
+            flags, _, _ = sweep.flags_for(case)
+            self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES"], "1")
+            self.assertNotIn("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP", flags)
+
     def test_recommendation_excludes_failed_quality_and_overlapping_ranges(self):
         ordinary = {
             "case": "ordinary",

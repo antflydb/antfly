@@ -65,7 +65,8 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(
-        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall)?", case
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall|attn|block|strict|trace|qkvtrace)?",
+        case,
     )
     if cohort or case in {
         "normoff",
@@ -89,17 +90,23 @@ def flags_for(case):
         if case == "normoff":
             flags["TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"] = "1"
         variant = cohort[3] if cohort else None
-        if variant in {"qkv", "canonical"}:
+        if variant in {"qkv", "canonical", "strict", "qkvtrace"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
-        if variant in {"ple", "canonical", "reduceall"}:
+        if variant in {"ple", "canonical", "reduceall", "strict"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
-        if variant in {"tail", "canonical", "reduceall"}:
+        if variant in {"tail", "canonical", "reduceall", "strict"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
         if variant in {"canonical", "reduce", "reduceall"}:
             flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
         if variant in {"reduce", "reduceall"}:
             flags["TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"] = "1"
             flags["TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH"] = "1"
+        if variant == "attn":
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT"] = "1"
+        if variant in {"block", "strict"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_BLOCK"] = "1"
+        if variant in {"trace", "qkvtrace"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES"] = "1"
         if case in {"reduce", "reduceall"}:
             flags["TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"] = "1"
             flags["TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH"] = "1"
@@ -116,6 +123,8 @@ def flags_for(case):
             flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL"] = "1"
         if case == "stepdiff":
             flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP"] = "1"
+    elif case == "singletontrace":
+        flags["ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES"] = "1"
     elif re.fullmatch(r"mtp[1-4](frame|verify|all|seedreduce)?", case):
         flags.update(
             ANTFLY_GEMMA4_MTP_MULTIMODAL="1",
@@ -370,6 +379,7 @@ def run(args):
             "server_flags": flags,
             "server_command": command,
             "diagnostic": case in {"differential", "stepdiff"}
+            or case.endswith("trace")
             or args.memory_probe is not None,
             "directory": directory.name,
         }

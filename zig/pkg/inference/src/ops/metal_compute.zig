@@ -21284,18 +21284,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         {
             const projection_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .attention_project);
             defer self.endActivePlannedComputeScope(projection_scope);
-            projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                .slot = request.attention_linear_slot,
-                .input = attention_linear_input,
-                .in_dim = attention_input_size,
-                .out_dim = request.hidden_size,
-            })) orelse {
-                if (trace_quant) std.debug.print(
-                    "metal-prefill-staged-null layer={d} reason=attention-output-linear slot={d} in={d} out={d} rows={d} input_device={}\n",
-                    .{ attention_layer_index, request.attention_linear_slot, attention_input_size, request.hidden_size, @as(usize, @intCast(attention_linear_input.dim(0))), attention_linear_input.isDevice() },
-                );
-                return null;
-            };
+            projected = if (request.attention.mode == .paged_decode and request.ple_hidden_size != 0 and attn_out.dim(0) > 1 and getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT"))
+                try ocrRowwisePrepared(@ptrCast(self), self, attention_linear_input, request.attention_linear_slot, attention_input_size, request.hidden_size, null)
+            else
+                (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.attention_linear_slot,
+                    .input = attention_linear_input,
+                    .in_dim = attention_input_size,
+                    .out_dim = request.hidden_size,
+                })) orelse {
+                    if (trace_quant) std.debug.print(
+                        "metal-prefill-staged-null layer={d} reason=attention-output-linear slot={d} in={d} out={d} rows={d} input_device={}\n",
+                        .{ attention_layer_index, request.attention_linear_slot, attention_input_size, request.hidden_size, @as(usize, @intCast(attention_linear_input.dim(0))), attention_linear_input.isDevice() },
+                    );
+                    return null;
+                };
         }
         defer projected.deinit();
         try self.maybeDumpDecodeStageTensor("attn-proj", attention_layer_index, projected, request.hidden_size);
@@ -26631,6 +26634,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return output.retainedCopy();
     }
 
+    // Isolate post-attention arithmetic without replacing attention or its KV
+    // history. The earlier scoped rollbacks left output projection/residual
+    // and several FFN operations in their matrix dispatch regimes.
+    fn ocrRowwiseBlock(ctx: *anyopaque, self: *MetalCompute, request: *const ops.RunGatedDecoderBlockRequest, layer_index: usize, attention: MetalTensor, residual: MetalTensor) !MetalTensor {
+        const rows: usize = @intCast(residual.dim(0));
+        const shape = [_]i32{ @intCast(rows), @intCast(request.hidden_size) };
+        const output_ct = (try allocUninitF32ShapeOp(ctx, &shape)) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, output_ct);
+        for (0..rows) |row| {
+            const h_shape = [_]i32{ 1, @intCast(request.hidden_size) };
+            const a_width = request.num_heads * request.head_dim;
+            const a_shape = [_]i32{ 1, @intCast(a_width) };
+            var h = try residual.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &h_shape);
+            defer h.deinit();
+            var a = try attention.retainedView(row * a_width * @sizeOf(f32), a_width * @sizeOf(f32), &a_shape);
+            defer a.deinit();
+            var result = (try self.finishGatedDecoderBlockFromAttentionOutputMt(request, layer_index, a, h, null)) orelse return error.NativeBatchedDecodeUnavailable;
+            defer result.deinit();
+            const ct = try retainedCtFromMetalTensor(self, &result);
+            defer freeOp(ctx, ct);
+            if (!try copyRows2DOp(ctx, output_ct, row, ct, 0, 1, request.hidden_size)) return error.NativeBatchedDecodeUnavailable;
+        }
+        const output = try self.borrowedMetalTensorFromCt(output_ct);
+        return output.retainedCopy();
+    }
+
     // Diagnostic-only canonical carriers. Each singleton result is copied
     // before another row may overwrite shared prepared scratch.
     fn prepareCanonicalOcrInputs(ctx: *anyopaque, self: *MetalCompute, request: *const ops.DecoderRuntimeDecodeRequest, inputs: *const DecodeBatchHostInputs) !DecodeBatchInitialTensors {
@@ -26947,6 +26976,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const block = blk: {
                 const scope = self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
                 defer self.endActivePlannedComputeScope(scope);
+                if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_BLOCK"))
+                    break :blk try ocrRowwiseBlock(ctx, self, &block_request, layer_index, attn_mt, hidden);
                 break :blk (try self.finishGatedDecoderBlockFromAttentionOutputMt(&block_request, layer_index, attn_mt, hidden, null)) orelse return error.NativeBatchedDecodeUnavailable;
             };
             // finishGatedLayerTailMt consumes the block on both success/error.
@@ -27013,14 +27044,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.allocator.free(choices);
         active_frame = false;
         for (choices, request.output_token_ids) |token, *output| output.* = @intCast(token);
-        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) {
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP") or getenvBool("ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES")) {
             const borrowed_logits = try self.borrowedMetalTensorFromCt(logits);
             var matrix_logits = try borrowed_logits.retainedCopy();
             defer matrix_logits.deinit();
             const values = try matrix_logits.toHostSlice();
             for (request.items, 0..) |item, row| {
                 const summary = try ocrLogitSummary(values[row * request.vocab_size ..][0..request.vocab_size], request.suppress_token_ids);
-                std.debug.print("ocr-parity-step-matrix row={d} seq={d} input={d} token={d} runner_up={d} margin={e}\n", .{ row, item.seq_len, item.token_id, choices[row], summary.runner_up, summary.margin });
+                std.debug.print("ocr-parity-step-matrix rows={d} row={d} seq={d} input={d} token={d} runner_up={d} margin={e} top_logit={e} runner_up_logit={e}\n", .{ rows, row, item.seq_len, item.token_id, choices[row], summary.runner_up, summary.margin, values[row * request.vocab_size + summary.token], values[row * request.vocab_size + summary.runner_up] });
             }
         }
         if (differential) {
