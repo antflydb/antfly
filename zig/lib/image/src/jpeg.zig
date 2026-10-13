@@ -79,6 +79,9 @@ pub const CanonicalHuffmanTable = struct {
     first_code: [16]u16,
     first_symbol_index: [16]u16,
     symbols: [max_huffman_symbols]u8,
+    // Packed code length and symbol for all eight-bit prefixes. Zero means
+    // a longer code (or an unused prefix), handled by the canonical decoder.
+    short_codes: [256]u16 = @splat(0),
 };
 
 pub const EntropyBitReader = struct {
@@ -564,7 +567,7 @@ fn colorEncodingForStructure(structure: Structure) ?ColorEncoding {
 }
 
 pub fn buildCanonicalHuffmanTable(info: HuffmanTableInfo) !CanonicalHuffmanTable {
-    if (!info.present or info.symbol_count == 0) return error.JpegDecodeFailed;
+    if (!info.present or info.symbol_count == 0 or info.symbol_count > max_huffman_symbols) return error.JpegDecodeFailed;
 
     var table = CanonicalHuffmanTable{
         .symbol_count = info.symbol_count,
@@ -585,6 +588,15 @@ pub fn buildCanonicalHuffmanTable(info: HuffmanTableInfo) !CanonicalHuffmanTable
         table.first_symbol_index[i] = symbol_index;
 
         if (next_code + code_count > max_codes_for_width) return error.JpegDecodeFailed;
+        if (@as(usize, symbol_index) + code_count > info.symbol_count) return error.JpegDecodeFailed;
+        if (i < 8) {
+            const suffix_bits: u3 = @intCast(7 - i);
+            for (0..code_count) |offset| {
+                const prefix = (next_code + offset) << suffix_bits;
+                const entry = (@as(u16, @intCast(i + 1)) << 8) | table.symbols[symbol_index + offset];
+                @memset(table.short_codes[prefix .. prefix + (@as(usize, 1) << suffix_bits)], entry);
+            }
+        }
         symbol_index += code_count;
         next_code = (next_code + code_count) << 1;
     }
@@ -602,6 +614,29 @@ pub fn quantTableNaturalOrder(table: QuantTableInfo) [64]u16 {
 }
 
 pub fn decodeHuffmanSymbol(reader: *EntropyBitReader, table: CanonicalHuffmanTable) !u8 {
+    return decodeHuffmanSymbolBorrowed(reader, &table);
+}
+
+// Borrow the table in coefficient loops. Passing the expanded table by value
+// copies it per symbol under the current compiler's calling convention.
+fn decodeHuffmanSymbolBorrowed(reader: *EntropyBitReader, table: *const CanonicalHuffmanTable) !u8 {
+    // Look ahead without demanding eight bits at an entropy boundary: a valid
+    // short symbol can remain before a restart marker or the end of a scan.
+    // readEntropyByte preserves encountered markers for restart handling.
+    while (reader.bit_count < 8) {
+        const byte = reader.readEntropyByte() catch break;
+        reader.bit_buffer = (reader.bit_buffer << 8) | byte;
+        reader.bit_count += 8;
+    }
+    if (reader.bit_count >= 8) {
+        const shift: u5 = @intCast(reader.bit_count - 8);
+        const entry = table.short_codes[(reader.bit_buffer >> shift) & 255];
+        const length: u8 = @intCast(entry >> 8);
+        if (length != 0) {
+            reader.bit_count -= length;
+            return @truncate(entry);
+        }
+    }
     var code: u16 = 0;
     for (0..16) |i| {
         code = (code << 1) | try reader.readBit();
@@ -701,14 +736,14 @@ pub fn decodeBaselineBlock(
 ) !BaselineBlockDecode {
     var coefficients = std.mem.zeroes([64]i64);
 
-    const dc_size = try decodeHuffmanSymbol(reader, dc_table);
+    const dc_size = try decodeHuffmanSymbolBorrowed(reader, &dc_table);
     const dc_delta = if (dc_size == 0) 0 else try extendSignI32(try reader.readBits(dc_size), dc_size);
     const dc_value = try checkedAddI64(prev_dc, dc_delta);
     coefficients[0] = dc_value;
 
     var zig_zag_index: usize = 1;
     while (zig_zag_index < 64) {
-        const symbol = try decodeHuffmanSymbol(reader, ac_table);
+        const symbol = try decodeHuffmanSymbolBorrowed(reader, &ac_table);
         if (symbol == 0x00) break;
         if (symbol == 0xf0) {
             zig_zag_index += 16;
@@ -734,7 +769,7 @@ pub fn decodeBaselineBlock(
 }
 
 fn decodeLosslessDifference(reader: *EntropyBitReader, dc_table: CanonicalHuffmanTable) !i32 {
-    const bit_len = try decodeHuffmanSymbol(reader, dc_table);
+    const bit_len = try decodeHuffmanSymbolBorrowed(reader, &dc_table);
     if (bit_len == 0) return 0;
     // In lossless Huffman JPEG, category 16 is a special fixed difference.
     if (bit_len == 16) return 32768;
@@ -749,7 +784,7 @@ pub fn decodeProgressiveDcFirst(
     prev_dc: i16,
     successive_low: u8,
 ) !ProgressiveBlockState {
-    const dc_size = try decodeHuffmanSymbol(reader, dc_table);
+    const dc_size = try decodeHuffmanSymbolBorrowed(reader, &dc_table);
     const dc_delta = if (dc_size == 0) 0 else try extendSign(try reader.readBits(dc_size), dc_size);
     const dc_value = try checkedAddI16(prev_dc, dc_delta);
 
@@ -808,7 +843,7 @@ pub fn decodeProgressiveAcFirstWithEobRun(
     const zig_zag_end: usize = spectral_end;
 
     while (zig_zag_index <= zig_zag_end) {
-        const symbol = try decodeHuffmanSymbol(reader, ac_table);
+        const symbol = try decodeHuffmanSymbolBorrowed(reader, &ac_table);
         const run_length = symbol >> 4;
         const value_bits = symbol & 0x0f;
         if (value_bits == 0) {
@@ -846,7 +881,7 @@ pub fn refineProgressiveAc(
 
     if (eob_run.* == 0) {
         while (zig_zag_index <= zig_zag_end) {
-            const symbol = try decodeHuffmanSymbol(reader, ac_table);
+            const symbol = try decodeHuffmanSymbolBorrowed(reader, &ac_table);
             var zero_run_remaining: i32 = symbol >> 4;
             const value_bits = symbol & 0x0f;
             var new_coefficient: i16 = 0;
@@ -5084,7 +5119,7 @@ test "pure zig baseline color decode matches djpeg hash on 444 fixture" {
     defer alloc.free(fixture_bytes);
 
     const structure = try parseStructure(fixture_bytes);
-    const decoded = try decodeRgbaPureZigColorBaseline(alloc, fixture_bytes, structure);
+    const decoded = try decodeRgbaPureZigColorBaseline(alloc, fixture_bytes, structure, 1, .jpeg_display);
     defer alloc.free(decoded.rgba);
 
     const actual_hex = try test_support.sha256HexAlloc(alloc, decoded.rgba);
@@ -5200,7 +5235,7 @@ test "pure zig baseline color decode matches djpeg hash on 422 fixture" {
     defer alloc.free(fixture_bytes);
 
     const structure = try parseStructure(fixture_bytes);
-    const decoded = try decodeRgbaPureZigColorBaseline(alloc, fixture_bytes, structure);
+    const decoded = try decodeRgbaPureZigColorBaseline(alloc, fixture_bytes, structure, 1, .jpeg_display);
     defer alloc.free(decoded.rgba);
 
     const actual_hex = try test_support.sha256HexAlloc(alloc, decoded.rgba);
@@ -5328,7 +5363,7 @@ test "decode rgba matches manifest-backed adobe cmyk jpeg fixture" {
     try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
 }
 
-test "PDF DeviceCMYK honors Adobe inverted CMYK encoding" {
+test "PDF DeviceCMYK leaves Adobe sample inversion to the PDF Decode transform" {
     const alloc = std.testing.allocator;
     const manifest = try test_support.loadManifest(alloc, std.testing.io);
     defer test_support.freeManifest(alloc, manifest);
@@ -5340,10 +5375,13 @@ test "PDF DeviceCMYK honors Adobe inverted CMYK encoding" {
     defer alloc.free(decoded.rgba);
     try std.testing.expectEqual(@as(u32, 3), decoded.width);
     try std.testing.expectEqual(@as(u32, 1), decoded.height);
+    // DeviceCMYK consumes the encoded samples directly. The PDF reader applies
+    // the PDF /Decode transform separately; JPEG display mode inverts Adobe
+    // samples. This fixture has inverted K=255, so raw DeviceCMYK is black.
     const expected_rgba = [_]u8{
-        0xff, 0x00, 0x00, 0xff,
-        0x00, 0xff, 0x00, 0xff,
-        0x00, 0x00, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0xff,
+        0x00, 0x00, 0x00, 0xff,
+        0x00, 0x00, 0x00, 0xff,
     };
     try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
 }
@@ -8294,14 +8332,15 @@ test "adobe transform classifies zero-based three-component color ids" {
     const alloc = std.testing.allocator;
     const manifest = try test_support.loadManifest(alloc, std.testing.io);
     defer test_support.freeManifest(alloc, manifest);
-    const fixture = test_support.findFixture(manifest, "jpeg/baseline/white-2x1.jpg") orelse return error.MissingImageFixture;
+    const fixture = test_support.findFixture(manifest, "jpeg/baseline/pattern-4x4-444.jpg") orelse return error.MissingImageFixture;
     const fixture_bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, fixture.path);
     defer alloc.free(fixture_bytes);
 
     var structure = try parseStructure(fixture_bytes);
-    structure.info.components[0].id = 0;
-    structure.info.components[1].id = 1;
-    structure.info.components[2].id = 2;
+    for (0..3) |component| {
+        structure.info.components[component].id = @intCast(component);
+        structure.scans[0].components[component].component_selector = @intCast(component);
+    }
     structure.adobe_transform = 1;
     try std.testing.expectEqual(ColorEncoding.ycbcr, colorEncodingForStructure(structure).?);
     try std.testing.expect(canPureZigDecodeColorBaseline(structure));
@@ -8309,4 +8348,55 @@ test "adobe transform classifies zero-based three-component color ids" {
     structure.adobe_transform = 0;
     try std.testing.expectEqual(ColorEncoding.rgb, colorEncodingForStructure(structure).?);
     try std.testing.expect(canPureZigDecodeColorBaseline(structure));
+}
+
+test "huffman prefix lookup matches bitwise decoding for all sixteen-bit inputs" {
+    var info = HuffmanTableInfo{ .present = true, .symbol_count = 4 };
+    info.code_counts[0] = 1;
+    info.code_counts[2] = 1;
+    info.code_counts[7] = 1;
+    info.code_counts[15] = 1;
+    info.symbols[0..4].* = .{ 7, 19, 83, 251 };
+    const table = try buildCanonicalHuffmanTable(info);
+    for (0..65536) |bits| {
+        // Supply a bit reservoir directly so every pattern, including ff,
+        // tests Huffman codes independently of JPEG byte stuffing.
+        var fast = EntropyBitReader{ .bytes = &.{}, .bit_buffer = @intCast(bits), .bit_count = 16 };
+        var reference = fast;
+        var expected: ?u8 = null;
+        var code: u16 = 0;
+        for (0..16) |i| {
+            code = (code << 1) | try reference.readBit();
+            const first = table.first_code[i];
+            const count = table.code_counts[i];
+            if (count != 0 and code >= first and code - first < count) {
+                expected = table.symbols[table.first_symbol_index[i] + code - first];
+                break;
+            }
+        }
+        if (expected) |symbol| {
+            try std.testing.expectEqual(symbol, try decodeHuffmanSymbol(&fast, table));
+            try std.testing.expectEqual(reference.bit_count, fast.bit_count);
+        } else {
+            try std.testing.expectError(error.JpegDecodeFailed, decodeHuffmanSymbol(&fast, table));
+        }
+    }
+}
+
+test "huffman lookahead retains short tails and restart markers" {
+    var info = HuffmanTableInfo{ .present = true, .symbol_count = 1 };
+    info.code_counts[0] = 1;
+    info.symbols[0] = 42;
+    const table = try buildCanonicalHuffmanTable(info);
+    var reader = EntropyBitReader.init(&.{ 0, 0xff, 0xd0, 0 });
+    for (0..8) |_| try std.testing.expectEqual(@as(u8, 42), try decodeHuffmanSymbol(&reader, table));
+    try std.testing.expectEqual(@as(?u8, 0xd0), reader.peekPendingMarker());
+    try reader.consumeExpectedRestartMarker(0xd0);
+    try std.testing.expectEqual(@as(u8, 42), try decodeHuffmanSymbol(&reader, table));
+    for (0..7) |_| try std.testing.expectEqual(@as(u8, 42), try decodeHuffmanSymbol(&reader, table));
+    try std.testing.expectError(error.JpegDecodeFailed, decodeHuffmanSymbol(&reader, table));
+    var stuffed = EntropyBitReader.init(&.{ 0xff, 0, 0, 0xff, 0xd0 });
+    try std.testing.expectEqual(@as(u16, 255), try stuffed.readBits(8));
+    for (0..8) |_| try std.testing.expectEqual(@as(u8, 42), try decodeHuffmanSymbol(&stuffed, table));
+    try stuffed.consumeExpectedRestartMarker(0xd0);
 }

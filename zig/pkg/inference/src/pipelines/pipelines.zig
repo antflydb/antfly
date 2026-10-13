@@ -141,3 +141,8 @@ test {
     _ = @import("document_token_classification.zig");
     _ = @import("adapters.zig");
 }
+
+test {
+    _ = @import("gemma4_image_broker.zig");
+    _ = @import("audio_preparation.zig");
+}

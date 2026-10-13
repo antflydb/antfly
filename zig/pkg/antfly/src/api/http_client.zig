@@ -2041,6 +2041,50 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupGraphEdgesBatchWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.graph_edges_batch_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidGraphEdgesWireRequest,
+            408 => return error.Timeout,
+            404 => return error.GraphEdgesBatchUnsupported,
+            409 => return remoteGroupConflictError(resp.body),
+            422 => return remoteGraphEdgesError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        const result: QueryResponse = .{ .body = resp.body, .owner_allocator = resp.owner_allocator orelse self.alloc };
+        resp.body = &.{};
+        return result;
+    }
+
     pub fn fetchGroupGraphMetricMaintenance(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -6512,4 +6556,20 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "public graph metric borrowed wire edge batch endpoint capability" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/graph-edges-batch"));
+            return .{ .status = 404, .body = try a.dupe(u8, "unsupported") };
+        }
+    };
+    var fake = Fake{};
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

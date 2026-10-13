@@ -1,0 +1,3064 @@
+{
+  "kind": "hackernews-restart-latency-investigation",
+  "date": "2026-10-13",
+  "scope": "ARM64 native local filesystem, normalized Snappy Parquet, application-cache-cleared cycles with readiness warming enabled. OS caches not flushed. Not full-archive, raw BigQuery, real S3/GCS or managed Cloud qualification.",
+  "engine_main_revision": "0bbd1807c1",
+  "engine_production_revision": "37fa71b50dc52d1845ed0bd986cbbf0a2d8c31d2",
+  "binary_sha256": "0451f6ee324c91714c2d6e33c40ec31a8cdd87f4e9edd86525cfa6a167340024",
+  "source": {
+    "rows": 142577,
+    "files": 1024,
+    "parquet_bytes": 69006338,
+    "inventory_sha256": "0bfc5fbb3b7eeecbb6024c3f6f7819f5eeed3a6868de061e2ce46a1000131cb2",
+    "note": "Original logical sample rows re-encoded in original order into Snappy files; not raw BigQuery physical encoding."
+  },
+  "original_evidence": "composed-lake-qualification-20261013.json",
+  "original_outliers": {
+    "single_search_restart_ms": 4385.25,
+    "single_search_cause": "Unproven; aggregate pre/post-search metrics were discarded by the original qualifier. Cannot recover the missing observations retroactively.",
+    "cursor_restart_ms": 2582.56,
+    "cursor_ranking_ms": 802.017,
+    "cursor_hydration_ms": 1688.153,
+    "cursor_note": "These original counters explain most of the cursor time but do not establish why those phases were slower on that particular shared-host run.",
+    "single_search_server_took_ms": 4377,
+    "single_search_ranking_ms": 86.635,
+    "single_search_hydration_ms": 6.609
+  },
+  "isolated_restart_probes": {
+    "diagnostic": [
+      {
+        "restart_ms": 774.44,
+        "warm_ms": 140.27
+      },
+      {
+        "restart_ms": 243.96,
+        "warm_ms": 133.49
+      },
+      {
+        "restart_ms": 236.78,
+        "warm_ms": 171.81
+      },
+      {
+        "restart_ms": 260.88,
+        "warm_ms": 105.32
+      },
+      {
+        "restart_ms": 266.56,
+        "warm_ms": 141.58
+      }
+    ],
+    "sampled": [
+      {
+        "restart_ms": 1148.19,
+        "warm_ms": 136.94
+      },
+      {
+        "restart_ms": 381.25,
+        "warm_ms": 147.51
+      },
+      {
+        "restart_ms": 398.7,
+        "warm_ms": 133.31
+      },
+      {
+        "restart_ms": 328.37,
+        "warm_ms": 137.4
+      },
+      {
+        "restart_ms": 289.08,
+        "warm_ms": 155.6
+      },
+      {
+        "restart_ms": 234.84,
+        "warm_ms": 122.09
+      },
+      {
+        "restart_ms": 243.79,
+        "warm_ms": 134.52
+      },
+      {
+        "restart_ms": 252.42,
+        "warm_ms": 111.03
+      },
+      {
+        "restart_ms": 244.04,
+        "warm_ms": 98.39
+      },
+      {
+        "restart_ms": 333.42,
+        "warm_ms": 200.21
+      },
+      {
+        "restart_ms": 345.69,
+        "warm_ms": 173.72
+      },
+      {
+        "restart_ms": 324.99,
+        "warm_ms": 145.05
+      },
+      {
+        "restart_ms": 402.72,
+        "warm_ms": 164.28
+      },
+      {
+        "restart_ms": 369.84,
+        "warm_ms": 210.86
+      },
+      {
+        "restart_ms": 416.97,
+        "warm_ms": 143.42
+      },
+      {
+        "restart_ms": 450.75,
+        "warm_ms": 165.02
+      },
+      {
+        "restart_ms": 242.31,
+        "warm_ms": 170.41
+      },
+      {
+        "restart_ms": 238.42,
+        "warm_ms": 93.1
+      },
+      {
+        "restart_ms": 241.99,
+        "warm_ms": 91.27
+      },
+      {
+        "restart_ms": 290.2,
+        "warm_ms": 147.67
+      }
+    ],
+    "delayed": [
+      {
+        "restart_ms": 261.04,
+        "warm_ms": 536.82
+      },
+      {
+        "restart_ms": 264.9,
+        "warm_ms": 880.51
+      },
+      {
+        "restart_ms": 337.93,
+        "warm_ms": 338.06
+      },
+      {
+        "restart_ms": 230.09,
+        "warm_ms": 514.72
+      },
+      {
+        "restart_ms": 334.03,
+        "warm_ms": 1256.78
+      },
+      {
+        "restart_ms": 309.72,
+        "warm_ms": 558.01
+      },
+      {
+        "restart_ms": 240.51,
+        "warm_ms": 483.84
+      },
+      {
+        "restart_ms": 305.99,
+        "warm_ms": 368.74
+      },
+      {
+        "restart_ms": 239.69,
+        "warm_ms": 320.08
+      },
+      {
+        "restart_ms": 310.2,
+        "warm_ms": 274.23
+      }
+    ]
+  },
+  "traced_full_sequences": [
+    {
+      "after_restart_ms": 111.62,
+      "cursor_restart_ms": 523.45,
+      "filesystem_operations": 64327,
+      "max_fsync_or_flock_ms": 6.205,
+      "note": "macOS process-local dynamic-library interposition. Diagnostic observations, not qualification timings; idle worker waits excluded from causal claims."
+    },
+    {
+      "after_restart_ms": 104.16,
+      "cursor_restart_ms": 512.74,
+      "filesystem_operations": 62859,
+      "max_fsync_or_flock_ms": 3.195,
+      "note": "macOS process-local dynamic-library interposition. Diagnostic observations, not qualification timings; idle worker waits excluded from causal claims."
+    }
+  ],
+  "preserved_phase_cycles": [
+    {
+      "first_search_ms": 292.26,
+      "after_restart_ms": 196.25,
+      "cursor_depth": {
+        "hits": 1408,
+        "samples_ms": [
+          493.86,
+          364.04,
+          608.67,
+          466.9,
+          261.2,
+          335.39,
+          310.24,
+          294.8,
+          289.73,
+          292.15
+        ],
+        "term": "AI",
+        "initial_ms": 566.04,
+        "restart_ms": 932.33
+      },
+      "composed_benchmarks": {
+        "union": {
+          "first_search_ms": 722.7,
+          "warm_samples_ms": [
+            250.45,
+            209.12,
+            212.53,
+            215.56,
+            194.7,
+            269.6,
+            267.2,
+            285.87,
+            220.26,
+            184.21,
+            211.74,
+            256.74,
+            222.37,
+            255.14,
+            285.11,
+            231.79,
+            261.92,
+            364.94,
+            339.13,
+            325.58
+          ],
+          "warm_p95_ms": 339.13,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        },
+        "saved_overlay": {
+          "first_search_ms": 594.31,
+          "warm_samples_ms": [
+            823.17,
+            482.47,
+            286.36,
+            386.63,
+            402.66,
+            388.97,
+            387.39,
+            334.33,
+            434.62,
+            339.98,
+            385.91,
+            552.34,
+            328.98,
+            292.55,
+            271.52,
+            283.8,
+            305.7,
+            302.42,
+            360.53,
+            409.06
+          ],
+          "warm_p95_ms": 552.34,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        }
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "profiles": [
+        {
+          "phase": "cold",
+          "elapsed_ms": 292.26,
+          "took_ms": 271,
+          "lake_phase_profile": {
+            "total_ms": 282.419,
+            "pre_search_ms": 130.359,
+            "search_ms": 136.48,
+            "post_search_ms": 15.58,
+            "hydration_ms": 8.544,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 9.841
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 405,
+            "antfly_lake_cache_provider_bytes_total": 24332866,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 282419000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 130359000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 136480000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 8544000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 15580000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 347,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 348,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 57,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 272630,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 496,
+            "antfly_lake_cache_misses_total": 752,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 57,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 40816000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 87389000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 23741000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 136166000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 8546000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 606000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 282533000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "cursor_initial",
+          "elapsed_ms": 566.04,
+          "took_ms": 356,
+          "lake_phase_profile": {
+            "total_ms": 562.215,
+            "pre_search_ms": 74.174,
+            "search_ms": 279.202,
+            "post_search_ms": 208.839,
+            "hydration_ms": 199.647,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 3.825
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 2596,
+            "antfly_lake_cache_provider_bytes_total": 36856806,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 562215000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 74174000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 279202000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 199647000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 208839000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 2526,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 1412,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 1184,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 3779855,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 3264,
+            "antfly_lake_cache_misses_total": 5122,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 1184,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 128,
+            "antfly_lake_query_best_first_pruned_nodes_total": 0,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 27126000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 46691000,
+            "antfly_lake_query_index_calls_total": 16,
+            "antfly_lake_query_index_nanoseconds_total": 24061000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 279131000,
+            "antfly_lake_query_hydration_calls_total": 2,
+            "antfly_lake_query_hydration_nanoseconds_total": 199653000,
+            "antfly_lake_query_highlight_calls_total": 2,
+            "antfly_lake_query_highlight_nanoseconds_total": 1049000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 562266000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "restart",
+          "elapsed_ms": 196.25,
+          "took_ms": 187,
+          "lake_phase_profile": {
+            "total_ms": 195.13,
+            "pre_search_ms": 108.415,
+            "search_ms": 77.486,
+            "post_search_ms": 9.229,
+            "hydration_ms": 6.778,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 1.12
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 0,
+            "antfly_lake_cache_provider_bytes_total": 0,
+            "antfly_lake_cache_disk_hits_total": 406,
+            "antfly_lake_cache_disk_bytes_total": 24505110,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 195130000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 108415000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 77486000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 6778000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 9229000,
+            "antfly_lake_disk_cache_read_hits_total": 406,
+            "antfly_lake_disk_cache_read_misses_total": 0,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 0,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 406,
+            "antfly_lake_cache_misses_total": 787,
+            "antfly_lake_cache_mapping_hits_total": 33,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 32689000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 74415000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 18850000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 77410000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 6780000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 49000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 195221000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "cursor_depth_restart",
+          "elapsed_ms": 932.33,
+          "took_ms": 400,
+          "lake_phase_profile": {
+            "total_ms": 928.763,
+            "pre_search_ms": 120.68,
+            "search_ms": 280.021,
+            "post_search_ms": 528.062,
+            "hydration_ms": 524.138,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 3.567
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 249,
+            "antfly_lake_cache_provider_bytes_total": 1145925,
+            "antfly_lake_cache_disk_hits_total": 2963,
+            "antfly_lake_cache_disk_bytes_total": 37878178,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 928763000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 120680000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 280021000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 524138000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 528062000,
+            "antfly_lake_disk_cache_read_hits_total": 2963,
+            "antfly_lake_disk_cache_read_misses_total": 249,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 249,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 249,
+            "antfly_lake_disk_cache_evicted_bytes_total": 483909,
+            "antfly_lake_cache_hits_total": 3231,
+            "antfly_lake_cache_misses_total": 6474,
+            "antfly_lake_cache_mapping_hits_total": 120,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 128,
+            "antfly_lake_query_best_first_pruned_nodes_total": 0,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 52782000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 67541000,
+            "antfly_lake_query_index_calls_total": 16,
+            "antfly_lake_query_index_nanoseconds_total": 29233000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 279937000,
+            "antfly_lake_query_hydration_calls_total": 2,
+            "antfly_lake_query_hydration_nanoseconds_total": 524144000,
+            "antfly_lake_query_highlight_calls_total": 2,
+            "antfly_lake_query_highlight_nanoseconds_total": 1258000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 929035000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "composed_cold.union",
+          "elapsed_ms": 722.7,
+          "took_ms": 0,
+          "lake_phase_profile": {
+            "total_ms": 564.191,
+            "pre_search_ms": 221.971,
+            "search_ms": 310.997,
+            "post_search_ms": 31.223,
+            "hydration_ms": 28.579,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 158.509
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 564191000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 221971000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 310997000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 28579000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 31223000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 391,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 453,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 2,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 264,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 554,
+            "antfly_lake_cache_misses_total": 846,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 2,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 64,
+            "antfly_lake_query_best_first_pruned_nodes_total": 64,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 44642000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 174900000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 59120000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 310851000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 28580000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 389000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 564592000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "composed_cold.saved_overlay",
+          "elapsed_ms": 594.31,
+          "took_ms": 0,
+          "lake_phase_profile": {
+            "total_ms": 389.662,
+            "pre_search_ms": 125.038,
+            "search_ms": 250.402,
+            "post_search_ms": 14.222,
+            "hydration_ms": 8.85,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 204.648
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 389662000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 125038000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 250402000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 8850000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 14222000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 391,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 389,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 66,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 226565,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 554,
+            "antfly_lake_cache_misses_total": 846,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 66,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 64,
+            "antfly_lake_query_best_first_pruned_nodes_total": 64,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 39353000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 84049000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 62672000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 250307000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 8852000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 50000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 389773000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        }
+      ],
+      "report_sha256": "d44278af122c05a5fac25a024226c37e8b68e447ba5563f36af84b12b86da0e1"
+    },
+    {
+      "first_search_ms": 386.31,
+      "after_restart_ms": 194.07,
+      "cursor_depth": {
+        "hits": 1408,
+        "samples_ms": [
+          357.9,
+          454.27,
+          304.01,
+          357.91,
+          245.69,
+          322.76,
+          366.04,
+          371.23,
+          449.76,
+          467.3
+        ],
+        "term": "AI",
+        "initial_ms": 712.23,
+        "restart_ms": 899.09
+      },
+      "composed_benchmarks": {
+        "union": {
+          "first_search_ms": 426.99,
+          "warm_samples_ms": [
+            367.1,
+            201.93,
+            271.14,
+            212.28,
+            235.28,
+            244.48,
+            223.73,
+            206.38,
+            225.11,
+            190.16,
+            198.55,
+            178.71,
+            165.59,
+            194.5,
+            178.25,
+            163.29,
+            171.56,
+            158.0,
+            246.66,
+            163.01
+          ],
+          "warm_p95_ms": 271.14,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        },
+        "saved_overlay": {
+          "first_search_ms": 464.21,
+          "warm_samples_ms": [
+            249.87,
+            307.84,
+            288.33,
+            375.54,
+            349.62,
+            313.84,
+            310.27,
+            283.26,
+            262.57,
+            378.99,
+            274.19,
+            344.97,
+            275.75,
+            335.86,
+            375.61,
+            322.33,
+            303.85,
+            334.07,
+            380.0,
+            440.05
+          ],
+          "warm_p95_ms": 380.0,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        }
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "profiles": [
+        {
+          "phase": "cold",
+          "elapsed_ms": 386.31,
+          "took_ms": 363,
+          "lake_phase_profile": {
+            "total_ms": 374.66,
+            "pre_search_ms": 154.656,
+            "search_ms": 204.525,
+            "post_search_ms": 15.479,
+            "hydration_ms": 7.893,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 11.65
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 405,
+            "antfly_lake_cache_provider_bytes_total": 24332866,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 374660000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 154656000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 204525000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 7893000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 15479000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 347,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 350,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 55,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 210571,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 496,
+            "antfly_lake_cache_misses_total": 752,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 55,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 99944000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 52317000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 36401000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 203886000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 7896000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 1500000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 374756000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "cursor_initial",
+          "elapsed_ms": 712.23,
+          "took_ms": 559,
+          "lake_phase_profile": {
+            "total_ms": 709.848,
+            "pre_search_ms": 144.693,
+            "search_ms": 411.224,
+            "post_search_ms": 153.931,
+            "hydration_ms": 147.079,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 2.382
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 2596,
+            "antfly_lake_cache_provider_bytes_total": 36856806,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 709848000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 144693000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 411224000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 147079000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 153931000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 2526,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 1188,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 1408,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 4264476,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 3264,
+            "antfly_lake_cache_misses_total": 5122,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 1408,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 128,
+            "antfly_lake_query_best_first_pruned_nodes_total": 0,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 44908000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 99478000,
+            "antfly_lake_query_index_calls_total": 16,
+            "antfly_lake_query_index_nanoseconds_total": 33509000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 411103000,
+            "antfly_lake_query_hydration_calls_total": 2,
+            "antfly_lake_query_hydration_nanoseconds_total": 147088000,
+            "antfly_lake_query_highlight_calls_total": 2,
+            "antfly_lake_query_highlight_nanoseconds_total": 996000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 709893000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "restart",
+          "elapsed_ms": 194.07,
+          "took_ms": 180,
+          "lake_phase_profile": {
+            "total_ms": 192.453,
+            "pre_search_ms": 87.588,
+            "search_ms": 89.535,
+            "post_search_ms": 15.33,
+            "hydration_ms": 11.454,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 1.617
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 5,
+            "antfly_lake_cache_provider_bytes_total": 94669,
+            "antfly_lake_cache_disk_hits_total": 401,
+            "antfly_lake_cache_disk_bytes_total": 24410441,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 192453000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 87588000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 89535000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 11454000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 15330000,
+            "antfly_lake_disk_cache_read_hits_total": 401,
+            "antfly_lake_disk_cache_read_misses_total": 5,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 5,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 5,
+            "antfly_lake_disk_cache_evicted_bytes_total": 31155,
+            "antfly_lake_cache_hits_total": 406,
+            "antfly_lake_cache_misses_total": 787,
+            "antfly_lake_cache_mapping_hits_total": 33,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 40310000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 45951000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 17765000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 89452000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 11455000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 77000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 192501000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "cursor_depth_restart",
+          "elapsed_ms": 899.09,
+          "took_ms": 511,
+          "lake_phase_profile": {
+            "total_ms": 895.218,
+            "pre_search_ms": 170.386,
+            "search_ms": 341.256,
+            "post_search_ms": 383.576,
+            "hydration_ms": 380.494,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 3.872
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 116,
+            "antfly_lake_cache_provider_bytes_total": 580896,
+            "antfly_lake_cache_disk_hits_total": 3096,
+            "antfly_lake_cache_disk_bytes_total": 38443207,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 895218000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 170386000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 341256000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 380494000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 383576000,
+            "antfly_lake_disk_cache_read_hits_total": 3096,
+            "antfly_lake_disk_cache_read_misses_total": 116,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 116,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 116,
+            "antfly_lake_disk_cache_evicted_bytes_total": 130230,
+            "antfly_lake_cache_hits_total": 3231,
+            "antfly_lake_cache_misses_total": 6474,
+            "antfly_lake_cache_mapping_hits_total": 120,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 128,
+            "antfly_lake_query_best_first_pruned_nodes_total": 0,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 42389000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 127112000,
+            "antfly_lake_query_index_calls_total": 16,
+            "antfly_lake_query_index_nanoseconds_total": 53979000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 341182000,
+            "antfly_lake_query_hydration_calls_total": 2,
+            "antfly_lake_query_hydration_nanoseconds_total": 380498000,
+            "antfly_lake_query_highlight_calls_total": 2,
+            "antfly_lake_query_highlight_nanoseconds_total": 890000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 895270000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "composed_cold.union",
+          "elapsed_ms": 426.99,
+          "took_ms": 0,
+          "lake_phase_profile": {
+            "total_ms": 315.671,
+            "pre_search_ms": 115.612,
+            "search_ms": 166.997,
+            "post_search_ms": 33.062,
+            "hydration_ms": 30.226,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 111.319
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 315671000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 115612000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 166997000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 30226000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 33062000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 391,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 431,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 24,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 338367,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 554,
+            "antfly_lake_cache_misses_total": 846,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 24,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 64,
+            "antfly_lake_query_best_first_pruned_nodes_total": 64,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 40231000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 73984000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 24448000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 166903000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 30227000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 59000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 315715000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "composed_cold.saved_overlay",
+          "elapsed_ms": 464.21,
+          "took_ms": 0,
+          "lake_phase_profile": {
+            "total_ms": 323.131,
+            "pre_search_ms": 157.099,
+            "search_ms": 154.309,
+            "post_search_ms": 11.723,
+            "hydration_ms": 8.465,
+            "scope": "Process counters for a serial query interval. Hydration overlaps search/post-search. Outside-lake time includes native/composed execution, transport and work outside the measured lake phases; overlapping leaves can make it negative.",
+            "outside_lake_ms": 141.079
+          },
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 323131000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 157099000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 154309000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 8465000,
+            "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 11723000,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 391,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 388,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 67,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 2024067,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 554,
+            "antfly_lake_cache_misses_total": 846,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 67,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 64,
+            "antfly_lake_query_best_first_pruned_nodes_total": 64,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 37498000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 118096000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 24352000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 154227000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 8466000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 49000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 323172000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        }
+      ],
+      "report_sha256": "769798418ba33021603ebe4ebfc475e97fe38e0566442f94c1d73bb87cbd82f1"
+    }
+  ],
+  "finding": "The qualifier discarded labeled aggregate lake phase counters and excluded labeled counters again during delta capture. Preserve their fixed phase labels and report pre-search, search, post-search and overlapping hydration timing.",
+  "conclusion": "The 4.39-second single-search stall did not recur in 35 isolated restarts and four additional full sequences. Its root cause remains unproven; this change fixes evidence capture, not a demonstrated engine stall. Original failures remain retained. Full-archive and managed Cloud latency are unqualified.",
+  "validation": {
+    "python_tests_passed": 25,
+    "python_subtests_passed": 9,
+    "untraced_full_sequences_passed": 2
+  },
+  "continued_reproduction": {
+    "scope": "Further bounded local tests on the same executable and owned fixture; no cloud spend, OS cache purge or artificial memory pressure. Traced samples are diagnostic, not replacement qualification timings. All returned IDs and scores matched the retained expected results.",
+    "recorded_full_sequences": [
+      {
+        "trace": false,
+        "first_search_ms": 221.22,
+        "after_restart_ms": 160.19,
+        "cursor_restart_ms": 2497.75
+      },
+      {
+        "trace": true,
+        "first_search_ms": 214.8,
+        "after_restart_ms": 136.61,
+        "cursor_restart_ms": 586.13
+      },
+      {
+        "trace": false,
+        "first_search_ms": 194.1,
+        "after_restart_ms": 139.17,
+        "cursor_restart_ms": 509.18
+      },
+      {
+        "trace": true,
+        "first_search_ms": 146.7,
+        "after_restart_ms": 151.85,
+        "cursor_restart_ms": 814.35
+      },
+      {
+        "trace": false,
+        "first_search_ms": 210.76,
+        "after_restart_ms": 284.19,
+        "cursor_restart_ms": 996.31
+      }
+    ],
+    "reproduced_cursor": {
+      "elapsed_ms": 2497.75,
+      "took_ms": 1415,
+      "lake_phase_profile": {
+        "total_ms": 2492.662,
+        "pre_search_ms": 55.111,
+        "search_ms": 1360.843,
+        "post_search_ms": 1076.708,
+        "hydration_ms": 1069.985,
+        "outside_lake_ms": 5.088,
+        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+      },
+      "cache_init_attempts": 0,
+      "source_ms": 25.44,
+      "publication_ms": 29.451,
+      "remaining_pre_search_ms": 0.22
+    },
+    "immediate_first_search_with_maintenance_disabled": [
+      {
+        "cycle": 1,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "off",
+        "elapsed_ms": 2057.175,
+        "took_ms": 2013,
+        "lake_phase_profile": {
+          "total_ms": 2048.989,
+          "pre_search_ms": 1856.928,
+          "search_ms": 148.908,
+          "post_search_ms": 43.153,
+          "hydration_ms": 30.308,
+          "outside_lake_ms": 8.186,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 332.21,
+        "publication_ms": 119.133,
+        "remaining_pre_search_ms": 1405.585
+      }
+    ],
+    "cache_enabled_disabled_pairs": [
+      {
+        "cycle": 1,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 3148.166,
+        "took_ms": 3001,
+        "lake_phase_profile": {
+          "total_ms": 3137.178,
+          "pre_search_ms": 2473.318,
+          "search_ms": 518.404,
+          "post_search_ms": 145.456,
+          "hydration_ms": 84.386,
+          "outside_lake_ms": 10.988,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 593.131,
+        "publication_ms": 355.394,
+        "remaining_pre_search_ms": 1524.793
+      },
+      {
+        "cycle": 2,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 3092.698,
+        "took_ms": 3047,
+        "lake_phase_profile": {
+          "total_ms": 3091.09,
+          "pre_search_ms": 2473.533,
+          "search_ms": 564.759,
+          "post_search_ms": 52.798,
+          "hydration_ms": 41.019,
+          "outside_lake_ms": 1.608,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 2020.444,
+        "publication_ms": 340.584,
+        "remaining_pre_search_ms": 112.505
+      },
+      {
+        "cycle": 3,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 1170.094,
+        "took_ms": 1142,
+        "lake_phase_profile": {
+          "total_ms": 1169.146,
+          "pre_search_ms": 893.925,
+          "search_ms": 238.128,
+          "post_search_ms": 37.093,
+          "hydration_ms": 22.159,
+          "outside_lake_ms": 0.948,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 39.297,
+        "publication_ms": 37.852,
+        "remaining_pre_search_ms": 816.776
+      },
+      {
+        "cycle": 4,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 267.769,
+        "took_ms": 259,
+        "lake_phase_profile": {
+          "total_ms": 266.742,
+          "pre_search_ms": 112.575,
+          "search_ms": 144.032,
+          "post_search_ms": 10.135,
+          "hydration_ms": 6.928,
+          "outside_lake_ms": 1.027,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 34.678,
+        "publication_ms": 72.567,
+        "remaining_pre_search_ms": 5.33
+      },
+      {
+        "cycle": 5,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 1337.181,
+        "took_ms": 1323,
+        "lake_phase_profile": {
+          "total_ms": 1335.968,
+          "pre_search_ms": 1166.67,
+          "search_ms": 151.529,
+          "post_search_ms": 17.769,
+          "hydration_ms": 11.606,
+          "outside_lake_ms": 1.213,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 59.391,
+        "publication_ms": 118.902,
+        "remaining_pre_search_ms": 988.377
+      },
+      {
+        "cycle": 6,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 982.277,
+        "took_ms": 973,
+        "lake_phase_profile": {
+          "total_ms": 980.718,
+          "pre_search_ms": 113.073,
+          "search_ms": 848.312,
+          "post_search_ms": 19.333,
+          "hydration_ms": 6.702,
+          "outside_lake_ms": 1.559,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 36.78,
+        "publication_ms": 71.045,
+        "remaining_pre_search_ms": 5.248
+      }
+    ],
+    "process_counter_pairs": [
+      {
+        "cycle": 1,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 1475.159,
+        "took_ms": 1449,
+        "process_counter_delta": {
+          "cpu_ms": 729.22025,
+          "pageins": 778,
+          "disk_read_bytes": 72138752,
+          "disk_write_bytes": 1474560
+        },
+        "lake_phase_profile": {
+          "total_ms": 1465.147,
+          "pre_search_ms": 1248.42,
+          "search_ms": 190.983,
+          "post_search_ms": 25.744,
+          "hydration_ms": 9.265,
+          "outside_lake_ms": 10.012,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 392.913,
+        "publication_ms": 77.114,
+        "remaining_pre_search_ms": 778.393
+      },
+      {
+        "cycle": 2,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 663.286,
+        "took_ms": 624,
+        "process_counter_delta": {
+          "cpu_ms": 395.77358333333314,
+          "pageins": 290,
+          "disk_read_bytes": 42082304,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 656.082,
+          "pre_search_ms": 326.242,
+          "search_ms": 295.287,
+          "post_search_ms": 34.553,
+          "hydration_ms": 30.578,
+          "outside_lake_ms": 7.204,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 267.139,
+        "publication_ms": 57.067,
+        "remaining_pre_search_ms": 2.036
+      },
+      {
+        "cycle": 3,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 479.61,
+        "took_ms": 468,
+        "process_counter_delta": {
+          "cpu_ms": 355.707,
+          "pageins": 0,
+          "disk_read_bytes": 27074560,
+          "disk_write_bytes": 81920
+        },
+        "lake_phase_profile": {
+          "total_ms": 478.783,
+          "pre_search_ms": 191.324,
+          "search_ms": 270.712,
+          "post_search_ms": 16.747,
+          "hydration_ms": 9.287,
+          "outside_lake_ms": 0.827,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 26.67,
+        "publication_ms": 159.025,
+        "remaining_pre_search_ms": 5.629
+      },
+      {
+        "cycle": 4,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 320.185,
+        "took_ms": 307,
+        "process_counter_delta": {
+          "cpu_ms": 277.39970833333336,
+          "pageins": 0,
+          "disk_read_bytes": 26710016,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 317.928,
+          "pre_search_ms": 91.116,
+          "search_ms": 213.601,
+          "post_search_ms": 13.211,
+          "hydration_ms": 8.564,
+          "outside_lake_ms": 2.257,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 40.102,
+        "publication_ms": 49.36,
+        "remaining_pre_search_ms": 1.654
+      },
+      {
+        "cycle": 5,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 1067.782,
+        "took_ms": 1057,
+        "process_counter_delta": {
+          "cpu_ms": 587.4156666666667,
+          "pageins": 232,
+          "disk_read_bytes": 42106880,
+          "disk_write_bytes": 180224
+        },
+        "lake_phase_profile": {
+          "total_ms": 1066.485,
+          "pre_search_ms": 915.048,
+          "search_ms": 137.718,
+          "post_search_ms": 13.719,
+          "hydration_ms": 8.095,
+          "outside_lake_ms": 1.297,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 1,
+        "source_ms": 57.44,
+        "publication_ms": 91.604,
+        "remaining_pre_search_ms": 766.004
+      },
+      {
+        "cycle": 6,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-on",
+        "elapsed_ms": 183.848,
+        "took_ms": 172,
+        "process_counter_delta": {
+          "cpu_ms": 249.64579166666658,
+          "pageins": 0,
+          "disk_read_bytes": 18554880,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 183.016,
+          "pre_search_ms": 72.167,
+          "search_ms": 95.479,
+          "post_search_ms": 15.37,
+          "hydration_ms": 9.64,
+          "outside_lake_ms": 0.832,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 27.91,
+        "publication_ms": 42.903,
+        "remaining_pre_search_ms": 1.354
+      },
+      {
+        "cycle": 7,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 172.104,
+        "took_ms": 166,
+        "process_counter_delta": {
+          "cpu_ms": 304.44925,
+          "pageins": 0,
+          "disk_read_bytes": 27971584,
+          "disk_write_bytes": 303104
+        },
+        "lake_phase_profile": {
+          "total_ms": 171.311,
+          "pre_search_ms": 68.033,
+          "search_ms": 95.01,
+          "post_search_ms": 8.268,
+          "hydration_ms": 4.085,
+          "outside_lake_ms": 0.793,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 24.763,
+        "publication_ms": 39.428,
+        "remaining_pre_search_ms": 3.842
+      },
+      {
+        "cycle": 8,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "cache-off",
+        "elapsed_ms": 154.981,
+        "took_ms": 150,
+        "process_counter_delta": {
+          "cpu_ms": 224.47725000000003,
+          "pageins": 0,
+          "disk_read_bytes": 26710016,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 153.996,
+          "pre_search_ms": 54.185,
+          "search_ms": 92.617,
+          "post_search_ms": 7.194,
+          "hydration_ms": 2.672,
+          "outside_lake_ms": 0.985,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.296,
+        "publication_ms": 29.57,
+        "remaining_pre_search_ms": 1.319
+      }
+    ],
+    "ready_cache_six_second_delay": [
+      {
+        "cycle": 1,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 307.939,
+        "took_ms": 271,
+        "process_counter_delta": {
+          "cpu_ms": 419.0196666666666,
+          "pageins": 478,
+          "disk_read_bytes": 28442624,
+          "disk_write_bytes": 294912
+        },
+        "lake_phase_profile": {
+          "total_ms": 298.632,
+          "pre_search_ms": 73.842,
+          "search_ms": 181.381,
+          "post_search_ms": 43.409,
+          "hydration_ms": 19.432,
+          "outside_lake_ms": 9.307,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 21.143,
+        "publication_ms": 43.759,
+        "remaining_pre_search_ms": 8.94
+      },
+      {
+        "cycle": 2,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 123.57,
+        "took_ms": 117,
+        "process_counter_delta": {
+          "cpu_ms": 216.99954166666657,
+          "pageins": 0,
+          "disk_read_bytes": 12288,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 121.398,
+          "pre_search_ms": 55.675,
+          "search_ms": 56.407,
+          "post_search_ms": 9.316,
+          "hydration_ms": 2.956,
+          "outside_lake_ms": 2.172,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 29.161,
+        "publication_ms": 25.133,
+        "remaining_pre_search_ms": 1.381
+      },
+      {
+        "cycle": 3,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 223.722,
+        "took_ms": 219,
+        "process_counter_delta": {
+          "cpu_ms": 302.02037499999994,
+          "pageins": 0,
+          "disk_read_bytes": 65536,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 222.769,
+          "pre_search_ms": 116.832,
+          "search_ms": 97.191,
+          "post_search_ms": 8.746,
+          "hydration_ms": 2.978,
+          "outside_lake_ms": 0.953,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 34.846,
+        "publication_ms": 80.356,
+        "remaining_pre_search_ms": 1.63
+      },
+      {
+        "cycle": 4,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 121.3,
+        "took_ms": 114,
+        "process_counter_delta": {
+          "cpu_ms": 220.53387499999997,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 120.156,
+          "pre_search_ms": 63.266,
+          "search_ms": 46.672,
+          "post_search_ms": 10.218,
+          "hydration_ms": 4.756,
+          "outside_lake_ms": 1.144,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.681,
+        "publication_ms": 38.096,
+        "remaining_pre_search_ms": 1.489
+      },
+      {
+        "cycle": 5,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 274.043,
+        "took_ms": 256,
+        "process_counter_delta": {
+          "cpu_ms": 312.2018750000001,
+          "pageins": 0,
+          "disk_read_bytes": 12288,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 272.808,
+          "pre_search_ms": 137.471,
+          "search_ms": 67.059,
+          "post_search_ms": 68.278,
+          "hydration_ms": 3.553,
+          "outside_lake_ms": 1.235,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 41.065,
+        "publication_ms": 94.668,
+        "remaining_pre_search_ms": 1.738
+      },
+      {
+        "cycle": 6,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 123.336,
+        "took_ms": 117,
+        "process_counter_delta": {
+          "cpu_ms": 220.2818749999998,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 122.24,
+          "pre_search_ms": 57.48,
+          "search_ms": 58.254,
+          "post_search_ms": 6.506,
+          "hydration_ms": 3.691,
+          "outside_lake_ms": 1.096,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.811,
+        "publication_ms": 32.231,
+        "remaining_pre_search_ms": 1.438
+      },
+      {
+        "cycle": 7,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 133.144,
+        "took_ms": 126,
+        "process_counter_delta": {
+          "cpu_ms": 224.30425000000002,
+          "pageins": 0,
+          "disk_read_bytes": 12288,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 131.752,
+          "pre_search_ms": 64.105,
+          "search_ms": 56.121,
+          "post_search_ms": 11.526,
+          "hydration_ms": 4.197,
+          "outside_lake_ms": 1.392,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 29.739,
+        "publication_ms": 33.037,
+        "remaining_pre_search_ms": 1.329
+      },
+      {
+        "cycle": 8,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 131.697,
+        "took_ms": 127,
+        "process_counter_delta": {
+          "cpu_ms": 225.9175416666667,
+          "pageins": 0,
+          "disk_read_bytes": 73728,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 130.753,
+          "pre_search_ms": 58.09,
+          "search_ms": 65.203,
+          "post_search_ms": 7.46,
+          "hydration_ms": 2.938,
+          "outside_lake_ms": 0.944,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 17.738,
+        "publication_ms": 38.935,
+        "remaining_pre_search_ms": 1.417
+      },
+      {
+        "cycle": 9,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 108.368,
+        "took_ms": 103,
+        "process_counter_delta": {
+          "cpu_ms": 216.65125,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 107.554,
+          "pre_search_ms": 52.461,
+          "search_ms": 48.319,
+          "post_search_ms": 6.774,
+          "hydration_ms": 3.788,
+          "outside_lake_ms": 0.814,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 24.751,
+        "publication_ms": 26.311,
+        "remaining_pre_search_ms": 1.399
+      },
+      {
+        "cycle": 10,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 171.42,
+        "took_ms": 166,
+        "process_counter_delta": {
+          "cpu_ms": 262.8717499999999,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 170.581,
+          "pre_search_ms": 109.499,
+          "search_ms": 51.938,
+          "post_search_ms": 9.144,
+          "hydration_ms": 3.684,
+          "outside_lake_ms": 0.839,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 44.38,
+        "publication_ms": 62.87,
+        "remaining_pre_search_ms": 2.249
+      },
+      {
+        "cycle": 11,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 130.074,
+        "took_ms": 124,
+        "process_counter_delta": {
+          "cpu_ms": 228.53183333333334,
+          "pageins": 0,
+          "disk_read_bytes": 12288,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 128.505,
+          "pre_search_ms": 55.688,
+          "search_ms": 63.337,
+          "post_search_ms": 9.48,
+          "hydration_ms": 3.506,
+          "outside_lake_ms": 1.569,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 26.567,
+        "publication_ms": 27.578,
+        "remaining_pre_search_ms": 1.543
+      },
+      {
+        "cycle": 12,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 145.011,
+        "took_ms": 139,
+        "process_counter_delta": {
+          "cpu_ms": 245.50512500000002,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 143.832,
+          "pre_search_ms": 70.21,
+          "search_ms": 67.251,
+          "post_search_ms": 6.371,
+          "hydration_ms": 3.44,
+          "outside_lake_ms": 1.179,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 19.842,
+        "publication_ms": 48.789,
+        "remaining_pre_search_ms": 1.579
+      },
+      {
+        "cycle": 13,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 145.108,
+        "took_ms": 137,
+        "process_counter_delta": {
+          "cpu_ms": 237.16141666666658,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 144.167,
+          "pre_search_ms": 58.579,
+          "search_ms": 74.768,
+          "post_search_ms": 10.82,
+          "hydration_ms": 6.246,
+          "outside_lake_ms": 0.941,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 20.744,
+        "publication_ms": 35.986,
+        "remaining_pre_search_ms": 1.849
+      },
+      {
+        "cycle": 14,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 150.063,
+        "took_ms": 144,
+        "process_counter_delta": {
+          "cpu_ms": 249.07875,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 149.105,
+          "pre_search_ms": 70.496,
+          "search_ms": 71.332,
+          "post_search_ms": 7.277,
+          "hydration_ms": 3.923,
+          "outside_lake_ms": 0.958,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 31.628,
+        "publication_ms": 36.827,
+        "remaining_pre_search_ms": 2.041
+      },
+      {
+        "cycle": 15,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 98.262,
+        "took_ms": 93,
+        "process_counter_delta": {
+          "cpu_ms": 203.9225416666667,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 97.412,
+          "pre_search_ms": 46.819,
+          "search_ms": 44.899,
+          "post_search_ms": 5.694,
+          "hydration_ms": 3.183,
+          "outside_lake_ms": 0.85,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 20.838,
+        "publication_ms": 24.567,
+        "remaining_pre_search_ms": 1.414
+      },
+      {
+        "cycle": 16,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 121.446,
+        "took_ms": 114,
+        "process_counter_delta": {
+          "cpu_ms": 217.4142916666667,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 120.035,
+          "pre_search_ms": 54.38,
+          "search_ms": 56.788,
+          "post_search_ms": 8.867,
+          "hydration_ms": 5.29,
+          "outside_lake_ms": 1.411,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 22.836,
+        "publication_ms": 30.182,
+        "remaining_pre_search_ms": 1.362
+      },
+      {
+        "cycle": 17,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 116.23,
+        "took_ms": 111,
+        "process_counter_delta": {
+          "cpu_ms": 210.2166666666667,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 115.402,
+          "pre_search_ms": 52.312,
+          "search_ms": 54.065,
+          "post_search_ms": 9.025,
+          "hydration_ms": 2.995,
+          "outside_lake_ms": 0.828,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 24.646,
+        "publication_ms": 26.195,
+        "remaining_pre_search_ms": 1.471
+      },
+      {
+        "cycle": 18,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 125.326,
+        "took_ms": 119,
+        "process_counter_delta": {
+          "cpu_ms": 213.65491666666674,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 124.076,
+          "pre_search_ms": 66.193,
+          "search_ms": 49.222,
+          "post_search_ms": 8.661,
+          "hydration_ms": 4.47,
+          "outside_lake_ms": 1.25,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 32.218,
+        "publication_ms": 32.567,
+        "remaining_pre_search_ms": 1.408
+      },
+      {
+        "cycle": 19,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 129.129,
+        "took_ms": 121,
+        "process_counter_delta": {
+          "cpu_ms": 223.22508333333326,
+          "pageins": 0,
+          "disk_read_bytes": 6778880,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 126.071,
+          "pre_search_ms": 57.284,
+          "search_ms": 62.255,
+          "post_search_ms": 6.532,
+          "hydration_ms": 3.586,
+          "outside_lake_ms": 3.058,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 19.566,
+        "publication_ms": 36.434,
+        "remaining_pre_search_ms": 1.284
+      },
+      {
+        "cycle": 20,
+        "delay_seconds": 6,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 154.758,
+        "took_ms": 150,
+        "process_counter_delta": {
+          "cpu_ms": 248.60458333333338,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 153.932,
+          "pre_search_ms": 80.716,
+          "search_ms": 67.001,
+          "post_search_ms": 6.215,
+          "hydration_ms": 3.266,
+          "outside_lake_ms": 0.826,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 36.071,
+        "publication_ms": 43.011,
+        "remaining_pre_search_ms": 1.634
+      }
+    ],
+    "findings": [
+      "A 2,498 ms retained-cursor request reproduced; ranking/search and hydration/delivery accounted for almost all of it.",
+      "Immediate first searches reproduced at 2,057 ms and 3,148 ms with cache restoration, and 3,093 ms with disk caching disabled. Cache restoration is not the sole contributor.",
+      "In a traced 1,563 ms immediate first search, the first source-file operation occurred about 864 ms after query start; preceding operations restored persistent-cache inventory. initializeInventory scans retained cache files synchronously before the cache is published ready.",
+      "The slow enabled/disabled pair coincided with substantial host swap activity; process-level page-ins and filesystem waits were also observed. This supports resource contention as a contributor but does not retrospectively prove the original cause.",
+      "The original 4,385 ms sample had a ready cache and no initialization attempt. Immediate-start restoration findings cannot explain that sample by themselves."
+    ],
+    "counter_notes": "Per-process CPU is Mach ticks converted using mach_timebase_info, and may exceed wall time because of parallel/background work. Host paging counters are system-wide and do not identify the owner of pressure. Aggregate lake metrics are process-wide; hydration overlaps other phases.",
+    "engine_performance_fix_implemented": false,
+    "original_single_search_cause_proven": false,
+    "ready_transition_delay_matrix": [
+      {
+        "cycle": 1,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 164.877,
+        "took_ms": 158,
+        "process_counter_delta": {
+          "cpu_ms": 242.84158333333335,
+          "pageins": 232,
+          "disk_read_bytes": 21647360,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 164.103,
+          "pre_search_ms": 70.122,
+          "search_ms": 84.425,
+          "post_search_ms": 9.556,
+          "hydration_ms": 4.659,
+          "outside_lake_ms": 0.774,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 28.387,
+        "publication_ms": 40.206,
+        "remaining_pre_search_ms": 1.529
+      },
+      {
+        "cycle": 2,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 118.452,
+        "took_ms": 112,
+        "process_counter_delta": {
+          "cpu_ms": 216.65912500000002,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 117.637,
+          "pre_search_ms": 55.163,
+          "search_ms": 55.609,
+          "post_search_ms": 6.865,
+          "hydration_ms": 4.172,
+          "outside_lake_ms": 0.815,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 22.501,
+        "publication_ms": 31.325,
+        "remaining_pre_search_ms": 1.337
+      },
+      {
+        "cycle": 3,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 194.321,
+        "took_ms": 181,
+        "process_counter_delta": {
+          "cpu_ms": 237.39329166666664,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 193.471,
+          "pre_search_ms": 57.883,
+          "search_ms": 115.297,
+          "post_search_ms": 20.291,
+          "hydration_ms": 11.395,
+          "outside_lake_ms": 0.85,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 17.851,
+        "publication_ms": 38.678,
+        "remaining_pre_search_ms": 1.354
+      },
+      {
+        "cycle": 4,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 120.0,
+        "took_ms": 115,
+        "process_counter_delta": {
+          "cpu_ms": 221.6162916666667,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 119.204,
+          "pre_search_ms": 52.651,
+          "search_ms": 59.548,
+          "post_search_ms": 7.005,
+          "hydration_ms": 3.263,
+          "outside_lake_ms": 0.796,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.652,
+        "publication_ms": 27.384,
+        "remaining_pre_search_ms": 1.615
+      },
+      {
+        "cycle": 5,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 150.897,
+        "took_ms": 141,
+        "process_counter_delta": {
+          "cpu_ms": 246.05195833333323,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 149.982,
+          "pre_search_ms": 76.291,
+          "search_ms": 60.759,
+          "post_search_ms": 12.932,
+          "hydration_ms": 7.589,
+          "outside_lake_ms": 0.915,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 31.672,
+        "publication_ms": 42.632,
+        "remaining_pre_search_ms": 1.987
+      },
+      {
+        "cycle": 6,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 120.664,
+        "took_ms": 116,
+        "process_counter_delta": {
+          "cpu_ms": 213.74029166666662,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 119.556,
+          "pre_search_ms": 58.772,
+          "search_ms": 52.796,
+          "post_search_ms": 7.988,
+          "hydration_ms": 2.973,
+          "outside_lake_ms": 1.108,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 28.406,
+        "publication_ms": 29.029,
+        "remaining_pre_search_ms": 1.337
+      },
+      {
+        "cycle": 7,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 111.718,
+        "took_ms": 107,
+        "process_counter_delta": {
+          "cpu_ms": 198.773375,
+          "pageins": 0,
+          "disk_read_bytes": 16384,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 110.871,
+          "pre_search_ms": 53.683,
+          "search_ms": 48.682,
+          "post_search_ms": 8.506,
+          "hydration_ms": 3.129,
+          "outside_lake_ms": 0.847,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.007,
+        "publication_ms": 29.347,
+        "remaining_pre_search_ms": 1.329
+      },
+      {
+        "cycle": 8,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 125.96,
+        "took_ms": 120,
+        "process_counter_delta": {
+          "cpu_ms": 225.3221666666667,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 125.214,
+          "pre_search_ms": 66.598,
+          "search_ms": 51.99,
+          "post_search_ms": 6.626,
+          "hydration_ms": 4.241,
+          "outside_lake_ms": 0.746,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 26.175,
+        "publication_ms": 39.091,
+        "remaining_pre_search_ms": 1.332
+      },
+      {
+        "cycle": 9,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 158.919,
+        "took_ms": 134,
+        "process_counter_delta": {
+          "cpu_ms": 223.13870833333328,
+          "pageins": 0,
+          "disk_read_bytes": 18554880,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 158.019,
+          "pre_search_ms": 48.053,
+          "search_ms": 82.363,
+          "post_search_ms": 27.603,
+          "hydration_ms": 22.649,
+          "outside_lake_ms": 0.9,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 16.368,
+        "publication_ms": 30.339,
+        "remaining_pre_search_ms": 1.346
+      },
+      {
+        "cycle": 10,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 125.252,
+        "took_ms": 120,
+        "process_counter_delta": {
+          "cpu_ms": 223.06225000000006,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 124.416,
+          "pre_search_ms": 67.725,
+          "search_ms": 51.075,
+          "post_search_ms": 5.616,
+          "hydration_ms": 3.401,
+          "outside_lake_ms": 0.836,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 29.433,
+        "publication_ms": 36.893,
+        "remaining_pre_search_ms": 1.399
+      },
+      {
+        "cycle": 11,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 123.883,
+        "took_ms": 119,
+        "process_counter_delta": {
+          "cpu_ms": 215.15966666666657,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 123.117,
+          "pre_search_ms": 66.875,
+          "search_ms": 50.195,
+          "post_search_ms": 6.047,
+          "hydration_ms": 3.486,
+          "outside_lake_ms": 0.766,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 29.693,
+        "publication_ms": 35.748,
+        "remaining_pre_search_ms": 1.434
+      },
+      {
+        "cycle": 12,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 101.705,
+        "took_ms": 97,
+        "process_counter_delta": {
+          "cpu_ms": 207.45483333333334,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 100.854,
+          "pre_search_ms": 46.515,
+          "search_ms": 46.468,
+          "post_search_ms": 7.871,
+          "hydration_ms": 2.789,
+          "outside_lake_ms": 0.851,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 21.135,
+        "publication_ms": 24.095,
+        "remaining_pre_search_ms": 1.285
+      },
+      {
+        "cycle": 13,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 117.696,
+        "took_ms": 113,
+        "process_counter_delta": {
+          "cpu_ms": 208.00879166666664,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 116.988,
+          "pre_search_ms": 55.681,
+          "search_ms": 54.533,
+          "post_search_ms": 6.774,
+          "hydration_ms": 3.003,
+          "outside_lake_ms": 0.708,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 24.621,
+        "publication_ms": 29.701,
+        "remaining_pre_search_ms": 1.359
+      },
+      {
+        "cycle": 14,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 121.192,
+        "took_ms": 116,
+        "process_counter_delta": {
+          "cpu_ms": 202.10716666666667,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 120.478,
+          "pre_search_ms": 62.308,
+          "search_ms": 51.906,
+          "post_search_ms": 6.264,
+          "hydration_ms": 3.246,
+          "outside_lake_ms": 0.714,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 28.434,
+        "publication_ms": 32.567,
+        "remaining_pre_search_ms": 1.307
+      },
+      {
+        "cycle": 15,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 131.594,
+        "took_ms": 126,
+        "process_counter_delta": {
+          "cpu_ms": 217.9755416666667,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 130.691,
+          "pre_search_ms": 68.846,
+          "search_ms": 54.941,
+          "post_search_ms": 6.904,
+          "hydration_ms": 3.186,
+          "outside_lake_ms": 0.903,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 28.311,
+        "publication_ms": 39.214,
+        "remaining_pre_search_ms": 1.321
+      },
+      {
+        "cycle": 16,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 146.223,
+        "took_ms": 141,
+        "process_counter_delta": {
+          "cpu_ms": 231.11470833333317,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 145.319,
+          "pre_search_ms": 79.762,
+          "search_ms": 59.691,
+          "post_search_ms": 5.866,
+          "hydration_ms": 3.481,
+          "outside_lake_ms": 0.904,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 36.763,
+        "publication_ms": 40.936,
+        "remaining_pre_search_ms": 2.063
+      },
+      {
+        "cycle": 17,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 166.537,
+        "took_ms": 162,
+        "process_counter_delta": {
+          "cpu_ms": 255.29312500000003,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 165.578,
+          "pre_search_ms": 110.389,
+          "search_ms": 49.679,
+          "post_search_ms": 5.51,
+          "hydration_ms": 2.805,
+          "outside_lake_ms": 0.959,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 27.425,
+        "publication_ms": 81.568,
+        "remaining_pre_search_ms": 1.396
+      },
+      {
+        "cycle": 18,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 263.54,
+        "took_ms": 254,
+        "process_counter_delta": {
+          "cpu_ms": 270.1868333333334,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 262.643,
+          "pre_search_ms": 148.772,
+          "search_ms": 98.841,
+          "post_search_ms": 15.03,
+          "hydration_ms": 7.0,
+          "outside_lake_ms": 0.897,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 83.144,
+        "publication_ms": 63.609,
+        "remaining_pre_search_ms": 2.019
+      },
+      {
+        "cycle": 19,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 244.323,
+        "took_ms": 233,
+        "process_counter_delta": {
+          "cpu_ms": 302.46154166666656,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 243.285,
+          "pre_search_ms": 159.282,
+          "search_ms": 69.616,
+          "post_search_ms": 14.387,
+          "hydration_ms": 9.604,
+          "outside_lake_ms": 1.038,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 56.339,
+        "publication_ms": 100.617,
+        "remaining_pre_search_ms": 2.326
+      },
+      {
+        "cycle": 20,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 127.758,
+        "took_ms": 123,
+        "process_counter_delta": {
+          "cpu_ms": 232.0528333333334,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 126.867,
+          "pre_search_ms": 62.616,
+          "search_ms": 58.677,
+          "post_search_ms": 5.574,
+          "hydration_ms": 3.159,
+          "outside_lake_ms": 0.891,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 23.886,
+        "publication_ms": 37.371,
+        "remaining_pre_search_ms": 1.359
+      },
+      {
+        "cycle": 21,
+        "delay_seconds": 0,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 121.033,
+        "took_ms": 116,
+        "process_counter_delta": {
+          "cpu_ms": 221.10608333333323,
+          "pageins": 0,
+          "disk_read_bytes": 8192,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 120.346,
+          "pre_search_ms": 57.986,
+          "search_ms": 54.902,
+          "post_search_ms": 7.458,
+          "hydration_ms": 3.638,
+          "outside_lake_ms": 0.687,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 21.845,
+        "publication_ms": 34.867,
+        "remaining_pre_search_ms": 1.274
+      },
+      {
+        "cycle": 22,
+        "delay_seconds": 0.05,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 148.925,
+        "took_ms": 143,
+        "process_counter_delta": {
+          "cpu_ms": 256.4455833333333,
+          "pageins": 0,
+          "disk_read_bytes": 4096,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 148.139,
+          "pre_search_ms": 78.536,
+          "search_ms": 62.595,
+          "post_search_ms": 7.008,
+          "hydration_ms": 3.518,
+          "outside_lake_ms": 0.786,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 26.54,
+        "publication_ms": 50.224,
+        "remaining_pre_search_ms": 1.772
+      },
+      {
+        "cycle": 23,
+        "delay_seconds": 0.2,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 117.142,
+        "took_ms": 112,
+        "process_counter_delta": {
+          "cpu_ms": 195.84695833333342,
+          "pageins": 0,
+          "disk_read_bytes": 12288,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 116.336,
+          "pre_search_ms": 50.199,
+          "search_ms": 58.493,
+          "post_search_ms": 7.644,
+          "hydration_ms": 3.782,
+          "outside_lake_ms": 0.806,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 22.65,
+        "publication_ms": 26.066,
+        "remaining_pre_search_ms": 1.483
+      },
+      {
+        "cycle": 24,
+        "delay_seconds": 1,
+        "range_cache_cleared": false,
+        "maintenance_mode": "default",
+        "disk_ready_before": 1,
+        "elapsed_ms": 95.14,
+        "took_ms": 90,
+        "process_counter_delta": {
+          "cpu_ms": 190.8079583333332,
+          "pageins": 0,
+          "disk_read_bytes": 0,
+          "disk_write_bytes": 20480
+        },
+        "lake_phase_profile": {
+          "total_ms": 94.479,
+          "pre_search_ms": 45.472,
+          "search_ms": 43.049,
+          "post_search_ms": 5.958,
+          "hydration_ms": 3.331,
+          "outside_lake_ms": 0.661,
+          "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        },
+        "cache_init_attempts": 0,
+        "source_ms": 21.144,
+        "publication_ms": 22.933,
+        "remaining_pre_search_ms": 1.395
+      }
+    ],
+    "probe_contract": {
+      "table": "hn_archive_poc",
+      "query": {
+        "full_text_search": {
+          "match": "database",
+          "field": "body"
+        },
+        "full_text_index": "body_text",
+        "fields": [
+          "hn_id",
+          "title",
+          "item_type",
+          "author",
+          "points",
+          "created_at"
+        ],
+        "highlight": {
+          "fields": [
+            "body"
+          ]
+        },
+        "limit": 5,
+        "order_by": [
+          {
+            "field": "_score",
+            "desc": true
+          }
+        ]
+      },
+      "ready_probes": "Restart the same owned standalone state, wait for /tables, poll the disk-ready metric, then issue the first query at the recorded delay. Preserve existing disk cache and verify hit IDs and scores. Sample metrics before and six seconds after the query to allow counter publication.",
+      "pair_configuration": "Disable artifact GC in both arms; change only lake_cache.enabled. Both arms restart immediately after /tables readiness.",
+      "process_counter_conversion": "macOS proc_pid_rusage V2; CPU Mach ticks converted with mach_timebase_info. No CPU/wall subtraction is treated as measured wait time."
+    }
+  }
+}
