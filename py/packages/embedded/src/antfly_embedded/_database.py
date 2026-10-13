@@ -468,6 +468,23 @@ class Database:
         finally:
             self._release()
 
+    def list_resolver_identities(self, *, raw: bool = False) -> Any:
+        """List active/retired table-local identities and their durable merges."""
+        return self._json_read(self._lib.antfly_db_list_resolver_identities_json, raw=raw)
+
+    def drop_resolver_identity(self, resolver: str) -> bool:
+        """Permanently discard a retired identity and its merges."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            deleted = ctypes.c_bool(False)
+            errors.raise_for_code(
+                self._lib.antfly_db_drop_resolver_identity(ctypes.c_void_p(handle), name, ctypes.byref(deleted))
+            )
+            return bool(deleted.value)
+        finally:
+            self._release()
+
     def set_resolver_namespace(self, resolver: str, request: JSONInput) -> None:
         """Reset or explicitly migrate aliases/merges into a new table/template; drain afterward."""
         handle = self._acquire()

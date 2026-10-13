@@ -375,6 +375,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ResolverSourceArtifactImmutable,
         error.ResolverArtifactImmutable,
         error.InvalidResolverConfig,
+        error.ResolverIdentityActive,
         error.EmptyEntityKey,
         error.InvalidArgument,
         error.SqlArraySubscriptError,

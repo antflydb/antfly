@@ -466,6 +466,10 @@ antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice
  * A durable fence rejects stale inline namespaces/aliases even after reset.
  * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
  * Application-owned documents/references are not renamed. */
+/* Lists active and retired identities, including durable merges. */
+antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);
+/* Drops a retired identity and its merges; rejects an active identity. */
+antfly_error_code antfly_db_drop_resolver_identity(antfly_db *db, antfly_slice resolver_name, bool *out_deleted);
 antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
 
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);

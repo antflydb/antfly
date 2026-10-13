@@ -927,9 +927,11 @@ the same namespace admission checks. Reactivation advances the internal revision
 so source changes made while retired cannot reuse stale decisions. Independently
 registered resolvers remain
 active when an index is removed. Reapplying an older inline declaration records
-its ownership without changing its resolution revision. Retired identities use
-required catalog version 2, so libraries without lifecycle support reject them
-instead of silently reactivating them. Native Lite and Directory C API handles both
+its ownership without changing its resolution revision. Retirement is additive
+catalog metadata and does not advance the required merge-state format version.
+A previous reader that tolerates optional fields can open the database, but may
+execute retired definitions; use a lifecycle-aware library when relying on
+retirement to suspend execution. Native Lite and Directory C API handles both
 reapply inline resolvers when adding an identical existing index.
 Existing artifact/index repair APIs rebuild derived state under the declared
 identity rules; they do not infer a key migration. This namespace operation
@@ -1011,7 +1013,13 @@ Native Lite candidate revisions include the physical table binding, committed
 source/enrichment sequences, selected index configuration and its applied replay
 sequence. This covers canonical inserts/deletes, table recreation and vectors
 becoming visible after an ANN drain. Embedding revisions cover the destination's
-embedding configuration independently of table mutations. Runtime adapters that
+embedding configuration and the resolved loaded model's immutable revision,
+independently of table mutations. The local revision covers resolved weight,
+shard, ONNX external tensor, tokenizer and processor file generations (inode/size/mtime/ctime), captured
+and cross-checked during model construction. It identifies the loaded generation,
+not a model name or a fresh inspection of potentially replaced files. Providers
+without an attested revision conservatively re-embed; no loaded model means no
+embedding reuse yet. Runtime adapters that
 cannot provide a complete revision return null: candidate fetching and/or
 embedding generation then run again rather than trust incomplete dependencies.
 The distributed adapter currently takes this conservative path. Candidate cache
@@ -1035,3 +1043,77 @@ mentions. It no longer requires rerunning extraction, embeddings, candidate
 search or comparisons whose dependencies are unchanged. Reuse is deliberately
 conservative: a destination mutation invalidates the table's candidate revision,
 including empty candidate sets, even if it ultimately changes no matches.
+
+
+### Embedded upgrade and identity management
+
+Prefer `add_index({..., "replaces":"knowledge_v1"})` for graph index versioning.
+It privately constructs the replacement and commits the new index catalog,
+last-owner retirement, routing revisions and cleanup debt together. A construction
+or pre-commit failure leaves the old index serving. `replaces` is a command field,
+not stored declarative configuration. Retrying the same request is idempotent;
+reopening may reapply the identical new config without `replaces`. Currently
+atomic replacement supports graph-to-graph upgrades with distinct names.
+
+The separate-call recipe is add v2 first, then delete v1. When changing identity
+rules, migrate/reset the resolver namespace first and submit v2 with the new
+inline rules; existing v1 keeps execution active during this sequence. Delete-first
+upgrades are supported too: `list_resolver_identities` includes archived configs
+and durable merges, and `set_resolver_namespace` works on retired identities
+without reactivating them. Adding v2 then reactivates the migrated identity.
+`drop_resolver_identity` explicitly discards an archived identity and its merges;
+it rejects active identities. Index deletion only retires last-owner identities.
+The capabilities/status JSON reports `minimum_reader_version`, an on-disk feature
+epoch independent of the package release: 1 for the baseline format, 2 when durable
+merges, aliases, namespace fences or disabled promotion require identity-aware
+readers. Optional retirement/cache metadata does not advance this epoch. Durable identity rules still require a reader supporting
+their format; additive retirement cannot give older readers its execution semantics.
+
+### Cache storage and mutation invariants
+
+Inline resolver configs accept `retain_work: "none" | "embeddings" | "full"`
+(default `full`) and `max_work_bytes` (default 1 MiB, maximum 16 MiB). The latter
+bounds persisted private work per resolution artifact; oversize work is omitted
+entirely without dropping authoritative entity decisions. `embeddings` retains
+only per-mention embeddings and dependencies, never candidate records/features.
+Vectors are encoded losslessly as base64 little-endian IEEE754 f32, including
+hydrated candidate vectors; older JSON-array caches remain readable. Public
+artifact lookup and raw resolution lookup strip `_resolution_work`; the existing
+artifact deletion, replay transaction and backup lifetime own cache GC. Backups
+retain private work as an expendable optimization, not authoritative decisions.
+
+Candidate epochs must advance on every visible destination insert, update,
+delete, TTL expiration and index publication. TTL uses ordinary guarded delete
+batches and advances the same replay clock. TTL-enabled destinations disable
+candidate reuse because logical expiration can precede physical cleanup. Physical
+compaction preserves that clock and cannot resurrect a deleted candidate. Directory adapters return no
+candidate revision until they can provide a pinned snapshot across tables;
+they refetch instead of reusing an unpinned candidate set. Aliases and merges are
+applied from current identity state on each resolution and override cached matches.
+Retiring a labeled resolver invalidates its source-sharing catch-all siblings and
+publishes durable backfill cursors in the retirement transaction.
+
+### Source-table identity and retries
+
+Resolver names, aliases, merges and namespace fences are scoped by source table.
+Two source tables may use the same resolver name and key template. Separate
+destinations give independent entities. With a shared destination, identical keys
+intentionally identify the same canonical row: promotion preserves its first
+canonical name and unions aliases. Native promotions serialize under the database
+writer fence; Directory promotions use the transaction coordinator's version
+checks. Conflicting writes retry rather than silently overwrite one another.
+A merge on source A does not modify source B's resolver mappings, even when both
+promote to the same destination; shared destination rows remain shared data.
+
+`ANTFLY_BUSY` means concurrent execution/configuration prevented establishing a
+consistent operation. Retry the entire read-only `resolve_query` request with
+bounded exponential backoff (for example 5 ms doubling to 100 ms, with jitter).
+Queries perform no writes and are safe to retry. Identical index config replay,
+namespace reset/mapping to the same desired state, and repeated key merges are
+idempotent in outcome; revisions may advance on explicit namespace operations.
+Inspect identity/catalog state after an uncertain transport failure before retrying
+an irreversible drop. Catalog activity admission waits at most 100 one-millisecond
+intervals, then returns Busy before mutation; index deletion cannot spin forever
+behind extraction or promotion. No internal text-query retries repeat model work
+without the caller's latency budget. Native same-path calls retain the documented
+path serialization while inference releases the fence with pinned lifetimes.

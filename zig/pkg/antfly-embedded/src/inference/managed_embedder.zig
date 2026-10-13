@@ -1242,6 +1242,7 @@ pub const ManagedEmbedder = struct {
             .deinit_fn = deinitDenseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
+            .cache_revision_fn = cacheRevision,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.denseForegroundBounded(),
         };
@@ -1257,6 +1258,7 @@ pub const ManagedEmbedder = struct {
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
+            .cache_revision_fn = cacheRevision,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
@@ -1501,6 +1503,14 @@ pub const ManagedEmbedder = struct {
 
     fn findEntry(self: *const ManagedEmbedder, name: []const u8) ?*const ManagedEmbeddingEntry {
         return self.findQueryEntry(name) orelse self.findArtifactEntry(name);
+    }
+
+    fn cacheRevision(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?[32]u8 {
+        const capabilities = denseCapabilities(ptr, a, name) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        return capabilities.model_revision;
     }
 
     fn recoveryIdentity(ptr: *anyopaque, embedding_name: []const u8) ?db_embedder.RecoveryIdentity {

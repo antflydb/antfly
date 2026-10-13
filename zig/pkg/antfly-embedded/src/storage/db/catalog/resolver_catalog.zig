@@ -107,6 +107,9 @@ pub const ResolverConfig = struct {
     retired: bool = false,
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
+    /// Optional work is bounded independently of authoritative resolutions.
+    retain_work: resolver_lib.WorkRetention = .full,
+    max_work_bytes: usize = 1024 * 1024,
     /// Mention labels this resolver consumes. Empty means all labels
     /// (catch-all). Labeled resolvers sharing a source artifact must claim
     /// disjoint label sets (admission-enforced), and catch-alls skip labels
@@ -203,7 +206,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -263,6 +266,8 @@ pub const ResolverConfig = struct {
             .inline_managed = cfg.inline_managed,
             .retired = cfg.retired,
             .promote = cfg.promote,
+            .retain_work = cfg.retain_work,
+            .max_work_bytes = cfg.max_work_bytes,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
@@ -314,6 +319,7 @@ pub const ResolverConfig = struct {
     pub fn validate(self: ResolverConfig) !void {
         try resolver_lib.validateAliases(self.aliases);
         try resolver_lib.validateAliases(self.merges);
+        if (self.max_work_bytes > 16 * 1024 * 1024) return error.InvalidResolverConfig;
         if (self.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
         const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(effective);
@@ -386,7 +392,7 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
     }
     for (parsed.value, 0..) |cfg, i| {
         if (cfg.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
-        if (cfg.retired and (cfg.inline_managed != true or cfg.merge_state_version != 2)) return error.InvalidResolverConfig;
+        if (cfg.retired and cfg.inline_managed != true) return error.InvalidResolverConfig;
         out[i] = try ResolverConfig.clone(alloc, cfg);
         initialized += 1;
     }
@@ -730,7 +736,7 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
 
 test "capi retired resolver identities retain merges without entering execution catalogs" {
     const a = std.testing.allocator;
-    var cfg: ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .inline_managed = true, .retired = true, .merge_state_version = 2 };
+    var cfg: ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .inline_managed = true, .retired = true };
     const encoded = try serializeCatalog(a, &.{cfg});
     defer a.free(encoded);
     const active = try deserializeActiveCatalog(a, encoded);
@@ -745,6 +751,7 @@ test "capi retired resolver identities retain merges without entering execution 
     try std.testing.expect(identities[0].retired);
     cfg.merges = &.{.{ .key = "a", .target = "b" }};
     cfg.merge_generation = 1;
+    cfg.merge_state_version = 1;
     const merged = try serializeCatalog(a, &.{cfg});
     defer a.free(merged);
     const sidecar = try serializeMergeState(a, &.{cfg});

@@ -131,6 +131,7 @@ pub const Resolution = struct {
     entities: []const ResolvedEntity,
     skipped_mentions: usize = 0,
     work: ?WorkCache = null,
+    max_work_bytes: usize = 1024 * 1024,
 
     pub fn deinit(self: *Resolution) void {
         self.arena.deinit();
@@ -180,10 +181,12 @@ pub const Resolution = struct {
         }
         try out.append(allocator, ']');
         if (self.work) |work| {
-            try out.appendSlice(allocator, ",\"_resolution_work\":");
             const encoded = try work.toJson(allocator);
             defer allocator.free(encoded);
-            try out.appendSlice(allocator, encoded);
+            if (encoded.len <= self.max_work_bytes) {
+                try out.appendSlice(allocator, ",\"_resolution_work\":");
+                try out.appendSlice(allocator, encoded);
+            }
         }
         try out.append(allocator, '}');
         return out.toOwnedSlice(allocator);
@@ -1277,6 +1280,8 @@ pub const RunResult = enum {
 /// Dependency records live inside the resolution artifact, so the existing
 /// atomic artifact/replay commit, deletion and portable backup own them too.
 /// Unknown versions and damaged cache data are discarded, never decisions.
+pub const WorkRetention = enum { none, embeddings, full };
+
 pub const WorkCache = struct {
     version: u32 = 1,
     promotion_enabled: ?bool = null,
@@ -1332,11 +1337,61 @@ pub const WorkCache = struct {
         }
         // Large canonical vectors are stored once per work unit, not once per
         // mention/candidate pair. Each pair retains just its comparison features.
-        return try std.json.Stringify.valueAlloc(gpa, Wire{ .version = self.version, .promotion_enabled = self.promotion_enabled, .mentions = mentions, .candidates = pool.items }, .{});
+        const raw = try std.json.Stringify.valueAlloc(a, Wire{ .version = self.version, .promotion_enabled = self.promotion_enabled, .mentions = mentions, .candidates = pool.items }, .{});
+        var compact = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try transformVectors(a, &compact, true);
+        return try std.json.Stringify.valueAlloc(gpa, compact, .{});
+    }
+
+    fn transformVectors(a: std.mem.Allocator, value: *std.json.Value, pack: bool) !void {
+        switch (value.*) {
+            .object => |*object| {
+                var it = object.iterator();
+                while (it.next()) |entry| {
+                    const is_vector = std.mem.eql(u8, entry.key_ptr.*, "vector") or std.mem.eql(u8, entry.key_ptr.*, "embedding");
+                    const v = entry.value_ptr;
+                    if (pack and is_vector and v.* == .array) {
+                        const bytes = try a.alloc(u8, try std.math.mul(usize, v.array.items.len, 4));
+                        for (v.array.items, 0..) |item, i| {
+                            const n: f32 = switch (item) {
+                                .float => |f| @floatCast(f),
+                                .integer => |n| @floatFromInt(n),
+                                else => return error.InvalidResolutionCache,
+                            };
+                            std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(n), .little);
+                        }
+                        const codec = std.base64.standard.Encoder;
+                        const encoded = try a.alloc(u8, 6 + codec.calcSize(bytes.len));
+                        @memcpy(encoded[0..6], "f32le:");
+                        _ = codec.encode(encoded[6..], bytes);
+                        v.* = .{ .string = encoded };
+                    } else if (!pack and is_vector and v.* == .string) {
+                        if (!std.mem.startsWith(u8, v.string, "f32le:")) return error.InvalidResolutionCache;
+                        const codec = std.base64.standard.Decoder;
+                        const bytes = try a.alloc(u8, try codec.calcSizeForSlice(v.string[6..]));
+                        try codec.decode(bytes, v.string[6..]);
+                        if (bytes.len % 4 != 0) return error.InvalidResolutionCache;
+                        var items: std.array_list.Managed(std.json.Value) = .init(a);
+                        for (0..bytes.len / 4) |i| {
+                            const n: f32 = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+                            if (!std.math.isFinite(n)) return error.InvalidResolutionCache;
+                            try items.append(.{ .float = n });
+                        }
+                        v.* = .{ .array = items };
+                    } else try transformVectors(a, v, pack);
+                }
+            },
+            .array => |*items| for (items.items) |*item| {
+                try transformVectors(a, item, pack);
+            },
+            else => {},
+        }
     }
 
     fn parseValue(a: std.mem.Allocator, value: std.json.Value) !?WorkCache {
-        const wire = try std.json.parseFromValueLeaky(Wire, a, value, .{ .ignore_unknown_fields = true });
+        var expanded = value;
+        try transformVectors(a, &expanded, false);
+        const wire = try std.json.parseFromValueLeaky(Wire, a, expanded, .{ .ignore_unknown_fields = true });
         if (wire.version != 1) return null;
         const mentions = try a.alloc(MentionWork, wire.mentions.len);
         for (wire.mentions, mentions) |entry, *mention| {
@@ -1411,6 +1466,8 @@ pub const ResolutionStage = struct {
     stats: ?*WorkStats = null,
     promotion_enabled: bool = true,
     retain_work: bool = true,
+    work_retention: WorkRetention = .full,
+    max_work_bytes: usize = 1024 * 1024,
     /// Optional name-embedding backfill: when set, each mention lacking an
     /// `embedding` gets one from its text before blocking/scoring, so `ann`
     /// candidate search and cosine comparisons have a query vector.
@@ -1619,7 +1676,14 @@ pub const ResolutionStage = struct {
                 }
             }
         }
-        if (self.retain_work) resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
+        resolution.max_work_bytes = self.max_work_bytes;
+        if (self.retain_work and self.work_retention != .none) {
+            if (self.work_retention == .embeddings) for (work) |*mention| {
+                mention.candidates = &.{};
+                mention.candidate_dependency = null;
+            };
+            resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
+        }
         return try resolution.toJson(gpa);
     }
 
@@ -2839,6 +2903,43 @@ test "incremental resolution reuses stages and invalidates changed dependencies"
     var cache_json = try std.json.parseFromSlice(std.json.Value, a, warm, .{});
     defer cache_json.deinit();
     try testing.expectEqual(@as(usize, 1), cache_json.value.object.get("_resolution_work").?.object.get("candidates").?.array.items.len);
+
+    // Both mention and candidate vectors use lossless compact storage.
+    const packed_mention = cache_json.value.object.get("_resolution_work").?.object.get("mentions").?.array.items[0];
+    try testing.expect(std.mem.startsWith(u8, packed_mention.object.get("embedding").?.string, "f32le:"));
+    stage.work_retention = .embeddings;
+    const embeddings_only = (try stage.computeAlloc(a, memory.store(), provider, "ext")).?;
+    defer a.free(embeddings_only);
+    var only_json = try std.json.parseFromSlice(std.json.Value, a, embeddings_only, .{});
+    defer only_json.deinit();
+    try testing.expectEqual(@as(usize, 0), only_json.value.object.get("_resolution_work").?.object.get("candidates").?.array.items.len);
+    stage.work_retention = .none;
+    const no_work = (try stage.computeAlloc(a, memory.store(), provider, "ext")).?;
+    defer a.free(no_work);
+    try testing.expect(std.mem.indexOf(u8, no_work, "_resolution_work") == null);
+    stage.work_retention = .full;
+    stage.max_work_bytes = 1;
+    const bounded = (try stage.computeAlloc(a, memory.store(), provider, "ext")).?;
+    defer a.free(bounded);
+    try testing.expect(std.mem.indexOf(u8, bounded, "_resolution_work") == null);
+    stage.max_work_bytes = 1024 * 1024;
+    // Newly supplied curation must win over a cached candidate match.
+    const previous_aliases = resolver.aliases;
+    resolver.aliases = try a.alloc(KeyAlias, 1);
+    @constCast(resolver.aliases)[0] = .{ .key = try a.dupe(u8, "ada"), .target = try a.dupe(u8, "curated") };
+    _ = try stage.run(a, memory.store(), provider, "ext", "res");
+    const curated_raw = (try memory.store().get(a, "res")).?;
+    defer a.free(curated_raw);
+    var curated = try parseResolution(a, curated_raw);
+    defer curated.deinit();
+    try testing.expectEqualStrings("curated", curated.entities[1].doc_ref.key);
+
+    for (resolver.aliases) |alias| {
+        a.free(alias.key);
+        a.free(alias.target);
+    }
+    a.free(resolver.aliases);
+    resolver.aliases = previous_aliases;
 
     // Unknown/corrupt cache versions are expendable and need no migration.
     try memory.store().put("res", "{\"_resolution_work\":{\"version\":99,\"mentions\":[]}}");

@@ -547,6 +547,26 @@ impl Database {
         })
     }
 
+    /// List active and retired identities, including durable merges.
+    pub fn resolver_identities_json(&self) -> Result<Vec<u8>> {
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_list_resolver_identities_json(h, out) })
+    }
+
+    /// Permanently discard a retired identity and its durable merges.
+    pub fn drop_resolver_identity(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_drop_resolver_identity(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
+            })?;
+            Ok(deleted)
+        })
+    }
+
     /// Atomically reset or migrate resolver identities; drain afterward.
     pub fn set_resolver_namespace_json(
         &self,

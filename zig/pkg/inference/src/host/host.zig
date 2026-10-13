@@ -3080,6 +3080,15 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
+    if (task == .embed) {
+        // Do not load weights just to inspect capabilities. Until an actual
+        // loaded generation exists, storage must conservatively re-embed.
+        if (node.model_manager.acquireLoadedModel(model_path)) |cached| {
+            var loaded = cached;
+            defer loaded.release();
+            result.model_revision = loaded.get().resolution_revision;
+        }
+    }
     try result.validate();
     return result;
 }

@@ -657,3 +657,174 @@ def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) 
                 assert len(edges) == 1
                 expected_target = "alpha/carol" if suffix == "alpha" else "beta/bob"
                 assert base64.b64decode(edges[0]["target_b64"]).decode() == expected_target
+
+
+def _open_graph_test(path, options):
+    opener = (
+        antfly_embedded.create_with_options
+        if options.storage == antfly_embedded.Storage.LITE and not path.exists()
+        else antfly_embedded.open_with_options
+    )
+    return opener(path, options)
+
+
+def _resolver_graph(name, resolver, *, labels=None, template="entity/{{ uslug _entity.text }}", destination="default"):
+    return {
+        "name": name,
+        "type": "graph",
+        "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}, {"name": "knows"}],
+        "resolvers": [
+            {
+                "name": resolver,
+                "table": destination,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved_" + resolver,
+                "key_template": template,
+                "labels": labels or [],
+                "promote": False,
+            }
+        ],
+    }
+
+
+def _stored_resolution(db, name):
+    key = b"\x01claim\x00\x00\x20resolution\x00\x00" + name.encode() + b"\x00\x00"
+    return json.loads(db.get_raw(key.decode()))
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_retirement_replays_catchall_routing(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    with _open_graph_test(
+        tmp_path / ("routing.aflite" if storage == antfly_embedded.Storage.LITE else "routing"), options
+    ) as db:
+        # Catch-all initially skips the person mention claimed by its sibling.
+        db.add_index(_resolver_graph("people_index", "people", labels=["person"]))
+        db.add_index(_resolver_graph("catchall_index", "catchall"))
+        extraction = {"entities": [{"id": "a", "text": "Ada", "label": "person"}]}
+        db.batch_json({"inserts": {"claim": {"kg": extraction}}})
+        db.run_until_idle()
+        assert _stored_resolution(db, "resolved_catchall")["entities"] == []
+        assert db.delete_index("people_index")
+        db.run_until_idle()
+        stored = _stored_resolution(db, "resolved_catchall")
+        query = db.resolve_query("catchall", {"extraction": extraction})
+        assert [e["doc_ref"]["key"] for e in stored["entities"]] == ["entity/ada"]
+        for entity in query["resolution"]["entities"]:
+            entity["doc_ref"].pop("storage_table", None)
+        for entity in stored["entities"]:
+            entity["doc_ref"].pop("storage_table", None)
+        assert stored["entities"] == query["resolution"]["entities"]
+        assert "_resolution_work" not in stored
+        # Reactivation restores the label owner and retires the catch-all's
+        # previous entity, without changing the catch-all's inline config.
+        db.add_index(_resolver_graph("people_index_v2", "people", labels=["person"]))
+        db.run_until_idle()
+        assert _stored_resolution(db, "resolved_catchall")["entities"] == []
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("order", ["add_first", "delete_first", "atomic"])
+def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    config = _resolver_graph("knowledge_v1", "concepts")
+    mention = {"text": "Ada", "label": "person"}
+    path = tmp_path / ("upgrade.aflite" if storage == antfly_embedded.Storage.LITE else "upgrade")
+    with _open_graph_test(path, options) as db:
+        db.add_index(config)
+        db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
+        db.run_until_idle()
+        reader_version = db.capabilities()["minimum_reader_version"]
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 2
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
+            db.drop_resolver_identity("concepts")
+        upgraded = json.loads(json.dumps(config))
+        upgraded["name"] = "knowledge_v2"
+        if order == "delete_first":
+            assert db.delete_index("knowledge_v1")
+            identities = db.list_resolver_identities()
+            assert identities[0]["config"]["retired"] is True
+            assert identities[0]["config"].get("merge_state_version", 0) <= 1
+            assert db.capabilities()["minimum_reader_version"] == reader_version
+            db.set_resolver_namespace(
+                "concepts",
+                {
+                    "table": "default",
+                    "key_template": "v2/{{ uslug _entity.text }}",
+                    "key_map": [
+                        {"key": "entity/ada", "target": "v2/ada"},
+                        {"key": "entity/canonical", "target": "v2/canonical"},
+                    ],
+                },
+            )
+            assert db.list_resolver_identities()[0]["config"]["retired"] is True
+            upgraded["resolvers"][0]["key_template"] = "v2/{{ uslug _entity.text }}"
+            db.add_index(upgraded)
+            expected = "v2/canonical"
+        else:
+            if order == "atomic":
+                upgraded["replaces"] = "knowledge_v1"
+                rejected = dict(upgraded, name="broken", edge_types=False)
+                with pytest.raises(antfly_embedded.AntflyError):
+                    db.add_index(rejected)
+                assert db.render_resolver_key("concepts", mention)["key"] == "entity/canonical"
+            db.add_index(upgraded)
+            if order == "add_first":
+                assert db.delete_index("knowledge_v1")
+            expected = "entity/canonical"
+        if order == "atomic":
+            # Repeating the command after the old index is gone is idempotent.
+            db.add_index(upgraded)
+        db.run_until_idle()
+        assert db.render_resolver_key("concepts", mention)["key"] == expected
+        names = {i["name"] for i in db.list_indexes()}
+        assert "knowledge_v2" in names
+        assert "knowledge_v1" not in names
+        upgraded.pop("replaces", None)
+    with _open_graph_test(path, options) as db:
+        db.add_index(upgraded)
+        assert db.render_resolver_key("concepts", mention)["key"] == expected
+        assert db.delete_index("knowledge_v2")
+        assert db.drop_resolver_identity("concepts")
+        assert db.list_resolver_identities() == []
+        assert not db.drop_resolver_identity("concepts")
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("shared", [False, True])
+def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    mention = {"text": "Ada", "label": "person"}
+    with _open_graph_test(
+        tmp_path / ("same_keys.aflite" if storage == antfly_embedded.Storage.LITE else "same_keys"), options
+    ) as db:
+        for destination in ["entities"] if shared else ["entities_a", "entities_b"]:
+            db.create_table(destination, {})
+        for source in ("a", "b"):
+            db.create_table(source, {})
+            with db.open_table(source) as table:
+                cfg = _resolver_graph("knowledge", "people", destination="entities" if shared else "entities_" + source)
+                cfg["resolvers"][0]["promote"] = True
+                table.add_index(cfg)
+                table.batch_json({"inserts": {"claim": {"kg": {"entities": [dict(mention, id="a")]}}}})
+                table.run_until_idle()
+        with db.open_table("a") as a, db.open_table("b") as b:
+            assert (
+                a.render_resolver_key("people", mention)["key"]
+                == b.render_resolver_key("people", mention)["key"]
+                == "entity/ada"
+            )
+            a.merge_resolver_keys("people", "entity/ada", "entity/canonical")
+            a.run_until_idle()
+            assert a.render_resolver_key("people", mention)["key"] == "entity/canonical"
+            assert b.render_resolver_key("people", mention)["key"] == "entity/ada"
+            assert b.list_resolver_identities()[0]["merges"] == []
+        with db.open_table("entities" if shared else "entities_b") as entities:
+            assert entities.lookup("entity/ada")["canonical_name"] == "Ada"

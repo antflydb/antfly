@@ -679,9 +679,11 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
-            '-Dtest-filter=--test-filter=capi native text queries' -j1
+            -j1
           cd ..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
@@ -1132,9 +1134,11 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
-            '-Dtest-filter=--test-filter=capi native text queries' -j1
+            -j1
           cd ..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \

@@ -38,18 +38,26 @@ fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, 
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     // Directory handles permit concurrent writes; without a pinned candidate
     // snapshot they must refetch. Native calls own the database path gate.
-    if (handle.embedded_path == null) return .{};
+    if (handle.lite_profile != .native) return .{};
     const database = try tables.get(handle, table);
     const physical = try boundTable(ptr, table);
     const index_config = database.core.index_manager.get(index);
+    var schema = database.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    const time_dependent = if (schema) |view| view.visibilityTtlDurationNs() != 0 else false;
     var producer = try database.getEnrichment(a, .embedding, embedding);
     defer if (producer) |*config| config.deinit(a);
     const hash = @import("antfly_resolver").fingerprint;
+    const embedder = database.resolution_embedder orelse if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null;
+    const model_revision: ?[32]u8 = if (embedder) |provider| blk: {
+        const revision = provider.cache_revision_fn orelse break :blk null;
+        break :blk try revision(provider.ptr, a, embedding);
+    } else null;
     var applied = try database.core.loadAppliedSequence(a, index);
     if (database.executor.appliedSequence(index)) |live| applied = @max(applied, live);
     return .{
-        .candidates = try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
-        .embedding = try hash(a, .{ physical, embedding, producer, index_config }),
+        .candidates = if (time_dependent) null else try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
+        .embedding = if (model_revision) |revision| try hash(a, .{ physical, embedding, producer, index_config, revision }) else null,
     };
 }
 
@@ -106,8 +114,11 @@ fn merge(a: std.mem.Allocator, current: ?[]const u8, incoming: []const u8, key: 
         if (redirect != .string) return error.InvalidEntityPromotionDocument;
         try ops.append(a, .{ .op = .set, .path = "merged_into", .value_json = try std.json.Stringify.valueAlloc(a, redirect, .{}) });
         if (document.object.get("merged_into_table")) |table| {
-            if (table != .string) return error.InvalidEntityPromotionDocument;
-            try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try std.json.Stringify.valueAlloc(a, table, .{}) });
+            switch (table) {
+                .string => try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try std.json.Stringify.valueAlloc(a, table, .{}) }),
+                .null => try ops.append(a, .{ .op = .unset, .path = "merged_into_table" }),
+                else => return error.InvalidEntityPromotionDocument,
+            }
         } else try ops.append(a, .{ .op = .unset, .path = "merged_into_table" });
     }
     if (ops.items.len == 0) return error.InvalidEntityPromotionDocument;
@@ -563,8 +574,13 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     // hand-written canonical row or vector. A deterministic provider makes
     // this production drain path run in ordinary CI without model downloads.
     const Embedder = struct {
+        model_revision: u8 = 1,
         mention_calls: usize = 0,
         entity_calls: usize = 0,
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @as([32]u8, @splat(self.model_revision));
+        }
         fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, _: []const u8, dims: u32) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, name, "mention_names")) self.mention_calls += 1 else self.entity_calls += 1;
@@ -574,12 +590,12 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     };
     var embed_context: Embedder = .{};
     try entities.addEnrichment(.{ .name = "entity_names", .kind = .embedding, .field = "canonical_name", .vector_space = "names", .expected_dims = 3 });
-    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed } });
+    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision } });
     const config =
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ slug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":1,"name_embedding":"mention_names","name_embedding_dims":3,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"canonical_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
-    const fake_embedder: @import("../storage/db/enrichment/embedder.zig").DenseEmbedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed };
+    const fake_embedder: @import("../storage/db/enrichment/embedder.zig").DenseEmbedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision };
     try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
     handle.db.setResolutionEmbedder(fake_embedder);
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:seed", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Approval reviewer\"}]}}" }} });
@@ -654,9 +670,40 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expect(!std.mem.eql(u8, &before_revision.candidates.?, &after_revision.candidates.?));
     try std.testing.expectEqualSlices(u8, &before_revision.embedding.?, &after_revision.embedding.?);
 
+    try entities.batch(.{ .deletes = &.{"concept/new"} });
+    const deleted_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &after_revision.candidates.?, &deleted_revision.candidates.?));
+    const compacted = try handle.owned_lite_backend.?.vacuum();
+    _ = compacted;
+    const compacted_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    // Compaction cannot roll back the deletion fence or resurrect candidates.
+    try std.testing.expectEqualSlices(u8, &deleted_revision.candidates.?, &compacted_revision.candidates.?);
+    const absent = try entities.get(a, "concept/new");
+    try std.testing.expect(absent == null);
+    embed_context.model_revision = 2;
+    const upgraded_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &deleted_revision.embedding.?, &upgraded_revision.embedding.?));
+    embed_context.model_revision = 1;
+    // Logical TTL visibility may change before physical cleanup appends a
+    // replay record. Until cleanup, a candidate snapshot cannot be reused.
+    try entities.setSchema(.{ .version = 1, .ttl_duration_ns = std.time.ns_per_s });
+    const expiring_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(expiring_revision.candidates == null);
+    try std.testing.expect(expiring_revision.embedding != null);
+    try entities.setSchema(.{ .version = 2, .ttl_duration_ns = 0 });
+
     // The cache shares the artifact's portable lifetime. Exercise export ->
     // import -> close -> reopen before the next real scorer change.
     try runUntilIdle(handle);
+    {
+        const runtime = handle.db.resolution_runtime.?;
+        try std.testing.expect(runtime.catch_up_mutex.tryLock());
+        defer runtime.catch_up_mutex.unlock();
+        var deleted: bool = true;
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_delete_index(id, .fromSlice("knowledge"), &deleted));
+        try std.testing.expect(!deleted);
+        try std.testing.expect(handle.db.core.index_manager.get("knowledge") != null);
+    }
     const resolution_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:ann", "resolved");
     defer a.free(resolution_key);
     const cached = try handle.db.core.store.get(a, resolution_key);
@@ -955,7 +1002,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const rendered = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer rendered.deinit();
     try std.testing.expectEqualStrings("concept/qwen", rendered.value.object.get("key").?.string);
-    try std.testing.expectEqual(@as(i64, 3), rendered.value.object.get("config_generation").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), rendered.value.object.get("config_generation").?.integer);
     // Read-only handles can query aliases without canonical documents and
     // observe the same durable generation after reopening.
     api.antfly_db_close(id);
@@ -970,7 +1017,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const resolution = queried.value.object.get("resolution").?.object;
     try std.testing.expectEqualStrings("concept/qwen", resolution.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("match", resolution.get("entities").?.array.items[0].object.get("decision").?.string);
-    try std.testing.expectEqual(@as(i64, 3), resolution.get("config_generation").?.integer);
+    try std.testing.expectEqual(rendered.value.object.get("config_generation").?.integer, resolution.get("config_generation").?.integer);
 }
 
 test "capi resolver config merge config advances revisions and protects key namespaces" {

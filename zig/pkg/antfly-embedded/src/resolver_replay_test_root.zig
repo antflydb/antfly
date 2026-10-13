@@ -17,4 +17,5 @@
 pub const antfly_sources = @import("source_owner_storage.zig");
 test {
     _ = @import("storage/db/resolution_runtime.zig");
+    _ = @import("storage/db/db.zig");
 }

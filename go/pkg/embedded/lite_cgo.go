@@ -725,6 +725,32 @@ func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
 	})
 }
 
+// ResolverIdentitiesJSON lists active and retired identities, including durable merges.
+func (db *DB) ResolverIdentitiesJSON() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_list_resolver_identities_json((*C.antfly_db)(handle), out)
+	})
+}
+
+// DropResolverIdentity permanently deletes a retired identity and its merges.
+func (db *DB) DropResolverIdentity(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+	var deleted C.bool
+	if err := check(C.antfly_db_drop_resolver_identity((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
 // SetResolverNamespaceJSON atomically resets or migrates resolver identities; drain afterward.
 func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 	name, cleanup := makeCStringSlice([]byte(resolver))

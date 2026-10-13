@@ -519,6 +519,8 @@ fn processChangedExtractionWithConfigOptions(
         .config_generation = cfg.effectiveGeneration(),
         .promotion_enabled = cfg.promote,
         .retain_work = retain_work,
+        .work_retention = cfg.retain_work,
+        .max_work_bytes = cfg.max_work_bytes,
         .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding, cfg.name_embedding_dims }) else null,
         .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
         .embedder = stage_embedder,

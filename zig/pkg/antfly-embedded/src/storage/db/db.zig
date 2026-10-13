@@ -24760,7 +24760,7 @@ pub const DB = struct {
     }
 
     pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !?u128 {
-        return self.addIndexForReconciliation(cfg, .managed, context);
+        return self.addIndexForReconciliation(cfg, .managed, context, null);
     }
     pub fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
         return self.deleteIndexForReconciliation(name, context);
@@ -27053,7 +27053,7 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         admission_mode: IndexAdmissionMode,
     ) !InstalledIndex {
-        return self.installIndexForReconciliation(cfg, admission_mode, null);
+        return self.installIndexForReconciliation(cfg, admission_mode, null, null);
     }
 
     /// Field-derived edges are part of prepared document effects. Preserve
@@ -27065,7 +27065,7 @@ pub const DB = struct {
         if (try manager.hasSchemaLeases()) return error.SchemaInUse;
     }
 
-    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context) !InstalledIndex {
+    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8) !InstalledIndex {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -27079,6 +27079,8 @@ pub const DB = struct {
         if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
             return error.UnsupportedOperation;
         try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
+        const old_repair = if (replaces) |old| try self.prepareIndexRepairForDeletion(self.alloc, old) else null;
+        defer if (old_repair != null) self.endIndexRepairLease(replaces.?);
         const summary = try self.managedAdmissionVisibilitySummary();
         const externally_populated = try index_manager_mod.configUsesExternalCoverage(self.alloc, cfg);
         const external_artifacts_exist = externally_populated and
@@ -27115,11 +27117,14 @@ pub const DB = struct {
         // ordinary synchronous backfill. Source identity proves the former;
         // a streaming artifact-key probe proves the latter. Both start clean
         // at the current replay head.
-        var applied = switch (admission_mode) {
+        var applied = if (replaces) |old| try self.core.replaceGraphIndex(old, cfg, admission_write) else switch (admission_mode) {
             .ordinary => try self.core.addIndex(cfg, admission_write),
             .managed => try self.core.addManagedIndex(cfg, admission_write),
         };
         catalog_committed = true;
+        if (old_repair) |id| self.removeIndexRepairIntentAndPin(self.alloc, id) catch |err| {
+            std.log.warn("index replacement committed with stale repair intent name={s} err={s}", .{ replaces.?, @errorName(err) });
+        };
         var post_commit_error: ?anyerror = if (builtin.is_test and test_fail_index_activation_after_catalog_commit)
             error.TestPostCommitIndexActivation
         else
@@ -27358,10 +27363,10 @@ pub const DB = struct {
     }
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
-        return self.addIndexForReconciliation(cfg, admission_mode, null);
+        return self.addIndexForReconciliation(cfg, admission_mode, null, null);
     }
 
-    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context) !?u128 {
+    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8) !?u128 {
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
         var row_policy_lease = self.local_execution.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
@@ -27391,7 +27396,17 @@ pub const DB = struct {
                 std.log.err("failed to restore enrichment runtime after index creation error index={s} err={s}", .{ cfg.name, @errorName(restart_err) });
             };
         };
-        const installed = try self.installIndexForReconciliation(cfg, admission_mode, context);
+        const paused_old = if (replaces) |old| try self.executor.pauseWorker(old) else false;
+        var replacement_committed = false;
+        defer if (paused_old) {
+            if (replacement_committed) self.executor.removeWorker(replaces.?) else self.executor.resumeWorker(replaces.?);
+        };
+        const installed = try self.installIndexForReconciliation(cfg, admission_mode, context, replaces);
+        replacement_committed = true;
+        if (replaces != null) {
+            self.scheduleGeneratedArtifactCleanup();
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+        }
         if (installed.post_commit_error) |activation_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("pending index activation", cfg.name) catch {};
             enrichment_restarted = true;
@@ -27405,6 +27420,12 @@ pub const DB = struct {
         };
         enrichment_restarted = true;
         return repair_id;
+    }
+
+    pub fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) !void {
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        _ = try self.addIndexForReconciliation(cfg, .ordinary, null, old);
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -27484,7 +27505,9 @@ pub const DB = struct {
     fn acquireResolverCatalogActivity(self: *DB, wait: bool) !ResolverCatalogActivity {
         const resolution = if (self.resolution_runtime) |runtime| &runtime.catch_up_mutex else null;
         const promotion = if (self.promotion_runtime) |runtime| &runtime.catch_up_mutex else null;
-        while (true) {
+        // Schema calls must not wait indefinitely for model inference/replay.
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
             if (resolution == null or resolution.?.tryLock()) {
                 if (promotion == null or promotion.?.tryLock())
                     return .{ .resolution = resolution, .promotion = promotion };
@@ -27493,6 +27516,7 @@ pub const DB = struct {
             // Managed refresh/apply callers hold a group activity. They must
             // release it so a worker already inside a Raft callback can finish.
             if (!wait) return error.WriterLocked;
+            if (attempts >= 100) return error.Busy;
             const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse
                 return error.BackendRuntimeIoUnavailable;
             try io.sleep(.fromMilliseconds(1), .awake);
@@ -27643,6 +27667,21 @@ pub const DB = struct {
                 continue;
             };
         }
+    }
+
+    pub fn dropRetiredResolverIdentity(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        return try self.core.index_manager.dropRetiredResolverIdentity(self.core.store, name);
     }
 
     pub fn restoreResolverIdentityWithoutDrain(self: *DB, name: []const u8, cfg: ?index_manager_mod.ResolverConfig) !void {
@@ -29059,7 +29098,10 @@ pub const DB = struct {
             };
             return delete_err;
         };
-        if (removed) self.scheduleGeneratedArtifactCleanup();
+        if (removed) {
+            self.scheduleGeneratedArtifactCleanup();
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+        }
         // Catalog absence is the committed API result. A runtime restart is a
         // supervised availability fault, not a reason to report that the
         // durable deletion failed.
@@ -118347,9 +118389,11 @@ test "db ttl cleanup defers transaction guarded parents without starving other e
         .{ .key = @constCast("parent"), .timestamp_ns = timestamp },
         .{ .key = @constCast("free"), .timestamp_ns = timestamp },
     };
+    const candidate_revision_before = db.core.nextDerivedSequence();
     try std.testing.expectEqual(@as(u32, 1), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
     try std.testing.expectEqual(@as(?u64, timestamp), try ttl_mod.readTimestamp(db.core.store, alloc, "parent"));
     try std.testing.expectEqual(@as(?u64, null), try ttl_mod.readTimestamp(db.core.store, alloc, "free"));
+    try std.testing.expect(db.core.nextDerivedSequence() > candidate_revision_before);
     try db.abortTransaction(txn, timestamp + 2);
     try std.testing.expectEqual(@as(u32, 1), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
     try std.testing.expectEqual(@as(?u64, null), try ttl_mod.readTimestamp(db.core.store, alloc, "parent"));

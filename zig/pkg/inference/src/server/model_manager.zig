@@ -2343,7 +2343,42 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| try paths.append(alloc, path);
+        }
+    }
+    if (manifest.safetensors_index_path) |path| {
+        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (index == .object) if (index.object.get("weight_map")) |weights| {
+            if (weights != .object) return error.InvalidModelLayout;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (weights.object.values()) |file| {
+                if (file != .string) return error.InvalidModelLayout;
+                const slot = try seen.getOrPut(alloc, file.string);
+                if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
+            }
+        };
+    }
+    var external: std.ArrayList([]const u8) = .empty;
+    for (paths.items) |path| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
+    }
+    try paths.appendSlice(alloc, external.items);
+    return componentDependencySignature(io, paths.items);
+}
+
 pub const LoadedModel = struct {
+    resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
@@ -7450,6 +7485,7 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        const resolution_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -7682,7 +7718,9 @@ pub const ModelManager = struct {
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
