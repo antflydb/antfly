@@ -239,9 +239,12 @@ pub const Set = struct {
 
     fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
         if (value != .object) return error.InvalidBatchRequest;
+        var input: expressions.PreparedInput = undefined;
+        try input.initJson(execution, value, null);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
             try execution.charge(1);
-            const result = plan.evaluateJsonWithExecution(execution, value) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };
@@ -285,9 +288,12 @@ pub const Set = struct {
     }
 
     fn firstRowInner(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        var input: expressions.PreparedInput = undefined;
+        try input.initRow(execution, row);
+        defer input.deinit();
         for (self.plans, 0..) |*plan, i| {
             try execution.charge(1);
-            const result = plan.evaluateRowWithExecution(execution, row) catch |err| {
+            const result = plan.evaluatePreparedWithExecution(execution, &input) catch |err| {
                 if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                 return err;
             };

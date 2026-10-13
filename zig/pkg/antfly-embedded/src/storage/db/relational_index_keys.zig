@@ -394,11 +394,14 @@ pub const TuplePlan = struct {
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         var has_null = false;
+        var input: expressions.PreparedInput = undefined;
+        try input.initBoundRow(execution, row);
+        defer input.deinit();
         for (self.keys) |key| {
             if (key.expression) |expression| {
                 // The tuple's layout/column-pointer fence above certifies the
                 // expression compiler's ordinals, including cold projections.
-                const value = (try expression.plan.evaluateBoundRowWithExecution(execution, row)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
+                const value = (try expression.plan.evaluatePreparedWithExecution(execution, &input)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
                 has_null = has_null or value == .null;
                 try appendExecutionValue(alloc, out, start, self.encoded_bytes_limit, key, value, execution, true);
                 continue;

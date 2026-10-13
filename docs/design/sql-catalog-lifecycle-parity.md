@@ -4394,3 +4394,52 @@ headers, the 2,053-file Apache boundary and original inventory integrity passed.
 The original inventory remains 479 implemented / 136 rejected / 73 superseded /
 898 unresolved; public durable-JSON activation and original sql-0671 remain open.
 No OpenAPI contract changed in this storage checkpoint.
+
+### Shared prepared input across CHECKs and tuple expressions
+
+CHECK sets and cold composite-index tuple evaluation now create one stable
+PreparedInput for their immutable source row. Selected ingress NUMERIC/array
+operands and decoded blob results are prepared lazily and reused across plans.
+The cache is sparse and validates declared kind/SQL element identity on reuse.
+Ordinary scalars remain borrowed, as do already encoded cold NUMERIC and array
+cells; adding cache entries for those views would add allocation without saving
+preparation. Blob comparisons retain their streaming base64 path.
+
+The owner shares the invocation's sticky work/cancellation identity and retained
+byte counter. Cache admission is refreshed after operand preparation consumes
+that same counter, before allocating an entry. A different Execution or byte
+counter cannot reuse the owner, even on paths that bypass the cache. All plans,
+source payloads and execution state must remain pinned until the owner retires;
+cached results cannot escape that lifetime. Advancing to another row requires
+another owner, not an ordinal-only cache carried across rows.
+
+The same boundary can read typed JSON provenance from authenticated ingress or
+decode a selected physical JSON cell once by its actual source ordinal.
+Regressions exercise shared numeric preparation across separately compiled
+plans, JSON null versus SQL NULL, exact numeric tokens, historical name lookup,
+one cold JSON decode, type fences, sticky budget/cancellation, and all observed
+allocation failures. The cancellation fixture explicitly arms the existing
+bounded polling interval rather than assuming callback installation resets it.
+
+These are internal evaluator interfaces; no OpenAPI grammar or capability was
+activated. Public JSON column/literal/function compilation remains guarded.
+Generated/default preparation already has its own shared typed-value boundary;
+complete activation still requires joining that boundary to all CHECK/index,
+vector-batch and rewrite consumers, safe legacy-result ownership, immutable
+literal identity, SQL lowering, public/client generation and reader fencing.
+No original case receives parity credit solely from operand-cache regressions.
+
+Cache lookup/insertion hashes are charged to the shared work counter. A
+deterministic 64-hit regression checks stable result identity, unchanged byte
+admission, one total preparation and only node/key work on reuse. This proves
+the preparation/allocation bound; it is not a claim about end-to-end latency.
+Cold JSON selection also fences precise SQL element identity before decoding.
+
+Final-source Debug qualification passed 799 SQL main-owner plus 226 linked
+tests (three existing skips, zero failures/leaks, 21/21 steps), and 236 native
+main-owner plus one linked test (zero failures/leaks, 50/50 steps). The final
+three focused ownership regressions passed with allocation sweeps. Formatting,
+source-catalog freshness, license headers, the 2,053-file Apache boundary and
+unchanged original inventory integrity passed. Original accounting remains
+479 implemented / 136 rejected / 73 superseded / 898 unresolved. Public durable
+JSON activation is still unfinished; this checkpoint does not claim otherwise.
