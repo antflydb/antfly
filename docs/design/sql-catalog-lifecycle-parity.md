@@ -8,7 +8,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Baseline and priorities
 
-The [original inventory](../sql-parity-inventory.md) remains authoritative:
+The [original inventory](sql/parity-inventory.md) remains authoritative:
 479 implemented / 136 rejected / 73 superseded / 898 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
@@ -64,7 +64,7 @@ Reuse these fixtures for the next read, document and source-mutation batches.
 Close an original ID only when its required public, durable and distributed
 boundaries have evidence. Component improvements and new regressions do not
 automatically receive original-case credit. Keep exhaustive regex qualification
-in [its own design](sql-regex-parity.md), alongside this work rather than using
+in [its own design](sql/regex-parity.md), alongside this work rather than using
 regex fixture totals as SQL completion metrics.
 
 ## Initial regression
@@ -4542,3 +4542,24 @@ sandboxed formatter invocation could not reach the pnpm registry; the permitted
 network-enabled final check passed. Cache GC was previewed without deletion.
 Original accounting remains 479 implemented / 136 rejected / 73 superseded /
 898 unresolved. No public OpenAPI grammar was activated by this checkpoint.
+
+### Main integration after CHECK provenance qualification
+
+Origin/main advanced to f986d952d7 during qualification, bringing the design-doc
+restructure and native inference changes. The merge preserves the branch's
+newer original-case evidence in the relocated SQL campaign history and updates
+this ledger's inventory/regex links. Generated Go SDK and antfarm conflicts
+were resolved by make generate from the merged specifications, not by selecting
+one side's generated output. No handwritten SQL/storage runtime change was
+required. Six relocated history documents lost only surplus EOF blank lines.
+
+Make generate and make fmt passed. Merged-tree Debug qualification passed all
+1,025 SQL tests (three existing skips, zero failures/leaks, 21/21 steps), 241
+native tests (zero failures/leaks, 50/50 steps) and 113 transaction contracts
+(zero failures/leaks, 50/50 steps). Go SDK OpenAPI tests and TypeScript SDK
+type-checking passed. Formatting, original inventory, the 2,046-file Apache
+boundary/license headers and staged whitespace checks passed. The source
+catalog checker passed with the existing worktree Python runtime; a redundant
+uv wrapper that had not launched Python was stopped without touching shared
+cache locks. Original accounting remains unchanged. Public durable-JSON
+activation and the full original SQL parity objective are still unfinished.

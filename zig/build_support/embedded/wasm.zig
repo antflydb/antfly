@@ -326,7 +326,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
 
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
-    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");

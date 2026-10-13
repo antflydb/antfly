@@ -1101,3 +1101,4 @@ behavior unchanged; archived measurements are in
 - [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
 - [ALGEBRAIC.md](ALGEBRAIC.md) — fact projection, materializations, folds
 - [JOINS.md](JOINS.md) — relational join planner and distributed execution
+- [SQL extraction](../docs/design/sql/extraction.md) — SQL design, including the [schema format and reader capability table](../docs/design/sql/extraction.md#schema-format-and-reader-capabilities)

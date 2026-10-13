@@ -1,4 +1,8 @@
-# Original SQL extraction parity inventory
+# SQL parity inventory: batch and campaign narratives
+
+> Relocated verbatim from `docs/sql-parity-inventory.md` (lines 3–27, 35–165, 239–526, 559–1312, 2489–2653) at commit 3ce5aff4ea on 2026-10-12. Durable decisions were folded into [SQL parity inventory](../parity-inventory.md) before the move. This is a historical implementation log; it describes work at the time it was performed, and its counts and test totals are not current guarantees.
+
+> Continued from the `Original SQL extraction parity inventory` section (lines 3–27).
 
 Current audited dispositions: **479 implemented / 136 rejected / 73 superseded /
 898 unresolved**. The unchanged original MD5 read now has independent PostgreSQL
@@ -29,18 +33,12 @@ Regex component tests alone do not resolve other corpus entries. Historical
 UPDATE ... FOR UPDATE forms remain unresolved PostgreSQL syntax incompatibilities;
 their source SQL has not been rewritten to inflate coverage.
 
-The pinned original source contains 1586 cases: 267 explicitly invalid or
-unsupported cases and 1319 cases requiring review of their original
-planner or runtime contract. These are **not** 1586 promises of working runtime
-execution. Original plan fingerprints, endpoint behavior, authorization, diagnostics,
-and deliberate rejections must be distinguished.
-
 ## Provenance and scope
 
 ### Native capture-capable regular expressions
 
 The remaining exhaustive contract and public-SQL qualification work is required
-and tracked in [the regex parity design](design/sql-regex-parity.md). Existing
+and tracked in [the regex parity design](../regex-parity.md). Existing
 component counts below do not close that target.
 
 The new bounded selection campaign qualifies 24,575 PostgreSQL 18.6 C/UTF8
@@ -190,78 +188,7 @@ These are invocation-local guarantees, not a claim of a single statement-wide
 budget across independent VM invocations or replacement of regex's separate
 pattern-work admission. This infrastructure changes no original dispositions.
 
-### Compatibility standard
-
-PostgreSQL is the SQL compatibility standard for this work. Its behavior governs
-syntax, type coercion, result types, SQL NULL semantics, ordering, JSON/array
-operations and mutations. Historical source plans and SQLite results do not
-override that contract. SQLite-backed fixtures below are limited regression
-checks, not evidence of PostgreSQL compatibility; new campaign completion must
-be validated against PostgreSQL and the native engine. An unavailable PostgreSQL
-oracle is a validation gap, not permission to substitute SQLite silently.
-
-The next read/document campaigns now use a real PostgreSQL 18+ oracle
-(PostgreSQL 19 is the target). `generate_sql_postgres_reference.py` starts a
-disposable private Unix-socket server, sends the original `$n` SQL unchanged,
-and records complete values, labels, PostgreSQL type OIDs and SQL NULL flags.
-The oracle uses UTF-8, C locale and UTC. Server-side raw cursors cap fetched
-read rows without modifying the source SQL or buffering its entire result.
-Reads are transactionally read-only; each mutation has an isolated rolled-back
-fixture. Time, lock, temporary-file and output limits bound oracle execution.
-Assignment-column triggers distinguish an explicit NULL write from a missing
-document property. Source schemas remain intact; an explicit current document
-schema models the historical object-valued `metadata: json` shorthand without
-granting any index-readiness or cardinality authority.
-
-Seven non-unique ordering contracts additionally use independent, bounded
-PostgreSQL observers for the complete eligible peer frontier. Validation checks
-a complete ordered prefix, allowing arbitrary selection only within genuine
-peers at the LIMIT boundary. Skipping better rows, duplicating rows or selecting
-worse rows fails; PostgreSQL's arbitrary tie order is not a compatibility rule.
-
-Install PostgreSQL 18 or newer, put its binaries on PATH or set `ANTFLY_PG_BIN`,
-then verify selected PostgreSQL goldens with:
-
-```sh
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_read_campaign_reference.json
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_reference.json
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py typed_array_read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_typed_array_read_reference.json
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py set_read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_set_read_campaign_reference.json
-uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
-```
-
-The 261-case read and 211-case document campaign manifests still describe
-the complete cohorts, not a claim that every case works. Oracle admission and
-discovery-mode native runs do not change dispositions; selected goldens must
-pass the non-discovery native endpoint gate before receiving completion credit.
-
-The separate fourteen-case typed-array read campaign keeps the original SQL and
-parameters unchanged, but declares stored SQL arrays explicitly. Its seed codec
-preserves lower bounds, SQL NULL elements and builtin element domains; ordinary
-JSON arrays remain JSONB. The mounted endpoint gate compares complete values,
-type OIDs, labels and NULL flags against PostgreSQL, including nonempty witnesses.
-
-Catalog discovery separately exercises all 479 original `ddl`/`unsupported_ddl`
-cases, including the already-dispositioned negative contracts. The current
-compiler admits 76, principally catalog operations, transactions and policy
-commands; that is not proof of authorization, durable publication, populated
-schema rewrites or constraint activation. Enable per-case diagnostics with
-`ANTFLY_SQL_CATALOG_DISCOVERY=1` and run `zig build sql-test
--Dtest-filter='SQL catalog campaign discovery'` from `zig/`.
-
-The separate strict catalog campaign keeps ten original commands unchanged and
-routes them through mounted SQL HTTP, production catalog admission and committed
-metadata Raft apply. It checks command tags, conditional no-op publication,
-resource identity, physical table/range topology, native relational schema,
-metadata reopen and snapshot installation. A disposable PostgreSQL server
-independently checks the same commands and seven duplicate/missing/nonempty
-object diagnostics. The SQL adapter translates resource-neutral catalog errors
-to target-specific SQLSTATEs only after handling atomic conditional outcomes;
-this adds neither existence preflights nor mutation retries. Lost replies after
-commit must remain non-retryable `40003`, with the committed object recoverable.
-This is single-owner durability evidence, not a distributed quorum or readiness
-fault campaign. It does not activate populated database retirement, CASCADE,
-routine/sequence/view catalogs, identity allocation or broader schema rewrites.
+> Continued from the `Compatibility standard` section (lines 239–526).
 
 Set execution retains a small hash table and streams UNION ALL without creating
 temporary files. Actual retained capacity triggers promotion to the shared
@@ -582,6 +509,7 @@ references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
 At that checkpoint, getting below 800 required at least 213 additional resolved
 dispositions; the current inventory report remains the authority for totals.
+> Continued from the `Compatibility standard` section (lines 559–1312).
 
 Six exact correlated and tuple-membership UPDATE/DELETE originals
 (`sql-0600`–`sql-0602`, `sql-0610`–`sql-0612`) now execute against native typed

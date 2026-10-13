@@ -40,8 +40,6 @@ pub const ModelRuntimeStrategy = enum {
     direct_session,
     /// Backend creates a ModelRuntime by compiling the traced graph at attach time.
     inline_compiled_graph,
-    /// Backend creates a ModelRuntime by loading offline compiled artifacts.
-    offline_artifact,
 };
 
 pub fn modelRuntimeStrategyLabel(strategy: ModelRuntimeStrategy) []const u8 {
@@ -49,7 +47,6 @@ pub fn modelRuntimeStrategyLabel(strategy: ModelRuntimeStrategy) []const u8 {
         .none => "none",
         .direct_session => "direct_session",
         .inline_compiled_graph => "inline_compiled_graph",
-        .offline_artifact => "offline_artifact",
     };
 }
 
@@ -277,7 +274,7 @@ test "planOwnsAllCompute ignores parameter-only fallback partitions" {
     try graph.markOutput(y);
 
     const capabilities = [_]partition_mod.Capability{
-        .{ .backend = .onnx, .priority = 10, .supports = &testSupportsOnlyGelu },
+        .{ .backend = .pjrt, .priority = 10, .supports = &testSupportsOnlyGelu },
         .{ .backend = .native, .priority = 1, .supports = &partition_mod.supportsAll },
     };
     const plan = try partition_mod.partition(allocator, &graph, &capabilities);
@@ -290,9 +287,9 @@ test "planOwnsAllCompute ignores parameter-only fallback partitions" {
     };
     defer dpp.deinit();
 
-    try std.testing.expect(planOwnsAllCompute(&graph, &dpp, .onnx));
-    try std.testing.expect(planHasSingleBackendComputePartition(&graph, &dpp, .onnx));
-    try std.testing.expect(attachmentTargetAllowsPlan(&graph, &dpp, .onnx, .whole_model));
+    try std.testing.expect(planOwnsAllCompute(&graph, &dpp, .pjrt));
+    try std.testing.expect(planHasSingleBackendComputePartition(&graph, &dpp, .pjrt));
+    try std.testing.expect(attachmentTargetAllowsPlan(&graph, &dpp, .pjrt, .whole_model));
 }
 
 test "planOwnsAllCompute rejects host compute fallback" {
@@ -319,7 +316,7 @@ test "planOwnsAllCompute rejects host compute fallback" {
     try graph.markOutput(z);
 
     const capabilities = [_]partition_mod.Capability{
-        .{ .backend = .onnx, .priority = 10, .supports = &testSupportsOnlyGelu },
+        .{ .backend = .pjrt, .priority = 10, .supports = &testSupportsOnlyGelu },
         .{ .backend = .native, .priority = 1, .supports = &partition_mod.supportsAll },
     };
     const plan = try partition_mod.partition(allocator, &graph, &capabilities);
@@ -332,9 +329,9 @@ test "planOwnsAllCompute rejects host compute fallback" {
     };
     defer dpp.deinit();
 
-    try std.testing.expect(!planOwnsAllCompute(&graph, &dpp, .onnx));
-    try std.testing.expect(!attachmentTargetAllowsPlan(&graph, &dpp, .onnx, .whole_model));
-    try std.testing.expect(attachmentTargetAllowsPlan(&graph, &dpp, .onnx, .partitioned));
+    try std.testing.expect(!planOwnsAllCompute(&graph, &dpp, .pjrt));
+    try std.testing.expect(!attachmentTargetAllowsPlan(&graph, &dpp, .pjrt, .whole_model));
+    try std.testing.expect(attachmentTargetAllowsPlan(&graph, &dpp, .pjrt, .partitioned));
 }
 
 test "planHasSingleBackendComputePartition rejects backend islands" {
@@ -388,7 +385,6 @@ test "planHasSingleBackendComputePartition rejects backend islands" {
 test "modelRuntimeStrategyLabel is stable for diagnostics" {
     try std.testing.expectEqualStrings("none", modelRuntimeStrategyLabel(.none));
     try std.testing.expectEqualStrings("inline_compiled_graph", modelRuntimeStrategyLabel(.inline_compiled_graph));
-    try std.testing.expectEqualStrings("offline_artifact", modelRuntimeStrategyLabel(.offline_artifact));
 }
 
 const RuntimeCachingMock = struct {
@@ -517,10 +513,10 @@ test "modelRuntimeForExecutor promotes backend-owned runtimes to session scope" 
     var executor = mock.executor();
     defer executor.deinit();
 
-    const first = try modelRuntimeForExecutor(allocator, &cache, &first_entry, .onnx, .whole_model, &executor);
-    const second = try modelRuntimeForExecutor(allocator, &cache, &second_entry, .onnx, .whole_model, &executor);
+    const first = try modelRuntimeForExecutor(allocator, &cache, &first_entry, .pjrt, .whole_model, &executor);
+    const second = try modelRuntimeForExecutor(allocator, &cache, &second_entry, .pjrt, .whole_model, &executor);
 
     try std.testing.expect(first == second);
-    try std.testing.expect(cache.getSessionCompiledModelRuntime(.onnx, .whole_model) == first);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.pjrt, .whole_model) == first);
     try std.testing.expectEqual(@as(usize, 1), mock.created);
 }

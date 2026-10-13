@@ -1634,6 +1634,8 @@ fn appendInferredInputs(
     const has_visual = manifest.visual_model_path != null or
         manifest.visual_projection_path != null or
         gguf_projector_has_image or
+        // Native Moondream2 checkpoints carry the vision tower in model.safetensors.
+        std.mem.eql(u8, manifest.config_model_arch, "moondream1") or
         (manifest.gguf_projector_path != null and gguf_projector_kind == .unknown);
     const has_audio = manifest.audio_model_path != null or
         manifest.audio_projection_path != null or
@@ -2863,4 +2865,20 @@ test "pull progress reports carry the model they belong to" {
     // A caller without a callback gets none.
     var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
     try std.testing.expect(bare.sink().callback == null);
+}
+
+test "native Moondream2 manifests declare image input for reader and generator roles" {
+    const allocator = std.testing.allocator;
+    const manifest = manifest_mod.ModelManifest{ .allocator = allocator, .config_model_arch = "moondream1" };
+    for ([_]manifest_mod.ModelType{ .reader, .generator }) |role| {
+        var inputs = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (inputs.items) |item| allocator.free(item);
+            inputs.deinit(allocator);
+        }
+        try appendInferredInputs(allocator, &manifest, role, &inputs);
+        var has_image = false;
+        for (inputs.items) |item| has_image = has_image or std.mem.eql(u8, item, "image");
+        try std.testing.expect(has_image);
+    }
 }
