@@ -42,6 +42,7 @@ pub const Collector = struct {
     upload_cutoff: u64 = 0,
     upload_floor: u64 = 0,
     namespace: ?[32]u8 = null,
+    audit_only: bool = false,
     progress: ?*@import("lake_index_gc_progress.zig").Progress = null,
 
     pub fn run(self: *Collector) !Result {
@@ -78,8 +79,6 @@ pub const Collector = struct {
             self.marked.deinit(self.a);
             self.marked = .empty;
         }
-        var scratch = std.heap.ArenaAllocator.init(self.a);
-        defer scratch.deinit();
         // Every non-retired generation is a root, including long-lived reader
         // and builder sessions. Reused roots retain their original upload IDs.
         const roots = try state.gcPublications(self.a);
@@ -91,26 +90,7 @@ pub const Collector = struct {
             } else false;
             if (retired) continue;
             try self.check();
-            _ = scratch.reset(.retain_capacity);
-            const sa = scratch.allocator();
-            var hydrated = publication;
-            if (hydrated.directory) |directory| {
-                _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
-                try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);
-                const directories = @import("lake_index_directory.zig");
-                const document = try directories.loadDocument(sa, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
-                hydrated.declarations = document.declarations;
-                hydrated.file_contributions = document.file_contributions;
-                if (document.contribution_index) |root| try self.markContributionIndex(sa, root);
-                for (document.contribution_pages) |page| {
-                    _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
-                    try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
-                    for (try directories.loadContributionPage(sa, self.store, page, self.cancellation(), null)) |contribution| try self.markArtifact(sa, contribution.artifact);
-                }
-            }
-            _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
-            for (hydrated.declarations) |declaration| try self.markArtifact(sa, declaration.artifact);
-            for (hydrated.file_contributions) |contribution| try self.markArtifact(sa, contribution.artifact);
+            try self.markPublication(publication);
         }
         self.result.marked = self.marked.count();
         // No destructive work until the complete bounded mark phase succeeds.
@@ -126,6 +106,43 @@ pub const Collector = struct {
         self.result.complete = true;
         return self.result;
     }
+    pub fn markPublication(self: *Collector, publication: local.metadata_lake_index_catalog.Publication) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
+        defer if (binding) |*value| value.deinit();
+        var hydrated = publication;
+        if (hydrated.directory) |directory| {
+            _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);
+            const directories = @import("lake_index_directory.zig");
+            const document = try directories.loadDocument(a, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
+            hydrated.declarations = document.declarations;
+            hydrated.file_contributions = document.file_contributions;
+            if (document.contribution_index) |root| try self.markContributionIndex(a, root);
+            for (document.contribution_pages) |page| {
+                _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
+                try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
+                for (try directories.loadContributionPage(a, self.store, page, self.cancellation(), null)) |contribution| try self.markArtifact(a, contribution.artifact);
+            }
+        }
+        _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
+        for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
+        for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
+
+        if (binding) |*held| {
+            const Visitor = struct {
+                collector: *Collector,
+                pub fn page(v: *@This(), ref: local.serverless_manifest_artifact_ref.ProviderGenerationRef) !void {
+                    _ = try v.collector.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+                }
+                pub fn record(_: *@This(), _: @import("../serverless/artifacts/cloud_generations.zig").Record) !void {}
+            };
+            var visitor: Visitor = .{ .collector = self };
+            try held.reader.walk(self.a, &visitor, self.cancellation());
+        }
+    }
     pub fn cancellation(self: *Collector) @import("antfly_cancellation").CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = canceled };
     }
@@ -136,6 +153,7 @@ pub const Collector = struct {
     }
     pub fn check(self: *Collector) !void {
         try self.context.ensureActive();
+        if (self.audit_only) return;
         const unix = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
         const authority = @import("antfly_platform").time.authorityNs();
         if (unix == 0 or authority == 0 or unix >= self.expires_ms or authority >= self.authority_deadline) return error.LakeIndexCollectionFenceChanged;
@@ -155,6 +173,15 @@ pub const Collector = struct {
             return false;
         }
         if (self.marked.count() == self.options.max_marked) return error.LakeIndexGcBudgetExceeded;
+        if (self.audit_only) {
+            var size = ref.byte_len;
+            if (size == 0) {
+                var metadata = try self.store.statWithCancellation(ref.artifact_id, self.cancellation());
+                defer metadata.deinit(self.store.allocator);
+                size = metadata.byte_len;
+            }
+            try self.store.verifyContentWithCancellationUsingAllocator(self.a, ref.artifact_id, size, ref.checksum, self.cancellation());
+        }
         const owned = try self.a.dupe(u8, ref.artifact_id);
         errdefer self.a.free(owned);
         // The checksum is part of this canonical immutable identity. Borrowing
@@ -226,19 +253,30 @@ pub const Collector = struct {
         for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
     pub fn markTextManifest(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool) !void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, "text-manifest") else try self.mark(ref);
+        return self.markTextManifestMode(a, ref, seekable, false);
+    }
+    pub fn markTextManifestMode(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool) !void {
+        const fresh = if (self.progress) |progress| try progress.expand(ref, if (maintenance_only) "text-maintenance" else "text-manifest") else try self.mark(ref);
         if (!fresh) return;
         // Charge before I/O, independently from the serving metadata budget.
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
-        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
-        for (group.descriptors) |descriptor| _ = try self.mark(descriptor);
+        if (!maintenance_only) for (group.opening_packs) |pack| {
+            _ = try self.mark(pack.artifact);
+        };
+        for (group.sources) |span| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = span.physical, .seekable = false, .maintenance_only = true } }) else try self.markTextManifestMode(a, span.physical, false, true);
+        }
+        if (!maintenance_only) for (group.descriptors) |descriptor| {
+            _ = try self.mark(descriptor);
+        };
         if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
         }
+        if (maintenance_only) return;
         for (group.segments) |segment| {
             if (seekable) {
                 if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
@@ -287,12 +325,17 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    if (root.serving) |serving| {
+                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+                    }
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.segment_files, false);
                     try self.markPages(a, root.domain, root.directories.files, false);
                     try self.markPages(a, root.domain, root.directories.segments, false);
                     try self.markPages(a, root.domain, root.directories.routing, false);
+                    try self.markPages(a, root.domain, root.pack_ownership, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
                     for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
@@ -309,7 +352,7 @@ pub const Collector = struct {
                         break :blk refs;
                     } else root.manifests;
                     for (manifests) |manifest| {
-                        if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
+                        if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable, .maintenance_only = root.serving != null } }) else try self.markTextManifestMode(a, manifest, root.seekable, root.serving != null);
                     }
                     for (root.file_groups) |group| for (group.rows) |block| {
                         if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
@@ -384,7 +427,7 @@ pub const Collector = struct {
         if (scope.fencingToken() < self.upload_floor or scope.fencingToken() >= self.upload_cutoff or self.marked.contains(id)) return;
         self.result.eligible += 1;
         if (self.options.dry_run or self.result.deleted == self.options.max_deleted) return;
-        try self.store.delete(id);
+        try self.store.deleteWithCancellation(id, self.cancellation());
         self.result.deleted += 1;
     }
 };

@@ -26,6 +26,7 @@ pub const Store = struct {
     implementation: artifacts.ObjectStore,
     identity: local.metadata_lake_index_catalog.Digest,
     locator: local.metadata_lake_index_catalog.StoreLocator,
+    cloud_binding: ?@import("lake_cloud_publication.zig").Binding = null,
 
     pub fn open(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool) !Store {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
@@ -49,6 +50,7 @@ pub const Store = struct {
         // This wrapper must never add bucket provisioning authority.
         var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .filesystem = opened.fs_client });
         errdefer implementation.deinit();
+        implementation.cloud_retention_qualified = if (config) |value| value.lake_indexes.cloud_generations.qualified_retention else false;
         const encoded = try std.json.Stringify.valueAlloc(a, .{
             .domain = "native-lake-artifact-store-v1",
             .connection = storage.artifacts.connection,
@@ -96,11 +98,25 @@ pub const Store = struct {
         if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
         return opened;
     }
+    pub fn bindPublication(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken) !void {
+        if (self.cloud_binding) |*held| {
+            const expected = publication.cloud_generations orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, held.reader.root.?.artifact_id, expected.root.artifact_id) or !std.mem.eql(u8, held.reader.root.?.generation, expected.root.generation)) return error.CatalogGenerationChanged;
+            return;
+        }
+        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(self.implementation.alloc, &self.implementation, publication, token);
+    }
+    pub fn bindGenerationMap(self: *Store, cloud: ?local.metadata_lake_index_catalog.CloudGenerations, token: @import("antfly_cancellation").CancellationToken) !void {
+        const selected = cloud orelse return;
+        if (self.cloud_binding != null) return error.CatalogGenerationChanged;
+        self.cloud_binding = try @import("lake_cloud_publication.zig").Binding.initMap(self.implementation.alloc, &self.implementation, selected, token);
+    }
     /// The Store's address must remain stable while this handle is borrowed.
     pub fn artifactStore(self: *Store) stores.ArtifactStore {
         return self.implementation.artifactStore();
     }
     pub fn deinit(self: *Store) void {
+        if (self.cloud_binding) |*binding| binding.deinit();
         self.implementation.deinit();
         self.opened.deinit();
         self.* = undefined;

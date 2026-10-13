@@ -767,7 +767,7 @@ pub const JsonApiClient = struct {
     }
 
     fn statObjectWithOptions(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
-        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+        return self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
     }
 
     fn statObjectVersion(
@@ -856,6 +856,22 @@ pub const JsonApiClient = struct {
         }
     }
 
+    fn listObjectVersions(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        if (opts.key_marker != null or opts.version_id_marker != null) return error.InvalidVersionPagination;
+        const base = try objectListUrlAlloc(alloc, self.cfg, bucket, .{ .prefix = opts.prefix, .recursive = true, .max_keys = opts.max_keys, .continuation_token = opts.continuation_token });
+        defer alloc.free(base);
+        const url = try std.fmt.allocPrint(alloc, "{s}&versions=true", .{base});
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, 8 * 1024 * 1024, opts.cancellation);
+        defer response.deinit(alloc);
+        if (response.status == 404) return .{ .entries = try alloc.alloc(types.ObjectVersionEntry, 0), .is_truncated = false };
+        if (response.status != 200) return mapUnexpectedStatus(response.status);
+        return parseVersionList(alloc, response.body);
+    }
+    fn erasedListObjectVersions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return self.listObjectVersions(alloc, bucket, opts);
+    }
     fn perform(
         self: *JsonApiClient,
         method: HttpMethod,
@@ -972,6 +988,7 @@ pub const JsonApiClient = struct {
         .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
+        .list_object_versions = erasedListObjectVersions,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -2382,4 +2399,40 @@ test "gcs exact reads reject contradictory response generations with and without
     var client = provider.client();
     defer client.deinit();
     for ([_]bool{ false, true }) |skip| try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "key", .{ .version_id = "123", .skip_metadata_probe = skip, .max_response_bytes = 1 }));
+}
+
+fn parseVersionList(a: Allocator, body: []const u8) !types.ListObjectVersionsResult {
+    const Wire = struct { items: []const struct { name: []const u8, generation: []const u8 } = &.{}, nextPageToken: ?[]const u8 = null };
+    var parsed = try std.json.parseFromSlice(Wire, a, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const entries = try a.alloc(types.ObjectVersionEntry, parsed.value.items.len);
+    var count: usize = 0;
+    errdefer {
+        for (entries[0..count]) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    for (entries, parsed.value.items) |*entry, item| {
+        const generation = std.fmt.parseUnsigned(u64, item.generation, 10) catch return error.InvalidListVersionsResponse;
+        if (generation == 0) return error.InvalidListVersionsResponse;
+        const name = try a.dupe(u8, item.name);
+        errdefer a.free(name);
+        entry.* = .{ .key = name, .version_id = try a.dupe(u8, item.generation), .is_delete_marker = false };
+        count += 1;
+    }
+    const next = if (parsed.value.nextPageToken) |value| if (value.len != 0) try a.dupe(u8, value) else return error.InvalidListVersionsResponse else null;
+    return .{ .entries = entries, .is_truncated = next != null, .next_continuation_token = next };
+}
+
+test "gcs generation inventory returns exact generations and opaque continuation with allocation safety" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var result = try parseVersionList(a, "{\"items\":[{\"name\":\"graph/a\",\"generation\":\"1\"},{\"name\":\"graph/a\",\"generation\":\"2\"}],\"nextPageToken\":\"opaque+token\"}");
+            defer result.deinit(a);
+            try std.testing.expect(result.is_truncated);
+            try std.testing.expectEqualStrings("2", result.entries[1].version_id);
+            try std.testing.expectEqualStrings("opaque+token", result.next_continuation_token.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.expectError(error.InvalidListVersionsResponse, parseVersionList(std.testing.allocator, "{\"items\":[{\"name\":\"key\",\"generation\":\"0\"}]}"));
 }

@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 35;
+pub const native_reader_protocol: u16 = 37;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -88,6 +88,17 @@ pub const FileContribution = struct {
     /// directories maintain these counts transactionally in the immutable tree.
     references: u32 = 0,
 };
+pub const CloudRetentionCertificate = struct {
+    version: u8 = 1,
+    until_ms: u64,
+    roots: []const Digest,
+    binding: Digest,
+};
+pub const CloudGenerations = struct {
+    root: artifacts.ProviderGenerationRef,
+    complete: bool = false,
+    certificate: ?CloudRetentionCertificate = null,
+};
 pub const Publication = struct {
     /// Zero denotes legacy consumers without renewable reader authority.
     /// Older strict decoders reject this field and fall back to source scans.
@@ -105,6 +116,7 @@ pub const Publication = struct {
     inventory: artifacts.ArtifactRef,
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
+    cloud_generations: ?CloudGenerations = null,
     file_contributions: []const FileContribution = &.{},
     /// Hydration-only authenticated tree reference; serialization retains the directory.
     contribution_index: ?[]const u8 = null,
@@ -112,13 +124,21 @@ pub const Publication = struct {
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory, .cloud_generations = self.cloud_generations });
         } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
         }
     }
     pub fn validate(self: Publication) !void {
         try validateReaderProtocol(self.reader_protocol);
+        if (self.cloud_generations) |cloud| {
+            if (self.reader_protocol < 36) return error.InvalidLakeIndexCatalog;
+            try cloud.root.validate();
+            if (cloud.certificate) |certificate| {
+                if (!cloud.complete or certificate.version != 1 or certificate.until_ms == 0 or certificate.until_ms > cloud.root.retention_until_ms or certificate.roots.len == 0 or certificate.roots.len > 4096 or std.mem.allEqual(u8, &certificate.binding, 0)) return error.InvalidLakeIndexCatalog;
+                for (certificate.roots, 0..) |root, i| if (i != 0 and std.mem.order(u8, &certificate.roots[i - 1], &root) != .lt) return error.InvalidLakeIndexCatalog;
+            }
+        }
         if (self.store_locator) |locator| try locator.validate();
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexCatalog;
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > (if (self.directory != null) max_directory_artifacts else max_artifacts)) return error.InvalidLakeIndexCatalog;

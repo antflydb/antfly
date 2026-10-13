@@ -42,11 +42,12 @@ const Checkpoint = struct {
 };
 pub const Job = union(enum) {
     publication: local.metadata_lake_index_catalog.Publication,
+    generation_page: struct { ref: local.serverless_manifest_artifact_ref.ProviderGenerationRef, depth: u8 },
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
-    text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool },
+    text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
     page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
 };
 pub const Progress = struct {
@@ -109,13 +110,24 @@ pub const Progress = struct {
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
-            .text_manifest => |manifest| try collector.markTextManifest(a, manifest.ref, manifest.seekable),
+            .text_manifest => |manifest| try collector.markTextManifestMode(a, manifest.ref, manifest.seekable, manifest.maintenance_only),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
                 try stores.chargeReadBudget(&collector.remaining_reads, page.byte_len);
                 for (try @import("lake_index_directory.zig").loadContributionPage(a, collector.store, page, collector.cancellation(), null)) |contribution| try self.enqueue(.{ .artifact = contribution.artifact });
             },
+            .generation_page => |page| {
+                const ref = page.ref;
+                if (!try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, "cloud-generation-page")) return;
+                const object = collector.store.providerStore() orelse return error.CloudGenerationStoreUnavailable;
+                var reader: @import("../serverless/artifacts/cloud_generations.zig").Reader = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .cache_limit = 0 };
+                defer reader.deinit();
+                try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                const node = try reader.read(a, ref, page.depth, collector.cancellation());
+                for (node.children) |child| try self.enqueue(.{ .generation_page = .{ .ref = child.ref, .depth = page.depth + 1 } });
+            },
             .publication => |publication| {
+                if (publication.cloud_generations) |cloud| try self.enqueue(.{ .generation_page = .{ .ref = cloud.root, .depth = 0 } });
                 try self.enqueue(.{ .chunk = .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len } });
                 var hydrated = publication;
                 if (publication.directory) |directory| {
@@ -224,7 +236,10 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     var progress: Progress = .{ .collector = collector, .a = a, .work_a = budget.allocator(), .value = value, .pages = &pages, .page_cache = &page_cache, .old_end = value.end, .previous = if (collection.progress) |ref| ref.artifact_id else null };
     collector.progress = &progress;
     defer collector.progress = null;
-    if (collection.progress == null) for (try state.gcPublications(a)) |publication| {
+    const publications = try state.gcPublications(a);
+    var cloud_union: ?@import("lake_cloud_publication.zig").UnionBinding = if (collector.store.providerStore()) |object| try @import("lake_cloud_publication.zig").UnionBinding.init(collector.a, object, publications, collection.retired, collector.namespace, collector.identity) else null;
+    defer if (cloud_union) |*binding| binding.deinit();
+    if (collection.progress == null) for (publications) |publication| {
         if (!std.meta.eql(publication.namespace, collector.namespace) or !std.mem.eql(u8, &publication.signature.store, &collector.identity)) continue;
         const retired = for (collection.retired) |generation| {
             if (generation == publication.generation) break true;
@@ -286,7 +301,10 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.check();
         if (live) continue;
         collector.result.eligible += 1;
-        try collector.store.delete(id);
+        collector.store.deleteWithCancellation(id, collector.cancellation()) catch |err| switch (err) {
+            error.ArtifactRetentionActive => continue,
+            else => return err,
+        };
         collector.result.deleted += 1;
     }
     // The lexical cursor follows backend order, independent of batched probes.

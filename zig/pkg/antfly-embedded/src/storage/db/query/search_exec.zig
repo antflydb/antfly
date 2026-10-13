@@ -126,6 +126,7 @@ pub const PinnedTextSource = struct {
     stored_projection_fields: []const []const u8 = &.{},
     /// Immutable provider metadata retained by release_owner's lease.
     provider_metadata: ?*const anyopaque = null,
+    logical_tie_rank: ?@import("../../../search/scorer.zig").TieRank = null,
     shared_owner: ?*Shared = null,
     const Shared = struct {
         allocator: Allocator,
@@ -12253,6 +12254,7 @@ pub fn searchTextQuery(
                 .distributed_text_stats = effective_req.distributed_text_stats,
                 .minimum_competitive_score = effective_req.minimum_competitive_score,
                 .text_navigation_plan = effective_req.text_navigation_plan,
+                .tie_rank = effective_req.native_text_tie_rank orelse text_source.logical_tie_rank,
                 .filter_doc_nums = native_constraints.filter_doc_nums,
                 .filter_doc_nums_positive = native_constraints.positive_filter,
                 .exclude_doc_nums = native_constraints.exclude_doc_nums,

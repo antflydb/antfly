@@ -133,7 +133,7 @@ pub const Overlay = struct {
         else
             try writer.acquireSnapshotWithReadCapability(.{ .ptr = owner, .check = Owner.check, .io = context.io });
         snapshot.text_statistics = .{ .ptr = owner, .check = Owner.check, .frequencies = Owner.frequencies, .summary = Owner.summary };
-        return .{ .snapshot = snapshot, .read_context = snapshot.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .provider_metadata = base.provider_metadata, .owner = owner, .release_owner = Owner.release };
+        return .{ .snapshot = snapshot, .logical_tie_rank = base.logical_tie_rank, .read_context = snapshot.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .provider_metadata = base.provider_metadata, .owner = owner, .release_owner = Owner.release };
     }
     fn shareMasked(a: A, writer: *local.index.IndexWriter, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !void {
         const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, base.snapshot.segments.len);
@@ -206,7 +206,7 @@ pub const Overlay = struct {
             try writer.acquireSnapshotWithReadContext(read_context)
         else
             writer.acquireSnapshot();
-        return .{ .snapshot = snapshot, .read_context = base.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .owner = owner, .release_owner = Owner.release };
+        return .{ .snapshot = snapshot, .logical_tie_rank = base.logical_tie_rank, .read_context = base.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .owner = owner, .release_owner = Owner.release };
     }
 };
 /// Coverage is an attribute of each snapshot, not the current table watermark.

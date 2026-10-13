@@ -180,6 +180,10 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Enable retention certificates only after qualifying the configured
+        /// provider's exact-version retention enforcement. Generation pinning
+        /// and ordinary complete auditing do not require this option.
+        cloud_generations: struct { qualified_retention: bool = false } = .{},
         /// Optional planning prefetch; required reads and publication proofs remain authoritative.
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {

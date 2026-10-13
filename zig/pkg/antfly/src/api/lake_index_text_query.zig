@@ -189,11 +189,14 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
+    owner.cloud_generations = selected.publication().cloud_generations;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
-        owner.recent_declarations = if (retained) |cut| cut.recent else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
+        const prepared: @import("lake_recent_vectors.zig").Prepared = if (retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
             server.notifyLakeCommit(table.name) catch {};
             return err;
         };
+        owner.recent_declarations = prepared.declarations;
+        owner.recent_cloud = prepared.cloud_generations;
         // All declared vector recipes publish as one coherent recent cut.
         var expected: usize = 0;
         for (owner.declarations) |declaration| if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) {
@@ -243,7 +246,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const serving_token: []const u8 = if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
         var artifacts = store.artifactStore();
         if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
-        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations }, retained_cancellation);
+        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud }, retained_cancellation);
     };
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
@@ -300,6 +303,8 @@ const Execution = struct {
     vector_filter: ?std.json.Value = null,
     vector_exclusion: ?std.json.Value = null,
     active_recent: bool = false,
+    cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
+    recent_cloud: ?local.metadata_lake_index_catalog.CloudGenerations = null,
     unit_runtime: ?*@import("lake_index_native_runtime_cache.zig").Entry = null,
     recent_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
     recent_dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
@@ -1182,6 +1187,10 @@ const Execution = struct {
         const self = from(raw);
         var pin = (try acquire(raw, name)) orelse return null;
         errdefer pin.deinit();
+        if (pin.provider_metadata) |raw_identities| {
+            const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(raw_identities));
+            pin.logical_tie_rank = identities.tie_rank;
+        }
         if (self.typed_delivery) {
             pin = try pin.share(self.result_allocator);
             const retained = try pin.clone();
@@ -1224,7 +1233,7 @@ const Execution = struct {
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
-        if (root.inventory_version != 3 or root.collection == null or root.statistics_version < 1 or root.term_statistics == null or root.segment_count <= 64) return null;
+        if (root.inventory_version != 3 or root.collection == null or root.statistics_version < 1 or root.term_statistics == null or (root.segment_count <= 64 and root.serving_bytes <= 32 * 1024 * 1024)) return null;
         if (!std.mem.eql(u8, &root.domain, &self.domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
         var plan_budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
         var plan = std.heap.ArenaAllocator.init(plan_budget.allocator());
@@ -1493,7 +1502,7 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.dense_entry.?;
         try entries.put(self.arena, selected.name, entry);
@@ -1562,7 +1571,7 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.sparse_entry.?;
         try entries.put(self.arena, selected.name, entry);

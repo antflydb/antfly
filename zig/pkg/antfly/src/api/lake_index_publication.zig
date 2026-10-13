@@ -124,6 +124,11 @@ const BuildProgress = struct {
         for (declarations, self.declarations.items) |*value, owned| value.* = owned.value;
         var saved = self.saved;
         saved.directory = try @import("lake_index_directory.zig").publish(scratch.allocator(), self.store, declarations, self.cancellation);
+        const maps = @import("../serverless/artifacts/cloud_generations.zig");
+        const writer = if (self.store.providerStore()) |object| object.cloud_writer else null;
+        const map_root = if (writer) |w| try w.finish(self.cancellation) else null;
+        defer if (map_root) |root| maps.freeRef(writer.?.a, root);
+        if (map_root) |root| saved.cloud_generations = .{ .root = root, .complete = false };
         saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
         try self.lease.save_checkpoint.?(self.lease.ptr, saved);
     }
@@ -180,6 +185,23 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     var scoped = artifact_store.*;
     scoped.allocator = a;
     scoped.upload_scope = scope;
+    const cloud_api = @import("lake_cloud_publication.zig");
+    const maps = @import("../serverless/artifacts/cloud_generations.zig");
+    const cloud_object = artifact_store.providerStore();
+    const cloud_seed = if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
+    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation) else null;
+    defer if (cloud_binding) |*held| held.deinit();
+    // Fresh/checkpoint artifacts may not belong to the previous closure. A
+    // builder verifies and records them; a query's complete binding stays strict.
+    if (cloud_binding) |*held| held.reader.complete = false;
+    var cloud_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = cloud_memory.allocator(), .reader = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = if (cloud_binding) |held| try maps.cloneRef(cloud_memory.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = if (current.value.published) |previous| if (previous.cloud_generations) |cloud| cloud.complete else false else false } else null else null;
+    const previous_writer = if (cloud_object) |object| object.cloud_writer else null;
+    if (cloud_writer) |*writer| cloud_object.?.cloud_writer = writer;
+    defer if (cloud_writer) |*writer| {
+        cloud_object.?.cloud_writer = previous_writer;
+        writer.deinit();
+    };
     const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
     defer a.free(inventory_bytes);
     var inventory_artifact = try scoped.putScoped(scope, inventory_bytes, cancellation);
@@ -320,8 +342,11 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         try context.ensureActive();
         try cancellation.check();
     };
-    const completed = try clock.now_ms(clock.ptr);
-    const publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
+    var completed = try clock.now_ms(clock.ptr);
+    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
+    if (cloud_writer) |*writer| try cloud_api.finish(na, writer, cloud_object.?, &publication, declarations, table.table_id, store_identity, context, cancellation, cloud_binding != null and cloud_object.?.cloud_certificate_until_ms != 0 and current.value.checkpoint == null);
+    completed = try clock.now_ms(clock.ptr);
+    publication.published_at_ms = completed;
     const latest = if (lease) |owner| try owner.snapshot(owner.ptr, a) else table;
     defer if (lease != null) a.free(latest.lake_index_catalog_json);
     var final_state = try catalog.parse(a, latest.lake_index_catalog_json);

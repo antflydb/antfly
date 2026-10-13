@@ -135,6 +135,7 @@ pub const NamedGraphResult = struct {
 };
 
 pub const SearchRequest = struct {
+    tie_rank: ?scorer_mod.TieRank = null,
     query: SearchQuery,
     k: u32 = 10,
     offset: u32 = 0,
@@ -683,7 +684,7 @@ fn executeMatch(
     request: SearchRequest,
 ) !SearchResult {
     if (preferParallelText(snap) and mq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
-    if (requestHasDocNumConstraints(request)) {
+    if (requestHasDocNumConstraints(request) or request.tie_rank != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
     }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
@@ -724,7 +725,7 @@ fn executeTerm(
     request: SearchRequest,
 ) !SearchResult {
     if (preferParallelText(snap) and tq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request, .{})) |result| return result;
-    if (requestHasDocNumConstraints(request)) {
+    if (requestHasDocNumConstraints(request) or request.tie_rank != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request)) |result| return result;
     }
     const results = try searchSnapshotTerms(alloc, snap, tq.field, &.{tq.term}, request);
@@ -958,6 +959,7 @@ fn executeScoredPhraseFilter(
     }
 
     var collector = FastTopK{
+        .tie_rank = request.tie_rank,
         .alloc = alloc,
         .k = effectiveK(request, snap),
         .filter_doc_bitmap = request.filter_doc_bitmap,
@@ -1684,6 +1686,7 @@ const ProducerConstraints = struct {
 };
 
 const FastTopK = struct {
+    tie_rank: ?scorer_mod.TieRank = null,
     alloc: Allocator,
     k: u32,
     filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
@@ -1771,9 +1774,9 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
-        if (self.after) |cursor| if (!(hit.score < cursor.score or (hit.score == cursor.score and hit.doc_id > cursor.doc_id))) return;
+        if (self.after) |cursor| if (!scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, self.tie_rank)) return;
         if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
-        try scorer_mod.offerTopK(self.alloc, &self.hits, self.k, hit);
+        try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, hit, self.tie_rank);
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
@@ -1787,7 +1790,7 @@ const FastTopK = struct {
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
         try self.flushPending();
         if (self.minimum_competitive_score == null and self.k > 0 and self.hits.items.len < self.k) self.pruned = false;
-        scorer_mod.sortScoredHits(self.hits.items);
+        scorer_mod.sortScoredHitsWithRank(self.hits.items, self.tie_rank);
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
 
@@ -1798,7 +1801,8 @@ const FastTopK = struct {
 
     fn worstCompetitiveDocId(self: *const FastTopK) ?u32 {
         if (self.k == 0 or self.hits.items.len < self.k) return null;
-        return self.hits.items[0].doc_id;
+        // Physical block boundaries cannot exclude equal-score logical ties.
+        return if (self.tie_rank != null) std.math.maxInt(u32) else self.hits.items[0].doc_id;
     }
 };
 
@@ -2519,7 +2523,7 @@ fn executeSimpleTextBoolWithProducers(
     if (must_terms.items.len == 0 and
         must_not_terms.items.len == 0 and
         effective_min_should == 1 and
-        !requestHasDocNumConstraints(request) and !producers.present())
+        !requestHasDocNumConstraints(request) and !producers.present() and request.tie_rank == null)
     {
         var wand_compatible = true;
         for (should_terms.items) |term| {
@@ -2546,6 +2550,7 @@ fn executeSimpleTextBoolWithProducers(
     }
 
     var collector = FastTopK{
+        .tie_rank = request.tie_rank,
         .alloc = alloc,
         .k = effectiveK(request, snap),
         .producers = producers,
@@ -2571,7 +2576,7 @@ fn executeSimpleTextBoolWithProducers(
         }
     }
     var filtered_wand = must_terms.items.len == 0 and must_not_terms.items.len == 0 and effective_min_should == 1 and bq.boost == 1 and
-        (producers.present() or requestHasDocNumConstraints(request));
+        (producers.present() or requestHasDocNumConstraints(request) or request.tie_rank != null);
     for (should_terms.items) |term| if (term.boost != 1) {
         filtered_wand = false;
         break;
@@ -4504,7 +4509,7 @@ const StreamingBoolParallel = struct {
         defer self.mutex.unlock(self.io);
         // Global heap storage was reserved before tasks started. Admission never
         // allocates from the request allocator while providers may use it.
-        for (local.hits.items) |hit| try scorer_mod.offerTopK(self.collector.alloc, &self.collector.hits, self.collector.k, hit);
+        for (local.hits.items) |hit| try scorer_mod.offerTopKWithRank(self.collector.alloc, &self.collector.hits, self.collector.k, hit, self.collector.tie_rank);
         self.collector.total_count += local.total_count;
         self.collector.pruned = self.collector.pruned or local.pruned;
         if (self.request.diagnostics) |target| inline for (@typeInfo(SearchDiagnostics).@"struct".field_names) |name| {
@@ -4518,7 +4523,7 @@ const StreamingBoolParallel = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const producers: ProducerConstraints = .{ .include = if (self.include) |*adapter| adapter.wrapped() else null, .exclude = if (self.exclude) |*adapter| adapter.wrapped() else null };
-        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
+        var local: FastTopK = .{ .tie_rank = self.request.tie_rank, .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
         defer local.deinit();
         while (true) {
             const index = self.next_work.fetchAdd(1, .monotonic);
@@ -4685,7 +4690,7 @@ fn scoreStreamingBoolPlans(alloc: Allocator, snap: *const index_mod.IndexSnapsho
 
 fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
     if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
-    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
+    var collector: FastTopK = .{ .tie_rank = request.tie_rank, .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
     defer collector.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5497,6 +5502,23 @@ fn buildResult(
         next.exclude_doc_nums = &.{};
         const count = if (filtered.items.len == scored.len) total_count else @as(u32, @intCast(filtered.items.len));
         return buildResult(alloc, snap, filtered.items, count, total_relation, next);
+    }
+    if (request.tie_rank) |order| {
+        const sorted = try alloc.dupe(scorer_mod.ScoredHit, scored);
+        defer alloc.free(sorted);
+        scorer_mod.sortScoredHitsWithRank(sorted, order);
+        var start: usize = 0;
+        if (request.search_after) |cursor| {
+            start = sorted.len;
+            for (sorted, 0..) |hit, i| if (scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, order)) {
+                start = i;
+                break;
+            };
+        }
+        var next = request;
+        next.tie_rank = null;
+        next.search_after = null;
+        return buildResult(alloc, snap, sorted[start..], total_count, total_relation, next);
     }
     // Apply cursor filter: skip all results at or before the cursor position.
     // Scored results are sorted by (score desc, doc_id asc).

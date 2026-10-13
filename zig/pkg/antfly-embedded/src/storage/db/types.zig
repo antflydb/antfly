@@ -1820,6 +1820,7 @@ pub const SearchRequest = struct {
     }
 
     /// Trusted request-local preparation, never decoded from public input.
+    native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
     text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
@@ -2090,6 +2091,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "distributed_text_stats",
     "minimum_competitive_score",
     "text_navigation_plan",
+    "native_text_tie_rank",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {

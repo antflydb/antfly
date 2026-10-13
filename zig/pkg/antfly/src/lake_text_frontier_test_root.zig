@@ -16,6 +16,10 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("serverless/artifacts/cloud_generations.zig");
+    _ = @import("api/lake_generation_envelope.zig");
+    _ = @import("api/lake_index_serving_compaction.zig");
+    _ = @import("api/lake_cloud_publication.zig");
     _ = @import("api/http_server.zig");
     _ = @import("api/lake_text_window_ahead.zig");
     _ = @import("api/lake_search_overlay.zig");

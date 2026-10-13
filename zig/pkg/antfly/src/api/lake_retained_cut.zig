@@ -43,6 +43,7 @@ pub const Descriptor = struct {
     catalog_metadata: ?local.serverless_external_source_mod.lake_catalog.types.Table = null,
     published_only: bool,
     recent: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
+    recent_cloud: ?catalog.CloudGenerations = null,
 };
 fn domain(table: u64, store: catalog.Digest) catalog.Digest {
     var hash = std.crypto.hash.Blake3.init(.{});
@@ -62,19 +63,17 @@ pub fn save(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
     const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), descriptor.expires_ms, io);
     var metadata = try store.putScoped(scope, bytes, cancellation);
     defer metadata.deinit(store.allocator);
-    return std.fmt.allocPrint(a, "{s}{s}:{d}", .{ prefix, metadata.artifact_id, metadata.byte_len });
+    return @import("lake_generation_envelope.zig").encode(a, prefix, metadata);
 }
 pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
     if (!std.mem.startsWith(u8, token, prefix)) return error.InvalidQueryRequest;
-    const split = std.mem.lastIndexOfScalar(u8, token, ':') orelse return error.InvalidQueryRequest;
-    const artifact = token[prefix.len..split];
+    const envelope = try @import("lake_generation_envelope.zig").decode(a, prefix, token, max_bytes);
+    defer if (envelope.generation) |value| a.free(value);
+    const artifact = envelope.id;
     const scope = (try stores.uploadScopeFromArtifactId(artifact)) orelse return error.InvalidQueryRequest;
     if (!std.mem.eql(u8, &scope.domain, &domain(table.table_id, store_identity))) return error.CatalogGenerationChanged;
     if (scope.fencingToken() <= now) return error.CatalogGenerationChanged;
-    const length = std.fmt.parseInt(usize, token[split + 1 ..], 10) catch return error.InvalidQueryRequest;
-    if (length > max_bytes or length == 0) return error.InvalidQueryRequest;
-    const checksum = try stores.sha256ChecksumFromArtifactId(artifact);
-    const bytes = store.getVerifiedAllocWithCancellation(artifact, length, checksum, cancellation) catch |err| switch (err) {
+    const bytes = @import("lake_generation_envelope.zig").read(store, envelope, cancellation) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => return error.CatalogGenerationChanged,
         else => return err,
     };
@@ -119,8 +118,7 @@ pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, 
         const remote = source.object.get("remote_snapshot") orelse return error.InvalidQueryRequest;
         if (remote != .string) return error.UnsupportedQueryRequest;
         const leaf_prefix = if (std.mem.startsWith(u8, remote.string, prefix)) prefix else if (std.mem.startsWith(u8, remote.string, @import("native_retained_cut.zig").prefix)) @import("native_retained_cut.zig").prefix else return error.UnsupportedQueryRequest;
-        const split = std.mem.lastIndexOfScalar(u8, remote.string, ':') orelse return error.InvalidQueryRequest;
-        const leaf_scope = (try stores.uploadScopeFromArtifactId(remote.string[leaf_prefix.len..split])) orelse return error.InvalidQueryRequest;
+        const leaf_scope = (try stores.uploadScopeFromArtifactId(try @import("lake_generation_envelope.zig").artifactId(leaf_prefix, remote.string))) orelse return error.InvalidQueryRequest;
         expires = @min(expires, leaf_scope.fencingToken());
     }
     if (expires <= now) return error.CatalogGenerationChanged;
@@ -129,17 +127,16 @@ pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, 
     const scope = try stores.UploadScope.forPublication(domain(0, identity), expires, io);
     var metadata = try store.putScoped(scope, encoded, cancellation);
     defer metadata.deinit(store.allocator);
-    return std.fmt.allocPrint(a, "source2:{s}:{d}", .{ metadata.artifact_id, metadata.byte_len });
+    return @import("lake_generation_envelope.zig").encode(a, "source2:", metadata);
 }
 pub fn loadCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, token: []const u8, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     if (!std.mem.startsWith(u8, token, "source2:")) return error.InvalidQueryRequest;
-    const split = std.mem.lastIndexOfScalar(u8, token, ':') orelse return error.InvalidQueryRequest;
-    const artifact = token[8..split];
+    const selector = try @import("lake_generation_envelope.zig").decode(a, "source2:", token, 2 * 1024 * 1024);
+    defer if (selector.generation) |value| a.free(value);
+    const artifact = selector.id;
     const scope = (try stores.uploadScopeFromArtifactId(artifact)) orelse return error.InvalidQueryRequest;
     if (scope.fencingToken() <= now or !std.mem.eql(u8, &scope.domain, &domain(0, identity))) return error.CatalogGenerationChanged;
-    const length = std.fmt.parseInt(usize, token[split + 1 ..], 10) catch return error.InvalidQueryRequest;
-    if (length == 0 or length > 2 * 1024 * 1024) return error.InvalidQueryRequest;
-    const bytes = try store.getVerifiedAllocWithCancellation(artifact, length, try stores.sha256ChecksumFromArtifactId(artifact), cancellation);
+    const bytes = try @import("lake_generation_envelope.zig").read(store, selector, cancellation);
     defer store.allocator.free(bytes);
     const envelope = try std.json.parseFromSliceLeaky(CursorEnvelope, a, bytes, .{ .allocate = .alloc_always });
     if (envelope.version != 1 or envelope.expires_ms != scope.fencingToken() or envelope.expires_ms <= now or envelope.expires_ms > now +| max_ttl_ms or envelope.payload.len > 1024 * 1024) return error.CatalogGenerationChanged;

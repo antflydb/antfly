@@ -46,6 +46,11 @@ pub const Job = struct {
     next_retry_ms: u64 = 0,
     last_error: ?[]const u8 = null,
     declarations: []const Declared = &.{},
+    cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
+};
+pub const Prepared = struct {
+    declarations: []const Declared,
+    cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
 };
 fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
@@ -71,7 +76,7 @@ fn jobKey(a: A, store: *Store, table: u64, cut: [32]u8) ![]u8 {
 fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
-pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) ![]const Declared {
+pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) !Prepared {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -88,8 +93,8 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     var job: Job = if (saved) |value| try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always }) else .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut };
     if (job.version != 1 or !std.mem.eql(u8, &job.cut, &cut) or job.table_id != table.table_id or job.object_generation != table.object_storage_generation or job.wal_lsn != overlay.pending.lsn or job.archive_generation != publication.generation or !std.mem.eql(u8, &job.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
     if (job.state == .ready and job.expires_ms > @max(now, cut_expires_ms)) {
-        const encoded = try std.json.Stringify.valueAlloc(scratch, job.declarations, .{});
-        return std.json.parseFromSliceLeaky([]const Declared, a, encoded, .{ .allocate = .alloc_always });
+        const encoded = try std.json.Stringify.valueAlloc(scratch, Prepared{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, .{});
+        return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
     }
     if (!build) return error.IndexRebuilding;
     if ((job.state == .building and job.lease_until_ms > now) or (job.state == .failed and job.next_retry_ms > now)) return error.IndexRebuilding;
@@ -118,6 +123,21 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     errdefer if (!job_finished) releaseClaim(scratch, store, key, claimed.etag orelse "", job, io) catch {};
     var artifacts = store.artifactStore();
     artifacts.upload_scope = try stores.UploadScope.forPublication(scopeDomain(table.table_id, store.identity), job.expires_ms, io);
+    const object = artifacts.providerStore();
+    const maps = @import("../serverless/artifacts/cloud_generations.zig");
+    var map_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_memory.allocator(), .reader = .{ .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
+    const previous_writer = if (object) |provider| provider.cloud_writer else null;
+    const previous_reader = if (object) |provider| provider.cloud_reader else null;
+    if (map_writer) |*writer| {
+        object.?.cloud_writer = writer;
+        object.?.cloud_reader = null;
+    }
+    defer if (map_writer) |*writer| {
+        object.?.cloud_writer = previous_writer;
+        object.?.cloud_reader = previous_reader;
+        writer.deinit();
+    };
     const output: ?[]const Declared = buildSegments(a, scratch, table, overlay, declarations, &artifacts, store, context, options) catch |err| failed: {
         job.state = .failed;
         job.last_error = @errorName(err);
@@ -129,6 +149,10 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
         job.state = .ready;
         job.declarations = ready;
         job.last_error = null;
+        if (map_writer) |*writer| if (try writer.finish(cancellation(context))) |root| {
+            defer maps.freeRef(writer.a, root);
+            job.cloud_generations = .{ .root = try maps.cloneRef(scratch, root), .complete = writer.complete and !writer.disabled };
+        };
     }
     // CAS ties completion to this claim; an expired worker cannot overwrite
     // a replacement. Immutable artifacts are safe orphan candidates on failure.
@@ -152,8 +176,8 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
         if (status_write) |*value| value.deinit(client.allocator);
     }
     if (job.state != .ready) return error.IndexRebuilding;
-    const encoded = try std.json.Stringify.valueAlloc(scratch, job.declarations, .{});
-    return std.json.parseFromSliceLeaky([]const Declared, a, encoded, .{ .allocate = .alloc_always });
+    const encoded = try std.json.Stringify.valueAlloc(scratch, Prepared{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, .{});
+    return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
 }
 fn releaseClaim(a: A, store: *Store, key: []const u8, etag: []const u8, previous: Job, io: std.Io) !void {
     const protection = io.swapCancelProtection(.blocked);
@@ -443,7 +467,7 @@ test "external lake recent vectors require retention through the entire query cu
     var client = store.opened.client;
     var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(a, job, .{}), .{});
     defer saved.deinit(client.allocator);
-    try std.testing.expectEqual(@as(usize, 0), (try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000)).declarations.len);
     try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 3_600_000));
     try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, job.expires_ms));
 }

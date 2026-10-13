@@ -184,6 +184,7 @@ pub const GetOptions = struct {
 };
 
 pub const StatOptions = struct {
+    version_id: ?[]const u8 = null,
     cancellation: ?CancellationToken = null,
 };
 
@@ -227,6 +228,8 @@ pub const ObjectVersionEntry = struct {
 };
 
 pub const ListObjectVersionsOptions = struct {
+    continuation_token: ?[]const u8 = null,
+    cancellation: ?CancellationToken = null,
     prefix: []const u8 = "",
     /// S3-style pagination is a tuple. `version_id_marker` is invalid without
     /// `key_marker`; a key marker alone is permitted by the provider API.
@@ -326,6 +329,7 @@ pub const ListResult = struct {
 };
 
 pub const ListObjectVersionsResult = struct {
+    next_continuation_token: ?[]u8 = null,
     entries: []ObjectVersionEntry,
     is_truncated: bool,
     next_key_marker: ?[]u8 = null,
@@ -334,6 +338,7 @@ pub const ListObjectVersionsResult = struct {
     pub fn deinit(self: *ListObjectVersionsResult, alloc: Allocator) void {
         for (self.entries) |*entry| entry.deinit(alloc);
         alloc.free(self.entries);
+        if (self.next_continuation_token) |value| alloc.free(value);
         if (self.next_key_marker) |value| alloc.free(value);
         if (self.next_version_id_marker) |value| alloc.free(value);
         self.* = undefined;

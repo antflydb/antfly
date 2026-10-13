@@ -251,6 +251,9 @@ pub const Client = struct {
         else
             try self.vtable.stat_object(self.ptr, self.allocator, bucket, key);
         errdefer metadata.deinit(self.allocator);
+        if (opts.version_id) |expected| if (metadata.version_id) |actual| {
+            if (!std.mem.eql(u8, actual, expected)) return error.PreconditionFailed;
+        };
         if (opts.cancellation) |token| try token.check();
         return metadata;
     }
@@ -277,9 +280,13 @@ pub const Client = struct {
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.version_id_marker != null and opts.key_marker == null)
             return error.InvalidVersionPagination;
-        const list_versions = self.vtable.list_object_versions orelse
-            return error.ObjectVersionListingUnsupported;
-        return try list_versions(self.ptr, self.allocator, bucket, opts);
+        if (opts.continuation_token != null and (opts.key_marker != null or opts.version_id_marker != null)) return error.AmbiguousContinuation;
+        if (opts.cancellation) |token| try token.check();
+        const list_versions = self.vtable.list_object_versions orelse return error.ObjectVersionListingUnsupported;
+        var result = try list_versions(self.ptr, self.allocator, bucket, opts);
+        errdefer result.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return result;
     }
 };
 

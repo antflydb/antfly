@@ -1136,7 +1136,7 @@ pub const Client = struct {
     }
 
     fn statObjectWithOptions(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
-        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+        return self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
     }
 
     fn statObjectVersion(
@@ -1165,7 +1165,7 @@ pub const Client = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
-            .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+            .version_id = if (response.version_id orelse version_id) |value| try alloc.dupe(u8, value) else null,
             .checksum = if (response.checksum) |value| try value.clone(alloc) else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
@@ -1231,12 +1231,13 @@ pub const Client = struct {
     }
 
     fn listObjectVersions(self: *Client, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        if (opts.continuation_token != null) return error.InvalidVersionPagination;
         const query = try buildListObjectVersionsQueryAlloc(alloc, opts);
         defer freeQueryPairs(alloc, query);
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.performAlloc(alloc, .GET, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, target, &.{}, null, null, 8 * 1024 * 1024, opts.cancellation);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => return try parseListObjectVersionsResponse(alloc, response.body),
@@ -2882,7 +2883,7 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
-        .{ .method = .GET, .url_contains = "versions=", .status = 200, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
+        .{ .method = .GET, .url_contains = "versions=", .status = 200, .expect_max_response_size = 8 * 1024 * 1024, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
         .{ .method = .DELETE, .url_contains = "versionId=v1", .status = 204 },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };

@@ -33,9 +33,9 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // Paged canonical inventories, term directories and pending DF runs require
 // a new wire identity. Catalog protocol 34 fences older workers before decode.
-pub const metadata_version: u16 = 10;
+pub const metadata_version: u16 = 11;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == metadata_version;
+    return version == 9 or version == 10 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -70,6 +70,7 @@ test "external lake stored source recipe attests production without changing sou
     try std.testing.expectEqual(old, sourceRecipe(table, config, false));
     try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
 }
+pub const source_spans = @import("lake_index_text_spans.zig");
 pub const physical = @import("lake_index_physical_ordinals.zig");
 pub const text_directory = @import("lake_index_text_directory.zig");
 pub const SegmentRouting = struct {
@@ -83,6 +84,7 @@ pub const SegmentRouting = struct {
 };
 pub const FileGroup = struct {
     file: state.File,
+    sources: []const source_spans.Span = &.{},
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
     summaries: []const ?statistics.Ref = &.{},
@@ -93,6 +95,11 @@ pub const FileGroup = struct {
     /// Query-only intervals map selected segment ordinals to original file ranks.
     selected: []const text_directory.Interval = &.{},
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
+        if (self.sources.len != 0) {
+            if (self.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
+            const last = self.sources[self.sources.len - 1];
+            try source_spans.validate(self.sources, if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count), domain);
+        }
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.opening_packs.len > 65536) return error.InvalidNativeLakeTextCorpus;
         for (self.opening_packs) |pack| try pack.validate(domain);
@@ -175,6 +182,11 @@ const CollectionBuilder = struct {
 };
 pub const Root = struct {
     version: u16 = metadata_version,
+    /// Independent serving packs; this root retains per-file maintenance statistics.
+    serving: ?artifacts.ChunkRef = null,
+    serving_bytes: u64 = 0,
+    pack_ownership: ?statistics.Ref = null,
+    open_packs: []const artifacts.ChunkRef = &.{},
     seekable: bool = false,
     /// Stored JSON contains exactly the binding projection, never an implicit
     /// full source document. Older publications require a format refresh.
@@ -226,6 +238,10 @@ pub const Root = struct {
     }
     fn validateAlloc(self: Root, a: A) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
+        if (self.serving) |ref| try text_directory.validateRef(ref, self.domain);
+        if (self.pack_ownership) |ref| try ref.validate();
+        if (self.open_packs.len > 7) return error.InvalidNativeLakeTextCorpus;
+        for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
@@ -234,7 +250,7 @@ pub const Root = struct {
         if (self.segment_files) |ref| try ref.validate();
         if (self.collection) |collection| try collection.validate();
         try self.directories.validate();
-        if (self.file_count > 16384 or self.segment_count > max_segments) return error.InvalidNativeLakeTextCorpus;
+        if (self.file_count > max_segments or self.segment_count > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.inventory_version < 1 or self.inventory_version > 3) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_deltas.len != 0) {
@@ -301,7 +317,13 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
 /// Directory-only metadata has a distinct cache type from expanded roots.
 pub const Directory = struct { root: Root };
 pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Directory {
-    return .{ .root = try loadRootDirectory(a, store, ref, cancellation, cache) };
+    return .{ .root = try servingRoot(a, store, try loadRootDirectory(a, store, ref, cancellation, cache), cancellation, cache) };
+}
+pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    const ref = outer.serving orelse return outer;
+    const root = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache);
+    if (root.serving != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents) return error.InvalidNativeLakeTextCorpus;
+    return root;
 }
 /// One independently admitted immutable file manifest. Share validation with
 /// serving while allowing GC to checkpoint between file jobs.
@@ -500,7 +522,7 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     // without imposing an unrelated sum of encoded artifact lengths.
     var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024, .monotonic = true };
     const bounded = budget.allocator();
-    var root = try loadRootDirectory(bounded, store, ref, cancellation, cache);
+    var root = try servingRoot(bounded, store, try loadRootDirectory(bounded, store, ref, cancellation, cache), cancellation, cache);
     root = try text_directory.withManifests(bounded, root, store, cache, cancellation);
     if (root.manifests.len != 0) {
         var groups: std.ArrayList(FileGroup) = .empty;
@@ -633,7 +655,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v10:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v11:{s}", .{want.binding.index_config_hash});
         const recipe = sourceRecipe(table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -920,7 +942,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
         const directories = try text_directory.publishManifests(a, store, current_refs.items, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
-        const root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
+        var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
+        root.serving = try @import("lake_index_serving_compaction.zig").publish(a, ca, store, root, seed, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -961,6 +984,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         remaining_reads: u64 = tree.max_page_bytes,
         witnesses: std.AutoHashMapUnmanaged(stores.UploadScope, stores.RetentionWitness) = .empty,
         certifiable: bool = true,
+        maintenance_only: bool = false,
         fn retain(v: *@This(), scope: stores.UploadScope) !void {
             if (!v.certifiable or v.witnesses.contains(scope)) return;
             if (v.witnesses.count() == 4096) {
@@ -1073,6 +1097,9 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             try v.check();
             for (entry.rows) |block| if (block.bitmap) |bitmap| try v.leaf(bitmap);
             if (entry.physical) |physical_ref| try v.leaf(physical_ref);
+            try v.pages(entry.route.summary);
+            if (v.maintenance_only) return;
+            for (entry.sources) |span| try v.leaf(span.physical);
             try v.leaf(entry.route.descriptor orelse return error.InvalidNativeLakeTextCorpus);
             try v.pages(entry.route.summary);
             try v.segment(entry.route.ref, true);
@@ -1097,10 +1124,17 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             }
         }
     };
-    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain };
+    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain, .maintenance_only = root.serving != null };
     defer validator.drain(true);
     defer validator.witnesses.deinit(a);
     try validator.retainArtifact(root_id);
+    if (root.serving) |ref| {
+        var arena_ = std.heap.ArenaAllocator.init(a);
+        defer arena_.deinit();
+        const serving_root = try servingRoot(arena_.allocator(), backend, root, cancellation, null);
+        try validateReuse(a, backend, serving_root, ref.artifact_id, context, cancellation);
+    }
+    try validator.pages(root.pack_ownership);
     try validator.pages(root.term_statistics);
     for (root.statistics_deltas) |run| try validator.pages(run.page);
     try validator.pages(root.term_directory.leaves);

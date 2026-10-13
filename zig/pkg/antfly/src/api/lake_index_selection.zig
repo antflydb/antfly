@@ -63,6 +63,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     if (!std.mem.eql(u8, &published.signature.store, &store.identity)) return error.ExternalLakeIndexStoreChanged;
     const binding = (table.external_base_source orelse return error.InvalidExternalTableBinding).binding;
     if (!std.mem.eql(u8, &published.signature.credentials, &try source.credentialIdentity(binding))) return error.ExternalLakeIndexCredentialsChanged;
+    try store.bindPublication(published, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
     var artifacts = store.artifactStore();
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;

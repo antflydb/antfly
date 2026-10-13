@@ -142,3 +142,18 @@ test "manifest artifact kinds include lake-native artifacts" {
     try @import("std").testing.expectEqual(@as(u8, 11), @backingInt(ArtifactKind.algebraic_segment));
     try @import("std").testing.expectEqual(@as(u8, 13), @backingInt(ArtifactKind.graph_metric_segment));
 }
+
+/// Provider-qualified map edges are separate from legacy content identities.
+/// Parents authenticate the generation as well as the payload digest.
+pub const ProviderGenerationRef = struct {
+    artifact_id: []const u8,
+    checksum: []const u8,
+    byte_len: u64,
+    generation: []const u8,
+    retention_until_ms: u64 = 0,
+    pub fn validate(self: @This()) !void {
+        if (self.artifact_id.len != 175 or self.checksum.len != 64 or self.byte_len == 0 or self.byte_len > 1024 * 1024 or self.generation.len == 0 or self.generation.len > 4096) return error.InvalidCloudGenerationMap;
+        const std = @import("std");
+        if (!std.mem.eql(u8, self.artifact_id[0..7], "sha256:") or !std.mem.eql(u8, self.artifact_id[7..71], self.checksum) or std.mem.eql(u8, self.generation, "null")) return error.InvalidCloudGenerationMap;
+    }
+};

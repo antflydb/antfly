@@ -40,7 +40,8 @@ pub const Roots = struct {
 };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
-const SegmentRecord = struct {
+pub const SegmentRecord = struct {
+    sources: []const corpus.source_spans.Span = &.{},
     file: state.File,
     manifest: Chunk,
     physical: ?Chunk = null,
@@ -76,9 +77,10 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
     const descriptors = try a.alloc(Chunk, group.segments.len);
     for (descriptors, group.segments, group.admissions, group.summaries) |*ref, segment, admission, summary| {
         try token.check();
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = group.sources, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
+    if (group.sources.len != 0) return;
     group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
@@ -119,12 +121,12 @@ const Segments = struct {
     first_block: usize = 0,
     blocks_examined: usize = 0,
     fn init(a: A, group: corpus.FileGroup, manifest: Chunk) !Segments {
-        _ = try corpus.physical.validate(group.rows);
+        if (group.sources.len == 0) _ = try corpus.physical.validate(group.rows);
         return .{ .group = group, .manifest = manifest, .routes = try @import("lake_index_serving_inventory.zig").compactRoutes(a, group) };
     }
     fn next(self: *Segments) !?SegmentRecord {
         if (self.ordinal == self.routes.len) {
-            if (self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
+            if (self.group.sources.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
             return null;
         }
         const route = self.routes[self.ordinal];
@@ -137,7 +139,7 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const result: SegmentRecord = .{ .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
+        const result: SegmentRecord = .{ .sources = self.group.sources, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
         self.lower = upper;
         self.ordinal += 1;
         return result;
@@ -145,30 +147,30 @@ const Segments = struct {
 };
 /// Metadata construction streams one record at a time into bounded sorts and
 /// durable runs. Replacement tails and last-write ordering remain explicit.
-const Mutations = struct {
+pub const Mutations = struct {
     a: A,
     sort: local.sql_spill.Sort,
     forest: @import("lake_index_delta_runs.zig").Forest,
     ordinal: u64 = 0,
-    fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
+    pub fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
         sort.shared_runs = true;
         sort.encoded_bytes = true;
         return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest } };
     }
-    fn deinit(self: *Mutations) void {
+    pub fn deinit(self: *Mutations) void {
         self.sort.deinit();
     }
     fn add(self: *Mutations, id: Id, value: ?[]const u8, previous_length: usize) !void {
         return self.addPrefix(&id, value, previous_length);
     }
-    fn addPrefix(self: *Mutations, prefix: []const u8, value: ?[]const u8, previous_length: usize) !void {
+    pub fn addPrefix(self: *Mutations, prefix: []const u8, value: ?[]const u8, previous_length: usize) !void {
         const length = if (value) |bytes| bytes.len else previous_length;
         if (length == 0 or length > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
         var offset: usize = 0;
         while (offset < length) : (offset += chunk_bytes) {
-            var buffer: [40]u8 = undefined;
-            if (prefix.len > 36) return error.InvalidNativeLakeTextCorpus;
+            var buffer: [68]u8 = undefined;
+            if (prefix.len > 64) return error.InvalidNativeLakeTextCorpus;
             @memcpy(buffer[0..prefix.len], prefix);
             std.mem.writeInt(u32, buffer[prefix.len..][0..4], @intCast(offset), .big);
             const k = buffer[0 .. prefix.len + 4];
@@ -212,7 +214,7 @@ const Mutations = struct {
         self.sort.shared_runs = true;
         self.sort.encoded_bytes = true;
     }
-    fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
+    pub fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
         try self.flush();
         const changes = try self.forest.finish() orelse return prior;
         const storage = self.forest.store;
@@ -490,6 +492,10 @@ fn validateRouting(record: SegmentRecord, domain: Id) !void {
     }
 }
 fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
+    if (record.sources.len != 0) {
+        if (record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        return corpus.source_spans.validate(record.sources, record.interval.count, domain);
+    }
     var covered = record.interval.lower;
     for (record.rows, 0..) |block, i| {
         var independent = block;
@@ -554,7 +560,7 @@ fn appendRouting(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, expec
     if (records.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
     const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
     const file_id = corpus.term_directory.identity(record.file.id);
-    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or record.physical == null) return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, domain);
     try records.append(a, record);
 }
@@ -678,7 +684,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .sources = selected[0].sources, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);
@@ -984,10 +990,10 @@ pub const RoutingCursor = struct {
         const record = try std.json.parseFromSliceLeaky(SegmentRecord, self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
         const file = corpus.term_directory.identity(record.file.id);
         if (!std.mem.eql(u8, key_[0..32], &file) or std.mem.readInt(u32, key_[32..36], .big) != record.ordinal) return error.InvalidNativeLakeTextCorpus;
-        if (record.rows.len != 0 or record.physical == null) return error.InvalidNativeLakeTextCorpus;
+        if (record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;
         try validateRouting(record, self.root.domain);
         const manifest_id = corpus.term_directory.identity(record.manifest.artifact_id);
-        const physical_id = corpus.term_directory.identity(record.physical.?.artifact_id);
+        const physical_id = corpus.term_directory.identity((record.physical orelse record.manifest).artifact_id);
         const same_file = if (self.last_file) |last| std.mem.eql(u8, &file, &last) else false;
         if (record.ordinal != (if (same_file) std.math.add(u32, self.last_ordinal, 1) catch return error.InvalidNativeLakeTextCorpus else @as(u32, 0)) or
             record.interval.lower != (if (same_file) self.last_upper else @as(u32, 0))) return error.InvalidNativeLakeTextCorpus;
