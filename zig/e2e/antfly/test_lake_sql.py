@@ -4361,13 +4361,11 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
         request = {"full_text_search": {"match": "quasar", "field": "body"},
                    "full_text_index": "body_text", "fields": ["amount"], "limit": 201}
         def full_admission(query):
-            # A redundant text filter retains the complete planner. Profiling
-            # alone now observes the actual bounded execution path.
-            filters = [{"match": "quasar", "field": "body"}]
-            if "filter_query" in query:
-                filters.append(query["filter_query"])
+            # A disabled pruner retains the complete source-aware planner;
+            # every score threshold defaults to zero. Profiling alone now
+            # observes the actual bounded execution path.
             return call("POST", "/tables/paged_text/query",
-                        dict(query, profile=True, filter_query=filters))
+                        dict(query, profile=True, pruner={}))
 
         oracle = full_admission(request)
         expected = [(h["_id"], h["_score"], h["_source"]["amount"]) for h in oracle["hits"]["hits"]]
