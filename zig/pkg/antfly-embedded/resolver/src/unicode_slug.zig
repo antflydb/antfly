@@ -67,6 +67,10 @@ fn letterOrDigit(cp: u21) bool {
     const i = find("last", &data.letters_digits, cp);
     return i < data.letters_digits.len and data.letters_digits[i].first <= cp;
 }
+fn mark(cp: u21) bool {
+    const i = find("last", &data.marks, cp);
+    return i < data.marks.len and data.marks[i].first <= cp;
+}
 pub fn append(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
     const view = try std.unicode.Utf8View.init(text);
     var iter = view.iterator();
@@ -99,7 +103,7 @@ pub fn append(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []co
     var wrote = false;
     var separator = false;
     for (units.items[0..written]) |unit| {
-        if (!letterOrDigit(unit.cp)) {
+        if (!letterOrDigit(unit.cp) and !(wrote and !separator and mark(unit.cp))) {
             if (wrote) separator = true;
             continue;
         }

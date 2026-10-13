@@ -439,6 +439,14 @@ const FloatPlanOutput = struct {
         write(ctx, key, score);
     }
     fn decoded(ctx: *anyopaque, values: []const f64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.plan.dense_columns and self.plan.row_order_identity) {
+            for (self.plan.column_sorted[0..self.plan.column_count], 0..) |column, ordinal| {
+                const col = if (self.plan.column_order_identity) column else self.plan.column_remap[column];
+                @memcpy(self.columns[col], values[ordinal * self.plan.nodes.len ..][0..self.plan.nodes.len]);
+            }
+            return;
+        }
         for (values, 0..) |value, key| write(ctx, key, if (std.math.isNan(value)) null else value);
     }
     fn completeSink(self: *@This()) @import("../storage/backend_types.zig").CompleteScoreSink {
@@ -449,12 +457,39 @@ const FloatPlanOutput = struct {
     }
 };
 
-fn populateColumns(
+/// Move-only stream bound to one erased transaction and allocator lifetime.
+/// Unknown identities keep ordinary scope ownership instead of retaining it.
+pub const FloatColumnStream = struct {
+    allocator: std.mem.Allocator,
+    txn: *@import("../storage/backend_erased.zig").ReadTxn,
+    txn_identity: u64,
+    scope: ?@import("../storage/backend_erased.zig").ReadScope = null,
+    pub fn init(a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn) @This() {
+        return .{ .allocator = a, .txn = txn, .txn_identity = txn.identity };
+    }
+    pub fn populate(self: *@This(), prefixes: []const ?[]const u8, nodes: []const []const u8, columns: []const []f64) !Stats {
+        if (self.txn_identity != self.txn.identity) return error.InvalidBatch;
+        try @import("../storage/prepared_score_request.zig").validateScoreColumns(nodes.len, prefixes.len, columns);
+        if (self.txn_identity == 0) return populateFloatColumns(self.allocator, self.txn, prefixes, nodes, columns);
+        return populateColumnsUsingScope(self.allocator, self.txn, prefixes, nodes, columns, &self.scope);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.scope) |*scope| scope.close();
+        self.* = undefined;
+    }
+};
+
+fn populateColumns(a: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8, columns: anytype) !Stats {
+    return populateColumnsUsingScope(a, txn, prefixes, nodes, columns, null);
+}
+
+fn populateColumnsUsingScope(
     caller_alloc: std.mem.Allocator,
     txn: anytype,
     prefixes: []const ?[]const u8,
     nodes: []const []const u8,
     columns: anytype,
+    reused: anytype,
 ) !Stats {
     std.debug.assert(prefixes.len == columns.len);
     for (columns) |column| {
@@ -475,12 +510,27 @@ fn populateColumns(
     const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(caller_alloc))).error_union.payload else void;
     // Probe-only wrappers expose the method but cannot open a pinned scope.
     // Keep their existing batched view, and propagate allocation/storage errors.
-    var scope: ?Scope = if (scoped) txn.openReadScope(caller_alloc) catch |err|
+    var scope: ?Scope = if (comptime @TypeOf(reused) != @TypeOf(null))
+        reused.* orelse (txn.openReadScope(caller_alloc) catch |err| (if (err == error.ReadOnly or err == error.Unsupported) null else return err))
+    else if (scoped) txn.openReadScope(caller_alloc) catch |err|
         (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
-    defer if (scoped) {
+    defer if (comptime @TypeOf(reused) != @TypeOf(null)) {
+        if (scope) |*active| active.resetScoreBatch() catch {
+            active.close();
+            scope = null;
+        };
+        reused.* = scope;
+    } else if (scoped) {
         if (scope) |*active| active.close();
     };
-    if (comptime scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
+    if (comptime @TypeOf(reused) != @TypeOf(null)) {
+        if (scope) |*active| active.beginScoreBatch() catch |err| {
+            if (err != error.Unsupported) return err;
+        };
+    }
+    // Streaming batches are one-shot shapes: reuse native working scratch,
+    // rather than constructing/promoting a full optional plan for every batch.
+    if (comptime @TypeOf(reused) == @TypeOf(null) and scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
         if (scope) |*active| {
             const supported = if (comptime @hasDecl(Scope, "supportsScoreVisitor")) active.supportsScoreVisitor() else true;
             if (supported) if (active.preparedScorePlan()) |plan| {
@@ -530,6 +580,64 @@ fn populateColumns(
             };
         }
     }
+    // Preserve warmed prepared delivery first. On an ordinary plan miss or a
+    // one-shot stream, strictly ordered unique rows can use typed native spans.
+    if (comptime @TypeOf(columns) == []const []f64 and scoped and @hasDecl(Scope, "readSortedScoreColumn")) {
+        if (scope) |*active| if (if (comptime @hasDecl(Scope, "supportsSortedScoreColumn")) active.supportsSortedScoreColumn() else true) {
+            var ordered_unique = true;
+            for (nodes[1..], nodes[0 .. nodes.len - 1]) |next, previous| if (std.mem.order(u8, previous, next) != .lt) {
+                ordered_unique = false;
+                break;
+            };
+            // Prefix aliases retain the generic deduplicated physical read.
+            for (prefixes, 0..) |prefix, i| if (prefix) |name| {
+                for (prefixes[0..i]) |previous| if (previous) |other| {
+                    if (std.mem.eql(u8, name, other)) ordered_unique = false;
+                };
+            };
+            if (ordered_unique) {
+                if (comptime @hasDecl(Scope, "beginScoreBatch")) {
+                    if (@typeInfo(@TypeOf(active.beginScoreBatch())) == .error_union) {
+                        active.beginScoreBatch() catch |err| {
+                            if (err != error.Unsupported) return err;
+                        };
+                    } else active.beginScoreBatch();
+                }
+                var stats = Stats{};
+                for (prefixes, columns) |prefix, column| {
+                    clearColumn(column);
+                    if (prefix) |name| {
+                        var offset: usize = 0;
+                        while (offset < nodes.len) {
+                            const end = @min(nodes.len, offset + max_keys_per_read);
+                            stats.batches += active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]) catch |err| switch (err) {
+                                error.OutOfMemory, error.ResourceBudgetExceeded => retry: {
+                                    // Inputs and outputs belong to the caller. Retire
+                                    // the failed lease, then retry once at the same
+                                    // transaction checkpoint without cached scratch.
+                                    active.close();
+                                    scope = null;
+                                    scope = try txn.openReadScope(caller_alloc);
+                                    if (comptime @hasDecl(Scope, "beginScoreBatch")) {
+                                        if (@typeInfo(@TypeOf(active.beginScoreBatch())) == .error_union) {
+                                            active.beginScoreBatch() catch |batch_err| {
+                                                if (batch_err != error.Unsupported) return batch_err;
+                                            };
+                                        } else active.beginScoreBatch();
+                                    }
+                                    break :retry try active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]);
+                                },
+                                else => return err,
+                            };
+                            stats.keys += end - offset;
+                            offset = end;
+                        }
+                    }
+                }
+                return stats;
+            }
+        };
+    }
     for (columns) |column| clearColumn(column);
     const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
@@ -568,7 +676,12 @@ fn populateColumns(
             return order == .lt or (order == .eq and a < b);
         }
     };
-    std.mem.sort(usize, rows, RowOrder{ .nodes = nodes }, RowOrder.less);
+    var ascending = true;
+    for (nodes[1..], nodes[0 .. nodes.len - 1]) |current, previous| if (std.mem.order(u8, current, previous) == .lt) {
+        ascending = false;
+        break;
+    };
+    if (!ascending) std.mem.sort(usize, rows, RowOrder{ .nodes = nodes }, RowOrder.less);
     var unique_count: usize = 1;
     for (rows[1..], rows[0 .. rows.len - 1]) |row, prior| {
         if (!std.mem.eql(u8, nodes[row], nodes[prior])) unique_count += 1;
@@ -1047,4 +1160,62 @@ test "graph metric physical compact chunk fallback overwrites partial pressure d
         for (columns[1]) |value| try std.testing.expect(value == null);
         try std.testing.expectEqualSlices(?f64, &columns[0], &columns[2]);
     }
+}
+
+test "graph metric typed spans retire failed lease and retry once without clearing completed columns" {
+    const backend = @import("../storage/backend_erased.zig");
+    const Txn = struct {
+        calls: usize = 0,
+        opened: usize = 0,
+        closed: usize = 0,
+        always_fail: bool = false,
+        const Parent = @This();
+        const Scope = struct {
+            parent: *Parent,
+            pub fn beginScoreBatch(_: *@This()) void {}
+            pub fn resetScoreBatch(_: *@This()) void {}
+            pub fn close(self: *@This()) void {
+                self.parent.closed += 1;
+            }
+            pub fn readSortedScoreColumn(self: *@This(), prefix: []const u8, nodes: []const []const u8, values: []f64) !usize {
+                self.parent.calls += 1;
+                if (self.parent.always_fail or self.parent.calls == 2) {
+                    @memset(values, 99);
+                    return error.OutOfMemory;
+                }
+                try std.testing.expectEqual(nodes.len, values.len);
+                @memset(values, if (std.mem.eql(u8, prefix, "first")) 1 else 2);
+                return 1;
+            }
+            pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                return error.Unsupported;
+            }
+            pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+                return error.Unsupported;
+            }
+        };
+        pub fn openReadScope(self: *@This(), a: std.mem.Allocator) !backend.ReadScope {
+            const scope = try backend.readScopeFrom(a, Scope{ .parent = self });
+            self.opened += 1;
+            return scope;
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.Unsupported;
+        }
+    };
+    var txn = Txn{};
+    var first: [3]f64 = undefined;
+    var second: [3]f64 = undefined;
+    const stats = try populateFloatColumns(std.testing.allocator, &txn, &.{ "first", "second" }, &.{ "a", "b", "c" }, &.{ &first, &second });
+    try std.testing.expectEqual(@as(usize, 6), stats.keys);
+    try std.testing.expectEqualSlices(f64, &.{ 1, 1, 1 }, &first);
+    try std.testing.expectEqualSlices(f64, &.{ 2, 2, 2 }, &second);
+    try std.testing.expectEqual(@as(usize, 2), txn.opened);
+    try std.testing.expectEqual(txn.opened, txn.closed);
+    txn = .{ .always_fail = true };
+    try std.testing.expectError(error.OutOfMemory, populateFloatColumns(std.testing.allocator, &txn, &.{ "first", "second" }, &.{ "a", "b", "c" }, &.{ &first, &second }));
+    try std.testing.expectEqual(@as(usize, 2), txn.calls);
+    try std.testing.expectEqual(txn.opened, txn.closed);
+    for (first) |value| try std.testing.expect(std.math.isNan(value));
+    for (second) |value| try std.testing.expect(std.math.isNan(value));
 }

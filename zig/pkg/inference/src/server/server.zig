@@ -9629,6 +9629,7 @@ pub const Node = struct {
             options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, limits.sequence_tokens);
             options.max_prompt_tokens = @min(options.max_prompt_tokens, limits.sequence_tokens);
             options.max_sequences_per_item = limits.prepared_sequences;
+            options.long_document_limits = @import("../models/gliner_span_window_limits.zig").qualified;
         }
 
         const texts = try scratch.alloc([]const u8, request.items.len);

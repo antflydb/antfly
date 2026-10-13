@@ -377,14 +377,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = matcher_mod,
     });
     const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone pkg/antfly-embedded/matcher tests");
     lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
 
     const lib_resolver_tests = b.addTest(.{
         .root_module = resolver_mod,
     });
     const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone pkg/antfly-embedded/resolver tests");
     lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
@@ -736,6 +736,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);
     lib_test_step.dependOn(&run_lib_google_tests.step);

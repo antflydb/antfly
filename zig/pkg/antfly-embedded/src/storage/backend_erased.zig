@@ -240,8 +240,11 @@ pub const ReadScope = struct {
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
+        begin_score_batch: ?*const fn (*anyopaque) anyerror!void = null,
+        reset_score_batch: ?*const fn (*anyopaque) anyerror!void = null,
         get_many_sorted_into: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8) anyerror!void = null,
         visit_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, backend_types.ScoreSink) anyerror!void = null,
+        read_sorted_score_column: ?*const fn (*anyopaque, []const u8, []const []const u8, []f64) anyerror!usize = null,
         working_allocator: ?*const fn (*anyopaque) Allocator = null,
         prepared_score_plan: ?*const fn (*anyopaque) ?*@import("prepared_score_plan.zig").PreparedScorePlan = null,
         prepared_score_allocator: ?*const fn (*anyopaque) Allocator = null,
@@ -250,6 +253,16 @@ pub const ReadScope = struct {
         get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
+    pub fn supportsSortedScoreColumn(self: *const @This()) bool {
+        return self.vtable.read_sorted_score_column != null;
+    }
+    /// A bounded, strictly increasing logical node span and one physical metric
+    /// prefix. The backend encodes keys once and fills caller-owned finite/NaN
+    /// scores directly; no per-score erased callback or prepared owner.
+    pub fn readSortedScoreColumn(self: *@This(), prefix: []const u8, nodes: []const []const u8, values: []f64) !usize {
+        const read = self.vtable.read_sorted_score_column orelse return error.Unsupported;
+        return read(self.ptr, prefix, nodes, values);
+    }
     pub fn preparedScorePlan(self: *@This()) ?*@import("prepared_score_plan.zig").PreparedScorePlan {
         return if (self.vtable.prepared_score_plan) |get_plan| get_plan(self.ptr) else null;
     }
@@ -346,6 +359,19 @@ pub const ReadScope = struct {
         try reset_scope(self.ptr);
     }
 
+    /// Opt into working-arena reuse only for bounded, transient score batches.
+    pub fn beginScoreBatch(self: *@This()) !void {
+        const begin_batch = self.vtable.begin_score_batch orelse return error.Unsupported;
+        try begin_batch(self.ptr);
+    }
+
+    /// Invalidates result and prepared-plan borrows, retaining bounded scratch.
+    /// Unsupported scopes must be closed between batches instead.
+    pub fn resetScoreBatch(self: *@This()) !void {
+        const reset_batch = self.vtable.reset_score_batch orelse return error.Unsupported;
+        try reset_batch(self.ptr);
+    }
+
     pub fn close(self: *@This()) void {
         self.vtable.close(self.allocator, self.ptr);
         self.* = undefined;
@@ -413,6 +439,19 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             return self.handle.reset();
         }
 
+        fn readSortedScoreColumn(ptr: *anyopaque, prefix: []const u8, nodes: []const []const u8, values: []f64) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.readSortedScoreColumn(prefix, nodes, values);
+        }
+        fn beginScoreBatch(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.beginScoreBatch();
+        }
+        fn resetScoreBatch(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.resetScoreBatch();
+        }
+
         fn close(a: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const parent_owner = self.parent;
@@ -439,7 +478,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -558,6 +597,7 @@ pub const ProbeTxn = struct {
         get_many_sorted_is_atomic: bool = false,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
@@ -570,6 +610,17 @@ pub const ProbeTxn = struct {
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// Exact presence in the probe's committed view, without retaining a value
+    /// on backends that implement native presence reads.
+    pub fn contains(self: *ProbeTxn, key: []const u8) !bool {
+        if (self.vtable.contains) |check| return try check(self.ptr, key);
+        _ = self.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     /// May pin an immutable generation until abort. Prefer get for long-lived
@@ -1550,6 +1601,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn contains(ptr: *anyopaque, key: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.contains(key);
+        }
+
         pub fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             if (@hasDecl(Handle, "getLeased")) return try unbox(ptr).handle.getLeased(key);
             return try unbox(ptr).handle.get(key);
@@ -1588,6 +1643,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
             .get = vt.get,
+            .contains = if (@hasDecl(Handle, "contains")) vt.contains else null,
             .get_leased = vt.getLeased,
             .get_many_sorted = vt.getManySorted,
             .get_many_sorted_with_block_cache_admission = vt.getManySortedWithBlockCacheAdmission,

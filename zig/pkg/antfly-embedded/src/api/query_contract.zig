@@ -3822,6 +3822,7 @@ fn ColumnWireResult(comptime T: type) type {
         alloc: std.mem.Allocator,
         failure: *?anyerror,
         plan: ?*ColumnWirePlan = null,
+        graph_wire: ?BorrowedGraphMap = null,
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
             try w.beginObject();
             inline for (@typeInfo(T).@"struct".field_names) |name| {
@@ -3894,6 +3895,8 @@ fn ColumnWireResult(comptime T: type) type {
                     try w.endArray();
                     try writeWireField(w, "max_score", self.base.hits.?.max_score);
                     try w.endObject();
+                } else if (comptime std.mem.eql(u8, name, "graph_results")) {
+                    if (self.graph_wire) |graphs| try writeWireField(w, name, graphs) else try writeWireField(w, name, @field(self.base, name));
                 } else try writeWireField(w, name, @field(self.base, name));
             }
             try w.endObject();
@@ -3905,7 +3908,7 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
-fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
+fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -3933,7 +3936,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -3961,7 +3964,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -3984,6 +3987,7 @@ pub fn encodeQueryResponsesWithDelivery(
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
     var delivered: ?usize = null;
+    var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
@@ -4011,7 +4015,7 @@ pub fn encodeQueryResponsesWithDelivery(
     const response_json = switch (graph_dialect orelse .canonical) {
         .canonical => blk: {
             const graph_results = if (graph_dialect != null)
-                try buildGraphQueryResults(indexes_openapi.GraphResult, arena, req, meta, result, .canonical)
+                try buildBorrowedGraphResults(arena, alloc, req, meta, result, &graph_wire_failure)
             else
                 null;
             const query_results = try arena.alloc(metadata_openapi.QueryResult, 1);
@@ -4024,14 +4028,14 @@ pub fn encodeQueryResponsesWithDelivery(
                 .evaluation = if (meta.evaluation_json) |data| try takeOpenApiObjectMap(arena, try ant_json.parseFromSliceLeaky(std.json.Value, arena, data, .{})) else null,
                 .aggregations = aggregations,
                 .graph_metric_results = graph_metric_results,
-                .graph_results = graph_results,
+                .graph_results = null,
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4063,7 +4067,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -5408,6 +5412,121 @@ fn toOpenApiGraphMetricStatusMap(
     return out;
 }
 
+// Borrow graph columns through serialization. Only one node's path/evidence
+// adapters are live at a time; the graph result outlives the response encoder.
+const BorrowedGraphNodes = struct {
+    alloc: std.mem.Allocator,
+    result: db_mod.types.GraphSearchResult,
+    include_paths: bool,
+    documents: *GraphDocumentLookup,
+    cancellation: @FieldType(db_mod.types.SearchRequest, "cancellation") = null,
+    failure: *?anyerror,
+
+    fn nodeValue(self: @This(), a: std.mem.Allocator, node: graph_query_mod.GraphResultNode) !indexes_openapi.GraphResultNode {
+        try validateCanonicalGraphResultNode(node);
+        try validateGraphNodeMetrics(node);
+        if (self.include_paths and node.path == null) return error.InvalidRemoteResponse;
+        return .{
+            .key = node.key,
+            .table = node.table,
+            .depth = @intCast(node.depth),
+            .document = try self.documents.documentWithAllocator(a, node.key, node.table),
+            .path = if (self.include_paths) try toOpenApiGraphNodePath(a, node) else null,
+            .path_edges = if (self.include_paths) try toOpenApiOptionalGraphPathEdges(a, node) else null,
+            .provenance = node.provenance,
+            .metrics = null,
+            .evidence = try graphNodeEvidenceObjectMap(a, node),
+        };
+    }
+    pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        try w.beginArray();
+        for (self.result.nodes) |node| {
+            if (self.cancellation) |token| token.check() catch |err| {
+                self.failure.* = err;
+                return error.WriteFailed;
+            };
+            _ = scratch.reset(.{ .retain_with_limit = 256 * 1024 });
+            const value = self.nodeValue(scratch.allocator(), node) catch |err| {
+                self.failure.* = err;
+                return error.WriteFailed;
+            };
+            try w.beginObject();
+            inline for (@typeInfo(indexes_openapi.GraphResultNode).@"struct".field_names) |field| {
+                if (comptime std.mem.eql(u8, field, "metrics")) {
+                    if (node.metricCount() != 0) {
+                        try w.objectField(field);
+                        try w.beginObject();
+                        for (0..node.metricCount()) |column| {
+                            const metric = node.metricAt(column);
+                            try w.objectField(metric.name);
+                            // Missing scores are explicit null entries in the map.
+                            try w.write(metric.score);
+                        }
+                        try w.endObject();
+                    }
+                } else try writeWireField(w, field, @field(value, field));
+            }
+            try w.endObject();
+        }
+        try w.endArray();
+    }
+};
+const BorrowedGraphResult = union(enum) {
+    nodes: struct {
+        kind: []const u8 = "nodes",
+        nodes: BorrowedGraphNodes,
+        metric_status: ?std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus),
+        stats: @FieldType(indexes_openapi.GraphNodesResult, "stats"),
+    },
+    converted: indexes_openapi.GraphResult,
+    pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
+        switch (self) {
+            .nodes => |value| try w.write(value),
+            .converted => |value| try w.write(value),
+        }
+    }
+};
+const BorrowedGraphMap = std.json.ArrayHashMap(BorrowedGraphResult);
+
+fn buildBorrowedGraphResults(alloc: std.mem.Allocator, backing: std.mem.Allocator, req: db_mod.types.SearchRequest, meta: QueryResponseMeta, result: db_mod.types.SearchResult, failure: *?anyerror) !BorrowedGraphMap {
+    var out: BorrowedGraphMap = .{};
+    errdefer out.deinit(alloc);
+    for (req.graph_queries) |requested| {
+        var occurrences: usize = 0;
+        for (result.graph_results) |graph| if (std.mem.eql(u8, requested.name, graph.name)) {
+            occurrences += 1;
+        };
+        if (occurrences != 1) return error.InvalidRemoteResponse;
+    }
+    for (result.graph_results) |graph| {
+        const query = (findGraphQuery(req.graph_queries, graph.name) orelse return error.InvalidRemoteResponse).query;
+        const value: BorrowedGraphResult = if (query.query_type == .traverse and query.match_pattern == null and query.aggregates.len == 0) blk: {
+            if (graph.nodes.len > query.params.max_results or graph.nodes.len > public_limits.max_graph_result_items or graph.paths.len != 0) return error.InvalidRemoteResponse;
+            const documents = try alloc.create(GraphDocumentLookup);
+            documents.* = try GraphDocumentLookup.initBorrowed(alloc, graph.hits, query.include_documents, .{ .fields = query.fields, .include_all_fields = query.include_all_fields });
+            break :blk .{ .nodes = .{ .nodes = .{ .alloc = backing, .result = graph, .include_paths = query.params.include_paths, .documents = documents, .cancellation = req.cancellation, .failure = failure }, .metric_status = try toOpenApiGraphMetricStatusMap(alloc, graph.metric_status), .stats = .{ .returned_items = @intCast(graph.nodes.len), .truncated = graph.truncated } } };
+        } else .{ .converted = toOpenApiGraphQueryResult(alloc, query, meta, graph) catch |err| {
+            if (graph_path_weight_diagnostic.isDomainError(err)) graph_path_weight_diagnostic.record(graph.name, query, err);
+            return err;
+        } };
+        if (out.map.contains(graph.name)) return error.InvalidRemoteResponse;
+        try out.map.put(alloc, graph.name, value);
+    }
+    return out;
+}
+
+fn validateGraphNodeMetrics(node: graph_query_mod.GraphResultNode) !void {
+    if (!node.metricViewValid() or node.metricCount() > graph_query_mod.graph_metric_projection_limit) return error.InvalidRemoteResponse;
+    for (0..node.metricCount()) |column| {
+        const metric = node.metricAt(column);
+        if (!graph_query_mod.isValidIdentifier(metric.name)) return error.InvalidRemoteResponse;
+        for (0..column) |previous| if (std.mem.eql(u8, node.metricAt(previous).name, metric.name)) return error.InvalidRemoteResponse;
+        if (metric.score) |score| if (!std.math.isFinite(score)) return error.InvalidRemoteResponse;
+    }
+}
+
 fn buildGraphQueryResults(
     comptime Result: type,
     alloc: std.mem.Allocator,
@@ -5476,9 +5595,10 @@ fn findGraphQuery(
 }
 
 const GraphDocumentLookup = struct {
-    const Entry = struct { document: ?std.json.ArrayHashMap(std.json.Value) };
+    const Entry = struct { document: ?std.json.ArrayHashMap(std.json.Value), hit: ?db_mod.types.SearchHit = null };
 
     enabled: bool,
+    projection: db_mod.types.LookupOptions = .{},
     remaining_bindings: usize = public_limits.max_graph_hydrated_bindings,
     entries: graph_node_identity.Map(Entry) = .{},
 
@@ -5508,6 +5628,22 @@ const GraphDocumentLookup = struct {
             _ = try self.entries.putIfAbsent(alloc, identity, .{ .document = parsed_document });
         }
         return self;
+    }
+
+    fn initBorrowed(alloc: std.mem.Allocator, hits: []const db_mod.types.SearchHit, enabled: bool, projection: db_mod.types.LookupOptions) !GraphDocumentLookup {
+        var self = GraphDocumentLookup{ .enabled = enabled, .projection = projection };
+        errdefer self.deinit(alloc);
+        if (enabled) for (hits) |hit| {
+            _ = try self.entries.putIfAbsent(alloc, .{ .table = hit.source_table, .key = hit.id }, .{ .document = null, .hit = hit });
+        };
+        return self;
+    }
+    fn documentWithAllocator(self: *GraphDocumentLookup, alloc: std.mem.Allocator, key: []const u8, table: ?[]const u8) !?std.json.ArrayHashMap(std.json.Value) {
+        const ready = try self.document(key, table);
+        if (!self.enabled) return null;
+        const entry = self.entries.get(.{ .table = table, .key = key }) orelse return null;
+        if (entry.hit) |hit| if (hit.stored_data) |stored| return try takeOpenApiObjectMap(alloc, try projectPublicStoredSourceValue(alloc, stored, self.projection));
+        return ready;
     }
 
     fn document(
@@ -5864,10 +6000,25 @@ fn toOpenApiGraphNodes(
             .path = if (include_paths) try toOpenApiGraphNodePath(alloc, node) else null,
             .path_edges = if (include_paths) try toOpenApiOptionalGraphPathEdges(alloc, node) else null,
             .provenance = node.provenance,
+            .metrics = try graphNodeMetricsObjectMap(alloc, node),
             .evidence = try graphNodeEvidenceObjectMap(alloc, node),
         };
     }
     return nodes;
+}
+
+fn graphNodeMetricsObjectMap(alloc: std.mem.Allocator, node: graph_query_mod.GraphResultNode) !?std.json.ArrayHashMap(std.json.Value) {
+    if (!node.metricViewValid() or node.metricCount() > graph_query_mod.graph_metric_projection_limit) return error.InvalidRemoteResponse;
+    if (node.metricCount() == 0) return null;
+    var out: std.json.ArrayHashMap(std.json.Value) = .{};
+    errdefer out.deinit(alloc);
+    for (0..node.metricCount()) |column| {
+        const metric = node.metricAt(column);
+        if (!graph_query_mod.isValidIdentifier(metric.name) or out.map.contains(metric.name)) return error.InvalidRemoteResponse;
+        if (metric.score) |score| if (!std.math.isFinite(score)) return error.InvalidRemoteResponse;
+        try out.map.put(alloc, metric.name, if (metric.score) |score| .{ .float = score } else .null);
+    }
+    return out;
 }
 
 fn validateCanonicalGraphResultNode(node: graph_query_mod.GraphResultNode) !void {
@@ -19100,4 +19251,126 @@ test "external lake query parser accepts bounded retained capabilities and rejec
     const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
     defer a.free(oversized);
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", oversized));
+}
+
+test "public graph metric projections survive canonical wire conversion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names = [_][]u8{ @constCast("rank"), @constCast("missing") };
+    var scores = [_]f64{ 3.5, std.math.nan(f64) };
+    var columns = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    var metrics = [_]graph_query_mod.GraphMetricValue{ .{ .name = "rank", .score = 3.5, .name_owned = false }, .{ .name = "missing", .score = null, .name_owned = false } };
+    var lookup = try GraphDocumentLookup.init(a, &.{}, false);
+    defer lookup.deinit(a);
+    for (0..2) |mode| {
+        var nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .depth = 0, .distance = 0, .metrics = if (mode == 0) &metrics else &.{}, .metrics_owned = false, .metric_columns = if (mode == 1) &columns else null }};
+        const result = db_mod.types.GraphSearchResult{ .name = @constCast("g"), .nodes = &nodes, .hits = &.{}, .total_hits = 1 };
+        const output = try toOpenApiGraphNodes(a, result, &lookup, false);
+        try std.testing.expectEqual(@as(usize, 2), nodes[0].metricCount());
+        try std.testing.expectEqual(@as(?f64, 3.5), nodes[0].metricAt(0).score);
+        try std.testing.expectEqual(@as(f64, 3.5), output[0].metrics.?.map.get("rank").?.float);
+        const wire = try std.json.Stringify.valueAlloc(a, output, .{});
+        const parsed = try std.json.parseFromSlice([]indexes_openapi.GraphResultNode, a, wire, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(f64, 3.5), parsed.value[0].metrics.?.map.get("rank").?.float);
+        try std.testing.expect(parsed.value[0].metrics.?.map.get("missing").? == .null);
+        var remote = try @import("query_execution_contract.zig").parseRemoteGraphNodes(a, parsed.value);
+        defer remote.deinit(a);
+        try std.testing.expectEqual(@as(?f64, 3.5), remote.nodes[0].metricAt(0).score);
+    }
+}
+
+test "public graph metric borrowed wire allocation measurement" {
+    const a = std.testing.allocator;
+    const n = public_limits.max_graph_result_items;
+    var names = [_][]u8{ @constCast("rank"), @constCast("degree"), @constCast("hub"), @constCast("missing") };
+    var scores = [_]f64{ 3.5, 2, 1, std.math.nan(f64) };
+    var columns = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    const nodes = try a.alloc(graph_query_mod.GraphResultNode, n);
+    defer a.free(nodes);
+    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0, .metric_columns = &columns, .metrics_owned = false };
+    var expected: ?[]u8 = null;
+    defer if (expected) |wire| a.free(wire);
+    for (0..2) |mode| {
+        var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        const alloc = counter.allocator();
+        var lookup = try GraphDocumentLookup.init(alloc, &.{}, false);
+        var failure: ?anyerror = null;
+        const wire = if (mode == 0) canonical: {
+            const result = db_mod.types.GraphSearchResult{ .name = @constCast("g"), .nodes = nodes, .hits = &.{}, .total_hits = n };
+            const out = try toOpenApiGraphNodes(alloc, result, &lookup, false);
+            defer {
+                for (out) |node| {
+                    var map = node.metrics.?;
+                    map.deinit(alloc);
+                }
+                alloc.free(out);
+            }
+            break :canonical try std.json.Stringify.valueAlloc(alloc, out, .{ .emit_null_optional_fields = false });
+        } else try std.json.Stringify.valueAlloc(alloc, BorrowedGraphNodes{ .alloc = alloc, .result = .{ .name = @constCast("g"), .nodes = nodes, .hits = &.{}, .total_hits = n }, .include_paths = false, .documents = &lookup, .failure = &failure }, .{ .emit_null_optional_fields = false });
+        if (mode == 0) expected = try a.dupe(u8, wire) else try std.testing.expectEqualStrings(expected.?, wire);
+        std.debug.print("PUBLIC_COLUMN_WIRE mode={d} nodes={d} json_bytes={d} peak_bytes={d} allocations={d}\n", .{ mode, n, wire.len, counter.peak, counter.alloc_calls });
+        alloc.free(wire);
+        lookup.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "public graph metric borrowed wire preserves projected documents paths and atomic delivery" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var names = [_][]u8{ @constCast("rank"), @constCast("missing") };
+            var scores = [_]f64{ 3.5, std.math.nan(f64) };
+            var columns = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+            var nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .table = "entities", .depth = 1, .distance = 1, .path = &.{ "root", "a" }, .path_tables = &.{ null, "entities" }, .provenance = &.{"source"}, .metric_columns = &columns }};
+            var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .source_table = @constCast("entities"), .stored_data = @constCast("{\"title\":\"keep\",\"secret\":\"omit\"}") }};
+            const graph = db_mod.types.GraphSearchResult{ .name = @constCast("g"), .nodes = &nodes, .hits = &hits, .total_hits = 1 };
+            const query = graph_query_mod.GraphQuery{ .query_type = .traverse, .index_name = "g", .start_nodes = .{ .keys = &.{"root"} }, .include_documents = true, .include_all_fields = false, .fields = &.{"title"}, .params = .{ .include_paths = true, .max_results = 10 } };
+            const old = try toOpenApiGraphQueryResult(scratch, query, .{}, graph);
+            const expected = try std.json.Stringify.valueAlloc(a, old, .{ .emit_null_optional_fields = false });
+            defer a.free(expected);
+            const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "g", .query = query }};
+            var graphs = [_]db_mod.types.GraphSearchResult{graph};
+            const req = db_mod.types.SearchRequest{ .graph_queries = &queries, .graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = @ptrCast(queries[0..].ptr), .admitted_operations_len = queries.len } };
+            const result = db_mod.types.SearchResult{ .alloc = a, .hits = &.{}, .total_hits = 0, .graph_results = &graphs };
+            var failure: ?anyerror = null;
+            const borrowed = try buildBorrowedGraphResults(scratch, a, req, .{}, result, &failure);
+            const actual = try std.json.Stringify.valueAlloc(a, borrowed.map.get("g").?, .{ .emit_null_optional_fields = false });
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+            var encoded = try encodeQueryResponses(a, "docs", req, .{}, result);
+            defer encoded.deinit(a);
+            const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, a, encoded.json, .{});
+            defer parsed.deinit();
+            const node = parsed.value.responses.?[0].graph_results.?.map.get("g").?.graph_nodes_result.nodes[0];
+            try std.testing.expectEqualStrings("keep", node.document.?.map.get("title").?.string);
+            try std.testing.expect(node.document.?.map.get("secret") == null);
+            try std.testing.expect(node.metrics.?.map.get("missing").? == .null);
+            const Sink = struct {
+                starts: usize = 0,
+                fn start(raw: *anyopaque, _: usize) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.starts += 1;
+                }
+                fn write(_: *anyopaque, _: []const u8) !void {}
+            };
+            var sink: Sink = .{};
+            scores[0] = std.math.inf(f64);
+            if (encodeQueryResponsesWithDelivery(a, "docs", req, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .spill_io = std.testing.io, .preparation_bytes = 1 })) |value| {
+                var unexpected = value;
+                unexpected.deinit(a);
+                return error.TestExpectedError;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidRemoteResponse, err);
+            }
+            try std.testing.expectEqual(@as(usize, 0), sink.starts);
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

@@ -22742,17 +22742,7 @@ fn runtimeGraphWritesWithResolutionsAlloc(
     if (endpoint_resolutions) |res_raw| {
         if (parsed.value == .object) {
             const a = parsed.arena.allocator();
-            const resolutions = std.json.parseFromSliceLeaky(std.json.Value, a, res_raw, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidResolutionArtifact,
-            };
-            if (resolutions != .object) return error.InvalidResolutionArtifact;
-            var references = resolutions.object.iterator();
-            while (references.next()) |entry| {
-                if (entry.value_ptr.* != .object) return error.InvalidResolutionArtifact;
-                const key = entry.value_ptr.object.get("key") orelse return error.InvalidResolutionArtifact;
-                if (key != .string or key.string.len == 0) return error.InvalidResolutionArtifact;
-            }
+            const resolutions = try @import("../graph_endpoint_resolutions.zig").references(a, res_raw);
             try parsed.value.object.put(a, "_entities", resolutions);
         }
     }
@@ -34746,7 +34736,7 @@ test "document extraction accepts validated reader no-text results without hidin
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
-test "capi graph replay injects canonical endpoints and rejects malformed resolution JSON" {
+test "capi graph replay injects canonical endpoints and isolates malformed resolution JSON" {
     const a = std.testing.allocator;
     const raw = "{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Alias\"},{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Parent\"}],\"relations\":[{\"type\":\"is_a\",\"source\":\"e0\",\"target\":\"e1\"}]}";
     const source = index_manager_mod.GraphArtifactSource{ .artifact_name = @constCast("kg"), .format = .extraction_graph, .mention_edge_type = @constCast("mentions") };
@@ -34755,5 +34745,8 @@ test "capi graph replay injects canonical endpoints and rejects malformed resolu
     try std.testing.expectEqual(@as(usize, 1), writes.len);
     try std.testing.expectEqualStrings("concept/canonical", writes[0].source);
     try std.testing.expectEqualStrings("concept/parent", writes[0].target);
-    try std.testing.expectError(error.InvalidResolutionArtifact, runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{", 10));
+    const malformed = try runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{", 10);
+    defer runtimeFreeGraphWrites(a, malformed);
+    // No inferred/fallback edge may be substituted for missing canonical refs.
+    try std.testing.expectEqual(@as(usize, 0), malformed.len);
 }

@@ -380,19 +380,19 @@ pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.Err
     const id = handle.next_sql_session_id;
     handle.next_sql_session_id = std.math.add(u64, id, 1) catch {
         handle.alloc.destroy(session);
-        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return h.capi.recordError(.internal, @src().fn_name ++ ": SQL session ID counter overflow");
     };
-    handle.sql_sessions.putNoClobber(handle.alloc, id, session) catch {
+    handle.sql_sessions.putNoClobber(handle.alloc, id, session) catch |err| {
         session.arena.deinit();
         handle.alloc.destroy(session);
-        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": registering the SQL session");
     };
     out.* = id;
     return .ok;
 }
 pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
     h.capi.clearLastError();
-    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const guard = api.enterHandlePinned(ptr, .exclusive) orelse");
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
@@ -400,7 +400,7 @@ pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.Erro
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL sessions require a root database handle");
-    const entry = handle.sql_sessions.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const entry = handle.sql_sessions.fetchRemove(id) orelse");
+    const entry = handle.sql_sessions.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL session ID is unknown or closed");
     @import("sql_cursor.zig").closeSession(handle, id);
     entry.value.arena.deinit();
     handle.alloc.destroy(entry.value);

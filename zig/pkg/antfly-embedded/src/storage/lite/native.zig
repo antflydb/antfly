@@ -6176,6 +6176,13 @@ pub const NativeFile = struct {
     }
 
     /// Arbitrary complete batches retain sorted-input validation.
+    pub fn readDecodedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, values: []f64, state: *DocumentBatchReadState) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, std.math.nan(f64));
+        errdefer @memset(values, std.math.nan(f64));
+        try self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?[]f64, values), state, null, true);
+    }
+
     pub fn visitCompleteScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
         return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?CompleteScoreSink, sink), state, null, true);
     }
@@ -6250,8 +6257,17 @@ pub const NativeFile = struct {
         return .{ .entry = entry, .score = {} };
     }
 
+    inline fn deliverBatchScore(scores: anytype, index: usize, value: ?f64) void {
+        if (comptime @TypeOf(scores) == ?[]f64) {
+            scores.?[index] = value orelse std.math.nan(f64);
+        } else if (comptime @TypeOf(scores) == ?CompleteScoreSink) {
+            scores.?.write(scores.?.context, index, value);
+        } else if (value) |score| scores.?.write(scores.?.context, index, score);
+    }
+
     fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: anytype, state: *DocumentBatchReadState, prepared: ?ReadIdentity, comptime score_reads: bool) !void {
-        const complete = comptime @TypeOf(scores) == ?CompleteScoreSink;
+        const direct_span = comptime @TypeOf(scores) == ?[]f64;
+        const complete = direct_span or @TypeOf(scores) == ?CompleteScoreSink;
         const namespace = if (prepared) |identity| identity.namespace else "";
         state.prepare(self);
         defer state.reset();
@@ -6267,7 +6283,7 @@ pub const NativeFile = struct {
             @memset(values, null);
         }
         if (keys.len == 0 or checkpoint.document_index_root_page == 0) {
-            if (complete) if (scores) |out| for (0..keys.len) |i| out.write(out.context, i, null);
+            if (complete and scores != null) for (0..keys.len) |i| deliverBatchScore(scores, i, null);
             return;
         }
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
@@ -6279,7 +6295,9 @@ pub const NativeFile = struct {
         if (cached and state.resolved.?.decoded_ready) {
             state.resolved.?.borrowed = true;
             defer state.resolved.?.borrowed = false;
-            if (complete) {
+            if (direct_span) {
+                @memcpy(scores.?, state.resolved.?.decoded);
+            } else if (complete) {
                 scores.?.deliverDecoded(state.resolved.?.decoded);
             } else for (state.resolved.?.decoded, 0..) |score, i| {
                 if (!std.math.isNan(score)) scores.?.write(scores.?.context, i, score);
@@ -6349,7 +6367,7 @@ pub const NativeFile = struct {
                     state.resolved.?.decoded[i] = std.math.nan(f64);
                     captured += 1;
                 }
-                if (complete) if (scores) |out| out.write(out.context, i, null);
+                if (complete and scores != null) deliverBatchScore(scores, i, null);
                 position += 1;
                 continue;
             }
@@ -6389,18 +6407,17 @@ pub const NativeFile = struct {
                     state.resolved.?.decoded[i] = std.math.nan(f64);
                     captured += 1;
                 }
-                if (complete) if (scores) |out| out.write(out.context, i, null);
+                if (complete and scores != null) deliverBatchScore(scores, i, null);
                 position += 1;
                 continue;
             }
             if (comptime score_reads) {
-                const out = scores.?;
                 const score = record.score.?;
                 if (capture) {
                     state.resolved.?.decoded[i] = score;
                     captured += 1;
                 }
-                out.write(out.context, i, score);
+                deliverBatchScore(scores, i, score);
             } else if (buffers) |out| {
                 const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
                 if (length > out[i].len) return error.BufferTooSmall;

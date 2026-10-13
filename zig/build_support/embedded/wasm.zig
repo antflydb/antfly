@@ -219,12 +219,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     }));
     const wasm_matcher_mod = b.createModule(.{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     const wasm_resolver_mod = b.createModule(.{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });

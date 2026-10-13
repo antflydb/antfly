@@ -2651,7 +2651,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics" },
+        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -5703,6 +5703,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",
+        "distributed graph supports cross-range traverse target selectors",
+        "distributed graph traverse target nodes filter returned nodes without pruning frontier",
+        "distributed graph traverse routes cross-table frontier by table generation",
+        "distributed graph path materialization preserves table provenance",
+        "public graph metric borrowed wire",
+        "graph metric native response adoption",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",

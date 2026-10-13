@@ -23,6 +23,23 @@ const Datum = @import("scalar.zig").Datum;
 const A = std.mem.Allocator;
 const magic = "AGS\x02";
 
+/// One representation contract for every partial consumer. Typed states borrow
+/// page-owned payloads; decoded and reader-produced payloads use caller scratch.
+pub fn partialCount(group: operators.GroupResult) !usize {
+    if (group.typed_states != null and group.state_reader != null) return error.InvalidSqlBackendResponse;
+    if ((group.typed_states != null or group.state_reader != null) and group.aggregates.len != 0) return error.InvalidSqlBackendResponse;
+    const n = if (group.state_reader) |reader| reader.count else if (group.typed_states) |states| states.len else group.aggregates.len;
+    if (group.aggregate_slots) |slots| if (slots.len != n) return error.InvalidSqlBackendResponse;
+    return n;
+}
+
+pub fn read(a: A, group: operators.GroupResult, index: usize, spec: operators.AggregateSpec) !operators.Aggregate {
+    if (index >= try partialCount(group)) return error.InvalidSqlBackendResponse;
+    const state = if (group.state_reader) |reader| try reader.read(reader.ptr, a, index) else if (group.typed_states) |states| states[index] else return decode(a, group.aggregates[index], spec);
+    if (state.kind != spec.kind or state.input_type != spec.input_type or state.input_element != spec.input_element or state.distinct != spec.distinct) return error.InvalidSqlBackendResponse;
+    return state;
+}
+
 fn elementId(identity: ?@import("array_value.zig").ElementType) u8 {
     return if (identity) |kind| switch (kind) {
         .text => 0,
@@ -583,4 +600,30 @@ test "SQL floating special values survive partial codec and combination" {
             try std.testing.expect(std.math.isNan((try nan_restored.finish()).value.float));
         }
     }
+}
+
+test "external lake partial readers share signature validation across typed lazy and durable states" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try operators.Aggregate.init(a, .count, null);
+    state.count = 4;
+    const spec: operators.AggregateSpec = .{ .kind = .count };
+    var group: operators.GroupResult = .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{state}, .ordinal = 0 };
+    try std.testing.expectEqual(@as(u64, 4), (try read(a, group, 0, spec)).count);
+    const Reader = struct {
+        fn load(raw: *const anyopaque, _: A, _: usize) !operators.Aggregate {
+            return @as(*const operators.Aggregate, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    group.state_reader = .{ .ptr = &state, .count = 1, .read = Reader.load };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, partialCount(group));
+    group.typed_states = null;
+    try std.testing.expectEqual(@as(u64, 4), (try read(a, group, 0, spec)).count);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, read(a, group, 0, .{ .kind = .sum }));
+    group.aggregates = &.{try cell(a, state)};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, partialCount(group));
+    group.state_reader = null;
+    try std.testing.expectEqual(@as(u64, 4), (try read(a, group, 0, spec)).count);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, read(a, group, 1, spec));
 }

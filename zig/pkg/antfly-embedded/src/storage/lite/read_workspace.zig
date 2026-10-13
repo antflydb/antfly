@@ -34,6 +34,7 @@ pub const Workspace = struct {
     graph: Scratch,
     native_state: native.DocumentBatchReadState,
     resolved_scores: native.ResolvedScoreBatch = .{},
+    score_key_storage: []align(@alignOf([]const u8)) u8 = &.{},
     score_plan_borrowed: bool = false,
     score_plan: @import("../prepared_score_plan.zig").PreparedScorePlan = .{},
 
@@ -64,6 +65,8 @@ pub const Workspace = struct {
         self.native_state.deinit();
         self.batch.deinit();
         self.graph.deinit();
+        self.allocator().free(self.score_key_storage);
+        self.score_key_storage = &.{};
         if (self.budget) |*b| b.deinit();
         backing.destroy(self);
     }
@@ -90,6 +93,8 @@ pub const Workspace = struct {
         self.native_state.deinit();
         self.batch.deinit();
         self.graph.deinit();
+        self.allocator().free(self.score_key_storage);
+        self.score_key_storage = &.{};
         self.allocation_failed = false;
         const a = self.allocator();
         self.batch = Scratch.init(self.arenaAllocator(), 256 * 1024);
@@ -105,10 +110,37 @@ pub const Workspace = struct {
         self.native_state.detach();
         self.resetScratch(&self.batch);
         self.resetScratch(&self.graph);
+        if (self.score_key_storage.len > 256 * 1024) {
+            self.allocator().free(self.score_key_storage);
+            self.score_key_storage = &.{};
+        }
         if (self.query_reservation) |*r| r.release();
         self.query_reservation = null;
         self.query_budget = null;
         self.result_backing = null;
+    }
+
+    pub fn resetScoreBatch(self: *Workspace) void {
+        self.score_plan_borrowed = false;
+        self.native_state.detach();
+        if (self.allocation_failed) {
+            self.discardRetainedStorage();
+            self.allocation_failed = false;
+        } else {
+            self.resetScratch(&self.batch);
+            self.resetScratch(&self.graph);
+        }
+    }
+
+    /// Exact-size encoder storage is independent of graph arena growth. The
+    /// previous span has finished before growth; no caller owns these bytes.
+    pub fn scoreKeyStorage(self: *Workspace, bytes: usize) ![]align(@alignOf([]const u8)) u8 {
+        if (self.score_key_storage.len < bytes) {
+            self.allocator().free(self.score_key_storage);
+            self.score_key_storage = &.{};
+            self.score_key_storage = try self.allocator().alignedAlloc(u8, .fromByteUnits(@alignOf([]const u8)), bytes);
+        }
+        return self.score_key_storage[0..bytes];
     }
 
     pub fn resetBatch(self: *Workspace) void {
