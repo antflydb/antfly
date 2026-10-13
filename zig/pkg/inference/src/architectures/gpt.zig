@@ -5814,6 +5814,21 @@ fn decoderBlock(
     }
     defer if (owns_qwen3vl_prefill_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    // Independent Gemma4 KV rows use the eager batched math, rather than the
+    // singleton prepared decoder. Bound temporary lifetimes to one layer while
+    // coalescing its GPU dispatches; singleton direct decoding is unaffected.
+    var owns_gemma4_batch_frame = false;
+    if (cb.kind() == .metal and config.family == .gemma and config.hasPle() and
+        config.usesGemma4Channels() and isDecodeStep(decode_context) and
+        batch <= 4 and decode_context != null and decode_context.?.kv_batch != null and
+        !getenvBool("ANTFLY_GEMMA4_METAL_OCR_DISABLE_LAYER_FRAMES") and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_gemma4_batch_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_gemma4_batch_frame) try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+    }
+    defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
+
     const result = try decoderBlockImpl(
         cb,
         allocator,
@@ -5845,6 +5860,10 @@ fn decoderBlock(
     if (owns_qwen3vl_prefill_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_prefill_frame = false;
+    }
+    if (owns_gemma4_batch_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_gemma4_batch_frame = false;
     }
     return result;
 }
