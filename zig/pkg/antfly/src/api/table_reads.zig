@@ -8531,9 +8531,13 @@ fn queryHostedAcrossGroupsParallel(
                     slot.err = err;
                     return;
                 },
-                .remote => |remote| slot.result = queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
-                    slot.err = normalizeDistributedQueryOperationalError(err);
-                    return;
+                .remote => |remote| {
+                    // Reclaim transport and decoding workspace at callback
+                    // completion; the slot arena retains final results only.
+                    slot.result = queryRemoteWithScratch(source.internalExecutor(), arena, slot.arena.child_allocator, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
+                        slot.err = normalizeDistributedQueryOperationalError(err);
+                        return;
+                    };
                 },
             }
             if (slot.result == null) slot.err = error.TableNotFound;
@@ -15498,9 +15502,22 @@ fn queryRemote(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
-    var result = try queryResponseRemote(executor, alloc, base_uri, group_id, table_name, req);
-    defer result.deinit(alloc);
-    var parsed = try parseRemoteSearchResult(alloc, result.json);
+    return queryRemoteWithScratch(executor, alloc, alloc, base_uri, group_id, table_name, req);
+}
+
+fn queryRemoteWithScratch(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+) !db_mod.types.SearchResult {
+    var result = try queryResponseRemote(executor, scratch, base_uri, group_id, table_name, req);
+    defer result.deinit(scratch);
+    var parsed = try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
+    errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
     return parsed;
 }
@@ -15536,8 +15553,14 @@ fn queryResponseRemote(
     else
         try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
+    const owner = result.owner_allocator orelse alloc;
+    const json = if (owner.ptr == alloc.ptr and owner.vtable == alloc.vtable) blk: {
+        const owned = result.body;
+        result.body = &.{};
+        break :blk owned;
+    } else try alloc.dupe(u8, result.body);
     return .{
-        .json = try alloc.dupe(u8, result.body),
+        .json = json,
         .identity_read_generation = result.identity_read_generation,
     };
 }
@@ -15838,17 +15861,18 @@ fn graphEdgesRemote(
     table_name: []const u8,
     req: distributed_graph.GraphEdgesRequest,
 ) !distributed_graph.GraphEdgesResponse {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
-    defer alloc.free(body);
+    const scratch = req.scratch_allocator orelse alloc;
+    var client = http_client.ApiHttpClient.init(scratch, executor);
+    const body = try distributed_graph.encodeGraphEdgesRequest(scratch, req);
+    defer scratch.free(body);
     var cancellation = if (req.cancellation) |token|
         http_common.RequestCancellation.fromToken(token)
     else
         null;
     if (req.keys.len != 0) {
-        var batch = try client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null);
-        defer batch.deinit(alloc);
-        return try distributed_graph.parseGraphEdgesResponse(alloc, batch.body);
+        var batch = client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null) catch |err| return if (req.allow_partial_keys and err == error.InvalidGraphEdgesWireRequest) error.GraphEdgesBatchUnsupported else err;
+        defer batch.deinit(scratch);
+        return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, batch.body);
     }
     var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
@@ -15859,8 +15883,8 @@ fn graphEdgesRemote(
         if (cancellation != null) &cancellation.? else null,
     ) catch |err| blk: {
         if (err != error.InvalidGraphEdgesWireRequest or !req.allow_legacy_wire_fallback) return err;
-        const legacy_body = try distributed_graph.encodeLegacyGraphEdgesRequest(alloc, req);
-        defer alloc.free(legacy_body);
+        const legacy_body = try distributed_graph.encodeLegacyGraphEdgesRequest(scratch, req);
+        defer scratch.free(legacy_body);
         break :blk try client.fetchGroupGraphEdgesWithControl(
             base_uri,
             group_id,
@@ -15870,8 +15894,8 @@ fn graphEdgesRemote(
             if (cancellation != null) &cancellation.? else null,
         );
     };
-    defer result.deinit(alloc);
-    return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
+    defer result.deinit(scratch);
+    return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, result.body);
 }
 
 test "graph hydrate and edges remote retry legacy wire safely" {

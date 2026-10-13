@@ -253,6 +253,8 @@ pub const GraphEdgesRequest = struct {
     index_name: []u8,
     key: []u8,
     keys: [][]const u8 = &.{},
+    resume_cursor: ?graph_mod.EdgeScanCursor = null,
+    allow_partial_keys: bool = false,
     edge_types: [][]const u8 = &.{},
     direction: graph_mod.EdgeDirection,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
@@ -265,6 +267,8 @@ pub const GraphEdgesRequest = struct {
     max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
     allow_legacy_wire_fallback: bool = false,
     legacy_wire_request: bool = false,
+    // Borrowed request-local transport/decode workspace, never serialized.
+    scratch_allocator: ?std.mem.Allocator = null,
     timeout_ms: ?u32 = null,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
@@ -276,6 +280,7 @@ pub const GraphEdgesRequest = struct {
         freeConstStrings(alloc, self.edge_types);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
+        if (self.resume_cursor) |*cursor| cursor.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -283,14 +288,24 @@ pub const GraphEdgesRequest = struct {
 pub const GraphEdgesResponse = struct {
     edges: []graph_mod.Edge,
     scanned_rows: u32 = 0,
-    // Complete key prefixes only. Total scans also include an incomplete key.
+    // Complete prefixes plus optional owned partial-key progress. Total scans
+    // include all fragments and unsuccessful bounded visits.
     key_offsets: []u32 = &.{},
     key_scanned_rows: []u32 = &.{},
+    partial_key: ?u32 = null,
+    partial_edges: []graph_mod.Edge = &.{},
+    resume_cursor: ?graph_mod.EdgeScanCursor = null,
+    owns_descriptors: bool = false,
     borrowed_edges: bool = false,
     physical_rows_precharged: bool = false,
 
     pub fn deinit(self: *GraphEdgesResponse, alloc: std.mem.Allocator) void {
-        if (self.borrowed_edges) return;
+        if (self.borrowed_edges) {
+            if (self.owns_descriptors) alloc.free(self.edges);
+            return;
+        }
+        if (self.resume_cursor) |*cursor| cursor.deinit(alloc);
+        graph_mod.GraphIndex.freeEdges(alloc, self.partial_edges);
         alloc.free(self.key_offsets);
         alloc.free(self.key_scanned_rows);
         for (self.edges) |e| graph_mod.GraphIndex.freeEdge(alloc, e);
@@ -426,6 +441,8 @@ pub const GraphEdgesRequestJson = struct {
     index_name: []const u8,
     key: []const u8,
     keys: ?[]const []const u8 = null,
+    resume_cursor: ?graph_mod.EdgeScanCursor = null,
+    allow_partial_keys: bool = false,
     edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
@@ -457,6 +474,9 @@ pub const GraphEdgesResponseJson = struct {
     scanned_rows: ?u32 = null,
     key_offsets: ?[]const u32 = null,
     key_scanned_rows: ?[]const u32 = null,
+    partial_key: ?u32 = null,
+    partial_edges: ?[]const GraphEdgeJson = null,
+    resume_cursor: ?graph_mod.EdgeScanCursor = null,
 };
 
 pub fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
@@ -583,10 +603,14 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
     const keys = try dupConstStrings(alloc, requested_keys);
     errdefer freeConstStrings(alloc, keys);
     if (keys.len > 64 or (keys.len != 0 and !std.mem.eql(u8, key, keys[0]))) return error.InvalidQueryRequest;
+    if (parsed.value.resume_cursor != null and (keys.len != 1 or !parsed.value.allow_partial_keys)) return error.InvalidQueryRequest;
+    const continuation = if (parsed.value.resume_cursor) |cursor| try cursor.clone(alloc) else null;
     return .{
         .index_name = index_name,
         .key = key,
         .keys = keys,
+        .resume_cursor = continuation,
+        .allow_partial_keys = parsed.value.allow_partial_keys,
         .edge_types = kinds,
         .direction = if (std.mem.eql(u8, parsed.value.direction, "in"))
             .in
@@ -611,6 +635,7 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
 // key's scans too; the coordinator can continue with a single-key read.
 pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIndex, req: GraphEdgesRequest, now_ns: u64) !GraphEdgesResponse {
     try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
+    if (req.resume_cursor != null and (req.keys.len != 1 or !req.allow_partial_keys)) return error.InvalidQueryRequest;
     if (req.keys.len == 0) {
         const result = try index.getEdgesByTypesBoundedWithStatsAt(alloc, req.key, req.edge_types, req.direction, req.max_edges, req.max_owned_bytes, req.max_scanned_rows, now_ns);
         return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
@@ -633,42 +658,91 @@ pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIn
     offsets.appendAssumeCapacity(0);
     var scanned: usize = 0;
     var owned_bytes: usize = 0;
-    var read_context = try index.beginEdgeReadContext(req.direction);
+    var read_context = if (req.allow_partial_keys) try index.beginEdgeReadContextWithProof(req.direction) else try index.beginEdgeReadContext(req.direction);
     defer read_context.deinit();
-    for (req.keys) |key| {
+    if (req.resume_cursor) |cursor| try read_context.validateContinuation(cursor);
+    const partial_supported = req.allow_partial_keys and read_context.read_generation != null;
+    var partial_key: ?u32 = null;
+    var partial_edges: []graph_mod.Edge = &.{};
+    errdefer graph_mod.GraphIndex.freeEdges(alloc, partial_edges);
+    var continuation: ?graph_mod.EdgeScanCursor = null;
+    errdefer if (continuation) |*cursor| cursor.deinit(alloc);
+    for (req.keys, 0..) |key, key_index| {
         if (scanned >= req.max_scanned_rows or edges.items.len >= req.max_edges or owned_bytes >= req.max_owned_bytes) break;
         if (req.cancellation) |token| try token.check();
         if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
         var attempted: usize = 0;
-        const result = read_context.getBounded(alloc, key, req.edge_types, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
+        var page = if (partial_supported) read_context.getPage(alloc, key, req.edge_types, req.resume_cursor, .{
+            .max_edges = req.max_edges - edges.items.len,
+            .max_owned_bytes = req.max_owned_bytes - owned_bytes,
+            .max_scanned_rows = req.max_scanned_rows - scanned,
+        }, now_ns, &attempted) catch |err| switch (err) {
             error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
                 scanned += attempted;
-                if (scanned > req.max_scanned_rows) return error.GraphExploredEdgesBudgetExceeded;
                 break;
             },
             else => return err,
+        } else blk: {
+            const bounded = read_context.getBounded(alloc, key, req.edge_types, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
+                error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
+                    scanned += attempted;
+                    break;
+                },
+                else => return err,
+            };
+            var bounded_bytes: usize = 0;
+            for (bounded.edges) |edge| {
+                bounded_bytes += @sizeOf(graph_mod.Edge);
+                inline for (.{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata, edge.winner_key_hex }) |value| bounded_bytes += value.len;
+            }
+            break :blk graph_mod.EdgePage{ .edges = bounded.edges, .scanned_rows = bounded.scanned_rows, .owned_bytes = bounded_bytes };
         };
-        var moved = false;
-        defer if (!moved) graph_mod.GraphIndex.freeEdges(alloc, result.edges);
-        try edges.ensureUnusedCapacity(alloc, result.edges.len);
-        for (result.edges) |edge| {
-            // Graph pages include edge descriptors in their owned-byte limit.
-            var bytes: usize = @sizeOf(graph_mod.Edge);
-            inline for (.{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata, edge.winner_key_hex }) |v| bytes += v.len;
-            owned_bytes += bytes;
-            edges.appendAssumeCapacity(edge);
+        defer page.deinit(alloc);
+        scanned += page.scanned_rows;
+        // A scan boundary may land on the last row. Preserve the bounded
+        // reader's one-probe EOF proof rather than requiring another RPC with
+        // a zero remaining allowance. Non-empty probes remain charged.
+        if (req.resume_cursor != null and page.next_cursor != null and page.scanned_rows == req.max_scanned_rows) {
+            var probe_scans: usize = 0;
+            var probe = read_context.getPage(alloc, key, req.edge_types, page.next_cursor, .{ .max_edges = 1, .max_owned_bytes = 1, .max_scanned_rows = 1 }, now_ns, &probe_scans) catch |err| switch (err) {
+                error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => blk: {
+                    scanned += probe_scans;
+                    break :blk graph_mod.EdgePage{ .edges = &.{}, .byte_limit_hit = true };
+                },
+                else => return err,
+            };
+            defer probe.deinit(alloc);
+            scanned += probe.scanned_rows;
+            if (!probe.byte_limit_hit and probe.scanned_rows == 0 and probe.next_cursor == null and probe.edges.len == 0) {
+                page.next_cursor.?.deinit(alloc);
+                page.next_cursor = null;
+            }
         }
-        alloc.free(result.edges);
-        moved = true;
-        scanned += result.scanned_rows;
-        scans.appendAssumeCapacity(@intCast(result.scanned_rows));
+        // A payload that does not fit the prefetch window is retried with the
+        // demand-read allowance. Its attempted physical visit stays charged.
+        if (page.byte_limit_hit and page.edges.len == 0) break;
+        if (page.next_cursor != null) {
+            partial_key = @intCast(key_index);
+            partial_edges = page.edges;
+            page.edges = &.{};
+            read_context.bindContinuation(&page.next_cursor.?);
+            continuation = page.next_cursor;
+            page.next_cursor = null;
+            break;
+        }
+        try edges.ensureUnusedCapacity(alloc, page.edges.len);
+        for (page.edges) |edge| edges.appendAssumeCapacity(edge);
+        alloc.free(page.edges);
+        page.edges = &.{};
+        owned_bytes += page.owned_bytes;
+        scans.appendAssumeCapacity(@intCast(page.scanned_rows));
         offsets.appendAssumeCapacity(@intCast(edges.items.len));
     }
     const owned_edges = try edges.toOwnedSlice(alloc);
     errdefer graph_mod.GraphIndex.freeEdges(alloc, owned_edges);
     const owned_offsets = try offsets.toOwnedSlice(alloc);
     errdefer alloc.free(owned_offsets);
-    return .{ .edges = owned_edges, .key_offsets = owned_offsets, .key_scanned_rows = try scans.toOwnedSlice(alloc), .scanned_rows = @intCast(scanned) };
+    return .{ .edges = owned_edges, .key_offsets = owned_offsets, .key_scanned_rows = try scans.toOwnedSlice(alloc), .scanned_rows = @intCast(scanned), .partial_key = partial_key, .partial_edges = partial_edges, .resume_cursor = continuation };
 }
 
 pub fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32, max_scanned_rows: u32) !void {
@@ -2174,7 +2248,22 @@ pub fn encodeGraphEdgesResponseForWire(alloc: std.mem.Allocator, res: GraphEdges
             .winner_key_hex = edge.winner_key_hex,
         };
     }
-    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows, .key_offsets = if (res.key_offsets.len == 0) null else res.key_offsets, .key_scanned_rows = if (res.key_offsets.len == 0) null else res.key_scanned_rows });
+    const partial = try alloc.alloc(GraphEdgeJson, res.partial_edges.len);
+    defer alloc.free(partial);
+    for (res.partial_edges, partial) |edge, *wire| wire.* = .{
+        .source = edge.source,
+        .target = edge.target,
+        .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
+        .weight = edge.weight,
+        .created_at = edge.created_at,
+        .updated_at = edge.updated_at,
+        .metadata = edge.metadata,
+        .winner_rank = edge.winner_rank,
+        .winner_key_hex = edge.winner_key_hex,
+    };
+    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows, .partial_key = res.partial_key, .partial_edges = if (res.partial_key != null) partial else null, .resume_cursor = res.resume_cursor, .key_offsets = if (res.key_offsets.len == 0) null else res.key_offsets, .key_scanned_rows = if (res.key_offsets.len == 0) null else res.key_scanned_rows });
 }
 
 pub fn encodeGraphExpandResponseForWire(alloc: std.mem.Allocator, res: GraphExpandResponse, legacy: bool) ![]u8 {
@@ -2217,4 +2306,127 @@ pub fn allocRelationshipExclusionKey(
         to.table orelse return error.InvalidGraphPath, to.key,                                          direction_tag[0..],
         edge_type,                                     edge_id,                                         owner_document,
     });
+}
+
+test "public graph metric borrowed wire partial batch resumes expired-row scan without replay" {
+    const a = std.testing.allocator;
+    var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem, .ttl_duration_ns = 10 });
+    defer index.close();
+    const count = 8200;
+    const keys = try a.alloc([24]u8, count);
+    defer a.free(keys);
+    const writes = try a.alloc(graph_mod.BatchWrite, count + 1);
+    defer a.free(writes);
+    for (keys, writes[0..count], 0..) |*buffer, *write, i| write.* = .{ .source = "root", .target = try std.fmt.bufPrint(buffer, "expired{d:0>5}", .{i}), .edge_type = "R", .ttl_created_ns = 1 };
+    writes[count] = .{ .source = "root", .target = "zz-live", .edge_type = "R", .ttl_created_ns = 100 };
+    try index.batchApply(writes, &.{});
+    const request: GraphEdgesRequest = .{
+        .index_name = @constCast("g"),
+        .key = @constCast("root"),
+        .keys = @constCast(&[_][]const u8{ "root", "other" }),
+        .direction = .out,
+        .max_edges = 4096,
+        .max_owned_bytes = 1024 * 1024,
+        .max_scanned_rows = 8199,
+        .allow_partial_keys = true,
+        .ttl_now_ns = 100,
+    };
+    var partial = try readGraphEdgesRequest(a, &index, request, 100);
+    defer partial.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 0), partial.partial_key);
+    try std.testing.expectEqual(@as(u32, 8199), partial.scanned_rows);
+    try std.testing.expectEqual(@as(usize, 0), partial.partial_edges.len);
+    const continuation: GraphEdgesRequest = .{
+        .index_name = @constCast("g"),
+        .key = @constCast("root"),
+        .keys = @constCast(&[_][]const u8{"root"}),
+        .direction = .out,
+        .max_edges = 4096,
+        .max_owned_bytes = 1024 * 1024,
+        .max_scanned_rows = 16400 - partial.scanned_rows,
+        .allow_partial_keys = true,
+        .resume_cursor = partial.resume_cursor,
+        .ttl_now_ns = 100,
+    };
+    var completed = try readGraphEdgesRequest(a, &index, continuation, 100);
+    defer completed.deinit(a);
+    try std.testing.expect(completed.resume_cursor == null);
+    try std.testing.expectEqual(@as(usize, 1), completed.edges.len);
+    try std.testing.expectEqualStrings("zz-live", completed.edges[0].target);
+    try std.testing.expectEqual(@as(u32, 8201), partial.scanned_rows + completed.scanned_rows);
+    std.debug.print("PARTIAL_EDGE_SCAN expired=8200 live=1 allowance=16400 initial=8199 total_scans=8201 replay_scans=0\n", .{});
+}
+
+test "public graph metric borrowed wire partial cursor fences mutation ownership and exact EOF" {
+    const a = std.testing.allocator;
+    var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer index.close();
+    try index.batchApply(&.{ .{ .source = "root", .target = "a", .edge_type = "R" }, .{ .source = "root", .target = "b", .edge_type = "R" } }, &.{});
+    var request: GraphEdgesRequest = .{ .index_name = @constCast("g"), .key = @constCast("root"), .keys = @constCast(&[_][]const u8{"root"}), .direction = .out, .allow_partial_keys = true, .max_edges = 10, .max_owned_bytes = 4096, .max_scanned_rows = 1 };
+    var partial = try readGraphEdgesRequest(a, &index, request, 1);
+    defer partial.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), partial.partial_edges.len);
+    try std.testing.expect(partial.resume_cursor.?.read_generation != null);
+    request.resume_cursor = partial.resume_cursor;
+    var end = try readGraphEdgesRequest(a, &index, request, 1);
+    defer end.deinit(a);
+    try std.testing.expect(end.resume_cursor == null);
+    try std.testing.expectEqual(@as(usize, 1), end.edges.len);
+    try std.testing.expectEqual(@as(u32, 2), partial.scanned_rows + end.scanned_rows);
+    // Attribute replacement preserves the numerical topology epoch, but must
+    // invalidate a data continuation just like an inserted identity does.
+    const topology = index.edge_generation;
+    try index.addEdge("root", "a", "R", 2, 0, 0, "{\"changed\":true}");
+    try std.testing.expectEqual(topology, index.edge_generation);
+    try std.testing.expectError(error.TopologyChanged, readGraphEdgesRequest(a, &index, request, 1));
+    try index.addEdge("root", "c", "R", 1, 0, 0, "{}");
+    try std.testing.expectError(error.TopologyChanged, readGraphEdgesRequest(a, &index, request, 1));
+    request.resume_cursor = null;
+    var fresh = try readGraphEdgesRequest(a, &index, request, 1);
+    defer fresh.deinit(a);
+    request.resume_cursor = fresh.resume_cursor;
+    try index.fenceOwnedRange(a, "c", "d");
+    try std.testing.expectError(error.TopologyChanged, readGraphEdgesRequest(a, &index, request, 1));
+}
+
+test "public graph metric borrowed wire legacy batch never migrates during reads" {
+    const a = std.testing.allocator;
+    var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer index.close();
+    try index.addEdge("root", "a", "R", 1, 0, 0, "{}");
+    {
+        var batch = try index.outgoing_store.beginBatch();
+        errdefer batch.abort();
+        try batch.delete("\x00graph:read-generation:g");
+        try batch.commit();
+    }
+    const request: GraphEdgesRequest = .{ .index_name = @constCast("g"), .key = @constCast("root"), .keys = @constCast(&[_][]const u8{"root"}), .direction = .out, .allow_partial_keys = true, .max_edges = 10, .max_owned_bytes = 4096, .max_scanned_rows = 10 };
+    var result = try readGraphEdgesRequest(a, &index, request, 1);
+    defer result.deinit(a);
+    try std.testing.expect(result.resume_cursor == null);
+    try std.testing.expectEqual(@as(usize, 1), result.edges.len);
+    var read = try index.outgoing_store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("\x00graph:read-generation:g"));
+}
+
+test "public graph metric borrowed wire reverse-only contributions fence data cursors without disabling fresh reads" {
+    const a = std.testing.allocator;
+    var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer index.close();
+    try index.batchApply(&.{ .{ .source = "root", .target = "a", .edge_type = "R" }, .{ .source = "root", .target = "b", .edge_type = "R" } }, &.{});
+    const request: GraphEdgesRequest = .{ .index_name = @constCast("g"), .key = @constCast("root"), .keys = @constCast(&[_][]const u8{"root"}), .direction = .out, .allow_partial_keys = true, .max_edges = 10, .max_owned_bytes = 4096, .max_scanned_rows = 1 };
+    var partial = try readGraphEdgesRequest(a, &index, request, 1);
+    defer partial.deinit(a);
+    const topology = index.edge_generation;
+    try index.replaceContributionSnapshots(&.{.{ .source = "root", .target = "b", .edge_type = "R", .owner = "producer", .contributions = &.{.{ .state_key = "state", .source_priority = 1, .weight = 2, .created_at = 0, .updated_at = 0, .ttl_created_ns = 0, .metadata_json = "{}" }} }});
+    try std.testing.expectEqual(topology, index.edge_generation);
+    var continuation = request;
+    continuation.resume_cursor = partial.resume_cursor;
+    try std.testing.expectError(error.TopologyChanged, readGraphEdgesRequest(a, &index, continuation, 1));
+    var fresh = try readGraphEdgesRequest(a, &index, request, 1);
+    defer fresh.deinit(a);
+    try std.testing.expect(fresh.resume_cursor != null);
+    try std.testing.expectEqual(partial.resume_cursor.?.read_generation, fresh.resume_cursor.?.read_generation);
+    try std.testing.expect(partial.resume_cursor.?.reverse_generation != fresh.resume_cursor.?.reverse_generation);
 }

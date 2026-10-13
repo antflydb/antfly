@@ -237,7 +237,7 @@ const Parser = struct {
     scratch: std.heap.ArenaAllocator,
     options: std.json.ParseOptions,
     fn reset(self: *@This()) void {
-        _ = self.scratch.reset(.{ .retain_with_limit = 256 * 1024 });
+        if (!self.scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = self.scratch.reset(.free_all);
     }
     fn expect(self: *@This(), kind: std.json.TokenType) !void {
         if (try self.scanner.peekNextTokenType() != kind) return error.UnexpectedToken;
@@ -347,4 +347,26 @@ pub fn parse(a: Allocator, body: []const u8) !graph.GraphExpandResponse {
     if (seen & 1 == 0) return error.MissingField;
     try parser.expect(.end_of_document);
     return .{ .expansions = try expansions.toOwnedSlice(a), .scanned_rows = scanned orelse @intCast(graph.graph_pattern_mod.default_max_explored_edges) };
+}
+
+test "public graph metric borrowed wire decoder retires scratch after failed shrink" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var parser: Parser = .{
+        .a = failing.allocator(),
+        .scanner = std.json.Scanner.initCompleteInput(failing.allocator(), "{}"),
+        .scratch = std.heap.ArenaAllocator.init(failing.allocator()),
+        .options = .{},
+    };
+    defer parser.scanner.deinit();
+    defer parser.scratch.deinit();
+    _ = try parser.scratch.allocator().alloc(u8, 1024 * 1024);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    parser.reset();
+    try std.testing.expectEqual(@as(usize, 0), parser.scratch.queryCapacity());
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    _ = try parser.scratch.allocator().alloc(u8, 32);
+    parser.reset();
+    try std.testing.expect(parser.scratch.queryCapacity() <= 256 * 1024);
 }

@@ -43330,6 +43330,7 @@ pub const DB = struct {
         const raw = try db_query_graph.fuseNamedSets(alloc, req, named_sets, .{
             .ctx = self,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
         });
         return try filterExpiredSearchResult(self, alloc, raw);
     }

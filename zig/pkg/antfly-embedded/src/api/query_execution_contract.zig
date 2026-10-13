@@ -4747,42 +4747,222 @@ pub fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_m
     };
 }
 
-pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
-    defer parsed.deinit();
-    const responses = parsed.value.responses orelse return error.InvalidQueryRequest;
-    if (responses.len == 0) return error.InvalidQueryRequest;
-    const response = responses[0];
-    const hits_obj = response.hits orelse return error.InvalidQueryRequest;
-    const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
-    const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
-    const total_hits = try query_contract.queryHitsTotalValueToU32(total_obj);
-    const total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation);
+// Metadata stays in an envelope arena; one hit's temporary values are retired
+// before reading the next. Source objects are validated and copied as raw JSON,
+// without constructing their values or serializing them a second time.
+const RemoteSearchParser = struct {
+    alloc: std.mem.Allocator,
+    scanner: std.json.Scanner,
+    metadata: std.heap.ArenaAllocator,
+    scratch: std.heap.ArenaAllocator,
+    options: std.json.ParseOptions,
+    hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
+    rows_seen: bool = false,
+    fn deinit(self: *@This()) void {
+        for (self.hits.items) |*hit| hit.deinit(self.alloc);
+        self.hits.deinit(self.alloc);
+        self.scanner.deinit();
+        self.scratch.deinit();
+        self.metadata.deinit();
+    }
+    fn expect(self: *@This(), token: std.json.TokenType) !void {
+        if (try self.scanner.peekNextTokenType() != token) return error.UnexpectedToken;
+        _ = try self.scanner.next();
+    }
+    fn read(self: *@This(), comptime T: type, alloc: std.mem.Allocator) !T {
+        return std.json.innerParse(T, alloc, &self.scanner, self.options);
+    }
+    fn key(self: *@This(), alloc: std.mem.Allocator) !?[]const u8 {
+        if (try self.scanner.peekNextTokenType() == .object_end) {
+            _ = try self.scanner.next();
+            return null;
+        }
+        return try self.read([]const u8, alloc);
+    }
+    fn index(comptime T: type, name: []const u8, seen: *u64) !usize {
+        inline for (@typeInfo(T).@"struct".field_names, 0..) |field, i| if (std.mem.eql(u8, name, field)) {
+            const bit = @as(u64, 1) << i;
+            if (seen.* & bit != 0) return error.DuplicateField;
+            seen.* |= bit;
+            return i;
+        };
+        return error.UnknownField;
+    }
+    fn member(self: *@This(), comptime T: type, target: *T, i: usize, alloc: std.mem.Allocator) !void {
+        inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types, 0..) |field, Field, at| if (i == at) {
+            @field(target.*, field) = try self.read(Field, alloc);
+            return;
+        };
+        unreachable;
+    }
+    fn required(comptime T: type, field: []const u8, seen: u64) bool {
+        inline for (@typeInfo(T).@"struct".field_names, 0..) |name, i| if (std.mem.eql(u8, field, name)) return seen & (@as(u64, 1) << i) != 0;
+        unreachable;
+    }
+    fn source(self: *@This()) !?[]u8 {
+        var start = self.scanner.cursor;
+        while (start < self.scanner.input.len and (std.ascii.isWhitespace(self.scanner.input[start]) or self.scanner.input[start] == ':')) : (start += 1) {}
+        if (try self.scanner.peekNextTokenType() == .null) {
+            _ = try self.scanner.next();
+            return null;
+        }
+        try self.expect(.object_begin);
+        const Frame = struct { object: bool, keys: std.StringHashMapUnmanaged(void) = .empty };
+        const a = self.scratch.allocator();
+        var stack = std.ArrayListUnmanaged(Frame).empty;
+        defer {
+            for (stack.items) |*frame| frame.keys.deinit(a);
+            stack.deinit(a);
+        }
+        try stack.append(a, .{ .object = true });
+        while (stack.items.len != 0) {
+            const frame = &stack.items[stack.items.len - 1];
+            const ending: std.json.TokenType = if (frame.object) .object_end else .array_end;
+            if (try self.scanner.peekNextTokenType() == ending) {
+                _ = try self.scanner.next();
+                var retired = stack.pop().?;
+                retired.keys.deinit(a);
+                continue;
+            }
+            if (frame.object) {
+                const name = try self.read([]const u8, a);
+                const entry = try frame.keys.getOrPut(a, name);
+                if (entry.found_existing) return error.DuplicateField;
+            }
+            switch (try self.scanner.peekNextTokenType()) {
+                .object_begin, .array_begin => |kind| {
+                    _ = try self.scanner.next();
+                    try stack.append(a, .{ .object = kind == .object_begin });
+                },
+                else => try self.scanner.skipValue(),
+            }
+        }
+        return try self.alloc.dupe(u8, self.scanner.input[start..self.scanner.cursor]);
+    }
+    fn row(self: *@This()) !db_mod.types.SearchHit {
+        if (!self.scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = self.scratch.reset(.free_all);
+        const a = self.scratch.allocator();
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
+        var stored: ?[]u8 = null;
+        errdefer if (stored) |value| self.alloc.free(value);
+        var seen: u64 = 0;
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryHit, name, &seen);
+            if (std.mem.eql(u8, name, "_source")) stored = try self.source() else try self.member(metadata_openapi.QueryHit, &wire, i, a);
+        }
+        if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
+        var hit: db_mod.types.SearchHit = .{ .id = try self.alloc.dupe(u8, wire._id) };
+        errdefer hit.deinit(self.alloc);
+        hit.score = wire._score;
+        hit.score_details = try parseRemoteGraphMetricRerankScoreDetails(self.alloc, wire._score_details);
+        hit.distance = wire._distance;
+        hit.index_scores = try parseRemoteIndexScoresAlloc(self.alloc, wire._index_scores);
+        hit.sort_values = try db_mod.types.cloneJsonValues(self.alloc, wire._sort orelse &.{});
+        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(self.alloc, wire.hierarchy, .source);
+        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(self.alloc, wire.hierarchy, .unit);
+        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(self.alloc, wire.hierarchy);
+        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(self.alloc, wire.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(self.alloc, wire._highlights);
+        hit.stored_data = stored;
+        stored = null;
+        return hit;
+    }
+    fn rows(self: *@This()) !void {
+        if (try self.scanner.peekNextTokenType() == .null) {
+            _ = try self.scanner.next();
+            return;
+        }
+        try self.expect(.array_begin);
+        self.rows_seen = true;
+        while (try self.scanner.peekNextTokenType() != .array_end) {
+            try self.hits.ensureUnusedCapacity(self.alloc, 1);
+            self.hits.appendAssumeCapacity(try self.row());
+        }
+        try self.expect(.array_end);
+    }
+    fn hitEnvelope(self: *@This()) !?metadata_openapi.QueryHits {
+        if (try self.scanner.peekNextTokenType() == .null) {
+            _ = try self.scanner.next();
+            return null;
+        }
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryHits = .{};
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryHits, name, &seen);
+            if (std.mem.eql(u8, name, "hits")) try self.rows() else try self.member(metadata_openapi.QueryHits, &wire, i, a);
+        }
+        return wire;
+    }
+    fn response(self: *@This()) !metadata_openapi.QueryResult {
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryResult = .{ .took = 0, .status = 0 };
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryResult, name, &seen);
+            if (std.mem.eql(u8, name, "hits")) wire.hits = try self.hitEnvelope() else try self.member(metadata_openapi.QueryResult, &wire, i, a);
+        }
+        if (!required(metadata_openapi.QueryResult, "took", seen) or !required(metadata_openapi.QueryResult, "status", seen)) return error.MissingField;
+        return wire;
+    }
+    fn root(self: *@This()) !metadata_openapi.QueryResult {
+        try self.expect(.object_begin);
+        var result: ?metadata_openapi.QueryResult = null;
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            _ = try index(metadata_openapi.QueryResponses, name, &seen);
+            if (try self.scanner.peekNextTokenType() == .null) {
+                _ = try self.scanner.next();
+                continue;
+            }
+            try self.expect(.array_begin);
+            if (try self.scanner.peekNextTokenType() != .array_end) result = try self.response();
+            while (try self.scanner.peekNextTokenType() != .array_end) {
+                // Preserve validation of later entries; the single-shard
+                // contract still consumes only the first response.
+                _ = try self.read(metadata_openapi.QueryResult, a);
+            }
+            try self.expect(.array_end);
+        }
+        try self.expect(.end_of_document);
+        return result orelse error.InvalidQueryRequest;
+    }
+};
 
-    const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
-    var initialized: usize = 0;
+pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInnerWithScratch(alloc, alloc, body);
+}
+
+pub fn parseRemoteSearchResultWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInnerWithScratch(alloc, scratch, body) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+
+fn parseRemoteSearchResultInnerWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    var parser: RemoteSearchParser = .{
+        .alloc = alloc,
+        .scanner = std.json.Scanner.initCompleteInput(scratch, body),
+        .metadata = std.heap.ArenaAllocator.init(scratch),
+        .scratch = std.heap.ArenaAllocator.init(scratch),
+        .options = .{ .allocate = .alloc_if_needed, .max_value_len = body.len },
+    };
+    defer parser.deinit();
+    const response = try parser.root();
+    const envelope = response.hits orelse return error.InvalidQueryRequest;
+    const total = envelope.total orelse return error.InvalidQueryRequest;
+    if (!parser.rows_seen) return error.InvalidQueryRequest;
+    const hits = try parser.hits.toOwnedSlice(alloc);
     errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        for (hits) |*hit| hit.deinit(alloc);
         alloc.free(hits);
     }
-    for (hits_value, 0..) |item, i| {
-        var hit: db_mod.types.SearchHit = .{ .id = try alloc.dupe(u8, item._id) };
-        errdefer hit.deinit(alloc);
-        hit.score = item._score;
-        hit.score_details = try parseRemoteGraphMetricRerankScoreDetails(alloc, item._score_details);
-        hit.distance = item._distance;
-        hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
-        hit.sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{});
-        hit.stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null;
-        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source);
-        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
-        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
-        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
-        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
-        hits[i] = hit;
-        initialized += 1;
-    }
+    return try finishRemoteSearchResult(alloc, response, hits, try query_contract.queryHitsTotalValueToU32(total), try query_contract.parseTotalHitsRelation(total.relation));
+}
 
+fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi.QueryResult, hits: []db_mod.types.SearchHit, total_hits: u32, total_hits_relation: db_mod.types.TotalHitsRelation) !db_mod.types.SearchResult {
     const graph_results: []db_mod.types.GraphSearchResult = if (response.graph_results) |graph_results_value|
         try parseRemoteGraphResults(alloc, graph_results_value)
     else
@@ -4802,11 +4982,6 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
     var graph_metric_rerank_status = try parseRemoteGraphMetricRerankStatus(alloc, response.profile);
     errdefer if (graph_metric_rerank_status) |*status| status.deinit(alloc);
 
-    // The hit errdefer above already owns its cleanup until we return.
-    errdefer {
-        for (graph_results) |*graph_result| graph_result.deinit(alloc);
-        if (graph_results.len > 0) alloc.free(graph_results);
-    }
     var result: db_mod.types.SearchResult = .{
         .alloc = alloc,
         .hits = hits,
@@ -6625,4 +6800,96 @@ test "remote graph metric ingress allocation measurement" {
         parsed.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), counter.live);
     }
+}
+
+test "public graph metric borrowed wire streamed search sources preserve validation and ownership" {
+    const a = std.testing.allocator;
+    const body =
+        \\{"responses":[{"took":1,"status":200,"hits":{"hits":[{"_source":{"n":1e2,"text":"a\\b","nested":[{"k":"v"}]},"_score":2,"_id":"a"},{"_id":"b","_score":1,"_source":null}],"total":{"value":2,"relation":"exact"}}}]}
+    ;
+    var result = try parseRemoteSearchResult(a, body);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expect(result.hits[1].stored_data == null);
+    var source = try std.json.parseFromSlice(std.json.Value, a, result.hits[0].stored_data.?, .{});
+    defer source.deinit();
+    try std.testing.expectEqualStrings("a\\b", source.value.object.get("text").?.string);
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, wire: []const u8) !void {
+            var owned = try parseRemoteSearchResult(alloc, wire);
+            defer owned.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{body});
+    for ([_][]const u8{
+        "{\"x\":1,\"x\":2}", "{\"nested\":[{\"a\":1,\"\\u0061\":2}]}", "[]", "{\"a\":[1,]}",
+    }) |invalid| {
+        const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":1,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"a\",\"_score\":1,\"_source\":{s}}}]}}}}]}}", .{invalid});
+        defer a.free(wire);
+        try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, wire));
+    }
+    // Returned source bodies are owned independently of the response buffer.
+    const mutable = try a.dupe(u8, body);
+    var owned = try parseRemoteSearchResult(a, mutable);
+    defer owned.deinit();
+    @memset(mutable, 'x');
+    a.free(mutable);
+    try std.testing.expect(std.mem.startsWith(u8, owned.hits[0].stored_data.?, "{\"n\":1e2"));
+}
+
+test "public graph metric borrowed wire streamed search allocation and CPU measurement" {
+    const a = std.testing.allocator;
+    var wire: std.Io.Writer.Allocating = .init(a);
+    defer wire.deinit();
+    try wire.writer.writeAll("{\"responses\":[{\"took\":1,\"status\":200,\"hits\":{\"total\":{\"value\":64,\"relation\":\"exact\"},\"hits\":[");
+    for (0..64) |row| {
+        if (row != 0) try wire.writer.writeByte(',');
+        try wire.writer.print("{{\"_id\":\"doc{d}\",\"_score\":1,\"_source\":{{\"v\":[", .{row});
+        for (0..2048) |value| {
+            if (value != 0) try wire.writer.writeByte(',');
+            try wire.writer.print("{d}", .{value});
+        }
+        try wire.writer.writeAll("]}}");
+    }
+    try wire.writer.writeAll("]}}]}");
+    const Before = struct {
+        fn decode(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
+            defer parsed.deinit();
+            const values = parsed.value.responses.?[0].hits.?.hits.?;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, values.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for (values, hits) |value, *hit| {
+                hit.* = .{ .id = try alloc.dupe(u8, value._id), .score = value._score };
+                initialized += 1;
+                hit.stored_data = try std.json.Stringify.valueAlloc(alloc, value._source.?, .{});
+            }
+            return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(values.len) };
+        }
+    };
+    const Counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var peaks: [2]usize = @splat(0);
+    var calls: [2]usize = @splat(0);
+    var times: [2][7]u64 = undefined;
+    for (0..7) |pair| for (0..2) |turn| {
+        const mode = (pair + turn) % 2;
+        var measured: Counter = .{ .backing = a };
+        const started = platform_time.monotonicNs();
+        var result = if (mode == 0) try Before.decode(measured.allocator(), wire.written()) else try parseRemoteSearchResult(measured.allocator(), wire.written());
+        times[mode][pair] = platform_time.monotonicNs() - started;
+        try std.testing.expectEqual(@as(usize, 64), result.hits.len);
+        try std.testing.expect(std.mem.startsWith(u8, result.hits[0].stored_data.?, "{\"v\":[0,1,2"));
+        peaks[mode] = measured.peak;
+        calls[mode] = measured.alloc_calls;
+        result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), measured.live);
+    };
+    for (&times) |*series| std.sort.pdq(u64, series, {}, std.sort.asc(u64));
+    try std.testing.expect(peaks[1] < peaks[0]);
+    try std.testing.expect(calls[1] < calls[0]);
+    std.debug.print("STREAMED_SEARCH rows=64 values_per_source=2048 wire_bytes={d} before_peak={d} after_peak={d} before_allocations={d} after_allocations={d} before_median_ns={d} after_median_ns={d}\n", .{ wire.written().len, peaks[0], peaks[1], calls[0], calls[1], times[0][3], times[1][3] });
 }

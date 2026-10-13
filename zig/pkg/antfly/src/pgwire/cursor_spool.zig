@@ -39,7 +39,14 @@ pub const Store = struct {
             const nulls = try alloc.alloc(bool, result.columns.len);
             for (cells, nulls, 0..) |*cell, *is_null, j| {
                 const value = try result.cell(alloc, i, j);
-                cell.* = try clone(alloc, value.value, 0);
+                if (value.array) |array| {
+                    if (value.sql_null or value.value != .null or value.numeric != null or result.columns[j].type != .array or result.columns[j].element_type != array.element_type) return error.InvalidResult;
+                    cell.* = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{});
+                } else if (value.numeric) |number| {
+                    if (value.sql_null or value.value != .null or result.columns[j].type != .number or result.columns[j].element_type != .numeric) return error.InvalidResult;
+                    var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = alloc };
+                    cell.* = .{ .string = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*) };
+                } else cell.* = try clone(alloc, value.value, 0);
                 is_null.* = value.sql_null;
             }
             try self.rows.append(alloc, .{ .values = cells, .nulls = nulls });
@@ -82,4 +89,41 @@ test "pgwire cursor spool bounds bytes rows and preserves typed nulls" {
         try std.testing.expectError(error.OutOfMemory, spool.append(.{ .columns = result.columns, .rows = &.{&.{.{ .string = large }}}, .command_tag = "SELECT" }, 3));
     }
     try std.testing.expectEqual(@as(usize, 0), budget.used);
+}
+
+test "pgwire cursor spool owns native arrays and exact numerics after page retirement" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var budget: Budget = .{ .child = a, .limit = 32 * 1024 };
+    var spool = Store.init(&budget);
+    defer spool.deinit();
+    {
+        var array = try sources.sql_array_text.decode(a, .jsonb, "{\"null\",NULL,\"{\\\"text\\\":\\\"owned\\\"}\"}", .{});
+        defer array.deinit();
+        var context: sources.sql_numeric_value.Context = .{ .alloc = a };
+        var numeric = try sources.sql_numeric_value.parse(&context, "12345678901234567890.123456789");
+        defer numeric.deinit();
+        const Reader = struct {
+            array: *const sources.sql_array_value.Value,
+            numeric: *const sources.sql_numeric_value.Value,
+            fn read(raw: *anyopaque, _: std.mem.Allocator, _: usize, column: usize) !backend.Cell {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (column == 0) .{ .array = self.array, .sql_null = false } else .{ .numeric = self.numeric, .sql_null = false };
+            }
+        };
+        var reader: Reader = .{ .array = &array.value, .numeric = &numeric.value };
+        const result: backend.Result = .{
+            .columns = &.{ .{ .name = "a", .type = .array, .element_type = .jsonb }, .{ .name = "n", .type = .number, .element_type = .numeric } },
+            .cells = .{ .context = &reader, .count = 1, .width = 2, .read = Reader.read },
+            .command_tag = "SELECT",
+        };
+        try spool.append(result, 1);
+    }
+    const row = spool.rows.items[0];
+    var decoded = try sources.sql_array_wire.decode(a, .jsonb, row.values[0], .{});
+    defer decoded.deinit();
+    try std.testing.expect(!decoded.value.elements[0].sql_null and decoded.value.elements[0].value == .null);
+    try std.testing.expect(decoded.value.elements[1].sql_null);
+    try std.testing.expectEqualStrings("owned", decoded.value.elements[2].value.object.get("text").?.string);
+    try std.testing.expectEqualStrings("12345678901234567890.123456789", row.values[1].string);
 }

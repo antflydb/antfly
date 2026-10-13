@@ -1331,6 +1331,8 @@ pub const Session = struct {
         var remaining: u64 = if (single) 1 else fetch.count;
         if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         var emitted: u64 = 0;
+        var row_bytes = std.Io.Writer.Allocating.init(self.alloc);
+        defer row_bytes.deinit();
         while (remaining != 0) : (remaining -= 1) {
             try req.check();
             if (target > 0 and @as(u64, @intCast(target)) > spool.rows.items.len and !cursor.exhausted) {
@@ -1345,7 +1347,12 @@ pub const Session = struct {
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
             }
             const row = spool.rows.items[@intCast(target - 1)];
-            if (!fetch.move) try self.dataRow(cursor.description.columns, &.{}, row.values, row.nulls);
+            if (!fetch.move) {
+                row_bytes.writer.end = 0;
+                try self.encodeDataRow(&row_bytes, cursor.description.columns, &.{}, row.values, row.nulls);
+                try self.message('D', row_bytes.written());
+                self.trimRowBuffer(&row_bytes);
+            }
             emitted += 1;
             if (emitted % 256 == 0) try self.writer.flush();
             if (single) break;
@@ -1622,13 +1629,11 @@ pub const Session = struct {
         try self.message('T', bytes.written());
     }
 
-    fn dataRow(self: *Session, columns: []const backend.Column, formats: []const u16, row: []const std.json.Value, null_flags: ?[]const bool) !void {
-        if (row.len != columns.len) return error.InvalidResult;
-        if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
-        var bytes = std.Io.Writer.Allocating.init(self.alloc);
-        defer bytes.deinit();
-        try self.encodeDataRow(&bytes, columns, formats, row, null_flags);
-        try self.message('D', bytes.written());
+    fn trimRowBuffer(self: *Session, bytes: *std.Io.Writer.Allocating) void {
+        if (bytes.writer.buffer.len > 64 * 1024) {
+            bytes.deinit();
+            bytes.* = std.Io.Writer.Allocating.init(self.alloc);
+        }
     }
     fn encodeDataRow(self: *Session, bytes: *std.Io.Writer.Allocating, columns: []const backend.Column, formats: []const u16, row: []const std.json.Value, null_flags: ?[]const bool) !void {
         if (row.len != columns.len) return error.InvalidResult;
@@ -1662,25 +1667,30 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         for (0..cells.count) |row| {
-            _ = scratch.reset(.retain_capacity);
+            if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
             bytes.writer.end = 0;
             try bytes.writer.writeInt(u16, @intCast(result.columns.len), .big);
             for (result.columns, 0..) |column, index| {
+                const payload_limit = self.limits.frame_bytes -| 4;
+                const remaining_headers = (result.columns.len - index) * 4;
+                if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+                const cell_limit = payload_limit - bytes.written().len - remaining_headers;
                 const value = try result.cell(scratch.allocator(), row, index);
                 if (value.sql_null) {
-                    if (value.value != .null) return error.InvalidResult;
+                    if (value.value != .null or value.array != null or value.numeric != null) return error.InvalidResult;
                     try bytes.writer.writeInt(i32, -1, .big);
                     continue;
                 }
                 const position = bytes.written().len;
                 try bytes.writer.writeInt(i32, 0, .big);
-                try values.encodeInto(scratch.allocator(), &bytes.writer, column.type, formatAt(formats, index), value.value);
+                try values.encodeCellInto(scratch.allocator(), &bytes.writer, column, formatAt(formats, index), value, cell_limit);
                 const length = bytes.written().len - position - 4;
                 if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
                 std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
             }
             if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
             try self.message('D', bytes.written());
+            self.trimRowBuffer(&bytes);
         }
     }
 
@@ -1692,6 +1702,7 @@ pub const Session = struct {
             bytes.writer.end = 0;
             try self.encodeDataRow(&bytes, columns, formats, row, if (flags) |bits| bits[index] else null);
             try self.message('D', bytes.written());
+            self.trimRowBuffer(&bytes);
         }
     }
 };

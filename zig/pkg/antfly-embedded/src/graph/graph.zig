@@ -83,6 +83,66 @@ pub const EdgeScanCursor = struct {
     at_phase_start: bool = false,
     physical_resume_key: ?[]u8 = null,
 
+    // Physical storage keys are arbitrary bytes. Hex keeps the cursor wire
+    // UTF-8 safe without expanding native search state or allocating to encode.
+    read_generation: ?u64 = null,
+    reverse_generation: ?u64 = null,
+    owner_generation: ?u64 = null,
+    ownership_fingerprint: ?u64 = null,
+    pub fn jsonStringify(self: EdgeScanCursor, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (.{ "edge_id", "owner_document", "direction", "type_index", "edge_type", "adjacent_key", "at_phase_start", "read_generation", "reverse_generation", "owner_generation", "ownership_fingerprint" }) |field| {
+            try writer.objectField(field);
+            try writer.write(@field(self, field));
+        }
+        if (self.physical_resume_key) |raw| {
+            try writer.objectField("physical_resume_key_hex");
+            try writer.print("\"{x}\"", .{raw});
+        }
+        try writer.endObject();
+    }
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !EdgeScanCursor {
+        const Wire = struct {
+            edge_id: []u8 = @constCast(""),
+            owner_document: []u8 = @constCast(""),
+            direction: EdgeDirection,
+            type_index: u32,
+            edge_type: []u8,
+            adjacent_key: []u8,
+            read_generation: ?u64 = null,
+            reverse_generation: ?u64 = null,
+            owner_generation: ?u64 = null,
+            ownership_fingerprint: ?u64 = null,
+            at_phase_start: bool = false,
+            physical_resume_key: ?[]u8 = null,
+            physical_resume_key_hex: ?[]const u8 = null,
+        };
+        const wire = try std.json.innerParse(Wire, alloc, source, options);
+        var result: EdgeScanCursor = .{ .edge_id = wire.edge_id, .owner_document = wire.owner_document, .direction = wire.direction, .type_index = wire.type_index, .edge_type = wire.edge_type, .adjacent_key = wire.adjacent_key, .at_phase_start = wire.at_phase_start, .physical_resume_key = wire.physical_resume_key, .read_generation = wire.read_generation, .reverse_generation = wire.reverse_generation, .owner_generation = wire.owner_generation, .ownership_fingerprint = wire.ownership_fingerprint };
+        if (wire.physical_resume_key_hex) |hex| {
+            if (wire.physical_resume_key != null or hex.len % 2 != 0) return error.UnexpectedToken;
+            const bytes = try alloc.alloc(u8, hex.len / 2);
+            errdefer alloc.free(bytes);
+            _ = std.fmt.hexToBytes(bytes, hex) catch return error.UnexpectedToken;
+            result.physical_resume_key = bytes;
+        }
+        return result;
+    }
+
+    pub fn clone(self: EdgeScanCursor, alloc: Allocator) !EdgeScanCursor {
+        var result = self;
+        result.edge_type = try alloc.dupe(u8, self.edge_type);
+        errdefer alloc.free(result.edge_type);
+        result.adjacent_key = try alloc.dupe(u8, self.adjacent_key);
+        errdefer alloc.free(result.adjacent_key);
+        result.edge_id = try alloc.dupe(u8, self.edge_id);
+        errdefer alloc.free(result.edge_id);
+        result.owner_document = try alloc.dupe(u8, self.owner_document);
+        errdefer alloc.free(result.owner_document);
+        result.physical_resume_key = if (self.physical_resume_key) |key| try alloc.dupe(u8, key) else null;
+        return result;
+    }
+
     pub fn deinit(self: *EdgeScanCursor, alloc: Allocator) void {
         alloc.free(self.edge_type);
         alloc.free(self.adjacent_key);
@@ -911,6 +971,8 @@ const graph_meta_prefix = "meta:";
 const graph_edge_count_key = "meta:edge_count";
 const graph_node_count_key = "meta:node_count";
 const graph_edge_generation_key = "meta:edge_generation";
+const graph_read_generation_key = "meta:read_generation:v1";
+const graph_reverse_read_generation_key = "meta:reverse_read_generation:v1";
 const artifact_rebuild_sequence_key = "meta:artifact_rebuild_sequence:v1";
 
 /// Owner-membership rows for entity-sourced edges live in the reverse
@@ -1290,9 +1352,26 @@ pub const GraphIndex = struct {
         direction: EdgeDirection,
         reads: OwnershipReads,
 
+        read_generation: ?u64 = null,
+        reverse_generation: u64 = 0,
+        owner_generation: u64 = 0,
+        ownership_fingerprint: u64 = 0,
+
+        pub fn validateContinuation(self: *@This(), cursor: EdgeScanCursor) !void {
+            if (self.read_generation == null or cursor.read_generation != self.read_generation or cursor.reverse_generation != self.reverse_generation or cursor.owner_generation != self.owner_generation or cursor.ownership_fingerprint != self.ownership_fingerprint) return error.TopologyChanged;
+        }
+        pub fn bindContinuation(self: *@This(), cursor: *EdgeScanCursor) void {
+            cursor.read_generation = self.read_generation;
+            cursor.reverse_generation = self.reverse_generation;
+            cursor.owner_generation = self.owner_generation;
+            cursor.ownership_fingerprint = self.ownership_fingerprint;
+        }
         pub fn deinit(self: *@This()) void {
             self.reads.deinit();
             self.* = undefined;
+        }
+        pub fn getPage(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64, scanned_out: ?*usize) !EdgePage {
+            return self.index.getEdgesByTypesPageInRead(alloc, key, edge_types, self.direction, cursor, limits, now_ns, scanned_out, &self.reads);
         }
         pub fn getBounded(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, max_edges: usize, max_owned_bytes: usize, max_physical_rows: usize, now_ns: u64, scanned_out: ?*usize) !BoundedEdgeResult {
             return self.index.getEdgesByTypesBoundedInRead(alloc, key, edge_types, self.direction, max_edges, max_owned_bytes, max_physical_rows, now_ns, scanned_out, &self.reads);
@@ -1301,6 +1380,41 @@ pub const GraphIndex = struct {
 
     pub fn beginEdgeReadContext(self: *GraphIndex, direction: EdgeDirection) !EdgeReadContext {
         return .{ .index = self, .direction = direction, .reads = try self.beginReadEdgeTxns(direction) };
+    }
+
+    /// A pair whose mutation epochs agree certifies one completed graph apply.
+    /// Older outgoing stores have no fence; keep their complete-key reads until
+    /// a normal writer batch stamps the fence. Reads never migrate storage.
+    pub fn beginEdgeReadContextWithProof(self: *GraphIndex, direction: EdgeDirection) !EdgeReadContext {
+        var context: EdgeReadContext = .{ .index = self, .direction = direction, .reads = try self.beginReadEdgeTxns(.both), .owner_generation = self.rebuild_owner_generation };
+        errdefer context.deinit();
+        const key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+        defer self.alloc.free(key);
+        const raw = context.reads.outgoing.?.get(key) catch |err| {
+            if (err == error.NotFound) return context;
+            return err;
+        };
+        if (raw.len != 8) return error.InvalidGraphMetricBuildManifest;
+        const outgoing_generation = std.mem.readInt(u64, raw[0..8], .little);
+        const reverse_generation = try readU64OrZero(&context.reads.incoming.?, graph_read_generation_key);
+        if (outgoing_generation != reverse_generation) return context;
+        context.read_generation = outgoing_generation;
+        context.reverse_generation = try readU64OrZero(&context.reads.incoming.?, graph_reverse_read_generation_key);
+        const range = context.reads.incoming.?.get(maintenance.range_key) catch |err| {
+            if (err == error.NotFound) return context;
+            return err;
+        };
+        context.ownership_fingerprint = std.hash.Wyhash.hash(0, range);
+        return context;
+    }
+
+    fn bumpReverseReadGeneration(batch: anytype) !void {
+        const next = std.math.add(u64, try readU64OrZero(batch, graph_reverse_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
+        try putU64(batch, graph_reverse_read_generation_key, next);
+    }
+
+    fn outgoingReadGenerationKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+        return std.mem.concat(alloc, u8, &.{ "\x00graph:read-generation:", index_name });
     }
 
     fn beginReadEdgeTxns(self: *GraphIndex, direction: EdgeDirection) !OwnershipReads {
@@ -7270,6 +7384,7 @@ pub const GraphIndex = struct {
                 }
             }
         }
+        try bumpReverseReadGeneration(&batch);
         try batch.commit();
         self.contributor_ordering_enabled.store(true, .release);
     }
@@ -7296,6 +7411,7 @@ pub const GraphIndex = struct {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         try batch.put(contribution_ordering_ready_key, "1");
+        try bumpReverseReadGeneration(&batch);
         try batch.commit();
         try self.reverse_owner.sync(true);
     }
@@ -7755,6 +7871,17 @@ pub const GraphIndex = struct {
             } else |err| if (err != error.NotFound) return err;
             try reverse_batch.delete(key);
         }
+        // Data epochs are independent of topology epochs: replacing weights,
+        // metadata or TTL stamps must fence continuation without rebuilding
+        // immutable numerical topology. The outgoing epoch and its reverse
+        // completion marker close the two-store commit gap. Reverse-only
+        // contributor changes advance their own epoch, not the forward marker.
+        const read_generation_key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+        defer self.alloc.free(read_generation_key);
+        const next_read_generation = std.math.add(u64, try readU64OrZero(&reverse_batch, graph_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
+        try putU64(&main_batch, read_generation_key, next_read_generation);
+        try putU64(&reverse_batch, graph_read_generation_key, next_read_generation);
+        try bumpReverseReadGeneration(&reverse_batch);
         if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
         try main_batch.commit();
         main_active = false;
@@ -8821,6 +8948,8 @@ pub const GraphIndex = struct {
         defer if (resume_key_owned) |value| alloc.free(value);
         const resume_key: ?[]const u8 = if (scan_cursor) |cursor| cursor.physical_resume_key orelse resume_key_owned else null;
 
+        if (resume_key) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidArgument;
+
         var cursor = try txn.openCursor();
         defer cursor.close();
         cursor.setUpperBound(upper);
@@ -9443,6 +9572,7 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
+        try bumpReverseReadGeneration(&batch);
         try batch.commit();
         return complete;
     }
@@ -9491,6 +9621,7 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
+        try bumpReverseReadGeneration(&batch);
         try batch.commit();
         return complete;
     }
@@ -9835,6 +9966,7 @@ pub const GraphIndex = struct {
             batch_bytes +|= rev_key.len +| pair.value.len;
 
             if (batch_count >= reverse_rebuild_batch_size or batch_bytes >= 4 * 1024 * 1024) {
+                try bumpReverseReadGeneration(&txn);
                 try txn.commit();
                 txn_active = false;
                 if (rebuild_state) |state| try state.updateWithIo(io, pair.key);
@@ -9851,6 +9983,7 @@ pub const GraphIndex = struct {
             }
         }
 
+        try bumpReverseReadGeneration(&txn);
         try txn.commit();
         txn_active = false;
         try self.rebuildCounterMetadata();

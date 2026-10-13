@@ -2080,7 +2080,9 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const result: QueryResponse = .{ .body = resp.body, .owner_allocator = resp.owner_allocator orelse self.alloc };
+        resp.body = &.{};
+        return result;
     }
 
     pub fn fetchGroupGraphMetricMaintenance(
