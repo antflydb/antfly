@@ -79,7 +79,11 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"], "1")
 
     def test_post_attention_isolation_and_free_running_trace(self):
+        flags, _, _ = sweep.flags_for("cohort4w8stable")
+        self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_MULTIROW"], "1")
+        self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC"], "0")
         flags, batch, _ = sweep.flags_for("cohort4w4strict")
+        self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC"], "1")
         self.assertEqual(batch, 4)
         for stage in ["QKV", "BLOCK", "PLE", "TAIL"]:
             self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_" + stage], "1")

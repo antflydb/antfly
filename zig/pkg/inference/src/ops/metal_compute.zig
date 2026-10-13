@@ -26608,6 +26608,46 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return carrier.retainedCopy();
     }
 
+    // Match the actual singleton projection family, including its paired K/V
+    // reduction. Three standalone row linears are not a canonical QKV replay.
+    fn ocrRowwiseQkv(ctx: *anyopaque, self: *MetalCompute, input: MetalTensor, layer: *const ops.DecoderRuntimeLayerSpec, in_dim: usize, q_dim: usize, kv_dim: usize) !metal_runtime.RuntimeLinearTripleResult {
+        const rows: usize = @intCast(input.dim(0));
+        const q_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(q_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, q_ct);
+        const k_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(kv_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, k_ct);
+        const v_ct = (try allocUninitF32ShapeOp(ctx, &.{ @intCast(rows), @intCast(kv_dim) })) orelse return error.NativeBatchedDecodeUnavailable;
+        defer freeOp(ctx, v_ct);
+        for (0..rows) |row| {
+            var view = try input.retainedView(row * in_dim * @sizeOf(f32), in_dim * @sizeOf(f32), &.{ 1, @intCast(in_dim) });
+            defer view.deinit();
+            var triple = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse
+                (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse
+                (try metal_runtime.tryApplyDenseRuntimeLinearQkv(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse return error.NativeBatchedDecodeUnavailable;
+            defer triple.first.deinit();
+            defer triple.second.deinit();
+            defer triple.third.deinit();
+            const q_row = try retainedCtFromMetalTensor(self, &triple.first);
+            defer freeOp(ctx, q_row);
+            const k_row = try retainedCtFromMetalTensor(self, &triple.second);
+            defer freeOp(ctx, k_row);
+            const v_row = try retainedCtFromMetalTensor(self, &triple.third);
+            defer freeOp(ctx, v_row);
+            if (!try copyRows2DOp(ctx, q_ct, row, q_row, 0, 1, q_dim) or
+                !try copyRows2DOp(ctx, k_ct, row, k_row, 0, 1, kv_dim) or
+                !try copyRows2DOp(ctx, v_ct, row, v_row, 0, 1, kv_dim)) return error.NativeBatchedDecodeUnavailable;
+        }
+        const q = try self.borrowedMetalTensorFromCt(q_ct);
+        const k = try self.borrowedMetalTensorFromCt(k_ct);
+        const v = try self.borrowedMetalTensorFromCt(v_ct);
+        var result = metal_runtime.RuntimeLinearTripleResult{ .first = try q.retainedCopy(), .second = undefined, .third = undefined };
+        errdefer result.first.deinit();
+        result.second = try k.retainedCopy();
+        errdefer result.second.deinit();
+        result.third = try v.retainedCopy();
+        return result;
+    }
+
     // Scoped PLE rollback: preserve matrix attention/FFN while using the
     // singleton PLE tail. Consumes block just like finishGatedLayerTailMt.
     fn ocrRowwisePle(ctx: *anyopaque, self: *MetalCompute, request: *const ops.RunGatedDecoderBlockRequest, layer_index: usize, block: MetalTensor, ple: MetalTensor) !MetalTensor {
@@ -26808,7 +26848,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }, &self.timing_stats)) orelse return error.NativeBatchedDecodeUnavailable;
             defer normed.deinit();
             const canonical_qkv = getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV");
-            var q = if (canonical_qkv) try ocrRowwisePrepared(ctx, self, normed, layer.q_linear_slot, request.hidden_size, q_dim, null) else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            var paired: ?metal_runtime.RuntimeLinearTripleResult = if (canonical_qkv and !layer.shares_kv) try ocrRowwiseQkv(ctx, self, normed, &layer, request.hidden_size, q_dim, kv_dim) else null;
+            defer if (paired) |*triple| {
+                triple.first.deinit();
+                triple.second.deinit();
+                triple.third.deinit();
+            };
+            var q = if (paired) |triple| try triple.first.retainedCopy() else if (canonical_qkv) try ocrRowwisePrepared(ctx, self, normed, layer.q_linear_slot, request.hidden_size, q_dim, null) else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
                 .slot = layer.q_linear_slot,
                 .input = normed,
                 .in_dim = request.hidden_size,
@@ -26820,13 +26866,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var v: ?MetalTensor = null;
             defer if (v) |*tensor| tensor.deinit();
             if (!layer.shares_kv) {
-                k = if (canonical_qkv) try ocrRowwisePrepared(ctx, self, normed, layer.k_linear_slot, request.hidden_size, kv_dim, null) else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                k = if (paired) |triple| try triple.second.retainedCopy() else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
                     .slot = layer.k_linear_slot,
                     .input = normed,
                     .in_dim = request.hidden_size,
                     .out_dim = kv_dim,
                 })) orelse return error.NativeBatchedDecodeUnavailable;
-                v = if (canonical_qkv) try ocrRowwisePrepared(ctx, self, normed, layer.v_linear_slot, request.hidden_size, kv_dim, null) else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                v = if (paired) |triple| try triple.third.retainedCopy() else (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
                     .slot = layer.v_linear_slot,
                     .input = normed,
                     .in_dim = request.hidden_size,
@@ -26843,11 +26889,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (reference_v) |*tensor| tensor.deinit();
             if (differential) {
                 reference_norm = try ocrRowwisePrepared(ctx, self, hidden, layer.attn_pre_norm_slot, request.hidden_size, request.hidden_size, request.norm_eps);
-                reference_q = try ocrRowwisePrepared(ctx, self, normed, layer.q_linear_slot, request.hidden_size, q_dim, null);
                 if (!layer.shares_kv) {
-                    reference_k = try ocrRowwisePrepared(ctx, self, normed, layer.k_linear_slot, request.hidden_size, kv_dim, null);
-                    reference_v = try ocrRowwisePrepared(ctx, self, normed, layer.v_linear_slot, request.hidden_size, kv_dim, null);
-                }
+                    const triple = try ocrRowwiseQkv(ctx, self, normed, &layer, request.hidden_size, q_dim, kv_dim);
+                    reference_q = triple.first;
+                    reference_k = triple.second;
+                    reference_v = triple.third;
+                } else reference_q = try ocrRowwisePrepared(ctx, self, normed, layer.q_linear_slot, request.hidden_size, q_dim, null);
             }
             self.endActivePlannedComputeScope(projection_scope);
             projection_scope = false;
@@ -28112,7 +28159,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (request.items.len > 1) {
             if (!active_decode_frame_enabled) return false;
-            if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"))
+            // Native batching retains the complete singleton operation family
+            // by default. Shape-dependent matrix arithmetic can flip an EOS
+            // decision after hundreds of identical emitted tokens; partial
+            // projection/FFN rollbacks do not provide an invariant history.
+            if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_MULTIROW") and
+                (getenvBool("ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC") or
+                    getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL") or
+                    getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")))
                 return runGemma4MultirowDecode(ctx, self, request, &batch_inputs);
             return runCoordinatedGemma4Rows(ctx, self, request, &batch_inputs);
         }
@@ -41974,4 +42028,77 @@ test "Metal OCR parity logit summary respects suppression and stable ties" {
     try std.testing.expectError(error.InvalidModelOutput, ocrLogitSummary(&.{1}, &.{}));
     try std.testing.expectError(error.InvalidModelOutput, ocrLogitSummary(&.{ 1, std.math.nan(f32) }, &.{}));
     try std.testing.expectError(error.InvalidModelOutput, ocrLogitSummary(&.{ 1, 2 }, &.{ 0, 1 }));
+}
+
+test "Metal OCR rowwise block preserves distinct rows and canonical arithmetic on frame" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const rows = 4;
+    const width = 32;
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var weights: [width * width]f32 = undefined;
+    var norm: [width]f32 = undefined;
+    var attention: [rows * width]f32 = undefined;
+    var residual: [rows * width]f32 = undefined;
+    for (&weights, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17) % 31)) - 15)) / 64;
+    for (&norm, 0..) |*value, i| value.* = 0.7 + @as(f32, @floatFromInt(i % 7)) / 32;
+    for (&attention, &residual, 0..) |*a, *r, i| {
+        a.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11) % 43)) - 21)) / 16;
+        r.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 29)) - 14)) / 32;
+    }
+    const weight_ct = try cb.fromFloat32Shape(&weights, &.{ width, width });
+    defer cb.free(weight_ct);
+    const bias_ct = try cb.fromFloat32Shape(&@as([width]f32, @splat(0)), &.{width});
+    defer cb.free(bias_ct);
+    const norm_ct = try cb.fromFloat32Shape(&norm, &.{width});
+    defer cb.free(norm_ct);
+    for (0..4) |slot| try std.testing.expect(try cb.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = weight_ct, .bias = bias_ct, .in_dim = width, .out_dim = width }));
+    for (4..7) |slot| try std.testing.expect(try cb.decoderRuntimePrepareRmsNorm(&.{ .slot = slot, .weight = norm_ct, .hidden_size = width }));
+    const attention_ct = try cb.fromFloat32Shape(&attention, &.{ rows, width });
+    defer cb.free(attention_ct);
+    const residual_ct = try cb.fromFloat32Shape(&residual, &.{ rows, width });
+    defer cb.free(residual_ct);
+    var a = try compute.ownedDeviceMetalTensorFromCt(attention_ct);
+    defer a.deinit();
+    var r = try compute.ownedDeviceMetalTensorFromCt(residual_ct);
+    defer r.deinit();
+    const request = ops.RunGatedDecoderBlockRequest{
+        .residual = residual_ct,
+        .attention = .{ .mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 },
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = width,
+        .attention_linear_slot = 0,
+        .attention_post_linear_rms_norm_slot = 4,
+        .hidden_size = width,
+        .eps = 1e-6,
+        .ffn_rms_norm_slot = 5,
+        .ffn_post_down_rms_norm_slot = 6,
+        .gate_ffn_linear_slot = 1,
+        .up_ffn_linear_slot = 2,
+        .down_ffn_linear_slot = 3,
+        .intermediate_size = width,
+        .activation = .silu,
+    };
+    var expected: [rows * width]f32 = undefined;
+    for (0..rows) |row| {
+        var av = try a.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
+        defer av.deinit();
+        var rv = try r.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
+        defer rv.deinit();
+        var output = (try compute.finishGatedDecoderBlockFromAttentionOutputMt(&request, 0, av, rv, null)) orelse return error.TestUnexpectedResult;
+        defer output.deinit();
+        @memcpy(expected[row * width ..][0..width], try output.toHostSlice());
+    }
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    defer cb.decoderRuntimeCancelFrame() catch {};
+    var actual = try MetalCompute.ocrRowwiseBlock(&compute, &compute, &request, 0, a, r);
+    defer actual.deinit();
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    try std.testing.expect(actual.isDevice());
+    try std.testing.expectEqualSlices(f32, &expected, try actual.toHostSlice());
 }
