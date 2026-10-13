@@ -1007,6 +1007,20 @@ qualify, deferred recovery and other K values use existing behavior. The
 remain unchanged. Full-corpus OCR qualification omits the last paragraph on
 one page with this option enabled, including with both frame opt-ins disabled;
 the seed lane has not passed the output-parity gate and defaults off.
+The clustered Metal drafter head requires
+`ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING=1` and
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD=1`. It scores selected clusters
+on the GPU and returns a scalar token. The target retains its full vocabulary
+verification. `TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY=1` optionally replays
+its four dispatches with a stable input buffer; released weights invalidate
+the template. This replay scope covers the drafter head, not whole target
+KV/RoPE/attention encoding.
+`ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY=1` skips unused hidden snapshots during
+canonical KV/choice recovery, while retaining snapshots when an activation is
+needed. `TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE=1` reserves shared
+singleton scratch at layer maxima for uniform KV-head geometry.
+All are experimental opt-ins; the design doc records complete-output and timing
+gates separately from isolated operator measurements.
 See the design doc below for source pins, flags and measured limits.
 
 [The OCR optimization investigation](../../../docs/design/inference/gemma4-ocr-optimization.md)
@@ -1014,6 +1028,21 @@ compares the identical GGUF model/projector with llama.cpp, profiles optimized
 Metal decode hits and transfer/wait counters, and keeps generative projected
 image features and prompt packing resident. The embedding measurements above
 are separate from OCR text generation.
+
+`ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS=1` extends the explicit OCR batch lane to
+an eight-page resident window by default (`ANTFLY_GEMMA4_METAL_OCR_WINDOW`,
+maximum sixteen), while GPU cohorts remain bounded by
+`ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS` at four. Finished leases retire immediately
+and remaining ready pages fill subsequent cohorts. Manifest/media limits still
+bound materialization and all live KV caches remain covered by admission.
+This operates within one explicit batch request. It does not enable a global
+cross-request image service or promote the matrix lane's output parity.
+`ANTFLY_GEMMA4_METAL_OCR_CONFIRM_EOS=1` optionally recomputes a batched stop
+choice through the canonical prepared singleton at the same KV position before
+retiring a page. `TERMITE_METAL_TRACE_GEMMA4_OCR_STOP=1` records those choices.
+This checks termination only, not the equivalence of earlier matrix steps.
+Continuous scalar cohorts preserve the measured transcripts but are slower;
+matrix cohorts have intermittent paragraph omissions. All options default off.
 
 An experimental `ANTFLY_GEMMA4_METAL_OCR_BATCH=1` lane coordinates independent
 GGUF Gemma4 page decoders at two or four rows. It holds an outer model/provider

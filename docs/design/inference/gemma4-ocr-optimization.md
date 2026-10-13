@@ -2,6 +2,113 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Clustered drafting, recovery and continuous cohorts
+
+The next implementation separates four opt-in opportunities:
+
+- `ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING=1` plus
+  `TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD=1` runs centroid scoring,
+  stable cluster selection, indexed candidate scoring and token selection on
+  Metal. The E2B assistant has BF16 matrices of 2,048×256 centroids and
+  262,144×256 output embeddings; top-32 selection scores 4,096 vocabulary rows.
+  This is distinct from the target's Q8_0 262,144×1,536 vocabulary head.
+  The target still verifies proposals with its existing full vocabulary head.
+  F32/BF16/F16/Q8_0 candidate weights are supported; unsupported/inverse-order
+  layouts retain the existing fallback. One bounded native workspace and one
+  immutable ordering upload are reused. Quantized candidate slots avoid an
+  unnecessary full dense mirror.
+- `ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY=1` avoids producing a normalized
+  hidden snapshot when recovery needs only KV writes and the next target choice.
+  It keeps the canonical prepared singleton forward, and leaves the hidden-copy
+  route intact whenever an activation is actually needed.
+  `TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE=1` reserves the shared
+  singleton scratch capacity once at the layer maxima instead of repeating
+  reservation for each layer. It requires uniform KV-head geometry; other
+  layouts keep the original reservation loop. These are capacity checks, not
+  changes to decoder arithmetic.
+- `TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY=1` stores the four clustered-head
+  dispatches in a Metal indirect command buffer. A blit refreshes the current
+  hidden input at a stable address before each execution. Weight/ordering
+  buffer identities, offsets, dimensions and dtypes invalidate the command
+  template. Direct dispatch remains available for A/B comparisons and fallback.
+  This first replay scope covers the drafter head, not whole target layers;
+  target KV/RoPE/attention commands still use their existing encoding.
+- `ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS=1` with the existing OCR batch opt-in
+  admits a bounded resident window (default eight, maximum sixteen) larger than
+  the GPU cohort (maximum four). The native scheduler packs ready decoders
+  with independent positions, retires finished leases, and fills subsequent
+  cohorts from the remaining window. `ANTFLY_GEMMA4_METAL_OCR_WINDOW` controls
+  the resident window; `ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS` controls cohort size.
+  Manifest/media ceilings still bound materialization and admission reserves
+  all live KV caches. This operates within an explicit batch request, rather
+  than establishing a global cross-request image batching service. Both the
+  existing scalar coordinated lane and experimental matrix lane can be tested.
+
+An isolated probe uses the actual BF16 assistant head/centroid weights and token
+ordering, with a fixed synthetic 256-element hidden vector. Both variants use
+ICB replay and alternate order over 24 pairs; the first six pairs are warmup.
+The serial selector has median GPU time 750.45 µs (746.8–1,092.5), versus
+302.45 µs (299.8–428.6) for parallel ranking with eight SIMD rows per threadgroup.
+Selected token IDs match in every pair. This isolates the selector implementation
+within the clustered path; it does not compare against the original full-vocab
+head or qualify whole OCR throughput. Repeated fixed inputs favor cache reuse.
+The implementation drops cached command bindings when their prepared weight
+slot is released, preventing templates from retaining evicted weights.
+
+The operator fixtures cover dense/Q8 weights, nonzero input/ordering offsets,
+changing inputs, workspace/template reuse, invalid shapes and replay on/off.
+The scheduler fixtures cover eight unequal page positions, four-row limits,
+lease retirement and a newly admitted page. All options remain off by default;
+complete-output and repeated whole-request performance gates decide qualification.
+
+### Whole-request qualification
+
+[Clustered-head results](gemma4-ocr-clustered-head.json) and
+[continuous-cohort results](gemma4-ocr-continuous-cohorts.json) pin runtime
+`849a025887`, binary, model, flags and corpus. Each full run uses eight
+pre-rendered pages, one warm page and two passes. Rendering and model startup
+are excluded. Timings measure recognition, including image preparation,
+prefill, decoding and HTTP.
+
+| Mode | Eight-page seconds, two passes | Output gate |
+| --- | --- | --- |
+| Ordinary singleton | 57.816 / 56.257 | 4,057 tokens, all eight transcripts match |
+| MTP control before | 66.496 / 67.058 | Same output |
+| Clustered head + replay + recovery + scratch | 64.163 / 64.738 | Same output |
+| MTP control after | 63.698 / 64.778 | Same output |
+| Explicit batch-eight serial control before | 54.308 / 54.012 | Same output |
+| Continuous window-eight, scalar cohorts | 59.878 / 57.147 | Same output |
+| Continuous window-eight, matrix cohorts | 34.296 / 34.639 | First pass omits Attention page 6's final paragraph; second matches |
+| Explicit batch-eight serial control after | 53.583 / 53.802 | Same output |
+
+The clustered changes preserve output but overlap the final MTP control;
+MTP remains slower than ordinary decoding. Scalar continuous cohorts preserve
+output but do not improve throughput. Matrix batching is substantially faster,
+but one pass emits 4,016 rather than 4,057 tokens: Attention page 6 stops at
+701 rather than 742. It does not hit the completion cap. The other seven pages
+match in that pass and all eight match in the second. This is an intermittent
+quality failure, so the faster timings do not qualify a repeatable OCR speedup.
+Per-page times are unavailable inside the shared eight-page wave.
+
+Earlier prototype pilots are excluded: they silently used the old masked
+fallback because the synchronization helper reopened an empty active frame.
+The integration now accepts that empty borrowed frame while rejecting pending
+work or unawaited submitted work, and preserves caller ownership. Regression
+fixtures cover those states and released-slot template invalidation. A separate
+instrumented serving run confirms the native clustered kernels execute; its
+timings are diagnostic only. The final regression selection passes 54 tests
+with zero skips, including actual Metal GPU execution.
+
+`ANTFLY_GEMMA4_METAL_OCR_CONFIRM_EOS=1` adds an opt-in canonical singleton
+check of a batched stop decision at the same reserved KV position. It does not
+append another position or validate earlier matrix arithmetic. With
+`TERMITE_METAL_TRACE_GEMMA4_OCR_STOP=1`, a final single-pass diagnostic at
+runtime `e58cba6333` matches all 4,057 tokens and transcripts. All seven stops
+encountered in matrix cohorts agree with canonical token 106; none is replaced
+(the remaining page finishes in a singleton cohort). Thus the passing run does
+not establish that confirmation fixes the prior intermittent omission. Its
+34.339 s timing is diagnostic only, and no option is promoted.
+
 ## Verification framing and vocabulary-head audit
 
 [The framing measurements](gemma4-ocr-verification-framing.json) retain the
