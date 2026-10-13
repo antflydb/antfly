@@ -3609,6 +3609,13 @@ pub const Set = struct {
             if (binding.generated) break true;
         } else false;
         if (!has_generated) return;
+        // One stable decoded owner spans every generated binding. Its sparse
+        // cache is keyed by physical source ordinal, not by a logical ordinal
+        // that may change across immutable historical schema layouts.
+        var json_owner: @import("../sql/row_value.zig").JsonRow = undefined;
+        json_owner.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer json_owner.deinit();
+        try json_owner.bindAdmission(execution.bytes);
         try execution.charge(self.table.relational_columns.len);
         const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
         const present = try execution.alloc.alloc(bool, values.len);
@@ -3632,6 +3639,7 @@ pub const Set = struct {
                 .sql_array => .{ .sql_array = .{ .element_type = column.sql_element_type orelse return error.InvalidRelationalGeneratedValue, .bytes = cell.value.bytes_val } },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
+                .json => .{ .json = try json_owner.decodePinned(std.math.cast(u32, physical) orelse return error.InvalidRelationalGeneratedValue, cell.value.bytes_val) },
                 else => return error.InvalidRelationalGeneratedValue,
             };
         }

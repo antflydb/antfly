@@ -4232,3 +4232,45 @@ tests and 226 linked tests, three existing skips, zero failures/leaks and
 21/21 build steps. This rerun followed the last inherited-limit edit; the
 earlier SQL run is not substituted for final-source qualification. No public
 schema or generated SDK contract changed in this checkpoint.
+
+### Typed root-null provenance and cold verification owners
+
+JsonNulls is a stable-address, row-local owner for authenticated root JSON-null
+markers. It owns imported field names, rejects duplicates, and lets typed
+generated/default results replace submitted provenance: SQL NULL and nonnull
+JSON remove a marker, while present JSON null adds one. Snapshots borrow owned
+immutable keys; schema validation must precede import, and consumers must not
+let a snapshot outlive its owner. A missing or skipped default does not perform
+an assignment. This component does not infer SQL semantics from JSON syntax.
+
+RegionAdmission binds independently retained JSON regions to one sequential
+row/program byte counter. Actual peak/spent arena capacity is charged once;
+previously admitted capacity can be reused, but another owner cannot mint new
+headroom or refund storage retained by a parent arena. Both decoded JSON and
+null-provenance owners support this binding and share sticky CPU/cancellation
+identity. Arena consolidation during reset may require additional headroom;
+the reuse regression explicitly prepays one buffer rather than assuming every
+multi-buffer reset is allocation-free.
+
+Cold generated-value verification now keeps one sparse pinned JSON owner for
+all bindings, keyed by physical source ordinal. SQL-null cells skip decoding;
+only the immutable dependency mask is materialized. All borrowed values retire
+after verification. The native regression distinguishes a generated SQL NULL
+from stored present JSON null, verifies zero JSON-input admission suffices for
+SQL NULL, and covers observed cancellation/allocation cuts on cold JSON cells.
+
+Focused Debug qualification passed all 11 logical row-owner tests and the
+native cold generated-JSON regression. An initial SQL-owner filter correctly
+failed discovery; the lifecycle regression was moved to its actual native
+storage owner and ran with a nonempty audited runtime filter. Full native
+Debug qualification passed 223 main-owner tests and one linked test, with
+zero failures/leaks (50/50 steps). Full SQL Debug qualification is separate
+and still pending for this checkpoint.
+
+Preparation integration remains open: the row owner must span validation,
+defaults/generated/CHECK/index execution and physical encoding, returning or
+consuming authoritative root-null provenance before retirement. Do not return
+a borrowed snapshot from a stack-local owner. Public JSON capability/lowering,
+immutable literals and full restart/restore qualification are still guarded;
+these owner contracts do not complete original sql-0671 or change any of the
+898 original unresolved dispositions.

@@ -76,6 +76,7 @@ pub const JsonRow = struct {
     context: *Context,
     entries: std.AutoHashMapUnmanaged(u32, Entry),
     decodes: usize,
+    admission: ?@import("memory_budget.zig").RegionAdmission = null,
 
     const Entry = struct { bytes: []const u8, json: *const Json };
 
@@ -97,6 +98,12 @@ pub const JsonRow = struct {
         self.memory.monotonic = true;
     }
 
+    pub fn bindAdmission(self: *JsonRow, remaining: *usize) !void {
+        try self.context.charge(0);
+        if (self.admission != null) return error.InvalidSqlProgram;
+        self.admission = @import("memory_budget.zig").RegionAdmission.init(&self.memory, remaining) catch return self.context.limit();
+    }
+
     pub fn deinit(self: *JsonRow) void {
         self.arena.deinit();
         self.* = undefined;
@@ -107,6 +114,8 @@ pub const JsonRow = struct {
     /// sticky cancellation, or the maximum live decode-memory boundary.
     pub fn resetRow(self: *JsonRow) !void {
         try self.context.charge(0);
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
         if (!self.arena.reset(.retain_capacity)) return self.failure(error.OutOfMemory);
         self.entries = .empty;
         self.decodes = 0;
@@ -117,6 +126,8 @@ pub const JsonRow = struct {
     /// does not replace physical validation or infer schema/NULL authority.
     pub fn decodePinned(self: *JsonRow, ordinal: u32, bytes: []const u8) !*const Json {
         try self.context.charge(1);
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
         if (self.entries.get(ordinal)) |entry| {
             // An ordinal alone is not source authority. Changing a source
             // buffer without a row reset must not return a previous row's tree.
@@ -137,6 +148,103 @@ pub const JsonRow = struct {
     fn failure(self: *JsonRow, err: anyerror) anyerror {
         if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) return self.context.limit();
         return err;
+    }
+};
+
+/// Row-local root JSON-null provenance. It is a set, not a substitute for
+/// schema/physical validation: the preparer must authenticate every submitted
+/// marker against its pinned schema and actual root datum before importing.
+/// Initialize at its final address; snapshots borrow immutable owned keys and
+/// must not escape this owner's lifetime.
+pub const JsonNulls = struct {
+    memory: @import("memory_budget.zig"),
+    arena: std.heap.ArenaAllocator,
+    context: *Context,
+    fields: std.StringHashMapUnmanaged(void),
+    admission: ?@import("memory_budget.zig").RegionAdmission = null,
+
+    pub fn init(self: *JsonNulls, backing: std.mem.Allocator, limit: usize, context: *Context) void {
+        self.* = .{
+            .memory = .{ .backing = backing, .limit = limit },
+            .arena = undefined,
+            .context = context,
+            .fields = .empty,
+        };
+        self.arena = .init(self.memory.allocator());
+    }
+
+    /// Parent arenas retain freed buffers; admission must not refund them.
+    pub fn initRegion(self: *JsonNulls, backing: std.mem.Allocator, limit: usize, context: *Context) void {
+        self.init(backing, limit, context);
+        self.memory.monotonic = true;
+    }
+
+    pub fn bindAdmission(self: *JsonNulls, remaining: *usize) !void {
+        try self.context.charge(0);
+        if (self.admission != null) return error.InvalidSqlProgram;
+        self.admission = @import("memory_budget.zig").RegionAdmission.init(&self.memory, remaining) catch return self.context.limit();
+    }
+
+    pub fn deinit(self: *JsonNulls) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Import authenticated source markers exactly once. Input names can be
+    /// released immediately; the row owner never borrows caller metadata.
+    pub fn import(self: *JsonNulls, names: []const []const u8) !void {
+        try self.context.charge(names.len);
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
+        for (names) |name| {
+            try self.context.charge(name.len);
+            if (self.fields.contains(name)) return error.InvalidSqlProgram;
+            try self.insertOwned(name);
+        }
+    }
+
+    pub fn contains(self: *JsonNulls, name: []const u8) !bool {
+        try self.context.charge(1);
+        try self.context.charge(name.len);
+        return self.fields.contains(name);
+    }
+
+    /// Only the typed result determines derived null semantics. A generated
+    /// SQL NULL or nonnull JSON value removes any submitted marker; present
+    /// JSON null adds it. Missing/default-skipped fields must not call this.
+    pub fn assign(self: *JsonNulls, name: []const u8, value: Value) !void {
+        try self.context.charge(1);
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
+        try self.context.charge(name.len);
+        if (value != .null and value != .json) return error.InvalidSqlProgram;
+        if (value == .json and value.json.value == .null) {
+            if (!self.fields.contains(name)) try self.insertOwned(name);
+        } else _ = self.fields.remove(name);
+    }
+
+    /// The returned set snapshot belongs to this row owner. Order is not
+    /// semantic; physical encoding still uses immutable schema ordinals.
+    pub fn snapshot(self: *JsonNulls) ![]const []const u8 {
+        try self.context.charge(self.fields.count());
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
+        if (self.fields.count() == 0) return &.{};
+        const names = self.arena.allocator().alloc([]const u8, self.fields.count()) catch |err| return self.failure(err);
+        var keys = self.fields.keyIterator();
+        for (names) |*name| name.* = keys.next().?.*;
+        return names;
+    }
+
+    fn insertOwned(self: *JsonNulls, name: []const u8) !void {
+        // Clone first: allocation failure after map insertion must not publish
+        // an uninitialized key into an owner that may be inspected or retried.
+        const owned = self.arena.allocator().dupe(u8, name) catch |err| return self.failure(err);
+        self.fields.put(self.arena.allocator(), owned, {}) catch |err| return self.failure(err);
+    }
+
+    fn failure(self: *JsonNulls, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.isExhausted()) self.context.limit() else err;
     }
 };
 
@@ -182,6 +290,186 @@ pub const Value = union(enum) {
         };
     }
 };
+
+test "SQL JSON owners share actual retained region admission without double charging or renewal" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var context: Context = .{ .alloc = a };
+    var bytes: usize = 1024 * 1024;
+    var row: JsonRow = undefined;
+    row.initRegion(region.allocator(), bytes, &context);
+    defer row.deinit();
+    var nulls: JsonNulls = undefined;
+    nulls.initRegion(region.allocator(), bytes, &context);
+    defer nulls.deinit();
+    // A single prepaid buffer lets retain_capacity reset reuse storage without
+    // needing temporary headroom to consolidate several arena buffers.
+    _ = try row.arena.allocator().alloc(u8, 8192);
+    try row.bindAdmission(&bytes);
+    try nulls.bindAdmission(&bytes);
+    try std.testing.expectError(error.InvalidSqlProgram, row.bindAdmission(&bytes));
+    try std.testing.expectError(error.InvalidSqlProgram, nulls.bindAdmission(&bytes));
+    const source = "{\"a\":null}";
+    _ = try row.decodePinned(0, source);
+    try nulls.import(&.{"a"});
+    try std.testing.expectEqual(@as(usize, 1024 * 1024) - bytes, row.memory.footprint() + nulls.memory.footprint());
+    const retained = bytes;
+    _ = try row.decodePinned(0, source);
+    _ = try nulls.contains("a");
+    try std.testing.expectEqual(retained, bytes);
+    // Other programs may consume all unreserved headroom. Already admitted
+    // capacity remains usable but neither region can obtain a fresh allowance.
+    bytes = 0;
+    try row.resetRow();
+    _ = try row.decodePinned(1, source);
+    try std.testing.expectEqual(@as(usize, 0), bytes);
+    const wide: [16384]u8 = @splat('x');
+    try std.testing.expectError(error.SqlProgramLimitExceeded, nulls.import(&.{&wide}));
+    bytes = 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, row.decodePinned(1, source));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, nulls.snapshot());
+}
+
+test "SQL JSON late admission binds existing capacity once and refuses insufficient headroom" {
+    const a = std.testing.allocator;
+    var context: Context = .{ .alloc = a };
+    var nulls: JsonNulls = undefined;
+    nulls.init(a, 1024 * 1024, &context);
+    defer nulls.deinit();
+    try nulls.import(&.{"field"});
+    const retained = nulls.memory.footprint();
+    var bytes = retained;
+    try nulls.bindAdmission(&bytes);
+    try std.testing.expectEqual(@as(usize, 0), bytes);
+    try std.testing.expect(try nulls.contains("field"));
+    var second_context: Context = .{ .alloc = a };
+    var row: JsonRow = undefined;
+    row.init(a, 1024 * 1024, &second_context);
+    defer row.deinit();
+    _ = try row.decodePinned(0, "{}");
+    var insufficient = row.memory.footprint() - 1;
+    const before = insufficient;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, row.bindAdmission(&insufficient));
+    try std.testing.expectEqual(before, insufficient);
+    insufficient = 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, row.bindAdmission(&insufficient));
+}
+
+test "SQL JSON null provenance owns root names and derived typed results replace submitted markers" {
+    const a = std.testing.allocator;
+    var context: Context = .{ .alloc = a };
+    var nulls: JsonNulls = undefined;
+    nulls.init(a, 1024 * 1024, &context);
+    defer nulls.deinit();
+    var source = [_]u8{ 'b', 'a', 's', 'e' };
+    try nulls.import(&.{&source});
+    @memset(&source, 'x');
+    try std.testing.expect(try nulls.contains("base"));
+    try std.testing.expect(!try nulls.contains("xxxx"));
+    try std.testing.expectError(error.InvalidSqlProgram, nulls.import(&.{"base"}));
+    const json_null: Json = .{ .value = .null };
+    try nulls.assign("generated", .{ .json = &json_null });
+    try std.testing.expect(try nulls.contains("generated"));
+    try nulls.assign("base", .null);
+    try std.testing.expect(!try nulls.contains("base"));
+    const nonnull: Json = .{ .value = .{ .object = .empty } };
+    try nulls.assign("generated", .{ .json = &nonnull });
+    try std.testing.expectEqual(@as(usize, 0), (try nulls.snapshot()).len);
+    try nulls.assign("generated", .{ .json = &json_null });
+    try nulls.assign("generated", .{ .json = &json_null });
+    const names = try nulls.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("generated", names[0]);
+    try std.testing.expectError(error.InvalidSqlProgram, nulls.assign("generated", .{ .integer = 1 }));
+    try std.testing.expect(try nulls.contains("generated"));
+    // Removing a marker cannot refund its retained arena/key capacity.
+    const retained = nulls.memory.footprint();
+    try nulls.assign("generated", .null);
+    try std.testing.expectEqual(retained, nulls.memory.footprint());
+    try std.testing.expectEqualStrings("generated", names[0]);
+}
+
+test "SQL JSON null provenance unwinds every allocation fault and retains sticky memory admission" {
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var context: Context = .{ .alloc = alloc };
+            var nulls: JsonNulls = undefined;
+            nulls.init(alloc, 1024 * 1024, &context);
+            defer nulls.deinit();
+            const wide: [1024]u8 = @splat('x');
+            try nulls.import(&.{ "a", "b", "c", &wide, "e", "f", "g", "h", "i" });
+            const value: Json = .{ .value = .null };
+            try nulls.assign("derived", .{ .json = &value });
+            try nulls.assign("a", .null);
+            try std.testing.expectEqual(@as(usize, 9), (try nulls.snapshot()).len);
+            try std.testing.expect(!try nulls.contains("a"));
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var context: Context = .{ .alloc = region.allocator() };
+    var limited: JsonNulls = undefined;
+    limited.initRegion(region.allocator(), 1, &context);
+    defer limited.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.import(&.{"field"}));
+    limited.memory.limit = 1024 * 1024;
+    context.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.import(&.{"field"}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.snapshot());
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.contains("field"));
+}
+
+test "SQL JSON null provenance shares every observed cancellation cut and work admission" {
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const Run = struct {
+        fn run(owner: *JsonNulls) !void {
+            const wide: [1024]u8 = @splat('x');
+            try owner.import(&.{ "base", &wide });
+            const value: Json = .{ .value = .null };
+            try owner.assign("derived", .{ .json = &value });
+            _ = try owner.contains(&wide);
+            _ = try owner.snapshot();
+        }
+    };
+    const a = std.testing.allocator;
+    var control: Control = .{};
+    var context: Context = .{ .alloc = a, .checkpoint = Control.poll, .ptr = &control };
+    var baseline: JsonNulls = undefined;
+    baseline.init(a, 1024 * 1024, &context);
+    defer baseline.deinit();
+    try Run.run(&baseline);
+    try std.testing.expect(control.polls >= 3);
+    const work = 8 * 1024 * 1024 - context.remaining;
+    for (1..control.polls + 1) |cut| {
+        var canceled: Control = .{ .fail_at = cut };
+        var scope: Context = .{ .alloc = a, .checkpoint = Control.poll, .ptr = &canceled };
+        var owner: JsonNulls = undefined;
+        owner.init(a, 1024 * 1024, &scope);
+        defer owner.deinit();
+        try std.testing.expectError(error.QueryCanceled, Run.run(&owner));
+        scope.checkpoint = null;
+        try std.testing.expectError(error.QueryCanceled, owner.snapshot());
+    }
+    var scope: Context = .{ .alloc = a, .remaining = work - 1 };
+    var owner: JsonNulls = undefined;
+    owner.init(a, 1024 * 1024, &scope);
+    defer owner.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Run.run(&owner));
+    scope.remaining = work;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, owner.snapshot());
+}
 
 test "SQL row values preserve exact scalar operands across explicit key projection" {
     const Scalar = union(enum) {

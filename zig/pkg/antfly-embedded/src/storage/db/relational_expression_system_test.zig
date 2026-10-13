@@ -19,6 +19,81 @@ const rows = @import("relational_rows.zig");
 const mapper = @import("document_mapper.zig");
 const alloc = std.testing.allocator;
 
+test "relational index system cold generated JSON verification preserves SQL null and shared ownership" {
+    const a = std.testing.allocator;
+    const expressions = @import("../../schema/relational_expression.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const Execution = expressions.Execution;
+    const Set = expressions.Set;
+    const Allocator = std.mem.Allocator;
+    const max_allocated_bytes = expressions.max_allocated_bytes;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const set = validator.execution.expressions.?;
+    var layout = try codec.PhysicalLayout.init(a, set.table);
+    defer layout.deinit();
+    const ordinal: u32 = @intCast(layout.ordinalForName(set.table.relational_columns, "g").?);
+    const sql_null = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &.{
+        .{ .ordinal = ordinal, .path = "g", .value_type = .bytes_val, .is_json = true, .is_null = true, .value = .{ .bytes_val = "" } },
+    }, @splat(0));
+    defer a.free(sql_null);
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &bytes);
+    execution.numeric.max_input_bytes = 0;
+    // No JSON decoding is required for SQL NULL; a present JSON null is not
+    // interchangeable with this generated result.
+    try set.verifyRowWithExecution(&execution, try codec.ordinalRowView(sql_null, set.table, &layout));
+    const wide: [1024]u8 = @splat('x');
+    const text = try std.fmt.allocPrint(a, "\"{s}\"", .{wide});
+    defer a.free(text);
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.Canceled;
+        }
+    };
+    for ([_][]const u8{ "null", text }) |json| {
+        const physical = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &.{
+            .{ .ordinal = ordinal, .path = "g", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = json } },
+        }, @splat(0));
+        defer a.free(physical);
+        const row = try codec.ordinalRowView(physical, set.table, &layout);
+        bytes = max_allocated_bytes;
+        execution = Execution.init(a, &bytes);
+        var observed: Control = .{};
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &observed;
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRowWithExecution(&execution, row));
+        for (1..observed.polls + 1) |cut| {
+            bytes = max_allocated_bytes;
+            execution = Execution.init(a, &bytes);
+            var canceled: Control = .{ .fail_at = cut };
+            execution.numeric.checkpoint = Control.poll;
+            execution.numeric.ptr = &canceled;
+            try std.testing.expectError(error.Canceled, set.verifyRowWithExecution(&execution, row));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, set.verifyRowWithExecution(&execution, row));
+        }
+        const Run = struct {
+            fn run(fault_alloc: Allocator, owner: *const Set, input: codec.OrdinalRowView) !void {
+                owner.verifyRow(fault_alloc, input) catch |err| {
+                    if (err == error.InvalidRelationalGeneratedValue) return;
+                    return err;
+                };
+                return error.TestExpectedError;
+            }
+        };
+        try Run.run(a, set, row);
+        var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ set, row });
+    }
+}
+
 test "relational index system NUMERIC public scalar constraints survive LSM reopen and portable restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-public-scalar");
