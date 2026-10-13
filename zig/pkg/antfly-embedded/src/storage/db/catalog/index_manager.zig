@@ -107,6 +107,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
+const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
 pub const graph_replacement_build_prefix = "\x00\x00__metadata__:graph_replacement_build_v1/";
 pub const GraphReplacementBuild = struct {
     name: []const u8,
@@ -298,6 +299,8 @@ const text_backfill_batch_size: usize = 64 * 1024;
 const text_backfill_compact_segment_threshold: usize = default_text_merge_max_segments_per_tier * 2;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
+pub const ReplacementSwapBoundary = enum { before_commit, after_commit };
+pub var test_replacement_swap_boundary: ?*const fn (ReplacementSwapBoundary) void = null;
 pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_text_backfill_invocations: usize = 0;
@@ -11958,9 +11961,11 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(key, value);
-        // Shadow metadata is unpublished and ignored by older readers. Only
-        // authoritative resolver catalog fields require a reader upgrade.
+        const resolver_data = try self.serializeResolverDefinitions(self.alloc);
+        defer self.alloc.free(resolver_data);
+        const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         try txn.commit();
+        self.minimum_reader_version.store(reader_version, .release);
         return stored;
     }
 
@@ -12191,7 +12196,9 @@ pub const IndexManager = struct {
             defer self.alloc.free(old_admission);
             const build_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored_cfg.name });
             defer self.alloc.free(build_key);
+            if (builtin.is_test) if (test_replacement_swap_boundary) |hook| hook(.before_commit);
             try self.persistCatalogExcludingWithAtomicMutation(store, old, .{ .batch = .{ .puts = writes[0..write_count], .deletes = &.{ old_admission, build_key } } });
+            if (builtin.is_test) if (test_replacement_swap_boundary) |hook| hook(.after_commit);
             self.clearManagedAdmissionSnapshotForIndex(old);
             self.removeInMemory(old);
             self.clearAppliedSequenceAfterCatalogRemoval(store, old);
@@ -22378,7 +22385,6 @@ pub const IndexManager = struct {
         defer self.alloc.free(resolver_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, resolver_data);
         try txn.put(resolver_catalog_key, resolver_data);
-        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, resolver_data);
         // Revisions and durable replay cursors publish with ownership removal.
         for (definitions) |cfg| {
             if (!cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
@@ -22409,6 +22415,7 @@ pub const IndexManager = struct {
                 };
             },
         };
+        const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         try txn.commit();
         self.minimum_reader_version.store(reader_version, .release);
         for (definitions) |cfg| {
@@ -22510,7 +22517,7 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, enrichment_data);
         try txn.put(resolver_catalog_key, resolver_data);
-        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, resolver_data);
+        const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
@@ -22520,6 +22527,52 @@ pub const IndexManager = struct {
         self.minimum_reader_version.store(reader_version, .release);
         self.invalidateWritePlanSnapshot();
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
+    }
+
+    /// Older writers do not retain shadow replay. Fence them only while
+    /// active shadows exist, preserving the authoritative feature epoch in a
+    /// separate baseline. Marker publication/removal and fencing share a txn.
+    fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !u32 {
+        const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
+        const baseline_raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const baseline = if (baseline_raw) |raw| try std.fmt.parseInt(u32, raw, 10) else current;
+        if (baseline > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
+        const authoritative = @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog));
+        var pending = false;
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
+                const parsed = try std.json.parseFromSlice(struct { phase: []const u8 = "building" }, self.alloc, kv.value, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (!std.mem.eql(u8, parsed.value.phase, "failed")) {
+                    pending = true;
+                    break;
+                }
+            }
+        }
+        const version = if (pending) @max(authoritative, 2) else authoritative;
+        // Pre-epoch libraries ignore minimum_reader_version, but their strict
+        // array parser rejects a versioned resolver envelope. Publish both
+        // fences atomically; restore the plain array when the last shadow ends.
+        const fenced_catalog = if (pending and try resolver_catalog.catalogReaderVersion(self.alloc, catalog) == 1)
+            try std.fmt.allocPrint(self.alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{catalog})
+        else
+            null;
+        defer if (fenced_catalog) |data| self.alloc.free(data);
+        const stored_catalog = fenced_catalog orelse catalog;
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
+        try txn.put(resolver_catalog_key, stored_catalog);
+        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else "2");
+        if (pending) {
+            try txn.put(replacement_reader_base_key, if (authoritative == 1) "1" else "2");
+        } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
+        return version;
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
@@ -22640,7 +22693,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
-        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, data);
+        const reader_version = try self.stampCatalogReaderVersion(&txn, data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);

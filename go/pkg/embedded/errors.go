@@ -41,9 +41,9 @@ const (
 	// Stalled reports stalled derived work or a failed derived worker. Inspect
 	// pending-work diagnostics and repair or reopen the database.
 	Stalled ErrorCode = 9
-	// Cancelled means the caller stopped the operation by returning false
-	// from its progress or streaming callback (see Inference.Pull and
-	// Inference.GenerateStream).
+	// Cancelled means the operation was cancelled, including cancellation
+	// of a pending replacement or a false progress/stream callback result
+	// (see Inference.Pull and Inference.GenerateStream).
 	Cancelled                        ErrorCode = 10
 	ReplacementFailed                ErrorCode = 11
 	ReplacementPending               ErrorCode = 12

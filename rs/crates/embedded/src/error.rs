@@ -31,10 +31,7 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub enum Error {
     /// Owned diagnostic from a native call. Use `code()`/`kind()` to classify.
-    Native {
-        code: i32,
-        detail: String,
-    },
+    Native { code: i32, detail: String },
     /// An argument, request, path, or open mode is invalid.
     InvalidArgument,
     /// The requested database object was not found.
@@ -57,14 +54,17 @@ pub enum Error {
     /// Derived work stalled or a derived worker failed. Inspect pending-work
     /// diagnostics and repair or reopen the database.
     Stalled,
-    /// The caller cancelled the call by returning `false` from its progress
-    /// or stream callback (e.g. [`crate::Inference::pull`]'s progress
-    /// callback or [`crate::Inference::generate_stream`]'s chunk callback).
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning `false`.
     Cancelled,
-    /// An internal error occurred.
+    /// A replacement failed after exhausting consecutive transient retries,
+    /// or encountered a permanent error. Inspect its pending-work diagnostics.
     ReplacementFailed,
+    /// The requested operation conflicts with a pending replacement.
     ReplacementPending,
+    /// The requested configuration differs from the pending replacement.
     ReplacementConfigurationMismatch,
+    /// An internal error occurred.
     Internal,
     /// A C ABI error code this binding does not recognize, carrying the raw
     /// numeric value.

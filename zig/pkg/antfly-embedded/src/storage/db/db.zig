@@ -2982,7 +2982,7 @@ pub const DB = struct {
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     physical_root_mode: OpenOptions.PhysicalRootMode,
-    graph_replacement_mutex: std.atomic.Mutex = .unlocked,
+    graph_replacement_mutex: std.Io.Mutex = .init,
     graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
     graph_replacement_catalog_generation: u64 = 0,
     graph_replacement_progress: ?struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 } = null,
@@ -26938,6 +26938,7 @@ pub const DB = struct {
     var test_fail_index_activation_after_catalog_commit = false;
     var test_graph_replacement_before_build: ?*const fn (*DB) anyerror!void = null;
     var test_graph_replacement_document_batches: usize = 0;
+    var test_graph_replacement_before_checkpoint: ?*const fn (*DB) void = null;
     var test_block_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
     var test_generated_artifact_finalization_entered: std.atomic.Value(bool) = .init(false);
     var test_release_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
@@ -27480,13 +27481,12 @@ pub const DB = struct {
             // catch-up rounds ran through the ordinary maintenance owner.
             const target = db.core.nextDerivedSequence();
 
-            // After eight yielding fences, stop admitting new journal work
-            // until this fixed finite target is drained. Merely increasing a
-            // timeout can still starve forever under sustained writes. A wait
-            // caller retains its own deadline; the background owner performs
-            // the escalated cutover without a caller-imposed timeout.
-            const escalated = candidate.activation_attempts >= 8 and candidate.deadline_ns == null;
-            const deadline = if (escalated) std.math.maxInt(u64) else @min(monotonicTimeNs() +| 100 * std.time.ns_per_ms, candidate.deadline_ns orelse std.math.maxInt(u64));
+            // Escalation has a finite cooperative budget too. Persisted tail
+            // ordinals retain completed work when either budget expires. A
+            // slow storage operation may overrun a quantum, but no loop may
+            // hold write admission until an arbitrarily large tail is empty.
+            const pause_ms: u64 = if (candidate.activation_attempts >= 8) 1000 else 100;
+            const deadline = @min(monotonicTimeNs() +| pause_ms * std.time.ns_per_ms, candidate.deadline_ns orelse std.math.maxInt(u64));
             // Freeze writes only for a bounded progress window. Even a tail
             // larger than 1024 can advance its durable checkpoint; it never
             // throws completed work away waiting for an initially small gap.
@@ -27509,6 +27509,11 @@ pub const DB = struct {
                 defer jobs.deinit();
                 for (jobs.value) |saved| if (std.mem.eql(u8, saved.name, cfg.name)) {
                     var job = saved;
+                    if (candidate.sequence > saved.applied_sequence or candidate.tail_source_cursor > saved.tail_source_cursor) {
+                        job.retry_count = 0;
+                        job.retry_after_ns = 0;
+                        job.last_error = null;
+                    }
                     job.applied_sequence = candidate.sequence;
                     job.tail_source_cursor = candidate.tail_source_cursor;
                     job.activation_attempts +|= 1;
@@ -27702,7 +27707,9 @@ pub const DB = struct {
     /// One fair maintenance quantum. Opening a shadow reuses its durable graph;
     /// the saved source cursor and replay watermark never restart the corpus.
     pub fn advanceGraphReplacement(self: *DB) !bool {
-        return self.advanceGraphReplacementUntil(null);
+        const pending = try self.advanceGraphReplacementUntil(null);
+        if (pending) try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
+        return pending;
     }
 
     fn replacementRetryable(err: anyerror) bool {
@@ -27711,17 +27718,12 @@ pub const DB = struct {
             error.SystemResources,
             error.NoSpaceLeft,
             error.DiskQuota,
-            error.InputOutput,
-            error.Unexpected,
-            error.ReadFailed,
-            error.WriteFailed,
             error.ConnectionRefused,
             error.ConnectionResetByPeer,
             error.ConnectionTimedOut,
             error.Timeout,
             error.NetworkUnreachable,
             error.TemporaryNameServerFailure,
-            error.UnexpectedReadFailure,
             error.SendFailed,
             error.RecvFailed,
             error.RemoteCapabilityDiscoveryTransient,
@@ -27741,7 +27743,7 @@ pub const DB = struct {
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
-        defer self.graph_replacement_mutex.unlock();
+        defer self.graph_replacement_mutex.unlock(self.core.index_manager.checkpointIo());
         const jobs = try self.graphReplacementStatusAlloc(self.alloc);
         defer jobs.deinit();
         for (jobs.value) |saved| {
@@ -27756,7 +27758,14 @@ pub const DB = struct {
                     defer activity.deinit();
                     try self.lockApplyForPortableRuntime();
                     defer self.core.unlockApply();
-                    var job = saved;
+                    // Activation can fail after a newer checkpoint committed.
+                    // Account against that durable progress, never overwrite it
+                    // with the scheduler's pre-quantum copy.
+                    const durable = try self.graphReplacementStatusAlloc(self.alloc);
+                    defer durable.deinit();
+                    var job = for (durable.value) |current| {
+                        if (std.mem.eql(u8, current.name, saved.name)) break current;
+                    } else return self.hasPendingGraphReplacements();
                     job.last_error = @errorName(err);
                     if (replacementRetryable(err) and job.retry_count < 4) {
                         // Persist wall-clock backoff across owner changes/restarts.
@@ -27776,13 +27785,9 @@ pub const DB = struct {
                 return self.hasPendingGraphReplacements();
             };
         }
-        if (self.hasPendingGraphReplacements()) {
-            // Foreground drains also drive this scheduler; avoid a hot loop
-            // when all jobs are waiting for their retry deadline.
-            try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
-            return true;
-        }
-        return false;
+        // Sleep only after releasing replacement ownership: cancellation,
+        // deletion and other ready jobs must not queue behind retry backoff.
+        return self.hasPendingGraphReplacements();
     }
 
     fn clearGraphReplacementProgress(self: *DB) void {
@@ -27803,11 +27808,8 @@ pub const DB = struct {
 
     pub fn cancelReplacement(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        while (!self.graph_replacement_mutex.tryLock()) {
-            const io = self.core.index_manager.checkpointIo();
-            try io.sleep(.fromMilliseconds(1), .awake);
-        }
-        defer self.graph_replacement_mutex.unlock();
+        try self.graph_replacement_mutex.lock(self.core.index_manager.checkpointIo());
+        defer self.graph_replacement_mutex.unlock(self.core.index_manager.checkpointIo());
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -27957,9 +27959,16 @@ pub const DB = struct {
             if (progress_job.resume_key_b64) |key| self.alloc.free(key);
         };
         if (checkpoint) {
+            if (builtin.is_test) if (test_graph_replacement_before_checkpoint) |hook| hook(self);
             try private.checkpointLsmWalForManagedIndex(.{ .name = cfg.name, .kind = .graph });
             try private.syncIndexByName(cfg.name, true);
-            job.last_error = null;
+            if (job.scanned > saved.scanned or job.applied_sequence > saved.applied_sequence or job.tail_source_cursor > saved.tail_source_cursor or job.phase != saved.phase) {
+                job.retry_count = 0;
+                job.retry_after_ns = 0;
+                job.last_error = null;
+                progress_job.retry_count = 0;
+                progress_job.retry_after_ns = 0;
+            }
             try self.core.index_manager.saveGraphReplacementBuild(self.core.store, job);
         }
         self.clearGraphReplacementProgress();
@@ -27988,7 +27997,16 @@ pub const DB = struct {
 
     pub fn waitGraphReplacement(self: *DB, name: []const u8, timeout_ms: u64) !void {
         const deadline = monotonicTimeNs() +| timeout_ms *| std.time.ns_per_ms;
-        while (self.core.index_manager.get(name) == null) {
+        while (true) {
+            // Publication appends the new runtime entry before committing the
+            // catalog. Its exclusive catalog lease spans commit and retirement;
+            // a shared observation cannot acknowledge that provisional entry.
+            const committed = blk: {
+                self.core.index_manager.catalog_mutex.lockShared();
+                defer self.core.index_manager.catalog_mutex.unlockShared();
+                break :blk self.core.index_manager.get(name) != null;
+            };
+            if (committed) return;
             const jobs = try self.graphReplacementStatusAlloc(self.alloc);
             defer jobs.deinit();
             const pending = for (jobs.value) |job| {
@@ -29651,9 +29669,8 @@ pub const DB = struct {
         // Match maintenance/cancellation ordering: replacement -> replication
         // -> resolver/structural -> apply. The marker and serving catalog are
         // removed by the same storage transaction below.
-        while (!self.graph_replacement_mutex.tryLock())
-            try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
-        defer self.graph_replacement_mutex.unlock();
+        try self.graph_replacement_mutex.lock(self.core.index_manager.checkpointIo());
+        defer self.graph_replacement_mutex.unlock(self.core.index_manager.checkpointIo());
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
         var row_policy_lease = self.local_execution.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
@@ -135676,13 +135693,15 @@ test "capi resolver replacement fenced tail advances gaps over 1024" {
     try private.registerReplacementIndex(db.core.store, cfg);
     var prepared = DB.PreparedGraphReplacement{ .manager = &private, .sequence = floor };
     defer if (prepared.entry) |*entry| private.destroyDetachedReplacementIndex(entry);
-    {
+    // A loaded machine may spend an entire window acquiring/reading IO.
+    // Require eventual progress over bounded attempts, not the first 100 ms.
+    for (0..100) |_| {
         db.core.lockApply();
         defer db.core.unlockApply();
         prepared.finish(&db, cfg) catch |err| if (err != error.Busy) return err;
+        if (prepared.sequence > floor or prepared.tail_source_cursor > 0) break;
     }
-    // The former >1024 shortcut never consumed even one entry. A bounded
-    // write pause must make durable progress even when it cannot swap yet.
+    // The former >1024 shortcut never consumed even one entry.
     try std.testing.expect(prepared.sequence > floor or prepared.tail_source_cursor > 0);
     if (prepared.sequence < db.core.nextDerivedSequence()) {
         const progress = try db.graphReplacementStatusAlloc(a);
@@ -135690,12 +135709,18 @@ test "capi resolver replacement fenced tail advances gaps over 1024" {
         try std.testing.expectEqual(prepared.sequence, progress.value[0].applied_sequence);
         try std.testing.expectEqual(prepared.tail_source_cursor, progress.value[0].tail_source_cursor);
         try std.testing.expect(progress.value[0].activation_attempts > 0);
-        // Force the starvation escalation after a producer has outrun the
-        // yielding fence. Its fixed target must drain in this admission.
+        // Escalated fences retain a finite budget and resume durable progress
+        // across admissions rather than holding writers for an unbounded tail.
         prepared.activation_attempts = 8;
         db.core.lockApply();
         defer db.core.unlockApply();
-        try prepared.finish(&db, cfg);
+        for (0..100) |_| {
+            prepared.finish(&db, cfg) catch |err| {
+                if (err == error.Busy) continue;
+                return err;
+            };
+            break;
+        }
         try std.testing.expectEqual(db.core.nextDerivedSequence(), prepared.sequence);
         try std.testing.expect(prepared.entry != null);
     }
@@ -135805,4 +135830,241 @@ test "capi resolver rejected serving deletion preserves its pending shadow" {
     try std.testing.expect(db.core.index_manager.get("old") == null);
     try std.testing.expect(!db.hasPendingGraphReplacements());
     try db.runUntilIdle();
+}
+
+test "capi resolver replacement retry budget resets only after durable progress" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-retry-progress");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var rows: std.ArrayList(types.BatchWrite) = .empty;
+    for (0..100) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[\"target\"]}" });
+    try db.batch(.{ .writes = rows.items });
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        var job = jobs.value[0];
+        job.retry_count = 4;
+        job.last_error = "NoSpaceLeft";
+        try db.core.index_manager.saveGraphReplacementBuild(db.core.store, job);
+    }
+    _ = try db.advanceGraphReplacement();
+    {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        try std.testing.expect(jobs.value[0].scanned > 0);
+        try std.testing.expectEqual(@as(u32, 0), jobs.value[0].retry_count);
+        try std.testing.expect(jobs.value[0].last_error == null);
+    }
+    const Failure = struct {
+        fn call(_: *DB) anyerror!void {
+            return error.NoSpaceLeft;
+        }
+    };
+    DB.test_graph_replacement_before_build = Failure.call;
+    defer DB.test_graph_replacement_before_build = null;
+    _ = try db.advanceGraphReplacement();
+    const jobs = try db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    try std.testing.expectEqual(@as(u32, 1), jobs.value[0].retry_count);
+    try std.testing.expect(jobs.value[0].phase != .failed);
+    try std.testing.expect(!DB.replacementRetryable(error.Unexpected));
+    try std.testing.expect(!DB.replacementRetryable(error.InputOutput));
+    try std.testing.expect(!DB.replacementRetryable(error.ReadFailed));
+}
+
+test "capi resolver replacement wait cannot acknowledge provisional catalog entries" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-wait-publication");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const Check = struct {
+        var database: *DB = undefined;
+        var thread: ?std.Thread = null;
+        var done: std.atomic.Value(bool) = .init(false);
+        var early: bool = false;
+        var failed: bool = false;
+        fn wait() void {
+            database.waitGraphReplacement("new", 0) catch {
+                failed = true;
+            };
+            done.store(true, .release);
+        }
+        fn boundary(phase: index_manager_mod.ReplacementSwapBoundary) void {
+            if (phase == .before_commit) {
+                thread = std.Thread.spawn(.{}, wait, .{}) catch @panic("spawn failed");
+                database.core.index_manager.checkpointIo().sleep(.fromMilliseconds(20), .awake) catch @panic("sleep failed");
+            }
+            early = early or done.load(.acquire);
+        }
+    };
+    Check.database = &db;
+    Check.thread = null;
+    Check.done.store(false, .release);
+    Check.early = false;
+    Check.failed = false;
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    index_manager_mod.test_replacement_swap_boundary = Check.boundary;
+    defer index_manager_mod.test_replacement_swap_boundary = null;
+    _ = try db.advanceGraphReplacement();
+    const thread = Check.thread orelse return error.TestUnexpectedResult;
+    thread.join();
+    try std.testing.expect(Check.done.load(.acquire));
+    try std.testing.expect(!Check.failed);
+    try std.testing.expect(!Check.early);
+}
+
+test "capi resolver replacement crash boundaries recover atomic ownership" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const options: OpenOptions = .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false };
+    if (std.c.getenv("ANTFLY_REPLACEMENT_CRASH_PATH")) |path| {
+        // An exec'd child has fresh allocator/IO state. Kill in the actual
+        // production boundaries: no close, unwind or final checkpoint occurs.
+        var db = try DB.open(a, std.mem.span(path), options);
+        const Crash = struct {
+            fn kill() noreturn {
+                _ = std.c.kill(std.c.getpid(), .KILL);
+                @panic("SIGKILL failed");
+            }
+            fn beforeCheckpoint(database: *DB) void {
+                const jobs = database.graphReplacementStatusAlloc(std.heap.page_allocator) catch @panic("status failed");
+                defer jobs.deinit();
+                // Leave one acknowledged checkpoint, then die with newer
+                // projected work that has not published its source cursor.
+                if (jobs.value[0].scanned > 0) kill();
+            }
+            fn swap(phase: index_manager_mod.ReplacementSwapBoundary) void {
+                const stage = std.mem.span(std.c.getenv("ANTFLY_REPLACEMENT_CRASH_STAGE").?);
+                if (std.mem.eql(u8, stage, @tagName(phase))) kill();
+            }
+        };
+        const stage = std.mem.span(std.c.getenv("ANTFLY_REPLACEMENT_CRASH_STAGE").?);
+        if (std.mem.eql(u8, stage, "checkpoint")) DB.test_graph_replacement_before_checkpoint = Crash.beforeCheckpoint else index_manager_mod.test_replacement_swap_boundary = Crash.swap;
+        for (0..1000) |_| _ = try db.advanceGraphReplacement();
+        return error.TestUnexpectedResult; // boundary must have killed us
+    }
+    const executable = try std.process.executablePathAlloc(io, a);
+    defer a.free(executable);
+    for ([_][]const u8{ "checkpoint", "before_commit", "after_commit" }) |stage| {
+        var directory = try TestDirectory.init("replacement-crash-boundary");
+        defer directory.cleanup();
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var rows: std.ArrayList(types.BatchWrite) = .empty;
+            for (0..100) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[\"before\"],\"next_links\":[\"after\"]}" });
+            try db.batch(.{ .writes = rows.items });
+            try db.runUntilIdle();
+            try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" });
+        }
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("TZ", "UTC0");
+        try env.put("ANTFLY_REPLACEMENT_CRASH_PATH", directory.path());
+        try env.put("ANTFLY_REPLACEMENT_CRASH_STAGE", stage);
+        var child = try std.process.spawn(io, .{ .argv = &.{ executable, "--test-filter", "capi resolver replacement crash boundaries recover atomic ownership" }, .environ_map = &env });
+        const term = try child.wait(io);
+        try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, term);
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        const swapped = std.mem.eql(u8, stage, "after_commit");
+        try std.testing.expectEqual(swapped, db.core.index_manager.get("new") != null);
+        try std.testing.expectEqual(!swapped, db.core.index_manager.get("old") != null);
+        if (!swapped) {
+            const jobs = try db.graphReplacementStatusAlloc(a);
+            defer jobs.deinit();
+            try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+            if (std.mem.eql(u8, stage, "checkpoint")) {
+                try std.testing.expect(jobs.value[0].scanned > 0);
+                try std.testing.expect(jobs.value[0].scanned < 100);
+            }
+        }
+        try db.runUntilIdle();
+        try db.waitGraphReplacement("new", 0);
+        for ([_][]const u8{ "source:0000", "source:0099" }) |key| {
+            const edges = try db.core.index_manager.graphIndex("new").?.index.getEdges(a, key, "R", .out);
+            defer graph_mod.GraphIndex.freeEdges(a, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqualStrings("after", edges[0].target);
+        }
+    }
+}
+
+test "capi resolver pending replacement fences old writers without a permanent plain epoch" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-writer-fence");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 1));
+        const raw = try read.get("\x00\x00__metadata__:resolvers");
+        // Older releases predate the epoch key and parse a strict array.
+        try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice([]resolver_catalog.ResolverConfig, a, raw, .{}));
+        try std.testing.expectEqual(@as(u32, 2), db.core.index_manager.minimum_reader_version.load(.acquire));
+    }
+    try db.runUntilIdle();
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 1), try resolver_catalog.readMinimumReaderVersion(&read, 1));
+        try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.minimum_reader_version.load(.acquire));
+    }
+    try db.replaceGraphIndex("new", .{ .name = "later", .kind = .graph, .config_json = config });
+    try std.testing.expect(try db.cancelReplacement("later"));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 1), try resolver_catalog.readMinimumReaderVersion(&read, 1));
+    }
+}
+
+test "capi resolver replacement reader fence survives multiple jobs and resolver epoch upgrades" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-fence-multiple");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old1", .kind = .graph, .config_json = config });
+    try db.addIndex(.{ .name = "old2", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old1", .{ .name = "new1", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old2", .{ .name = "new2", .kind = .graph, .config_json = config });
+    try std.testing.expect(try db.cancelReplacement("new1"));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 1));
+    }
+    // An authoritative feature upgrade during a temporary fence must survive
+    // the last shadow's removal. Resolver serialization introduces v2 fields.
+    try db.core.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false });
+    try std.testing.expect(try db.cancelReplacement("new2"));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 1));
+    }
 }

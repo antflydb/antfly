@@ -251,8 +251,8 @@ pub const ErrorCode = enum(c_int) {
     /// succeed. See `antfly_db_run_until_idle_json`
     /// for the stuck index name and indexed/expected counters.
     stalled = 9,
-    /// The caller cancelled the call, by returning false from its progress
-    /// or stream callback.
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning false.
     cancelled = 10,
     replacement_failed = 11,
     replacement_pending = 12,

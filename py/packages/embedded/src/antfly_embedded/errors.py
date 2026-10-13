@@ -80,9 +80,8 @@ UNSUPPORTED = 8
 # A bounded drain (e.g. run_until_idle) detected a managed index making no
 # forward progress and gave up.
 STALLED = 9
-# The caller cancelled the call by returning false from its progress or
-# stream callback (Inference.pull()'s progress, generate_stream()'s
-# on_chunk).
+# The operation was cancelled, including a pending replacement or a
+# progress/stream callback returning false.
 CANCELLED = 10
 REPLACEMENT_FAILED = 11
 REPLACEMENT_PENDING = 12

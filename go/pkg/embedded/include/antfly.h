@@ -41,8 +41,8 @@ typedef enum antfly_error_code {
     /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
      * and repair or reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
-    /* The caller cancelled the call by returning false from its progress or
-     * stream callback. */
+    /* The operation was cancelled, including a pending replacement or a
+     * progress/stream callback returning false. */
     ANTFLY_CANCELLED = 10,
     /* Stable replacement precondition failures, distinct from malformed input. */
     ANTFLY_REPLACEMENT_FAILED = 11,
@@ -497,7 +497,8 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * ANTFLY_CANCELLED. Precondition failures are ANTFLY_REPLACEMENT_FAILED,
  * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
  * pending_work_stats_json reports progress, retry_count, retry_after_ns and
- * last_error. Transient failures retry four times with persisted backoff. */
+ * last_error. Consecutive transient failures retry four times with persisted
+ * backoff; durable forward progress resets the budget. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 /* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);

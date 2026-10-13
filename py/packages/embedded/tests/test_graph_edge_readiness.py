@@ -921,7 +921,7 @@ def test_concurrent_shared_destination_promotion_preserves_aliases(tmp_path, sto
             assert set(row["aliases"]) == {"Ada", "ADA"}
 
 
-def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_path):
+def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path):
     previous = os.environ.get("ANTFLY_LITE_PREVIOUS_LIBRARY")
     if not previous:
         if os.environ.get("ANTFLY_LITE_REQUIRE_PREVIOUS_READER") == "1":
@@ -930,6 +930,7 @@ def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_pa
     options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.LITE)
     plain = tmp_path / "previous-plain.aflite"
     identity = tmp_path / "previous-identity.aflite"
+    pending = tmp_path / "previous-pending.aflite"
     with _open_graph_test(plain, options) as db:
         db.create_table("plain_named", {})
         db.create_table("dropped_named", {})
@@ -944,20 +945,84 @@ def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_pa
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
         assert db.capabilities()["minimum_reader_version"] == 2
+    # Hosted maintenance leaves the shadow pending deterministically. The old
+    # writer must fail open before it can truncate the retained journal.
+    with antfly_embedded.create_hosted(pending) as db:
+        graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+        db.add_index(graph)
+        db.batch_json({"inserts": {"source": {"links": ["before"]}}})
+        db.run_until_idle()
+        db.add_index(dict(graph, name="new", replaces="old"))
+        assert db.pending_work_stats()["replacements"]
+        assert db.capabilities()["minimum_reader_version"] == 2
     script = r"""
 import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1])
 lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
 lib.antfly_lite_open.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
-for path, accepted in [(sys.argv[2], True), (sys.argv[3], False)]:
+for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], False)]:
     handle = ctypes.c_void_p()
     code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
     assert (code == 0) == accepted, (path, code)
     if handle.value:
         lib.antfly_db_close(handle)
 """
-    subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity)], check=True, timeout=60)
+    subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60)
+
+
+    # A previously opened Lite writer must also reject mutation after the
+    # registration commit, when its connection refreshes the catalog.
+    live = tmp_path / "previous-live-writer.aflite"
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with antfly_embedded.create_hosted(live) as db:
+        db.add_index(graph)
+        db.batch_json({"inserts": {"source": {"links": ["before"]}}})
+        db.run_until_idle()
+    writer_script = r"""
+import ctypes, sys
+class Slice(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_open.restype = ctypes.c_int
+lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice]
+lib.antfly_db_batch_json.restype = ctypes.c_int
+lib.antfly_db_close.argtypes = [ctypes.c_void_p]
+handle = ctypes.c_void_p()
+assert lib.antfly_lite_open(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+print("ready", flush=True)
+assert sys.stdin.readline().strip() == "write"
+request = b'{"inserts":{"source":{"links":["obsolete"]}}}'
+buffer = ctypes.create_string_buffer(request)
+code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)))
+assert code != 0, "old writer admitted mutation across the replacement fence"
+lib.antfly_db_close(handle)
+"""
+    writer = subprocess.Popen(
+        [sys.executable, "-c", writer_script, previous, str(live)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        import select
+
+        ready, _, _ = select.select([writer.stdout], [], [], 30)
+        assert ready and writer.stdout.readline().strip() == "ready"
+        with antfly_embedded.open_hosted(live) as db:
+            db.add_index(dict(graph, name="new", replaces="old"))
+            _, stderr = writer.communicate("write\n", timeout=30)
+            assert writer.returncode == 0, stderr
+            db.batch_json({"inserts": {"source": {"links": ["latest"]}}})
+            db.run_until_idle()
+            edges = db.edges("new", "source", "R", antfly_embedded.GraphDirection.OUT)
+            assert [base64.b64decode(edge["target_b64"]).decode() for edge in edges] == ["latest"]
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+        writer.wait(timeout=30)
 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
@@ -1204,7 +1269,7 @@ def test_plain_table_lifecycle_preserves_reader_version_one(tmp_path, storage):
 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
-def test_plain_replacement_keeps_reader_version_one(tmp_path, storage):
+def test_plain_replacement_temporarily_fences_older_writers(tmp_path, storage):
     path = tmp_path / ("plain-replace.aflite" if storage == antfly_embedded.Storage.LITE else "plain-replace")
     options = antfly_embedded.OpenOptions(storage=storage)
     with _open_graph_test(path, options) as db:
@@ -1221,7 +1286,7 @@ def test_plain_replacement_keeps_reader_version_one(tmp_path, storage):
                     "wait": {"timeout_ms": 0},
                 }
             )
-        assert db.capabilities()["minimum_reader_version"] == 1
+        assert db.capabilities()["minimum_reader_version"] == 2
         db.run_until_idle()
         assert db.capabilities()["minimum_reader_version"] == 1
     with _open_graph_test(path, options) as db:
