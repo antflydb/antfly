@@ -96,7 +96,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const sanitize_thread = shared.sanitize_thread;
     const runtime_artifact_role = shared.runtime_artifact_role;
     const antfly_bin_name = shared.antfly_bin_name;
-    const inference_enable_onnx = shared.inference_enable_onnx;
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
@@ -378,14 +377,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = matcher_mod,
     });
     const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone pkg/antfly-embedded/matcher tests");
     lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
 
     const lib_resolver_tests = b.addTest(.{
         .root_module = resolver_mod,
     });
     const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone pkg/antfly-embedded/resolver tests");
     lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
@@ -737,6 +736,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);
     lib_test_step.dependOn(&run_lib_google_tests.step);
@@ -855,7 +855,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
-        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,

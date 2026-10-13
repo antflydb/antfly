@@ -621,14 +621,27 @@ Ranked; each item needs the gates above and a rollback env.
 5. **Retire the split-GQA floor**: a bit-identical `split_count==1` direct-write
    variant so the split family serves KV=1 upward and `paged_1x` is pure
    fallback.
-6. Longer-horizon levers from the original plan, not yet re-audited: quantize
-   `per_layer_model_proj` F16 → Q8_0; quantized (Q8_0) KV for long context;
-   loud telemetry for silent layer-spec cache misses and split-GQA fallbacks;
-   serving-path work (tokenize/render once per request, single JSON parse,
-   keyless/streaming prompt-prefix caching once the attach bug is fixed,
-   per-request state pooling, coalesced SSE writes); MTP auto-on with a
-   registry-shipped assistant and prompt-lookup decoding; MatFormer
-   self-drafting and activation-sparsity spikes.
+6. Longer-horizon levers from the original plan that remain open (already
+   shipped: Q8_0 staging of `per_layer_model_proj` with
+   `TERMITE_METAL_DISABLE_PLE_MODEL_PROJ_Q8` rollback, render/tokenize once per
+   request, single JSON body parse, one-write SSE frames, and split-GQA
+   below-floor telemetry):
+   - Make layer-spec cache misses loud: `fillLayerSpecsCached`
+     (`src/architectures/gemma4_runtime.zig`) rebuilds silently on a
+     fingerprint miss; add a counter to the runtime snapshot and benchmark JSON.
+   - Pool per-request decode state (KV, backend, and lease setup still happen
+     per request).
+   - Keyless/streaming prompt-prefix caching, blocked on the prompt-cache
+     attach bug in the main [Open work](#open-work).
+   - Quantized KV for long context: Q8_0 KV is not implemented on Metal; the
+     compressed `polar4`/`turbo3` formats exist but are not defaults (see
+     [TURBOQUANT.md](../../TURBOQUANT.md)).
+   - MTP on by default on Metal: auto-draft loading of the registry companion
+     assistant exists behind `ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO` (default
+     off); promotion waits on the acceptance-rate work in the main Open work.
+   - Prompt-lookup decoding, MatFormer E2B-in-E4B self-drafting, and FFN
+     activation-sparsity spikes: not implemented; each needs a quality eval
+     gate.
 7. Release gates still open from the last qualification: rerun from a pristine
    zero-swap boot, resolve the E2B free-form fixture mismatch (164 vs a
    180-word floor), and retain evidence outside `/private/tmp` with hosted

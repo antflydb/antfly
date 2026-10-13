@@ -159,7 +159,6 @@ curl http://localhost:8080/api/models
 ## Files Involved
 
 - `src/pipelines/generation.zig`
-- `src/pipelines/onnx_decoder_only_vlm.zig`
 - `src/server/server.zig`
 - `../../../specs/openapi/inference/api.yaml`
 - `../../e2e/inference/test_generate.py`

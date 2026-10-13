@@ -132,21 +132,21 @@ pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.S
         return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": if (guard.handle.parent_id != null)");
+    if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": operation requires a root database handle");
     out_id.* = open(guard.handle, "default", request.bytes()) catch |err| return diagnostic(err, out);
     return .ok;
 }
 pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) h.capi.ErrorCode {
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const guard = api.enterHandlePinned(ptr, .exclusive) orelse");
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     if (rows == 0 or rows > 4096) return diagnostic(error.InvalidSqlLimit, out);
-    const cursor = guard.handle.sql_cursors.get(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const cursor = guard.handle.sql_cursors.get(id) orelse");
+    const cursor = guard.handle.sql_cursors.get(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL cursor ID is unknown or closed");
     var page = cursor.stream.next(rows) catch |err| {
         if (cursor.session_id) |session_id| if (guard.handle.sql_sessions.get(session_id)) |session| {
             if (session.active) session.failed = true;
@@ -169,13 +169,13 @@ pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u
 }
 pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
     h.capi.clearLastError();
-    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const guard = api.enterHandlePinned(ptr, .exclusive) orelse");
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const entry = guard.handle.sql_cursors.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": const entry = guard.handle.sql_cursors.fetchRemove(id) orelse");
+    const entry = guard.handle.sql_cursors.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL cursor ID is unknown or closed");
     entry.value.close();
     return .ok;
 }

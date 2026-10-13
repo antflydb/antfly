@@ -1,0 +1,25 @@
+{
+  "source_catalog": "zig/pkg/inference/src/registry/qwen3_embedding_catalog.zig",
+  "model_id": "Qwen/Qwen3-Embedding-0.6B-GGUF",
+  "revision": "370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+  "model_files": {
+    "Qwen3-Embedding-0.6B-Q8_0.gguf": {
+      "size_bytes": 639150592,
+      "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
+    },
+    "tokenizer.json": {
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+      "size_bytes": 11423705,
+      "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+    },
+    "tokenizer_config.json": {
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+      "size_bytes": 9706,
+      "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+    }
+  },
+  "model_manifest": "{\"type\":\"embedder\",\"pooling\":\"last\",\"normalize\":true,\"embedding_style\":\"qwen3_embedding\",\"embedding_profile\":{\"task_contract\":\"profiled\",\"query\":{\"prefix\":\"Instruct: Given a web search query, retrieve relevant passages that answer the query\\nQuery:\",\"instruction_template\":\"Instruct: {instruction}\\nQuery:\"},\"document\":{\"prefix\":\"\"}}}\n",
+  "model_manifest_sha256": "d07fad596a5839ef429562db9e22f217da17063aa05d4d1b8bfaef0c43557c03"
+}

@@ -24209,6 +24209,7 @@ test "algebraic adaptive backfill materializes schemaless path recommendations" 
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -24540,6 +24541,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
         &create_identity,
         &.{"doc:a"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, create_identity.items, &.{}, null);
 
@@ -24557,6 +24559,8 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
         }
         delete_identity.deinit(alloc);
     }
+    var live_deletes_delete_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_delete_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         &store,
@@ -24566,8 +24570,9 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
         &delete_identity,
         &.{},
         &.{"doc:a"},
+        &live_deletes_delete_identity,
     );
-    try store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+    try store.putBatchWithReplay(null, delete_identity.items, live_deletes_delete_identity.items, null);
 
     var visible_at_create = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(&store,
         \\{"ids":["doc:a"]}
@@ -24905,6 +24910,7 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
@@ -25627,6 +25633,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     for (docs) |doc| {
         try identity_writes.append(alloc, .{
@@ -26814,6 +26821,7 @@ test "algebraic index maintains composite equi join aggregate" {
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -27116,7 +27124,7 @@ test "algebraic index executes cardinality partial tensor programs" {
         }
         identity_writes.deinit(alloc);
     }
-    try doc_identity.appendBatchIdentityMetadataAlloc(alloc, &store, 0, 0, 7, &identity_writes, doc_keys[0..], &.{});
+    try doc_identity.appendBatchIdentityMetadataAlloc(alloc, &store, 0, 0, 7, &identity_writes, doc_keys[0..], &.{}, null);
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try idx.applyBatch(&store, .{ .sequence = 7, .documents = docs[0..] });
 
@@ -29463,6 +29471,7 @@ test "algebraic derived join tensor reads subtract identity tombstones at genera
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 

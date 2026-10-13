@@ -128,7 +128,7 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_k
 /// sibling configs); free it with `gpa`. Labeled resolvers need no exclusions
 /// (admission keeps sibling label sets disjoint), so this returns empty for
 /// them without allocating.
-fn siblingClaimedLabelsAlloc(
+pub fn siblingClaimedLabelsAlloc(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
@@ -146,7 +146,7 @@ fn siblingClaimedLabelsAlloc(
     return try claimed.toOwnedSlice(gpa);
 }
 
-fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
+pub fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
     if (labels.len > 0) gpa.free(labels);
 }
 
@@ -225,12 +225,15 @@ pub fn resolveExtraction(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
+    defer gpa.free(effective_aliases);
+    resolver.aliases = effective_aliases;
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
     parsed.entities = resolver.filterEntitiesByLabel(parsed.entities);
 
-    var resolution = try resolver.resolve(gpa, cfg.config_generation, parsed.entities, candidates);
+    var resolution = try resolver.resolve(gpa, cfg.effectiveGeneration(), parsed.entities, candidates);
     defer resolution.deinit();
 
     const bytes = try resolution.toJson(gpa);
@@ -318,6 +321,61 @@ fn siblingResolutionsJsonAlloc(
     return try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = map }, .{});
 }
 
+/// Resolve ephemeral mentions with the same candidates, embeddings and scorer as
+/// ingestion. The store has no writable backing and cannot publish artifacts.
+pub fn resolveQueryExtractionAlloc(
+    gpa: Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    extraction: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+) ![]u8 {
+    if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
+    const key = try internal_keys.artifactNamedPrefixAlloc(gpa, "query", "asset", cfg.source_artifact);
+    defer gpa.free(key);
+    const QueryStore = struct {
+        key: []const u8,
+        value: []const u8,
+        fn get(ptr: *anyopaque, a: Allocator, requested: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (std.mem.eql(u8, requested, self.key)) try a.dupe(u8, self.value) else null;
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.QueryResolutionWriteAttempt;
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.QueryResolutionWriteAttempt;
+        }
+    };
+    var memory = QueryStore{ .key = key, .value = extraction };
+    const store: resolver_lib.ArtifactStore = .{ .ptr = &memory, .vtable = &.{ .get = QueryStore.get, .put = QueryStore.put, .delete = QueryStore.delete } };
+    var overlay: std.ArrayList(ArtifactWrite) = .empty;
+    defer {
+        for (overlay.items) |write| {
+            gpa.free(write.key);
+            gpa.free(write.value);
+        }
+        overlay.deinit(gpa);
+    }
+    // Resolve siblings first so identity templates can refer to their entities,
+    // while retaining the durable catalog's label-routing rules.
+    for (resolvers) |*sibling| {
+        if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse continue;
+        if (outcome.resolution_value) |value| {
+            overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
+                gpa.free(outcome.resolution_key);
+                gpa.free(value);
+                return err;
+            };
+        } else gpa.free(outcome.resolution_key);
+    }
+    const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse return error.InvalidArgument;
+    defer gpa.free(outcome.resolution_key);
+    return outcome.resolution_value orelse error.InvalidArgument;
+}
+
 pub fn processChangedExtractionWithConfig(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
@@ -349,6 +407,9 @@ pub fn processChangedExtractionWithConfig(
         cfg.scorer_json,
     );
     defer resolver.deinit();
+    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
+    defer gpa.free(effective_aliases);
+    resolver.aliases = effective_aliases;
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -428,7 +489,7 @@ pub fn processChangedExtractionWithConfig(
 
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
-        .config_generation = cfg.config_generation,
+        .config_generation = cfg.effectiveGeneration(),
         .embedder = stage_embedder,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,
@@ -1094,6 +1155,7 @@ const SourceCandidateProvider = struct {
                     .index_name = self.ann_index_name,
                     .embedding = emb,
                     .k = self.candidate_limit,
+                    .vector_fields = try self.resolver.candidateVectorFields(allocator),
                 }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.NearestUnsupported => return,
                     else => return e,
@@ -1597,6 +1659,56 @@ fn repairAssetSourceIndexWindow(
     };
 }
 
+/// Backfill scans may visit unrelated source streams. Avoid journal writes,
+/// candidate searches and inference when every subscriber is already current.
+fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStore, resolvers: []const ResolverConfig, key: []const u8) !bool {
+    var source = (try parseSourceArtifactKeyAlloc(gpa, key)) orelse return false;
+    defer source.deinit(gpa);
+    for (resolvers) |*cfg| {
+        if (!resolverMatchesArtifact(cfg, source.source_artifact_kind, source.artifact_name)) continue;
+        // Legacy resolvers require a caller-owned config_generation bump.
+        // Without a combined revision clock, an equal generation alone cannot
+        // prove that a changed config has already been replayed.
+        if (cfg.merge_generation == 0 and cfg.resolution_generation == 0) return true;
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, source.resolution_scope_key, cfg.resolution_artifact);
+        defer gpa.free(resolution_key);
+        const bytes = (try store.get(gpa, resolution_key)) orelse return true;
+        defer gpa.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return true;
+        const revision = parsed.value.object.get("config_generation") orelse return true;
+        if (revision == .integer and revision.integer >= 0 and @as(u64, @intCast(revision.integer)) == cfg.effectiveGeneration()) continue;
+        // A changed scorer/template cannot affect a source with no routed
+        // mentions and no previous decisions to retire. Inspect the immutable
+        // extraction, avoiding embeddings, candidates and derived writes.
+        const previous = parsed.value.object.get("entities") orelse return true;
+        if (previous != .array or previous.array.items.len > 0) return true;
+        const extraction = (try store.get(gpa, key)) orelse return true;
+        defer gpa.free(extraction);
+        var mentions = resolver_lib.parseExtractionEntities(gpa, extraction) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
+        defer mentions.deinit();
+        const excluded = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+        defer freeSiblingClaimedLabels(gpa, excluded);
+        for (mentions.entities) |mention| {
+            if (!cfg.resolvesLabel(mention.label)) continue;
+            var sibling_claims = false;
+            for (excluded) |label| if (std.mem.eql(u8, label, mention.label)) {
+                sibling_claims = true;
+                break;
+            };
+            if (!sibling_claims) return true;
+        }
+    }
+    return false;
+}
+
 pub fn enqueueReresolveBacklogWindow(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
@@ -1698,6 +1810,12 @@ pub fn enqueueReresolveBacklogWindow(
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
+    var i: usize = 0;
+    while (i < asset_keys.items.len) {
+        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_keys.items[i])) {
+            i += 1;
+        } else gpa.free(@constCast(asset_keys.orderedRemove(i)));
+    }
     const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
@@ -4479,4 +4597,50 @@ test "SourceCandidateProvider ann blocking generates missing mention embeddings"
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "resolver backfill skips current revisions and unrelated source streams" {
+    const alloc = std.testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "kg");
+    defer alloc.free(key);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolved");
+    defer alloc.free(resolution_key);
+    var cfg: ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .merge_generation = 3 };
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    try store.put(resolution_key, "{\"config_generation\":3,\"entities\":[]}");
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 4;
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 0;
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[]}");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 4;
+    cfg.source_artifact = "unrelated";
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.source_artifact = "kg";
+    try store.put(resolution_key, "invalid");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+}
+
+test "resolver backfill skips stale empty resolutions without routed mentions" {
+    const alloc = std.testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "kg");
+    defer alloc.free(key);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolved");
+    defer alloc.free(resolution_key);
+    var cfg: ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .resolution_generation = 4, .labels = &.{"person"} };
+    try store.put(key, "{\"entities\":[{\"text\":\"Antfly\",\"label\":\"company\"}]}");
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[]}");
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.labels = &.{"company"};
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.labels = &.{"person"};
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[{}]}");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
 }

@@ -1942,7 +1942,8 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
     }
     if (manifest.model_type != .embedder) return;
     if (manifest.native_arch_hint == .florence or
-        std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder"))
+        std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder") or
+        std.mem.eql(u8, manifest.config_model_arch, "moondream1"))
     {
         manifest.model_type = .reader;
         manifest.model_type_origin = .config;
@@ -3598,7 +3599,7 @@ fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
 
 fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
     if (try shouldUseClipclapGgufVariant(catalog)) return true;
-    if (build_options.enable_cuda and !build_options.enable_onnx) {
+    if (build_options.enable_cuda) {
         return try catalog.exists("antfly_inference_variants.json");
     }
     return false;

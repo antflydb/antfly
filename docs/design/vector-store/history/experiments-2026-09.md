@@ -2286,7 +2286,7 @@ are in `.benchmark-results/vector-foreground-gc/RESULTS.md`.
 
 ## Active scan progress and protected reuse experiment
 
-The [2026-09-08 correctness and design review](../../../../zig/VECTOR_STORE_REVIEW.md) records
+The [2026-09-08 correctness and design review](review-2026-09-08.md) records
 the remaining audit boundaries and larger opportunities after these measurements.
 
 The three structural follow-ups are now implemented under

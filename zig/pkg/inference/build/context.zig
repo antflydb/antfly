@@ -48,6 +48,6 @@ pub const Context = struct {
         artifact.root_module.link_libc = true;
     }
     pub fn hasAccelerator(ctx: Context) bool {
-        return ctx.backend.enable_metal or ctx.backend.enable_cuda or ctx.backend.enable_onnx or ctx.backend.enable_pjrt;
+        return ctx.backend.enable_metal or ctx.backend.enable_cuda or ctx.backend.enable_pjrt;
     }
 };

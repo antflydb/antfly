@@ -321,7 +321,9 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    canonical schema_version 2 relations shape for a windowed request
 //    native/Metal" (server/gliner_boundary_service_test.zig) exercise this
 //    exact merge path end to end -- one against a real 37KB multi-window
-//    design-doc section (zig/VOPR.md's "Completion-Claim Audit"), one
+//    design-doc section (zig/VOPR.md's "Completion-Claim Audit", frozen at
+//    commit 3ce5aff4ea as testdata/gliner25/long_document_probe/
+//    vopr_completion_claim_audit.txt), one
 //    deterministically against the known repro relation -- through both the
 //    HTTP handler and the in-process provider entry, and assert the
 //    response matches zig/EXTRACT.md's canonical envelope (entities with
@@ -336,7 +338,10 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    percentile and max section size across zig/*.md and work-log/**/*.md):
 //    zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And Scan Work" (6.8KB),
 //    zig/VOPR.md's "Completion-Claim Audit" (37KB), and zig/PDF.md's "Review
-//    findings and required fixes" (99KB) -- plus two synthetic documents
+//    findings and required fixes" (99KB) -- the latter two as frozen
+//    snapshots at commit 3ce5aff4ea under
+//    testdata/gliner25/long_document_probe/ (vopr_completion_claim_audit.txt,
+//    pdf_review_findings.txt) -- plus two synthetic documents
 //    built by concatenating real corpus sections (zig/PDF.md's two largest
 //    real sections, per a docsaf-accurate Go-side sweep of the whole ingest
 //    corpus) up to 130KB and 182KB/28275 words, well past every individual
@@ -496,7 +501,8 @@ const fastino_gliner25_base_v1_fp16_encoder = bundle.Identity{
 //    resolveModelDirectoryFromEnv) rather than copy-pasted: the 37KB VOPR.md
 //    "Completion-Claim Audit" multi-window document through both the HTTP
 //    handler and the in-process provider entry (native and Metal), the
-//    ~99KB PDF.md corpus-maximum section through both entries (native, the
+//    ~99KB PDF.md corpus-maximum section (both frozen snapshots under
+//    testdata/gliner25/long_document_probe/) through both entries (native, the
 //    same backend the fp32 row's corpus-maximum evidence used), and the
 //    corpus-minimum documents (20-byte SCHEMA.md section, 1-byte document)
 //    through the provider entry on both backends -- all pass with the

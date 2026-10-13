@@ -61,7 +61,7 @@ pub export fn antfly_inference_options_size() u32 {
 
 pub export fn antfly_inference_options_init(options: ?*capi.InferenceOptions) capi.ErrorCode {
     capi.clearLastError();
-    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const opts = options orelse");
+    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": options pointer must not be null");
     opts.* = .{};
     return .ok;
 }
@@ -129,7 +129,7 @@ pub export fn antfly_inference_open(
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
     out.* = openInference(options) catch |err| return capi.mapError(err);
     return .ok;
@@ -176,8 +176,8 @@ fn invoke(
     request: []const u8,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
     const deadline_ns = handle.deadline();
     const response = inference_provider.invokeEmbeddedInferenceRoute(
@@ -217,11 +217,11 @@ pub export fn antfly_inference_generate_json(h: ?*anyopaque, request_json: capi.
     // There is no stream sink across the C ABI; without this check the
     // runtime fails a streaming request with an opaque internal error.
     if (requestsStreaming(request_json.bytes())) {
-        const buffer = db.resetOutBuffer(out) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const buffer = db.resetOutBuffer(out) orelse");
+        const buffer = db.resetOutBuffer(out) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
         const body = "{\"error\":\"STREAMING_UNSUPPORTED\",\"message\":\"use antfly_inference_generate_stream_json to stream\"}";
         const owned = alloc.dupe(u8, body) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         buffer.* = .{ .ptr = owned.ptr, .len = owned.len };
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": non-streaming generation cannot accept stream=true");
     }
     return invoke(h, .post, "generate", request_json.bytes(), out);
 }
@@ -461,7 +461,7 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
         .{ "NetworkUnreachable", .busy },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], name)) return entry[1];
-    return capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+    return capi.recordError(.internal, name);
 }
 
 /// Downloads models into this handle's models directory, calling `progress`
@@ -474,8 +474,8 @@ pub export fn antfly_inference_pull_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
     const io = handle.io.io();
     var call = PullCall{
@@ -626,14 +626,14 @@ pub export fn antfly_inference_generate_stream_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
-    const callback = on_chunk orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const callback = on_chunk orelse");
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const callback = on_chunk orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": stream callback must not be null");
     const request = streamingRequest(request_json.bytes()) catch |err| switch (err) {
         error.OutOfMemory => return capi.mapError(err),
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed streaming generation request"),
     };
     defer alloc.free(request);
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
 
     var call = StreamCall{ .callback = callback, .callback_context = chunk_context };
@@ -649,11 +649,11 @@ pub export fn antfly_inference_generate_stream_json(
     if (call.stream_error) |message| {
         const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         out.* = .{ .ptr = body.ptr, .len = body.len };
-        return capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return capi.recordError(.internal, message);
     }
     // A request rejected before streaming started gets an ordinary response.
     if (call.status == 0) {
-        const response = call.response orelse return capi.recordError(.internal, @src().fn_name ++ ": const response = call.response orelse");
+        const response = call.response orelse return capi.recordError(.internal, @src().fn_name ++ ": inference worker returned no response");
         call.response = null;
         out.* = .{ .ptr = response.body.ptr, .len = response.body.len };
         return errorForStatus(response.status);
