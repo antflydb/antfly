@@ -2073,3 +2073,24 @@ exact against complete-clip inference and pass pinned PyTorch retrieval gates.
 full goal remains active; this does not add incremental live decoder state.
 
 See [qualification receipts](testdata/live/reader-cache-validation/README.md).
+
+
+### Explicit rolling and sparse window advance
+
+Live coordinator windows accept an optional positive `advance_ns`, independent
+of duration and within-window frame sampling. Null preserves consecutive
+windows; smaller advances overlap and larger advances sample sparse intervals.
+Commit retains preroll for the next start, with all fallible probing before
+cursor/ownership mutation. EOF tails clip to the published end; old epochs drain
+before reset clocks. Sparse pumping evicts skipped units to validated preroll
+under the existing byte/unit/packet limits, preserving failed-transfer retries.
+
+Fresh CPU, Metal and actual Linux pretrained comparisons pass six rolling and
+two sparse real-clip windows, all exactly equal to complete-clip vectors and token
+counts. The matching original intervals pass pinned PyTorch retrieval gates.
+Live cache telemetry reports conservative misses after one-second GOP eviction;
+no across-eviction reuse or sustained-throughput claim is made. MacOS passes
+230 video, 19 live and 47 model checks; actual Linux passes 205 video, 19 live
+and 42 model checks with platform skips. The original scope remains active.
+
+See [qualification receipts](testdata/live/advance-validation/README.md).

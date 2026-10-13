@@ -23,6 +23,8 @@ const avc = @import("avc.zig");
 pub const Options = struct {
     window: windows.Options = .{},
     duration_ns: i64 = 2 * std.time.ns_per_s,
+    /// Window advance; null preserves consecutive non-overlapping intervals.
+    advance_ns: ?u64 = null,
     step_ns: u64 = std.time.ns_per_s,
     max_frames: usize = 32,
     max_retained_bytes: usize = 64 * 1024 * 1024,
@@ -68,6 +70,7 @@ pub const Coordinator = struct {
     pending: ?media.live_mp4.Segment = null,
     pub fn init(a: std.mem.Allocator, options: Options) !Coordinator {
         if (options.duration_ns <= 0 or options.max_windows == 0 or options.window.max_units == 0 or options.window.max_units > 256) return error.ResourceLimitExceeded;
+        if (options.advance_ns) |advance| if (advance == 0 or advance > std.math.maxInt(i64)) return error.InvalidLiveWindowAdvance;
         try (sampling.TimestampPolicy{ .step_ns = options.step_ns, .max_frames = options.max_frames }).validate();
         const reservation = if (options.window.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Coordinator) }) else media.admission.Token{};
         return .{ .allocator = a, .options = options, .reservation = reservation };
@@ -128,10 +131,20 @@ pub const Coordinator = struct {
             sealed = @max(sealed orelse 0, frontier);
             pending_ns = if (logical.?.pending_pts) |pts| try ns(pts, view.reader.track.timescale) else null;
         }
+        // A sparse advance can leave the cursor beyond the published frontier.
+        // Retain only its validated preroll while pumping skipped units, so a
+        // long interval does not consume one slot for every intervening unit.
+        const keep = if (self.epoch_committed and self.start_ns.? >= (sealed orelse 0)) try self.retentionKeep(view.reader, logical, self.start_ns.?, self.count + 1) else 0;
+        var released: usize = 0;
+        var removed_packets: usize = 0;
+        for (self.units[0..keep]) |old| {
+            released = try std.math.add(usize, released, try charge(old));
+            removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
+        }
         if (self.logical) |*previous| previous.deinit();
         self.logical = logical;
         logical = null;
-        self.logical_base = 0;
+        self.logical_base = removed_packets;
         self.pending_ns = pending_ns;
         if (self.logical != null) self.stats.validation_walks += 1;
         self.count += 1;
@@ -140,6 +153,10 @@ pub const Coordinator = struct {
         if (!self.epoch_committed) self.start_ns = start;
         self.tail_ns = tail;
         self.sealed_ns = sealed;
+        self.retained_bytes -= released;
+        for (self.units[0..keep]) |*old| old.deinit();
+        std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
+        self.count -= keep;
         unit.* = null;
     }
     /// Explicit presentation watermark for layouts without an automatic proof.
@@ -186,34 +203,29 @@ pub const Coordinator = struct {
         if (logical != null) self.stats.metadata_snapshots += 1;
         return .{ .window = window, .logical = logical, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
     }
-    pub fn commit(self: *Coordinator, prepared: *const Prepared) !void {
-        try self.options.window.stream.control.check();
-        if (prepared.ordinal != self.ordinal or self.start_ns == null or prepared.source_start_ns != self.start_ns.? or self.count == 0 or prepared.window.epoch != self.units[0].epoch) return error.InvalidLiveWindowCommit;
-        const end = prepared.source_end_ns;
-        if (end <= self.start_ns.? or end > (self.sealed_ns orelse 0)) return error.InvalidLiveWindowCommit;
-        if (end > try std.math.add(i64, self.start_ns.?, self.options.duration_ns)) return error.InvalidLiveWindowCommit;
-        // All fallible probing precedes the cursor update. Logical first-packet
-        // selectors preserve complete field/partition preroll across unit edges.
+    /// Latest independently decoded preroll at/before a presentation cursor.
+    /// All payload probes are fallible and run before retention state changes.
+    fn retentionKeep(self: *const Coordinator, snapshot: media.mp4.Reader, logical_index: ?pictures.Index, cutoff: i64, active_count: usize) !usize {
+        var reader = snapshot;
         var keep: usize = 0;
-        if (prepared.window.reader.track.codec == .mjpeg) {
+        if (reader.track.codec == .mjpeg) {
             var at: usize = 0;
-            for (self.units[0..self.count], 0..) |unit, index| {
+            for (self.units[0..active_count], 0..) |unit, index| {
                 for (unit.reader.packets) |packet| {
-                    if (at >= prepared.window.reader.packets.len) break;
-                    if (try ns(packet.pts, unit.reader.track.timescale) <= end) keep = index;
+                    if (at >= reader.packets.len) break;
+                    if (try ns(packet.pts, unit.reader.track.timescale) <= cutoff) keep = index;
                     at += 1;
                 }
             }
         } else {
-            var reader = prepared.window.reader;
-            const logical = prepared.logical orelse return error.InvalidLivePictureIndex;
+            const logical = logical_index orelse return error.InvalidLivePictureIndex;
             for (logical.pictures) |picture| {
-                if (try ns(picture.pts, reader.track.timescale) > end) continue;
+                if (try ns(picture.pts, reader.track.timescale) > cutoff) continue;
                 var payload = try reader.readPacket(picture.first_packet);
                 defer payload.deinit();
                 if (!try avc.isPortableIdr(payload.bytes, reader.track.nal_length_bytes)) continue;
                 var count: usize = 0;
-                for (self.units[0..self.count], 0..) |unit, index| {
+                for (self.units[0..active_count], 0..) |unit, index| {
                     count += unit.reader.packets.len;
                     if (picture.first_packet < count) {
                         keep = index;
@@ -227,7 +239,7 @@ pub const Coordinator = struct {
         for (self.units[0..keep], 0..) |unit, index| {
             var future = false;
             for (unit.reader.packets) |packet| {
-                if (try ns(packet.pts, unit.reader.track.timescale) >= end) {
+                if (try ns(packet.pts, unit.reader.track.timescale) >= cutoff) {
                     future = true;
                     break;
                 }
@@ -237,6 +249,20 @@ pub const Coordinator = struct {
                 break;
             }
         }
+        return keep;
+    }
+    pub fn commit(self: *Coordinator, prepared: *const Prepared) !void {
+        try self.options.window.stream.control.check();
+        if (prepared.ordinal != self.ordinal or self.start_ns == null or prepared.source_start_ns != self.start_ns.? or self.count == 0 or prepared.window.epoch != self.units[0].epoch) return error.InvalidLiveWindowCommit;
+        const end = prepared.source_end_ns;
+        if (end <= self.start_ns.? or end > (self.sealed_ns orelse 0)) return error.InvalidLiveWindowCommit;
+        if (end > try std.math.add(i64, self.start_ns.?, self.options.duration_ns)) return error.InvalidLiveWindowCommit;
+        const advance: i64 = @intCast(self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns)));
+        const requested_start = try std.math.add(i64, self.start_ns.?, advance);
+        const next_start = if (self.finished) @min(self.tail_ns, requested_start) else requested_start;
+        // All fallible probing precedes the cursor update. Logical first-packet
+        // selectors preserve complete field/partition preroll across unit edges.
+        const keep = try self.retentionKeep(prepared.window.reader, prepared.logical, next_start, self.count);
         var released: usize = 0;
         var removed_packets: usize = 0;
         for (self.units[0..keep]) |unit| {
@@ -244,7 +270,7 @@ pub const Coordinator = struct {
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
         const next_base = try std.math.add(usize, self.logical_base, removed_packets);
-        self.start_ns = end;
+        self.start_ns = next_start;
         self.epoch_committed = true;
         self.ordinal += 1;
         self.retained_bytes -= released;
@@ -592,4 +618,182 @@ test "live coordinator reuses admitted validation metadata across prepare commit
     try std.testing.expectEqual(@as(usize, 2), flow.stats.metadata_snapshots);
     try std.testing.expect(prepared.logical.?.pictures.len > tail.logical.?.pictures.len);
     pool.limits.host_bytes = limit;
+}
+
+test "live coordinator overlapping advance retains preroll retries and clipped tail ownership" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var ingest = try media.live_mp4.Ingest.init(a, "overlap", fixture[0..797], .{ .stream = .{ .admission_pool = &pool } });
+    defer ingest.deinit();
+    var one = try part(&ingest, 797, 11206);
+    defer if (one) |*unit| unit.deinit();
+    var two = try part(&ingest, 11206, 20811);
+    defer if (two) |*unit| unit.deinit();
+    const advance = std.time.ns_per_s / 2;
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .advance_ns = advance, .window = .{ .stream = .{ .admission_pool = &pool } } });
+    defer flow.deinit();
+    try flow.append(&one);
+    try flow.append(&two);
+    var first = (try flow.prepare()).?;
+    defer first.deinit();
+    const anchor = first.source_start_ns;
+    const units = flow.count;
+    const packets = first.window.reader.packets.len;
+    const old = pool.snapshot();
+    first.window.reader.input.limits.max_reads = first.window.reader.input.reads;
+    try std.testing.expectError(error.ResourceLimitExceeded, flow.commit(&first));
+    try std.testing.expectEqual(anchor, flow.start_ns.?);
+    try std.testing.expectEqual(units, flow.count);
+    try std.testing.expectEqual(old, pool.snapshot());
+    first.window.reader.input.limits.max_reads = 100_000;
+    try flow.commit(&first);
+    try std.testing.expectEqual(anchor + advance, flow.start_ns.?);
+    try std.testing.expectEqual(units, flow.count);
+    try std.testing.expectEqual(@as(usize, 0), flow.logical_base);
+    try flow.finish();
+    var second = (try flow.prepare()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(anchor + advance, second.source_start_ns);
+    try std.testing.expect(second.source_start_ns < first.source_end_ns);
+    try std.testing.expectEqual(packets, second.window.reader.packets.len);
+    try assertFirstSample(a, &second);
+    try flow.commit(&second);
+    try std.testing.expect(flow.count < units);
+    var outputs: usize = 2;
+    var previous = second.source_start_ns;
+    while (try flow.prepare()) |value| {
+        var tail = value;
+        defer tail.deinit();
+        try std.testing.expect(tail.source_start_ns > previous);
+        try std.testing.expect(tail.source_end_ns <= flow.tail_ns);
+        try std.testing.expect(tail.source_end_ns > tail.source_start_ns);
+        previous = tail.source_start_ns;
+        try flow.commit(&tail);
+        outputs += 1;
+        try std.testing.expect(outputs < 16);
+    }
+    try std.testing.expectEqual(flow.tail_ns, flow.start_ns.?);
+    var retained = try first.window.reader.readPacket(0);
+    defer retained.deinit();
+    try std.testing.expect(retained.bytes.len > 0);
+}
+test "live coordinator window advance rejects invalid intervals and preserves window cap" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidLiveWindowAdvance, Coordinator.init(a, .{ .advance_ns = 0 }));
+    try std.testing.expectError(error.InvalidLiveWindowAdvance, Coordinator.init(a, .{ .advance_ns = std.math.maxInt(u64) }));
+    var ingest = try media.live_mp4.Ingest.init(a, "cap", fixture[0..797], .{});
+    defer ingest.deinit();
+    var one = try part(&ingest, 797, 11206);
+    defer if (one) |*unit| unit.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .advance_ns = std.time.ns_per_s / 4, .max_windows = 1 });
+    defer flow.deinit();
+    try flow.append(&one);
+    try flow.finish();
+    var first = (try flow.prepare()).?;
+    defer first.deinit();
+    try flow.commit(&first);
+    try std.testing.expectError(error.ResourceLimitExceeded, flow.prepare());
+}
+
+test "live coordinator rolling windows drain old epoch before accepting reset clocks" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "rolling-epoch", fixture[0..797], .{});
+    defer ingest.deinit();
+    const old = try part(&ingest, 797, 11206);
+    try ingest.reconfigure("reset", fixture[0..797]);
+    var reader = FakeReader{ .units = .{ old, try part(&ingest, 797, 11206) }, .available = 2, .done = true };
+    defer reader.deinit();
+    var flow = try Coordinator.init(a, .{ .advance_ns = std.time.ns_per_s / 2 });
+    defer flow.deinit();
+    var first = (try flow.pull(&reader)).?;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first.window.epoch);
+    const anchor = first.source_start_ns;
+    try flow.commit(&first);
+    var tail = (try flow.pull(&reader)).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tail.window.epoch);
+    try std.testing.expect(tail.source_start_ns > anchor and tail.source_start_ns < first.source_end_ns);
+    try flow.commit(&tail);
+    var reset = (try flow.pull(&reader)).?;
+    defer reset.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reset.window.epoch);
+    try std.testing.expectEqual(anchor, reset.source_start_ns);
+    try std.testing.expectEqual(@as(usize, 0), flow.logical_base);
+    var held = try first.window.reader.readPacket(0);
+    defer held.deinit();
+    try std.testing.expect(held.bytes.len > 0);
+}
+
+test "live coordinator sparse window advance skips presentation intervals and stops at EOF" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "sparse-advance", fixture[0..797], .{});
+    defer ingest.deinit();
+    var first = try part(&ingest, 797, 11206);
+    defer if (first) |*unit| unit.deinit();
+    var second = try part(&ingest, 11206, 20811);
+    defer if (second) |*unit| unit.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2, .advance_ns = std.time.ns_per_s });
+    defer flow.deinit();
+    try flow.append(&first);
+    try flow.append(&second);
+    try flow.finish();
+    var one = (try flow.prepare()).?;
+    defer one.deinit();
+    try flow.commit(&one);
+    var two = (try flow.prepare()).?;
+    defer two.deinit();
+    try std.testing.expectEqual(one.source_start_ns + std.time.ns_per_s, two.source_start_ns);
+    try std.testing.expect(two.source_start_ns > one.source_end_ns);
+    try assertFirstSample(a, &two);
+    try flow.commit(&two);
+    try std.testing.expect((try flow.prepare()) == null);
+    try std.testing.expectEqual(flow.tail_ns, flow.start_ns.?);
+}
+
+test "live coordinator sparse pumping evicts skipped units within a two-unit budget" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "sparse-pump", fixture[0..797], .{});
+    defer ingest.deinit();
+    var first = try part(&ingest, 797, 11206);
+    defer if (first) |*unit| unit.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2, .advance_ns = 10 * std.time.ns_per_s, .window = .{ .max_units = 2 } });
+    defer flow.deinit();
+    try flow.append(&first);
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    const anchor = prepared.source_start_ns;
+    try flow.commit(&prepared);
+    try std.testing.expectEqual(anchor + 10 * std.time.ns_per_s, flow.start_ns.?);
+    for (1..11) |second| {
+        // Independently reset I-frame units with an explicitly shifted clock.
+        var unit_ingest = try media.live_mp4.Ingest.init(a, "sparse-pump", fixture[0..797], .{});
+        defer unit_ingest.deinit();
+        var unit = try part(&unit_ingest, 797, 11206);
+        defer if (unit) |*owner| owner.deinit();
+        const shift = @as(i64, @intCast(second)) * unit.?.reader.track.timescale;
+        for (unit.?.reader.packets) |*packet| {
+            packet.dts += shift;
+            packet.pts += shift;
+            packet.media_dts += shift;
+            packet.media_pts += shift;
+        }
+        try flow.append(&unit);
+        try std.testing.expect(unit == null);
+        if (second < 10) {
+            try std.testing.expect((try flow.prepare()) == null);
+            try std.testing.expectEqual(@as(usize, 1), flow.count);
+        }
+    }
+    var next = (try flow.prepare()).?;
+    defer next.deinit();
+    try std.testing.expectEqual(anchor + 10 * std.time.ns_per_s, next.source_start_ns);
+    try assertFirstSample(a, &next);
+    try flow.finish();
+    try flow.commit(&next);
+    try std.testing.expect((try flow.prepare()) == null);
+    var held = try prepared.window.reader.readPacket(0);
+    defer held.deinit();
+    try std.testing.expect(held.bytes.len > 0);
 }

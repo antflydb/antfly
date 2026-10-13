@@ -20,7 +20,7 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const factory = internal.architectures.session_factory;
 const pipeline = internal.pipelines.embedding_gemma2;
-const Case = struct { id: []const u8, path: []const u8, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s, qualify_reader_cache: bool = false };
+const Case = struct { id: []const u8, path: []const u8, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s, qualify_reader_cache: bool = false, advance_ns: ?u64 = null };
 const Query = struct { id: []const u8, text: []const u8 };
 const Suite = struct { cases: []const Case, queries: []const Query = &.{} };
 const QueryResult = struct { id: []const u8, vector: []f32 };
@@ -35,6 +35,8 @@ const Measurement = struct {
     baseline_seconds: f64,
     coordinator_validation_walks: usize,
     coordinator_metadata_snapshots: usize,
+    live_cache_hits: usize,
+    live_cache_stored: usize,
     max_abs: f32,
     cosine: f64,
     vector: []f32,
@@ -117,12 +119,14 @@ pub fn main(init: std.process.Init) !void {
         var ingest = try media.live_mp4.Ingest.init(std.heap.c_allocator, case.id, bytes[0..case.init_end], .{ .stream = .{ .admission_pool = &pool } });
         defer ingest.deinit();
         var reader = Reader{ .ingest = &ingest, .bytes = bytes, .ends = case.fragment_ends, .begin = case.init_end };
-        var coordinator = try video.live_coordinator.Coordinator.init(std.heap.c_allocator, .{ .duration_ns = case.duration_ns, .window = .{ .stream = .{ .admission_pool = &pool } } });
+        var coordinator = try video.live_coordinator.Coordinator.init(std.heap.c_allocator, .{ .duration_ns = case.duration_ns, .advance_ns = case.advance_ns, .window = .{ .stream = .{ .admission_pool = &pool } } });
         defer coordinator.deinit();
+        var live_cache = pipeline.FrameCache{ .allocator = std.heap.c_allocator, .session = session, .control = control };
+        defer live_cache.deinit();
         var windows: usize = 0;
         while (true) {
             const started = now();
-            const event = (try pipeline.embedNextLive(std.heap.c_allocator, session, tokenizer.tokenizer(), &coordinator, &reader, null, .{}, null, control)) orelse break;
+            const event = (try pipeline.embedNextLiveCached(std.heap.c_allocator, session, tokenizer.tokenizer(), &coordinator, &reader, null, .{}, null, control, if (case.qualify_reader_cache) &live_cache else null)) orelse break;
             const stream_seconds = seconds(started);
             const result = event.result orelse return error.UnexpectedGap;
             defer std.heap.c_allocator.free(result.vector);
@@ -144,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
             }
             const cosine = dot / @sqrt(left * right);
             if (max_abs > 0.00001 or cosine < 0.999999) return error.StreamParityFailed;
-            try results.append(a, .{ .case = case.id, .ordinal = event.ordinal, .epoch = event.epoch, .start_ns = event.source_start_ns, .end_ns = event.source_end_ns, .input_tokens = result.input_tokens, .stream_seconds = stream_seconds, .baseline_seconds = baseline_seconds, .coordinator_validation_walks = coordinator.stats.validation_walks, .coordinator_metadata_snapshots = coordinator.stats.metadata_snapshots, .max_abs = max_abs, .cosine = cosine, .vector = try a.dupe(f32, result.vector), .baseline_vector = try a.dupe(f32, baseline.vector) });
+            try results.append(a, .{ .case = case.id, .ordinal = event.ordinal, .epoch = event.epoch, .start_ns = event.source_start_ns, .end_ns = event.source_end_ns, .input_tokens = result.input_tokens, .stream_seconds = stream_seconds, .baseline_seconds = baseline_seconds, .coordinator_validation_walks = coordinator.stats.validation_walks, .coordinator_metadata_snapshots = coordinator.stats.metadata_snapshots, .live_cache_hits = live_cache.stats.hits, .live_cache_stored = live_cache.stats.stored, .max_abs = max_abs, .cosine = cosine, .vector = try a.dupe(f32, result.vector), .baseline_vector = try a.dupe(f32, baseline.vector) });
             windows += 1;
             std.debug.print("live {s}/{d}: tokens={d} max_abs={d} seconds={d}\n", .{ case.id, event.ordinal, result.input_tokens, max_abs, stream_seconds });
         }

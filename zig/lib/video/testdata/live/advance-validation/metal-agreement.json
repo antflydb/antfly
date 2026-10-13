@@ -1,0 +1,82 @@
+{
+  "max_reference_abs": 2.9942020773887634e-07,
+  "retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.6363854629369606,
+        "sintel-6s/1": 0.7023631839723746,
+        "sintel-6s/2": 0.6076037703676187
+      },
+      "landscape": {
+        "sintel-6s/0": 0.591372253657923,
+        "sintel-6s/1": 0.6217557563993087,
+        "sintel-6s/2": 0.6602172872687745
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "reference_retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.6363853944238138,
+        "sintel-6s/1": 0.7023632779477036,
+        "sintel-6s/2": 0.6076036912844522
+      },
+      "landscape": {
+        "sintel-6s/0": 0.5913721664002963,
+        "sintel-6s/1": 0.6217558094385864,
+        "sintel-6s/2": 0.6602172859438755
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "stream_baseline_exact": true,
+  "retrieval_agreement": {
+    "queries": {
+      "dragon": {
+        "max_score_error": 9.397532896304739e-08,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      },
+      "landscape": {
+        "max_score_error": 8.725762667971537e-08,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      }
+    },
+    "pass": true
+  },
+  "scope": "Pinned PyTorch gates cover rolling windows 0, 2, 4 corresponding to the original non-overlapping reference intervals. All eight rolling/sparse outputs independently match complete-clip native baselines exactly."
+}
