@@ -1868,6 +1868,7 @@ pub fn handleTableQueryRequest(
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
             return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
         },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
