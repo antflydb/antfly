@@ -167,8 +167,16 @@ pub fn write(a: std.mem.Allocator, value: Json, writer: *std.Io.Writer, limit: u
         .number_string => |raw| try number(raw, writer, limit, work),
         .float => |v| {
             if (!std.math.isFinite(v)) return error.SqlTypeMismatch;
-            var buffer: [64]u8 = undefined;
-            try number(try @import("builtin_cast.zig").floatText(f64, v, &buffer), writer, limit, work);
+            // An existing JSONB datum has exact logical numeric identity.
+            // SQL float-to-JSON conversion chooses its spelling in sqlJson(),
+            // before this boundary; rendering must not round a retained DOM.
+            const parts = try @import("../common/json_float_decimal.zig").Parts.init(v);
+            try work.consume(parts.work());
+            var coefficient: [768]u8 = undefined;
+            const digits = try parts.coefficientText(&coefficient);
+            var buffer: [800]u8 = undefined;
+            const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", digits, parts.decimalExponent() }) catch unreachable;
+            try number(raw, writer, limit, work);
         },
         .string => |bytes| {
             try work.consume(bytes.len);

@@ -1313,7 +1313,7 @@ test "SQL NUMERIC modifiers match PostgreSQL rounding overflow arrays and lazy e
             if (result.array) |array| {
                 var buffer: [16384]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
-                try @import("array_text.zig").encode(array.*, &writer, .{});
+                try @import("array_text.zig").encode(a, array.*, &writer, .{});
                 try std.testing.expectEqualStrings(expected, writer.buffered());
             } else {
                 var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
@@ -1335,7 +1335,7 @@ test "SQL NUMERIC modifier dynamic arrays retain bounds and unwind allocation fa
             const result = try program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "[-2:0]={12.345,NULL,-12.345}" }}, .{});
             var buffer: [16384]u8 = undefined;
             var writer = std.Io.Writer.fixed(&buffer);
-            try @import("array_text.zig").encode(result.array.?.*, &writer, .{});
+            try @import("array_text.zig").encode(a, result.array.?.*, &writer, .{});
             try std.testing.expectEqualStrings("[-2:0]={12.35,NULL,-12.35}", writer.buffered());
             if (!errors) return;
             try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "{99.995}" }}, .{}));
@@ -1515,7 +1515,7 @@ test "SQL constant preparation preserves PostgreSQL input validation and lazy ru
                 return alloc.dupe(u8, try @import("numeric_value.zig").format(&context, number.*));
             }
             var writer: std.Io.Writer.Allocating = .init(r);
-            try @import("array_text.zig").encode(value.array.?.*, &writer.writer, .{});
+            try @import("array_text.zig").encode(r, value.array.?.*, &writer.writer, .{});
             return alloc.dupe(u8, writer.written());
         }
     };

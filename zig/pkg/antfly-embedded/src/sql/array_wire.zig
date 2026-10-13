@@ -525,16 +525,11 @@ test "SQL array envelope matches PostgreSQL binary values without losing bounds 
         try std.testing.expectEqual(measured.wire_bytes, shared.wire_bytes);
         var binary = std.Io.Writer.Allocating.init(a);
         defer binary.deinit();
-        try @import("array_binary.zig").encode(decoded.value, &binary.writer, .{});
+        try @import("array_binary.zig").encode(a, decoded.value, &binary.writer, .{});
         const expected = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(expected);
         _ = try std.fmt.hexToBytes(expected, entry.binary);
-        if (entry.element_type == .jsonb) {
-            var pg = try @import("array_binary.zig").decode(a, .jsonb, expected, .{});
-            defer pg.deinit();
-            var work: arrays.Budget = .{};
-            try std.testing.expectEqual(std.math.Order.eq, try pg.value.compare(decoded.value, &work));
-        } else try std.testing.expectEqualSlices(u8, expected, binary.written());
+        try std.testing.expectEqualSlices(u8, expected, binary.written());
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const materialized = try toJsonLeaky(arena.allocator(), original.value, .{});

@@ -1134,7 +1134,7 @@ fn dynamicBoundKey(a: A, tuple: local.storage_db_relational_index_keys.TuplePlan
             // placeholder is not data, and cross-domain narrowing is unproven.
             if (bound.column_type != .numeric) return null;
             value.* = .{ .numeric = try local.sql_numeric_binary.encodeAlloc(&ctx, number.*) };
-        } else if (datum.array != null or datum.patterns != null or (!datum.sql_null and datum.value == .null)) return null else value.* = try local.schema_relational_checks.valueFromJson(a, bound.column_type, if (datum.sql_null) .null else datum.value, true);
+        } else if (datum.array != null or datum.patterns() != null or (!datum.sql_null and datum.value == .null)) return null else value.* = try local.schema_relational_checks.valueFromJson(a, bound.column_type, if (datum.sql_null) .null else datum.value, true);
     }
     var encoded: std.ArrayList(u8) = .empty;
     _ = try tuple.appendValuesWithContext(a, &encoded, values, &ctx);

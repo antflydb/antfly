@@ -15860,7 +15860,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer source_array.deinit();
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();
-            if (format == 0) try sources.sql_array_text.encode(source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source_array.value, &encoded.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(alloc, source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(alloc, source_array.value, &encoded.writer, .{});
             var array_request = request;
             array_request.statement = "SELECT $1::bigint[] a,cardinality($1) n FROM usage_records LIMIT 1";
             array_request.parameter_types = if (declared) &.{.array} else &.{};

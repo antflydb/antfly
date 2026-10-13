@@ -893,7 +893,7 @@ test "SQL flat JSONB stored arrays preserve scale but hash logical numeric value
 }
 
 test "SQL flat JSONB persistence preserves PostgreSQL display and null provenance" {
-    const Fixture = struct { entries: []const struct { binary: []const u8, elements: []const ?[]const u8 } };
+    const Fixture = struct { entries: []const struct { binary: []const u8, text: []const u8, elements: []const ?[]const u8 } };
     const a = std.testing.allocator;
     const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/sql_jsonb_array_storage_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -922,6 +922,14 @@ test "SQL flat JSONB persistence preserves PostgreSQL display and null provenanc
         const again = try encodeAlloc(a, stored.value, .{});
         defer a.free(again);
         try std.testing.expectEqualSlices(u8, bytes, again);
+        var binary_output: std.Io.Writer.Allocating = .init(a);
+        defer binary_output.deinit();
+        try @import("array_binary.zig").encode(a, stored.value, &binary_output.writer, .{});
+        try std.testing.expectEqualSlices(u8, binary, binary_output.written());
+        var text_output: std.Io.Writer.Allocating = .init(a);
+        defer text_output.deinit();
+        try @import("array_text.zig").encode(a, stored.value, &text_output.writer, .{});
+        try std.testing.expectEqualStrings(entry.text, text_output.written());
     }
 }
 
@@ -1337,7 +1345,7 @@ test "SQL flat array primitive preparation uses one output allocation and cold s
         try std.testing.expectEqual(@as(usize, 1), tracked.alloc_index);
         const view = try layout.View.open(kind, bytes, .{});
         var pg: std.Io.Writer.Discarding = .init(&.{});
-        try @import("array_binary.zig").encode(value, &pg.writer, .{});
+        try @import("array_binary.zig").encode(a, value, &pg.writer, .{});
         try std.testing.expect(bytes.len < pg.count);
         const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
         var total: u64 = 0;

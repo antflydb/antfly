@@ -4684,3 +4684,74 @@ from this shared codec work. Remaining work includes PostgreSQL-compatible array
 text output and shared wire admission, public JSON-program grammar/lowering and
 schema-definition identity, typed projected tuple/vector consumption, and the
 remaining exact original-case activation and distributed fault proofs.
+
+### Shared PostgreSQL array wire preparation (2026-10-13)
+
+Text and binary array output now share a request-owned preparation boundary.
+JSONB preparation retains a compact 12-byte size/quoting record per element and
+one exactly sized maximum-path object-key sorting buffer. The parsed immutable
+DOM stays borrowed; no encoded JSON payload, per-element arena or whole-array
+output copy is retained. Fixed-buffer sorting scratch is reused during
+preflight and emission. Primitive arrays and all-SQL-NULL JSONB preparation
+allocate nothing. Callers pass an explicit allocator rather than using a global
+allocator or hiding allocation failures behind an optional default.
+
+JSONB output uses its PostgreSQL key order, separators, numeric scale and
+exponent expansion. Array text uses PostgreSQL's conditional quoting, including
+the distinction between the JSON null datum and SQL NULL, and canonical UUID
+spelling. All eleven binary codec goldens now require exact PostgreSQL bytes;
+the alternate native JSONB binary golden and the envelope's JSONB-only semantic
+comparison exception were removed. All 19 existing text-array inputs gained
+independently captured PostgreSQL output text without changing their previously
+verified binary values or 19 rejection contracts. Five JSONB persistence goldens
+now also verify exact text and binary emission after physical storage.
+
+Admission covers shape/domain validation, key-scratch sizing, formatting,
+complete wire size and emission work before touching the destination. A local
+prepaid emission context forwards cancellation through the original owner and
+parent chain without spending the admitted work twice or resetting its quota.
+The numeric context has an explicit polling-only operation for this already
+admitted work. Buffered output amortizes small writes, while copying and metadata
+scans poll in bounded chunks. Binary input also accepts the shared owner,
+preserves cancellation through JSON parsing, checks it before allocating an
+owned decode region, and distinguishes genuine OOM from sticky quota exhaustion.
+This codec-level ownership contract does not claim that every protocol/session
+caller has acquired a statement-wide cancellation owner.
+
+The wire audit also found a hot/cold numeric identity mismatch: rendering an
+existing native JSONB float used its short float spelling, while storage and
+logical comparison retain the exact value. The shared JSONB writer now uses the
+bounded native exact-decimal expansion. SQL float-to-JSON conversion still chooses
+its PostgreSQL spelling at the existing sqlJson boundary. Hot/cold text/binary
+roundtrips preserve logical identity for ordinary floats, negative zero, large
+integral floats, the minimum subnormal and maximum finite binary64.
+
+Focused Debug qualification passed 35 contracts, including every allocation
+failure, every observed cancellation phase, exact parent quota accounting,
+initial zero-cost cancellation and a one-unit-short admission failure before
+publication. A 1 MiB string uses only 12 bytes of preparation memory and no
+sorting scratch; a nested-object test proves exact 40-byte path scratch rather
+than retaining all objects' sort vectors. Primitive output runs with an allocator
+that cannot allocate. For 1,024/4,096 Boolean cells, measured work was
+7,170/28,674 units for text and 13,352/53,288 for binary. One local Debug sample
+measured 170/688 microseconds for text and 148/578 microseconds for binary;
+these are operator scaling diagnostics, not production latency or an A/B win.
+Timing uses std.Io.
+
+Final production Debug qualification passed 1,034 SQL tests (three existing
+skips), 107 PostgreSQL protocol tests, 249 native relational tests and 113
+transaction tests, with no failures/leaks. Both mounted original stored-array
+read and joined source-RETURNING contracts passed. Their first build exposed one
+stale Datum.patterns field access in an imported server file; the accessor-only
+compatibility correction restored the mounted gate without adding lake features.
+Six independent PostgreSQL 18.6 oracle tests passed. Formatting, control-catalog
+freshness, the 2,047-file Apache boundary/license headers and original inventory
+integrity passed. Cache GC was previewed only; nothing was deleted.
+
+Freshly fetched origin/main was already merged. Original accounting remains
+479 implemented / 136 rejected / 73 superseded / 898 unresolved; existing original
+contracts were revalidated, not credited again. Public JSON-program
+grammar/lowering and schema-definition identity, typed projected tuple/vector
+consumers, unified JSONB numeric-range admission for non-rendered parameters,
+broader statement-wide owner wiring, and the remaining exact original cases and
+distributed activation proofs still require implementation.

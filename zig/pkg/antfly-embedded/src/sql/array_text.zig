@@ -22,6 +22,7 @@ const builtin_cast = @import("builtin_cast.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
+const output = @import("array_output.zig");
 pub const Options = struct {
     values: arrays.Limits = .{},
     wire_bytes: usize = 8 * 1024 * 1024,
@@ -63,20 +64,39 @@ const QuotedWriter = struct {
     }
 };
 
-fn writeElement(kind: arrays.ElementType, cell: arrays.Element, writer: *std.Io.Writer) !void {
+fn writeElement(value: arrays.Value, index: usize, writer: *std.Io.Writer, prepared: *output.Prepared, work: *arrays.Budget, measuring: bool, wire: usize) !void {
+    try work.consume(1);
+    const kind = value.element_type;
+    const cell = value.elements[index];
     if (cell.sql_null) return writer.writeAll("NULL");
     switch (kind) {
         .numeric => {
-            var none = std.heap.FixedBufferAllocator.init(&.{});
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+            var ctx = work.numericContext(A.failing);
+            const before = ctx.remaining;
+            defer work.remaining -|= @intCast(before - ctx.remaining);
             try @import("numeric_value.zig").write(&ctx, cell.numeric.?.*, writer);
         },
-        .text, .uuid, .jsonb => {
+        .text, .uuid => {
+            var uuid_buffer: [36]u8 = undefined;
+            const bytes = if (kind == .uuid) blk: {
+                uuid_buffer = uuid.format(try uuid.parse(cell.value.string));
+                break :blk &uuid_buffer;
+            } else cell.value.string;
+            try work.consume(bytes.len);
+            const quoted = output.needsQuotes(bytes);
+            if (!quoted) return writer.writeAll(bytes);
             try writer.writeByte('"');
             var escaped: QuotedWriter = .{ .target = writer };
-            if (kind == .jsonb) {
-                try std.json.Stringify.value(cell.value, .{}, &escaped.writer);
-            } else try escaped.writer.writeAll(cell.value.string);
+            try escaped.writer.writeAll(bytes);
+            try writer.writeByte('"');
+        },
+        .jsonb => {
+            const metadata = prepared.cells[index];
+            if (measuring) return writer.splatByteAll(0, metadata.textSize());
+            if (!metadata.quoted) return prepared.writeJson(cell.value, writer, wire, work);
+            try writer.writeByte('"');
+            var escaped: QuotedWriter = .{ .target = writer };
+            try prepared.writeJson(cell.value, &escaped.writer, wire, work);
             try writer.writeByte('"');
         },
         .int16, .int32, .int64 => try writer.print("{d}", .{cell.value.integer}),
@@ -92,19 +112,19 @@ fn writeElement(kind: arrays.ElementType, cell: arrays.Element, writer: *std.Io.
     }
 }
 
-fn writeAxis(value: arrays.Value, depth: usize, offset: *usize, writer: *std.Io.Writer) anyerror!void {
+fn writeAxis(value: arrays.Value, depth: usize, offset: *usize, writer: *std.Io.Writer, prepared: *output.Prepared, work: *arrays.Budget, measuring: bool, wire: usize) anyerror!void {
     try writer.writeByte('{');
     for (0..value.dimensions[depth].length) |index| {
         if (index != 0) try writer.writeByte(',');
         if (depth + 1 == value.dimensions.len) {
-            try writeElement(value.element_type, value.elements[offset.*], writer);
+            try writeElement(value, offset.*, writer, prepared, work, measuring, wire);
             offset.* += 1;
-        } else try writeAxis(value, depth + 1, offset, writer);
+        } else try writeAxis(value, depth + 1, offset, writer, prepared, work, measuring, wire);
     }
     try writer.writeByte('}');
 }
 
-fn writeValue(value: arrays.Value, writer: *std.Io.Writer) !void {
+fn writeValue(value: arrays.Value, writer: *std.Io.Writer, prepared: *output.Prepared, work: *arrays.Budget, measuring: bool, wire: usize) !void {
     if (value.dimensions.len == 0) return writer.writeAll("{}");
     for (value.dimensions) |dimension| if (dimension.lower != 1) {
         for (value.dimensions) |axis| try writer.print("[{d}:{d}]", .{ axis.lower, @as(i64, axis.lower) + axis.length - 1 });
@@ -112,27 +132,37 @@ fn writeValue(value: arrays.Value, writer: *std.Io.Writer) !void {
         break;
     };
     var offset: usize = 0;
-    try writeAxis(value, 0, &offset, writer);
+    try writeAxis(value, 0, &offset, writer, prepared, work, measuring, wire);
     std.debug.assert(offset == value.elements.len);
 }
 
 /// Validate shape, payload domains and complete wire/work admission before
 /// touching the destination. Emission streams with bounded (rank <= 6) stack
-/// depth and zero allocations, including escaped JSONB and non-finite floats.
-pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    return encodeInner(value, writer, options) catch |err| return sharedFailure(options, err);
+/// depth. Primitive arrays allocate nothing; JSONB owns only output metadata
+/// and maximum-path sorting scratch, never another payload-sized string.
+pub fn encode(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInner(alloc, value, writer, options) catch |err| return sharedFailure(options, err);
 }
 
-fn encodeInner(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+fn encodeInner(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
     var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     try work.consume(0);
     const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
+    var prepared: output.Prepared = undefined;
+    prepared.init(alloc, value, options.values.bytes, options.wire_bytes, &work) catch |err| return prepared.failure(err);
+    defer prepared.deinit();
     var size: std.Io.Writer.Discarding = .init(&.{});
-    try writeValue(value, &size.writer);
-    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
-    try work.consume(@as(usize, @intCast(size.count)) * 2);
-    try writeValue(value, writer);
+    const before = work.remaining;
+    try writeValue(value, &size.writer, &prepared, &work, true, options.wire_bytes);
+    if (size.count > options.wire_bytes) return error.SqlProgramLimitExceeded;
+    const formatting = std.math.add(usize, prepared.format_cost, before - work.remaining) catch return error.SqlProgramLimitExceeded;
+    var emission: output.Emission = undefined;
+    try emission.init(&work, try output.emissionCost(formatting, @intCast(size.count)));
+    var destination: output.Writer = undefined;
+    destination.init(writer, &emission.work);
+    writeValue(value, &destination.writer, &prepared, &emission.work, false, options.wire_bytes) catch |err| return destination.failure orelse err;
+    destination.writer.flush() catch |err| return destination.failure orelse err;
 }
 
 const Shape = struct {
@@ -453,7 +483,7 @@ fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {
 
 const Fixture = struct {
     reference: []const u8,
-    entries: []const struct { input: []const u8, element_type: arrays.ElementType, sql_type: []const u8, binary: []const u8 },
+    entries: []const struct { input: []const u8, element_type: arrays.ElementType, sql_type: []const u8, binary: []const u8, text: []const u8 },
     errors: []const struct { input: []const u8, element_type: arrays.ElementType, sql_type: []const u8, code: []const u8 },
 };
 
@@ -477,16 +507,17 @@ test "SQL text arrays match PostgreSQL builtin values bounds escapes and diagnos
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(actual.value, &work));
         try std.testing.expectEqual(try expected.value.semanticHash(&work), try actual.value.semanticHash(&work));
-        if (entry.element_type != .jsonb) {
+        {
             var writer: std.Io.Writer.Allocating = .init(a);
             defer writer.deinit();
-            try @import("array_binary.zig").encode(actual.value, &writer.writer, .{});
+            try @import("array_binary.zig").encode(a, actual.value, &writer.writer, .{});
             try std.testing.expectEqualSlices(u8, wire, writer.written());
         }
         try std.testing.expect(actual.budget.peak <= actual.budget.limit);
         var encoded: std.Io.Writer.Allocating = .init(a);
         defer encoded.deinit();
-        try encode(actual.value, &encoded.writer, .{});
+        try encode(a, actual.value, &encoded.writer, .{});
+        try std.testing.expectEqualStrings(entry.text, encoded.written());
         var roundtrip = try decode(a, entry.element_type, encoded.written(), .{});
         defer roundtrip.deinit();
         try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(roundtrip.value, &work));
@@ -501,29 +532,29 @@ test "SQL text arrays match PostgreSQL builtin values bounds escapes and diagnos
     }
 }
 
-test "SQL text array output streams escaping bounds nulls and quotas without allocation" {
+test "SQL text array output streams PostgreSQL quoting bounds nulls and quotas" {
     const a = std.testing.allocator;
     for ([_]struct { kind: arrays.ElementType, input: []const u8, output: []const u8 }{
         .{ .kind = .text, .input = "[0:1][3:4]={{NULL,\"NULL\"},{\"a\\\"b\",\"c\\\\d\"}}", .output = "[0:1][3:4]={{NULL,\"NULL\"},{\"a\\\"b\",\"c\\\\d\"}}" },
         .{ .kind = .int64, .input = "{-9223372036854775808,9223372036854775807,NULL}", .output = "{-9223372036854775808,9223372036854775807,NULL}" },
         .{ .kind = .float32, .input = "{NaN,Infinity,-Infinity,-0,1.5}", .output = "{NaN,Infinity,-Infinity,-0,1.5}" },
         .{ .kind = .boolean, .input = "{true,false,NULL}", .output = "{t,f,NULL}" },
-        .{ .kind = .jsonb, .input = "{\"null\",NULL,\"[1,2]\",\"{\\\"k\\\":\\\"a\\\\\\\\b\\\"}\"}", .output = "{\"null\",NULL,\"[1,2]\",\"{\\\"k\\\":\\\"a\\\\\\\\b\\\"}\"}" },
+        .{ .kind = .jsonb, .input = "{\"null\",NULL,\"[1,2]\",\"{\\\"k\\\":\\\"a\\\\\\\\b\\\"}\"}", .output = "{\"null\",NULL,\"[1, 2]\",\"{\\\"k\\\": \\\"a\\\\\\\\b\\\"}\"}" },
         .{ .kind = .text, .input = "{}", .output = "{}" },
     }) |entry| {
         var owned = try decode(a, entry.kind, entry.input, .{});
         defer owned.deinit();
         var buffer: [512]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
-        try encode(owned.value, &writer, .{});
+        try encode(a, owned.value, &writer, .{});
         try std.testing.expectEqualStrings(entry.output, writer.buffered());
         writer.end = 0;
-        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(owned.value, &writer, .{ .wire_bytes = entry.output.len - 1 }));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(a, owned.value, &writer, .{ .wire_bytes = entry.output.len - 1 }));
         try std.testing.expectEqual(@as(usize, 0), writer.end);
-        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(owned.value, &writer, .{ .values = .{ .work = 1 } }));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(a, owned.value, &writer, .{ .values = .{ .work = 1 } }));
         try std.testing.expectEqual(@as(usize, 0), writer.end);
         var short: std.Io.Writer = .fixed(buffer[0..1]);
-        try std.testing.expectError(error.WriteFailed, encode(owned.value, &short, .{}));
+        try std.testing.expectError(error.WriteFailed, encode(a, owned.value, &short, .{}));
     }
 }
 

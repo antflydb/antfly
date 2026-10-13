@@ -159,9 +159,9 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
     var view = try sources.sql_array_wire.decodeBorrowed(a, column.element_type orelse return error.InvalidResult, value, .{});
     defer view.deinit();
     if (format == 0)
-        try sources.sql_array_text.encode(view.value, writer, .{ .wire_bytes = wire_bytes })
+        try sources.sql_array_text.encode(a, view.value, writer, .{ .wire_bytes = wire_bytes })
     else
-        try sources.sql_array_binary.encode(view.value, writer, .{ .wire_bytes = wire_bytes });
+        try sources.sql_array_binary.encode(a, view.value, writer, .{ .wire_bytes = wire_bytes });
 }
 
 pub fn fromOid(value: u32) !Type {
@@ -731,6 +731,35 @@ test "pgwire direct cell encoding matches allocated text and binary formats" {
     };
 }
 
+test "pgwire JSONB array columns emit exact PostgreSQL display and binary payloads" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const owned = region.allocator();
+    // Independently captured in sql_jsonb_array_storage_reference.json.
+    const text = "[-2:0]={1.20,\"null\",NULL}";
+    const hex = "000000010000000100000eda00000003fffffffe0000000501312e323000000005016e756c6cffffffff";
+    var source = try sources.sql_array_text.decode(a, .jsonb, text, .{});
+    defer source.deinit();
+    const envelope = try sources.sql_array_wire.toJsonLeaky(owned, source.value, .{});
+    const column: Column = .{ .name = "j", .type = .array, .element_type = .jsonb };
+    try std.testing.expectEqual(@as(u32, 3807), try columnOid(column));
+    const bytes = try a.alloc(u8, hex.len / 2);
+    defer a.free(bytes);
+    _ = try std.fmt.hexToBytes(bytes, hex);
+    for ([_]u16{ 0, 1 }) |format| {
+        const expected = if (format == 0) text else bytes;
+        var actual: std.Io.Writer.Allocating = .init(a);
+        defer actual.deinit();
+        try encodeColumnInto(a, &actual.writer, column, format, envelope, expected.len);
+        try std.testing.expectEqualSlices(u8, expected, actual.written());
+        actual.writer.end = 0;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &actual.writer, column, format, envelope, expected.len - 1));
+        try std.testing.expectEqual(@as(usize, 0), actual.written().len);
+    }
+}
+
 test "pgwire array columns retain element OIDs and lossless text and binary payloads" {
     const sources = @import("antfly_local_sources");
     const a = std.testing.allocator;
@@ -757,13 +786,13 @@ test "pgwire array columns retain element OIDs and lossless text and binary payl
         for ([_]u16{ 0, 1 }) |format| {
             var expected: std.Io.Writer.Allocating = .init(a);
             defer expected.deinit();
-            if (format == 0) try sources.sql_array_text.encode(value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(value.value, &expected.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(a, value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(a, value.value, &expected.writer, .{});
             const parameter = try decode(owner.allocator(), case.oid, format, expected.written());
             var parameter_view = try sources.sql_array_wire.decode(a, case.kind, parameter, .{});
             defer parameter_view.deinit();
             var parameter_wire: std.Io.Writer.Allocating = .init(a);
             defer parameter_wire.deinit();
-            if (format == 0) try sources.sql_array_text.encode(parameter_view.value, &parameter_wire.writer, .{}) else try sources.sql_array_binary.encode(parameter_view.value, &parameter_wire.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(a, parameter_view.value, &parameter_wire.writer, .{}) else try sources.sql_array_binary.encode(a, parameter_view.value, &parameter_wire.writer, .{});
             try std.testing.expectEqualSlices(u8, expected.written(), parameter_wire.written());
             var actual: std.Io.Writer.Allocating = .init(a);
             defer actual.deinit();
