@@ -1654,7 +1654,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph target refs are table exact while raw keys remain wildcard",
         "distributed graph MATCH binding refs preserve table identity and deduplicate",
         "distributed graph executes result dependencies before declaration order",
-        "distributed graph path materialization preserves table provenance",
         "distributed canonical path weight is the checked raw edge sum",
         "distributed K path identity preserves parallel typed edges",
         "distributed Yen edge exclusions preserve table-qualified path identity",
@@ -2630,9 +2629,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
-    // The query engine owner runs the shared bitmap kernels. Lake-named
-    // regressions must not acquire a second owner through this broad filter.
-    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{"encoding.roaring.test."});
+    // Query-engine and SQL owners run their shared kernels and lake-named
+    // regressions. Broad scaffold filters must not select those tests again.
+    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{ "encoding.roaring.test.", "sql." });
     const lake_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
         .target = target,
@@ -5711,7 +5710,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph traverse routes cross-table frontier by table generation",
         "distributed graph path materialization preserves table provenance",
         "public graph metric borrowed wire",
-        "graph metric native response adoption",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
@@ -5737,7 +5735,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_graph_metric_fan_in_tests = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact(b, graph_metric_fan_in_tests, &graph_metric_fan_in_filters);
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
-    b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests").dependOn(&run_graph_metric_fan_in_tests.step);
+    const graph_metric_contract_step = b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests");
+    graph_metric_contract_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    // Native response adoption belongs to graph.query in the graph owner.
+    // Reuse that run so the standalone contract gate retains this coverage.
+    graph_metric_contract_step.dependOn(&run_graph_metric_unit_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
         "api http client authenticates only the internal API namespace",
