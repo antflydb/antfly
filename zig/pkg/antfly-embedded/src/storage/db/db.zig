@@ -2983,6 +2983,9 @@ pub const DB = struct {
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     physical_root_mode: OpenOptions.PhysicalRootMode,
     graph_replacement_mutex: std.atomic.Mutex = .unlocked,
+    graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
+    graph_replacement_catalog_generation: u64 = 0,
+    graph_replacement_progress: ?struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 } = null,
     index_backends: db_config.IndexBackendOptions,
     core: *db_core.DBCore,
     /// Immutable physical root identity, initialized before workers bind.
@@ -5821,6 +5824,7 @@ pub const DB = struct {
         self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
+        self.clearGraphReplacementManager();
         self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
@@ -27455,16 +27459,37 @@ pub const DB = struct {
         manager: *index_manager_mod.IndexManager,
         sequence: u64,
         deadline_ns: ?u64 = null,
+        tail_source_cursor: usize = 0,
         entry: ?index_manager_mod.IndexManager.DetachedIndex = null,
 
         fn finish(candidate: *@This(), db: *DB, cfg: types.IndexConfig) !void {
             // New writes are briefly fenced here; construction and earlier
             // catch-up rounds ran through the ordinary maintenance owner.
             const target = db.core.nextDerivedSequence();
-            if (target -| candidate.sequence > 1024) return error.Busy;
+
             const deadline = @min(monotonicTimeNs() +| 100 * std.time.ns_per_ms, candidate.deadline_ns orelse std.math.maxInt(u64));
-            candidate.sequence = try db.catchUpGraphReplacement(candidate.manager, cfg.name, candidate.sequence, target, 1024, deadline);
-            if (candidate.sequence < target) return error.Busy;
+            // Freeze writes only for a bounded progress window. Even a tail
+            // larger than 1024 can advance its durable checkpoint; it never
+            // throws completed work away waiting for an initially small gap.
+            while (candidate.sequence < target and monotonicTimeNs() < deadline) {
+                const next = try db.catchUpGraphReplacementTail(candidate.manager, cfg.name, candidate.sequence, target, &candidate.tail_source_cursor, deadline);
+                if (next == candidate.sequence) break;
+                candidate.sequence = next;
+            }
+            try candidate.manager.checkpointLsmWalForManagedIndex(.{ .name = cfg.name, .kind = .graph });
+            try candidate.manager.syncIndexByName(cfg.name, true);
+            if (candidate.sequence < target) {
+                const jobs = try db.graphReplacementStatusAlloc(db.alloc);
+                defer jobs.deinit();
+                for (jobs.value) |saved| if (std.mem.eql(u8, saved.name, cfg.name)) {
+                    var job = saved;
+                    job.applied_sequence = candidate.sequence;
+                    job.tail_source_cursor = candidate.tail_source_cursor;
+                    try db.core.index_manager.saveGraphReplacementBuild(db.core.store, job);
+                    break;
+                };
+                return error.Busy;
+            }
             candidate.entry = try candidate.manager.detachReplacementIndex(cfg.name);
         }
     };
@@ -27488,7 +27513,8 @@ pub const DB = struct {
     pub fn hasPendingGraphReplacements(self: *DB) bool {
         const jobs = self.core.index_manager.graphReplacementBuildsAlloc(self.core.store, self.alloc) catch return true;
         defer jobs.deinit();
-        return jobs.value.len != 0;
+        for (jobs.value) |job| if (job.phase != .failed) return true;
+        return false;
     }
 
     pub fn graphReplacementStatusAlloc(self: *DB, alloc: Allocator) !std.json.Parsed([]index_manager_mod.GraphReplacementBuild) {
@@ -27528,7 +27554,7 @@ pub const DB = struct {
             }
         };
         var collected = Collect{ .alloc = a, .target = target, .deadline = deadline, .applied = from };
-        _ = self.core.store.forEachReplayLaneFrom(internal_keys.replay_all_kind, from, limit, &collected, Collect.record) catch |err| switch (err) {
+        _ = self.core.store.forEachReplayLaneFrom(internal_keys.replay_all_kind, from +| 1, limit, &collected, Collect.record) catch |err| switch (err) {
             error.StopReplayChunk => {},
             else => return err,
         };
@@ -27538,10 +27564,17 @@ pub const DB = struct {
         // to repeat without advancing their journal watermark.
         var ctx = self.graphReplacementContext(private);
         defer ctx.deinit(self.alloc);
-        var documents = collected.documents.keyIterator();
-        while (documents.next()) |key| {
+        var source_read = try self.core.store.beginReadTxn();
+        defer source_read.abort();
+        var documents: std.ArrayList([]const u8) = .empty;
+        var document_keys = collected.documents.keyIterator();
+        while (document_keys.next()) |key| try documents.append(a, key.*);
+        var offset: usize = 0;
+        while (offset < documents.items.len) {
             if (deadline) |end| if (monotonicTimeNs() >= end) return from;
-            try rebuildGraphReplacementDocument(&ctx, name, key.*);
+            const end = @min(offset + 32, documents.items.len);
+            try rebuildGraphReplacementDocumentsWithRead(&ctx, name, documents.items[offset..end], &source_read);
+            offset = end;
         }
         var keys: std.ArrayList([]const u8) = .empty;
         var artifacts = collected.artifacts.keyIterator();
@@ -27550,6 +27583,60 @@ pub const DB = struct {
         const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, private, keys.items, name, .{ .require_resolution_contract = true });
         try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = name, .kind = .graph }, null, false, null);
         return collected.applied;
+    }
+
+    /// The final write pause can yield within one large journal batch. The
+    /// cursor indexes immutable source keys in its next retained entry, and is
+    /// published only after the corresponding shadow projection checkpoint.
+    fn catchUpGraphReplacementTail(self: *DB, private: *index_manager_mod.IndexManager, name: []const u8, from: u64, target: u64, source_cursor: *usize, deadline: u64) !u64 {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const First = struct {
+            alloc: Allocator,
+            target: u64,
+            sequence: u64 = 0,
+            payload: ?[]const u8 = null,
+            fn record(state: *@This(), sequence: u64, payload: []const u8) anyerror!void {
+                if (sequence > state.target) return error.StopReplayChunk;
+                state.sequence = sequence;
+                state.payload = try state.alloc.dupe(u8, payload);
+            }
+        };
+        var first = First{ .alloc = a, .target = target };
+        _ = self.core.store.forEachReplayLaneFrom(internal_keys.replay_all_kind, from +| 1, 1, &first, First.record) catch |err| switch (err) {
+            error.StopReplayChunk => {},
+            else => return err,
+        };
+        const payload = first.payload orelse return from;
+        var decoded = try change_journal_mod.decodeRecord(a, payload);
+        defer decoded.deinit();
+        var documents: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for ([_][]const []const u8{ decoded.record.changed_doc_keys, decoded.record.deleted_doc_keys, decoded.record.overwritten_doc_keys }) |keys| {
+            for (keys) |key| try documents.put(a, key, {});
+        }
+        var artifacts: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (decoded.record.changed_artifact_keys) |key| try artifacts.put(a, key, {});
+        const total = documents.count() + artifacts.count();
+        if (source_cursor.* > total) return error.InvalidReplacementReplayCursor;
+        var ctx = self.graphReplacementContext(private);
+        defer ctx.deinit(self.alloc);
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        while (source_cursor.* < total) {
+            if (monotonicTimeNs() >= deadline) return from;
+            const ordinal = source_cursor.*;
+            if (ordinal < documents.count()) {
+                try rebuildGraphReplacementDocumentWithRead(&ctx, name, documents.keys()[ordinal], &read);
+            } else {
+                const key = artifacts.keys()[ordinal - documents.count()];
+                const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, private, &.{key}, name, .{ .require_resolution_contract = true });
+                try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = name, .kind = .graph }, null, false, null);
+            }
+            source_cursor.* += 1;
+        }
+        source_cursor.* = 0;
+        return first.sequence;
     }
 
     fn graphReplacementContext(self: *DB, manager: *index_manager_mod.IndexManager) AsyncContext {
@@ -27572,19 +27659,81 @@ pub const DB = struct {
     }
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
-        return self.advanceGraphReplacementOnce(deadline) catch |err| {
-            const jobs = try self.core.index_manager.graphReplacementBuildsAlloc(self.core.store, self.alloc);
-            defer jobs.deinit();
-            if (jobs.value.len > 0) {
-                var job = jobs.value[0];
-                job.last_error = @errorName(err);
-                try self.core.index_manager.saveGraphReplacementBuild(self.core.store, job);
-            }
-            return err;
-        };
+        if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
+        defer self.graph_replacement_mutex.unlock();
+        const jobs = try self.graphReplacementStatusAlloc(self.alloc);
+        defer jobs.deinit();
+        for (jobs.value) |saved| {
+            if (saved.phase == .failed) continue;
+            return self.advanceGraphReplacementOnce(deadline, saved) catch |err| {
+                if (self.core.index_manager.get(saved.name) == null) {
+                    if (err == error.Busy or err == error.IntegrityTopologyBusy) return true;
+                    var owner = self.acquireReplicationMutationShared();
+                    defer if (owner) |*lease| lease.release();
+                    try self.enforceReplicationWriteGate();
+                    var activity = try self.acquireResolverCatalogActivity(true);
+                    defer activity.deinit();
+                    try self.lockApplyForPortableRuntime();
+                    defer self.core.unlockApply();
+                    var job = saved;
+                    job.phase = .failed;
+                    job.last_error = @errorName(err);
+                    try self.core.index_manager.failGraphReplacement(self.core.store, job);
+                    if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+                }
+                self.clearGraphReplacementManager();
+                return self.hasPendingGraphReplacements();
+            };
+        }
+        return false;
     }
 
-    fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64) !bool {
+    fn clearGraphReplacementProgress(self: *DB) void {
+        if (self.graph_replacement_progress) |progress| if (progress.job.resume_key_b64) |key| self.alloc.free(key);
+        self.graph_replacement_progress = null;
+    }
+
+    fn clearGraphReplacementManager(self: *DB) void {
+        self.clearGraphReplacementProgress();
+        if (self.graph_replacement_manager) |manager| {
+            // Only checkpointed shadow state is reusable. Never flush an
+            // abandoned or retired generation over a newer connection view.
+            manager.deinitImmutableSnapshot();
+            self.alloc.destroy(manager);
+            self.graph_replacement_manager = null;
+        }
+    }
+
+    pub fn cancelReplacement(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var owner = self.acquireReplicationMutationShared();
+        defer if (owner) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        while (!self.graph_replacement_mutex.tryLock()) {
+            const io = self.backend_runtime.io() orelse return error.Busy;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer self.graph_replacement_mutex.unlock();
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        const cancelled = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            self.core.repair_replay_mutex.lockUncancelable(self.core.index_manager.checkpointIo());
+            defer self.core.repair_replay_mutex.unlock(self.core.index_manager.checkpointIo());
+            if (self.graph_replacement_manager) |manager| if (manager.get(name) != null) self.clearGraphReplacementManager();
+            break :blk try self.core.index_manager.cancelGraphReplacement(self.core.store, name);
+        };
+        // Inline maintenance lanes may execute cleanup synchronously. Never
+        // submit while retaining apply/replay admission needed by that cleanup.
+        if (cancelled) {
+            self.scheduleGeneratedArtifactCleanup();
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+        }
+        return cancelled;
+    }
+
+    fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64, saved: index_manager_mod.GraphReplacementBuild) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
@@ -27592,19 +27741,30 @@ pub const DB = struct {
         var build_snapshot_lease = try self.acquireSnapshotReplayMutation();
         var snapshot_held = true;
         defer if (snapshot_held) build_snapshot_lease.release();
-        if (!self.graph_replacement_mutex.tryLock()) return true;
-        defer self.graph_replacement_mutex.unlock();
-        const jobs = try self.core.index_manager.graphReplacementBuildsAlloc(self.core.store, self.alloc);
-        defer jobs.deinit();
-        if (jobs.value.len == 0) return false;
-        var job = jobs.value[0];
+        var job = saved;
         const cfg = job.config orelse return error.InvalidIndexConfig;
-        var private = try index_manager_mod.IndexManager.initWithOptions(self.core.index_manager.alloc, self.core.index_manager.base_path, self.index_backends);
-        defer private.deinit();
-        private.source_payload_store = self.core.index_manager.source_payload_store;
-        private.setIo(self.backend_runtime.io());
-        try private.registerReplacementIndex(self.core.store, cfg);
-        var ctx = self.graphReplacementContext(&private);
+        const catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
+        if (self.graph_replacement_manager) |manager| if (manager.get(job.name) == null or self.graph_replacement_catalog_generation != catalog_generation) self.clearGraphReplacementManager();
+        if (self.graph_replacement_manager == null) {
+            const manager = try self.alloc.create(index_manager_mod.IndexManager);
+            errdefer self.alloc.destroy(manager);
+            manager.* = try index_manager_mod.IndexManager.initWithOptions(self.core.index_manager.alloc, self.core.index_manager.base_path, self.index_backends);
+            errdefer manager.deinit();
+            manager.source_payload_store = self.core.index_manager.source_payload_store;
+            manager.setIo(self.backend_runtime.io());
+            try manager.registerReplacementIndex(self.core.store, cfg);
+            self.graph_replacement_manager = manager;
+            self.graph_replacement_catalog_generation = catalog_generation;
+        }
+        const private = self.graph_replacement_manager.?;
+        if (self.graph_replacement_progress) |progress| {
+            job.resume_key_b64 = progress.job.resume_key_b64;
+            job.scanned = progress.job.scanned;
+            job.applied_sequence = progress.job.applied_sequence;
+            job.tail_source_cursor = progress.job.tail_source_cursor;
+            job.phase = progress.job.phase;
+        }
+        var ctx = self.graphReplacementContext(private);
         defer ctx.deinit(self.alloc);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -27615,60 +27775,108 @@ pub const DB = struct {
             defer read.abort();
             var cursor = try read.openCursor();
             defer cursor.close();
+            const source_lower = try documentRangeLowerAlloc(a, "");
+            const source_upper = (try documentRangeUpperAlloc(a, "")).?;
             const build_resume = if (job.resume_key_b64) |encoded| blk: {
                 const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
                 const bytes = try a.alloc(u8, size);
                 try std.base64.standard.Decoder.decode(bytes, encoded);
                 break :blk bytes;
-            } else "";
-            var row = try cursor.seekAtOrAfter(build_resume);
+            } else source_lower;
+            var row = try cursor.seekAtOrAfter(if (std.mem.lessThan(u8, build_resume, source_lower)) source_lower else build_resume);
             if (job.resume_key_b64 != null and row != null and std.mem.eql(u8, row.?.key, build_resume)) row = try cursor.next();
+            var documents: std.ArrayList([]const u8) = .empty;
+            var artifacts: std.ArrayList([]const u8) = .empty;
             var count: usize = 0;
+            var visited: usize = 0;
+            const build_deadline = @min(deadline orelse std.math.maxInt(u64), monotonicTimeNs() +| 100 * std.time.ns_per_ms);
             while (row) |kv| : (row = try cursor.next()) {
-                if (count == 256) break;
-                if (deadline) |end| if (monotonicTimeNs() >= end) break;
-                count += 1;
+                if (!std.mem.lessThan(u8, kv.key, source_upper)) {
+                    row = null;
+                    break;
+                }
+                if (count == 32 or visited == 4096) break;
+                visited += 1;
+                if (monotonicTimeNs() >= build_deadline) break;
                 if (internal_keys.isStoredDocumentRowKey(kv.key)) {
                     const key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(a, kv.key)).?;
-                    try rebuildGraphReplacementDocument(&ctx, cfg.name, key);
+                    count += 1;
+                    try documents.append(a, key);
                 } else if (internal_keys.isAssetArtifactKey(kv.key) or internal_keys.isChunkArtifactRecordKey(kv.key) or internal_keys.isResolutionArtifactKey(kv.key)) {
-                    const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, &private, &.{kv.key}, cfg.name, .{ .require_resolution_contract = true });
-                    try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = cfg.name, .kind = .graph }, null, false, null);
+                    count += 1;
+                    try artifacts.append(a, try a.dupe(u8, kv.key));
                 }
                 const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(kv.key.len));
                 job.resume_key_b64 = std.base64.standard.Encoder.encode(encoded, kv.key);
                 job.scanned += 1;
             }
+            if (documents.items.len > 0) try rebuildGraphReplacementDocumentsWithRead(&ctx, cfg.name, documents.items, &read);
+            if (artifacts.items.len > 0) {
+                const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, private, artifacts.items, cfg.name, .{ .require_resolution_contract = true });
+                try applyDerivedBatchToIndexContextProfiled(&ctx, .{ .changed_artifact_keys = changed }, .{ .name = cfg.name, .kind = .graph }, null, false, null);
+            }
             if (row == null) job.phase = .catching_up;
         }
         const target = self.core.nextDerivedSequence();
-        job.applied_sequence = try self.catchUpGraphReplacement(&private, cfg.name, job.applied_sequence, target, 1024, deadline);
-        // Projection durability precedes publication of either cursor.
-        try private.checkpointLsmWalForManagedIndex(.{ .name = cfg.name, .kind = .graph });
-        try private.syncIndexByName(cfg.name, true);
-        job.last_error = null;
-        try self.core.index_manager.saveGraphReplacementBuild(self.core.store, job);
-        if (job.phase != .catching_up or job.applied_sequence < target) return true;
+        const before_catchup = job.applied_sequence;
+        job.applied_sequence = try self.catchUpGraphReplacement(private, cfg.name, job.applied_sequence, target, 1024, deadline);
+        if (job.applied_sequence > before_catchup) job.tail_source_cursor = 0;
+        // Yielding is not a durability boundary. Keep volatile progress with
+        // the resident shadow, retaining the journal at the last durable cut.
+        // Checkpoint the first quantum, at most once per second thereafter,
+        // and always before activation. A crash repeats only unacknowledged
+        // work, never an entire completed build.
+        const now = monotonicTimeNs();
+        const previous_checkpoint = if (self.graph_replacement_progress) |progress| progress.checkpoint_ns else 0;
+        const checkpoint = previous_checkpoint == 0 or now -| previous_checkpoint >= std.time.ns_per_s or job.phase == .catching_up;
+        var progress_job = job;
+        progress_job.name = "";
+        progress_job.old = "";
+        progress_job.config = null;
+        progress_job.last_error = null;
+        progress_job.resume_key_b64 = if (job.resume_key_b64) |key| try self.alloc.dupe(u8, key) else null;
+        var progress_transferred = false;
+        errdefer if (!progress_transferred) {
+            if (progress_job.resume_key_b64) |key| self.alloc.free(key);
+        };
+        if (checkpoint) {
+            try private.checkpointLsmWalForManagedIndex(.{ .name = cfg.name, .kind = .graph });
+            try private.syncIndexByName(cfg.name, true);
+            job.last_error = null;
+            try self.core.index_manager.saveGraphReplacementBuild(self.core.store, job);
+        }
+        self.clearGraphReplacementProgress();
+        self.graph_replacement_progress = .{ .job = progress_job, .checkpoint_ns = if (checkpoint) now else previous_checkpoint };
+        progress_transferred = true;
+        if (job.phase != .catching_up) return true;
         // Activation acquires its own structural/role admission. Release the
         // construction leases first so a waiting snapshot/role fence cannot
         // deadlock a nested acquisition by this owner.
         build_snapshot_lease.release();
         snapshot_held = false;
         releaseReplicationMutationShared(&owner);
-        var prepared = PreparedGraphReplacement{ .manager = &private, .sequence = job.applied_sequence, .deadline_ns = deadline };
+        var prepared = PreparedGraphReplacement{ .manager = private, .sequence = job.applied_sequence, .deadline_ns = deadline, .tail_source_cursor = job.tail_source_cursor };
         defer if (prepared.entry) |*entry| private.destroyDetachedReplacementIndex(entry);
         _ = self.addIndexForReconciliation(cfg, .ordinary, null, job.old, &prepared) catch |err| switch (err) {
-            error.Busy, error.IntegrityTopologyBusy => return true,
+            error.Busy, error.IntegrityTopologyBusy => {
+                // The bounded fence may have advanced the durable intra-entry
+                // cursor; refresh from that cut on the next maintenance turn.
+                self.clearGraphReplacementProgress();
+                return true;
+            },
             else => return err,
         };
-        return jobs.value.len > 1;
+        return self.hasPendingGraphReplacements();
     }
 
     pub fn waitGraphReplacement(self: *DB, name: []const u8, timeout_ms: u64) !void {
         const deadline = monotonicTimeNs() +| timeout_ms *| std.time.ns_per_ms;
         while (self.core.index_manager.get(name) == null) {
             if (monotonicTimeNs() >= deadline) return error.Busy;
-            _ = try self.advanceGraphReplacementUntil(deadline);
+            const jobs = try self.graphReplacementStatusAlloc(self.alloc);
+            defer jobs.deinit();
+            for (jobs.value) |job| if (std.mem.eql(u8, job.name, name) and job.phase == .failed) return error.IndexReplacementFailed;
+            _ = self.advanceGraphReplacementUntil(deadline) catch {};
             if (self.backend_runtime.io()) |io| try io.sleep(.fromMilliseconds(1), .awake);
         }
     }
@@ -29315,8 +29523,11 @@ pub const DB = struct {
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
         const jobs = try self.core.index_manager.graphReplacementBuildsAlloc(self.core.store, self.alloc);
         defer jobs.deinit();
-        for (jobs.value) |job| if (std.mem.eql(u8, job.old, name) or std.mem.eql(u8, job.name, name)) return error.Busy;
-        return self.deleteIndexForReconciliation(name, null);
+        var cancelled = false;
+        for (jobs.value) |job| if (std.mem.eql(u8, job.old, name) or std.mem.eql(u8, job.name, name)) {
+            cancelled = (try self.cancelReplacement(job.name)) or cancelled;
+        };
+        return (try self.deleteIndexForReconciliation(name, null)) or cancelled;
     }
 
     fn deleteIndexForReconciliation(self: *DB, name: []const u8, context: ?@import("artifact_reconcile_intent.zig").Context) !bool {
@@ -30245,7 +30456,7 @@ pub const DB = struct {
             .producer => return self.advanceArtifactProducerWorkPage(),
             .footprint => return self.advanceArtifactFootprintPage(),
             .repair => {
-                const pending = try self.advanceGraphReplacement();
+                const pending = self.advanceGraphReplacement() catch self.hasPendingGraphReplacements();
                 try self.runArtifactRepairMaintenanceTurn();
                 return pending;
             },
@@ -54633,56 +54844,60 @@ fn applySplitGraphArtifactsStreaming(
 /// Reuse ordinary graph materialization for a renamed logical index, not the
 /// old index's already-materialized edge keys. This keeps changed source
 /// mappings, mention edges and relation endpoints on the public semantics.
-fn rebuildGraphReplacementDocument(ctx: *AsyncContext, name: []const u8, key: []const u8) !void {
+fn rebuildGraphReplacementDocumentWithRead(ctx: *AsyncContext, name: []const u8, key: []const u8, read: *docstore_mod.DocStore.Txn) !void {
+    return rebuildGraphReplacementDocumentsWithRead(ctx, name, &.{key}, read);
+}
+
+fn rebuildGraphReplacementDocumentsWithRead(ctx: *AsyncContext, name: []const u8, keys: []const []const u8, read: *docstore_mod.DocStore.Txn) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena.deinit();
     const a = arena.allocator();
     var plan = try ctx.index_manager.writePlanSnapshotAlloc(a);
     defer plan.deinit();
-    const prefix = try internal_keys.documentExactPrefixAlloc(a, key);
-    var read = try ctx.store.beginReadTxn();
-    defer read.abort();
     var cursor = try read.openCursor();
     defer cursor.close();
     var sources: std.ArrayList([]const u8) = .empty;
     var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
     var owned_deletes: std.ArrayListUnmanaged([]u8) = .empty;
-    var row = try cursor.seekAtOrAfter(prefix);
-    while (row) |kv| : (row = try cursor.next()) {
-        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
-        if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
-            const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(a, kv.key)).?;
-            if (std.mem.eql(u8, parsed.index_name, name)) try deletes.append(a, try a.dupe(u8, kv.key));
-        } else if (internal_keys.isAssetArtifactKey(kv.key) or internal_keys.isChunkArtifactRecordKey(kv.key) or internal_keys.isResolutionArtifactKey(kv.key)) {
-            try sources.append(a, try a.dupe(u8, kv.key));
-        }
-    }
     var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     var direct: std.ArrayListUnmanaged(types.BatchWrite) = .empty;
     var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
     var owned_values: std.ArrayListUnmanaged([]u8) = .empty;
-    const stored_key = try internal_keys.documentKeyAlloc(a, key);
-    const raw = read.get(stored_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    if (raw) |value| {
-        const json = try ctx.index_manager.materializeStoredValueAlloc(a, stored_key, value);
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
-        var extracted = try mapper.extractWrite(a, key, json);
-        try local_mutation.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(plan, a, key, root, &extracted);
-        const graph = ctx.index_manager.graphIndex(name).?;
-        for (extracted.graph_writes) |write| {
-            if (!std.mem.eql(u8, write.index_name, name)) continue;
-            const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(a, key, name, write.edge_type, write.target, write.source, write.edge_id);
-            const payload = try encodeGraphSourceEdgeArtifactWithTtlAlloc(a, ctx.store, artifact, graph.config.coverage_generation, graph.ttl_duration_ns, currentTimeNs(), write);
-            try direct.append(a, .{ .key = artifact, .value = payload });
-            try writes.append(a, .{ .key = artifact, .value = payload });
+    for (keys) |key| {
+        const prefix = try internal_keys.documentExactPrefixAlloc(a, key);
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |kv| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
+                const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(a, kv.key)).?;
+                if (std.mem.eql(u8, parsed.index_name, name)) try deletes.append(a, try a.dupe(u8, kv.key));
+            } else if (internal_keys.isAssetArtifactKey(kv.key) or internal_keys.isChunkArtifactRecordKey(kv.key) or internal_keys.isResolutionArtifactKey(kv.key)) {
+                try sources.append(a, try a.dupe(u8, kv.key));
+            }
+        }
+        const stored_key = try internal_keys.documentKeyAlloc(a, key);
+        const raw = read.get(stored_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (raw) |value| {
+            const json = try ctx.index_manager.materializeStoredValueAlloc(a, stored_key, value);
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+            var extracted = try mapper.extractWrite(a, key, json);
+            try local_mutation.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(plan, a, key, root, &extracted);
+            const graph = ctx.index_manager.graphIndex(name).?;
+            for (extracted.graph_writes) |write| {
+                if (!std.mem.eql(u8, write.index_name, name)) continue;
+                const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(a, key, name, write.edge_type, write.target, write.source, write.edge_id);
+                const payload = try encodeGraphSourceEdgeArtifactWithTtlAlloc(a, ctx.store, artifact, graph.config.coverage_generation, graph.ttl_duration_ns, currentTimeNs(), write);
+                try direct.append(a, .{ .key = artifact, .value = payload });
+                try writes.append(a, .{ .key = artifact, .value = payload });
+            }
         }
     }
     try local_mutation.appendMixedDirectGraphContenderMutations(a, ctx.store, ctx.index_manager, direct.items, &writes, &deletes, &owned_keys, &owned_values, &owned_deletes);
     if (writes.items.len > 0 or deletes.items.len > 0) try ctx.store.putBatch(writes.items, deletes.items);
-    try ctx.index_manager.deleteGraphDocsByName(name, &.{key});
+    try ctx.index_manager.deleteGraphDocsByName(name, keys);
     const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, ctx.index_manager, sources.items, name, .{ .require_resolution_contract = true });
     var changed_keys: std.ArrayList([]const u8) = .empty;
     try changed_keys.appendSlice(a, changed);
@@ -135216,9 +135431,25 @@ test "capi resolver replacement builds while replay gates remain available" {
     defer DB.test_graph_replacement_before_build = null;
     try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     try std.testing.expect(!Check.observed);
-    try std.testing.expectError(error.InjectedReplacementBuildFailure, db.advanceGraphReplacement());
+    try std.testing.expect(!try db.advanceGraphReplacement());
     try std.testing.expect(db.core.index_manager.get("old") != null);
     try std.testing.expect(db.core.index_manager.get("new") == null);
+    {
+        const jobs = try db.graphReplacementStatusAlloc(alloc);
+        defer jobs.deinit();
+        try std.testing.expectEqual(.failed, jobs.value[0].phase);
+        try std.testing.expectEqualStrings("InjectedReplacementBuildFailure", jobs.value[0].last_error.?);
+        try std.testing.expectEqual(@as(u64, 99), try db.core.index_manager.clampReplayForGraphReplacementBuilds(db.core.store, 99));
+    }
+    Check.fail_build = false;
+    try db.addIndex(.{ .name = "other_old", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("other_old", .{ .name = "z_later", .kind = .graph, .config_json = config });
+    try db.runUntilIdle(); // failed work must not poison unrelated maintenance
+    try std.testing.expect(db.core.index_manager.get("z_later") != null);
+    try std.testing.expect(db.core.index_manager.get("old") != null);
+    try std.testing.expect(try db.cancelReplacement("new"));
+    try std.testing.expect(!try db.cancelReplacement("new"));
+    try db.runUntilIdle(); // bounded cleanup frees the reserved artifact name
     Check.fail_build = false;
     try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     try db.runUntilIdle();
@@ -135292,4 +135523,83 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
         try db.waitGraphReplacement("new", 0);
         try std.testing.expect(!db.hasPendingGraphReplacements());
     }
+}
+
+test "capi resolver replacement fenced tail advances gaps over 1024" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-tail");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const jobs = try db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    const floor = jobs.value[0].applied_sequence;
+    for (0..1100) |revision| {
+        const value = try std.fmt.allocPrint(a, "{{\"links\":[\"target\"],\"revision\":{d}}}", .{revision});
+        defer a.free(value);
+        try db.batch(.{ .writes = &.{.{ .key = "hot", .value = value }} });
+    }
+    try std.testing.expect(db.core.nextDerivedSequence() - floor > 1024);
+    var private = try index_manager_mod.IndexManager.initWithOptions(a, db.core.index_manager.base_path, db.index_backends);
+    defer private.deinit();
+    private.source_payload_store = db.core.index_manager.source_payload_store;
+    private.setIo(db.backend_runtime.io());
+    const cfg = jobs.value[0].config.?;
+    try private.registerReplacementIndex(db.core.store, cfg);
+    var prepared = DB.PreparedGraphReplacement{ .manager = &private, .sequence = floor };
+    defer if (prepared.entry) |*entry| private.destroyDetachedReplacementIndex(entry);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        prepared.finish(&db, cfg) catch |err| if (err != error.Busy) return err;
+    }
+    // The former >1024 shortcut never consumed even one entry. A bounded
+    // write pause must make durable progress even when it cannot swap yet.
+    try std.testing.expect(prepared.sequence > floor or prepared.tail_source_cursor > 0);
+    if (prepared.sequence < db.core.nextDerivedSequence()) {
+        const progress = try db.graphReplacementStatusAlloc(a);
+        defer progress.deinit();
+        try std.testing.expectEqual(prepared.sequence, progress.value[0].applied_sequence);
+        try std.testing.expectEqual(prepared.tail_source_cursor, progress.value[0].tail_source_cursor);
+    }
+}
+
+test "capi resolver replacement tail resumes inside a large journal batch" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-batch-tail");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const jobs = try db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    const floor = jobs.value[0].applied_sequence;
+    var rows: std.ArrayList(types.BatchWrite) = .empty;
+    defer rows.deinit(a);
+    for (0..100) |i| try rows.append(a, .{ .key = try std.fmt.allocPrint(a, "doc:{d}", .{i}), .value = "{\"links\":[\"target\"]}" });
+    defer for (rows.items) |row| a.free(row.key);
+    try db.batch(.{ .writes = rows.items });
+    var private = try index_manager_mod.IndexManager.initWithOptions(a, db.core.index_manager.base_path, db.index_backends);
+    defer private.deinit();
+    private.source_payload_store = db.core.index_manager.source_payload_store;
+    private.setIo(db.backend_runtime.io());
+    try private.registerReplacementIndex(db.core.store, jobs.value[0].config.?);
+    // The first source was checkpointed in a previous bounded pause. A zero
+    // budget must preserve that intra-entry cursor rather than restarting it.
+    var cursor: usize = 1;
+    try std.testing.expectEqual(floor, try db.catchUpGraphReplacementTail(&private, "new", floor, db.core.nextDerivedSequence(), &cursor, monotonicTimeNs()));
+    try std.testing.expectEqual(@as(usize, 1), cursor);
+    // Replaying from the beginning is idempotent, as on a background resume.
+    cursor = 0;
+    const target = db.core.nextDerivedSequence();
+    try std.testing.expectEqual(target, try db.catchUpGraphReplacementTail(&private, "new", floor, target, &cursor, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(usize, 0), cursor);
+    const edges = try private.graphIndex("new").?.index.getEdges(a, "doc:99", "R", .out);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
 }

@@ -2777,6 +2777,13 @@ func TestResolverIdentityManagement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if cancelled, err := db.CancelReplacement("missing"); err != nil || cancelled {
+		t.Fatalf("cancel missing: %v %v", cancelled, err)
+	}
+	if archive, err := db.BackupJSON([]byte(`{"tables":["default"]}`)); err != nil || len(archive) == 0 {
+		t.Fatalf("scoped backup: %v", err)
+	}
+
 	config := []byte(`{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}`)
 	if err := db.AddIndexJSON(config); err != nil {
 		t.Fatal(err)

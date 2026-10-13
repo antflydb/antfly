@@ -347,6 +347,10 @@ antfly_error_code antfly_db_capabilities_json(antfly_db *db, antfly_buffer *out)
  * atomically replaces an existing destination.
  */
 antfly_error_code antfly_db_backup(antfly_db *db, antfly_buffer *out);
+/** Portable backup with optional {"tables":["default","healthy"]} scope.
+ * Explicit scope includes default and exactly the named tables. Full backup
+ * fails closed if any table is unavailable; it never silently omits data. */
+antfly_error_code antfly_db_backup_json(antfly_db *db, antfly_slice options_json, antfly_buffer *out);
 antfly_error_code antfly_db_import_backup(antfly_db *db, antfly_slice backup);
 antfly_error_code antfly_restore_backup_json(
     const char *dest_path,
@@ -489,6 +493,11 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 /* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
+/** Cancel a running or failed shadow by its new name; idempotent. Leaves the
+ * serving index intact and schedules bounded shadow-artifact cleanup. Failed
+ * jobs do not retry or pin replay; cancel before registering a fresh attempt.
+ * delete_index on either name also cancels dependent replacements. */
+antfly_error_code antfly_db_cancel_replacement(antfly_db *db, antfly_slice name, bool *out_cancelled);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_add_enrichment_json(antfly_db *db, antfly_slice config_json);
 antfly_error_code antfly_db_delete_enrichment(

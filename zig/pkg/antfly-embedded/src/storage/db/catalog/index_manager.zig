@@ -114,10 +114,11 @@ pub const GraphReplacementBuild = struct {
     old: []const u8 = "",
     config: ?types.IndexConfig = null,
     request_hash: u64 = 0,
-    phase: enum { building, catching_up } = .building,
+    phase: enum { building, catching_up, failed } = .building,
     resume_key_b64: ?[]const u8 = null,
     scanned: u64 = 0,
     applied_sequence: u64 = 0,
+    tail_source_cursor: usize = 0,
     last_error: ?[]const u8 = null,
 };
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
@@ -11954,7 +11955,11 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(key, value);
+        // Resumable shadows are a real new storage feature; plain table DDL
+        // is not. Stamp their requirement with the reservation atomically.
+        try txn.put(resolver_catalog.minimum_reader_key, "2");
         try txn.commit();
+        self.minimum_reader_version.store(@max(@as(u32, 2), self.minimum_reader_version.load(.acquire)), .release);
         return stored;
     }
 
@@ -11991,13 +11996,49 @@ pub const IndexManager = struct {
         try txn.commit();
     }
 
+    pub fn failGraphReplacement(self: *IndexManager, store: anytype, job: GraphReplacementBuild) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const cfg = job.config orelse return error.InvalidIndexConfig;
+        const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, job.name });
+        defer self.alloc.free(key);
+        const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
+        defer self.alloc.free(value);
+        try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, job.name, cfg.config_json, .{ .put = .{ .key = key, .value = value } });
+    }
+
+    /// Remove reservation and enqueue existing bounded artifact cleanup in one
+    /// transaction. The serving index remains authoritative throughout.
+    pub fn cancelGraphReplacement(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
+        defer jobs.deinit();
+        for (jobs.value) |job| {
+            if (!std.mem.eql(u8, job.name, name)) continue;
+            var cleanup = try self.prepareGeneratedArtifactCleanupPlan(job.name, .graph, job.generation, null, null, &.{});
+            defer cleanup.deinit();
+            const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, name });
+            defer self.alloc.free(key);
+            const cfg = job.config orelse return error.InvalidIndexConfig;
+            try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, cfg.config_json, .{ .put_delete = .{
+                .put = .{ .key = cleanup.key.?, .value = cleanup.value.? },
+                .delete = key,
+            } });
+            return true;
+        }
+        return false;
+    }
+
     /// Retain only journal records not consumed by a shadow. Each bounded
     /// build/catch-up round advances this pin, allowing ordinary truncation.
     pub fn clampReplayForGraphReplacementBuilds(self: *IndexManager, store: anytype, effective: u64) !u64 {
         const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
         defer jobs.deinit();
         var floor = effective;
-        for (jobs.value) |job| floor = @min(floor, job.applied_sequence);
+        for (jobs.value) |job| if (job.phase != .failed) {
+            floor = @min(floor, job.applied_sequence);
+        };
         return floor;
     }
 
@@ -12046,6 +12087,11 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store, false);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        if (prepared == null) {
+            const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
+            defer jobs.deinit();
+            for (jobs.value) |job| if (std.mem.eql(u8, job.name, cfg.name)) return error.IndexReplacementPending;
+        }
         if (replaces) |old| {
             const previous = self.get(old) orelse return error.NotFound;
             if (previous.kind != .graph or cfg.kind != .graph) return error.UnsupportedOperation;
@@ -22201,10 +22247,14 @@ pub const IndexManager = struct {
 
     fn inlineResolversRetiringWithIndex(self: *const IndexManager, alloc: Allocator, excluded: []const u8) ![][]const u8 {
         const removed = self.get(excluded) orelse return alloc.alloc([]const u8, 0);
+        return self.inlineResolversRetiringWithConfig(alloc, excluded, removed.config_json);
+    }
+
+    fn inlineResolversRetiringWithConfig(self: *const IndexManager, alloc: Allocator, excluded: []const u8, config_json: []const u8) ![][]const u8 {
         var retiring: std.ArrayList([]const u8) = .empty;
         errdefer retiring.deinit(alloc);
         for (self.resolvers.items) |cfg| {
-            if (cfg.inline_managed == false or !try self.indexDeclaresResolver(removed.config_json, cfg.name)) continue;
+            if (cfg.inline_managed == false or !try self.indexDeclaresResolver(config_json, cfg.name)) continue;
             var shared = false;
             for (self.graph_indexes.items) |entry| {
                 if (std.mem.eql(u8, entry.config.name, excluded)) continue;
@@ -22234,8 +22284,17 @@ pub const IndexManager = struct {
         excluded_name: []const u8,
         atomic_mutation: ?AtomicCatalogMutation,
     ) !void {
-        const data = try serializeCatalogExcluding(self.alloc, self, excluded_name);
+        return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation);
+    }
+
+    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation) !void {
+        const data = if (self.get(excluded_name) != null)
+            try serializeCatalogExcluding(self.alloc, self, excluded_name)
+        else
+            try serializeCatalog(self.alloc, self);
         defer self.alloc.free(data);
+        const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
+        defer jobs.deinit();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -22243,8 +22302,23 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
-        const retiring = try self.inlineResolversRetiringWithIndex(self.alloc, excluded_name);
-        defer self.alloc.free(retiring);
+        const maybe_retiring = if (removed_config) |config|
+            try self.inlineResolversRetiringWithConfig(self.alloc, excluded_name, config)
+        else
+            try self.inlineResolversRetiringWithIndex(self.alloc, excluded_name);
+        defer self.alloc.free(maybe_retiring);
+        var retire_count: usize = 0;
+        for (maybe_retiring) |name| {
+            const shared = for (jobs.value) |job| {
+                if (std.mem.eql(u8, job.name, excluded_name) or job.phase == .failed) continue;
+                if (job.config) |cfg| if (try self.indexDeclaresResolver(cfg.config_json, name)) break true;
+            } else false;
+            if (!shared) {
+                maybe_retiring[retire_count] = name;
+                retire_count += 1;
+            }
+        }
+        const retiring = maybe_retiring[0..retire_count];
         try self.retired_resolvers.ensureUnusedCapacity(self.alloc, retiring.len);
         const definitions = try self.resolverDefinitionsAlloc(self.alloc);
         defer self.alloc.free(definitions);

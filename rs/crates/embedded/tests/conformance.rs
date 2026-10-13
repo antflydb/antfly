@@ -702,6 +702,9 @@ fn resolver_identity_management() {
         .spawn(|| {
             let path = std::env::temp_dir().join(format!("antfly-identities-{}-{}.aflite",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let db = Database::create(&path, &OpenOptions::new().no_sync(true)).unwrap();
+            assert!(!db.cancel_replacement("missing").unwrap());
+            assert!(!db.backup_json(br#"{"tables":["default"]}"#).unwrap().is_empty());
+
             db.add_index_json(br#"{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}"#).unwrap();
             let active: Value = serde_json::from_slice(&db.resolver_identities_json().unwrap()).unwrap();
             assert_eq!(active[0]["config"]["name"], "concepts");

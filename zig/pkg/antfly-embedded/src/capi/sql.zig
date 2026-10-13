@@ -241,6 +241,9 @@ pub fn Adapter(comptime native: type) type {
         };
 
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            // Coordinated constraints require the complete dependency catalog;
+            // ordinary reads can proceed against healthy referenced tables.
+            if (self.handle) |handle| if (handle.embedded_table_errors.count() > 0) return error.IntegrityCatalogUnavailable;
             const count = if (self.handle) |handle| handle.embedded_tables.count() + 1 else 1;
             const tables = try alloc.alloc(topology.TableRecord, count);
             const ranges = try alloc.alloc(topology.RangeRecord, count);

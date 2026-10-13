@@ -2991,6 +2991,30 @@ pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) 
     return .ok;
 }
 
+pub export fn antfly_db_backup_json(handle_ptr: ?*anyopaque, options: capi.Slice, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle = guard.handle;
+
+    @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(handle.alloc);
+    const Request = struct { tables: ?[]const []const u8 = null };
+    const request = std.json.parseFromSlice(Request, handle.alloc, options.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer request.deinit();
+    @import("database_backup.zig").exportTables(handle, &out, request.value.tables) catch |err| return capi.mapError(err);
+    const bytes = out.toOwnedSlice(handle.alloc) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    out = .empty;
+    out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     capi.clearLastError();
     const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -5490,7 +5514,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    try @import("tables.zig").load(handle);
+    try @import("tables.zig").loadAvailable(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
@@ -7312,6 +7336,21 @@ pub export fn antfly_db_add_index_json(
     // enrichment/resolver registration restores the pre-call enrichment
     // catalog instead of leaving durably changed producers behind a caller
     // who was told the AddIndex failed.
+    {
+        const jobs = handle.database().graphReplacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer jobs.deinit();
+        for (jobs.value) |job| {
+            if (!std.mem.eql(u8, job.name, parsed.value.name)) continue;
+            const cfg = job.config orelse return capi.mapError(error.InvalidIndexConfig);
+            const same = cfg.kind == kind and (@import("../storage/db/enrichment/config_validation.zig").producerJsonValuesEqual(handle.alloc, cfg.config_json, parsed.value.config_json) catch |err| return capi.mapError(err));
+            if (!same or (replacement != null and !std.mem.eql(u8, replacement.?.string, job.old)))
+                return capi.mapErrorContext(error.InvalidArgument, "index name is reserved by a different pending replacement; cancel_replacement before changing it");
+            if (job.phase == .failed)
+                return capi.mapErrorContext(error.InvalidArgument, "replacement failed; inspect pending_work_stats and cancel_replacement before retrying");
+            if (wait_ms) |timeout| handle.database().waitGraphReplacement(job.name, timeout) catch |err| return capi.mapError(err);
+            return .ok;
+        }
+    }
     var rollback: ?LiteCatalogRollback = null;
     defer if (rollback) |*undo| undo.deinit();
     {
@@ -7389,6 +7428,25 @@ pub export fn antfly_db_add_index_json(
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     @import("tables.zig").noteReaderVersion(handle) catch |err| return capi.mapError(err);
     if (wait_ms) |timeout| handle.database().waitGraphReplacement(name.string, timeout) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_cancel_replacement(
+    handle_ptr: ?*anyopaque,
+    name: capi.Slice,
+    out_deleted: ?*bool,
+) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
+    out.* = false;
+    const handle = guard.handle;
+    out.* = handle.database().*.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 

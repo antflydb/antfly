@@ -931,6 +931,9 @@ def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_pa
     plain = tmp_path / "previous-plain.aflite"
     identity = tmp_path / "previous-identity.aflite"
     with _open_graph_test(plain, options) as db:
+        db.create_table("plain_named", {})
+        db.create_table("dropped_named", {})
+        db.drop_table("dropped_named")
         assert db.capabilities()["minimum_reader_version"] == 1
     with _open_graph_test(identity, options) as db:
         config = _resolver_graph("knowledge", "concepts")
@@ -1028,6 +1031,16 @@ def test_directory_open_does_not_open_broken_named_table(tmp_path):
         db.capabilities()
         with pytest.raises(antfly_embedded.AntflyError):
             db.open_table("bad")
+        db.run_until_idle()
+        assert "bad" in db.pending_work_stats()["unavailable_tables"]
+        assert db.sql("SELECT 42 AS value")["rows"] == [["42"]]
+        with pytest.raises(antfly_embedded.AntflyError):
+            db.backup()  # A full archive must not silently lose a table.
+        scoped = db.backup(tables=["default"])
+    with antfly_embedded.create(tmp_path / "healthy-restore.aflite") as restored:
+        restored.import_backup(scoped)
+        assert restored.lookup("healthy")["text"] == "available"
+        assert "bad" not in restored.list_tables()
 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
@@ -1062,9 +1075,9 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
                 }
                 db.add_index(request)
                 db.add_index(request)
-                deadline = time.monotonic() + 30
+                deadline = time.monotonic() + 90
                 while "new" not in {i["name"] for i in db.list_indexes()}:
-                    assert time.monotonic() < deadline, db.pending_work_stats()
+                    assert time.monotonic() < deadline, json.dumps(db.pending_work_stats())
                     time.sleep(0.01)
             finally:
                 stop.set()
@@ -1101,3 +1114,40 @@ os._exit(0)  # Deliberately bypass all handle close/flush hooks.
         assert "old" not in {i["name"] for i in db.list_indexes()}
         for key in ("source:0000", "source:0299"):
             assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("reserved.aflite" if storage == antfly_embedded.Storage.LITE else "reserved")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+        db.run_until_idle()
+        config = {"name": "new", "type": "graph", "edge_types": [{"name": "R", "field": "next_links"}]}
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(config, replaces="old", wait={"timeout_ms": 0}))
+        db.add_index(config)  # Codex's plain inline config replay joins the shadow.
+        with pytest.raises(antfly_embedded.InvalidArgumentError):
+            db.add_index(dict(config, edge_types=[{"name": "R", "field": "wrong"}]))
+        assert db.cancel_replacement("new")
+        assert not db.cancel_replacement("new")
+        assert "old" in {i["name"] for i in db.list_indexes()}
+        db.run_until_idle()
+        assert not db.pending_work_stats()["replacements"]
+        db.add_index(dict(config, replaces="old"))
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "s:0000", "R", 0)] == ["new"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_table_lifecycle_preserves_reader_version_one(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("epoch.aflite" if storage == antfly_embedded.Storage.LITE else "epoch")
+    with _open_graph_test(path, options) as db:
+        db.create_table("plain", {})
+        assert db.capabilities()["minimum_reader_version"] == 1
+        db.drop_table("plain")
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1

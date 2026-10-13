@@ -546,7 +546,7 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
 pub fn runUntilIdle(handle: *h.Handle) !void {
     const root = handle.parent_handle orelse handle;
     if (root.embedded_path == null) return handle.database().runUntilIdle();
-    try tables.load(root);
+    try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
         try root.db.runUntilIdle();
@@ -1864,4 +1864,46 @@ test "capi resolver embedding cache batches writes bounds size and expires pages
     }
     try std.testing.expect(total <= 512);
     try std.testing.expectEqual(total, try std.fmt.parseInt(usize, try read.get(embedding_cache_bytes_key), 10));
+}
+
+test "capi resolver failed replacement permits portable backup and cancellation" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("failed-shadow-backup");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    const old = "{\"name\":\"old\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    const replacement = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(old)));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var rows: std.ArrayList(h.db_mod.types.BatchWrite) = .empty;
+    for (0..300) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d}", .{i}), .value = "{\"links\":[\"old\"],\"next_links\":[\"new\"]}" });
+    try handle.db.batch(.{ .writes = rows.items });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(replacement)));
+    _ = try handle.db.advanceGraphReplacement();
+    const jobs = try handle.db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+    var job = jobs.value[0];
+    job.phase = .failed;
+    job.last_error = "InjectedReplacementBuildFailure";
+    try handle.db.core.index_manager.failGraphReplacement(handle.db.core.store, job);
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(@as(u64, 999), try handle.db.core.index_manager.clampReplayForGraphReplacementBuilds(handle.db.core.store, 999));
+    var archive: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&archive);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_backup(id, &archive));
+    try @import("database_backup.zig").validate(a, archive.ptr.?[0..archive.len]);
+    var cancelled = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_cancel_replacement(id, .fromSlice("new"), &cancelled));
+    try std.testing.expect(cancelled);
+    try runUntilIdle(handle);
+    try std.testing.expect(handle.db.core.index_manager.get("old") != null);
+    try std.testing.expect(handle.db.core.index_manager.get("new") == null);
 }

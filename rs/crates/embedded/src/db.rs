@@ -373,6 +373,14 @@ impl Database {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_backup(h, out) })
     }
 
+    /// Export with optional {"tables":[...]} scope; default is always included.
+    /// Full backups fail closed if any table is unavailable.
+    pub fn backup_json(&self, options: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(options.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_backup_json(h, input, out)
+        })
+    }
+
     /// Imports a portable Antfly backup archive into this empty database.
     /// [`Error::OutcomeUnknown`] means the live handle adopted the imported
     /// generation, but crash durability could not be confirmed; inspect the
@@ -599,6 +607,21 @@ impl Database {
             let mut deleted = false;
             check(unsafe {
                 sys::antfly_db_delete_index(handle, borrow_slice(name.as_bytes()), &mut deleted)
+            })?;
+            Ok(deleted)
+        })
+    }
+
+    /// Cancel a running or failed shadow by its new name; idempotent.
+    pub fn cancel_replacement(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_cancel_replacement(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
             })?;
             Ok(deleted)
         })

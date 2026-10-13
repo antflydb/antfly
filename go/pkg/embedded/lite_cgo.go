@@ -440,6 +440,14 @@ func (db *DB) Backup() ([]byte, error) {
 	})
 }
 
+// BackupJSON exports a portable archive with an explicit optional table scope.
+// Default is always included. Full backups never silently omit unavailable tables.
+func (db *DB) BackupJSON(options []byte) ([]byte, error) {
+	return db.withInputOutput(options, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_backup_json((*C.antfly_db)(handle), input, out)
+	})
+}
+
 // ImportBackup imports a portable Antfly backup archive into this empty
 // database. OutcomeUnknown means the live handle adopted the imported
 // generation, but crash durability could not be confirmed; inspect the handle
@@ -789,6 +797,26 @@ func (db *DB) DeleteIndex(name string) (bool, error) {
 
 	var deleted C.bool
 	if err := check(C.antfly_db_delete_index((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
+// CancelReplacement cancels a running or failed shadow by its new name.
+func (db *DB) CancelReplacement(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+
+	var deleted C.bool
+	if err := check(C.antfly_db_cancel_replacement((*C.antfly_db)(handle), input, &deleted)); err != nil {
 		return false, err
 	}
 	return bool(deleted), nil

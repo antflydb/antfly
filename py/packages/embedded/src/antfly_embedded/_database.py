@@ -324,9 +324,14 @@ class Database:
 
     # -- backup / import ----------------------------------------------------
 
-    def backup(self) -> bytes:
-        """Return a portable Antfly backup archive (.afb) of this database,
-        which restores or imports into either storage kind."""
+    def backup(self, *, tables: list[str] | None = None) -> bytes:
+        """Return a portable archive for either storage kind.
+
+        ``tables`` explicitly scopes named tables; default is always included.
+        Full backups fail if any table is unavailable, without omitting data.
+        """
+        if tables is not None:
+            return self._with_input_output(self._lib.antfly_db_backup_json, encode_json_input({"tables": tables}))
         return self._read_buffer(self._lib.antfly_db_backup)
 
     def import_backup(self, backup: bytes) -> None:
@@ -516,6 +521,18 @@ class Database:
             sl, _keep = _ffi.make_slice(encode_text(name))
             deleted = ctypes.c_bool(False)
             code = self._lib.antfly_db_delete_index(ctypes.c_void_p(handle), sl, ctypes.byref(deleted))
+            errors.raise_for_code(code)
+            return bool(deleted.value)
+        finally:
+            self._release()
+
+    def cancel_replacement(self, name: str) -> bool:
+        """Cancel a running or failed replacement by its new name; idempotent."""
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_text(name))
+            deleted = ctypes.c_bool(False)
+            code = self._lib.antfly_db_cancel_replacement(ctypes.c_void_p(handle), sl, ctypes.byref(deleted))
             errors.raise_for_code(code)
             return bool(deleted.value)
         finally:

@@ -1064,8 +1064,34 @@ Catch-up coalesces each journal window by source key, so repeated updates to a
 hot document rebuild its latest projection once per round.
 Replay retention advances after each round; it does not pin the entire journal.
 Restart resumes the durable marker/checkpoints, without rebuilding completed
-pages. Failed background work retains its checkpoint and exposes `last_error`
-in the per-index `replacements` array of `pending_work_stats_json`.
+pages. Background construction retains its private manager across rounds, shares
+a source snapshot across each page, and checkpoints once per bounded quantum.
+Source pages collect at most 32 sources per turn, sharing their write plan,
+artifact transaction and graph apply. Collection yields after 100 ms, followed
+by the current bounded source batch. Resident managers are invalidated when the
+catalog revision changes, so reused builders cannot retain stale resolver rules. A resident progress cursor lets these
+short turns share a durability checkpoint: checkpoint the first turn, then at
+most once per second during construction, and always before activation. The
+journal remains pinned at the last durable cut; crash recovery repeats only
+unacknowledged work. Checkpoint fsync remains required before the durable cursor
+advances. The scan excludes unrelated metadata/journal keys, and replay begins
+strictly after the last consumed sequence.
+
+A failed job enters terminal `phase: "failed"`, exposes `last_error`, releases its
+journal retention pin and retires any inline execution owned only by that shadow.
+It is excluded from scheduling: later replacements, artifact repair, drains and
+backups continue. Backups export serving state and exclude failed shadow outputs.
+Call `cancel_replacement(new_name)` to remove a running or failed reservation and
+schedule bounded artifact cleanup; the serving old index stays intact. Repeated
+cancellation is a no-op. Deleting either index name cancels dependent shadows.
+Cancel and drain cleanup before registering a fresh attempt after failure.
+Plain `add_index` with the identical pending config joins its shadow even without
+`replaces`; conflicting configs are rejected before changing catalogs or storage.
+The final write fence consumes and durably checkpoints a bounded tail even when
+the gap exceeds 1024. An intra-entry source cursor also permits yielding within a
+large journal batch. Each pause advances completed sources rather than restarting
+the tail; its 100 ms work budget includes the current indivisible source, followed
+by the required durability checkpoint.
 
 Identical in-progress requests are no-ops. `replaces` and optional
 `"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
@@ -1098,7 +1124,10 @@ and opening checks the epoch before parsing resolver definitions. Extended
 catalogs also use a versioned object envelope, which pre-epoch array readers
 reject even if they ignore unknown resolver fields. Older unstamped
 catalogs infer their epoch on load; the next mutation stamps it. Status polling
-uses cached epochs under a read guard. Open loads the lightweight table catalog,
+uses cached epochs under a read guard. Plain table creation/drop preserves the
+original table catalog format and reader epoch 1; actual resolver format changes
+stamp the aggregate requirement in separate metadata. Existing durable epoch
+stamps remain monotonic. Open loads the lightweight table catalog,
 then opens each table on demand. Named-table catalogs durably summarize the reader
 epoch. Background discovery isolates an unavailable table and reports its error
 in `unavailable_tables`; unrelated root/table reads remain available. Portable
@@ -1176,3 +1205,20 @@ intervals, then returns Busy before mutation; index deletion cannot spin forever
 behind extraction or promotion. No internal text-query retries repeat model work
 without the caller's latency budget. Native same-path calls retain the documented
 path serialization while inference releases the fence with pinned lifetimes.
+
+
+### Unavailable embedded namespaces
+
+Database-wide drain discovers available tables and reports failed opens in
+`pending_work_stats_json.unavailable_tables`, in both Lite and Directory.
+Healthy-table work and SQL reads continue; an operation that actually references
+an unavailable table still fails. Coordinated SQL constraints require a complete
+catalog and fail closed when dependency metadata is unavailable.
+
+Full portable backup retains its completeness guarantee and fails if any table
+cannot be opened. Explicit `backup_json({"tables":["healthy"]})` (Python
+`backup(tables=["healthy"])`) includes default plus exactly those named tables,
+without opening unrelated namespaces. Restore reconstructs only that explicit
+scope. Include dependency tables when exporting schemas with cross-table
+constraints or resolver references. Go and Rust expose `BackupJSON`/`backup_json`;
+all bindings expose replacement cancellation.

@@ -20,7 +20,7 @@ const api = @import("db.zig");
 const std = h.std;
 const catalog_key = "\x00antfly/embedded/tables/v1";
 const Record = struct { name: []const u8, id: u64 };
-const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{}, minimum_reader_version: u32 = 1 };
+const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{} };
 pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
@@ -83,9 +83,8 @@ pub fn loadCatalog(handle: *h.Handle) !void {
         },
         else => return err,
     };
-    const parsed = try std.json.parseFromSlice(Catalog, handle.alloc, bytes, .{});
+    const parsed = try std.json.parseFromSlice(Catalog, handle.alloc, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.minimum_reader_version > @import("../storage/db/catalog/resolver_catalog.zig").supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
     errdefer {
         var names = handle.embedded_table_records.keyIterator();
         while (names.next()) |name| handle.alloc.free(name.*);
@@ -98,8 +97,6 @@ pub fn loadCatalog(handle: *h.Handle) !void {
         try handle.embedded_table_records.putNoClobber(handle.alloc, name, record.id);
     }
     handle.embedded_next_table_id = parsed.value.next_id;
-    const current = handle.db.core.index_manager.minimum_reader_version.load(.acquire);
-    handle.db.core.index_manager.minimum_reader_version.store(@max(current, if (parsed.value.tables.len > 0) @max(@as(u32, 2), parsed.value.minimum_reader_version) else parsed.value.minimum_reader_version), .release);
     handle.embedded_catalog_loaded = true;
 }
 
@@ -126,9 +123,6 @@ pub fn loadAvailable(handle: *h.Handle) !void {
 }
 
 fn persist(handle: *h.Handle) !void {
-    // The lazy catalog carries an aggregate reader epoch; old strict catalog
-    // readers cannot interpret this extension, even for plain named tables.
-    handle.db.core.index_manager.minimum_reader_version.store(2, .release);
     const records = try handle.alloc.alloc(Record, handle.embedded_table_records.count());
     defer handle.alloc.free(records);
     var iterator = handle.embedded_table_records.iterator();
@@ -141,12 +135,11 @@ fn persist(handle: *h.Handle) !void {
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.less);
-    const bytes = try std.json.Stringify.valueAlloc(handle.alloc, Catalog{ .next_id = handle.embedded_next_table_id, .tables = records, .minimum_reader_version = handle.db.core.index_manager.minimum_reader_version.load(.acquire) }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(handle.alloc, Catalog{ .next_id = handle.embedded_next_table_id, .tables = records }, .{});
     defer handle.alloc.free(bytes);
     var write = try handle.db.core.store.beginWriteTxn();
     errdefer write.abort();
     try write.put(catalog_key, bytes);
-    try write.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, "2");
     write.commit() catch {
         // An uncertain catalog publication cannot be followed by operations
         // using the old in-memory catalog. Reopening reloads durable truth.
@@ -160,8 +153,15 @@ pub fn noteReaderVersion(handle: *h.Handle) !void {
     const version = handle.database().core.index_manager.minimum_reader_version.load(.acquire);
     const previous = root.db.core.index_manager.minimum_reader_version.load(.acquire);
     if (version <= previous) return;
+    // Aggregate only actual format requirements in separate metadata; the
+    // longstanding table catalog wire shape stays readable by older readers.
+    var write = try root.db.core.store.beginWriteTxn();
+    errdefer write.abort();
+    const value = try std.fmt.allocPrint(root.alloc, "{d}", .{version});
+    defer root.alloc.free(value);
+    try write.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, value);
+    try write.commit();
     root.db.core.index_manager.minimum_reader_version.store(version, .release);
-    try persist(root);
 }
 
 pub fn requireDatabase(handle: *h.Handle) !void {
@@ -176,9 +176,14 @@ pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
     defer handle.embedded_table_open_mutex.unlock(h.handleLockIo());
     if (handle.embedded_tables.get(name)) |table| return &table.db;
     const id = handle.embedded_table_records.get(name) orelse return error.UndefinedTable;
-    const table = try openTable(handle, name, id);
+    const table = openTable(handle, name, id) catch |err| {
+        const owned_name = handle.embedded_table_records.getKey(name).?;
+        try handle.embedded_table_errors.put(handle.alloc, owned_name, @errorName(err));
+        return err;
+    };
     errdefer destroy(handle, table);
     try handle.embedded_tables.putNoClobber(handle.alloc, table.name, table);
+    _ = handle.embedded_table_errors.remove(name);
     return &table.db;
 }
 

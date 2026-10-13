@@ -83,7 +83,7 @@ fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u6
     };
 }
 fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []const u8, session: ?*@import("sql_session.zig").Session) !u64 {
-    try @import("tables.zig").load(handle);
+    try @import("tables.zig").loadAvailable(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     const cursor = try handle.alloc.create(Cursor);
