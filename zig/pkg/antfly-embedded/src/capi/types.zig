@@ -359,6 +359,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.IndexReplacementFailed => .replacement_failed,
         error.IndexReplacementPending => .replacement_pending,
         error.IndexReplacementConfigurationMismatch => .replacement_configuration_mismatch,
+        error.Canceled, error.Cancelled => .cancelled,
         error.VersionConflict => .version_conflict,
         error.SqlFeatureNotSupported, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
@@ -590,6 +591,8 @@ test "capi query retry errors retain the busy ABI diagnostic" {
 }
 
 test "capi resolver replacement preconditions have distinct ABI codes" {
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Cancelled));
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Canceled));
     try std.testing.expectEqual(ErrorCode.replacement_failed, mapError(error.IndexReplacementFailed));
     try std.testing.expectEqual(ErrorCode.replacement_pending, mapError(error.IndexReplacementPending));
     try std.testing.expectEqual(ErrorCode.replacement_configuration_mismatch, mapError(error.IndexReplacementConfigurationMismatch));
