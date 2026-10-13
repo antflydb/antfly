@@ -607,6 +607,7 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
     defer query_json.deinit();
     const query_resolution = query_json.value.object.get("resolution").?.object;
+    try std.testing.expect(!query_resolution.contains("_resolution_work"));
     const resolved = query_resolution.get("entities").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", resolved[0].object.get("doc_ref").?.object.get("key").?.string);
@@ -652,6 +653,50 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     const after_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
     try std.testing.expect(!std.mem.eql(u8, &before_revision.candidates.?, &after_revision.candidates.?));
     try std.testing.expectEqualSlices(u8, &before_revision.embedding.?, &after_revision.embedding.?);
+
+    // The cache shares the artifact's portable lifetime. Exercise export ->
+    // import -> close -> reopen before the next real scorer change.
+    try runUntilIdle(handle);
+    const resolution_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:ann", "resolved");
+    defer a.free(resolution_key);
+    const cached = try handle.db.core.store.get(a, resolution_key);
+    defer a.free(cached);
+    var backup: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&backup);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_backup(id, &backup));
+    const destination_path = try std.fmt.allocPrint(a, "{s}.restored.aflite", .{tmp.path()});
+    defer a.free(destination_path);
+    const destination = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, destination_path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const destination_id = try api.publishHandle(destination);
+    {
+        defer api.antfly_db_close(destination_id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_import_backup(destination_id, .{ .ptr = backup.ptr, .len = backup.len }));
+        const imported = try destination.db.core.store.get(a, resolution_key);
+        defer a.free(imported);
+        try std.testing.expectEqualStrings(cached, imported);
+    }
+    const reopened = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, destination_path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    const reopened_cache = try reopened.db.core.store.get(a, resolution_key);
+    defer a.free(reopened_cache);
+    try std.testing.expectEqualStrings(cached, reopened_cache);
+    const reopened_entities = try tables.get(reopened, "entities");
+    try reopened_entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    try reopened.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    reopened.db.setResolutionEmbedder(fake_embedder);
+    // Explicitly install the same provider on the destination used by mentions.
+    reopened_entities.setResolutionEmbedder(fake_embedder);
+    const before_reopen_replay = embed_context.mention_calls;
+    try updated.value.object.put(a, "name", .{ .string = "knowledge_restored" });
+    const restored_scorer = try std.mem.replaceOwned(u8, a, scorer, "0.8", "0.7");
+    defer a.free(restored_scorer);
+    scorer_value.* = .{ .string = restored_scorer };
+    const restored_config = try std.json.Stringify.valueAlloc(a, updated.value, .{});
+    defer a.free(restored_config);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(reopened_id, .fromSlice(restored_config)));
+    try runUntilIdle(reopened);
+    try std.testing.expectEqual(before_reopen_replay, embed_context.mention_calls);
 }
 
 test "capi Lite models_dir loads a real extractor for graph enrichment" {
@@ -1142,4 +1187,50 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     const finished = api.enterHandle(reader, .read).?;
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
     finished.leave();
+}
+
+test "capi inline resolver ownership migrates legacy declarations and preserves independent definitions" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-ownership");
+    defer tmp.cleanup();
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
+    ;
+    const Case = struct { independent: bool, replay: bool };
+    for ([_]Case{ .{ .independent = false, .replay = false }, .{ .independent = false, .replay = true }, .{ .independent = true, .replay = true } }, 0..) |case, ordinal| {
+        const independent = case.independent;
+        const path = try std.fmt.allocPrint(a, "{s}-{d}.aflite", .{ tmp.path(), ordinal });
+        defer a.free(path);
+        const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+        const id = try api.publishHandle(handle);
+        defer api.antfly_db_close(id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+        const configs = try handle.db.listResolvers(a);
+        defer {
+            for (configs) |*cfg| cfg.deinit(a);
+            a.free(configs);
+        }
+        if (independent) {
+            try std.testing.expect(try handle.db.removeResolver("concepts"));
+            try handle.db.addResolver(configs[0]);
+        } else {
+            var legacy = configs[0];
+            legacy.inline_managed = null;
+            try handle.db.restoreResolverIdentityWithoutDrain("concepts", legacy);
+        }
+        // Replaying the existing index claims a pre-ownership inline resolver,
+        // while an independently registered definition remains independent.
+        if (case.replay) {
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+            try std.testing.expectEqual(!independent, handle.db.core.index_manager.getResolver("concepts").?.inline_managed.?);
+        }
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("knowledge"), &deleted));
+        try std.testing.expect(deleted);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&out);
+        try std.testing.expectEqual(if (independent) h.capi.ErrorCode.ok else h.capi.ErrorCode.not_found, api.antfly_db_render_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Antfly\",\"label\":\"concept\"}"), &out));
+    }
 }

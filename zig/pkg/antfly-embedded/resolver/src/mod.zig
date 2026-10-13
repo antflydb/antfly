@@ -87,6 +87,15 @@ pub const Candidate = struct {
     features: ?[]const matcher.Feature = null,
 };
 
+fn hasCrossTableRedirect(candidates: []const Candidate) bool {
+    for (candidates) |candidate| {
+        if (candidate.resolved_doc_ref) |survivor| {
+            if (!std.mem.eql(u8, candidate.doc_ref.table, survivor.table)) return true;
+        }
+    }
+    return false;
+}
+
 pub const Decision = enum {
     /// Linked to an existing candidate entity.
     match,
@@ -1295,14 +1304,24 @@ pub const WorkCache = struct {
         const a = arena.allocator();
         var pool: std.ArrayListUnmanaged(Candidate) = .empty;
         var indices: std.AutoHashMapUnmanaged([32]u8, usize) = .empty;
+        const RecordIdentity = struct { fields: usize, len: usize, survivor_fields: usize, survivor_len: usize, endpoint: [32]u8 };
+        var digests: std.AutoHashMapUnmanaged(RecordIdentity, [32]u8) = .empty;
         const mentions = try a.alloc(Mention, self.mentions.len);
         for (self.mentions, mentions) |entry, *mention| {
             const uses = try a.alloc(Use, entry.candidates.len);
             for (entry.candidates, uses) |candidate, *use| {
                 var row = candidate;
                 row.features = null;
-                const digest = try fingerprint(a, row);
-                const slot = try indices.getOrPut(a, digest);
+                const identity: RecordIdentity = .{
+                    .fields = @intFromPtr(row.record.fields.ptr),
+                    .len = row.record.fields.len,
+                    .survivor_fields = if (row.resolved_record) |record| @intFromPtr(record.fields.ptr) else 0,
+                    .survivor_len = if (row.resolved_record) |record| record.fields.len else 0,
+                    .endpoint = try fingerprint(a, .{ row.doc_ref, row.label, row.resolved_doc_ref }),
+                };
+                const memo = try digests.getOrPut(a, identity);
+                if (!memo.found_existing) memo.value_ptr.* = try fingerprint(a, row);
+                const slot = try indices.getOrPut(a, memo.value_ptr.*);
                 if (!slot.found_existing) {
                     slot.value_ptr.* = pool.items.len;
                     try pool.append(a, row);
@@ -1391,6 +1410,7 @@ pub const ResolutionStage = struct {
     candidate_dependency: ?[32]u8 = null,
     stats: ?*WorkStats = null,
     promotion_enabled: bool = true,
+    retain_work: bool = true,
     /// Optional name-embedding backfill: when set, each mention lacking an
     /// `embedding` gets one from its text before blocking/scoring, so `ann`
     /// candidate search and cosine comparisons have a query vector.
@@ -1527,7 +1547,7 @@ pub const ResolutionStage = struct {
                 if (alias_mask[i]) continue;
                 if (self.candidate_dependency) |dep| work[i].candidate_dependency = try fingerprint(a, .{ dep, entity });
                 if (prior[i]) |entry| {
-                    if (sameDependency(entry.candidate_dependency, work[i].candidate_dependency)) {
+                    if (sameDependency(entry.candidate_dependency, work[i].candidate_dependency) and !hasCrossTableRedirect(entry.candidates)) {
                         lists[i] = entry.candidates;
                         if (self.stats) |stats| stats.reused_candidate_mentions += 1;
                         continue;
@@ -1560,12 +1580,16 @@ pub const ResolutionStage = struct {
                             break;
                         }
                     };
-                    candidate.features = try scorer.featuresAlloc(a, mention, candidate.record, old_features, if (self.stats) |stats| &stats.features else null);
+                    const inputs_unchanged = if (prior[i]) |entry| sameDependency(entry.candidate_dependency, work[i].candidate_dependency) and !hasCrossTableRedirect(entry.candidates) else false;
+                    candidate.features = try scorer.featuresAllocWithInputReuse(a, mention, candidate.record, old_features, inputs_unchanged, if (self.stats) |stats| &stats.features else null);
                 }
             }
             lists[i] = candidates;
             work[i].embedding = entity.embedding;
             work[i].candidates = candidates;
+            // The source-table revision cannot validate a survivor in another
+            // table. Refetch until the provider supplies per-survivor revisions.
+            if (hasCrossTableRedirect(candidates)) work[i].candidate_dependency = null;
         }
 
         var resolution = try self.resolver.resolve(gpa, self.config_generation, parsed.entities, lists);
@@ -1595,7 +1619,7 @@ pub const ResolutionStage = struct {
                 }
             }
         }
-        resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
+        if (self.retain_work) resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
         return try resolution.toJson(gpa);
     }
 

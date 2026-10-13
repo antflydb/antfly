@@ -27527,6 +27527,10 @@ pub const DB = struct {
         /// nonblocking: a refresh holding a group activity must not wait for
         /// in-flight resolution or promotion callbacks.
         drain_backfill: bool = true,
+        /// Standalone callers may wait for in-flight replay without draining a
+        /// corpus backfill. Managed refresh callbacks keep this false to avoid
+        /// waiting while holding a group activity needed by the replay owner.
+        wait_for_activity: bool = false,
         /// Only the explicit namespace migration operation may bypass this guard.
         migrate_namespace: bool = false,
     };
@@ -27550,7 +27554,7 @@ pub const DB = struct {
             // Do not wait for distributed callbacks, rewrite the catalog, or
             // retire a serving owner just because replay is currently active.
             if (!options.migrate_namespace and self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
-            var activity = try self.acquireResolverCatalogActivity(options.drain_backfill);
+            var activity = try self.acquireResolverCatalogActivity(options.drain_backfill or options.wait_for_activity);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -27639,6 +27643,26 @@ pub const DB = struct {
                 continue;
             };
         }
+    }
+
+    pub fn restoreResolverIdentityWithoutDrain(self: *DB, name: []const u8, cfg: ?index_manager_mod.ResolverConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        if (cfg) |previous| {
+            try self.core.index_manager.restoreResolverIdentity(self.core.store, previous);
+        } else {
+            _ = try self.core.index_manager.removeResolver(self.core.store, name);
+        }
+        if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
     }
 
     pub fn removeResolverWithoutDrain(self: *DB, name: []const u8) !bool {
@@ -29016,6 +29040,8 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         if (context == null) try self.enforceReplicationWriteGate();
+        var resolver_activity = try self.acquireResolverCatalogActivity(context == null);
+        defer resolver_activity.deinit();
         var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
         defer structural_guard.deinit();
         {

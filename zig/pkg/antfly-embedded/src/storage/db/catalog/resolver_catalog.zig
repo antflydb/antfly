@@ -101,6 +101,10 @@ pub const ResolverConfig = struct {
     /// Explicit namespace operations fence subsequent declarative replacements,
     /// including resets with no remaining merge records.
     namespace_generation: u64 = 0,
+    /// Inline declarations own execution, while retired definitions retain identity
+    /// state for re-add/rename. These fields are catalog-owned, never public config.
+    inline_managed: ?bool = null,
+    retired: bool = false,
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
     /// Mention labels this resolver consumes. Empty means all labels
@@ -199,7 +203,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -256,6 +260,8 @@ pub const ResolverConfig = struct {
             .merge_state_version = cfg.merge_state_version,
             .resolution_generation = cfg.resolution_generation,
             .namespace_generation = cfg.namespace_generation,
+            .inline_managed = cfg.inline_managed,
+            .retired = cfg.retired,
             .promote = cfg.promote,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
@@ -308,7 +314,7 @@ pub const ResolverConfig = struct {
     pub fn validate(self: ResolverConfig) !void {
         try resolver_lib.validateAliases(self.aliases);
         try resolver_lib.validateAliases(self.merges);
-        if (self.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
+        if (self.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
         const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(effective);
         try resolver_lib.validateAliases(effective);
@@ -379,11 +385,33 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
         alloc.free(out);
     }
     for (parsed.value, 0..) |cfg, i| {
-        if (cfg.merge_state_version > 1) return error.UnsupportedResolverCatalogVersion;
+        if (cfg.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
+        if (cfg.retired and (cfg.inline_managed != true or cfg.merge_state_version != 2)) return error.InvalidResolverConfig;
         out[i] = try ResolverConfig.clone(alloc, cfg);
         initialized += 1;
     }
     return out;
+}
+
+/// Execution plans exclude retired identities; backups and catalog comparisons
+/// use deserializeCatalog so durable merges and namespace fences remain intact.
+pub fn deserializeActiveCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig {
+    const all = try deserializeCatalog(alloc, data);
+    defer alloc.free(all);
+    var active: std.ArrayList(ResolverConfig) = .empty;
+    errdefer {
+        for (active.items) |*cfg| cfg.deinit(alloc);
+        active.deinit(alloc);
+    }
+    // Allocate before transferring ownership so failure frees every definition.
+    active.ensureTotalCapacity(alloc, all.len) catch |err| {
+        for (all) |*cfg| cfg.deinit(alloc);
+        return err;
+    };
+    for (all) |*cfg| {
+        if (cfg.retired) cfg.deinit(alloc) else active.appendAssumeCapacity(cfg.*);
+    }
+    return try active.toOwnedSlice(alloc);
 }
 
 pub const merge_catalog_key = "\x00\x00__metadata__:resolver_merges_v1";
@@ -416,7 +444,7 @@ pub fn applyMergeState(alloc: Allocator, configs: []ResolverConfig, data: []cons
         var found = false;
         for (configs) |*cfg| {
             if (!std.mem.eql(u8, cfg.name, state.name)) continue;
-            if (cfg.merges.len > 0 or cfg.merge_state_version != 1 or cfg.merge_generation == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
+            if (cfg.merges.len > 0 or (cfg.merge_state_version == 0 or cfg.merge_state_version > 2) or cfg.merge_generation == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
             cfg.merges = try ResolverConfig.cloneAliases(alloc, state.aliases);
             try cfg.validate();
             found = true;
@@ -424,7 +452,7 @@ pub fn applyMergeState(alloc: Allocator, configs: []ResolverConfig, data: []cons
         }
         if (!found) return error.InvalidResolverMergeState;
     }
-    for (configs) |cfg| if ((cfg.merge_generation > 0 or cfg.merge_state_version > 0) and cfg.merges.len == 0) return error.MissingResolverMergeState;
+    for (configs) |cfg| if ((cfg.merge_generation > 0 or cfg.merge_state_version == 1) and cfg.merges.len == 0) return error.MissingResolverMergeState;
 }
 
 test "resolver catalog round trip" {
@@ -696,6 +724,36 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
         for (forward) |*entry| entry.deinit(alloc);
         alloc.free(forward);
     }
-    const unsupported = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"merge_state_version\":2}]";
+    const unsupported = "[{\"name\":\"r\",\"table\":\"default\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"x\",\"merge_state_version\":3}]";
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, deserializeCatalog(alloc, unsupported));
+}
+
+test "capi retired resolver identities retain merges without entering execution catalogs" {
+    const a = std.testing.allocator;
+    var cfg: ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .inline_managed = true, .retired = true, .merge_state_version = 2 };
+    const encoded = try serializeCatalog(a, &.{cfg});
+    defer a.free(encoded);
+    const active = try deserializeActiveCatalog(a, encoded);
+    defer a.free(active);
+    try std.testing.expectEqual(@as(usize, 0), active.len);
+    const identities = try deserializeCatalog(a, encoded);
+    defer {
+        for (identities) |*entry| entry.deinit(a);
+        a.free(identities);
+    }
+    try applyMergeState(a, identities, "[]");
+    try std.testing.expect(identities[0].retired);
+    cfg.merges = &.{.{ .key = "a", .target = "b" }};
+    cfg.merge_generation = 1;
+    const merged = try serializeCatalog(a, &.{cfg});
+    defer a.free(merged);
+    const sidecar = try serializeMergeState(a, &.{cfg});
+    defer a.free(sidecar);
+    const restored = try deserializeCatalog(a, merged);
+    defer {
+        for (restored) |*entry| entry.deinit(a);
+        a.free(restored);
+    }
+    try applyMergeState(a, restored, sidecar);
+    try std.testing.expectEqualStrings("b", restored[0].merges[0].target);
 }

@@ -913,12 +913,22 @@ renamed. Update your declarative inline config to the new table/template and
 mapped inline aliases before reapplying it. A durable namespace fence rejects
 old table/template or alias configurations even after reset leaves zero merges.
 Further identity changes require another explicit namespace operation. Changing an existing physical index config still requires
-its normal delete/recreate lifecycle, which preserves the resolver and merges.
+its normal delete/recreate lifecycle, which retains resolver identity and merges.
 Resolver identity is scoped by source table and resolver name, independently of physical
 index names: deleting index v1 and adding index v2 with the same resolver name
 and source/output artifact bindings retains merges and namespace fences. Renaming
 the resolver itself creates a new identity; removing it deliberately deletes its
-curation.
+curation. Inline declarations own resolver execution: deleting the last declaring
+index retires its resolver, so rendering/query resolution returns not found and
+new source writes do not run that resolver. A shared declaring index keeps it
+active. Retired definitions retain merges and namespace fences in the portable
+catalog, including across backup/restore; re-add/rename reactivates them through
+the same namespace admission checks. Independently registered resolvers remain
+active when an index is removed. Reapplying an older inline declaration records
+its ownership without changing its resolution revision. Retired identities use
+required catalog version 2, so libraries without lifecycle support reject them
+instead of silently reactivating them. Native Lite and Directory C API handles both
+reapply inline resolvers when adding an identical existing index.
 Existing artifact/index repair APIs rebuild derived state under the declared
 identity rules; they do not infer a key migration. This namespace operation
 reuses the existing resolver replay/repair pipeline for derived reconciliation.
@@ -978,7 +988,11 @@ Each extraction-local mention records its embedding dependencies, candidate
 universe revision, candidate records and raw comparator features. This is
 reusable work, not authoritative identity state: old artifacts without it work
 normally, and malformed or unknown cache versions are discarded and recomputed.
-Public `resolve_query` responses omit the private cache.
+Public `resolve_query` responses omit the private cache and do not serialize
+or calculate persistence revisions for ephemeral work. Canonical records and
+vectors shared by several mentions are stored once per artifact. A validated
+candidate/mention revision also avoids rehashing unchanged vectors while
+reusing their comparison features.
 
 | Change | Repeated work |
 | --- | --- |
@@ -998,7 +1012,12 @@ becoming visible after an ANN drain. Embedding revisions cover the destination's
 embedding configuration independently of table mutations. Runtime adapters that
 cannot provide a complete revision return null: candidate fetching and/or
 embedding generation then run again rather than trust incomplete dependencies.
-The distributed adapter currently takes this conservative path.
+The distributed adapter currently takes this conservative path. Candidate cache
+dependencies use the effective blocking strategy: a resolver without a scorer
+uses exact-key lookup even if its declarative strategy is prefix or ANN.
+Cross-table redirect candidates are refetched because the source-table revision
+does not cover survivor changes in another table. Comparison input hashes still
+allow safe feature reuse when the refreshed candidate fields are unchanged.
 
 The work cache is part of the resolution artifact, so the existing atomic
 artifact/replay commit, portable backup/import, source deletion and bounded

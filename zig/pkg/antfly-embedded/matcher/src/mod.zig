@@ -312,12 +312,16 @@ pub const Scorer = struct {
     /// A condition/weight/bias/decision edit reuses these values; a field or
     /// comparator edit computes just its missing dependencies.
     pub fn featuresAlloc(self: *const Scorer, alloc: std.mem.Allocator, left: Record, right: Record, previous: []const Feature, stats: ?*FeatureStats) ![]const Feature {
+        return self.featuresAllocWithInputReuse(alloc, left, right, previous, false, stats);
+    }
+
+    /// A validated candidate-universe/mention revision proves that all record
+    /// inputs are identical. Reuse then avoids even rehashing large vectors.
+    pub fn featuresAllocWithInputReuse(self: *const Scorer, alloc: std.mem.Allocator, left: Record, right: Record, previous: []const Feature, inputs_unchanged: bool, stats: ?*FeatureStats) ![]const Feature {
         var out: std.ArrayListUnmanaged(Feature) = .empty;
         for (self.comparisons) |cmp| {
-            const inputs = try std.json.Stringify.valueAlloc(alloc, .{ left.get(cmp.left), right.get(cmp.right) }, .{});
-            defer alloc.free(inputs);
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(inputs, &digest, .{});
+            var digest: ?[32]u8 = null;
+            if (!inputs_unchanged) digest = try featureInputDigest(alloc, left.get(cmp.left), right.get(cmp.right));
             for (cmp.levels) |level| {
                 const threshold = switch (level.condition) {
                     .otherwise => continue,
@@ -329,14 +333,20 @@ pub const Scorer = struct {
                     break;
                 };
                 if (duplicate) continue;
+                var input: [32]u8 = undefined;
                 const cached: ?f64 = found: {
-                    for (previous) |f| if (f.comparator == threshold.comparator and std.mem.eql(u8, f.left, cmp.left) and std.mem.eql(u8, f.right, cmp.right) and std.mem.eql(u8, &f.input, &digest) and std.math.isFinite(f.value)) break :found f.value;
+                    for (previous) |f| if (f.comparator == threshold.comparator and std.mem.eql(u8, f.left, cmp.left) and std.mem.eql(u8, f.right, cmp.right) and (inputs_unchanged or std.mem.eql(u8, &f.input, &digest.?)) and std.math.isFinite(f.value)) {
+                        input = f.input;
+                        break :found f.value;
+                    };
+                    if (digest == null) digest = try featureInputDigest(alloc, left.get(cmp.left), right.get(cmp.right));
+                    input = digest.?;
                     break :found null;
                 };
                 if (stats) |st| {
                     if (cached != null) st.reused += 1 else st.computed += 1;
                 }
-                try out.append(alloc, .{ .left = cmp.left, .right = cmp.right, .comparator = threshold.comparator, .input = digest, .value = cached orelse similarity(alloc, threshold.comparator, left.get(cmp.left), right.get(cmp.right)) });
+                try out.append(alloc, .{ .left = cmp.left, .right = cmp.right, .comparator = threshold.comparator, .input = input, .value = cached orelse similarity(alloc, threshold.comparator, left.get(cmp.left), right.get(cmp.right)) });
             }
         }
         return try out.toOwnedSlice(alloc);
@@ -393,6 +403,14 @@ pub const Scorer = struct {
         return out;
     }
 };
+
+fn featureInputDigest(alloc: std.mem.Allocator, left: Value, right: Value) ![32]u8 {
+    const inputs = try std.json.Stringify.valueAlloc(alloc, .{ left, right }, .{});
+    defer alloc.free(inputs);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(inputs, &digest, .{});
+    return digest;
+}
 
 fn parseComparison(a: std.mem.Allocator, value: std.json.Value) ParseError!Comparison {
     if (value != .object) return error.InvalidComparison;

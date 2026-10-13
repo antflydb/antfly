@@ -365,7 +365,7 @@ pub fn resolveQueryExtractionAlloc(
     // while retaining the durable catalog's label-routing rules.
     for (resolvers) |*sibling| {
         if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse continue;
         if (outcome.resolution_value) |value| {
             overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
                 gpa.free(outcome.resolution_key);
@@ -374,14 +374,9 @@ pub fn resolveQueryExtractionAlloc(
             };
         } else gpa.free(outcome.resolution_key);
     }
-    const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse return error.InvalidArgument;
+    const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse return error.InvalidArgument;
     defer gpa.free(outcome.resolution_key);
-    const value = outcome.resolution_value orelse return error.InvalidArgument;
-    defer gpa.free(value);
-    var result = try std.json.parseFromSlice(std.json.Value, gpa, value, .{});
-    defer result.deinit();
-    _ = result.value.object.orderedRemove("_resolution_work");
-    return try std.json.Stringify.valueAlloc(gpa, result.value, .{});
+    return outcome.resolution_value orelse error.InvalidArgument;
 }
 
 pub fn processChangedExtractionWithConfig(
@@ -395,6 +390,22 @@ pub fn processChangedExtractionWithConfig(
     embedder: ?embedder_mod.DenseEmbedder,
     persistence: PersistenceMode,
     pending_overlay: []const ArtifactWrite,
+) !?ProcessOutcome {
+    return processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, persistence, pending_overlay, true);
+}
+
+fn processChangedExtractionWithConfigOptions(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    changed_key: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    persistence: PersistenceMode,
+    pending_overlay: []const ArtifactWrite,
+    retain_work: bool,
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
@@ -428,11 +439,12 @@ pub fn processChangedExtractionWithConfig(
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
     var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg) };
     var source_provider: SourceCandidateProvider = undefined;
+    const effective_strategy = if (resolver.scorer == null) "exact_key" else cfg.candidate_search;
     const blocked_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
         // in-store providers when the resolver declares a candidate search mode.
         if (batch_source) |src| {
-            if (candidateModeFromConfig(if (resolver.scorer == null) "exact_key" else cfg.candidate_search)) |mode| {
+            if (candidateModeFromConfig(effective_strategy)) |mode| {
                 source_provider = .{
                     .source = src,
                     .resolver = &resolver,
@@ -495,18 +507,20 @@ pub fn processChangedExtractionWithConfig(
     const sibling_resolutions = try siblingResolutionsJsonAlloc(gpa, resolvers, cfg, store, parsed, pending_overlay);
     defer if (sibling_resolutions) |raw| gpa.free(raw);
 
-    const revisions: CandidateSource.Revisions = if (batch_source) |source|
-        if (source.vtable.revisions) |read| try read(source.ptr, gpa, cfg.table, annIndexName(cfg), cfg.name_embedding) else .{}
-    else
-        .{};
+    const revisions: CandidateSource.Revisions = if (retain_work and provider == null) revisions: {
+        const source = batch_source orelse break :revisions .{};
+        const read = source.vtable.revisions orelse break :revisions .{};
+        break :revisions try read(source.ptr, gpa, cfg.table, annIndexName(cfg), cfg.name_embedding);
+    } else .{};
     const vector_fields = try resolver.candidateVectorFields(gpa);
     defer gpa.free(vector_fields);
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.effectiveGeneration(),
         .promotion_enabled = cfg.promote,
+        .retain_work = retain_work,
         .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding, cfg.name_embedding_dims }) else null,
-        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, cfg.candidate_search, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
+        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
         .embedder = stage_embedder,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,
@@ -4735,4 +4749,74 @@ test "incremental resolution replay commits refreshes atomically without unchang
     var decoded = try resolver_lib.parseResolution(a, changed);
     defer decoded.deinit();
     try std.testing.expectEqualStrings("person/ada", decoded.entities[0].doc_ref.key);
+}
+
+test "incremental resolution invalidates effective blocking and cross-table survivors" {
+    const a = testing.allocator;
+    const Epoch = struct {
+        fn revisions(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!CandidateSource.Revisions {
+            // Deliberately unchanged source table while the survivor changes.
+            return .{ .candidates = @as([32]u8, @splat(7)) };
+        }
+    };
+    var source: FakeCandidateSource = .{ .alloc = a };
+    defer source.deinit();
+    const candidates: CandidateSource = .{ .ptr = &source, .vtable = &.{ .get = FakeCandidateSource.getFn, .scan_prefix = FakeCandidateSource.scanPrefixFn, .revisions = Epoch.revisions } };
+    var memory: MapStore = .{ .alloc = a };
+    defer memory.deinit();
+    const extraction = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(extraction);
+    try memory.store().put(extraction, "{\"entities\":[{\"id\":\"e\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+    var configs = [_]ResolverConfig{.{ .name = "r", .table = "people", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "person/{{ uslug _entity.text }}", .candidate_search = "prefix", .config_generation = 1 }};
+    try source.put("person/canonical", "{\"canonical_name\":\"Ada\",\"label\":\"person\"}");
+    const first = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(first.resolution_key);
+    // Without a scorer the effective strategy is exact_key, caching no hits.
+    configs[0].scorer_json =
+        \\{"comparisons":[{"name":"n","left":"text","right":"canonical_name","levels":[{"when":"exact","weight":8},{"else":true,"weight":-8}]}],"combine":{"bias":-3},"decision":{"match":0.9}}
+    ;
+    configs[0].config_generation += 1;
+    const warm = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(warm.resolution_key);
+    const warm_value = (try memory.store().get(a, warm.resolution_key)).?;
+    defer a.free(warm_value);
+    var parsed = try resolver_lib.parseResolution(a, warm_value);
+    defer parsed.deinit();
+    try testing.expectEqual(resolver_lib.Decision.match, parsed.entities[0].decision);
+    try testing.expectEqualStrings("person/canonical", parsed.entities[0].doc_ref.key);
+    try memory.store().delete(warm.resolution_key);
+    const cold = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(cold.resolution_key);
+    const cold_value = (try memory.store().get(a, cold.resolution_key)).?;
+    defer a.free(cold_value);
+    try testing.expectEqualStrings(warm_value, cold_value);
+
+    // Add a redirect to a different table and then remove only its survivor.
+    // The source-table revision stays unchanged, so cross-table reuse is unsafe.
+    try source.put("person/canonical", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"survivor\",\"merged_into_table\":\"curated\"}");
+    try source.put("survivor", "{\"canonical_name\":\"Ada\",\"label\":\"person\"}");
+    try memory.store().delete(cold.resolution_key);
+    const redirected = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(redirected.resolution_key);
+    const redirected_value = (try memory.store().get(a, redirected.resolution_key)).?;
+    defer a.free(redirected_value);
+    var redirected_parsed = try resolver_lib.parseResolution(a, redirected_value);
+    defer redirected_parsed.deinit();
+    try testing.expectEqualStrings("curated", redirected_parsed.entities[0].doc_ref.table);
+    const removed = source.map.fetchRemove("survivor").?;
+    a.free(removed.key);
+    a.free(removed.value);
+    const deleted_warm = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(deleted_warm.resolution_key);
+    const deleted_value = (try memory.store().get(a, deleted_warm.resolution_key)).?;
+    defer a.free(deleted_value);
+    var deleted = try resolver_lib.parseResolution(a, deleted_value);
+    defer deleted.deinit();
+    try testing.expect(deleted.entities[0].decision != .match);
+    try memory.store().delete(deleted_warm.resolution_key);
+    const deleted_cold = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(deleted_cold.resolution_key);
+    const deleted_cold_value = (try memory.store().get(a, deleted_cold.resolution_key)).?;
+    defer a.free(deleted_cold_value);
+    try testing.expectEqualStrings(deleted_value, deleted_cold_value);
 }

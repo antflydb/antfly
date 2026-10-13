@@ -407,14 +407,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         # A reset fences the namespace even though the durable merge list is empty.
         stale = json.loads(json.dumps(config))
-        if destination_storage == antfly_embedded.Storage.LITE:
-            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
-                restored.add_index(stale)
-        else:
-            # Directory index admission does not reapply inline resolvers.
-            assert (
-                restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
-            )
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+            restored.add_index(stale)
         current = json.loads(json.dumps(config))
         current["name"] = "fresh_namespace"
         current["resolvers"][0]["key_template"] = "fresh/{{ uslug _entity.text }}"
@@ -432,9 +426,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         # Even an alias-only stale replacement is rejected.
         current["name"] = "stale_aliases"
         current["resolvers"][0]["aliases"] = [{"key": "fresh/qwen3", "target": "fresh/old"}]
-        if destination_storage == antfly_embedded.Storage.LITE:
-            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
-                restored.add_index(current)
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="aliases.*resetting or migrating"):
+            restored.add_index(current)
         restored.set_resolver_namespace(
             "concepts",
             {
@@ -518,3 +511,126 @@ def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
             restored.add_index(changed)
         assert restored.render_resolver_key("concepts", mention)["key"] == "topic/qwen3"
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) -> None:
+    path = tmp_path / ("scoped.aflite" if storage == antfly_embedded.Storage.LITE else "scoped")
+    options = antfly_embedded.OpenOptions(
+        storage=storage, profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True
+    )
+    mention = {"id": "a", "text": "Ada", "label": "person"}
+    render_mention = {"text": "Ada", "label": "person"}
+    extraction = {
+        "entities": [mention, {"id": "b", "text": "Bob", "label": "person"}],
+        "relations": [{"type": "knows", "source": "a", "target": "b"}],
+    }
+    configs = {}
+    for suffix in ("alpha", "beta"):
+        configs[suffix] = {
+            "name": "knowledge",
+            "type": "graph",
+            "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+            "artifact": {
+                "name": "kg",
+                "kind": "asset",
+                "source": {"type": "field", "value": "kg"},
+                "content_type": "application/json",
+            },
+            "edge_types": [{"name": "mentions"}, {"name": "knows"}],
+            "resolvers": [
+                {
+                    "name": "people",
+                    "table": f"entities_{suffix}",
+                    "promote": False,
+                    "source_artifact": "kg",
+                    "resolution_artifact": "resolved",
+                    "key_template": suffix + "/{{ uslug _entity.text }}",
+                    "config_generation": 1,
+                }
+            ],
+        }
+    opener = (
+        antfly_embedded.create_with_options
+        if storage == antfly_embedded.Storage.LITE
+        else antfly_embedded.open_with_options
+    )
+    with opener(path, options) as db:
+        for suffix in configs:
+            db.create_table(f"entities_{suffix}", {})
+            db.create_table(f"source_{suffix}", {})
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.batch_json({"inserts": {"claim": {"kg": extraction}}})
+                table.run_until_idle()
+        with db.open_table("source_alpha") as alpha, db.open_table("source_beta") as beta:
+            alpha.merge_resolver_keys("people", "alpha/ada", "alpha/canonical")
+            alpha.run_until_idle()
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            assert beta.render_resolver_key("people", render_mention)["key"] == "beta/ada"
+            assert len(alpha.edges("knowledge", "alpha/canonical", "knows", 0)) == 1
+            assert len(beta.edges("knowledge", "beta/ada", "knows", 0)) == 1
+            # One resolver may have multiple declaring indexes. Only the last
+            # owner retires it; table-local curation never affects its sibling.
+            shared = json.loads(json.dumps(configs["alpha"]))
+            shared["name"] = "shared"
+            alpha.add_index(shared)
+            alpha.run_until_idle()
+            assert alpha.delete_index("knowledge")
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            assert alpha.delete_index("shared")
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.resolve_query("people", {"extraction": extraction})
+            assert beta.render_resolver_key("people", render_mention)["key"] == "beta/ada"
+        # A backup made while retired must retain identity without reactivating it.
+        backup = db.backup()
+    restored_path = tmp_path / ("archived.aflite" if storage == antfly_embedded.Storage.LITE else "archived")
+    antfly_embedded.restore(restored_path, backup, storage=storage)
+    with antfly_embedded.open_with_options(restored_path, options) as restored:
+        with restored.open_table("source_alpha") as alpha:
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            # Failed reactivation of a retained namespace cannot lose its merges.
+            invalid = json.loads(json.dumps(configs["alpha"]))
+            invalid["resolvers"][0]["key_template"] = "wrong/{{ uslug _entity.text }}"
+            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+                alpha.add_index(invalid)
+            alpha.run_until_idle()
+            # Partial registration must restore a previously retired identity.
+            invalid = json.loads(json.dumps(configs["alpha"]))
+            invalid["resolvers"].append({**invalid["resolvers"][0], "name": "conflicting"})
+            with pytest.raises(antfly_embedded.InvalidArgumentError):
+                alpha.add_index(invalid)
+            alpha.run_until_idle()
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            renamed = json.loads(json.dumps(configs["alpha"]))
+            renamed["name"] = "knowledge_v2"
+            alpha.add_index(renamed)
+            alpha.run_until_idle()
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            assert len(alpha.edges("knowledge_v2", "alpha/canonical", "knows", 0)) == 1
+    # Exact consumer pattern on two tables: reopen, reapply identical inline
+    # configs on existing indexes, then render/resolve and check relation edges.
+    with antfly_embedded.open_with_options(path, options) as db:
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.run_until_idle()
+    with antfly_embedded.open_with_options(path, options) as db:
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.run_until_idle()
+                expected = "alpha/canonical" if suffix == "alpha" else "beta/ada"
+                rendered = table.render_resolver_key("people", render_mention)
+                assert rendered["key"] == expected
+                assert rendered["table"] == f"entities_{suffix}"
+                result = table.resolve_query("people", {"extraction": extraction})
+                endpoint = result["resolution"]["entities"][0]["doc_ref"]
+                assert endpoint["key"] == expected
+                assert endpoint["table"] == f"entities_{suffix}"
+                assert len(table.edges("knowledge", expected, "knows", 0)) == 1

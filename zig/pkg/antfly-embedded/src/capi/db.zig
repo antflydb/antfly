@@ -260,7 +260,7 @@ pub const LiteCatalogRollback = struct {
         return .{
             .handle = handle,
             .prior = prior,
-            .prior_resolvers = try handle.database().*.listResolvers(handle.alloc),
+            .prior_resolvers = try handle.database().core.index_manager.listResolverIdentities(handle.alloc),
         };
     }
 
@@ -303,15 +303,9 @@ pub const LiteCatalogRollback = struct {
                 }
                 break :blk null;
             };
-            if (prior) |cfg| {
-                _ = self.handle.database().*.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }) catch |err| {
-                    std.log.warn("lite AddIndex rollback failed to restore resolver {s}: {s}", .{ name, @errorName(err) });
-                };
-            } else {
-                _ = self.handle.database().*.removeResolverWithoutDrain(name) catch |err| {
-                    std.log.warn("lite AddIndex rollback failed to remove resolver {s}: {s}", .{ name, @errorName(err) });
-                };
-            }
+            self.handle.database().*.restoreResolverIdentityWithoutDrain(name, prior) catch |err| {
+                std.log.warn("AddIndex rollback failed to restore resolver identity {s}: {s}", .{ name, @errorName(err) });
+            };
         }
         for (self.touched.items) |touch| {
             const prior = blk: {
@@ -338,9 +332,9 @@ pub const LiteCatalogRollback = struct {
 /// server registers resolvers from the whole table's indexes JSON
 /// (`metadata_table_provisioner.ensureResolversWithOptions`) after index
 /// provisioning; a native Lite handle admits one index at a time, so this
-/// harvests the graph config's `"resolvers"` array after the index itself is
-/// admitted. Add/update only — a single index's config never proves another
-/// index's resolvers are gone, so nothing is removed here. `upsertResolver`
+/// harvests the graph config's `"resolvers"` array before graph construction so
+/// retained canonical endpoints are available during index rebuild. Deletion reconciles ownership across all admitted graph indexes;
+/// the last owner's removal retires execution but retains durable identity. `upsertResolver`
 /// is idempotent for an unchanged config; backfill is deferred to the
 /// resolver workers (or the next `antfly_db_run_until_idle`).
 pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
@@ -364,11 +358,13 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
         cfg.value.merge_state_version = 0;
         cfg.value.resolution_generation = 0;
         cfg.value.namespace_generation = 0;
+        cfg.value.inline_managed = true;
+        cfg.value.retired = false;
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
         try rollback.willTouchResolver(cfg.value.name);
-        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false });
+        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false, .wait_for_activity = true });
     }
 }
 
@@ -7085,7 +7081,7 @@ pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolv
         next.merges = aliases.items;
         next.merge_state_version = 1;
         next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7149,7 +7145,7 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
         else
             0;
         next.merge_state_version = if (merges.items.len > 0) 1 else 0;
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7204,9 +7200,9 @@ pub export fn antfly_db_add_index_json(
     // who was told the AddIndex failed.
     var rollback: ?LiteCatalogRollback = null;
     defer if (rollback) |*undo| undo.deinit();
-    if (handle.lite_profile == .native) {
+    {
         rollback = LiteCatalogRollback.init(handle) catch |err| return capi.mapError(err);
-        registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
+        if (handle.lite_profile == .native) registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
             rollback.?.restore();
             return capi.mapError(err);
         };
@@ -7223,10 +7219,10 @@ pub export fn antfly_db_add_index_json(
     else
         parsed.value.config_json;
     defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
-    // Native clients replay inline configs on every open. Admit an identical
+    // Embedded clients replay inline configs on every open. Admit an identical
     // existing index idempotently, while retaining duplicate-config conflicts.
     var existing_index = false;
-    if (handle.lite_profile == .native) {
+    {
         const installed = handle.database().listIndexes(handle.alloc) catch |err| {
             if (rollback) |*undo| undo.restore();
             return capi.mapError(err);
@@ -7245,6 +7241,18 @@ pub export fn antfly_db_add_index_json(
             existing_index = true;
         }
     }
+    // Reactivate inline identities before graph construction reads retained
+    // resolution artifacts. Otherwise a new generation can be built while its
+    // resolver is retired, then skip already-current resolutions on replay.
+    // The undo buffer restores both active and retired state on failed admission.
+    if (kind == .graph) {
+        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
+            rollback.?.restore();
+            if (err == error.ResolverMergeNamespaceChange)
+                return capi.mapErrorContext(err, "changing a resolver table, key_template, or fenced inline aliases requires explicitly resetting or migrating its durable namespace");
+            return capi.mapError(err);
+        };
+    }
     if (!existing_index) handle.database().*.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
@@ -7253,23 +7261,6 @@ pub export fn antfly_db_add_index_json(
         if (rollback) |*undo| undo.restore();
         return capi.mapError(err);
     };
-    // A native handle also registers the entity resolvers a graph config
-    // declares inline, after the index (and its source artifact's enrichment)
-    // is admitted, the way the server's provisioner runs ensureResolvers
-    // after index reconciliation. A resolver registration failure unwinds
-    // the just-admitted index and the enrichment catalog so the call is
-    // all-or-nothing.
-    if (handle.lite_profile == .native and kind == .graph) {
-        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
-            if (!existing_index) _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
-                std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
-            };
-            if (rollback) |*undo| undo.restore();
-            if (err == error.ResolverMergeNamespaceChange)
-                return capi.mapErrorContext(err, "changing a resolver table or key_template requires explicitly resetting or migrating its durable merges");
-            return capi.mapError(err);
-        };
-    }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }

@@ -541,6 +541,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native text queries",
+        "capi inline resolver ownership",
+        "capi retired resolver identities",
         "capi query retry errors",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
@@ -595,7 +597,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     antfly_imports.configureEmbedded(b, resolution_test_mod, link_libc);
-    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution replay", "processRecordKeys", "reresolveAll" } });
+    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll" } });
     const run_resolution = b.addRunArtifact(resolution_tests);
     b.step("embedded-resolver-replay-test", "Test selective embedded resolver replay").dependOn(&run_resolution.step);
     capi_test_step.dependOn(&run_resolution.step);
