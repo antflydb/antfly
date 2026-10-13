@@ -17364,9 +17364,16 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("$legacy", owned.req.graph_queries[0].name);
         }
 
+        test "canonical graph contract preserves non-deduplicating traversal" {
+            const alloc = std.testing.allocator;
+            var owned = try parsePublicQueryRequest(alloc, null, "docs", "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}");
+            defer owned.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expect(!owned.req.graph_queries[0].query.params.deduplicate);
+        }
+
         test "canonical graph contract rejects modes without exact public execution" {
             const cases = [_][]const u8{
-                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",

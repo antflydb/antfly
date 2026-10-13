@@ -3247,6 +3247,7 @@ fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anyty
 
 fn finishPortableIdentityImport(alloc: Allocator, store: *DocStore, opts: ImportOptions, imported_identity: bool) !void {
     if (imported_identity) {
+        try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, store, opts.cancellation);
         try doc_identity.validateStoreAlloc(alloc, store);
         try validateImportedIdentityNamespace(store, opts);
     }
@@ -7281,23 +7282,29 @@ test "portable backup v02 released AFB2 validates imports and binds public schem
     const alloc = std.testing.allocator;
     const bytes = @embedFile("testdata/v02-server/portable.afb");
     try validatePortable(alloc, bytes);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try openTestStore(alloc, &tmp);
-    defer store.close();
-    try importPortable(alloc, &store, bytes);
-    try validateCompleteDatabaseImageAlloc(alloc, &store);
-    const runtime = (try storage_schema.loadSchema(&store, alloc)).?;
-    defer storage_schema.freeSchema(alloc, runtime);
-    try std.testing.expectEqual(@as(u32, 12), runtime.decoded_format_version);
-    try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
-    const key = try internal_keys.documentKeyAlloc(alloc, "a");
-    defer alloc.free(key);
-    const row = try store.get(alloc, key);
-    defer alloc.free(row);
-    try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
-    try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+    for ([_]bool{ false, true }) |staged| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(alloc, &tmp);
+        defer store.close();
+        try importPortableWithOptions(alloc, &store, bytes, .{ .unpublished_staging = staged });
+        try validateCompleteDatabaseImageAlloc(alloc, &store);
+        var identity = try store.beginProbeTxn();
+        defer identity.abort();
+        try doc_identity.requireLiveDirectoryTxn(&identity);
+        try std.testing.expect(try doc_identity.lookupOrdinalTxn(alloc, &identity, "a") != null);
+        const runtime = (try storage_schema.loadSchema(&store, alloc)).?;
+        defer storage_schema.freeSchema(alloc, runtime);
+        try std.testing.expectEqual(@as(u32, 12), runtime.decoded_format_version);
+        try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+        const key = try internal_keys.documentKeyAlloc(alloc, "a");
+        defer alloc.free(key);
+        const row = try store.get(alloc, key);
+        defer alloc.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
+        try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+    }
 }
 
 test "resolver import cross checks merge catalog before publication" {
