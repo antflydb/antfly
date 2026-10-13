@@ -109,6 +109,248 @@ encountered in matrix cohorts agree with canonical token 106; none is replaced
 not establish that confirmation fixes the prior intermittent omission. Its
 34.339 s timing is diagnostic only, and no option is promoted.
 
+## Fixed-prefix parity and stage isolation
+
+The next qualification tools distinguish complete-step drift from individual
+operation differences. `ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP=1` executes a
+matrix step first, recomputes the same input and reserved KV positions through
+the canonical singleton, and emits the canonical choice. The singleton restores
+the current KV positions before the next step, so every comparison starts from
+a canonical committed prefix. It records both choices and top-two logit margins;
+canonical hidden capture is checked against the canonical head choice.
+
+`ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL=1` instead compares embedding/PLE inputs,
+attention normalization, Q/K/V projections, complete layer outputs and final
+normalization/logits. Local projection comparisons use exactly the same normalized
+input. Every layer's singleton result and current KV writes replace the matrix
+result before proceeding, isolating local errors from accumulated drift. Both
+modes are diagnostics with host readbacks and extra GPU work, and cannot be used
+together. Their timings never qualify throughput.
+
+An initial eight-token, eight-page probe at runtime `14445c818b` records 6,811
+stage samples and 49 matrix choice comparisons, with no nonfinite values or
+changed choices. Embeddings, PLE inputs, attention norms and final norms match
+bit-for-bit in every sample. The first difference is the layer-zero Q projection:
+maximum absolute difference 6.10e-5. Across all samples Q projection differences
+reach 1.22e-4, complete local layer differences 1.48e-3, and logits 2.29e-5.
+This establishes differing projection arithmetic, not a KV/scheduler bug or the
+cause of a later token change. It also corrects the initial normalization lead:
+two passing normalization-rollback runs do not prove normalization caused the
+intermittent omission. Disabling small-row reduction takes 77.220/76.423 s
+versus the matrix control's 40.446/42.764 s, which reproduces one omission.
+
+Two full canonical-prefix passes at `920765db79` check 7,800 matrix choices,
+with zero changed choices and zero captured-head choice mismatches. Both emit
+all eight ordinary transcripts (4,057 tokens/pass). Diagnostic times are
+96.637/101.334 s and are excluded from performance comparisons. The smallest
+canonical top-two margin is 0.0032997 logits: newline token 108 versus EOS 106
+at sequence position 1,011, immediately around the omitted paragraph boundary.
+The earlier shortened transcript is an exact 2,810-character prefix of the
+3,014-character ordinary transcript; it omits 204 characters/41 tokens.
+This is consistent with accumulated numerical state perturbations flipping a
+fragile stop decision. Identical-state probes do not establish a deterministic
+kernel/KV indexing defect, and restoring only the final step cannot repair past
+state differences. The scoped rollbacks and free-running corpus/order tests
+are needed to qualify an actual remedy.
+
+Scoped rollback switches keep other matrix work available:
+
+- `ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV=1` uses prepared singleton projections
+  per row, sharing the frame and preserving independent positions/attention.
+- `TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN=1` explicitly overrides the
+  multirow Q4 FFN opt-ins. Setting the enable flag to zero alone is insufficient
+  because the OCR matrix opt-in also enables this path.
+- `ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE=1` uses singleton PLE tails per row.
+- `ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL=1` completes the matrix backbone
+  frame and uses the existing fused singleton norm/head/argmax tail per row.
+  It exports only scalar IDs. Tail commands are included in wall time but
+  excluded from matrix backbone frame counters. It cannot be combined with
+  either differential mode.
+
+The first packed row norm/linear tail prototype is rejected: runtime
+`920765db79` encounters an encoder assertion, and `eccf5bfc65` avoids that
+assertion but produces incorrect transcripts, including a capped response.
+Those timings are excluded. Runtime `7f531ca852` replaces that prototype with
+the existing fused canonical singleton tail after completing the backbone.
+This avoids treating unqualified generic in-frame row packing as a reference.
+
+The assertion also exposes a general Metal copy issue. Buffer-copy/pair
+transitions now use their explicit owning runtime rather than ambient thread-local
+state to close the compute encoder and account for blits. Shared-to-shared copies
+use the GPU when a frame is active/submitted, instead of immediate CPU memcpy
+before queued producers complete. GPU fixtures remove the ambient association,
+queue a compute producer and check exact copied values, offsets, frame counts,
+shared/private destinations and paired copies. These correctness fixes apply to
+the shared Metal copy primitive; they do not establish the cause of the original
+intermittent paragraph omission or qualify an audio speedup.
+
+All switches are off by default. The earlier enable-zero FFN experiment is
+excluded from FFN isolation: it retained the matrix kernel. Stage rollbacks
+are alternatives to blanket singleton decoding; their complete-output and
+performance gates must both pass before promotion.
+
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME=1` appends clustered-head work to
+the assistant's existing frame before the scalar boundary. The hidden producer
+and head then require one submission/wait rather than a producer flush followed
+by an independent head command. A flush preserves caller frame ownership by
+reopening an empty frame, which the caller can cancel. The native fixture tests
+pending input writes, selected token correctness, exactly one submission and
+empty borrowed-frame preservation, with direct dispatch and ICB replay.
+
+`tools/bench/gemma4_ocr_sweep.py` starts a fresh server per case, pins the binary
+hash and explicit compilation revision, clears inherited experiment flags,
+checks every transcript/token count and generation cap, and records the sum
+of server/worker process-tree RSS (shared mappings can be double-counted).
+Earlier prototype RSS sampled only the lightweight parent process and is
+excluded from memory comparisons. An optional local `metal_memory_probe.m`
+uses [Metal's resource allocation counter](https://developer.apple.com/documentation/metal/mtldevice/currentallocatedsize?language=objc)
+after command-buffer waits in the inference worker. Those are sampled maxima,
+not instantaneous peaks. Injected memory-probe timings are diagnostic only;
+RSS and Metal allocations are different domains and must not be added. It supports row-order reversal, separate
+stage rollbacks, cohorts of two/four with windows four/eight/sixteen, and fixed
+MTP K=1/2/3/4. It excludes warm requests from MTP acceptance/phase counters and
+compares time per committed completion token, including drafting and recovery.
+The runner never promotes a diagnostic or incomplete-output case. Repeat ranges
+must beat the ordinary controls before it reports a campaign speedup; independent
+replication is still needed on this shared machine.
+
+### Larger inline media envelopes
+
+The sixteen-page PNG request contains about 11.5 MB of base64 media, exceeding
+the standalone HTTP listener's default 10 MiB body cap. Its connection resets
+before any batch decoding, so that failure does not measure GPU window capacity.
+`--http-max-body-mb 32` (or run JSON `http_max_body_mb`) now sets an explicit
+encoded-payload cap. `NodeConfig.http_max_body_bytes` feeds the common listener
+configuration. The default remains 10 MiB; zero and conversion overflow are
+rejected. The HTTP library's 64 MiB aggregate retained-body budget covers this
+32 MiB cap, independently from model/KV admission and GPU cohort limits. Tests
+cover defaults, units, overflow, invalid capacity and aggregate retention.
+
+The first expanded corpus independently fails ordinary OCR on Attention page 4:
+its diagram repeats “Linear” to the 2,048-token cap in both passes. That failed
+quality case is retained separately, with no throughput qualification. A new
+sixteen-page text corpus replaces it with NIST page 11 and produces a stable
+9,126-token ordinary reference, with no caps. No claim of general diagram OCR
+correctness follows from the text-corpus results.
+
+### Repeated cohort/window qualification
+
+The [source-pinned parity investigation](gemma4-ocr-parity-investigation.json)
+retains both successful and rejected runs. Each timing below covers one complete
+recognition pass over pre-rendered pages; ordinary runs bracket each campaign.
+All throughput candidates must match every ordinary transcript and completion
+count in both passes, without reaching the generation cap.
+
+| Corpus / configuration | Two passes, seconds | Output gate |
+| --- | --- | --- |
+| Eight pages, ordinary controls (`7f531ca852`) | 58.628–65.369 | 4,057 tokens/pass |
+| Eight pages, four-row/eight-window canonical QKV | 44.476 / 44.229 | Pass |
+| Sixteen text pages, ordinary controls (`7f531ca852`) | 123.357–129.584 | 9,126 tokens/pass |
+| Sixteen text pages, two-row/four-window | 96.493 / 97.193 | Pass in this order |
+| Sixteen text pages, two-row/eight-window | 106.690 / 104.316 | One paragraph omitted in pass two |
+| Sixteen text pages, four-row/four-window canonical QKV | 98.194 / 95.389 | One paragraph omitted in pass one |
+| Sixteen text pages, four-row/eight-window canonical QKV | 93.548 / 92.430 | Pass |
+| Sixteen text pages, ordinary controls (`90a6fd9f5b`, 32 MiB HTTP cap) | 124.716–146.310 | 9,126 tokens/pass |
+| Sixteen text pages, two-row/sixteen-window | 132.126 / 128.953 | Pass; overlaps controls |
+| Sixteen text pages, four-row/sixteen-window canonical QKV | 107.780 / 96.145 | Pass |
+| Reversed eight pages, ordinary controls (`90a6fd9f5b`) | 55.297–61.729 | 4,057 tokens/pass |
+| Reversed eight pages, two-row/four-window | 46.768 / 45.893 | One paragraph omitted in pass two |
+| Reversed eight pages, four-row/eight-window canonical QKV | 49.893 / 46.659 | Pass |
+
+Four-row/eight-window canonical QKV is the stronger measured candidate: it
+passes both ordinary eight-page runs, both expanded text runs and both reversed
+runs. In the sixteen-text-page campaign it reduces median recognition time by
+about 27% versus its own ordinary controls. Increasing the request window to
+sixteen does not establish a further gain. The smaller cohort fails under
+reordering, and QKV rollback itself fails with a four-page window; neither
+cohort size nor a single scoped rollback guarantees canonical output.
+A subsequent allocation-instrumented pass also reproduces the paragraph
+omission with four-row/eight-window canonical QKV (9,085 versus 9,126 tokens).
+Although instrumentation excludes its timing, that output failure is retained
+as evidence that QKV rollback is not a robust parity fix. The matrix lane and
+rollback switches therefore remain experimental and off by default. Timing ranges across campaigns should not be ranked directly on
+this shared machine; the per-campaign ordinary brackets are the comparisons.
+
+The `90a6fd9f5b` sixteen-page campaign also records native generation pipeline
+latency: ordinary p95 is 10.594–12.120 seconds, while four-row/sixteen-window
+canonical QKV p95 is 106.448 seconds. These per-page pipeline durations include
+waits but exclude queueing before pipeline start and HTTP return; the full batch
+returns as a wave. Better aggregate completion time therefore does not imply
+better individual-page latency. Earlier `7f531ca852` profile summaries still
+include a preload dummy generation and must not be used for precise per-request
+latency or MTP work comparisons; `90a6fd9f5b` removes it before explicit warmup
+removal. Recognition wall times are unaffected by that profile correction.
+
+### Fixed-K and synchronization calibration
+
+Runtime `90a6fd9f5b` repeats Attention pages 1 and 3 twice per case, with a fresh
+server and one warmup page. Every variant reproduces the same 841 tokens/pass.
+The pilot is qualified against those two pages from the unchanged eight-page
+ordinary reference; supplying the full reference initially marked the six
+out-of-corpus pages missing. The report records this post-measurement reference
+subset correction, without changing outputs or timings.
+
+| Configuration | Two passes, seconds | ms / committed token | Matched / drafted |
+| --- | --- | --- | --- |
+| Ordinary controls | 11.990–12.766 | 14.257–15.180 | — |
+| MTP K=1 | 15.165 / 15.688 | 18.032 / 18.654 | 590 / 1,092 |
+| MTP K=2 | 15.993 / 15.420 | 19.016 / 18.336 | 802 / 1,380 |
+| MTP K=3 | 17.345 / 17.270 | 20.624 / 20.536 | 864 / 1,674 |
+| MTP K=4 | 16.917 / 16.876 | 20.115 / 20.066 | 926 / 1,962 |
+| K=2, assistant head frame | 15.171 / 15.128 | 18.040 / 17.988 | 802 / 1,380 |
+| K=2, verification input/tail frames | 15.181 / 16.626 | 18.051 / 19.769 | 802 / 1,380 |
+| K=2, all three frames | 15.102 / 15.321 | 17.957 / 18.217 | 802 / 1,380 |
+| K=2, cached seed, legacy reductions, head frame | 14.394 / 13.854 | 17.116 / 16.473 | 1,050 / 1,262 |
+
+None beats ordinary. K=2's head frame reduces total measured draft phase time
+across both passes from 5.926 to 5.471 seconds, while verification and correction
+still dominate: 9.181 and 10.731 seconds respectively. Increasing K reduces
+rounds but adds draft/verification work; K=4 matches only about 47% of its draft
+slots. Cached-seed acceptance counts include a target-supplied first slot,
+so its 83% ratio is not an independent predictor accuracy measurement.
+Only the strongest complete-output pilot candidate is selected for the separate
+full eight-page gate; the four K values are pilot measurements, not full-corpus
+qualifications. All MTP experiments remain off by default.
+
+The selected cached-seed/reduction/head-frame candidate also preserves all
+4,057 tokens in both full eight-page passes at `90a6fd9f5b`: 68.715/66.461 s,
+versus ordinary brackets 64.252/68.694 and 61.370/64.393 s. Its ranges overlap
+the controls, so **no overall MTP speedup is qualified**. Unlike the earlier
+cached-seed configuration, this combined configuration passes this full-corpus
+quality check. It does not isolate which reduction rollback changes the fragile
+stop decision, or establish parity under every cohort/order. Across the two
+passes it spends 13.589 s drafting, 59.580 s verifying and 39.087 s materializing
+corrections; 5,106/6,010 draft slots match (including supplied seed slots).
+Reducing assistant work alone leaves target verification/correction as the
+larger costs. The measured matrix cohort path is the current throughput lead.
+
+### GPU allocation diagnostics and final validation
+
+A separate one-pass sixteen-text-page run injects the local wait probe at runtime
+`90a6fd9f5b`. Every timing from this campaign is excluded from throughput ranking.
+The reported allocation maximum includes preload/prefill and recognition; it is
+sampled after waits and does not resolve short-lived peaks.
+
+| Configuration | Sampled Metal resources, GiB | Sampled process-tree RSS, GiB | Output |
+| --- | --- | --- | --- |
+| Two-row/four-window | 3.781 | 1.313 | 9,085 tokens; Attention page 6 short |
+| Four-row/eight-window canonical QKV | 3.767 | 1.868 | 9,085 tokens; Attention page 6 short |
+| Four-row/sixteen-window canonical QKV | 3.720 | 3.533 | All 9,126 tokens match |
+
+There are 135/102/92 allocation samples respectively. Similar sampled GPU
+maxima do not establish identical live KV usage: the maximum also includes
+common preload/prefill resources. Host RSS increases with the larger media
+window, and may double-count shared mappings. Do not add RSS to Metal bytes.
+The instrumented QKV failure reinforces the parity limit; it does not establish
+that instrumentation itself causes the numerical divergence. All matrix and
+MTP experiments remain opt-in, with no new audio or CUDA speedup claim.
+
+Final `90a6fd9f5b` validation selects 56 native Metal/MTP/decoder/scheduler/parity/
+HTTP-capacity tests: all pass, zero skips, with head-frame/replay both enabled
+and both disabled. ReleaseFast serving build, seven sweep tests, Zig formatting,
+license and whitespace checks pass. The committed report pins each measured
+binary, harness, corpus PNG and diagnostic probe hash.
+
 ## Verification framing and vocabulary-head audit
 
 [The framing measurements](gemma4-ocr-verification-framing.json) retain the

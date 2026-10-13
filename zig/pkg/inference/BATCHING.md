@@ -1058,3 +1058,53 @@ compatible MTP assistant from the actual image prefill's final hidden row and
 target KV. An unavailable image hidden state fails instead of reconstructing a
 text-only placeholder prompt. Warm OCR speed, draft acceptance and exact
 transcript parity must pass before changing the existing automatic policy.
+
+For parity isolation, `ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP=1` shadows
+complete matrix steps with canonical singleton steps at the same KV positions
+and emits canonical choices, restoring canonical history for the next step.
+`ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL=1` compares and canonically restores each
+layer instead. They are mutually exclusive diagnostics, perform host readbacks,
+and cannot qualify throughput. Logit traces include the top-two margin.
+Scoped `ANTFLY_GEMMA4_METAL_OCR_CANONICAL_{QKV,PLE,TAIL}=1` rollbacks keep other
+matrix work enabled. `TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN=1` explicitly
+overrides the FFN opt-ins; setting an enable flag to zero is insufficient.
+All options default off. The source-pinned `tools/bench/gemma4_ocr_sweep.py`
+checks full transcripts/counts/caps, cohort/window sizes, reversed page order,
+and fixed MTP K=1–4 before ranking time per committed token.
+
+`TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME=1` appends clustered-head scoring
+to the assistant frame, removing its separate submission/wait. It preserves
+caller ownership with an empty frame after completion; the caller cancels it.
+This is an opt-in synchronization change, independent of ICB head replay and
+of the existing target verification-input/tail framing switches.
+
+The canonical tail rollback completes the backbone frame, then uses the existing
+fused singleton norm/head/argmax per row. It is mutually exclusive with parity
+diagnostics. The initial generic in-frame packed tail is rejected for failing
+transcript/cap gates. Buffer-copy transitions now use their explicit runtime;
+Shared copies inside active/submitted frames follow GPU producers instead of
+reading pending values on CPU.
+
+For memory experiments, the sweep samples the server/worker process-tree RSS,
+which can double-count shared mappings. The optional `metal_memory_probe.m`
+records worker `MTLDevice.currentAllocatedSize` after waits; its sampled maximum
+is not an instantaneous peak. Probe-injected runs are diagnostics and excluded
+from throughput ranking.
+
+The HTTP encoded-payload cap is independent of the resident window. Large inline
+media batches can exceed the default 10 MiB before reaching inference.
+`antfly inference run --http-max-body-mb 32` (run JSON `http_max_body_mb`) selects
+a finite larger cap; the default remains 10 MiB and aggregate HTTP body retention
+and model/KV admission remain bounded. The qualification sweep records the cap.
+
+The final bracketed sixteen-text-page sweep matches all 9,126 completion tokens
+with four-row/eight-window canonical QKV in both passes: 93.548/92.430 seconds
+versus ordinary controls of 123.357–129.584 seconds. It also matches both
+reversed eight-page passes. Two-row/four-window fails the reversed-order gate,
+and four-row/four-window canonical QKV fails the expanded-corpus gate. Increasing
+the request window to sixteen is not an established additional speedup. These
+are per-campaign recognition measurements over pre-rendered pages; matrix
+batching remains opt-in: the memory-instrumented four-row/eight-window QKV run
+also omits the paragraph, so that rollback is not a robust parity fix. See
+[the investigation](../../../docs/design/inference/gemma4-ocr-parity-investigation.json)
+for source/binary pins, exact flags, latency/memory counters and rejected cases.

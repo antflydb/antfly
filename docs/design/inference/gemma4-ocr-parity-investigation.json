@@ -1,0 +1,4806 @@
+{
+  "scope": "Gemma4 generative OCR, shared Apple M4 Max 32 GPU cores/36 GiB. Recognition includes image prep/prefill/decode/HTTP; rendering/startup excluded. All diagnostics excluded from throughput qualification. Model/assistant pins in gemma4-ocr-clustered-head.json.",
+  "local_layer_diagnostic": {
+    "runtime_source_revision": "14445c818bd2c9caf9ca1458e507e5a684ace0fb",
+    "binary_sha256": "403cac7e8cb910c1e3ff467c51ce7db57411c0cdb4a393eeea5d96775b94c718",
+    "max_completion_tokens": 8,
+    "summary": {
+      "stage_samples": 6811,
+      "nonfinite_samples": 0,
+      "first_nonidentical_stage": {
+        "stage": "q-proj",
+        "layer": "0",
+        "row": "0",
+        "seq": "313",
+        "input": "236770",
+        "max_abs": "6.1035156e-5",
+        "mean_abs": "2.6732159312814474e-6",
+        "nonfinite": "0",
+        "matrix_hash": "ff053487c0dc5fcc",
+        "canonical_hash": "bfe6252b77e4b11e"
+      },
+      "choice_samples": 49,
+      "changed_choices": []
+    },
+    "max_abs_by_stage": {
+      "embedding": 0,
+      "ple_input": 0,
+      "attention_norm": 0,
+      "q_projection": 0.00012207031,
+      "k_projection": 6.1035156e-05,
+      "v_projection": 6.1035156e-05,
+      "layer": 0.0014762878,
+      "final_norm": 0,
+      "logits": 2.2888184e-05
+    }
+  },
+  "canonical_prefix_step_diagnostic": {
+    "runtime_source_revision": "920765db79",
+    "binary_sha256": "d1a9cb32beff237fbf6986149c80ba214e57195839f3568273777901260f3ecf",
+    "server_flags": {
+      "TERMITE_SERVER_GENERATE_TIMING": "1",
+      "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+      "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+      "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+      "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+      "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+      "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+      "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+      "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+      "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+      "ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP": "1"
+    },
+    "seconds": [
+      96.637361042,
+      101.33400191599999
+    ],
+    "completion_tokens_per_pass": [
+      4057,
+      4057
+    ],
+    "parity": {
+      "stage_samples": 0,
+      "nonfinite_samples": 0,
+      "first_nonidentical_stage": null,
+      "choice_samples": 7800,
+      "changed_choices": []
+    },
+    "passes_output_gate": true,
+    "scope": "Canonical singleton rewrites current KV and emits its choice after each matrix comparison, restoring canonical history for the next step. Whole decoder comparison; local layer restoration disabled. All checked head choices match their captured normalized hidden head.",
+    "smallest_canonical_margin": {
+      "seq": 1011,
+      "input_token": 236761,
+      "choice_token": 108,
+      "runner_up_token": 106,
+      "margin": 0.0032997131,
+      "meaning": "newline versus EOS at a paragraph boundary; IDs are for the pinned tokenizer. Margin is raw logits before any monotonic softcap."
+    }
+  },
+  "interpretation": "No choice divergence in 7800 identical-state full-step comparisons across two passes. Earlier free-running matrix control intermittently omits 41 tokens at a paragraph boundary. Local projections differ in float arithmetic, but normalization matches in the isolated probe. Accumulated state and cohort scheduling geometry remain suspects; not a proven KV or norm implementation bug. EOS-only confirmation does not repair past state.",
+  "validation": {
+    "native_Metal_and_MTP_tests": {
+      "runtime_source_revision": "90a6fd9f5b",
+      "passed": 56,
+      "skipped": 0,
+      "head_frame": "on",
+      "head_replay": "on",
+      "scope": "Actual Metal GPU fixtures plus MTP/decoder/scheduler/parity/HTTP capacity regression selection",
+      "head_frame_and_replay_off": {
+        "passed": 56,
+        "skipped": 0
+      }
+    },
+    "runtime_final_serving_build": "90a6fd9f5b ReleaseFast passed",
+    "sweep_tests_passed": 7,
+    "copy_regressions": {
+      "runtime_source_revision": "eccf5bfc65",
+      "passed": 18,
+      "skipped": 0,
+      "scope": "Actual GPU execution, including explicit-runtime copies with absent ambient TLS and pending Shared producers, plus decoder/scheduler/parity regressions"
+    }
+  },
+  "stage_sweep": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "920765db79",
+    "binary_sha256": "d1a9cb32beff237fbf6986149c80ba214e57195839f3568273777901260f3ecf",
+    "harness_sha256": "716f5b4924a8637f9d5dd358526fb522f913569eab3c1a6092be0671cd9c96dc",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          53.465356,
+          53.416638125
+        ],
+        "sampled_peak_rss_bytes": 7274496,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.013178544737490756,
+          0.01316653638772492
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w4",
+        "batch": 4,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4"
+        },
+        "diagnostic": false,
+        "directory": "1-cohort2w4",
+        "seconds": [
+          42.411690084,
+          43.449090666
+        ],
+        "sampled_peak_rss_bytes": 7274496,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.010453953681045108,
+          0.010709660011338426
+        ],
+        "matrix_frames": {
+          "samples": 3296,
+          "rows_counts": {
+            "2": 3296
+          },
+          "submissions": 3296,
+          "gpu_ns": 40504921873,
+          "wait_ns": 42039880000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "qkvoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-qkvoff",
+        "seconds": [
+          38.073432125,
+          37.59393004099999
+        ],
+        "sampled_peak_rss_bytes": 7274496,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.009384627095144194,
+          0.009266435800098593
+        ],
+        "matrix_frames": {
+          "samples": 2473,
+          "rows_counts": {
+            "2": 834,
+            "4": 1215,
+            "3": 424
+          },
+          "submissions": 2473,
+          "gpu_ns": 41606944380,
+          "wait_ns": 42767937000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ffnoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1"
+        },
+        "diagnostic": false,
+        "directory": "3-ffnoff",
+        "seconds": [
+          47.847553666,
+          46.436745417
+        ],
+        "sampled_peak_rss_bytes": 7258112,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.011793826390436284,
+          0.011446079718264727
+        ],
+        "matrix_frames": {
+          "samples": 2477,
+          "rows_counts": {
+            "2": 847,
+            "3": 392,
+            "4": 1238
+          },
+          "submissions": 2477,
+          "gpu_ns": 58247802359,
+          "wait_ns": 59750285000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "pleoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1"
+        },
+        "diagnostic": false,
+        "directory": "4-pleoff",
+        "seconds": [
+          41.139214415999994,
+          38.8288945
+        ],
+        "sampled_peak_rss_bytes": 7258112,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4016
+        ],
+        "changed_pages": [
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.010140304268178456,
+          0.009668549427290837
+        ],
+        "matrix_frames": {
+          "samples": 2451,
+          "rows_counts": {
+            "2": 807,
+            "3": 400,
+            "4": 1244
+          },
+          "submissions": 2451,
+          "gpu_ns": 44666540605,
+          "wait_ns": 46076873000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": false,
+    "recommendation": {
+      "measured_fastest_case": "qkvoff",
+      "median_seconds_per_committed_token": 0.009325531447621393,
+      "qualified_speedup": false,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication.",
+      "reason": "Incomplete campaign; timing leads only."
+    }
+  },
+  "excluded_tail_prototype": {
+    "runtime_source_revision": "920765db79",
+    "case": "parity-stage-sweep/5-tailoff",
+    "error": "Metal assertion: a command encoder is already encoding when opening a blit encoder",
+    "scope": "No completed pass or timing qualified. Tracked buffer copies depended on ambient TLS ownership; explicit-runtime transitions and queued Shared producer ordering are covered by GPU regressions at eccf5bfc65. The remaining prototype cases lacked a final control and are qualification leads, not a complete final bracket.",
+    "subsequent_failure": "eccf5bfc65 avoids the encoder assertion but fails all transcript gates and reaches the generation cap; these packed-tail timings are excluded. 7f531ca852 replaces it with existing fused canonical singleton tails."
+  },
+  "stage_fixed": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "eccf5bfc65",
+    "binary_sha256": "0330a41745e848f84d4e42b7b42a71ae32da071ef21a52725cfd191cedc76432",
+    "harness_sha256": "ff4ba7349bb815980629a2c0079dd2b18b7d0225f3daeb3671ef8421bc9b49ba",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          52.86526275,
+          55.721100792
+        ],
+        "sampled_peak_rss_bytes": 7241728,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.013030629221099335,
+          0.013734557750061622
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "tailoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+        },
+        "diagnostic": false,
+        "directory": "1-tailoff",
+        "seconds": [
+          167.4597235,
+          104.91073795900002
+        ],
+        "sampled_peak_rss_bytes": 7241728,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4932,
+          3001
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 342
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 362
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 466
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 343
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 2048
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 343
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 449
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 579
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 368
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 394
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 381
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 370
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 367
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 360
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 379
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 382
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 1,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.0339537152270884,
+          0.034958593121959355
+        ],
+        "matrix_frames": {
+          "samples": 11,
+          "rows_counts": {
+            "2": 2,
+            "3": 2,
+            "4": 7
+          },
+          "submissions": 11,
+          "gpu_ns": 233847827,
+          "wait_ns": 243190000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "canonical",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-canonical",
+        "seconds": [
+          102.174904375,
+          106.63718324999999
+        ],
+        "sampled_peak_rss_bytes": 7258112,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          3512,
+          3438
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 402
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 424
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 486
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 352
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 504
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 359
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 492
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 493
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 430
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 420
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 485
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 343
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 437
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 369
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 481
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 473
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.029093082111332574,
+          0.031017214441535775
+        ],
+        "matrix_frames": {
+          "samples": 12,
+          "rows_counts": {
+            "2": 2,
+            "3": 3,
+            "4": 7
+          },
+          "submissions": 12,
+          "gpu_ns": 359909871,
+          "wait_ns": 366260000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "reduce",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1"
+        },
+        "diagnostic": false,
+        "directory": "3-reduce",
+        "seconds": [
+          44.273213207999994,
+          43.78171379199999
+        ],
+        "sampled_peak_rss_bytes": 7241728,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01091279595957604,
+          0.010791647471530686
+        ],
+        "matrix_frames": {
+          "samples": 2476,
+          "rows_counts": {
+            "2": 833,
+            "4": 1233,
+            "3": 410
+          },
+          "submissions": 2476,
+          "gpu_ns": 57942136108,
+          "wait_ns": 59225593000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "reduceall",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+        },
+        "diagnostic": false,
+        "directory": "4-reduceall",
+        "seconds": [
+          108.968851833,
+          97.57391545799999
+        ],
+        "sampled_peak_rss_bytes": 7258112,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          3388,
+          4664
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 391
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 406
+          },
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 453
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 336
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 517
+          },
+          {
+            "iteration": 0,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 299
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 458
+          },
+          {
+            "iteration": 0,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 528
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 1,
+            "completion_tokens": 108
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 3,
+            "completion_tokens": 442
+          },
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 423
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 5,
+            "completion_tokens": 343
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 6,
+            "completion_tokens": 2048
+          },
+          {
+            "iteration": 1,
+            "document": "nist-2021",
+            "page": 9,
+            "completion_tokens": 331
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 8,
+            "completion_tokens": 441
+          },
+          {
+            "iteration": 1,
+            "document": "nbs-1907",
+            "page": 12,
+            "completion_tokens": 528
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 1,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.032163179407615115,
+          0.02092065082718696
+        ],
+        "matrix_frames": {
+          "samples": 12,
+          "rows_counts": {
+            "2": 2,
+            "4": 9,
+            "3": 1
+          },
+          "submissions": 12,
+          "gpu_ns": 369513828,
+          "wait_ns": 375322000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "qkvoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "5-qkvoff",
+        "seconds": [
+          35.626981625,
+          36.542865958
+        ],
+        "sampled_peak_rss_bytes": 7258112,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4016,
+          4057
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.008871260364790837,
+          0.009007361586886862
+        ],
+        "matrix_frames": {
+          "samples": 2439,
+          "rows_counts": {
+            "2": 811,
+            "3": 392,
+            "4": 1236
+          },
+          "submissions": 2439,
+          "gpu_ns": 41042910368,
+          "wait_ns": 42371428000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": false,
+    "recommendation": {
+      "measured_fastest_case": "reduce",
+      "median_seconds_per_committed_token": 0.010852221715553362,
+      "qualified_speedup": false,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication.",
+      "reason": "Incomplete campaign; timing leads only."
+    }
+  },
+  "stage_fused": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "7f531ca852",
+    "binary_sha256": "cc7d79172e6433150865b9284c1377147cb1616aba9788a9aad2ae6728241c43",
+    "harness_sha256": "4bd9450313bf22947e8aa290c67c09b378d4058f7cdc71cf383781eec9a2fe51",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          61.305398792,
+          65.36942758300002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1063387136,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01511101769583436,
+          0.016112750205324135
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "tailoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+        },
+        "diagnostic": false,
+        "directory": "1-tailoff",
+        "seconds": [
+          56.469914542,
+          55.893870291999995
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1474625536,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.013919131018486566,
+          0.013777143281242295
+        ],
+        "matrix_frames": {
+          "samples": 2480,
+          "rows_counts": {
+            "2": 808,
+            "4": 1224,
+            "3": 448
+          },
+          "submissions": 2480,
+          "gpu_ns": 38368095587,
+          "wait_ns": 41081754000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "canonical",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-canonical",
+        "seconds": [
+          68.199780584,
+          60.98849129199999
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1688010752,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4016
+        ],
+        "changed_pages": [
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.016810396988908058,
+          0.015186377313745019
+        ],
+        "matrix_frames": {
+          "samples": 2429,
+          "rows_counts": {
+            "2": 776,
+            "4": 1267,
+            "3": 386
+          },
+          "submissions": 2429,
+          "gpu_ns": 60799292405,
+          "wait_ns": 62816893000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "qkvoff",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "3-qkvoff",
+        "seconds": [
+          44.476136583,
+          44.2287235
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1786527744,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.010962814045600197,
+          0.010901829800345084
+        ],
+        "matrix_frames": {
+          "samples": 2462,
+          "rows_counts": {
+            "2": 807,
+            "3": 408,
+            "4": 1247
+          },
+          "submissions": 2462,
+          "gpu_ns": 43684618290,
+          "wait_ns": 46073561000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "reduce",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1"
+        },
+        "diagnostic": false,
+        "directory": "4-reduce",
+        "seconds": [
+          50.090760040999996,
+          48.518138707999995
+        ],
+        "sampled_peak_process_tree_rss_bytes": 2350432256,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.012346748839290114,
+          0.011959117256100566
+        ],
+        "matrix_frames": {
+          "samples": 2485,
+          "rows_counts": {
+            "2": 834,
+            "3": 429,
+            "4": 1222
+          },
+          "submissions": 2485,
+          "gpu_ns": 58593426425,
+          "wait_ns": 60900628000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w8",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8"
+        },
+        "diagnostic": false,
+        "directory": "5-cohort4w8",
+        "seconds": [
+          43.686015999999995,
+          44.051928374999996
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1866596352,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01076805915701257,
+          0.010858252002711361
+        ],
+        "matrix_frames": {
+          "samples": 2478,
+          "rows_counts": {
+            "2": 809,
+            "3": 461,
+            "4": 1208
+          },
+          "submissions": 2478,
+          "gpu_ns": 41467945929,
+          "wait_ns": 44390478000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "6-ordinary",
+        "seconds": [
+          58.628298292,
+          60.09153887500001
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1294778368,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01445114574611782,
+          0.014811816335962538
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "cohort4w8",
+      "median_seconds_per_committed_token": 0.010813155579861965,
+      "qualified_speedup": true,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "extended_diagram_failure": {
+    "source_revision": "7f531ca852",
+    "campaign": "parity-extended-cohorts",
+    "page": {
+      "document": "attention",
+      "page": 4
+    },
+    "ordinary_seconds": [
+      139.628548917,
+      148.20561375
+    ],
+    "completion_tokens_per_pass": 10657,
+    "failure": "Both ordinary passes repeat Linear and hit the 2048-token cap. No throughput qualification; campaign stopped after baseline. Replacement NIST page11 forms a separate 16-page text corpus; failed diagram retained as a separate quality test, not silently omitted from an aggregate."
+  },
+  "extended_cohorts": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      },
+      {
+        "document": "attention",
+        "page": 2,
+        "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+      },
+      {
+        "document": "attention",
+        "page": 4,
+        "image_sha256": "ab17a218bc1d74e2d1226a2403e65840ca35a14a959fe8f0ed82ea4ae774f11f"
+      },
+      {
+        "document": "attention",
+        "page": 5,
+        "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+      },
+      {
+        "document": "attention",
+        "page": 7,
+        "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+      },
+      {
+        "document": "nist-2021",
+        "page": 4,
+        "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+      },
+      {
+        "document": "nist-2021",
+        "page": 7,
+        "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+      },
+      {
+        "document": "nist-2021",
+        "page": 8,
+        "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+      },
+      {
+        "document": "nist-2021",
+        "page": 10,
+        "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "7f531ca852",
+    "binary_sha256": "cc7d79172e6433150865b9284c1377147cb1616aba9788a9aad2ae6728241c43",
+    "harness_sha256": "5a0043813885f76d14d6a27f29818b8a39b8e4572f18256a599d6313536fcdb3",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          139.628548917,
+          148.20561375000003
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1193689088,
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          10657,
+          10657
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 2,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.013102050193957023,
+          0.013906879398517409
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": false,
+    "recommendation": {
+      "qualified_speedup": false,
+      "reason": "Incomplete campaign; timing leads only."
+    }
+  },
+  "extended_text_cohorts": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      },
+      {
+        "document": "attention",
+        "page": 2,
+        "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+      },
+      {
+        "document": "nist-2021",
+        "page": 11,
+        "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+      },
+      {
+        "document": "attention",
+        "page": 5,
+        "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+      },
+      {
+        "document": "attention",
+        "page": 7,
+        "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+      },
+      {
+        "document": "nist-2021",
+        "page": 4,
+        "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+      },
+      {
+        "document": "nist-2021",
+        "page": 7,
+        "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+      },
+      {
+        "document": "nist-2021",
+        "page": 8,
+        "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+      },
+      {
+        "document": "nist-2021",
+        "page": 10,
+        "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "7f531ca852",
+    "binary_sha256": "cc7d79172e6433150865b9284c1377147cb1616aba9788a9aad2ae6728241c43",
+    "harness_sha256": "ebf6027ba155ef2badd4d7528a18fa7684adee82dca7dd0578d843cb798aee48",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          129.3338645,
+          123.35739245900001
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1223475200,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 7276,
+          "p95": 10358,
+          "max": 11014,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          6.216474540999999,
+          6.395895042000001,
+          10.253708707999998,
+          5.543126166999997,
+          10.057281541999998,
+          5.507971333999997,
+          7.263913375000001,
+          8.373521790999995,
+          9.08253466699999,
+          7.323395000000005,
+          10.037813750000012,
+          11.055752749999996,
+          6.991283666000001,
+          9.683409041000004,
+          6.143603917000007,
+          9.403060334000003,
+          5.823130417000016,
+          6.1305654169999855,
+          9.672568499999983,
+          5.091157542000019,
+          9.348058084000002,
+          5.07724512499999,
+          6.766642458000007,
+          7.781505542000019,
+          8.449482582999991,
+          7.042624665999995,
+          9.603788708999986,
+          10.393511582999992,
+          6.737503834000023,
+          9.60977837499999,
+          6.357549000000006,
+          9.471508333000031
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.014172021093578787,
+          0.013517137021586677
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w4",
+        "batch": 4,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4"
+        },
+        "diagnostic": false,
+        "directory": "1-cohort2w4",
+        "seconds": [
+          96.49336516700001,
+          97.19342958400001
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1778712576,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 21460,
+          "p95": 27284,
+          "max": 27500,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          21.996062166,
+          23.093121583,
+          27.365298042,
+          24.037514790999992,
+          21.535823207999996,
+          23.205463624999993,
+          27.574558207999985,
+          24.87734145799999
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.010573456625794434,
+          0.010650167607275917
+        ],
+        "matrix_frames": {
+          "samples": 7856,
+          "rows_counts": {
+            "2": 7856
+          },
+          "submissions": 7856,
+          "gpu_ns": 96664736068,
+          "wait_ns": 100548000000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w8",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8"
+        },
+        "diagnostic": false,
+        "directory": "2-cohort2w8",
+        "seconds": [
+          106.69029583300001,
+          104.315775584
+        ],
+        "sampled_peak_process_tree_rss_bytes": 2044051456,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 46413,
+          "p95": 58954,
+          "max": 59356,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          47.128541082999995,
+          59.561506957999995,
+          49.038628292,
+          55.276966958
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9085
+        ],
+        "changed_pages": [
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.011690806030352838,
+          0.011482198743423225
+        ],
+        "matrix_frames": {
+          "samples": 8786,
+          "rows_counts": {
+            "2": 8786
+          },
+          "submissions": 8786,
+          "gpu_ns": 110142879925,
+          "wait_ns": 119821302000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w16",
+        "batch": 16,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16"
+        },
+        "diagnostic": false,
+        "directory": "3-cohort2w16",
+        "error": {
+          "type": "CalledProcessError",
+          "message": "Command '['/Library/Developer/CommandLineTools/usr/bin/python3', '/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/zig/pkg/inference/tools/bench/pdf_ocr.py', '--base-url', 'http://127.0.0.1:18097', '--corpus', '.benchmark-results/gemma4-ocr-optim-2026-10-11/parity-extended-text-cohorts/corpus.json', '--model', 'ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07', '--output-dir', '.benchmark-results/gemma4-ocr-optim-2026-10-11/parity-extended-text-cohorts/3-cohort2w16', '--batches', '16', '--iterations', '2', '--warmups', '1', '--max-tokens', '2048']' returned non-zero exit status 1."
+        },
+        "eligible_for_throughput_comparison": false
+      },
+      {
+        "case": "cohort4w4qkv",
+        "batch": 4,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "4-cohort4w4qkv",
+        "seconds": [
+          98.19448150000001,
+          95.38876679100001
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1753088000,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 21128,
+          "p95": 27057,
+          "max": 27625,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          22.087039459000003,
+          23.995440958000003,
+          27.721051167,
+          24.390286167000014,
+          21.237049708,
+          22.410047625000004,
+          27.123753375000007,
+          24.61765216699999
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9085,
+          9126
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.010808418436984041,
+          0.010452418013477975
+        ],
+        "matrix_frames": {
+          "samples": 6350,
+          "rows_counts": {
+            "2": 4085,
+            "3": 1350,
+            "4": 915
+          },
+          "submissions": 6350,
+          "gpu_ns": 92113019595,
+          "wait_ns": 95554998000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w8qkv",
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "5-cohort4w8qkv",
+        "seconds": [
+          93.5481035,
+          92.42952950000002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1831649280,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 40023,
+          "p95": 49377,
+          "max": 50093,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          44.053958708,
+          49.493554917,
+          42.14677262500001,
+          50.28252275
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01025072359193513,
+          0.010128153572211265
+        ],
+        "matrix_frames": {
+          "samples": 5400,
+          "rows_counts": {
+            "2": 1557,
+            "4": 2874,
+            "3": 969
+          },
+          "submissions": 5400,
+          "gpu_ns": 94626180170,
+          "wait_ns": 99181021000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w16qkv",
+        "batch": 16,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "6-cohort4w16qkv",
+        "error": {
+          "type": "CalledProcessError",
+          "message": "Command '['/Library/Developer/CommandLineTools/usr/bin/python3', '/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/zig/pkg/inference/tools/bench/pdf_ocr.py', '--base-url', 'http://127.0.0.1:18097', '--corpus', '.benchmark-results/gemma4-ocr-optim-2026-10-11/parity-extended-text-cohorts/corpus.json', '--model', 'ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07', '--output-dir', '.benchmark-results/gemma4-ocr-optim-2026-10-11/parity-extended-text-cohorts/6-cohort4w16qkv', '--batches', '16', '--iterations', '2', '--warmups', '1', '--max-tokens', '2048']' returned non-zero exit status 1."
+        },
+        "eligible_for_throughput_comparison": false
+      },
+      {
+        "case": "ordinary",
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "7-ordinary",
+        "seconds": [
+          126.90153175,
+          129.58416016700002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1273757696,
+        "generation_pipeline_wall_ms": {
+          "samples": 33,
+          "p50": 7381,
+          "p95": 10847,
+          "max": 11268,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          6.1027087920000005,
+          6.4714332500000005,
+          10.421138459000002,
+          5.441465917000002,
+          10.112336667000001,
+          5.706858457999999,
+          6.972469584000002,
+          7.939879000000005,
+          8.460149290999993,
+          6.984686624999995,
+          9.499132332999991,
+          10.462126458,
+          6.834413542000007,
+          9.858155834000002,
+          6.231843624999996,
+          9.401503458999997,
+          5.716766624999991,
+          6.147052333999994,
+          9.88036308300002,
+          5.366844832999988,
+          9.94943975000001,
+          5.371032000000014,
+          6.819741708000009,
+          8.003698332999988,
+          8.776920875000002,
+          7.423847166000002,
+          10.093332667000027,
+          11.307581249999998,
+          7.171208707999995,
+          10.903640166999992,
+          6.600448499999999,
+          10.050933957999973
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01390549328840675,
+          0.014199447750054791
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "cohort4w8qkv",
+      "median_seconds_per_committed_token": 0.010189438582073197,
+      "qualified_speedup": true,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "window16_http": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      },
+      {
+        "document": "attention",
+        "page": 2,
+        "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+      },
+      {
+        "document": "nist-2021",
+        "page": 11,
+        "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+      },
+      {
+        "document": "attention",
+        "page": 5,
+        "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+      },
+      {
+        "document": "attention",
+        "page": 7,
+        "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+      },
+      {
+        "document": "nist-2021",
+        "page": 4,
+        "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+      },
+      {
+        "document": "nist-2021",
+        "page": 7,
+        "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+      },
+      {
+        "document": "nist-2021",
+        "page": 8,
+        "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+      },
+      {
+        "document": "nist-2021",
+        "page": 10,
+        "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "90a6fd9f5b",
+    "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+    "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          125.063331,
+          146.30954987500002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1274707968,
+        "generation_pipeline_wall_ms": {
+          "samples": 32,
+          "p50": 8214.5,
+          "p95": 12120,
+          "max": 13302,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          5.606882541999999,
+          5.834237042,
+          9.426724750000002,
+          5.025279000000001,
+          9.413435875000005,
+          5.513688082999998,
+          6.779790333999998,
+          7.809763791000002,
+          8.368749541,
+          7.136034082999998,
+          9.917496041999996,
+          10.505409624999999,
+          7.372959707999996,
+          10.044378457999997,
+          6.308781249999996,
+          9.998669583000009,
+          6.288073874999981,
+          6.579411707999981,
+          11.285318375000003,
+          5.925596333999977,
+          11.481649208999983,
+          6.549291667000006,
+          8.185853542000018,
+          9.404403583000004,
+          10.26042458400002,
+          9.049982708999977,
+          13.382630458999984,
+          12.196352082999994,
+          8.024612708000006,
+          10.325246042000032,
+          6.952634125000031,
+          10.415053166000007
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.013704068704799474,
+          0.016032166324238442
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w16",
+        "http_max_body_mb": 32,
+        "batch": 16,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16"
+        },
+        "diagnostic": false,
+        "directory": "1-cohort2w16",
+        "seconds": [
+          132.126073417,
+          128.95273091699997
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1860288512,
+        "generation_pipeline_wall_ms": {
+          "samples": 32,
+          "p50": 118377.5,
+          "p95": 131227,
+          "max": 131640,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          132.125885583,
+          128.952490625
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01447798306125356,
+          0.014130257606508873
+        ],
+        "matrix_frames": {
+          "samples": 9054,
+          "rows_counts": {
+            "2": 9054
+          },
+          "submissions": 9054,
+          "gpu_ns": 114987306779,
+          "wait_ns": 140119793000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w16qkv",
+        "http_max_body_mb": 32,
+        "batch": 16,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-cohort4w16qkv",
+        "seconds": [
+          107.779740833,
+          96.14539408299999
+        ],
+        "sampled_peak_process_tree_rss_bytes": 3165978624,
+        "generation_pipeline_wall_ms": {
+          "samples": 32,
+          "p50": 91380.5,
+          "p95": 106448,
+          "max": 107445,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          107.77960024999999,
+          96.145319416
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.011810184180692528,
+          0.010535326986960332
+        ],
+        "matrix_frames": {
+          "samples": 4718,
+          "rows_counts": {
+            "2": 340,
+            "3": 221,
+            "4": 4157
+          },
+          "submissions": 4718,
+          "gpu_ns": 95425391351,
+          "wait_ns": 106488622000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "3-ordinary",
+        "seconds": [
+          129.114334042,
+          124.71629441599998
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1340538880,
+        "generation_pipeline_wall_ms": {
+          "samples": 32,
+          "p50": 7599.0,
+          "p95": 10594,
+          "max": 10749,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          5.928726041,
+          6.281983374999999,
+          9.984270207999998,
+          6.137740624999999,
+          9.870821583999998,
+          5.398330833000003,
+          7.094493208000003,
+          8.185483333,
+          8.77444495799999,
+          7.4259077500000075,
+          10.175721500000009,
+          10.855876125000009,
+          7.043010292000005,
+          9.943639832999992,
+          6.378525582999998,
+          9.631677834000001,
+          5.899295875000007,
+          6.395769209000008,
+          9.883817209,
+          5.071005332999988,
+          9.416140250000012,
+          5.1331233330000146,
+          6.808643375000003,
+          7.8621613749999995,
+          8.481655791999998,
+          7.111579499999976,
+          9.729632291000001,
+          10.623572375000009,
+          6.888489042000003,
+          9.782743084000003,
+          6.227145291999989,
+          9.40043758400003
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          9126,
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.014147965597413981,
+          0.013666041465702387
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "cohort4w16qkv",
+      "median_seconds_per_committed_token": 0.011172755583826431,
+      "qualified_speedup": true,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "mtp_pilot": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/pilot-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "90a6fd9f5b",
+    "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+    "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": "Post-measurement qualification against Attention pages 1/3 subset of unchanged eight-page ordinary reference; original command supplied full reference and therefore counted out-of-corpus pages as missing. No outputs/timings changed.",
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          11.990311791000002,
+          12.703388665999999
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1153482752,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 6159.0,
+          "p95": 6509,
+          "max": 6509,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          5.779713291999999,
+          6.210476332999999,
+          6.166187167,
+          6.5371035410000005
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.014257207837098693,
+          0.015105099483947679
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp1",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1"
+        },
+        "diagnostic": false,
+        "directory": "1-mtp1",
+        "seconds": [
+          15.164630666999999,
+          15.688188249999996
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1174470656,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7685.0,
+          "p95": 8085,
+          "max": 8085,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.276659625000001,
+          7.887817665999998,
+          7.561192334000001,
+          8.126718375000003
+        ],
+        "mtp_work": {
+          "rounds": 1092,
+          "drafted": 1092,
+          "matched": 590,
+          "acceptance_rate": 0.5402930402930403,
+          "phase_wall_ns": {
+            "draft_ns": 4894238715,
+            "verify_ns": 7208856215,
+            "materialize_ns": 13618863695
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.018031665478002376,
+          0.018654207193816878
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-mtp2",
+        "seconds": [
+          15.992577333,
+          15.420156083000002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1124745216,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7817.5,
+          "p95": 8043,
+          "max": 8043,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          8.096496084,
+          7.8957637080000005,
+          7.603790166000003,
+          7.816272000000005
+        ],
+        "mtp_work": {
+          "rounds": 880,
+          "drafted": 1380,
+          "matched": 802,
+          "acceptance_rate": 0.5811594202898551,
+          "phase_wall_ns": {
+            "draft_ns": 5925924737,
+            "verify_ns": 9236286422,
+            "materialize_ns": 10833259072
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.019016144272294887,
+          0.018335500693222356
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp3",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1"
+        },
+        "diagnostic": false,
+        "directory": "3-mtp3",
+        "seconds": [
+          17.345112166,
+          17.270477709
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1471528960,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 8634.0,
+          "p95": 8886,
+          "max": 8886,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          8.433838332999999,
+          8.911134667000002,
+          8.350721333,
+          8.919585042000001
+        ],
+        "mtp_work": {
+          "rounds": 818,
+          "drafted": 1674,
+          "matched": 864,
+          "acceptance_rate": 0.5161290322580645,
+          "phase_wall_ns": {
+            "draft_ns": 7087716575,
+            "verify_ns": 12514753993,
+            "materialize_ns": 10056436743
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.020624390209274673,
+          0.020535645313912013
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp4",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1"
+        },
+        "diagnostic": false,
+        "directory": "4-mtp4",
+        "seconds": [
+          16.916955125,
+          16.875756541
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1156612096,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 8413.0,
+          "p95": 8718,
+          "max": 8718,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          8.163870958,
+          8.752861207999999,
+          8.145670667000001,
+          8.729985833999997
+        ],
+        "mtp_work": {
+          "rounds": 756,
+          "drafted": 1962,
+          "matched": 926,
+          "acceptance_rate": 0.47196738022426094,
+          "phase_wall_ns": {
+            "draft_ns": 8031395624,
+            "verify_ns": 11708057702,
+            "materialize_ns": 9123384424
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.020115285523186685,
+          0.020066297908442332
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2frame",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME": "1"
+        },
+        "diagnostic": false,
+        "directory": "5-mtp2frame",
+        "seconds": [
+          15.17123575,
+          15.127697666
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1348452352,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7546.0,
+          "p95": 7602,
+          "max": 7602,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.550163333,
+          7.620913583000002,
+          7.488734584000003,
+          7.638869457999995
+        ],
+        "mtp_work": {
+          "rounds": 880,
+          "drafted": 1380,
+          "matched": 802,
+          "acceptance_rate": 0.5811594202898551,
+          "phase_wall_ns": {
+            "draft_ns": 5470802322,
+            "verify_ns": 9181452710,
+            "materialize_ns": 10730936130
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.018039519322235433,
+          0.017987749900118904
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2verify",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "1"
+        },
+        "diagnostic": false,
+        "directory": "6-mtp2verify",
+        "seconds": [
+          15.180976166,
+          16.625998458
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1289453568,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7712.0,
+          "p95": 8737,
+          "max": 8737,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.513239333,
+          7.666804917000002,
+          7.845283625,
+          8.780493332999999
+        ],
+        "mtp_work": {
+          "rounds": 880,
+          "drafted": 1380,
+          "matched": 802,
+          "acceptance_rate": 0.5811594202898551,
+          "phase_wall_ns": {
+            "draft_ns": 6233961105,
+            "verify_ns": 8888632632,
+            "materialize_ns": 11282253602
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.018051101267538644,
+          0.019769320401902497
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2all",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME": "1"
+        },
+        "diagnostic": false,
+        "directory": "7-mtp2all",
+        "seconds": [
+          15.102037124999999,
+          15.320692208
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1317486592,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7542.0,
+          "p95": 7733,
+          "max": 7733,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.484142875,
+          7.617766208999999,
+          7.545804457999999,
+          7.774795332999997
+        ],
+        "mtp_work": {
+          "rounds": 880,
+          "drafted": 1380,
+          "matched": 802,
+          "acceptance_rate": 0.5811594202898551,
+          "phase_wall_ns": {
+            "draft_ns": 5571953861,
+            "verify_ns": 8747043757,
+            "materialize_ns": 11019740873
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.017957237960760996,
+          0.01821723211414982
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2seedreduce",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "1",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1",
+          "TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME": "1"
+        },
+        "diagnostic": false,
+        "directory": "8-mtp2seedreduce",
+        "seconds": [
+          14.394378875000001,
+          13.853932667000002
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1033617408,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 7044.5,
+          "p95": 7203,
+          "max": 7203,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.246880583,
+          7.147318834000002,
+          6.831487458999998,
+          7.022338374999997
+        ],
+        "mtp_work": {
+          "rounds": 632,
+          "drafted": 1262,
+          "matched": 1050,
+          "acceptance_rate": 0.8320126782884311,
+          "phase_wall_ns": {
+            "draft_ns": 2593904324,
+            "verify_ns": 12590607043,
+            "materialize_ns": 7872979038
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01711578938763377,
+          0.016473166072532703
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "9-ordinary",
+        "seconds": [
+          12.737403167,
+          12.766038041999998
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1263271936,
+        "generation_pipeline_wall_ms": {
+          "samples": 4,
+          "p50": 6333.0,
+          "p95": 6522,
+          "max": 6522,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          6.224062125,
+          6.513178542,
+          6.207562334000002,
+          6.558339
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          841,
+          841
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.015145544788347206,
+          0.015179593391200948
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "ordinary",
+      "median_seconds_per_committed_token": 0.014681153660523187,
+      "qualified_speedup": false,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "reversed_cohorts": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "90a6fd9f5b",
+    "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+    "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": true,
+    "runs": [
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          55.296667041999996,
+          56.377034666
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1254916096,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 6414.5,
+          "p95": 9716,
+          "max": 9716,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.937077125,
+          6.699059957999999,
+          5.064249167000003,
+          9.306692165999998,
+          4.993006874999999,
+          9.565488166999998,
+          6.035247249999998,
+          5.695427459000001,
+          7.760005625000005,
+          6.899620541999994,
+          5.234774875000014,
+          9.541530207999998,
+          5.185678042000006,
+          9.743819916999996,
+          6.1994612909999915,
+          5.811768834000006
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.013629940113877248,
+          0.013896237285186097
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort2w4",
+        "http_max_body_mb": 32,
+        "batch": 4,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4"
+        },
+        "diagnostic": false,
+        "directory": "1-cohort2w4",
+        "seconds": [
+          46.768208875,
+          45.893080333
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1820721152,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 19617.0,
+          "p95": 24341,
+          "max": 24341,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          24.458361,
+          22.309654709,
+          23.644309584000005,
+          22.248606624999994
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4016
+        ],
+        "changed_pages": [
+          {
+            "iteration": 1,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.011527781334730095,
+          0.011427559843874502
+        ],
+        "matrix_frames": {
+          "samples": 3147,
+          "rows_counts": {
+            "2": 3147
+          },
+          "submissions": 3147,
+          "gpu_ns": 39155391975,
+          "wait_ns": 41041599000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w8qkv",
+        "http_max_body_mb": 32,
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": false,
+        "directory": "2-cohort4w8qkv",
+        "seconds": [
+          49.893178916000004,
+          46.658514583
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1280229376,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 41739.5,
+          "p95": 49666,
+          "max": 49666,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          49.893043083,
+          46.658286749999995
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.012298047551392655,
+          0.011500743057185112
+        ],
+        "matrix_frames": {
+          "samples": 2468,
+          "rows_counts": {
+            "2": 812,
+            "4": 1234,
+            "3": 422
+          },
+          "submissions": 2468,
+          "gpu_ns": 46133984367,
+          "wait_ns": 50229861000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "3-ordinary",
+        "seconds": [
+          61.348257667,
+          61.729187291
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1217839104,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 7011.0,
+          "p95": 10805,
+          "max": 10805,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          8.631735375000002,
+          7.421391542000002,
+          5.711021334000002,
+          10.132893125000002,
+          5.615495707999997,
+          10.743916249999998,
+          6.503727042000001,
+          6.586562165999993,
+          8.721667291000003,
+          7.330691333000004,
+          5.607823290999988,
+          10.172130041999992,
+          5.643734792000004,
+          10.849797667000004,
+          6.795949874999991,
+          6.606877833999988
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01512158187503081,
+          0.015215476285679074
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "cohort4w8qkv",
+      "median_seconds_per_committed_token": 0.011899395304288882,
+      "qualified_speedup": true,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "mtp_full": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/pdf-ocr-comparison-2026-10-11/ocr-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "90a6fd9f5b",
+    "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+    "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+    "memory_probe_sha256": null,
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "0-ordinary",
+        "seconds": [
+          64.251558875,
+          68.6941515
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1105985536,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 7855.0,
+          "p95": 11790,
+          "max": 11790,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          6.2582325,
+          6.610037916000001,
+          10.252742167000001,
+          5.580437207999999,
+          11.000017833000001,
+          6.356799125000002,
+          8.440745333999999,
+          9.751620208000006,
+          7.237479832999995,
+          7.5975631249999935,
+          11.841423707999994,
+          6.595155665999997,
+          11.608606957999996,
+          6.579488624999996,
+          8.228177875,
+          9.005084083000014
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.015837209483608578,
+          0.01693225326596007
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "mtp2seedreduce",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "1",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_MTP_MULTIMODAL": "1",
+          "ANTFLY_GEMMA4_MTP_ACCEPT_BONUS": "1",
+          "ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME": "1",
+          "ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY": "1",
+          "ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE": "1",
+          "TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH": "1",
+          "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN": "1",
+          "TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME": "1"
+        },
+        "diagnostic": false,
+        "directory": "1-mtp2seedreduce",
+        "seconds": [
+          68.715166375,
+          66.46120325
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1347338240,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 7730.0,
+          "p95": 11291,
+          "max": 11291,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          7.764421083,
+          7.642801542000001,
+          11.3975665,
+          6.889743875000001,
+          11.349826583000002,
+          6.277841833000004,
+          8.090272749999997,
+          9.301622124999994,
+          7.355609375,
+          7.54954329200001,
+          11.250267291,
+          6.861440000000002,
+          10.739735292000006,
+          5.985434459000004,
+          7.7982506250000085,
+          8.920289833999988
+        ],
+        "mtp_work": {
+          "rounds": 3008,
+          "drafted": 6010,
+          "matched": 5106,
+          "acceptance_rate": 0.8495840266222962,
+          "phase_wall_ns": {
+            "draft_ns": 13589006658,
+            "verify_ns": 59580059269,
+            "materialize_ns": 39087499725
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.01693743317106236,
+          0.01638185931722948
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "ordinary",
+        "http_max_body_mb": 32,
+        "batch": 1,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+        },
+        "diagnostic": false,
+        "directory": "2-ordinary",
+        "seconds": [
+          61.369981333000005,
+          64.392918666
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1269989376,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 7147.5,
+          "p95": 11231,
+          "max": 11231,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          6.15468025,
+          6.951177582999998,
+          10.968937125,
+          5.685656750000003,
+          10.190885000000002,
+          5.520743833999994,
+          7.327667875000003,
+          8.569638792,
+          6.409809874999993,
+          7.071473249999997,
+          11.291778832999995,
+          6.158952583000001,
+          10.590066667000002,
+          5.9462515000000025,
+          7.7112464589999945,
+          9.211992459000001
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "completion_tokens_per_pass": [
+          4057,
+          4057
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": true,
+        "seconds_per_committed_token": [
+          0.015126936488291843,
+          0.01587205291249692
+        ],
+        "matrix_frames": {
+          "samples": 0,
+          "rows_counts": {},
+          "submissions": 0,
+          "gpu_ns": 0,
+          "wait_ns": 0,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "measured_fastest_case": "ordinary",
+      "median_seconds_per_committed_token": 0.01549949470039438,
+      "qualified_speedup": false,
+      "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+    }
+  },
+  "memory": {
+    "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+    "corpus_pages": [
+      {
+        "document": "attention",
+        "page": 1,
+        "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      },
+      {
+        "document": "attention",
+        "page": 2,
+        "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+      },
+      {
+        "document": "nist-2021",
+        "page": 11,
+        "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+      },
+      {
+        "document": "attention",
+        "page": 5,
+        "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+      },
+      {
+        "document": "attention",
+        "page": 7,
+        "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+      },
+      {
+        "document": "nist-2021",
+        "page": 4,
+        "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+      },
+      {
+        "document": "nist-2021",
+        "page": 7,
+        "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+      },
+      {
+        "document": "nist-2021",
+        "page": 8,
+        "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+      },
+      {
+        "document": "nist-2021",
+        "page": 10,
+        "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+      }
+    ],
+    "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+    "runtime_source_revision": "90a6fd9f5b",
+    "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+    "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+    "memory_probe_sha256": "b765d526e102237606519e764b28ccbdba6f90abeb707ae5d6affce4c8e8a9f5",
+    "qualification_reference_note": null,
+    "reverse_rows": false,
+    "runs": [
+      {
+        "case": "cohort2w4",
+        "http_max_body_mb": 32,
+        "batch": 4,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4"
+        },
+        "diagnostic": true,
+        "directory": "0-cohort2w4",
+        "seconds": [
+          110.386626583
+        ],
+        "sampled_peak_process_tree_rss_bytes": 1410023424,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 24602.5,
+          "p95": 31998,
+          "max": 31998,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          24.827519457999998,
+          28.789895167000005,
+          32.111929834,
+          24.656699542
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "sampled_max_metal_allocated_bytes": 4059824128,
+        "metal_memory_samples": 135,
+        "metal_memory_scope": "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded.",
+        "completion_tokens_per_pass": [
+          9085
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.012150426701485965
+        ],
+        "matrix_frames": {
+          "samples": 3897,
+          "rows_counts": {
+            "2": 3897
+          },
+          "submissions": 3897,
+          "gpu_ns": 49233686221,
+          "wait_ns": 53240757000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w8qkv",
+        "http_max_body_mb": 32,
+        "batch": 8,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": true,
+        "directory": "1-cohort4w8qkv",
+        "seconds": [
+          88.705736833
+        ],
+        "sampled_peak_process_tree_rss_bytes": 2005647360,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 38799.0,
+          "p95": 46610,
+          "max": 46610,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          41.955259083,
+          46.750295708
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "sampled_max_metal_allocated_bytes": 4045029376,
+        "metal_memory_samples": 102,
+        "metal_memory_scope": "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded.",
+        "completion_tokens_per_pass": [
+          9085
+        ],
+        "changed_pages": [
+          {
+            "iteration": 0,
+            "document": "attention",
+            "page": 6,
+            "completion_tokens": 701
+          }
+        ],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": false,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.009763977637094112
+        ],
+        "matrix_frames": {
+          "samples": 2675,
+          "rows_counts": {
+            "2": 771,
+            "3": 457,
+            "4": 1447
+          },
+          "submissions": 2675,
+          "gpu_ns": 46690292130,
+          "wait_ns": 48606924000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      },
+      {
+        "case": "cohort4w16qkv",
+        "http_max_body_mb": 32,
+        "batch": 16,
+        "server_flags": {
+          "TERMITE_SERVER_GENERATE_TIMING": "1",
+          "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+          "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+          "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+          "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+          "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+          "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+          "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+          "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+          "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16",
+          "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+        },
+        "diagnostic": true,
+        "directory": "2-cohort4w16qkv",
+        "seconds": [
+          95.6956665
+        ],
+        "sampled_peak_process_tree_rss_bytes": 3793256448,
+        "generation_pipeline_wall_ms": {
+          "samples": 16,
+          "p50": 85776.0,
+          "p95": 95386,
+          "max": 95386,
+          "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+        },
+        "http_wave_seconds": [
+          95.69558379200001
+        ],
+        "mtp_work": {
+          "rounds": 0,
+          "drafted": 0,
+          "matched": 0,
+          "acceptance_rate": null,
+          "phase_wall_ns": {
+            "draft_ns": 0,
+            "verify_ns": 0,
+            "materialize_ns": 0
+          }
+        },
+        "sampled_max_metal_allocated_bytes": 3993911296,
+        "metal_memory_samples": 92,
+        "metal_memory_scope": "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded.",
+        "completion_tokens_per_pass": [
+          9126
+        ],
+        "changed_pages": [],
+        "missing_pages": [],
+        "truncated_at_cap": 0,
+        "passes_output_gate": true,
+        "eligible_for_throughput_comparison": false,
+        "seconds_per_committed_token": [
+          0.010486047172912558
+        ],
+        "matrix_frames": {
+          "samples": 2355,
+          "rows_counts": {
+            "2": 141,
+            "3": 114,
+            "4": 2100
+          },
+          "submissions": 2355,
+          "gpu_ns": 48706905558,
+          "wait_ns": 53312307000,
+          "scope": "Matrix cohort frames only; singleton tails, image prep and prefill are excluded. No warm matrix frames."
+        }
+      }
+    ],
+    "completed": true,
+    "recommendation": {
+      "qualified_speedup": false,
+      "reason": "No repeated complete-output eligible cases"
+    },
+    "allocation_scope_note": "Sampled maximum includes preload/prefill/recognition; timings excluded. Similar maxima do not establish identical live KV use. RSS is a separate sampled domain and cannot be added to Metal resources."
+  },
+  "overall_decision": {
+    "promote_matrix_batching": false,
+    "promote_mtp": false,
+    "reason": "Four-row/eight-window canonical QKV beats ordinary in transcript-matching bracketed campaigns, but its later allocation-instrumented run omits Attention page 6. The matrix parity failure remains unresolved. No overall MTP speedup qualifies. All experiments remain opt-in.",
+    "timing_claim_scope": "Per-campaign complete-output uninstrumented runs only; not a robust production throughput guarantee."
+  }
+}
