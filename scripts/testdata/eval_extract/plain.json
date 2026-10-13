@@ -1,0 +1,1 @@
+{"schema_version":2,"model":"fastino/gliner2.5-base-v1","schema":{"entities":["person","location"]},"options":{"threshold":0.5,"long_document":{"mode":"window","window_words":256,"overlap_words":32}}}

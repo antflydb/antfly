@@ -1,0 +1,1 @@
+{"schema_version":2,"model":"fastino/gliner2.5-base-v1","schema":{"entities":["person","location"],"entity_definitions":{"person":{"description":"A named individual human being."},"location":{"description":"A named city, country, or geographic place."}}},"options":{"threshold":0.5,"long_document":{"mode":"window","window_words":256,"overlap_words":32}}}

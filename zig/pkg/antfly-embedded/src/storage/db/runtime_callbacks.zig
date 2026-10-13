@@ -28,6 +28,9 @@ pub const CandidateSource = struct {
         index_name: []const u8,
         embedding: []const f32,
         k: usize,
+        /// Candidate record fields consumed by comparisons against the mention vector.
+        /// Empty means ANN blocking only: return stored JSON without vector hydration.
+        vector_fields: []const []const u8 = &.{},
     };
     pub const ScanOptions = struct {
         limit: usize = 0,

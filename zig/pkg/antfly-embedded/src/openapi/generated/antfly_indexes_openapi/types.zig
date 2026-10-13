@@ -8010,6 +8010,10 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Materialize canonical entity documents. False resolves graph keys without promotion.
+    promote: ?bool = null,
+    /// Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution.
+    aliases: ?[]const std.json.Value = null,
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
@@ -8037,6 +8041,8 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "promote", "promote", true },
+        .{ "aliases", "aliases", true },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
@@ -8078,6 +8084,14 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.promote) |value| {
+            try jw.objectField("promote");
+            try jw.write(value);
+        }
+        if (self.aliases) |value| {
+            try jw.objectField("aliases");
+            try jw.write(value);
+        }
         if (self.labels) |value| {
             try jw.objectField("labels");
             try jw.write(value);
