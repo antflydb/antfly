@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "id": "sintel-6s",
+      "path": "/fixture/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ],
+      "advance_ns": 1000000000,
+      "qualify_reader_cache": true,
+      "incremental_validation": false
+    },
+    {
+      "id": "sintel-6s-sparse",
+      "path": "/fixture/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ],
+      "advance_ns": 3000000000,
+      "qualify_reader_cache": true,
+      "incremental_validation": false
+    }
+  ],
+  "queries": [
+    {
+      "id": "dragon",
+      "text": "A dragon and a young woman."
+    },
+    {
+      "id": "landscape",
+      "text": "A wide landscape with mountains."
+    }
+  ]
+}

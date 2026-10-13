@@ -27,6 +27,8 @@ pub const Index = struct {
     packet_count: usize = 0,
     pending_pts: ?i64 = null,
     pending_first_packet: ?usize = null,
+    decoded_packets: usize = 0,
+    payload_bytes: u64 = 0,
     reservation: media.admission.Token = .{},
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.pictures);
@@ -62,7 +64,7 @@ pub const Index = struct {
             }
             at += 1;
         }
-        return .{ .allocator = a, .pictures = owned, .timescale = self.timescale, .packet_count = packet_count, .pending_pts = self.pending_pts, .pending_first_packet = if (self.pending_first_packet) |pending| pending - base else null, .reservation = reservation };
+        return .{ .allocator = a, .pictures = owned, .timescale = self.timescale, .packet_count = packet_count, .pending_pts = self.pending_pts, .pending_first_packet = if (self.pending_first_packet) |pending| pending - base else null, .decoded_packets = self.decoded_packets, .payload_bytes = self.payload_bytes, .reservation = reservation };
     }
     /// Return transport selectors for logical pictures in presentation order.
     /// The first member selects the complete field/partition assembly on replay.
@@ -119,6 +121,162 @@ const Collector = struct {
         try self.planes.append(self.allocator, if (picture.independent_plane) |plane| @as(u8, 1) << @intCast(plane) else 0);
     }
 };
+/// Persistent static-configuration logical index. Published packets are immutable;
+/// normalized content bindings detect prefix/configuration mutation before reuse.
+/// Geometry/configuration epochs use a fresh owner. Failed reconstruction requires
+/// destroying this owner and replaying retained preroll; snapshots stay independent.
+pub const Stream = struct {
+    allocator: std.mem.Allocator,
+    options: Options,
+    core: *h264.Incremental,
+    collector: Collector,
+    reservation: media.admission.Token = .{},
+    allocations: media.admission.TrackedAllocator,
+    prefix: [32]u8,
+    valid: bool = true,
+    last_stats: h264.Statistics = .{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 },
+    pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Stream {
+        if (options.max_pictures == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+        const slots = try std.math.mul(usize, try std.math.add(usize, options.max_pictures, 8), 3);
+        const bytes = try std.math.add(usize, @sizeOf(Stream), try std.math.mul(usize, slots, @sizeOf(h264.Picture) + @sizeOf(u8)));
+        var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Stream) }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const self = try a.create(Stream);
+        errdefer a.destroy(self);
+        const prefix = try prefixHash(reader, 0, options.decode.max_packet_bytes);
+        const core = try h264.Incremental.init(a, reader, options.decode);
+        errdefer core.deinit();
+        const allocation_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{}) else media.admission.Token{};
+        self.* = .{ .allocator = a, .options = options, .core = core, .collector = .{ .allocator = a, .limit = options.max_pictures }, .reservation = reservation, .allocations = .{ .backing = a, .reservation = allocation_reservation, .limit = bytes - @sizeOf(Stream) }, .prefix = prefix };
+        self.collector.allocator = self.allocations.allocator();
+        return self;
+    }
+    pub fn deinit(self: *Stream) void {
+        self.core.deinit();
+        self.collector.pictures.deinit(self.collector.allocator);
+        self.collector.planes.deinit(self.collector.allocator);
+        const a = self.allocator;
+        var reservation = self.reservation;
+        var allocation_reservation = self.allocations.reservation;
+        std.debug.assert(self.allocations.live == 0);
+        a.destroy(self);
+        allocation_reservation.deinit();
+        reservation.deinit();
+    }
+    pub fn advance(self: *Stream, reader: *media.mp4.Reader) !h264.Statistics {
+        if (!self.valid) return error.InvalidVideoDecoder;
+        if (reader.packets.len > self.options.max_packets or reader.packets.len <= self.core.cursor()) return error.ResourceLimitExceeded;
+        const previous = try prefixHash(reader, self.core.cursor(), self.options.decode.max_packet_bytes);
+        if (!std.mem.eql(u8, &previous, &self.prefix)) return error.InvalidLivePictureIndex;
+        const next = try prefixHash(reader, reader.packets.len, self.options.decode.max_packet_bytes);
+        errdefer self.valid = false;
+        self.collector.pending_pts = null;
+        self.collector.pending_first_packet = null;
+        self.allocations.denied = null;
+        const stats = self.core.advance(reader, .{ .context = &self.collector, .accept = Collector.accept, .pending = Collector.pending }) catch |err| return if (err == error.OutOfMemory) self.allocations.denied orelse err else err;
+        self.prefix = next;
+        self.last_stats = stats;
+        return stats;
+    }
+    pub fn snapshot(self: *Stream, reader: *media.mp4.Reader) !Index {
+        if (!self.valid or reader.packets.len != self.core.cursor()) return error.InvalidLivePictureIndex;
+        var count: usize = 0;
+        var pending_pts = self.collector.pending_pts;
+        var pending_first = self.collector.pending_first_packet;
+        for (self.collector.pictures.items, self.collector.planes.items) |picture, mask| {
+            if (mask == 0 or mask == 7) count += 1 else {
+                pending_pts = if (pending_pts) |old| @min(old, picture.pts) else picture.pts;
+                pending_first = if (pending_first) |old| @min(old, picture.first_packet) else picture.first_packet;
+            }
+        }
+        const bytes = try std.math.mul(usize, count, @sizeOf(h264.Picture));
+        var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const owned = try self.allocator.alloc(h264.Picture, count);
+        errdefer self.allocator.free(owned);
+        var at: usize = 0;
+        for (self.collector.pictures.items, self.collector.planes.items) |picture, mask| if (mask == 0 or mask == 7) {
+            try reader.input.control.check();
+            owned[at] = picture;
+            at += 1;
+        };
+        return .{ .allocator = self.allocator, .pictures = owned, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .pending_pts = pending_pts, .pending_first_packet = pending_first, .decoded_packets = self.last_stats.decoded_packets, .payload_bytes = self.last_stats.payload_bytes, .reservation = reservation };
+    }
+    /// All probes precede mutation; caller commits source eviction only on success.
+    pub fn rebase(self: *Stream, reader: *media.mp4.Reader, removed: usize) !void {
+        if (!self.valid or reader.packets.len != self.core.cursor() or !self.core.canRebase(removed)) return error.InvalidLivePictureIndex;
+        if (self.collector.pending_first_packet) |pending| if (pending < removed) return error.InvalidLivePictureIndex;
+        for (self.collector.pictures.items, self.collector.planes.items) |picture, mask| {
+            if (mask != 0 and mask != 7 and picture.first_packet < removed) return error.InvalidLivePictureIndex;
+        }
+        var suffix = reader.*;
+        suffix.packets = reader.packets[removed..];
+        const binding = try prefixHash(&suffix, suffix.packets.len, self.options.decode.max_packet_bytes);
+        var at: usize = 0;
+        for (self.collector.pictures.items, self.collector.planes.items) |picture, mask| {
+            if (picture.first_packet < removed) continue;
+            var rebased = picture;
+            rebased.first_packet -= removed;
+            if (rebased.last_packet) |last| rebased.last_packet = last - removed;
+            self.collector.pictures.items[at] = rebased;
+            self.collector.planes.items[at] = mask;
+            at += 1;
+        }
+        self.collector.pictures.items.len = at;
+        self.collector.planes.items.len = at;
+        if (self.collector.pending_first_packet) |pending| self.collector.pending_first_packet = pending - removed;
+        self.core.rebase(removed);
+        self.prefix = binding;
+    }
+};
+fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int => |info| {
+            var bytes: [8]u8 = undefined;
+            const word: u64 = if (info.signedness == .signed) @bitCast(@as(i64, @intCast(value))) else @intCast(value);
+            std.mem.writeInt(u64, &bytes, word, .little);
+            hash.update(&bytes);
+        },
+        .bool => hashValue(hash, @as(u8, @intFromBool(value))),
+        .@"enum" => hashValue(hash, @as(u64, @backingInt(value))),
+        .@"struct" => inline for (@typeInfo(T).@"struct".field_names) |name| hashValue(hash, @field(value, name)),
+        .array => for (value) |item| hashValue(hash, item),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                hashValue(hash, value.len);
+                for (value) |item| hashValue(hash, item);
+            },
+            else => @compileError("unsupported hash pointer"),
+        },
+        .optional => {
+            hashValue(hash, value != null);
+            if (value) |item| hashValue(hash, item);
+        },
+        else => @compileError("unsupported hash value"),
+    }
+}
+fn prefixHash(reader: *media.mp4.Reader, count: usize, max_packet: usize) ![32]u8 {
+    if (count > reader.packets.len) return error.InvalidPacketIndex;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-incremental-avc-prefix-v1");
+    hashValue(&hash, reader.track);
+    hashValue(&hash, count);
+    for (reader.packets[0..count], 0..) |packet, i| {
+        try reader.input.control.check();
+        if (packet.size > max_packet) return error.ResourceLimitExceeded;
+        var lease = try reader.readPacket(i);
+        defer lease.deinit();
+        var descriptor = packet;
+        descriptor.offset = 0;
+        hashValue(&hash, descriptor);
+        hashValue(&hash, lease.bytes);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
 fn codedEnds(reader: *media.mp4.Reader, begin: usize, end: usize, max_packet: usize) !?[2]usize {
     var first: ?usize = null;
     var last: usize = 0;
@@ -168,6 +326,7 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
     defer collector.planes.deinit(a);
     var decode = options.decode;
     decode.picture_observer = .{ .context = &collector, .accept = Collector.accept, .pending = if (partial) Collector.pending else null };
+    var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
     if (reader.track.inband_parameter_sets) {
         const session = try dynamic.Session.init(a, reader, decode);
         defer session.deinit();
@@ -177,13 +336,13 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
             try selectors.appendSlice(a, &ends);
         };
         if (selectors.items.len == 0) return error.EmptyVideo;
-        _ = session.decodeSelected(selectors.items, &collector, discard) catch |err| caught: {
+        stats = session.decodeSelected(selectors.items, &collector, discard) catch |err| caught: {
             if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
             break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
         };
     } else {
         const ends = try codedEnds(reader, 0, reader.packets.len, decode.max_packet_bytes) orelse return error.EmptyVideo;
-        _ = h264.decodeSelected(a, reader, &ends, decode, &collector, discard) catch |err| caught: {
+        stats = h264.decodeSelected(a, reader, &ends, decode, &collector, discard) catch |err| caught: {
             if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
             break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
         };
@@ -204,7 +363,7 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
     collector.planes.deinit(a);
     collector.planes = .empty;
     try reservation.resize(.{ .host_bytes = owned.len * @sizeOf(h264.Picture) });
-    return .{ .allocator = a, .pictures = owned, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .pending_pts = collector.pending_pts, .pending_first_packet = collector.pending_first_packet, .reservation = reservation };
+    return .{ .allocator = a, .pictures = owned, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .pending_pts = collector.pending_pts, .pending_first_packet = collector.pending_first_packet, .decoded_packets = stats.decoded_packets, .payload_bytes = stats.payload_bytes, .reservation = reservation };
 }
 
 test "AVC logical picture index counts field pairs partitions and configuration epochs" {
@@ -310,4 +469,102 @@ test "AVC logical snapshots rebase retained suffix and keep independent admissio
     original_live = false;
     try std.testing.expectEqual(before + copy.pictures.len * @sizeOf(h264.Picture), pool.snapshot().host_bytes);
     try std.testing.expectEqual(@as(u32, 80), copy.pictures[1].width);
+}
+
+test "AVC incremental logical metadata matches replay across static tools and unfinished fields" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-baseline-p", "h264-high10-cabac", "h264-paff-adaptive-packets-8-1", "h264-paff-interleaved-fragments-10-2", "h264-paff-split-packets-14-3", "h264-jm-separate", "h264-jm-partitions" }) |name| {
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        if (!reader.track.inband_parameter_sets) {
+            const packets = reader.packets;
+            defer reader.packets = packets;
+            var stream: ?*Stream = null;
+            defer if (stream) |owner| owner.deinit();
+            var decoded: usize = 0;
+            for (1..packets.len + 1) |end| {
+                reader.packets = packets[0..end];
+                var oracle = streaming(a, &reader, .{}) catch |expected| {
+                    if (stream == null) stream = try Stream.init(a, &reader, .{});
+                    try std.testing.expectError(expected, stream.?.advance(&reader));
+                    stream.?.deinit();
+                    stream = null;
+                    continue;
+                };
+                defer oracle.deinit();
+                if (stream == null) stream = try Stream.init(a, &reader, .{});
+                const stats = try stream.?.advance(&reader);
+                decoded += stats.decoded_packets;
+                var snapshot = try stream.?.snapshot(&reader);
+                defer snapshot.deinit();
+                try std.testing.expectEqualSlices(h264.Picture, oracle.pictures, snapshot.pictures);
+                try std.testing.expectEqual(oracle.pending_pts, snapshot.pending_pts);
+                try std.testing.expectEqual(oracle.pending_first_packet, snapshot.pending_first_packet);
+            }
+            try std.testing.expect(decoded >= packets.len);
+            if (std.mem.eql(u8, name, "h264-baseline-p") or std.mem.eql(u8, name, "h264-paff-adaptive-packets-8-1")) try std.testing.expectEqual(packets.len, decoded);
+        }
+    }
+}
+fn streamAllocationRun(a: std.mem.Allocator) !void {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "incremental-failure", .admission_pool = &pool, .storage = .{ .borrowed = @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const packets = reader.packets;
+    defer reader.packets = packets;
+    reader.packets = packets[0..1];
+    const owner = try Stream.init(a, &reader, .{});
+    defer owner.deinit();
+    _ = try owner.advance(&reader);
+    var held = try owner.snapshot(&reader);
+    defer held.deinit();
+    reader.packets = packets;
+    _ = try owner.advance(&reader);
+    var complete = try owner.snapshot(&reader);
+    defer complete.deinit();
+}
+test "AVC incremental owner releases persistent allocation and admission failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, streamAllocationRun, .{});
+}
+
+test "AVC incremental prefix mutation and failed eviction preserve retry and held metadata" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4"));
+    defer a.free(bytes);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "immutable-prefix", .admission_pool = &pool, .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const packets = reader.packets;
+    defer reader.packets = packets;
+    reader.packets = packets[0..1];
+    const owner = try Stream.init(a, &reader, .{});
+    defer owner.deinit();
+    _ = try owner.advance(&reader);
+    var held = try owner.snapshot(&reader);
+    defer held.deinit();
+    try std.testing.expect(held.pending_first_packet != null);
+    const charged = pool.snapshot().host_bytes;
+    try std.testing.expectError(error.InvalidLivePictureIndex, owner.rebase(&reader, 1));
+    try std.testing.expectEqual(charged, pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.core.cursor());
+    reader.packets = packets;
+    const at: usize = @intCast(packets[0].offset + packets[0].size - 1);
+    bytes[at] ^= 1;
+    try std.testing.expectError(error.InvalidLivePictureIndex, owner.advance(&reader));
+    try std.testing.expectEqual(@as(usize, 1), owner.core.cursor());
+    try std.testing.expect(owner.valid);
+    bytes[at] ^= 1;
+    _ = try owner.advance(&reader);
+    var oracle = try streaming(a, &reader, .{});
+    defer oracle.deinit();
+    var snapshot = try owner.snapshot(&reader);
+    defer snapshot.deinit();
+    try std.testing.expectEqualSlices(h264.Picture, oracle.pictures, snapshot.pictures);
+    // The earlier output owns its metadata even while the owner advances.
+    try std.testing.expect(held.pending_first_packet != null and held.pictures.len == 0);
 }

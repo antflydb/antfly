@@ -1,0 +1,16 @@
+install-video-tests
++- install test
+   +- compile test safe aarch64-linux-musl 2 errors
+error: ld.lld: cannot open /private/tmp/native-video-core-admission-linux-cache/o/b94bf12d13f4968cae82a254a546e616/test_zcu.o: No such file or directory
+error: ld.lld: cannot open /private/tmp/native-video-h264-share-global/o/86f6caad40045e94068341850b14de15/libcompiler_rt.a: No such file or directory
+error: 2 compilation errors
+failed command: /Users/ajroetker/bin/zig-0.17.0/zig test -Osafe -target aarch64-linux-musl -mcpu baseline --dep antfly_media --dep antfly_image -Mroot=video_test_root.zig -Osafe -target aarch64-linux-musl -mcpu baseline -Mantfly_media=../media/src/mod.zig -Osafe -target aarch64-linux-musl -mcpu baseline -Mantfly_image=../image/src/mod.zig --cache-dir /private/tmp/native-video-core-admission-linux-cache --global-cache-dir /private/tmp/native-video-h264-share-global --build-root . --name test --zig-lib-dir /Users/ajroetker/bin/zig-0.17.0/lib/ --listen=-
+
+Build Summary: 3/6 steps succeeded (1 failed)
+install-live-window-tests success
++- install test success
+   +- compile test safe aarch64-linux-musl success 52s MaxRSS:546M
+install-video-tests transitive failure
++- install test transitive failure
+   +- compile test safe aarch64-linux-musl 2 errors
+

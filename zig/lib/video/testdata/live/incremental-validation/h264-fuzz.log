@@ -1,0 +1,14 @@
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.h264_fuzz_test.test.video fuzz H264 containers reconstruction and allocation cleanup" (29bbc2298b4f46fb)
+Runs: 0 -> 101170
+Unique runs: 0 -> 1163
+Coverage: 0/31576 -> 4666/31576 (14.78%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 2m MaxRSS:14M
+   +- compile test safe native success 39s MaxRSS:1G
+

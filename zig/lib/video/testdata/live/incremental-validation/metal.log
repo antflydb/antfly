@@ -1,0 +1,8 @@
+live sintel-6s/0: tokens=246 max_abs=0 seconds=1.34486
+live sintel-6s/1: tokens=246 max_abs=0 seconds=0.612319
+live sintel-6s/2: tokens=246 max_abs=0 seconds=0.600546
+live sintel-6s/3: tokens=246 max_abs=0 seconds=0.610737
+live sintel-6s/4: tokens=246 max_abs=0 seconds=0.688499
+live sintel-6s/5: tokens=124 max_abs=0 seconds=0.037141
+live sintel-6s-sparse/0: tokens=246 max_abs=0 seconds=0.899654
+live sintel-6s-sparse/1: tokens=246 max_abs=0 seconds=0.8783

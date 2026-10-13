@@ -3,9 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Verify real rolling/sparse live outputs and projection reuse across eviction.
 
-The pinned PyTorch oracle covers three original consecutive intervals. Its gates
-apply only to the matching rolling subset; other windows use complete-clip native
-baselines. This verifier does not claim fresh PyTorch coverage for those windows.
+Full rolling oracles cover every interval. Historical three-window oracles
+remain supported with their explicit matching-subset scope.
 """
 
 import argparse
@@ -14,6 +13,8 @@ import json
 from pathlib import Path
 
 import video_live_qualification
+import compare
+import video_compare
 
 
 def validate(report, oracle):
@@ -49,22 +50,81 @@ def validate(report, oracle):
                 or row["live_cache_stored"] != expected_stored
             ):
                 raise ValueError("rolling reuse/sparse cache isolation changed")
-    # Explicit verification view: preserve source times and vectors, renumber
-    # only the three matched intervals to the original oracle's ordinals.
-    subset = copy.deepcopy(report)
-    subset["cases"] = [copy.deepcopy(rolling[i]) for i in (0, 2, 4)]
-    for ordinal, row in enumerate(subset["cases"]):
-        row["ordinal"] = ordinal
-    result = video_live_qualification.validate(subset, oracle)
+    if "documents" in oracle:
+        result = full_reference(report, oracle)
+    else:
+        # Explicit verification view: preserve source times and vectors, renumber
+        # only the three matched intervals to the original oracle's ordinals.
+        subset = copy.deepcopy(report)
+        subset["cases"] = [copy.deepcopy(rolling[i]) for i in (0, 2, 4)]
+        for ordinal, row in enumerate(subset["cases"]):
+            row["ordinal"] = ordinal
+        result = video_live_qualification.validate(subset, oracle)
+        result["scope"] = (
+            "Pinned PyTorch gates cover rolling windows 0, 2, 4 matching the original "
+            "non-overlapping intervals. All eight rolling/sparse outputs match "
+            "complete-clip native baselines exactly. Five rolling cache hits survive "
+            "preroll eviction; sparse intervals have no shared selected pictures."
+        )
     result["rolling_cache_hits"] = rolling[-1]["live_cache_hits"]
     result["rolling_cache_stored"] = rolling[-1]["live_cache_stored"]
-    result["scope"] = (
-        "Pinned PyTorch gates cover rolling windows 0, 2, 4 matching the original "
-        "non-overlapping intervals. All eight rolling/sparse outputs match "
-        "complete-clip native baselines exactly. Five rolling cache hits survive "
-        "preroll eviction; sparse intervals have no shared selected pictures."
-    )
     return result
+
+
+def full_reference(report, oracle):
+    if oracle.get("status") != "pass":
+        raise ValueError("completed rolling oracle required")
+    expected = {row["case"] + "/" + str(row["ordinal"]) for row in report["cases"]}
+    documents = oracle["documents"]
+    queries = report["queries"]
+    query_ids = {row["id"] for row in queries}
+    if (
+        len(documents) != 8
+        or {row["id"] for row in documents} != expected
+        or len(queries) != 2
+        or query_ids != {"dragon", "landscape"}
+        or set(oracle["cases"]) != expected | query_ids
+    ):
+        raise ValueError("all rolling oracle identities required")
+    policies = {row["id"]: row["sampling"] for row in documents}
+    vectors = {}
+    maximum = 0.0
+    for row in report["cases"]:
+        name = row["case"] + "/" + str(row["ordinal"])
+        policy = {
+            "policy": "timestamps",
+            "start_ns": row["start_ns"] - 200_000_000,
+            "end_ns": row["end_ns"] - 200_000_000,
+        }
+        if (
+            policies[name] != policy
+            or row["input_tokens"] != oracle["cases"][name]["encoder_tokens"]
+        ):
+            raise ValueError("rolling oracle sampling/token identity changed")
+        metric = compare.assert_agreement(
+            row["vector"], oracle["cases"][name]["vector"]
+        )
+        maximum = max(maximum, metric["max_abs"])
+        vectors[name] = row["vector"]
+    for row in queries:
+        compare.assert_agreement(row["vector"], oracle["cases"][row["id"]]["vector"])
+        vectors[row["id"]] = row["vector"]
+    data = {"documents": documents, "queries": queries}
+    actual = video_compare.retrieval(data, vectors)
+    reference = video_compare.retrieval(
+        data, {name: row["vector"] for name, row in oracle["cases"].items()}
+    )
+    agreement = video_compare.rank_agreement(actual, reference, (1, 3, 5, 8), 1e-5)
+    if not agreement["pass"]:
+        raise ValueError("full rolling reference ranking/score drift")
+    return {
+        "max_reference_abs": maximum,
+        "retrieval": actual,
+        "reference_retrieval": reference,
+        "stream_baseline_exact": True,
+        "retrieval_agreement": agreement,
+        "scope": "Pinned PyTorch gates cover all six rolling and two sparse intervals, including the clipped tail. All native outputs also match complete-clip baselines exactly.",
+    }
 
 
 def main():

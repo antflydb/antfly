@@ -1359,3 +1359,61 @@ sustained throughput; append-time incremental reconstruction and broader
 qualification remain active work.
 
 See [qualification receipts](../video/testdata/live/idr-cache-validation/README.md).
+
+
+### Persistent static-AVC live validation
+
+The coordinator now defaults to `incremental_validation = true` for static AVC
+parameter sets. An owned `h264_pictures.Stream` retains reconstruction workspaces,
+prediction references and unfinished assemblies across appended packets, using
+the same native decode loop as ordinary replay. Separate colour planes retain
+independent lanes. Completed logical metadata escapes only through independently
+owned snapshots; source eviction rebases selectors and cursor state.
+
+SHA-256 binds immutable track values and normalized packet descriptors/payloads.
+Changed prefixes reject reuse before reconstruction. All eviction probes precede
+state mutation. If reconstruction or a later append probe fails, the coordinator
+discards the mutated decoder owner while preserving committed metadata, cursor
+and incoming unit ownership; retry reconstructs retained preroll. Shared admission
+covers the stable owner, retained reconstruction resources and actual metadata
+allocation/growth. Cancelled or failed construction frees those owners.
+
+Full replay remains selectable as `incremental_validation = false`, and in-band
+SPS/PPS configuration streams continue to use it. Automatic pending-picture
+watermarks and incomplete EOF checks remain active. Replay now reports other
+pictures completed in a packet before returning its unfinished-selection error;
+otherwise streaming metadata could lose a completed interleaved field pair.
+
+ReleaseSafe macOS gates pass 234 video tests (two skips), 20 live checks and 49
+CPU/Metal model checks. Actual Linux ARM64 passes 209 video tests (27 platform
+skips), 20 live checks and 44 model checks (five Metal skips). The replay and
+persistent paths preserve identical logical metadata through unfinished fields;
+allocation failures, prefix mutation and denied eviction retain clean ownership
+and retry behavior. Independently held snapshots survive owner advancement.
+
+Fresh CPU, Metal and actual Linux pretrained incremental/replay comparisons
+preserve all eight rolling/sparse vectors and token counts exactly, including the
+124-token clipped tail. Each policy reconstructs 60 packets rather than 150;
+rolling reconstruction payload bytes fall 81,132 to 33,431 and sparse bytes fall
+85,762 to 33,431. Coordinator walk/snapshot counts and projection cache behavior
+match. These are successful native reconstruction counts, excluding compressed
+prefix hashing and transport reads; shared-host timings do not establish
+sustained throughput or RSS improvement.
+
+Fresh pinned PyTorch CPU and MPS oracles now cover every rolling/sparse interval,
+including the previously uncovered odd windows and clipped tail. CPU, Metal and
+Linux preserve exact rankings and full top-k overlap for both queries across all
+eight documents. Maximum vector-coordinate error is below 2.08e-6. The reference
+generator retains independent FFmpeg picture/timestamp selection and pinned
+checkpoint/implementation hashes; all dependencies are offline qualification
+tools. The verifier rejects missing reference cases, altered policies, incomplete
+oracles and unchanged reconstruction work. Historical subset oracles remain
+supported with their explicit narrower scope.
+
+Dynamic incremental parameter/geometry handling, persistent-owner fuzzing,
+large-clip sustained measurements, prefix/parameter planning and the original
+broader non-CUDA scope remain active. The modified ordinary reconstruction loop
+passes 101,170 coverage-guided H.264 fuzz runs; this does not qualify sustained
+persistent-owner fuzzing. Source, binary and fixture receipts bind the scope.
+
+See [qualification receipts](../video/testdata/live/incremental-validation/README.md).

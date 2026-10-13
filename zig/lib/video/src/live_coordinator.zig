@@ -29,6 +29,8 @@ pub const Options = struct {
     max_frames: usize = 32,
     max_retained_bytes: usize = 64 * 1024 * 1024,
     max_windows: usize = 4096,
+    /// Full replay remains available as a differential/benchmark oracle.
+    incremental_validation: bool = true,
 };
 pub const Prepared = struct {
     window: windows.Window,
@@ -48,7 +50,7 @@ pub const Prepared = struct {
 };
 /// Single consumer. Unit ownership transfers only after successful append.
 /// A prepared output owns independent storage; commit only after delivery succeeds.
-pub const Stats = struct { validation_walks: usize = 0, metadata_snapshots: usize = 0 };
+pub const Stats = struct { validation_walks: usize = 0, validation_packets: usize = 0, validation_payload_bytes: u64 = 0, metadata_snapshots: usize = 0 };
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -61,6 +63,7 @@ pub const Coordinator = struct {
     tail_ns: i64 = 0,
     pending_ns: ?i64 = null,
     logical: ?pictures.Index = null,
+    stream: ?*pictures.Stream = null,
     logical_base: usize = 0,
     stats: Stats = .{},
     ordinal: usize = 0,
@@ -75,7 +78,12 @@ pub const Coordinator = struct {
         const reservation = if (options.window.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Coordinator) }) else media.admission.Token{};
         return .{ .allocator = a, .options = options, .reservation = reservation };
     }
+    fn dropStream(self: *Coordinator) void {
+        if (self.stream) |stream| stream.deinit();
+        self.stream = null;
+    }
     pub fn deinit(self: *Coordinator) void {
+        self.dropStream();
         for (self.units[0..self.count]) |*unit| unit.deinit();
         if (self.pending) |*unit| unit.deinit();
         if (self.logical) |*logical| logical.deinit();
@@ -116,6 +124,7 @@ pub const Coordinator = struct {
         self.units[self.count] = value;
         var view = try windows.join(self.allocator, "live-probe", self.units[0 .. self.count + 1], self.options.window);
         defer view.deinit();
+        errdefer self.dropStream();
         var sealed = self.sealed_ns;
         var pending_ns: ?i64 = null;
         var logical: ?pictures.Index = null;
@@ -124,7 +133,15 @@ pub const Coordinator = struct {
             const last = view.reader.packets[view.reader.packets.len - 1];
             sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
         } else {
-            logical = try pictures.streaming(self.allocator, &view.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
+            const picture_options = pictures.Options{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } };
+            if (self.options.incremental_validation and !view.reader.track.inband_parameter_sets) {
+                if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, &view.reader, picture_options);
+                _ = try self.stream.?.advance(&view.reader);
+                logical = try self.stream.?.snapshot(&view.reader);
+            } else {
+                self.dropStream();
+                logical = try pictures.streaming(self.allocator, &view.reader, picture_options);
+            }
             const last = view.reader.packets[view.reader.packets.len - 1];
             var frontier = try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale);
             if (logical.?.pending_pts) |pts| frontier = @min(frontier, try ns(pts, view.reader.track.timescale));
@@ -141,12 +158,17 @@ pub const Coordinator = struct {
             released = try std.math.add(usize, released, try charge(old));
             removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
         }
+        if (keep != 0) if (self.stream) |stream| try stream.rebase(&view.reader, removed_packets);
         if (self.logical) |*previous| previous.deinit();
         self.logical = logical;
         logical = null;
         self.logical_base = removed_packets;
         self.pending_ns = pending_ns;
-        if (self.logical != null) self.stats.validation_walks += 1;
+        if (self.logical) |validated| {
+            self.stats.validation_walks += 1;
+            self.stats.validation_packets += validated.decoded_packets;
+            self.stats.validation_payload_bytes += validated.payload_bytes;
+        }
         self.count += 1;
         self.retained_bytes += bytes;
         // Start remains fixed after the first window has been delivered.
@@ -270,6 +292,7 @@ pub const Coordinator = struct {
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
         const next_base = try std.math.add(usize, self.logical_base, removed_packets);
+        if (removed_packets != 0) if (self.stream) |stream| try stream.rebase(@constCast(&prepared.window.reader), removed_packets);
         self.start_ns = next_start;
         self.epoch_committed = true;
         self.ordinal += 1;
@@ -308,6 +331,7 @@ pub const Coordinator = struct {
                 self.pending_ns = null;
                 if (self.logical) |*logical| logical.deinit();
                 self.logical = null;
+                self.dropStream();
                 self.logical_base = 0;
                 self.finished = false;
                 self.epoch_committed = false;
@@ -796,4 +820,39 @@ test "live coordinator sparse pumping evicts skipped units within a two-unit bud
     var held = try prepared.window.reader.readPacket(0);
     defer held.deinit();
     try std.testing.expect(held.bytes.len > 0);
+}
+
+test "live coordinator incremental validation avoids old packet reconstruction and matches replay" {
+    const a = std.testing.allocator;
+    var saved: ?Prepared = null;
+    defer if (saved) |*prepared| prepared.deinit();
+    var replay_packets: usize = 0;
+    inline for (.{ false, true }) |incremental| {
+        var ingest = try media.live_mp4.Ingest.init(a, "incremental-oracle", fixture[0..797], .{});
+        defer ingest.deinit();
+        var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .incremental_validation = incremental });
+        defer flow.deinit();
+        var one = try part(&ingest, 797, 11206);
+        defer if (one) |*unit| unit.deinit();
+        var two = try part(&ingest, 11206, 20811);
+        defer if (two) |*unit| unit.deinit();
+        const first_count = one.?.reader.packets.len;
+        const total = first_count + two.?.reader.packets.len;
+        try flow.append(&one);
+        try flow.append(&two);
+        var prepared = (try flow.prepare()).?;
+        if (incremental) {
+            defer prepared.deinit();
+            try std.testing.expectEqualSlices(@import("h264.zig").Picture, saved.?.logical.?.pictures, prepared.logical.?.pictures);
+            try std.testing.expectEqual(saved.?.source_start_ns, prepared.source_start_ns);
+            try std.testing.expectEqual(saved.?.source_end_ns, prepared.source_end_ns);
+            try std.testing.expectEqual(total, flow.stats.validation_packets);
+            try std.testing.expectEqual(total + first_count, replay_packets);
+            try flow.commit(&prepared);
+            try assertFirstSample(a, &prepared);
+        } else {
+            replay_packets = flow.stats.validation_packets;
+            saved = prepared;
+        }
+    }
 }
