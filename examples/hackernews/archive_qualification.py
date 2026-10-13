@@ -62,6 +62,13 @@ def percentile(values, fraction=0.95):
 
 def plan(config, inventory, ledger=None):
     r, b = config["resources"], config["budget"]
+    if config.get("benchmark_composed") and (
+        not config.get("qualify_composed_sources")
+        or not 2 <= config.get("composed_current_rows", 1000) <= 4096
+    ):
+        raise ValueError(
+            "Composed benchmarks require composition qualification and 2–4096 current rows"
+        )
     if ledger is not None:
         validate_future_reservation(ledger, config)
         previous = ledger["budget"]
@@ -134,6 +141,11 @@ def plan(config, inventory, ledger=None):
         "reservation_usd": b["reservation_per_run_usd"],
         "planned_total_reserved_usd": float(planned),
         "current_exposure_usd": held,
+        "remaining_run_slots": future_runs,
+        "unreserved_budget_usd": float(money(b["ceiling_usd"]) - money(held)),
+        "can_reserve_next_run": future_runs > 0
+        and money(held) + money(b["reservation_per_run_usd"])
+        <= money(b["ceiling_usd"]),
         "note": "Same-region reads; existing export reused. Actual billing and GCS operations must be reconciled separately.",
     }
 
@@ -263,6 +275,27 @@ def assess(regional, config):
                     failures.append(
                         f"{label}: workload {term} exceeds sample/latency gate"
                     )
+            if config.get("benchmark_composed"):
+                benchmarks = report.get("composed_benchmarks", {})
+                for name in ("union", "saved_overlay"):
+                    result = benchmarks.get(name, {})
+                    samples = result.get("warm_samples_ms", [])
+                    cold = result.get("first_search_ms")
+                    if (
+                        result.get("current_fixture_rows")
+                        != config.get("composed_current_rows", 1000)
+                        or result.get("result_count", 0) < 1
+                        or len(samples) < config["repeats"]
+                        or cold is None
+                        or not math.isfinite(cold)
+                        or cold < 0
+                        or cold > c["cold_ms"]
+                        or not samples
+                        or percentile(samples) > c["warm_p95_ms"]
+                    ):
+                        failures.append(
+                            f"{label}: composed {name} exceeds coverage/latency gate"
+                        )
             cursor_depth = report.get("cursor_depth", {})
             if config.get("qualify_composed_sources") and not {
                 "union_history",
@@ -380,6 +413,14 @@ def main():
         command.append("--store-source")
     if config.get("qualify_composed_sources"):
         command.append("--qualify-composed-sources")
+    if config.get("benchmark_composed"):
+        command.extend(
+            [
+                "--benchmark-composed",
+                "--composed-current-rows",
+                str(config.get("composed_current_rows", 1000)),
+            ]
+        )
     if config.get("cursor_term"):
         command.extend(["--cursor-term", config["cursor_term"]])
     command.extend(
