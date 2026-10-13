@@ -279,6 +279,7 @@ const Stream = struct {
             break :exact true;
         } else true;
         if (items != .array or items.array.items.len > self.page_rows) return error.InvalidQueryRequest;
+        if (exact and remaining < items.array.items.len) return error.CatalogGenerationChanged;
         // Admitted ordered leaf queries provide the requested sort window even
         // when pruning leaves cardinality as a lower bound. A short lower-bound
         // window cannot prove exhaustion and must fail closed. Never accumulate
@@ -935,6 +936,7 @@ const LowerBoundFixture = struct {
     calls: usize = 0,
     rows: usize = 7,
     full_total: bool = false,
+    inconsistent_exact: bool = false,
     fn checkpoint(_: *anyopaque) !void {}
     fn run(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -951,9 +953,9 @@ const LowerBoundFixture = struct {
             const item = try std.json.Stringify.valueAlloc(pa, .{ ._id = id, ._sort = [_]V{ .{ .float = 1.0 / @as(f64, @floatFromInt(rank + 1)) }, .{ .string = id } }, ._source = .{ .id = rank } }, .{});
             try hits.append(pa, try std.json.parseFromSliceLeaky(V, pa, item, .{}));
         }
-        const exact = !self.incomplete and hits.items.len < maximum;
+        const exact = self.inconsistent_exact or (!self.incomplete and hits.items.len < maximum);
         // Change the bound between requests; it is never a snapshot identity.
-        const value = if (exact) (if (self.full_total) self.rows else self.rows - start) else if (self.calls % 2 == 0) hits.items.len else self.rows - start;
+        const value = if (self.inconsistent_exact) 0 else if (exact) (if (self.full_total) self.rows else self.rows - start) else if (self.calls % 2 == 0) hits.items.len else self.rows - start;
         return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ ._composed_identity = self.changed, .remote_snapshot = table, .hits = .{ .total = .{ .value = value, .relation = if (exact) "exact" else "gte" }, .hits = hits.items } }} }, .{}), false);
     }
     fn executor(self: *@This()) Executor {
@@ -989,6 +991,9 @@ test "external lake composition retains lower-bound cuts and proves exact exhaus
                         try std.testing.expectEqualStrings("gte", hits.object.get("total").?.object.get("relation").?.string);
                         var next = try clone(pa, request, V);
                         try next.object.put(pa, "source_cursor", cursor);
+                        fixture.inconsistent_exact = true;
+                        try std.testing.expectError(error.CatalogGenerationChanged, execute(a, try std.json.Stringify.valueAlloc(pa, next, .{}), fixture.executor()));
+                        fixture.inconsistent_exact = false;
                         fixture.changed = true;
                         try std.testing.expectError(error.CatalogGenerationChanged, execute(a, try std.json.Stringify.valueAlloc(pa, next, .{}), fixture.executor()));
                         fixture.changed = false;
