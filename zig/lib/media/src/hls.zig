@@ -69,6 +69,8 @@ pub const Segment = struct {
     part: ?Part = null,
     dash: ?DashTiming = null,
     encryption: ?crypto.Key = null,
+    /// Preserve an explicit identity METHOD=NONE as well as AES across delta updates.
+    identity_key_declared: bool = false,
 };
 pub const Limits = struct {
     max_bytes: usize = 1024 * 1024,
@@ -95,11 +97,13 @@ pub const Playlist = struct {
     /// Playlist-owned manifest references. HLS references borrow its input;
     /// DASH copies both explicit and expanded references into this owner.
     owned_uris: []const []u8 = &.{},
+    reservation: @import("admission.zig").Token = .{},
     pub fn deinit(self: *Playlist) void {
         for (self.owned_uris) |owned| self.allocator.free(owned);
         self.allocator.free(self.owned_uris);
         self.allocator.free(self.segments);
         self.allocator.free(self.dash_periods);
+        self.reservation.deinit();
         self.* = undefined;
     }
 };
@@ -176,6 +180,14 @@ fn map(value: []const u8, limits: Limits) !Initialization {
 /// fMP4 media playlists and published partial units, including AES-128 identity keys.
 /// Master and I-frame playlists use separate APIs or fail explicitly.
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist {
+    return parseUpdateControlled(a, bytes, limits, null, .{}, null);
+}
+/// Merge skipped complete media segments from an immutable committed snapshot.
+/// Missing history is distinguished so HTTP readers can retry a full playlist.
+pub fn parseUpdate(a: std.mem.Allocator, bytes: []const u8, limits: Limits, previous: ?Playlist) !Playlist {
+    return parseUpdateControlled(a, bytes, limits, previous, .{}, null);
+}
+pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Limits, history: ?Playlist, control: @import("source.zig").Control, pool: ?*@import("admission.zig").Pool) !Playlist {
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.MalformedHls;
     if (master.isMaster(bytes)) return error.UnsupportedHls;
@@ -184,6 +196,9 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next().?, "\r"), "#EXTM3U")) return error.MalformedHls;
     var segments: std.ArrayList(Segment) = .empty;
     errdefer segments.deinit(a);
+    var skipped: ?u64 = null;
+    var reservation = @import("admission.zig").Token{};
+    errdefer reservation.deinit();
     var target: ?u64 = null;
     var initialization: ?Initialization = null;
     var duration: ?f64 = null;
@@ -205,6 +220,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
     var has_identity_key = false;
     var unsupported_only = false;
     while (lines.next()) |raw| {
+        try control.check();
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) continue;
         if (ended or std.mem.eql(u8, line, "#EXTM3U")) return error.MalformedHls;
@@ -264,7 +280,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
                 _ = std.math.add(u64, offset, pending.length) catch return error.MalformedHls;
                 range = .{ .offset = offset, .length = pending.length };
             }
-            try segments.append(a, .{ .uri = reference, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity and part_index == 0, .encryption = encryption, .part = .{ .index = part_index, .independent = (try attrs.yesNo("INDEPENDENT")) orelse false, .gap = (try attrs.yesNo("GAP")) orelse false } });
+            try segments.append(a, .{ .uri = reference, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity and part_index == 0, .encryption = encryption, .identity_key_declared = has_identity_key, .part = .{ .index = part_index, .independent = (try attrs.yesNo("INDEPENDENT")) orelse false, .gap = (try attrs.yesNo("GAP")) orelse false } });
             part_index = std.math.add(u32, part_index, 1) catch return error.ResourceLimitExceeded;
         } else if (std.mem.startsWith(u8, line, "#EXT-X-MAP:")) {
             if (part_index != 0) return error.MalformedHls;
@@ -307,7 +323,46 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
                 unsupported_only = false;
             } else if (!has_identity_key) unsupported_only = true;
             min_version = @max(min_version, declaration.min_version);
-        } else if (std.mem.startsWith(u8, line, "#EXT-X-STREAM-INF:") or std.mem.startsWith(u8, line, "#EXT-X-MEDIA:") or std.mem.startsWith(u8, line, "#EXT-X-I-FRAME") or std.mem.startsWith(u8, line, "#EXT-X-SKIP:") or std.mem.startsWith(u8, line, "#EXT-X-DEFINE:") or std.mem.startsWith(u8, line, "#EXT-X-SESSION-KEY:")) {
+        } else if (std.mem.startsWith(u8, line, "#EXT-X-SKIP:")) {
+            if (skipped != null or segments.items.len != 0 or duration != null or pending_range != null or discontinuity) return error.MalformedHls;
+            const attrs = try @import("hls_attributes.zig").parse(line[12..]);
+            skipped = (try attrs.integer("SKIPPED-SEGMENTS")) orelse return error.MalformedHls;
+            // This reader requests segment-only YES updates, never v2 date-range deletion.
+            if (attrs.get("RECENTLY-REMOVED-DATERANGES") != null) return error.UnsupportedHls;
+            if (skipped.? > limits.max_segments) return error.ResourceLimitExceeded;
+            const end = std.math.add(u64, sequence, skipped.?) catch return error.MalformedHls;
+            if (pool) |shared| reservation = try shared.acquire(.{ .host_bytes = limits.max_planning_bytes });
+            const array_bytes = std.math.mul(usize, limits.max_segments, @sizeOf(Segment)) catch return error.ResourceLimitExceeded;
+            if (array_bytes > limits.max_planning_bytes) return error.ResourceLimitExceeded;
+            try segments.ensureTotalCapacityPrecise(a, limits.max_segments);
+            if (skipped.? != 0) {
+                const old = history orelse return error.HlsDeltaHistoryMissing;
+                var expected = sequence;
+                for (old.segments) |item| {
+                    try control.check();
+                    if (item.part != null or item.sequence < expected) continue;
+                    if (expected == end) break;
+                    if (item.sequence != expected) return error.HlsDeltaHistoryMissing;
+                    if (expected == sequence) {
+                        const base = std.math.sub(u64, item.discontinuity_sequence, @intFromBool(item.discontinuity)) catch return error.SourceVersionChanged;
+                        if (base != discontinuity_sequence) return error.SourceVersionChanged;
+                    }
+                    try segments.append(a, item);
+                    expected += 1;
+                }
+                if (expected != end) return error.HlsDeltaHistoryMissing;
+                const last = segments.items[segments.items.len - 1];
+                if (initialization == null) initialization = last.initialization;
+                if (!has_identity_key) {
+                    encryption = last.encryption;
+                    has_identity_key = last.identity_key_declared;
+                    if (has_identity_key) unsupported_only = false;
+                }
+                discontinuity_sequence = last.discontinuity_sequence;
+                previous_full = last;
+            }
+            sequence = end;
+        } else if (std.mem.startsWith(u8, line, "#EXT-X-STREAM-INF:") or std.mem.startsWith(u8, line, "#EXT-X-MEDIA:") or std.mem.startsWith(u8, line, "#EXT-X-I-FRAME") or std.mem.startsWith(u8, line, "#EXT-X-DEFINE:") or std.mem.startsWith(u8, line, "#EXT-X-SESSION-KEY:")) {
             return error.UnsupportedHls;
         } else if (line[0] != '#') {
             if (unsupported_only) return error.UnsupportedEncryptedMedia;
@@ -326,7 +381,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
                 _ = std.math.add(u64, offset, pending.length) catch return error.MalformedHls;
                 range = .{ .offset = offset, .length = pending.length };
             }
-            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption });
+            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption, .identity_key_declared = has_identity_key });
             previous_full = segments.items[segments.items.len - 1];
             part_index = 0;
             sequence = std.math.add(u64, sequence, 1) catch return error.MalformedHls;
@@ -337,15 +392,16 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
     }
     if (duration != null or pending_range != null or discontinuity) return error.MalformedHls;
     const target_seconds = target orelse return error.MalformedHls;
+    if (skipped != null and (version orelse 1) < 9) return error.UnsupportedHls;
     if ((version orelse 1) < min_version or (initialization != null and (version orelse 1) < 6)) return error.UnsupportedHls;
-    const control = server_control orelse ServerControl{};
-    if (control.can_skip_dateranges and control.can_skip_until == null) return error.MalformedHls;
-    if (control.can_skip_until) |seconds| if (seconds < 6 * @as(f64, @floatFromInt(target_seconds))) return error.MalformedHls;
-    if (control.hold_back) |seconds| if (seconds < 3 * @as(f64, @floatFromInt(target_seconds))) return error.MalformedHls;
-    if (control.part_hold_back) |seconds| {
+    const server = server_control orelse ServerControl{};
+    if (server.can_skip_dateranges and server.can_skip_until == null) return error.MalformedHls;
+    if (server.can_skip_until) |seconds| if (seconds < 6 * @as(f64, @floatFromInt(target_seconds))) return error.MalformedHls;
+    if (server.hold_back) |seconds| if (seconds < 3 * @as(f64, @floatFromInt(target_seconds))) return error.MalformedHls;
+    if (server.part_hold_back) |seconds| {
         if (seconds < 2 * (part_target orelse return error.MalformedHls)) return error.MalformedHls;
     }
-    if (server_control != null and part_target != null and control.part_hold_back == null) return error.MalformedHls;
+    if (server_control != null and part_target != null and server.part_hold_back == null) return error.MalformedHls;
     if (ended and preload_hint != null) return error.MalformedHls;
     if (part_target) |seconds| for (segments.items, 0..) |segment, index| {
         const part = segment.part orelse continue;
@@ -353,7 +409,16 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist 
         const following = segments.items[index + 1];
         if (following.part) |next| if (following.sequence == segment.sequence and !next.gap) return error.MalformedHls;
     };
-    return .{ .allocator = a, .segments = try segments.toOwnedSlice(a), .target_duration_seconds = target_seconds, .ended = ended, .part_target_seconds = part_target, .server_control = control, .preload_hint = preload_hint };
+    var result = Playlist{ .allocator = a, .segments = try segments.toOwnedSlice(a), .target_duration_seconds = target_seconds, .ended = ended, .part_target_seconds = part_target, .server_control = server, .preload_hint = preload_hint };
+    errdefer result.deinit();
+    if (skipped != null) {
+        try ownDeltaReferences(&result, limits, control);
+        var bytes_owned: usize = result.segments.len * @sizeOf(Segment) + result.owned_uris.len * @sizeOf([]u8);
+        for (result.owned_uris) |owned| bytes_owned += owned.len;
+        try reservation.resize(.{ .host_bytes = bytes_owned });
+        result.reservation = reservation;
+    }
+    return result;
 }
 
 const fixture = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:41\n#EXT-X-DISCONTINUITY-SEQUENCE:5\n#EXT-X-MAP:URI=\"init,1.mp4\",BYTERANGE=\"100@0\"\n#EXTINF:1.5,first\n#EXT-X-BYTERANGE:200@100\nmedia.mp4\n#EXTINF:2,second\n#EXT-X-BYTERANGE:300\nmedia.mp4\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init2.mp4\"\n#EXTINF:1,last\nnext.mp4\n#EXT-X-ENDLIST\n";
@@ -515,4 +580,164 @@ test "HLS partial fuzz serialized seeds are positively accepted" {
         defer parsed.deinit();
         try std.testing.expect(parsed.segments.len > 0 and parsed.segments[0].part != null);
     }
+}
+
+fn ownDeltaReferences(playlist: *Playlist, limits: Limits, control: @import("source.zig").Control) !void {
+    const Owner = struct {
+        a: std.mem.Allocator,
+        refs: [][]u8,
+        used: usize = 0,
+        bytes: usize,
+        limit: usize,
+        fn copy(self: *@This(), ref: *[]const u8) !void {
+            if (ref.len == 0) return;
+            if (ref.len > self.limit -| self.bytes) return error.ResourceLimitExceeded;
+            self.refs[self.used] = try self.a.dupe(u8, ref.*);
+            ref.* = self.refs[self.used];
+            self.used += 1;
+            self.bytes += ref.len;
+        }
+    };
+    const count = try std.math.add(usize, try std.math.mul(usize, playlist.segments.len, 4), @intFromBool(playlist.preload_hint != null));
+    const refs = try playlist.allocator.alloc([]u8, count);
+    var owner = Owner{ .a = playlist.allocator, .refs = refs, .bytes = playlist.segments.len * @sizeOf(Segment) + refs.len * @sizeOf([]u8), .limit = limits.max_planning_bytes };
+    errdefer {
+        for (refs[0..owner.used]) |ref| playlist.allocator.free(ref);
+        playlist.allocator.free(refs);
+    }
+    if (owner.bytes > owner.limit) return error.ResourceLimitExceeded;
+    for (playlist.segments) |*item| {
+        try control.check();
+        try owner.copy(&item.uri);
+        try owner.copy(&item.initialization.uri);
+        if (item.encryption) |*key| try owner.copy(&key.uri);
+        if (item.initialization.encryption) |*key| try owner.copy(&key.uri);
+    }
+    if (playlist.preload_hint) |*hint| try owner.copy(&hint.uri);
+    // Fill unused slots with zero-length owners, keeping exact allocation length.
+    for (refs[owner.used..]) |*ref| ref.* = &.{};
+    playlist.owned_uris = refs;
+}
+
+const delta_base = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\",IV=0x1\n#EXT-X-MAP:URI=\"init1\"\n#EXTINF:2,\n#EXT-X-BYTERANGE:10@0\nmedia\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2\",IV=0x2\n#EXT-X-MAP:URI=\"init2\"\n#EXTINF:2,\n#EXT-X-BYTERANGE:10\nmedia\n";
+const delta_update = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXTINF:2,\n#EXT-X-BYTERANGE:10\nmedia\n";
+test "HLS delta merge owns inherited maps keys ranges and discontinuities" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, delta_base);
+    defer a.free(bytes);
+    var old = try parse(a, bytes, .{});
+    var old_live = true;
+    defer if (old_live) old.deinit();
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    var merged = try parseUpdateControlled(a, delta_update, .{}, old, .{}, &pool);
+    defer merged.deinit();
+    old.deinit();
+    old_live = false;
+    @memset(bytes, 'x');
+    try std.testing.expectEqual(@as(usize, 3), merged.segments.len);
+    const last = merged.segments[2];
+    try std.testing.expectEqual(@as(u64, 12), last.sequence);
+    try std.testing.expectEqual(@as(u64, 4), last.discontinuity_sequence);
+    try std.testing.expectEqual(@as(u64, 20), last.range.?.offset);
+    try std.testing.expectEqualStrings("init2", last.initialization.uri);
+    try std.testing.expectEqualStrings("key2", last.encryption.?.uri);
+    try std.testing.expectEqualStrings("key2", last.initialization.encryption.?.uri);
+    try std.testing.expect(!last.discontinuity);
+    try std.testing.expect(pool.snapshot().host_bytes > 0);
+    var next = try parseUpdate(a, delta_update, .{}, merged);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 3), next.segments.len);
+}
+fn deltaAllocationRun(a: std.mem.Allocator) !void {
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var old = try parse(a, delta_base, .{});
+    defer old.deinit();
+    var merged = try parseUpdateControlled(a, delta_update, .{}, old, .{}, &pool);
+    defer merged.deinit();
+}
+test "HLS delta merge bounds history allocations admission and cancellation" {
+    const a = std.testing.allocator;
+    try std.testing.checkAllAllocationFailures(a, deltaAllocationRun, .{});
+    try std.testing.expectError(error.HlsDeltaHistoryMissing, parseUpdate(a, delta_update, .{}, null));
+    var old = try parse(a, delta_base, .{});
+    defer old.deinit();
+    var short = old;
+    short.segments = old.segments[0..1];
+    try std.testing.expectError(error.HlsDeltaHistoryMissing, parseUpdate(a, delta_update, .{}, short));
+    try std.testing.expectError(error.ResourceLimitExceeded, parseUpdate(a, delta_update, .{ .max_segments = 1 }, old));
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, parseUpdateControlled(a, delta_update, .{}, old, .{}, &pool));
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, parseUpdateControlled(a, delta_update, .{}, old, .{ .check_fn = Cancel.check }, null));
+    try std.testing.expectEqual(@as(u64, 10), old.segments[0].sequence);
+}
+
+test "HLS delta rejects duplicate malformed unsupported and conflicting history" {
+    const a = std.testing.allocator;
+    var old = try parse(a, delta_base, .{});
+    defer old.deinit();
+    const header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n";
+    inline for (.{ "#EXT-X-SKIP:SKIPPED-SEGMENTS=\"2\"\n", "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,SKIPPED-SEGMENTS=2\n", "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXT-X-SKIP:SKIPPED-SEGMENTS=0\n" }) |tail| try std.testing.expectError(error.MalformedHls, parseUpdate(a, header ++ tail, .{}, old));
+    try std.testing.expectError(error.UnsupportedHls, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"id\"\n", .{}, old));
+    const wrong = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n";
+    try std.testing.expectError(error.SourceVersionChanged, parseUpdate(a, wrong, .{}, old));
+    var cleared = try parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\nplain\n", .{}, old);
+    defer cleared.deinit();
+    try std.testing.expect(cleared.segments[2].encryption == null);
+    try std.testing.expect(cleared.segments[2].initialization.encryption != null);
+}
+
+const delta_fuzz_seeds = .{ partialFuzzSeed(delta_update), partialFuzzSeed("#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-MAP:URI=\"plain-init\"\n#EXTINF:2,\nplain\n") };
+test "HLS delta fuzz bounded merging with inherited encrypted state" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            const a = std.testing.allocator;
+            var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 64 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            var old = try parse(a, delta_base, .{});
+            defer old.deinit();
+            var bytes: [4096]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0x484c5303);
+            var parsed = parseUpdateControlled(a, bytes[0..length], .{ .max_bytes = bytes.len, .max_segments = 64, .max_uri_bytes = 256, .max_planning_bytes = 64 * 1024 }, old, .{}, &pool) catch return;
+            defer parsed.deinit();
+            for (parsed.segments, 0..) |segment, index| if (index != 0) try std.testing.expect(segment.sequence >= parsed.segments[index - 1].sequence);
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &delta_fuzz_seeds });
+}
+test "HLS delta fuzz serialized seeds merge positively" {
+    const a = std.testing.allocator;
+    var old = try parse(a, delta_base, .{});
+    defer old.deinit();
+    inline for (delta_fuzz_seeds) |seed| {
+        var smith = std.testing.Smith{ .in = seed };
+        var bytes: [4096]u8 = undefined;
+        const length = smith.sliceWithHash(&bytes, 0x484c5303);
+        try std.testing.expectEqual(seed.len - 4, length);
+        var parsed = try parseUpdate(a, bytes[0..length], .{}, old);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.owned_uris.len > 0);
+    }
+}
+
+test "HLS delta inherited identity scope still accepts alternate unsupported key formats" {
+    const a = std.testing.allocator;
+    const header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n";
+    const alternative = "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"drm\",KEYFORMAT=\"example.drm\"\n";
+    inline for (.{ "#EXT-X-KEY:METHOD=NONE\n", "#EXT-X-KEY:METHOD=AES-128,URI=\"identity-key\"\n" }) |key| {
+        var old = try parse(a, header ++ key ++ "#EXTINF:2,\nfirst\n", .{});
+        defer old.deinit();
+        var merged = try parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n" ++ alternative ++ "#EXTINF:2,\nsecond\n", .{}, old);
+        defer merged.deinit();
+        try std.testing.expect(merged.segments[1].identity_key_declared);
+        try std.testing.expect(crypto.same(old.segments[0].encryption, merged.segments[1].encryption));
+    }
+    var undeclared = try parse(a, header ++ "#EXTINF:2,\nfirst\n", .{});
+    defer undeclared.deinit();
+    try std.testing.expectError(error.UnsupportedEncryptedMedia, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n" ++ alternative ++ "#EXTINF:2,\nsecond\n", .{}, undeclared));
 }

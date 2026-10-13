@@ -23,7 +23,8 @@ pub const TransportFactory = struct {
     context: *anyopaque,
     accept: *const fn (*anyopaque, []const u8, []const u8, hls.Segment, live.Options, @import("source.zig").Control, ?*@import("admission.zig").Pool) anyerror!live.Segment,
 };
-pub const Options = struct { playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
+pub const Clock = struct { context: ?*anyopaque = null, now_ns: *const fn (?*anyopaque) u64 };
+pub const Options = struct { clock: ?Clock = null, playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
@@ -58,7 +59,7 @@ fn directiveName(raw: []const u8, name: []const u8) bool {
 }
 /// Preserve authentication query bytes. Existing delivery directives are
 /// rejected rather than creating ambiguous duplicate query parameters.
-pub fn blockingRequestUrl(a: std.mem.Allocator, url: []const u8, sequence: u64, part: ?u32, limit: usize) ![]u8 {
+fn directiveSeparator(url: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidHlsDeliveryDirective;
     const query = std.mem.indexOfScalar(u8, url, '?');
     if (query) |offset| {
@@ -68,7 +69,15 @@ pub fn blockingRequestUrl(a: std.mem.Allocator, url: []const u8, sequence: u64, 
             if (directiveName(key, "_HLS_msn") or directiveName(key, "_HLS_part") or directiveName(key, "_HLS_skip")) return error.InvalidHlsDeliveryDirective;
         }
     }
-    const separator: []const u8 = if (query == null) "?" else if (std.mem.endsWith(u8, url, "?") or std.mem.endsWith(u8, url, "&")) "" else "&";
+    return if (query == null) "?" else if (std.mem.endsWith(u8, url, "?") or std.mem.endsWith(u8, url, "&")) "" else "&";
+}
+pub fn deltaRequestUrl(a: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {
+    const separator = try directiveSeparator(url);
+    if (std.fmt.count("{s}{s}_HLS_skip=YES", .{ url, separator }) > limit) return error.ResourceLimitExceeded;
+    return std.fmt.allocPrint(a, "{s}{s}_HLS_skip=YES", .{ url, separator });
+}
+pub fn blockingRequestUrl(a: std.mem.Allocator, url: []const u8, sequence: u64, part: ?u32, limit: usize) ![]u8 {
+    const separator = try directiveSeparator(url);
     const length = if (part) |index| std.fmt.count("{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.count("{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
     if (length > limit) return error.ResourceLimitExceeded;
     return if (part) |index| std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
@@ -94,6 +103,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         media_url: ?[]u8 = null,
         options: ReaderOptions,
         manifest: ?network.Body = null,
+        snapshot_requested_ns: ?u64 = null,
         playlist: ?hls.Playlist = null,
         ingest: ?live.Ingest = null,
         next_sequence: ?u64 = null,
@@ -191,6 +201,25 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         pub fn reload(self: *Self) !void {
             return self.reloadRequest(null);
         }
+        pub fn canSkipReload(self: *const Self) bool {
+            if (comptime !@hasDecl(manifest_parser, "parseUpdateControlled")) return false;
+            if (comptime @hasDecl(manifest_parser, "parseUpdateControlled")) {
+                const playlist = self.playlist orelse return false;
+                if (playlist.ended) return false;
+                const boundary = playlist.server_control.can_skip_until orelse return false;
+                const clock = self.options.clock orelse return false;
+                const requested = self.snapshot_requested_ns orelse return false;
+                const current = clock.now_ns(clock.context);
+                return current >= requested and @as(f64, @floatFromInt(current - requested)) <= boundary * 0.5 * std.time.ns_per_s;
+            }
+        }
+        /// Explicit opt-in. Old/missing clock or capability uses an ordinary reload.
+        pub fn reloadDelta(self: *Self) !void {
+            if (!self.canSkipReload()) return self.reload();
+            const url = try deltaRequestUrl(self.allocator, self.mediaUrl(), self.transport.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            return self.reloadRequest(url);
+        }
         pub fn canBlockReload(self: *const Self) bool {
             const playlist = self.playlist orelse return false;
             return @hasDecl(manifest_parser, "master") and playlist.server_control.can_block_reload and !playlist.ended;
@@ -205,6 +234,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         }
         fn reloadRequest(self: *Self, request_url: ?[]const u8) !void {
             try self.transport.control.check();
+            const requested_ns: ?u64 = if (comptime @hasDecl(manifest_parser, "parseUpdateControlled")) if (self.options.clock) |clock| clock.now_ns(clock.context) else null else null;
             var body = try self.transport.fetch(self.mediaUrl(), request_url orelse self.mediaUrl(), null, self.options.playlist.max_bytes);
             errdefer body.deinit();
             var selected_url: ?[]u8 = null;
@@ -227,8 +257,17 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 break :blk try manifest_parser.parseAtWithSelection(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null, selection);
             } else if (@hasDecl(manifest_parser, "parseAt"))
                 try manifest_parser.parseAt(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null)
-            else
-                try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
+            else if (@hasDecl(manifest_parser, "parseUpdateControlled")) blk: {
+                const merged = manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, self.playlist, self.transport.control, self.transport.pool) catch |err| {
+                    if (err != error.HlsDeltaHistoryMissing) return err;
+                    // Neither cursor nor committed manifest changes on retry failure.
+                    const replacement = try self.transport.fetch(self.mediaUrl(), manifest_url, null, self.options.playlist.max_bytes);
+                    body.deinit();
+                    body = replacement;
+                    break :blk try manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, null, self.transport.control, self.transport.pool);
+                };
+                break :blk merged;
+            } else try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
             errdefer parsed.deinit();
             if (self.playlist) |previous| {
                 if (!std.meta.eql(parsed.timing_identity, previous.timing_identity)) return error.SourceVersionChanged;
@@ -274,6 +313,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             self.clearKey();
             self.playlist = parsed;
             self.manifest = body;
+            self.snapshot_requested_ns = requested_ns;
             if (selected_url) |url| {
                 self.media_url = url;
                 selected_url = null;
@@ -1191,4 +1231,112 @@ test "live HLS independent AES partial objects and parent fallback preserve samp
     defer tail.deinit();
     try std.testing.expectEqual(first.reader.packets.len, tail.reader.packets.len);
     try std.testing.expect(reader.ended());
+}
+
+const DeltaTestClock = struct {
+    tick: u64 = std.time.ns_per_s,
+    fn now(raw: ?*anyopaque) u64 {
+        return @as(*DeltaTestClock, @ptrCast(@alignCast(raw.?))).tick;
+    }
+};
+const delta_header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12\n";
+const delta_full = delta_header ++ "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\none.mp4\n#EXTINF:2,\ntwo.mp4\n";
+const delta_tail = "#EXTINF:2,\nthree.mp4\n";
+const DeltaHttp = struct {
+    pub const Client = struct {
+        responses: []const []const u8,
+        directives: []const bool,
+        at: usize = 0,
+        fail_at: ?usize = null,
+        pub fn get(self: *@This(), url: []const u8, _: anytype) !FakeHttp.Response {
+            if (self.at >= self.responses.len) return error.UnexpectedRequest;
+            const directed = std.mem.indexOf(u8, url, "&_HLS_skip=YES") != null;
+            try std.testing.expectEqual(self.directives[self.at], directed);
+            try std.testing.expect(std.mem.indexOf(u8, url, "?token=a%26b") != null);
+            if (self.fail_at == self.at) return error.ConnectionReset;
+            const bytes = self.responses[self.at];
+            self.at += 1;
+            return .{ .body = bytes };
+        }
+    };
+};
+test "live HLS delta reload merges inherited state and enforces snapshot age" {
+    const a = std.testing.allocator;
+    var clock = DeltaTestClock{};
+    var client = DeltaHttp.Client{ .responses = &.{ delta_full, delta_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n" ++ delta_tail, delta_full ++ delta_tail }, .directives = &.{ false, true, false } };
+    var transport = network.Adapter(DeltaHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8?token=a%26b" };
+    var reader = try Reader(DeltaHttp).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now_ns = DeltaTestClock.now } });
+    defer reader.deinit();
+    try reader.reloadDelta(); // Initial load always requests complete metadata.
+    try std.testing.expect(reader.canSkipReload());
+    clock.tick += std.time.ns_per_s;
+    try reader.reloadDelta();
+    try std.testing.expectEqual(@as(usize, 3), reader.playlist.?.segments.len);
+    try std.testing.expectEqualStrings("init.mp4", reader.playlist.?.segments[2].initialization.uri);
+    try std.testing.expectEqualStrings(transport.root_url, reader.mediaUrl());
+    clock.tick += 7 * std.time.ns_per_s;
+    try std.testing.expect(!reader.canSkipReload());
+    try reader.reloadDelta(); // Too old: full reload, no directive.
+    clock.tick = 0;
+    try std.testing.expect(!reader.canSkipReload());
+    try std.testing.expectEqual(@as(usize, 3), client.at);
+}
+test "live HLS delta missing history retries once and failed fetch preserves snapshot" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |fail| {
+        var clock = DeltaTestClock{};
+        var client = DeltaHttp.Client{ .responses = &.{ delta_full, delta_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=3\n#EXTINF:2,\nfour.mp4\n", delta_full ++ delta_tail ++ "#EXTINF:2,\nfour.mp4\n" }, .directives = &.{ false, true, false }, .fail_at = if (fail) 2 else null };
+        var transport = network.Adapter(DeltaHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8?token=a%26b" };
+        var reader = try Reader(DeltaHttp).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now_ns = DeltaTestClock.now } });
+        defer reader.deinit();
+        try reader.reload();
+        if (fail) {
+            try std.testing.expectError(error.ConnectionReset, reader.reloadDelta());
+            try std.testing.expectEqual(@as(usize, 2), reader.playlist.?.segments.len);
+            try std.testing.expectEqual(@as(?u64, 10), reader.next_sequence);
+            client.fail_at = null;
+            try reader.reload();
+        } else try reader.reloadDelta();
+        try std.testing.expectEqual(@as(usize, 4), reader.playlist.?.segments.len);
+        try std.testing.expectEqual(@as(usize, 3), client.at);
+    }
+}
+test "live HLS delta request preserves query bytes and refuses directive aliases" {
+    const a = std.testing.allocator;
+    const result = try deltaRequestUrl(a, "https://example.test/list.m3u8?token=a%26b", 4096);
+    defer a.free(result);
+    try std.testing.expectEqualStrings("https://example.test/list.m3u8?token=a%26b&_HLS_skip=YES", result);
+    inline for (.{ "_HLS_skip=v2", "%5FHLS_skip=YES", "_HLS_msn=1", "%5FHLS_part=0" }) |query| try std.testing.expectError(error.InvalidHlsDeliveryDirective, deltaRequestUrl(a, "https://example.test/list.m3u8?" ++ query, 4096));
+    try std.testing.expectError(error.ResourceLimitExceeded, deltaRequestUrl(a, "https://example.test/list.m3u8", 1));
+}
+
+test "live HLS delta descriptor mutation retains committed snapshot and cursor" {
+    const a = std.testing.allocator;
+    var clock = DeltaTestClock{};
+    var client = DeltaHttp.Client{ .responses = &.{ delta_full, delta_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXTINF:2,\nchanged-two.mp4\n" }, .directives = &.{ false, true } };
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var transport = network.Adapter(DeltaHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8?token=a%26b", .pool = &pool };
+    var reader = try Reader(DeltaHttp).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now_ns = DeltaTestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    const before = pool.snapshot();
+    try std.testing.expectError(error.SourceVersionChanged, reader.reloadDelta());
+    try std.testing.expectEqual(before, pool.snapshot());
+    try std.testing.expectEqual(@as(?u64, 10), reader.next_sequence);
+    try std.testing.expectEqualStrings("two.mp4", reader.playlist.?.segments[1].uri);
+}
+fn deltaReaderAllocationRun(a: std.mem.Allocator) !void {
+    var clock = DeltaTestClock{};
+    var client = DeltaHttp.Client{ .responses = &.{ delta_full, delta_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n" ++ delta_tail }, .directives = &.{ false, true } };
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var transport = network.Adapter(DeltaHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8?token=a%26b", .pool = &pool };
+    var reader = try Reader(DeltaHttp).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now_ns = DeltaTestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    try reader.reloadDelta();
+}
+test "live HLS delta reader releases planning and transport owners on every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, deltaReaderAllocationRun, .{});
 }

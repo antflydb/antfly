@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     const partial_fuzz_root = b.createModule(.{ .root_source_file = b.path("hls_partial_fuzz_root.zig"), .target = target, .optimize = optimize });
     const partial_fuzz_tests = b.addTest(.{ .root_module = partial_fuzz_root, .filters = &.{"HLS partial fuzz"}, .use_llvm = true });
     b.step("test-media-hls-partial-fuzz", "Qualify bounded partial HLS manifests with positively accepted seeds").dependOn(&b.addRunArtifact(partial_fuzz_tests).step);
+    const delta_fuzz_tests = b.addTest(.{ .root_module = partial_fuzz_root, .filters = &.{"HLS delta fuzz"}, .use_llvm = true });
+    b.step("test-media-hls-delta-fuzz", "Fuzz bounded delta HLS merging with positively accepted encrypted-state seeds").dependOn(&b.addRunArtifact(delta_fuzz_tests).step);
     const aes_fuzz_root = b.createModule(.{ .root_source_file = b.path("hls_aes_fuzz_root.zig"), .target = target, .optimize = optimize });
     const aes_fuzz_tests = b.addTest(.{ .root_module = aes_fuzz_root, .filters = &.{"HLS AES fuzz"}, .use_llvm = true });
     b.step("test-media-hls-aes-fuzz", "Qualify HLS AES parsing/decryption; accepts --fuzz=limit").dependOn(&b.addRunArtifact(aes_fuzz_tests).step);

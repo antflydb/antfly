@@ -385,3 +385,64 @@ test "production HTTP low latency HLS authenticates blocking reload and verifies
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 5), transport.requests);
 }
+
+test "production HTTP HLS delta merges snapshots and retries missing history without duplicating media" {
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12\n";
+    const first = prefix ++ "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\none.m4s\n";
+    const second = prefix ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXTINF:2,\ntwo.m4s\n";
+    const missing = prefix ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=3\n#EXTINF:2,\nfour.m4s\n";
+    const full = first ++ "#EXTINF:2,\ntwo.m4s\n#EXTINF:2,\nthree.m4s\n#EXTINF:2,\nfour.m4s\n#EXT-X-ENDLIST\n";
+    const bytes = @embedFile("testdata/fragmented.mp4");
+    const Request = struct {
+        fn initial(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/live/list.m3u8?token=stable%26key", request.target);
+        }
+        fn delta(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/live/list.m3u8?token=stable%26key&_HLS_skip=YES", request.target);
+        }
+        fn now(_: ?*anyopaque) u64 {
+            return std.time.ns_per_s;
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/live/list.m3u8", .assert_request = Request.initial, .max_uses = 1, .respond = .{ .body = first } },
+        .{ .path = "/live/list.m3u8", .assert_request = Request.delta, .max_uses = 1, .respond = .{ .body = second } },
+        .{ .path = "/live/list.m3u8", .assert_request = Request.delta, .max_uses = 1, .respond = .{ .body = missing } },
+        .{ .path = "/live/list.m3u8", .assert_request = Request.initial, .max_uses = 1, .respond = .{ .body = full } },
+        .{ .path = "/live/init.mp4", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = bytes[0..797] } },
+        .{ .path = "/live/one.m4s", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = bytes[797..11206] } },
+        .{ .path = "/live/two.m4s", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = bytes[11206..20811] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/live/list.m3u8?token=stable%26key", .{server.baseUrl()});
+    defer a.free(url);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .pool = &pool };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{ .clock = .{ .now_ns = Request.now }, .ingest = .{ .stream = .{ .max_bytes = 65536 }, .index = .{ .max_index_bytes = 256 * 1024 } } });
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 7 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    var one = (try reader.next()).?;
+    defer one.deinit();
+    var held = try one.reader.readPacket(0);
+    defer held.deinit();
+    const original = try a.dupe(u8, held.bytes);
+    defer a.free(original);
+    try reader.reloadDelta();
+    var two = (try reader.next()).?;
+    defer two.deinit();
+    try std.testing.expect(two.reader.packets[0].media_dts > one.reader.packets[0].media_dts);
+    try std.testing.expect((try reader.next()) == null);
+    try reader.reloadDelta(); // Missing skipped segment 12 -> one full retry.
+    try std.testing.expectEqual(@as(?u64, 12), reader.next_sequence);
+    try std.testing.expectEqual(@as(usize, 4), reader.playlist.?.segments.len);
+    try std.testing.expectEqualSlices(u8, original, held.bytes);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 7), transport.requests);
+}

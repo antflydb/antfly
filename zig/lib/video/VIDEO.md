@@ -1774,7 +1774,7 @@ the playlist hint is not a validated codec restart point. Preload hints never
 become input until published as actual parts.
 
 This closes a library ingestion gap. Model-level live window orchestration,
-TS partials, delta updates and broader live rendition/CBC-range qualification
+TS partials, date-range delta updates and broader live rendition/CBC-range qualification
 remain in the active non-CUDA objective. See the media
 [partial-HLS receipt](../media/testdata/hls/partial-validation/README.md).
 VP9 and AV1 remain checked-in, Antfly-maintained Zig ports with no runtime
@@ -1880,3 +1880,34 @@ stream parity and reducing repeated GOP validation remain required. No codec or
 transport runtime dependency is added.
 
 Qualification: `zig/lib/video/testdata/live/field-frontier-validation`.
+
+
+### Bounded HLS delta snapshots
+
+`hls.parseUpdateControlled` merges `EXT-X-SKIP` segment-only updates against the
+committed playlist. Every skipped complete segment must be present; skipped
+partial-only parents cannot stand in for complete history. Map/key declarations,
+explicit identity `METHOD=NONE`, discontinuity state and implicit byte-range
+continuation carry forward. Delta playlists own all URI references independently
+of both manifest bodies, with bounded planning memory, shared admission,
+cancellation checks and allocation-failure cleanup.
+
+`hls_live.Reader.reloadDelta` explicitly requests `_HLS_skip=YES` only when the
+server advertises skipping and a configured monotone clock proves the committed
+snapshot is no older than half the skip boundary. Otherwise it performs a full
+reload. Authentication query bytes remain intact; conflicting/encoded delivery
+directive aliases fail. Missing skipped history causes exactly one full request
+without the directive. HTTP/allocation/validation failure preserves the old
+playlist and delivery cursor. Overlapping descriptor mutations still fail.
+
+The real authenticated HTTP test delivers two successive fMP4 units, retains an
+older packet lease, then recovers unavailable skipped history without repeating
+media or initialization fetches. Final ReleaseSafe checks pass 139 media tests
+and nine production HTTP tests on macOS and actual Linux ARM64. A bounded delta
+fuzz campaign passes 20,456 runs with positively accepted inherited-key seeds.
+These checks qualify segment-only `YES` deltas; date-range `v2`, rendition
+coordination, TS partials and CBC range chaining remain work. No runtime codec
+or transport dependency is added. Protocol basis: [HLS 2nd edition draft 22,
+sections 4.4.5.2 and 6.3.7](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-22).
+
+See [qualification receipts](../media/testdata/hls-delta-validation/README.md).
