@@ -6330,8 +6330,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager
             else
                 db.core.index_manager.resource_manager;
+            // Whole source documents are buffered here. Back the budget with the
+            // long-lived DB allocator so source bytes are charged only to the
+            // document extraction budget, not also to the request's fixed
+            // preparation budget (which rejected large sources).
+            const extraction_backing = if (@hasField(@TypeOf(db.*), "alloc")) db.alloc else alloc;
             var extraction_budgeted: ?resource_manager_mod.BudgetedAllocator = if (extraction_resource_manager) |manager|
-                resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, alloc, 1)
+                resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, extraction_backing, 1)
             else
                 null;
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
