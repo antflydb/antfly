@@ -141,7 +141,7 @@ the v1 runtime intentionally exposes one blocking strategy per resolver.
 ### 2. Scoring (comparison levels -- "Fellegi-Sunter")
 
 The scorer is the one pluggable interface. It is **implemented** today in
-`zig/lib/matcher/` and is pure, deterministic, and allocation-light so it is
+`zig/pkg/antfly-embedded/matcher/` and is pure, deterministic, and allocation-light so it is
 safe inside replay workers.
 
 A `Comparison` pairs a field on the mention (`left`) with a field on the
@@ -178,7 +178,7 @@ probability.
 }
 ```
 
-Supported comparators (see `lib/matcher/src/mod.zig`):
+Supported comparators (see `pkg/antfly-embedded/matcher/src/mod.zig`):
 
 | Comparator     | Operates on | Notes |
 |----------------|-------------|-------|
@@ -232,7 +232,7 @@ Generality lives in the comparator + level space, not in arbitrary code.
 
 ## Resolution Stage Runtime (backend_runtime)
 
-The resolution stage worker body is implemented in `lib/resolver` as
+The resolution stage worker body is implemented in `pkg/antfly-embedded/resolver` as
 `ResolutionStage`, behind two vtable seams so it stays pure and unit-testable:
 
 - `ArtifactStore` -- `get`/`put`/`delete` of artifact bytes by primary-store key.
@@ -519,13 +519,13 @@ Open/index/enrichment validation should reject:
 
 The design in this document -- deterministic resolver, promoter, fusion data
 model, and cross-shard candidate blocking -- is implemented and tested. The
-scorer and comparators live in `lib/matcher`; the resolver core, resolution
-stage, and `DocRef` type live in `lib/resolver`; the resolution and promotion
+scorer and comparators live in `pkg/antfly-embedded/matcher`; the resolver core, resolution
+stage, and `DocRef` type live in `pkg/antfly-embedded/resolver`; the resolution and promotion
 managed replay stages are `resolution_runtime.zig` and `promotion_runtime.zig`;
 cross-shard candidate blocking and the promoter's cross-shard entity sink are
 `api/distributed_candidate_source.zig`; and the resolver catalog persists
 through `resolver_catalog.zig` and `table_provisioner`. Test coverage spans
-`lib/matcher`, `lib/resolver`, and the `antfly-storage-db-test` /
+`pkg/antfly-embedded/matcher`, `pkg/antfly-embedded/resolver`, and the `antfly-storage-db-test` /
 `e2e/antfly/test_resolution.py` suites.
 
 Learned-weights resolution, a review queue/curation UI, entity merge/split, and
@@ -850,9 +850,14 @@ handles. Read-only text queries lazily cache a foreground extractor producer on
 the handle, reusing its inference provider and loaded models across calls.
 Only cache construction holds the producer mutex; each extraction gets an
 invocation context and uses the synchronized capability cache. Native Lite
-connection/snapshot locks and model execution gates still apply. Snapshot refresh
-invalidates named-table caches before freeing their borrowed inference provider;
-the next query binds to the new provider. The cache is released on close.
+captures an owned extractor plan and pins its root inference snapshot, then
+releases the connection, path gate and file lease during text extraction.
+Concurrent text queries and writer commits can proceed on the same database
+path. The short canonical lookup/resolution phase reacquires a current snapshot;
+a resolver or extractor config change during extraction returns a retryable busy
+error. Model execution/admission gates still apply. Named tables share their root
+snapshot's cache. Retired snapshots retain providers until their last in-flight
+query finishes; the cache is released with the snapshot.
 They use resolver-level aliases and ignore document-specific curation
 since the query has no stored document identity. Queries currently require an
 asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
@@ -882,6 +887,9 @@ The effective resolution revision advances on either a config change or merge,
 even when the incoming config generation equals the preceding merge revision.
 For example, config generation 2 → merge → config generation 3 yields effective
 revisions 2 → 3 → 4. Identical config replay leaves the revision unchanged.
+Namespace operations preserve the caller-owned `config_generation` and advance
+the internal clock, so reapplying the correctly updated inline config does not
+schedule a second replay.
 Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
 rather than silently resolving keys differently. Both mention and relation
 edges are reconciled on the root drain, including removal of old endpoints.
@@ -889,6 +897,9 @@ edges are reconciled on the root drain, including removal of old endpoints.
 The namespace request contains `table`, `key_template`, and exactly one of:
 
 - `reset_merges:true`: explicitly discard durable redirects and inline aliases.
+  Optional `aliases:[...]` supplies their complete replacement under the new
+  namespace; omitting it leaves no inline aliases. This is also the explicit
+  way to change aliases after a namespace fence has been installed.
 - `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
   stored inline/durable alias source and target into the new namespace. Incomplete
   maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
@@ -899,9 +910,15 @@ The operation validates the destination table and commits the config, merge stor
 and replay cursors atomically. Call `run_until_idle` to reconcile resolver-owned
 mention/relation edges. Application-owned documents and references are not
 renamed. Update your declarative inline config to the new table/template and
-mapped inline aliases before reapplying it; an old config is rejected while
-migrated merges remain. Changing an existing physical index config still requires
+mapped inline aliases before reapplying it. A durable namespace fence rejects
+old table/template or alias configurations even after reset leaves zero merges.
+Further identity changes require another explicit namespace operation. Changing an existing physical index config still requires
 its normal delete/recreate lifecycle, which preserves the resolver and merges.
+Resolver identity is scoped by source table and resolver name, independently of physical
+index names: deleting index v1 and adding index v2 with the same resolver name
+and source/output artifact bindings retains merges and namespace fences. Renaming
+the resolver itself creates a new identity; removing it deliberately deletes its
+curation.
 Existing artifact/index repair APIs rebuild derived state under the declared
 identity rules; they do not infer a key migration. This namespace operation
 reuses the existing resolver replay/repair pipeline for derived reconciliation.
@@ -910,9 +927,14 @@ Only material resolution changes (including an explicit `config_generation`
 bump) schedule replay; changing revision bookkeeping alone does not. A changed
 scorer, routing rule or identity rule can affect every subscribed document and
 requires scanning its source corpus. Backfill skips source artifacts whose
-subscribing curated resolvers already have the current combined revision, avoiding
-unrelated journal writes, ANN searches and embedding generation. Legacy resolvers
-without a combined revision retain their conservative replay behavior. Identical
+subscribers already have the current internal resolution revision, avoiding
+unrelated journal writes, ANN searches and embedding generation. The internal
+clock also advances on material changes before the first merge. Stale empty
+resolutions with no currently routed mentions are skipped; nonempty previous
+decisions are always revisited to retire removed labels/edges. A global scorer
+change necessarily revisits every source with eligible mentions; it cannot
+safely infer unchanged decisions without evaluating the new scorer. Older
+catalogs acquire the internal clock on their first material change. Identical
 config reapplication incurs no backfill. Portable import cross-checks sidecar
 records against the resolver catalog before publishing destination state,
 including missing required records and orphan/duplicate records.

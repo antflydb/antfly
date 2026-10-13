@@ -22,7 +22,7 @@
 //! decisions stay stable (the replay-stability invariant).
 //!
 //! `scorer_json` is the optional matcher scorer config (parsed by
-//! `lib/matcher`); an empty `scorer_json` means a purely deterministic resolver
+//! `pkg/antfly-embedded/matcher`); an empty `scorer_json` means a purely deterministic resolver
 //! that always mints canonical keys from `key_template`.
 
 const std = @import("std");
@@ -96,6 +96,11 @@ pub const ResolverConfig = struct {
     /// config changes or merges; the field name retains catalog compatibility.
     merge_generation: u64 = 0,
     merge_state_version: u32 = 0,
+    /// Internal clock, including config changes before the first merge.
+    resolution_generation: u64 = 0,
+    /// Explicit namespace operations fence subsequent declarative replacements,
+    /// including resets with no remaining merge records.
+    namespace_generation: u64 = 0,
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
     /// Mention labels this resolver consumes. Empty means all labels
@@ -168,7 +173,7 @@ pub const ResolverConfig = struct {
     }
 
     pub fn effectiveGeneration(self: ResolverConfig) u64 {
-        return @max(self.config_generation, self.merge_generation);
+        return @max(self.resolution_generation, @max(self.config_generation, self.merge_generation));
     }
 
     /// Borrowed strings, owned array. Durable curation wins over inline aliases.
@@ -194,7 +199,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -249,6 +254,8 @@ pub const ResolverConfig = struct {
             .merges = try cloneAliases(alloc, cfg.merges),
             .merge_generation = cfg.merge_generation,
             .merge_state_version = cfg.merge_state_version,
+            .resolution_generation = cfg.resolution_generation,
+            .namespace_generation = cfg.namespace_generation,
             .promote = cfg.promote,
             .labels = try cloneLabels(alloc, cfg.labels),
             .type_must_match = cfg.type_must_match,
@@ -666,7 +673,7 @@ test "capi resolver catalog preserves legacy defaults and versions durable merge
     var cfg = ResolverConfig{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .config_generation = 1 };
     const legacy = try serializeCatalog(alloc, &.{cfg});
     defer alloc.free(legacy);
-    for ([_][]const u8{ "aliases", "promote", "merges", "merge_generation", "merge_state_version" }) |field| try std.testing.expect(std.mem.indexOf(u8, legacy, field) == null);
+    for ([_][]const u8{ "aliases", "promote", "merges", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation" }) |field| try std.testing.expect(std.mem.indexOf(u8, legacy, field) == null);
     cfg.merges = &.{.{ .key = "a", .target = "b" }};
     cfg.merge_generation = 2;
     cfg.merge_state_version = 1;

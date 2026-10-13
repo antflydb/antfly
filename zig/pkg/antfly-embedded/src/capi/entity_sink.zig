@@ -751,7 +751,8 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     const text_request = "{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}";
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
     const child, const slot = api.handle_registry.enter(readonly_table).?;
-    try std.testing.expect(child.query_producer != null);
+    try std.testing.expect(child.query_producer == null);
+    try std.testing.expect(child.parent_handle.?.query_producer != null);
     api.HandleRegistry.leave(slot);
     var writer: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &options, &writer));
@@ -764,6 +765,7 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     const refreshed = api.enterHandle(readonly_table, .read).?;
     try std.testing.expect(refreshed.entry_error == null);
     try std.testing.expect(refreshed.handle.query_producer == null);
+    try std.testing.expect(refreshed.handle.parent_handle.?.query_producer == null);
     refreshed.leave();
     api.antfly_buffer_free(&table_query);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
@@ -961,4 +963,104 @@ test "capi resolver config merge config advances revisions and protects key name
     const resolution = queried.value.object.get("resolution").?.object;
     try std.testing.expectEqual(@as(i64, 4), resolution.get("config_generation").?.integer);
     try std.testing.expectEqualStrings("concept/qwen", resolution.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "capi native text queries overlap writer commits and retain retired providers" {
+    const api = @import("db.zig");
+    const extracting = @import("antfly_extracting");
+    const managed = @import("../inference/managed_embedder.zig");
+    const a = std.testing.allocator;
+    const State = struct {
+        entered: std.atomic.Value(u32) = .init(0),
+        both_entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        committed: std.Io.Event = .unset,
+        pub fn extract(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(h.handleLockIo());
+            try self.release.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
+            return .{ .allocator = alloc, .json = try alloc.dupe(u8, "{\"object\":\"extraction\",\"model\":\"test-extractor\",\"data\":[{\"entities\":[{\"text\":\"Antfly\",\"label\":\"company\"}],\"relations\":[]}]}") };
+        }
+        fn embedDense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const Query = struct {
+        id: ?*anyopaque,
+        code: h.capi.ErrorCode = .internal,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            defer self.done.set(h.handleLockIo());
+            var result: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&result);
+            self.code = api.antfly_db_resolve_query_json(self.id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Antfly\"}"), &result);
+        }
+    };
+    const Writer = struct {
+        id: ?*anyopaque,
+        state: *State,
+        code: h.capi.ErrorCode = .internal,
+        fn run(self: *@This()) void {
+            var result: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&result);
+            self.code = api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"probe\":{\"body\":\"committed\"}}}"), &result);
+            self.state.committed.set(h.handleLockIo());
+        }
+    };
+    var tmp = try api.TestDirectory.init("resolver-query-concurrency");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, "{s}.aflite", .{tmp.path()}, 0);
+    defer a.free(path);
+    const options: h.capi.OpenOptions = .{ .storage_kind = h.capi.storage_kind_lite, .profile = h.capi.profile_native };
+    var writer: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_create_with_options(path, &options, &writer));
+    defer api.antfly_db_close(writer);
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly","model":"test-extractor","schema":{"entities":["company"]}}}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(writer, .fromSlice(config)));
+    var readonly = options;
+    readonly.open_mode = h.capi.open_mode_readonly;
+    var reader: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &reader));
+    defer api.antfly_db_close(reader);
+    var state: State = .{};
+    const setup = api.enterHandle(reader, .read).?;
+    const snapshot = setup.handle;
+    snapshot.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(snapshot.alloc, snapshot.database().backend_runtime.io().?, .{
+        .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract },
+    });
+    setup.leave();
+    var first: Query = .{ .id = reader };
+    var second: Query = .{ .id = reader };
+    const first_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Query.run, .{&first});
+    defer first_thread.join();
+    defer state.release.set(h.handleLockIo());
+    const second_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Query.run, .{&second});
+    defer second_thread.join();
+    defer state.release.set(h.handleLockIo());
+    try state.both_entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    var write: Writer = .{ .id = writer, .state = &state };
+    const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
+    defer writer_thread.join();
+    defer state.release.set(h.handleLockIo());
+    // A bounded wait fails instead of deadlocking if extraction retains the path lock.
+    try state.committed.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, write.code);
+    const refreshed = api.enterHandle(reader, .read).?;
+    try std.testing.expect(refreshed.handle != snapshot);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.query_borrows);
+    try std.testing.expect(snapshot.query_producer != null);
+    refreshed.leave();
+    state.release.set(h.handleLockIo());
+    try first.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try second.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, second.code);
+    const finished = api.enterHandle(reader, .read).?;
+    try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
+    finished.leave();
 }

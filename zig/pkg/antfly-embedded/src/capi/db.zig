@@ -362,6 +362,8 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
         cfg.value.merges = &.{};
         cfg.value.merge_generation = 0;
         cfg.value.merge_state_version = 0;
+        cfg.value.resolution_generation = 0;
+        cfg.value.namespace_generation = 0;
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
@@ -740,9 +742,54 @@ pub const HandleGuard = struct {
     entry_error: ?capi.ErrorCode = null,
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
+    suspended_query_root: ?*Handle = null,
+
+    /// Keep registry references and the provider snapshot alive, releasing both
+    /// process and file locks while inference runs on an owned request plan.
+    pub fn suspendQuery(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        const root = connection.current.?;
+        root.query_borrows += 1;
+        self.suspended_query_root = root;
+        connection.detach();
+        if (self.path_lease) |lease| {
+            var owned = lease;
+            owned.close();
+        }
+        self.path_lease = null;
+        self.connection_gate_held = false;
+        connection.gate.mutex.unlock(handleLockIo());
+        connection.mutex.unlock(handleLockIo());
+    }
+
+    pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
+        if (self.suspended_query_root == null) return true;
+        // Original registry references keep the connection/owner alive.
+        const next = enterHandle(ptr, .read) orelse return false;
+        const connection = self.connection.?;
+        if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
+        self.suspended_query_root.?.query_borrows -= 1;
+        connection.collectRetired();
+        if (!next.connection_gate_held) connection.gate.mutex.unlock(handleLockIo());
+        if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+        HandleRegistry.leave(self.slot);
+        self.* = next;
+        return true;
+    }
 
     pub fn leave(self: HandleGuard) void {
         const io = handleLockIo();
+        if (self.suspended_query_root) |root| {
+            const connection = self.connection.?;
+            connection.gate.mutex.lockUncancelable(io);
+            root.query_borrows -= 1;
+            connection.collectRetired();
+            connection.gate.mutex.unlock(io);
+            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+            HandleRegistry.leave(self.slot);
+            return;
+        }
         if (self.connection) |connection| {
             if (self.pinned_store_readonly) |was_readonly| {
                 const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
@@ -6907,11 +6954,12 @@ pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_nam
     capi.clearLastError();
     const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "query resolution output pointer must not be null");
     out.* = .{};
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    const handle = guard.handle;
-    var request = std.json.parseFromSlice(std.json.Value, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid query resolution JSON");
+    var handle = guard.handle;
+    const alloc = handle.alloc;
+    var request = std.json.parseFromSlice(std.json.Value, alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid query resolution JSON");
     defer request.deinit();
     if (request.value != .object) return capi.mapErrorContext(error.InvalidArgument, "query request must be an object containing text or extraction");
     const text = request.value.object.get("text");
@@ -6923,37 +6971,79 @@ pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_nam
     if (extraction) |value| {
         if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
     }
-    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
     defer {
-        for (configs) |*cfg| cfg.deinit(handle.alloc);
-        handle.alloc.free(configs);
+        for (configs) |*cfg| cfg.deinit(alloc);
+        alloc.free(configs);
     }
     for (configs) |*cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
-        // Read-only databases have no enrichment worker. Retain a lazy producer
-        // on the handle so repeated queries reuse transport/capability state and
-        // the handle's inference provider/model cache. Only construction is locked;
+        // Native connections cache producers on their provider-owning snapshot;
+        // read-only databases otherwise have no enrichment producer. Repeated
+        // queries reuse transport/capability/model state. Only construction is locked;
         // invocation contexts share the runtime's synchronized capability cache.
-        const cached_producer = text != null and handle.database().enrichment_runtime == null;
+        const producer_handle = if (guard.connection != null) handle.parent_handle orelse handle else handle;
+        const cached_producer = text != null and (guard.connection != null or handle.database().enrichment_runtime == null);
         if (cached_producer) {
-            handle.query_producer_mutex.lockUncancelable(handleLockIo());
-            defer handle.query_producer_mutex.unlock(handleLockIo());
-            if (handle.query_producer == null) {
+            producer_handle.query_producer_mutex.lockUncancelable(handleLockIo());
+            defer producer_handle.query_producer_mutex.unlock(handleLockIo());
+            if (producer_handle.query_producer == null) {
                 const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
-                handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+                producer_handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(alloc, io, .{ .antfly_provider = producer_handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
             }
         }
-        const extracted = if (text) |value|
-            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (cached_producer) handle.query_producer.?.producer().withInvocationContext(.{}) else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
-        else
-            std.json.Stringify.valueAlloc(handle.alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
-        defer handle.alloc.free(extracted);
-        const resolution = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(handle.alloc, configs, cfg, extracted, @import("entity_sink.zig").candidateSource(handle), handle.database().resolution_embedder) catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
-        defer handle.alloc.free(resolution);
-        var parsed_extraction = std.json.parseFromSlice(std.json.Value, handle.alloc, extracted, .{}) catch |err| return capi.mapError(err);
+        const extracted = if (text) |value| extracted: {
+            var plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor");
+            defer plan.deinit(alloc);
+            if (guard.connection != null) guard.suspendQuery();
+            const bytes = if (cached_producer)
+                plan.produce(alloc, value.string, producer_handle.query_producer.?.producer().withInvocationContext(.{})) catch |err| return capi.mapErrorContext(err, "extracting query text")
+            else
+                handle.database().extractResolverQueryAlloc(alloc, cfg.*, value.string, null) catch |err| return capi.mapErrorContext(err, "extracting query text");
+            if (!guard.resumeQuery(handle_ptr)) {
+                alloc.free(bytes);
+                return capi.mapErrorContext(error.Busy, "query handle closed during extraction; retry");
+            }
+            if (guard.entry_error) |code| {
+                alloc.free(bytes);
+                return capi.ensureError(code, @src().fn_name);
+            }
+            handle = guard.handle;
+            // Canonical lookup uses the latest snapshot. Configuration changes
+            // require a retry rather than mixing two resolver/schema versions.
+            const current = handle.database().listResolvers(alloc) catch |err| {
+                alloc.free(bytes);
+                return capi.mapError(err);
+            };
+            defer {
+                for (current) |*entry| entry.deinit(alloc);
+                alloc.free(current);
+            }
+            var unchanged = current.len == configs.len;
+            if (unchanged) for (current, configs) |a, b| {
+                if (!a.eql(b)) {
+                    unchanged = false;
+                    break;
+                }
+            };
+            var latest_plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| {
+                alloc.free(bytes);
+                return capi.mapError(err);
+            };
+            defer latest_plan.deinit(alloc);
+            if (!unchanged or !plan.eql(latest_plan)) {
+                alloc.free(bytes);
+                return capi.mapErrorContext(error.Busy, "resolver or extractor configuration changed during extraction; retry");
+            }
+            break :extracted bytes;
+        } else std.json.Stringify.valueAlloc(alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
+        defer alloc.free(extracted);
+        const resolution = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, @import("entity_sink.zig").candidateSource(handle), handle.database().resolution_embedder) catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
+        defer alloc.free(resolution);
+        var parsed_extraction = std.json.parseFromSlice(std.json.Value, alloc, extracted, .{}) catch |err| return capi.mapError(err);
         defer parsed_extraction.deinit();
-        var parsed_resolution = std.json.parseFromSlice(std.json.Value, handle.alloc, resolution, .{}) catch |err| return capi.mapError(err);
+        var parsed_resolution = std.json.parseFromSlice(std.json.Value, alloc, resolution, .{}) catch |err| return capi.mapError(err);
         defer parsed_resolution.deinit();
         out.* = stringifyJson(.{ .extraction = parsed_extraction.value, .resolution = parsed_resolution.value }) catch |err| return capi.mapError(err);
         return .ok;
@@ -7010,10 +7100,11 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
     const KeyMap = struct { key: []const u8, target: []const u8 };
-    const Request = struct { table: []const u8, key_template: []const u8, reset_merges: bool = false, key_map: ?[]const KeyMap = null };
+    const Request = struct { table: []const u8, key_template: []const u8, reset_merges: bool = false, key_map: ?[]const KeyMap = null, aliases: ?[]const @import("antfly_resolver").KeyAlias = null };
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
     defer parsed.deinit();
     const request = parsed.value;
+    if (request.key_map != null and request.aliases != null) return capi.mapErrorContext(error.InvalidArgument, "explicit aliases require reset_merges:true");
     if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
     const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
     defer {
@@ -7051,10 +7142,12 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
                 .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
             }) catch |err| return capi.mapError(err);
         }
-        next.aliases = aliases.items;
+        next.aliases = request.aliases orelse aliases.items;
         next.merges = merges.items;
-        next.config_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
-        next.merge_generation = if (merges.items.len > 0) next.config_generation else 0;
+        next.merge_generation = if (merges.items.len > 0)
+            std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow")
+        else
+            0;
         next.merge_state_version = if (merges.items.len > 0) 1 else 0;
         _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;

@@ -12203,6 +12203,8 @@ pub const IndexManager = struct {
             effective.merge_generation = existing.merge_generation;
             effective.merge_state_version = existing.merge_state_version;
         }
+        effective.resolution_generation = existing.resolution_generation;
+        effective.namespace_generation = existing.namespace_generation;
         return existing.eql(effective);
     }
 
@@ -12291,19 +12293,29 @@ pub const IndexManager = struct {
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
+            cfg.resolution_generation = entry.resolution_generation;
+            cfg.namespace_generation = entry.namespace_generation;
+            if (migrate_namespace) cfg.namespace_generation = try std.math.add(u64, entry.namespace_generation, 1);
             try cfg.validate();
+            if (!migrate_namespace and entry.namespace_generation > 0 and
+                (!std.mem.eql(u8, entry.table, cfg.table) or
+                    !std.mem.eql(u8, entry.key_template, cfg.key_template) or
+                    !resolver_catalog.ResolverConfig.aliasesEqual(entry.aliases, cfg.aliases)))
+                return error.ResolverMergeNamespaceChange;
             if (!migrate_namespace and entry.merges.len > 0 and
                 (!std.mem.eql(u8, entry.table, cfg.table) or !std.mem.eql(u8, entry.key_template, cfg.key_template)))
                 return error.ResolverMergeNamespaceChange;
             if (entry.eql(cfg)) return .updated_no_backfill;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
+            if (material_changed) cfg.resolution_generation = @max(try std.math.add(u64, entry.effectiveGeneration(), 1), cfg.effectiveGeneration());
             // Once curated identities exist, merge_generation is the combined
             // revision clock. A config bump can equal a previous merge revision;
             // every change must still invalidate older resolution artifacts.
             if (material_changed and entry.merges.len > 0) {
                 const revision = try std.math.add(u64, entry.effectiveGeneration(), 1);
                 if (cfg.merges.len == 0) {
-                    cfg.config_generation = @max(revision, cfg.config_generation);
+                    // The internal clock above invalidates resolutions without
+                    // rewriting the caller-owned declarative config generation.
                     cfg.merge_generation = 0;
                     cfg.merge_state_version = 0;
                 } else cfg.merge_generation = @max(revision, @max(cfg.config_generation, cfg.merge_generation));

@@ -162,6 +162,7 @@ const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
+                if (retired.query_borrows > 0) break :retained true;
                 for (self.connections.items) |connection| {
                     var cursors = connection.sql_cursors.valueIterator();
                     while (cursors.next()) |cursor| {

@@ -211,7 +211,7 @@ SOURCE_MODULES = {
     "antfly_logging_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
-    "antfly_matcher": ("zig/lib/matcher/src/mod.zig",),
+    "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),
@@ -238,7 +238,7 @@ SOURCE_MODULES = {
     "antfly_reranking_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",
     ),
-    "antfly_resolver": ("zig/lib/resolver/src/mod.zig",),
+    "antfly_resolver": ("zig/pkg/antfly-embedded/resolver/src/mod.zig",),
     "antfly_root": ("zig/pkg/antfly-embedded/src/capi_embedded_root.zig",),
     "antfly_s3_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig",

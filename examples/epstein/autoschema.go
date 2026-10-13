@@ -270,7 +270,7 @@ var (
 // long-document execution, confidence and spans included. GLiNER emits
 // id-less entities referenced positionally by each relation's entity_index;
 // the resolver and materializer resolve those under decimal positional local
-// ids (lib/resolver parseExtractionEntities, db.zig
+// ids (pkg/antfly-embedded/resolver parseExtractionEntities, db.zig
 // graphArtifactEntityAtIndex).
 func autoschemaGlinerProducerJSON(model, inferenceAPIURL string) (string, error) {
 	relationSchemas := make([]map[string]any, 0, len(autoschemaGlinerRelationTypes))
@@ -464,7 +464,7 @@ func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string
 	// phase, because a split node silently starves retrieval while a merged
 	// node is at least visible and curable.
 	entityKeyTemplate := "entity/{{ slug _entity.text }}"
-	// Compositional event identity (lib/resolver computes it from the
+	// Compositional event identity (pkg/antfly-embedded/resolver computes it from the
 	// artifact's relations): sorted participant slugs + the asserted
 	// predicate, degrading to the normalized sentence text when either is
 	// missing. Replay-stable AND convergent: two differently worded sentences

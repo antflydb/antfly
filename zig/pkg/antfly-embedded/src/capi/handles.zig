@@ -104,6 +104,8 @@ pub const Handle = struct {
     /// construction; each call uses a scoped invocation context.
     query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
     query_producer_mutex: std.Io.Mutex = .init,
+    /// Protected by the native path gate; pins provider and extractor lifetime.
+    query_borrows: usize = 0,
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads

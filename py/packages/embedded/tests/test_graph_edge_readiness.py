@@ -308,6 +308,16 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert (
             db.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "concept/qwen_embedding"
         )
+        renamed = json.loads(json.dumps(config))
+        renamed["name"] = "knowledge_v2"
+        db.delete_index("knowledge")
+        db.add_index(renamed)
+        db.run_until_idle()
+        assert (
+            db.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "concept/qwen_embedding"
+        )
+        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
+        config = renamed
         backup = db.backup()
         backup_file = tmp_path / "resolver.afb"
         db.backup_to_file(backup_file)
@@ -339,8 +349,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
             restored.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["key"]
             == "concept/qwen_embedding"
         )
-        assert len(restored.edges("knowledge", "concept/qwen_embedding", "uses", 0)) == 1
-        assert restored.edges("knowledge", "concept/qwen", "uses", 0) == []
+        assert len(restored.edges(config["name"], "concept/qwen_embedding", "uses", 0)) == 1
+        assert restored.edges(config["name"], "concept/qwen", "uses", 0) == []
         restored.create_table("canonical", {})
         migrated = {
             "table": "canonical",
@@ -372,8 +382,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert (
             restored.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["table"] == "canonical"
         )
-        assert len(restored.edges("knowledge", "topic/qwen_embedding", "uses", 0)) == 1
-        assert restored.edges("knowledge", "concept/qwen_embedding", "uses", 0) == []
+        assert len(restored.edges(config["name"], "topic/qwen_embedding", "uses", 0)) == 1
+        assert restored.edges(config["name"], "concept/qwen_embedding", "uses", 0) == []
     with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
         assert (
             restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
@@ -389,14 +399,115 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         restored.run_until_idle()
         assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
-        assert len(restored.edges("knowledge", "fresh/qwen3", "uses", 0)) == 1
-        assert restored.edges("knowledge", "topic/qwen_embedding", "uses", 0) == []
+        assert len(restored.edges(config["name"], "fresh/qwen3", "uses", 0)) == 1
+        assert restored.edges(config["name"], "topic/qwen_embedding", "uses", 0) == []
     with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
         assert (
             restored.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["key"] == "fresh/qwen3"
         )
+        # A reset fences the namespace even though the durable merge list is empty.
+        stale = json.loads(json.dumps(config))
+        if destination_storage == antfly_embedded.Storage.LITE:
+            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+                restored.add_index(stale)
+        else:
+            # Directory index admission does not reapply inline resolvers.
+            assert (
+                restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
+            )
+        current = json.loads(json.dumps(config))
+        current["name"] = "fresh_namespace"
+        current["resolvers"][0]["key_template"] = "fresh/{{ uslug _entity.text }}"
+        current["resolvers"][0]["aliases"] = []
+        before_reapply = restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})[
+            "config_generation"
+        ]
+        restored.add_index(current)
+        restored.run_until_idle()
+        assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
+        assert (
+            restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["config_generation"]
+            == before_reapply
+        )
+        # Even an alias-only stale replacement is rejected.
+        current["name"] = "stale_aliases"
+        current["resolvers"][0]["aliases"] = [{"key": "fresh/qwen3", "target": "fresh/old"}]
+        if destination_storage == antfly_embedded.Storage.LITE:
+            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+                restored.add_index(current)
+        restored.set_resolver_namespace(
+            "concepts",
+            {
+                "table": "default",
+                "key_template": "fresh/{{ uslug _entity.text }}",
+                "reset_merges": True,
+                "aliases": [{"key": "fresh/qwen3", "target": "fresh/qwen"}],
+            },
+        )
+        restored.run_until_idle()
+        assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen"
+    with antfly_embedded.open_with_options(aflite_path, options) as db:
+        db.add_index(config)
+        db.run_until_idle()
+        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
     with antfly_embedded.open_readonly(aflite_path) as db:
         result = db.resolve_query("concepts", request)
         assert result["resolution"]["config_generation"] == 2
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
         assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
+
+
+def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
+    import copy
+
+    config = {
+        "name": "knowledge",
+        "type": "graph",
+        "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": "default",
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{ uslug _entity.text }}",
+                "config_generation": 1,
+            }
+        ],
+    }
+    options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.LITE, profile=antfly_embedded.Profile.NATIVE)
+    with antfly_embedded.create_with_options(tmp_path / "revisions.aflite", options) as db:
+        db.add_index(config)
+        mention = {"text": "Qwen3", "label": "concept"}
+        assert db.render_resolver_key("concepts", mention)["config_generation"] == 1
+        changed = copy.deepcopy(config)
+        changed["name"] = "changed"
+        changed["resolvers"][0]["min_confidence"] = 0.1
+        db.add_index(changed)
+        assert db.render_resolver_key("concepts", mention)["config_generation"] == 2
+        db.add_index(changed)
+        assert db.render_resolver_key("concepts", mention)["config_generation"] == 2
+        db.merge_resolver_keys("concepts", "concept/qwen3", "concept/qwen")
+        assert db.render_resolver_key("concepts", mention)["config_generation"] == 3
+        changed["name"] = "changed_again"
+        changed["resolvers"][0]["min_confidence"] = 0.2
+        db.add_index(changed)
+        assert db.render_resolver_key("concepts", mention)["config_generation"] == 4
+        db.set_resolver_namespace(
+            "concepts", {"table": "default", "key_template": "topic/{{ uslug _entity.text }}", "reset_merges": True}
+        )
+        backup = db.backup()
+    restored_path = tmp_path / "reset-restored.aflite"
+    antfly_embedded.restore(restored_path, backup, storage=antfly_embedded.Storage.LITE)
+    with antfly_embedded.open_with_options(restored_path, options) as restored:
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+            restored.add_index(changed)
+        assert restored.render_resolver_key("concepts", mention)["key"] == "topic/qwen3"

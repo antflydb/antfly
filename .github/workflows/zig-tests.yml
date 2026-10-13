@@ -679,7 +679,8 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' -j1
+            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
+            '-Dtest-filter=--test-filter=capi native text queries' -j1
           cd ..
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
@@ -1131,7 +1132,8 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' -j1
+            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
+            '-Dtest-filter=--test-filter=capi native text queries' -j1
           cd ..
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \

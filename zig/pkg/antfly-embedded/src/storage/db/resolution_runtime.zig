@@ -1669,7 +1669,7 @@ fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStor
         // Legacy resolvers require a caller-owned config_generation bump.
         // Without a combined revision clock, an equal generation alone cannot
         // prove that a changed config has already been replayed.
-        if (cfg.merge_generation == 0) return true;
+        if (cfg.merge_generation == 0 and cfg.resolution_generation == 0) return true;
         const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, source.resolution_scope_key, cfg.resolution_artifact);
         defer gpa.free(resolution_key);
         const bytes = (try store.get(gpa, resolution_key)) orelse return true;
@@ -1681,7 +1681,30 @@ fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStor
         defer parsed.deinit();
         if (parsed.value != .object) return true;
         const revision = parsed.value.object.get("config_generation") orelse return true;
-        if (revision != .integer or revision.integer < 0 or @as(u64, @intCast(revision.integer)) != cfg.effectiveGeneration()) return true;
+        if (revision == .integer and revision.integer >= 0 and @as(u64, @intCast(revision.integer)) == cfg.effectiveGeneration()) continue;
+        // A changed scorer/template cannot affect a source with no routed
+        // mentions and no previous decisions to retire. Inspect the immutable
+        // extraction, avoiding embeddings, candidates and derived writes.
+        const previous = parsed.value.object.get("entities") orelse return true;
+        if (previous != .array or previous.array.items.len > 0) return true;
+        const extraction = (try store.get(gpa, key)) orelse return true;
+        defer gpa.free(extraction);
+        var mentions = resolver_lib.parseExtractionEntities(gpa, extraction) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
+        defer mentions.deinit();
+        const excluded = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+        defer freeSiblingClaimedLabels(gpa, excluded);
+        for (mentions.entities) |mention| {
+            if (!cfg.resolvesLabel(mention.label)) continue;
+            var sibling_claims = false;
+            for (excluded) |label| if (std.mem.eql(u8, label, mention.label)) {
+                sibling_claims = true;
+                break;
+            };
+            if (!sibling_claims) return true;
+        }
     }
     return false;
 }
@@ -4599,5 +4622,25 @@ test "resolver backfill skips current revisions and unrelated source streams" {
     try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
     cfg.source_artifact = "kg";
     try store.put(resolution_key, "invalid");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+}
+
+test "resolver backfill skips stale empty resolutions without routed mentions" {
+    const alloc = std.testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "kg");
+    defer alloc.free(key);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolved");
+    defer alloc.free(resolution_key);
+    var cfg: ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .resolution_generation = 4, .labels = &.{"person"} };
+    try store.put(key, "{\"entities\":[{\"text\":\"Antfly\",\"label\":\"company\"}]}");
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[]}");
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.labels = &.{"company"};
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.labels = &.{"person"};
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[{}]}");
     try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
 }

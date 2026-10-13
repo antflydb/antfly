@@ -460,8 +460,10 @@ antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resol
  * references and manually supplied graph edges are not rewritten. */
 antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
 
-/** Set {table,key_template} and choose reset_merges:true (clears inline aliases too)
- * or key_map:[{key,target},...] mapping every inline/durable alias endpoint.
+/** Set {table,key_template} and choose reset_merges:true (clears inline aliases too,
+ * unless an explicit replacement aliases array is supplied) or
+ * key_map:[{key,target},...] mapping every inline/durable alias endpoint.
+ * A durable fence rejects stale inline namespaces/aliases even after reset.
  * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
  * Application-owned documents/references are not renamed. */
 antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
