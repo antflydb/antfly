@@ -253,6 +253,43 @@ int termite_metal_decode_runtime_mtp_cluster_head_test(termite_metal_decode_runt
         if (termite_metal_decode_runtime_mtp_cluster_head(r, 0, 1, (__bridge void *)input, 16, (__bridge void *)order, 16, 64, 32, 4, 2, &token) != -3) return -6;
         [r->submitted_frame_cb waitUntilCompleted]; r->submitted_frame_cb = nil;
         if (r->mtp_head_workspace == nil) return -5;
+        // A serving frame may outlive its ambient thread-local association.
+        // Copies must close the explicit runtime's compute encoder, and Shared
+        // GPU producers must not be read by an immediate CPU memcpy.
+        float guards[8] = {-77,-77,-77,-77,-77,-77,-77,-77};
+        id<MTLBuffer> produced = [r->device newBufferWithLength:4 * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> copied = [r->device newBufferWithBytes:guards length:sizeof(guards) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> copied_private = [r->device newBufferWithLength:4 * sizeof(float) options:MTLResourceStorageModePrivate];
+        if (!produced || !copied || !copied_private) return -7;
+        for (unsigned pair = 0; pair < 2; ++pair) {
+            if (termite_metal_decode_runtime_begin_frame(r) != 0) return -7;
+            TermiteMetalMtpHeadWorkspace *w = r->mtp_head_workspace;
+            id<MTLComputeCommandEncoder> producer_encoder = [r->active_frame_cb computeCommandEncoder];
+            if (!producer_encoder) return -7;
+            r->active_planned_compute_encoder = producer_encoder;
+            r->active_frame_compute_encoder_count += 1;
+            [producer_encoder setComputePipelineState:w->pipelines[0]];
+            [producer_encoder setBuffer:w->input offset:0 atIndex:0];
+            [producer_encoder setBuffer:w->centroid_weight offset:w->centroid_offset atIndex:1];
+            [producer_encoder setBuffer:produced offset:0 atIndex:2];
+            [producer_encoder setBuffer:w->params offset:0 atIndex:3];
+            [producer_encoder dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            termite_metal_active_encoder_runtime = NULL;
+            const int copy_rc = pair
+                ? termite_metal_buffer_copy_pair(r, (__bridge void *)produced, 0, (__bridge void *)copied, 0, 16, (__bridge void *)produced, 0, (__bridge void *)copied_private, 0, 16)
+                : termite_metal_buffer_copy(r, (__bridge void *)produced, 0, (__bridge void *)copied, 16, 16);
+            if (copy_rc || r->active_planned_compute_encoder != nil || r->active_frame_blit_encoder_count != 1) return -7;
+            if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return -7;
+            const float sign = head_frame ? -1.0f : 1.0f;
+            const float *values = copied.contents;
+            for (unsigned i = 0; i < 4; ++i) if (values[(pair ? 0 : 4) + i] != sign * (i + 1)) return -7;
+            if (!pair) for (unsigned i = 0; i < 4; ++i) if (values[i] != -77.0f) return -7;
+            if (pair) {
+                float downloaded[4] = {0};
+                if (termite_metal_buffer_download(r, (__bridge void *)copied_private, 0, downloaded, sizeof(downloaded))) return -7;
+                for (unsigned i = 0; i < 4; ++i) if (downloaded[i] != sign * (i + 1)) return -7;
+            }
+        }
         if (termite_metal_decode_runtime_clear_linear_slot(r, 0) != 0 || r->mtp_head_workspace != nil) return -5;
         return 0;
     }

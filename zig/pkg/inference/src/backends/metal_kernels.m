@@ -16170,14 +16170,17 @@ int termite_metal_decode_runtime_end_planned_compute_scope(termite_metal_decode_
     return 0;
 }
 
-static id<MTLBlitCommandEncoder> termite_metal_tracked_blit_command_encoder(id<MTLCommandBuffer> command_buffer) {
-    termite_metal_decode_runtime *runtime = termite_metal_active_encoder_runtime;
+static id<MTLBlitCommandEncoder> termite_metal_tracked_blit_command_encoder_for_runtime(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer) {
     if (runtime != NULL && runtime->active_frame_cb == command_buffer) {
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         runtime->blit_encoder_count += 1;
         runtime->active_frame_blit_encoder_count += 1;
     }
     return [command_buffer blitCommandEncoder];
+}
+
+static id<MTLBlitCommandEncoder> termite_metal_tracked_blit_command_encoder(id<MTLCommandBuffer> command_buffer) {
+    return termite_metal_tracked_blit_command_encoder_for_runtime(termite_metal_active_encoder_runtime, command_buffer);
 }
 
 static bool termite_metal_trace_encoders_enabled(void) {
@@ -16189,12 +16192,15 @@ static bool termite_metal_trace_encoders_enabled(void) {
     return cached == 1;
 }
 
-static void termite_metal_record_active_frame_blit_source(id<MTLCommandBuffer> command_buffer, size_t source) {
-    termite_metal_decode_runtime *runtime = termite_metal_active_encoder_runtime;
+static void termite_metal_record_active_frame_blit_source_for_runtime(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, size_t source) {
     if (runtime == NULL || runtime->active_frame_cb != command_buffer) return;
     if (source >= TERMITE_METAL_BLIT_COUNTER_COUNT) source = TERMITE_METAL_BLIT_SOURCE_OTHER;
     runtime->active_frame_blit_source_counts[source] += 1;
     if (termite_metal_trace_encoders_enabled()) fprintf(stderr, "metal_encoder_trace: blit source=%zu\n", source);
+}
+
+static void termite_metal_record_active_frame_blit_source(id<MTLCommandBuffer> command_buffer, size_t source) {
+    termite_metal_record_active_frame_blit_source_for_runtime(termite_metal_active_encoder_runtime, command_buffer, source);
 }
 
 static id<MTLComputePipelineState> termite_metal_make_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString *name) {
@@ -64682,7 +64688,8 @@ int termite_metal_buffer_copy(
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
         id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_handle;
         if (src_offset + length > src.length || dst_offset + length > dst.length) return -2;
-        if (src.storageMode == MTLStorageModeShared && dst.storageMode == MTLStorageModeShared) {
+        if (src.storageMode == MTLStorageModeShared && dst.storageMode == MTLStorageModeShared &&
+            (runtime == NULL || (runtime->active_frame_cb == nil && runtime->submitted_frame_cb == nil))) {
             memcpy((uint8_t *)dst.contents + dst_offset, (const uint8_t *)src.contents + src_offset, length);
             return 0;
         }
@@ -64690,11 +64697,11 @@ int termite_metal_buffer_copy(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -4;
-        termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
+        termite_metal_record_active_frame_blit_source_for_runtime(runtime, command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
         if (!frame_owned && termite_metal_trace_frame_blits_enabled()) {
             fprintf(stderr, "metal_frame_blit: kind=copy length=%zu src_offset=%zu dst_offset=%zu\n", length, src_offset, dst_offset);
         }
-        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);
         if (blit == nil) return -5;
         if ([blit respondsToSelector:@selector(setLabel:)]) {
             blit.label = @"buffer-copy";
@@ -64730,7 +64737,8 @@ int termite_metal_buffer_copy_pair(
         if (src_a.storageMode == MTLStorageModeShared &&
             dst_a.storageMode == MTLStorageModeShared &&
             src_b.storageMode == MTLStorageModeShared &&
-            dst_b.storageMode == MTLStorageModeShared) {
+            dst_b.storageMode == MTLStorageModeShared &&
+            (runtime == NULL || (runtime->active_frame_cb == nil && runtime->submitted_frame_cb == nil))) {
             memcpy((uint8_t *)dst_a.contents + dst_a_offset, (const uint8_t *)src_a.contents + src_a_offset, length_a);
             memcpy((uint8_t *)dst_b.contents + dst_b_offset, (const uint8_t *)src_b.contents + src_b_offset, length_b);
             return 0;
@@ -64739,11 +64747,11 @@ int termite_metal_buffer_copy_pair(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -6;
-        termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
+        termite_metal_record_active_frame_blit_source_for_runtime(runtime, command_buffer, TERMITE_METAL_BLIT_SOURCE_BUFFER_COPY);
         if (!frame_owned && termite_metal_trace_frame_blits_enabled()) {
             fprintf(stderr, "metal_frame_blit: kind=copy_pair length_a=%zu length_b=%zu src_a_offset=%zu dst_a_offset=%zu src_b_offset=%zu dst_b_offset=%zu\n", length_a, length_b, src_a_offset, dst_a_offset, src_b_offset, dst_b_offset);
         }
-        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder_for_runtime(runtime, command_buffer);
         if (blit == nil) return -7;
         if ([blit respondsToSelector:@selector(setLabel:)]) {
             blit.label = @"buffer-copy-pair";
