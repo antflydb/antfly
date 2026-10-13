@@ -4879,3 +4879,63 @@ cooperation, public JSON program/schema identity and lowering, typed projected
 consumers, distributed activation proofs and remaining original cases still
 need work. Component ownership/fault proofs do not change the original
 479 implemented / 136 rejected / 73 superseded / 898 unresolved dispositions.
+
+### Native durable JSON columns and structural consumers
+
+The capability-gated native VM now compiles JSON columns and jsonb_typeof,
+jsonb_array_length, jsonb_extract_path and jsonb_extract_path_text. Operands
+retain JSONB identity; present JSON null differs from SQL NULL and missing
+paths. Path components use the existing query kernel, including negative array
+ordinals and PostgreSQL's invalid-ordinal-as-missing behavior. Selected arguments
+all execute after NULL or a missing child, while lazy ancestors retain their
+short-circuit semantics. Scalar-input jsonb_array_length errors retain SQLSTATE 22023, and
+cardinality has the PostgreSQL int32 result identity.
+
+All programs still require explicit native JSON-expression capability. Public
+schema derivation, generated OpenAPI grammar and SQL DDL lowering have not been
+enabled. A test-only structural bridge feeds 25 independently verified existing
+PostgreSQL path cases into native programs; it does not bypass a public SQL gate
+or grant any original-case credit.
+
+Multiple plans share the same sparse pinned-root cache. Direct path chains
+consumed by typeof/cardinality do not allocate intermediate JSON headers.
+After one cold-root decode, 20,000 text-path/cardinality evaluations succeed with
+a failing allocator and no output allocation; one Debug sample took 11.9 ms.
+Hot typed DOM reads pin rather than parse. Retained JSON and cold-derived text
+copy at owner retirement; derived text now polls during bounded copy chunks
+without charging its byte admission twice. Tests poison the retired physical
+source and verify that retained values and allocators remain valid.
+
+Native generated text uses the ordinary typed-row expression set, preserving
+123.00 display from a JSONB 1.2300e2 source, overwriting submitted generated
+values, and strictly rejecting forged restored text. Program and generated-set
+identities change with the path but survive schema-epoch and physical-column
+reordering. This is native integration evidence, not activation of original
+sql-0671 or a public generated-JSON contract.
+
+Five new contracts cover the independent path goldens, precise argument types,
+NULL provenance, lazy/strict selection, source retirement, shared-root reuse,
+and every observed cancellation/allocation-failure cut for JSON/text results.
+The fault fixture initially used a row schema version different from its
+declared layout; correcting that fixture preserved the schema-mismatch guard.
+The independent PostgreSQL oracle reverified all 138 text/JSON scalar cases
+without regenerating fixtures.
+
+Full production Debug qualification passed 1,041 SQL tests (three existing
+skips), 111 protocol tests and 113 transaction tests. The final native rerun,
+including the last added generated-text integration test, passed all 254 tests
+without failures or leaks. The five new contracts also passed directly from the
+final Debug artifact. Formatting, control-catalog freshness, the 2,048-file Apache
+boundary/license headers and original inventory integrity passed.
+
+Before public activation, complete the generated JSON/null OpenAPI contract,
+SQL lowering, typed projected tuple/vector consumers and reader/capability
+barriers. Restore verification for generated JSONB/JSONB-array results must also
+preserve observable numeric display, not merely SQL logical equality; the
+current generic generated-value comparison is not evidence for that requirement.
+The public JSON-null literal representation must also survive generated SDKs
+which omit a nil optional value; native explicit-null field-presence rules are
+not by themselves a complete SDK contract.
+Public schema/rewrite identity and distributed activation proofs still need
+end-to-end qualification. Original dispositions remain unchanged at
+479 implemented / 136 rejected / 73 superseded / 898 unresolved.

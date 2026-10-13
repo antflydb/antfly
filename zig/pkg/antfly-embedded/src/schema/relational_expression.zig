@@ -743,7 +743,14 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text };
+
+fn jsonFunction(op: Op) bool {
+    return switch (op) {
+        .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => true,
+        else => false,
+    };
+}
 
 fn numericFunction(op: Op) ?@import("../sql/numeric_functions.zig").Function {
     return switch (op) {
@@ -770,6 +777,8 @@ pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
         .array => count <= 32,
+        .jsonb_typeof, .jsonb_array_length => count == 1,
+        .jsonb_extract_path, .jsonb_extract_path_text => count >= 2 and count <= 32,
         .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5, .abs, .ceil, .floor, .sign, .sqrt => count == 1,
         .round, .trunc => count == 1 or count == 2,
         .replace => count == 3,
@@ -1136,6 +1145,7 @@ pub const Plan = struct {
             if (node.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, input, modifier, false);
             return input;
         }
+        if (jsonFunction(node.op)) return self.evaluateJsonFunction(execution, source, node);
         if (node.op == .replace or node.op == .md5) {
             // Strict calls still evaluate every argument before propagating
             // NULL; a later selected argument may raise an arithmetic error.
@@ -1264,6 +1274,70 @@ pub const Plan = struct {
                 const output = try allocateOutput(alloc, a.string.len, budget);
                 for (a.string, output) |byte, *out| out.* = if (node.op == .lower_ascii) std.ascii.toLower(byte) else std.ascii.toUpper(byte);
                 return .{ .string = output };
+            },
+            else => unreachable,
+        }
+    }
+
+    fn selectJsonPath(self: *const Plan, execution: *Execution, source: Source, node: Node) anyerror!?std.json.Value {
+        const operand = self.nodes[node.children[0]];
+        var value: ?std.json.Value = if (operand.op == .jsonb_extract_path) nested: {
+            // A structural consumer needs the subtree, not a transient JSON
+            // result header. Fuse direct path chains without cloning or
+            // allocating an intermediate wrapper; keep node work identical.
+            try execution.numeric.charge(1);
+            break :nested try self.selectJsonPath(execution, source, operand);
+        } else root: {
+            const result = try self.evaluateNode(execution, source, node.children[0]);
+            break :root if (result == .null) null else result.json.value;
+        };
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        // Strict selected arguments still run after SQL NULL, a NULL path
+        // component or a missing child. Lazy ancestors decide selection.
+        for (node.children[1..]) |child| {
+            const key = try self.evaluateNode(execution, source, child);
+            if (key == .null) {
+                value = null;
+            } else if (value) |current| {
+                value = @import("../sql/json_path.zig").extract(current, key.string, &work) catch |err| return executionFailure(err);
+            }
+        }
+        return value;
+    }
+
+    fn evaluateJsonFunction(self: *const Plan, execution: *Execution, source: Source, node: Node) !Value {
+        const selected = (try self.selectJsonPath(execution, source, node)) orelse return .null;
+        var work: @import("../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+        switch (node.op) {
+            .jsonb_typeof => return .{ .string = switch (selected) {
+                .null => "null",
+                .bool => "boolean",
+                .integer, .float, .number_string => "number",
+                .string => "string",
+                .array => "array",
+                .object => "object",
+            } },
+            .jsonb_array_length => {
+                if (selected != .array) return error.InvalidRelationalExpressionInput;
+                return .{ .integer = std.math.cast(i32, selected.array.items.len) orelse return error.RelationalExpressionOverflow };
+            },
+            .jsonb_extract_path => {
+                const Json = @import("../sql/row_value.zig").Json;
+                try execution.charge(1);
+                if (@sizeOf(Json) > execution.bytes.*) return execution.limit();
+                execution.bytes.* -= @sizeOf(Json);
+                const view = try execution.alloc.create(Json);
+                view.* = .{ .value = selected };
+                return .{ .json = view };
+            },
+            .jsonb_extract_path_text => {
+                if (selected == .null) return .null;
+                if (selected == .string) return .{ .string = selected.string };
+                var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+                defer execution.bytes.* -|= memory.footprint();
+                const text = @import("../sql/jsonb_text.zig").format(memory.allocator(), selected, @min(max_output_bytes, execution.bytes.*), &work) catch |err|
+                    return if (err == error.OutOfMemory and memory.isExhausted()) execution.limit() else executionFailure(err);
+                return .{ .string = text };
             },
             else => unreachable,
         }
@@ -2495,6 +2569,7 @@ const Compiler = struct {
                 if (node.kind == .sql_array and node.sql_type == null) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .json => if (!self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, node.ordinal) == null) try self.dependencies.append(self.alloc, node.ordinal);
@@ -2552,6 +2627,15 @@ const Compiler = struct {
                             if (candidate.kind != .boolean) return error.InvalidRelationalExpressionType;
                         } else if (!sameOperandType(candidate, operand)) return error.InvalidRelationalExpressionType;
                     }
+                } else if (jsonFunction(op)) {
+                    if (!self.table.requires_json_expressions or operand.kind != .json) return error.InvalidRelationalExpressionType;
+                    for (children[1..]) |child| if (self.nodes.items[child].kind != .string) return error.InvalidRelationalExpressionType;
+                    node.kind = switch (op) {
+                        .jsonb_extract_path => .json,
+                        .jsonb_array_length => .integer,
+                        else => .string,
+                    };
+                    if (op == .jsonb_array_length) node.sql_type = .int32;
                 } else if (numericFunction(op) != null) {
                     if (operand.kind != .integer and operand.kind != .number and operand.kind != .numeric) return error.InvalidRelationalExpressionType;
                     if (operand.kind == .integer and op != .abs) return error.InvalidRelationalExpressionType;
@@ -2595,6 +2679,7 @@ const Compiler = struct {
                     .is_null, .is_not_null => node.kind = .boolean,
                     .in_list, .not_in_list => node.kind = .boolean,
                     .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => {},
+                    .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => {},
                     else => unreachable,
                 }
             },
@@ -4379,7 +4464,13 @@ fn retainPreparedResult(execution: *Execution, value: Value, decoded: bool) !Val
 fn retainPreparedBytes(execution: *Execution, bytes: []const u8) ![]const u8 {
     try execution.charge(bytes.len);
     const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
-    @memcpy(output, bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = offset + @min(bytes.len - offset, 256);
+        try execution.numeric.pollCheckpoint(end - offset);
+        @memcpy(output[offset..end], bytes[offset..end]);
+        offset = end;
+    }
     return output;
 }
 
@@ -4451,6 +4542,365 @@ test "relational index system legacy preparation is bound once to operand source
             try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
             try std.testing.expectEqual(max_allocated_bytes, bytes);
         }
+    }
+}
+
+test "relational index system durable JSON functions match PostgreSQL path contracts behind capability" {
+    const a = std.testing.allocator;
+    const Fixture = struct { entries: []const struct { sql: []const u8, value: std.json.Value = .null, sql_null: ?bool = null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_json_path_reference.json"), .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer fixture.deinit();
+    // A test-only structural bridge feeds already typed native programs from
+    // the independent SQL oracle. It does not activate public SQL lowering.
+    const Native = struct {
+        fn expression(alloc: Allocator, input: *const @import("../sql/ast.zig").Scalar, expected: Kind) anyerror!std.json.Value {
+            var result: std.json.ObjectMap = .empty;
+            switch (input.*) {
+                .literal => |raw| {
+                    var value: std.json.Value = switch (raw) {
+                        .null => .null,
+                        .string => |text| .{ .string = text },
+                        else => return error.UnexpectedJsonFixture,
+                    };
+                    if (expected == .json and raw != .null) {
+                        if (raw != .string) return error.UnexpectedJsonFixture;
+                        var work: @import("../sql/json_order.zig").Budget = .{};
+                        value = try @import("../sql/json_order.zig").parseTextLeaky(alloc, raw.string, &work);
+                        if (value == .null) try result.put(alloc, "json_null", .{ .bool = true });
+                    }
+                    try result.put(alloc, "op", .{ .string = "literal" });
+                    try result.put(alloc, "type", .{ .string = @tagName(expected) });
+                    try result.put(alloc, "value", value);
+                },
+                .call => |call| {
+                    const op = std.meta.stringToEnum(Op, call.name) orelse return error.UnexpectedJsonFixture;
+                    if (!jsonFunction(op)) return error.UnexpectedJsonFixture;
+                    var args = std.json.Array.init(alloc);
+                    for (call.args, 0..) |arg, i| try args.append(try expression(alloc, arg, if (i == 0) .json else .string));
+                    try result.put(alloc, "op", .{ .string = @tagName(op) });
+                    try result.put(alloc, "args", .{ .array = args });
+                },
+                else => return error.UnexpectedJsonFixture,
+            }
+            return .{ .object = result };
+        }
+    };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    var checked: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.@"error" != null) continue; // SQL signature/input errors remain the binder's contract.
+        errdefer std.debug.print("native JSON oracle: {s}\n", .{entry.sql});
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var parsed = try @import("../sql/compiler.zig").compileScalar(a, entry.sql, .{});
+        defer parsed.deinit();
+        const kind: Kind = switch (entry.oid.?) {
+            3802 => .json,
+            25 => .string,
+            23 => .integer,
+            else => return error.UnexpectedJsonFixture,
+        };
+        const definition = try Native.expression(region.allocator(), parsed.expression, kind);
+        var plan = try Plan.init(a, table, definition, kind);
+        defer plan.deinit();
+        const actual = try plan.evaluate(region.allocator(), &.{});
+        try std.testing.expectEqual(entry.sql_null orelse (entry.value == .null), actual == .null);
+        const rendered = try valueToJson(region.allocator(), actual);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(region.allocator(), entry.value, .{}), try std.json.Stringify.valueAlloc(region.allocator(), rendered, .{}));
+        if (kind == .integer) try std.testing.expectEqual(@as(?Numeric, .int32), plan.result_sql_type);
+        var guarded = table;
+        guarded.requires_json_expressions = false;
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, guarded, definition, kind));
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 25), checked);
+}
+
+test "relational index system durable JSON columns reuse pinned roots and fuse structural consumers" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"k\":\"owned\",\"n\":1.20,\"a\":[null,{\"s\":\"owned\"}]}" } },
+    }, &layout);
+    defer a.free(bytes);
+    try codec.finalizeOrdinalMetadata(bytes, @splat(0), 0);
+    const cold = try codec.ordinalRowView(bytes, table, &layout);
+    const Compile = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8, kind: Kind) !Plan {
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, source, .{});
+            defer parsed.deinit();
+            return Plan.init(backing, binding, parsed.value, kind);
+        }
+    };
+    var text = try Compile.run(a, table, "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"k\"}]}", .string);
+    defer text.deinit();
+    var length = try Compile.run(a, table, "{\"op\":\"jsonb_array_length\",\"args\":[{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}]}", .integer);
+    defer length.deinit();
+    var json = try Compile.run(a, table, "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"-1\"}]}", .json);
+    defer json.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(region.allocator(), &allowance);
+    var input: PreparedInput = undefined;
+    try input.initRow(&execution, cold);
+    defer input.deinit();
+    const first = try text.evaluatePreparedWithExecution(&execution, &input);
+    try std.testing.expectEqualStrings("owned", first.string);
+    try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &input)).integer);
+    try std.testing.expectEqual(@as(usize, 1), input.preparations);
+    try std.testing.expectEqual(@as(usize, 1), input.roots.decodes);
+    const before = allowance;
+    execution.alloc = .failing;
+    execution.numeric.alloc = .failing;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const reused = try text.evaluatePreparedWithExecution(&execution, &input);
+        try std.testing.expectEqual(first.string.ptr, reused.string.ptr);
+        try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &input)).integer);
+    }
+    std.debug.print("durable JSON pinned path: evaluations=20000 decodes={d} output_allocations=0 elapsed_ns={d}\n", .{ input.roots.decodes, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+    try std.testing.expectEqual(before, allowance);
+    execution.alloc = region.allocator();
+    execution.numeric.alloc = region.allocator();
+    const selected = try json.evaluatePreparedWithExecution(&execution, &input);
+    try std.testing.expectEqualStrings("owned", selected.json.value.object.get("s").?.string);
+    // Legacy retained results must outlive the temporary decoded-root owner
+    // and the physical source. Mutating the retired source proves no alias.
+    const retired = try a.dupe(u8, bytes);
+    defer a.free(retired);
+    const source = try codec.ordinalRowView(retired, table, &layout);
+    const owned_text = try text.evaluateRowWithExecution(&execution, source);
+    const owned_json = try json.evaluateBoundRowWithExecution(&execution, source);
+    @memset(retired, 0);
+    try std.testing.expectEqualStrings("owned", owned_text.string);
+    try std.testing.expectEqualStrings("owned", owned_json.json.value.object.get("s").?.string);
+    var reordered = table;
+    reordered.version = 99;
+    reordered.relational_columns = &.{
+        .{ .name = "other", .path = "other", .column_type = .string },
+        table.relational_columns[0],
+    };
+    var same = try Compile.run(a, reordered, "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"k\"}]}", .string);
+    defer same.deinit();
+    try std.testing.expectEqualSlices(u8, &text.fingerprint, &same.fingerprint);
+    try std.testing.expectEqual(@as(u32, 1), same.dependencies[0]);
+    try std.testing.expectEqualStrings("owned", (try same.evaluateRowWithExecution(&execution, cold)).string);
+    const hot = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"j\":{\"k\":\"owned\",\"a\":[null,{\"s\":\"owned\"}]}}", .{});
+    var hot_input: PreparedInput = undefined;
+    try hot_input.initJson(&execution, hot, null);
+    defer hot_input.deinit();
+    const hot_text = try text.evaluatePreparedWithExecution(&execution, &hot_input);
+    try std.testing.expectEqual(hot.object.get("j").?.object.get("k").?.string.ptr, hot_text.string.ptr);
+    try std.testing.expectEqual(@as(i64, 2), (try length.evaluatePreparedWithExecution(&execution, &hot_input)).integer);
+    try std.testing.expectEqual(@as(usize, 1), hot_input.preparations);
+    try std.testing.expectEqual(@as(usize, 0), hot_input.roots.decodes);
+}
+
+test "relational index system durable JSON functions keep strict selection type and null provenance" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    const Compile = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: []const u8, kind: Kind) !Plan {
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, source, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            return Plan.init(backing, binding, parsed.value, kind);
+        }
+    };
+    for ([_]struct { value: []const u8, expected: []const u8 }{
+        .{ .value = "null", .expected = "null" },
+        .{ .value = "true", .expected = "boolean" },
+        .{ .value = "1.20", .expected = "number" },
+        .{ .value = "\"x\"", .expected = "string" },
+        .{ .value = "[]", .expected = "array" },
+        .{ .value = "{}", .expected = "object" },
+    }) |case| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_typeof\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}{s}}}]}}", .{ case.value, if (std.mem.eql(u8, case.value, "null")) ",\"json_null\":true" else "" });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .string);
+        defer plan.deinit();
+        try std.testing.expectEqualStrings(case.expected, (try plan.evaluate(.failing, &.{})).string);
+    }
+    for ([_][]const u8{ "null", "true", "1", "\"text\"", "{}" }) |scalar| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_array_length\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}{s}}}]}}", .{ scalar, if (std.mem.eql(u8, scalar, "null")) ",\"json_null\":true" else "" });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .integer);
+        defer plan.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, plan.evaluate(.failing, &.{}));
+    }
+    for ([_][]const u8{
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}",
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}",
+        "{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"literal\",\"type\":\"string\",\"value\":\"{}\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}",
+    }, 0..) |invalid, i| {
+        try std.testing.expectError(if (i == 0) error.InvalidRelationalExpression else error.InvalidRelationalExpressionType, Compile.run(a, table, invalid, .json));
+    }
+    // Missing/NULL path components must not suppress a later selected error.
+    const failing_key = "{\"op\":\"case_when\",\"args\":[{\"op\":\"eq\",\"args\":[{\"op\":\"divide\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"b\"}]}";
+    for ([_][]const u8{ "null", "{}" }) |source| for ([_][]const u8{ "null", "\"missing\"" }) |key| {
+        const definition = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":{s}}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":{s}}},{s}]}}", .{ source, key, failing_key });
+        defer a.free(definition);
+        var plan = try Compile.run(a, table, definition, .string);
+        defer plan.deinit();
+        try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(.failing, &.{}));
+    };
+    const guarded_failure = try std.fmt.allocPrint(a, "{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"literal\",\"type\":\"json\",\"value\":null}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":null}},{s}]}}", .{failing_key});
+    defer a.free(guarded_failure);
+    const lazy = try std.fmt.allocPrint(a, "{{\"op\":\"coalesce\",\"args\":[{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"ok\"}},{s}]}}", .{guarded_failure});
+    defer a.free(lazy);
+    var selected = try Compile.run(a, table, lazy, .string);
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("ok", (try selected.evaluate(.failing, &.{})).string);
+    var typeof = try Compile.run(a, table, "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .string);
+    defer typeof.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(region.allocator(), &allowance);
+    const document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"j\":null}", .{});
+    var markers: @import("../sql/row_value.zig").JsonNulls = undefined;
+    markers.initRegion(region.allocator(), allowance, &execution.numeric);
+    defer markers.deinit();
+    try markers.bindAdmission(&allowance);
+    try markers.import(&.{"j"});
+    var present: PreparedInput = undefined;
+    try present.initJson(&execution, document, &markers);
+    defer present.deinit();
+    try std.testing.expectEqualStrings("null", (try typeof.evaluatePreparedWithExecution(&execution, &present)).string);
+    var sql_null: PreparedInput = undefined;
+    try sql_null.initJson(&execution, document, null);
+    defer sql_null.deinit();
+    try std.testing.expect((try typeof.evaluatePreparedWithExecution(&execution, &sql_null)) == .null);
+}
+
+test "relational index system durable JSON formatting and retention unwind every allocation and cancellation cut" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const wide: [1024]u8 = @splat('x');
+    const raw = try std.fmt.allocPrint(a, "{{\"a\":{{\"k\":\"{s}\",\"n\":1.20}}}}", .{&wide});
+    defer a.free(raw);
+    const bytes = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = raw } },
+    }, &layout);
+    defer a.free(bytes);
+    try codec.finalizeOrdinalMetadata(bytes, @splat(0), 0);
+    const cold = try codec.ordinalRowView(bytes, table, &layout);
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(ptr: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const Run = struct {
+        fn run(backing: Allocator, binding: schema.TableSchema, source: codec.OrdinalRowView, kind: Kind, control: *Control) !void {
+            const definition = try std.fmt.allocPrint(backing, "{{\"op\":\"{s}\",\"args\":[{{\"op\":\"column\",\"column\":\"j\"}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}}]}}", .{if (kind == .json) "jsonb_extract_path" else "jsonb_extract_path_text"});
+            defer backing.free(definition);
+            const parsed = try std.json.parseFromSlice(std.json.Value, backing, definition, .{});
+            defer parsed.deinit();
+            var plan = try Plan.init(backing, binding, parsed.value, kind);
+            defer plan.deinit();
+            var region: std.heap.ArenaAllocator = .init(backing);
+            defer region.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var execution = Execution.init(region.allocator(), &remaining);
+            execution.numeric.checkpoint = Control.check;
+            execution.numeric.ptr = control;
+            const value = plan.evaluateRowWithExecution(&execution, source) catch |err| {
+                if (err == error.QueryCanceled) {
+                    try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+                    try std.testing.expectError(error.QueryCanceled, plan.evaluateRowWithExecution(&execution, source));
+                }
+                return err;
+            };
+            if (kind == .json) {
+                try std.testing.expectEqualStrings("1.20", value.json.value.object.get("n").?.number_string);
+            } else {
+                try std.testing.expect(std.mem.endsWith(u8, value.string, "\", \"n\": 1.20}"));
+            }
+        }
+    };
+    for ([_]Kind{ .json, .string }) |kind| {
+        var observed: Control = .{};
+        try Run.run(a, table, cold, kind, &observed);
+        for (1..observed.polls + 1) |cut| {
+            var canceled: Control = .{ .fail_at = cut };
+            try std.testing.expectError(error.QueryCanceled, Run.run(a, table, cold, kind, &canceled));
+        }
+        var healthy: Control = .{};
+        var stable: std.testing.FailingAllocator = .init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ table, cold, kind, &healthy });
+    }
+}
+
+test "relational index system durable JSON generated text shares typed preparation identity and restore verification" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "source_key", .path = "source_key", .column_type = .string },
+    } };
+    const Compile = struct {
+        fn run(alloc: Allocator, binding: schema.TableSchema, key: []const u8) !*Set {
+            const bytes = try schema.serializeSchema(alloc, binding);
+            defer alloc.free(bytes);
+            const owned = try schema.deserializeSchema(alloc, bytes);
+            errdefer schema.freeSchema(alloc, owned);
+            const definition = try std.fmt.allocPrint(alloc, "[{{\"column\":\"source_key\",\"expression\":{{\"op\":\"jsonb_extract_path_text\",\"args\":[{{\"op\":\"column\",\"column\":\"metadata\"}},{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"{s}\"}}]}}}}]", .{key});
+            defer alloc.free(definition);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, definition, .{});
+            defer parsed.deinit();
+            return Set.createOwned(alloc, owned, .null, parsed.value);
+        }
+    };
+    const set = try Compile.run(a, table, "source");
+    defer set.deinit();
+    const changed = try Compile.run(a, table, "other");
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &generatedFingerprint(set), &generatedFingerprint(changed)));
+    var moved_table = table;
+    moved_table.version = 999;
+    moved_table.relational_columns = &.{ table.relational_columns[1], table.relational_columns[0] };
+    const moved = try Compile.run(a, moved_table, "source");
+    defer moved.deinit();
+    try std.testing.expectEqualSlices(u8, &generatedFingerprint(set), &generatedFingerprint(moved));
+    for ([_]struct { json: []const u8, expected: ?[]const u8 }{
+        .{ .json = "{\"metadata\":{\"source\":1.2300e2},\"source_key\":\"forged\"}", .expected = "123.00" },
+        .{ .json = "{\"metadata\":{\"source\":true}}", .expected = "true" },
+        .{ .json = "{\"metadata\":{\"source\":null}}", .expected = null },
+        .{ .json = "{\"metadata\":{}}", .expected = null },
+    }) |case| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), case.json, .{ .parse_numbers = false });
+        var remaining: usize = max_allocated_bytes;
+        var execution = Execution.init(region.allocator(), &remaining);
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(region.allocator(), remaining, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(&remaining);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(region.allocator(), remaining, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(&remaining);
+        try set.applyTypedJsonWithExecution(&execution, &document, &roots, &nulls);
+        if (case.expected) |text| try std.testing.expectEqualStrings(text, document.object.get("source_key").?.string) else try std.testing.expect(document.object.get("source_key").? == .null);
+        const markers = try nulls.snapshot();
+        try set.verifyTypedJsonWithExecution(&execution, document, markers);
+        try document.object.put(region.allocator(), "source_key", .{ .string = "forged" });
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyTypedJsonWithExecution(&execution, document, markers));
+        try std.testing.expectEqual(@as(usize, 0), roots.decodes);
     }
 }
 
