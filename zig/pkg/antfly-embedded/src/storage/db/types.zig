@@ -1819,6 +1819,8 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted request-local preparation, never decoded from public input.
+    text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2087,6 +2089,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "text_navigation_plan",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {

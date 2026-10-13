@@ -1123,17 +1123,15 @@ const Execution = struct {
     // the publication's collection statistics and global term frequencies;
     // only admission/doc ordinals are local. Source hydration remains after
     // final top-K movement. Metadata filters, typed ordering/cursors and
-    // highlights share the same bounded coordinator; source-dependent ranking
-    // and composed retrieval keep their existing planner.
+    // highlights and text components of hybrid/composed retrieval share the same
+    // bounded coordinator. The composed owner retains fusion and source leases;
+    // source-dependent ranking keeps its existing planner.
     fn pagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
         if (self.forced_selection != null or !self.typed_delivery or self.overlay != null or
-            req.profile or
             req.filter_text != null or req.exclusion_text != null or requiresEarlySource(req) or
             req.filter_prefix.len != 0 or req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
             req.filter_doc_ids.len != 0 or req.filter_doc_ids_positive or req.exclude_doc_ids.len != 0 or
             req.resolved_doc_filter != null or req.resolved_text_doc_filter != null or req.native_key_predicate != null or
-            req.full_text_queries.len > 1 or req.dense != null or req.sparse != null or
-            req.dense_queries.len != 0 or req.sparse_queries.len != 0 or
             req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
             req.aggregations_json.len != 0 or req.pruner != null or req.reranker != null or
             (!req.count_only and req.limit == 0)) return null;
@@ -1156,19 +1154,9 @@ const Execution = struct {
         const root = metadata.value.root;
         if (root.inventory_version != 3 or root.collection == null or root.statistics_version < 1 or root.term_statistics == null or root.segment_count <= 64) return null;
         if (!std.mem.eql(u8, &root.domain, &self.domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
-        // Preserve the exact selective route when the query has few segments.
         var plan_budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
         var plan = std.heap.ArenaAllocator.init(plan_budget.allocator());
         defer plan.deinit();
-        var planning = self.*;
-        planning.arena = plan.allocator();
-        const subset = planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
-            error.OutOfMemory => null,
-            else => return err,
-        };
-        if (subset) |ids| if (ids.len <= 64 or ids.len < root.segment_count / 2) return null;
-        var reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
-        defer reader.deinit();
         var schema_ = try local.schema_mod.parseValidatedTableSchema(self.arena, self.schema_json);
         defer schema_.deinit(self.arena);
         const runtime = try local.schema_mod.deriveRuntimeTableSchema(self.arena, schema_);
@@ -1203,19 +1191,53 @@ const Execution = struct {
             queries[0] = .{ .query = text, .text_analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime), .runtime_schema = runtime, .selected_field = field };
             self.highlight_queries = queries;
         }
+        const frontier_mod = @import("lake_index_text_frontier.zig");
+        var frontier: ?*frontier_mod = null;
+        if (ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
+            _ = plan.reset(.retain_capacity);
+            const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
+            // Analysis is retained in plan until the frontier is destroyed.
+            frontier = frontier_mod.create(a, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime) catch |err| switch (err) {
+                error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.NativeLakeTermDirectoryKeyTooLarge => null,
+                else => return err,
+            };
+        }
+        defer if (frontier) |value| {
+            self.server.lake_query_metrics.recordNavigation(.{ .queries = 1, .admitted_segments = value.admitted, .subtree_reductions = value.reductions, .pruned_ranges = value.pruned_ranges, .overflow_subtrees = value.overflow_subtrees, .metadata_read_bytes = 256 * 1024 * 1024 - value.reads });
+            value.deinit();
+        };
+        var reader: ?*@import("lake_index_text_directory.zig").RoutingCursor = null;
+        if (frontier == null) {
+            var planning = self.*;
+            planning.arena = plan.allocator();
+            const subset = planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
+                error.OutOfMemory => null,
+                else => return err,
+            };
+            if (subset) |selected_ids| if (selected_ids.len <= 64 or selected_ids.len < root.segment_count / 2) return null;
+            reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
+        }
+        defer if (reader) |value| value.deinit();
         var winners = PagedWinners.initOrdered(a, if (req.count_only) 0 else @as(usize, req.offset) + req.limit, if (ordering) |*order| order else null);
         defer winners.deinit();
         var total: u32 = 0;
         var relation: types.TotalHitsRelation = .exact;
+        var profiled: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+        defer profiled.deinit();
         var ids: [64][32]u8 = undefined;
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        while (try reader.nextBounded(&ids, 32 * 1024 * 1024)) |window| {
+        while (true) {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const wa = scratch.allocator();
+            const window: @import("lake_index_text_directory.zig").RoutingCursor.Window = if (frontier) |value| blk: {
+                const identity = (try value.next(winners.cutoff())) orelse break;
+                ids[0] = identity;
+                break :blk .{ .identities = ids[0..1], .doc_offset = 0 };
+            } else (try reader.?.nextBounded(&ids, 32 * 1024 * 1024)) orelse break;
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities };
             defer child.deinit();
             var request = req;
@@ -1223,18 +1245,44 @@ const Execution = struct {
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
             request.highlight = null;
+            request.text_navigation_plan = if (frontier) |value| value.plan else null;
             if (ordering == null and !req.count_only) request.minimum_competitive_score = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
+            if (req.profile) if (page.sort_profile) |profile| {
+                if (profiled.sort_profile == null) {
+                    try profiled.setOwnedSortProfile(profile);
+                } else {
+                    mergeWindowProfile(&profiled.sort_profile.?, profile);
+                }
+            };
             if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
             total +|= page.total_hits;
             for (page.hits) |hit| {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
                 const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
-                try winners.addLocated(hit, ordinal, location);
+                if (frontier != null) {
+                    const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
+                    const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
+                    try winners.addPositioned(hit, try identities.logicalPosition(hit.native_text_doc_id.?), location);
+                } else try winners.addLocated(hit, ordinal, location);
             }
         }
-        return .{ .alloc = a, .hits = try winners.finishLocated(req.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        if (frontier) |value| if (value.pruned) {
+            relation = .gte;
+        };
+        var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(req.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        if (req.profile) {
+            result.sort_profile = profiled.sort_profile orelse .{};
+            result.sort_profile_storage = profiled.sort_profile_storage;
+            profiled.sort_profile = null;
+            profiled.sort_profile_storage = null;
+            result.sort_profile.?.selection_reason = if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
+            result.sort_profile.?.selected_count = result.hits.len;
+            result.sort_profile.?.window_capacity = winners.limit;
+            result.sort_profile.?.collector_heap_peak = winners.peak;
+        }
+        return result;
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
@@ -2396,10 +2444,28 @@ fn storedHighlightLocation(pin: search.PinnedTextSource, ids: []const [32]u8, do
     return error.InvalidNativeLakeTextCorpus;
 }
 
+/// Window-local counters describe all admitted work. Capacities/peaks describe
+/// the maximum concurrent window; labels retain the first executor's owned
+/// contract and the coordinator supplies its admission reason separately.
+fn mergeWindowProfile(target: *types.SortProfile, source: types.SortProfile) void {
+    inline for (@typeInfo(types.SortProfile).@"struct".field_names, @typeInfo(types.SortProfile).@"struct".field_types) |name, T| {
+        if (@typeInfo(T) == .int) {
+            if (std.mem.eql(u8, name, "window_capacity") or std.mem.eql(u8, name, "window_len") or std.mem.eql(u8, name, "collector_heap_peak") or std.mem.eql(u8, name, "distributed_shard_count") or std.mem.eql(u8, name, "distributed_shard_window")) {
+                @field(target, name) = @max(@field(target, name), @field(source, name));
+            } else @field(target, name) +|= @field(source, name);
+        } else if (T == bool) {
+            @field(target, name) = if (std.mem.eql(u8, name, "selective_filter_doc_values_preferred")) @field(target, name) or @field(source, name) else @field(target, name) and @field(source, name);
+        } else if (T == []const u8) {
+            if (!std.mem.eql(u8, @field(target, name), @field(source, name))) @field(target, name) = "mixed_window_plans";
+        }
+    }
+}
+
 const PagedWinners = struct {
     const Winner = struct {
         hit: types.SearchHit,
         ordinal: u64,
+        position: ?@import("lake_index_text_directory.zig").Position = null,
         highlight: ?StoredHighlightLocation = null,
         fn worst(ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder, l: Winner, r: Winner) std.math.Order {
             if (ordering) |typed| {
@@ -2407,11 +2473,18 @@ const PagedWinners = struct {
                 return if (typed.effective.req.search_before.len != 0) compared else compared.invert();
             }
             const order = std.math.order(l.hit.score orelse 0, r.hit.score orelse 0);
-            return if (order == .eq) std.math.order(r.ordinal, l.ordinal) else order;
+            if (order != .eq) return order;
+            if (l.position) |left| {
+                const right = r.position.?;
+                const file = std.mem.order(u8, &right.file, &left.file);
+                return if (file == .eq) std.math.order(right.rank, left.rank) else file;
+            }
+            return std.math.order(r.ordinal, l.ordinal);
         }
     };
     a: A,
     limit: usize,
+    peak: usize = 0,
     heap: std.PriorityQueue(Winner, ?*const local.storage_db_query_search_exec.SearchHitOrder, Winner.worst) = .initContext(null),
     fn init(a: A, limit: usize) PagedWinners {
         return initOrdered(a, limit, null);
@@ -2434,10 +2507,16 @@ const PagedWinners = struct {
         return self.addLocated(hit, ordinal, null);
     }
     fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredHighlightLocation) !void {
+        return self.addWinner(hit, ordinal, null, highlight);
+    }
+    fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
+        return self.addWinner(hit, 0, position, highlight);
+    }
+    fn addWinner(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, position: ?@import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
         if (self.limit == 0) return;
         if (!std.math.isFinite(hit.score orelse 0)) return error.InvalidNativeLakeTextCorpus;
         if (self.heap.context) |order| try order.validate(hit);
-        const candidate: Winner = .{ .hit = hit, .ordinal = ordinal };
+        const candidate: Winner = .{ .hit = hit, .ordinal = ordinal, .position = position };
         if (self.heap.items.len == self.limit and Winner.worst(self.heap.context, candidate, self.heap.peek().?) != .gt) return;
         var owned = try hit.clone(self.a);
         errdefer owned.deinit(self.a);
@@ -2450,7 +2529,8 @@ const PagedWinners = struct {
             var removed = self.heap.pop().?.hit;
             removed.deinit(self.a);
         }
-        try self.heap.push(self.a, .{ .hit = owned, .ordinal = ordinal, .highlight = highlight });
+        try self.heap.push(self.a, .{ .hit = owned, .ordinal = ordinal, .position = position, .highlight = highlight });
+        self.peak = @max(self.peak, self.heap.items.len);
     }
     fn finish(self: *PagedWinners, offset: usize) ![]types.SearchHit {
         return self.finishLocated(offset, null, self.a);
@@ -2538,4 +2618,34 @@ test "external lake paged stored highlights retain only returned winner location
     try std.testing.expectEqual(@as(usize, 1), locations.count());
     try std.testing.expectEqual(@as(u32, 8), locations.get("b").?.document);
     try std.testing.expect(locations.get("a") == null and locations.get("c") == null);
+}
+
+test "external lake global frontier winners keep logical file rank ties after arbitrary traversal" {
+    const a = std.testing.allocator;
+    var winners = PagedWinners.init(a, 3);
+    defer winners.deinit();
+    try winners.addPositioned(.{ .id = @constCast("late"), .score = 1 }, .{ .file = @splat(9), .rank = 0 }, null);
+    try winners.addPositioned(.{ .id = @constCast("second"), .score = 1 }, .{ .file = @splat(1), .rank = 8 }, null);
+    try winners.addPositioned(.{ .id = @constCast("first"), .score = 1 }, .{ .file = @splat(1), .rank = 2 }, null);
+    try winners.addPositioned(.{ .id = @constCast("best"), .score = 2 }, .{ .file = @splat(255), .rank = 100 }, null);
+    try std.testing.expectEqual(@as(usize, 3), winners.peak);
+    const hits = try winners.finish(0);
+    defer a.free(hits);
+    defer for (hits) |*hit| hit.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    try std.testing.expectEqualStrings("best", hits[0].id);
+    try std.testing.expectEqualStrings("first", hits[1].id);
+    try std.testing.expectEqualStrings("second", hits[2].id);
+}
+
+test "external lake bounded window profiles sum work and preserve actual peaks" {
+    var target: types.SortProfile = .{ .candidate_count = 9, .window_len = 4, .collector_heap_peak = 4, .index_sort_match = true, .native_loader = true, .native_filter_mode = "bitmap", .distributed_shard_count = 1 };
+    mergeWindowProfile(&target, .{ .candidate_count = 7, .window_len = 3, .collector_heap_peak = 2, .index_sort_match = false, .native_loader = true, .native_filter_mode = "point", .distributed_shard_count = 1 });
+    try std.testing.expectEqualStrings("mixed_window_plans", target.native_filter_mode);
+    try std.testing.expectEqual(@as(usize, 1), target.distributed_shard_count);
+    try std.testing.expectEqual(@as(u64, 16), target.candidate_count);
+    try std.testing.expectEqual(@as(usize, 4), target.window_len);
+    try std.testing.expectEqual(@as(usize, 4), target.collector_heap_peak);
+    try std.testing.expect(!target.index_sort_match);
+    try std.testing.expect(target.native_loader);
 }

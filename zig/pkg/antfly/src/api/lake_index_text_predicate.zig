@@ -251,6 +251,19 @@ pub const Identities = struct {
         result.spans = spans;
         return result;
     }
+    /// Stable logical ranking position shares predicate/hydration translation.
+    /// Admission and physical packing must never define the public tie order.
+    pub fn logicalPosition(self: Identities, ordinal_value: u32) !@import("lake_index_text_directory.zig").Position {
+        var lo: usize = 0;
+        var hi = self.spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans[mid].span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
+        const item = self.spans[lo];
+        return .{ .file = corpus.term_directory.identity(item.file), .rank = try item.span.original(ordinal_value) };
+    }
     fn liveRows(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         return cache.load(a, store, cached, block);
     }

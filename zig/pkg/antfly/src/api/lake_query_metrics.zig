@@ -21,13 +21,26 @@ const local = @import("antfly_local_sources");
 const prom = @import("../common/health_server.zig");
 pub const Phase = enum { source, publication, index, ranking, hydration, highlight, total };
 const count = @typeInfo(Phase).@"enum".field_names.len;
+pub const Navigation = struct {
+    queries: u64 = 0,
+    admitted_segments: u64 = 0,
+    subtree_reductions: u64 = 0,
+    pruned_ranges: u64 = 0,
+    overflow_subtrees: u64 = 0,
+    metadata_read_bytes: u64 = 0,
+};
 pub const Stats = struct {
+    navigation: Navigation = .{},
     calls: [count]u64 = @splat(0),
     nanoseconds: [count]u64 = @splat(0),
 };
 pub const Metrics = struct {
+    navigation: [@typeInfo(Navigation).@"struct".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
     calls: [count]std.atomic.Value(u64) = @splat(.init(0)),
     nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
+    pub fn recordNavigation(self: *Metrics, value: Navigation) void {
+        inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, i| _ = self.navigation[i].fetchAdd(@field(value, field), .monotonic);
+    }
     pub fn record(self: *Metrics, phase: Phase, start: u64) void {
         const index = @backingInt(phase);
         _ = self.calls[index].fetchAdd(1, .monotonic);
@@ -35,6 +48,7 @@ pub const Metrics = struct {
     }
     pub fn snapshot(self: *const Metrics) Stats {
         var result: Stats = .{};
+        inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, i| @field(result.navigation, field) = self.navigation[i].load(.monotonic);
         for (0..count) |i| {
             result.calls[i] = self.calls[i].load(.monotonic);
             result.nanoseconds[i] = self.nanoseconds[i].load(.monotonic);
@@ -58,6 +72,9 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         }
         if (stats.last_write_error) |reason| try prom.appendPromMetricLabeled(writer, "antfly_lake_disk_cache_last_write_error", "gauge", "Most recent asynchronous lake cache write failure", &.{.{ .name = "reason", .value = reason }}, 1);
     }
+    inline for (@typeInfo(Navigation).@"struct".field_names) |field| {
+        try prom.appendPromMetric(writer, "antfly_lake_text_frontier_" ++ field ++ "_total", "counter", "Lake native text navigation work including failed and canceled queries", @field(query.navigation, field));
+    }
     inline for (@typeInfo(Phase).@"enum".field_names, 0..) |phase, i| {
         try prom.appendPromMetric(writer, "antfly_lake_query_" ++ phase ++ "_calls_total", "counter", "Lake query phase invocations including failed work", query.calls[i]);
         try prom.appendPromMetric(writer, "antfly_lake_query_" ++ phase ++ "_nanoseconds_total", "counter", "Lake query phase elapsed nanoseconds including failed work", query.nanoseconds[i]);
@@ -68,6 +85,7 @@ test "external lake metrics expose fallback and disk write reasons without paths
     var buffer: [16384]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     var metrics: Metrics = .{};
+    metrics.recordNavigation(.{ .queries = 1, .admitted_segments = 2, .pruned_ranges = 7 });
     metrics.record(.hydration, @import("antfly_platform").time.monotonicNs());
     try append(&writer, local.serverless_query_lake_serving_cache.Cache.Stats{ .disk_unavailable = "ConcurrencyUnavailable", .disk_hits = 7 }, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, .{ .write_errors = 2, .last_write_error = "NoSpaceLeft", .drops_queue = 3 }), metrics.snapshot());
     const text = writer.buffered();
@@ -77,4 +95,6 @@ test "external lake metrics expose fallback and disk write reasons without paths
     try std.testing.expect(std.mem.indexOf(u8, text, "reason=\"NoSpaceLeft\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_disk_cache_drops_queue_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_hydration_calls_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_text_frontier_admitted_segments_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_text_frontier_pruned_ranges_total 7") != null);
 }

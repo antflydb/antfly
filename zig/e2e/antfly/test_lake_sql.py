@@ -4315,7 +4315,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
     objects.mkdir(parents=True)
     for part in range(67):
         path = tmp_path / "part.parquet"
-        rows = [{"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
+        rows = [{"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i, "sparse_native": '{"1":1}'}
                 for i in range(part * 3, part * 3 + 3)]
         pq.write_table(pa.Table.from_pylist(rows), path, compression="snappy", row_group_size=2)
         payload = path.read_bytes()
@@ -4338,9 +4338,11 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             "document_schemas": {"doc": {"schema": {"type": "object", "properties": {
                 "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
                 "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+                "sparse_native": {"type": "string"},
             }}}}, "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount"}], "include_columns": ["body"]}], "base_source": {
                 "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
-            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}, "stored_text": {"type": "full_text", "field": "body", "store_source": True}}})
+            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}, "all_text": {"type": "full_text"}, "stored_text": {"type": "full_text", "field": "body", "store_source": True},
+            "sparse_native": {"type": "embeddings", "external": True, "sparse": True}}})
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
@@ -4350,15 +4352,24 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             stored = call("GET", "/tables/paged_text/indexes/stored_text")
             assert stored["config"]["store_source"] is True, stored
             assert stored["status"]["readiness"]["state"] != "failed", str(stored) + server.debug_logs()
-            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored)):
+            sparse = call("GET", "/tables/paged_text/indexes/sparse_native")
+            assert sparse["status"]["readiness"]["state"] != "failed", str(sparse) + server.debug_logs()
+            if all(item["status"]["readiness"]["queryable"] for item in (resource, sortable, stored, sparse)):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
         request = {"full_text_search": {"match": "quasar", "field": "body"},
                    "full_text_index": "body_text", "fields": ["amount"], "limit": 201}
-        # Profiling deliberately uses full admission, providing an independent
-        # score/tie oracle for the bounded coordinator and final hydration.
-        oracle = call("POST", "/tables/paged_text/query", dict(request, profile=True))
+        def full_admission(query):
+            # A redundant text filter retains the complete planner. Profiling
+            # alone now observes the actual bounded execution path.
+            filters = [{"match": "quasar", "field": "body"}]
+            if "filter_query" in query:
+                filters.append(query["filter_query"])
+            return call("POST", "/tables/paged_text/query",
+                        dict(query, profile=True, filter_query=filters))
+
+        oracle = full_admission(request)
         expected = [(h["_id"], h["_score"], h["_source"]["amount"]) for h in oracle["hits"]["hits"]]
         assert len(expected) == 201
 
@@ -4374,6 +4385,8 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
             assert counted["hits"]["hits"] == []
             shapes = [
+                {"embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                 "indexes": ["sparse_native"], "highlight": {"fields": ["body"]}},
                 {"highlight": {"fields": ["body"]}},
                 {"full_text_index": "stored_text", "highlight": {"fields": ["body"]}},
                 {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
@@ -4386,11 +4399,13 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             ]
             for shape in shapes:
                 query = dict(request, **shape, limit=7)
-                reference = call("POST", "/tables/paged_text/query", dict(query, profile=True))
+                reference = full_admission(query)
                 actual = call("POST", "/tables/paged_text/query", query)
                 assert actual["hits"]["hits"] == reference["hits"]["hits"], (actual, reference)
+                profiled = call("POST", "/tables/paged_text/query", dict(query, profile=True))
+                assert profiled["hits"]["hits"] == actual["hits"]["hits"]
                 counted = call("POST", "/tables/paged_text/query", dict(query, limit=0))
-                assert counted["hits"]["total"] == call("POST", "/tables/paged_text/query", dict(query, limit=0, profile=True))["hits"]["total"]
+                assert counted["hits"]["total"] == full_admission(dict(query, limit=0))["hits"]["total"]
                 assert counted["hits"]["hits"] == []
                 assert all(set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"])
                 if "highlight" in shape:
@@ -4399,7 +4414,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                     cursor = actual["hits"]["hits"][-1]["_sort"]
                     forward = dict(query, search_after=cursor, remote_snapshot=actual["remote_snapshot"])
                     following = call("POST", "/tables/paged_text/query", forward)
-                    assert following["hits"]["hits"] == call("POST", "/tables/paged_text/query", dict(forward, profile=True))["hits"]["hits"]
+                    assert following["hits"]["hits"] == full_admission(forward)["hits"]["hits"]
                     backward = dict(query, search_before=following["hits"]["hits"][0]["_sort"], remote_snapshot=following["remote_snapshot"])
                     assert call("POST", "/tables/paged_text/query", backward)["hits"]["hits"] == actual["hits"]["hits"]
         check()

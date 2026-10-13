@@ -154,6 +154,9 @@ pub const SearchRequest = struct {
     /// Private coordinator hint, valid only for score top-K. Equal scores
     /// cannot be pruned because local document numbers do not encode global ties.
     minimum_competitive_score: ?f32 = null,
+    /// Borrowed from the same pinned publication; all scoring tasks join before
+    /// this metadata-only preparation can be released.
+    text_navigation_plan: ?*const TextNavigationPlan = null,
     bm25_config: inverted.BM25Config = .{},
     diagnostics: ?*scorer_mod.SearchDiagnostics = null,
 };
@@ -544,7 +547,7 @@ pub fn execute(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
-    var result = if (request.sort == null and (request.search_after != null or request.minimum_competitive_score != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
+    var result = if (request.sort == null and (request.search_after != null or request.minimum_competitive_score != null or request.text_navigation_plan != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
         (try executeStreamingTextBool(alloc, snap, if (request.query == .bool_query) request.query.bool_query else .{ .should = &.{request.query}, .min_should = 1, .pure_should_optional = true }, request, .{})).?
     else if (request.sort != null)
         try executeSort(alloc, snap, request)
@@ -2993,11 +2996,110 @@ const StreamingBoolNode = struct {
     }
 };
 
+/// Metadata-only planning shares analysis and Boolean lowering with scoring.
+/// It owns no segment inventory, payload decoder, or source lease.
+pub const TextNavigationPlan = struct {
+    pub const Statistics = struct {
+        ptr: *anyopaque,
+        count: u32,
+        average: *const fn (*anyopaque, []const u8) f32,
+        frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
+    };
+    pub const Summaries = struct {
+        ptr: *anyopaque,
+        read: *const fn (*anyopaque, []const u8, []const u8, f32, inverted.BM25Config) anyerror!index_mod.IndexSnapshot.TextTermSummary,
+    };
+    a: Allocator,
+    arena: std.heap.ArenaAllocator,
+    stats: StreamingBoolStats = undefined,
+    root: *const LoweredText = undefined,
+    config: inverted.BM25Config,
+
+    pub fn create(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config) !?*TextNavigationPlan {
+        if (!canStreamBool(query, 0)) return null;
+        const self = try a.create(TextNavigationPlan);
+        self.* = .{ .a = a, .arena = .init(a), .config = config };
+        errdefer self.deinit();
+        const scratch = self.arena.allocator();
+        self.stats = .{ .a = scratch, .metadata = source, .count = source.count };
+        try self.stats.collect(query);
+        var lowerer: LoweredText.Lowerer = .{ .a = scratch, .stats = &self.stats, .constrained = false };
+        self.root = try lowerer.lower(query);
+        if (!restricted(self.root)) {
+            self.deinit();
+            return null;
+        }
+        try self.stats.load();
+        return self;
+    }
+    pub fn deinit(self: *TextNavigationPlan) void {
+        const a = self.a;
+        self.arena.deinit();
+        a.destroy(self);
+    }
+    // A baseline can match documents absent from every positive term.
+    fn restricted(node: *const LoweredText) bool {
+        switch (node.kind) {
+            .all, .bitmap => return false,
+            .none, .term, .phrase => return true,
+            .boolean => {
+                if (node.baseline != null) return false;
+                for (node.must) |child| if (!restricted(child)) return false;
+                for (node.should) |child| if (!restricted(child)) return false;
+                return true;
+            },
+        }
+    }
+    pub fn bound(self: *const TextNavigationPlan, source: Summaries) !f32 {
+        return self.nodeBound(self.root, source);
+    }
+    fn nodeBound(self: *const TextNavigationPlan, node: *const LoweredText, source: Summaries) anyerror!f32 {
+        var upper: f32 = 0;
+        switch (node.kind) {
+            .none => {},
+            .all, .bitmap => return std.math.inf(f32),
+            .term => {
+                const term = node.term.?;
+                const stats = try @constCast(&self.stats).get(term.field, term.term);
+                const summary = try source.read(source.ptr, term.field, term.term, stats.average, self.config);
+                if (summary.frequency != 0) upper = summary.tf_upper * inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency)) * term.boost;
+                if (term.boost < 0 or !std.math.isFinite(term.boost)) return std.math.inf(f32);
+            },
+            .phrase => {
+                // Exact phrase frequency cannot exceed first-position TF.
+                var idf: f32 = 0;
+                var first: ?index_mod.IndexSnapshot.TextTermSummary = null;
+                for (node.groups, 0..) |group, i| for (group) |term| {
+                    const stats = try @constCast(&self.stats).get(node.field, term);
+                    const summary = try source.read(source.ptr, node.field, term, stats.average, self.config);
+                    if (i == 0 and first == null) first = summary;
+                    idf += inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency));
+                };
+                upper = if (!node.scored) node.boost else if (first) |summary| summary.tf_upper * idf * node.boost else 0;
+            },
+            .boolean => {
+                for (node.must) |child| upper += try self.nodeBound(child, source);
+                var optional: f32 = 0;
+                for (node.should) |child| {
+                    const value = @max(0, try self.nodeBound(child, source));
+                    if (node.group_optional) optional += value else upper += value;
+                }
+                if (node.group_optional) upper += optional;
+                upper *= node.boost;
+            },
+        }
+        if (node.boost < 0 or !std.math.isFinite(upper)) return std.math.inf(f32);
+        return if (upper > 0) std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32)) else upper;
+    }
+};
+
 const StreamingBoolStats = struct {
     const Frequency = struct { value: u32 = 0, local: bool = false, candidates: ?[]const index_mod.IndexSnapshot.TextCandidate = null };
     const Field = struct { average: f32, frequencies: std.StringHashMapUnmanaged(Frequency) = .empty };
     a: Allocator,
-    snap: *const index_mod.IndexSnapshot,
+    snap: ?*const index_mod.IndexSnapshot = null,
+    metadata: ?TextNavigationPlan.Statistics = null,
+    preparation: ?*const TextNavigationPlan = null,
     count: u32,
     fields: std.StringHashMapUnmanaged(Field) = .empty,
     overrides: []const distributed_stats_mod.TextFieldStats = &.{},
@@ -3006,6 +3108,7 @@ const StreamingBoolStats = struct {
     analyses: std.ArrayListUnmanaged(struct { text: []const u8, analyzer: *const analysis_mod.Analyzer, tokens: []const analysis_mod.Token }) = .empty,
     phrases: std.ArrayListUnmanaged(struct { field: []const u8, text: []const u8, analyzer: *const analysis_mod.Analyzer, filter: ?query_mod.Filter }) = .empty,
     fn analyzed(self: *@This(), text: []const u8, analyzer: *const analysis_mod.Analyzer) ![]const analysis_mod.Token {
+        if (self.preparation) |prepared| for (prepared.stats.analyses.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.text, text)) return entry.tokens;
         for (self.analyses.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.text, text)) return entry.tokens;
         if (self.sealed) return error.InvalidArgument;
         const tokens = try analyzer.analyze(self.a, text);
@@ -3014,6 +3117,7 @@ const StreamingBoolStats = struct {
     }
     fn phraseFilter(self: *@This(), q: PhraseQuery) !?query_mod.Filter {
         const analyzer = q.analyzer orelse &analysis_mod.default_analyzer;
+        if (self.preparation) |prepared| for (prepared.stats.phrases.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.field, q.field) and std.mem.eql(u8, entry.text, q.text)) return entry.filter;
         for (self.phrases.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.field, q.field) and std.mem.eql(u8, entry.text, q.text)) return entry.filter;
         if (self.sealed) return error.InvalidArgument;
         const filter = try buildPhraseFilterFromTokens(self.a, q.field, try self.analyzed(q.text, analyzer), 0, false);
@@ -3022,7 +3126,7 @@ const StreamingBoolStats = struct {
     }
     fn add(self: *@This(), field: []const u8, term: []const u8, local: bool) !void {
         const entry = try self.fields.getOrPut(self.a, field);
-        if (!entry.found_existing) entry.value_ptr.* = .{ .average = self.snap.textAvgDocLen(field) };
+        if (!entry.found_existing) entry.value_ptr.* = .{ .average = if (self.metadata) |source| source.average(source.ptr, field) else self.snap.?.textAvgDocLen(field) };
         const value = try entry.value_ptr.frequencies.getOrPut(self.a, term);
         if (!value.found_existing) {
             value.key_ptr.* = try self.a.dupe(u8, term);
@@ -3070,13 +3174,22 @@ const StreamingBoolStats = struct {
         var fields = self.fields.iterator();
         while (fields.next()) |field| {
             const frequencies = &field.value_ptr.frequencies;
-            if (self.snap.text_statistics) |reader| if (reader.prepare) |prepare| {
+            if (self.metadata) |source| {
+                const names = try self.a.alloc([]const u8, frequencies.count());
+                const values = try self.a.alloc(u32, names.len);
+                var keys = frequencies.keyIterator();
+                for (names) |*name| name.* = keys.next().?.*;
+                try source.frequencies(source.ptr, self.a, field.key_ptr.*, names, values);
+                for (names, values) |name, value| frequencies.getPtr(name).?.value = value;
+                continue;
+            }
+            if (self.snap.?.text_statistics) |reader| if (reader.prepare) |prepare| {
                 const requested = try self.a.alloc([]const u8, frequencies.count());
                 var keys = frequencies.keyIterator();
                 for (requested) |*key| key.* = keys.next().?.*;
                 try prepare(reader.ptr, self.a, field.key_ptr.*, requested);
             };
-            if (self.snap.text_statistics) |reader| if (reader.candidates) |candidate_reader| {
+            if (self.snap.?.text_statistics) |reader| if (reader.candidates) |candidate_reader| {
                 var terms = frequencies.iterator();
                 while (terms.next()) |entry| entry.value_ptr.candidates = try candidate_reader(reader.ptr, self.a, field.key_ptr.*, entry.key_ptr.*);
             };
@@ -3094,7 +3207,10 @@ const StreamingBoolStats = struct {
                 names[i] = entry.key_ptr.*;
                 i += 1;
             };
-            try self.snap.termDocFreqs(self.a, field.key_ptr.*, names, values);
+            if (self.preparation) |prepared| {
+                const prepared_field = prepared.stats.fields.get(field.key_ptr.*) orelse return error.InvalidArgument;
+                for (names, values) |name, *value| value.* = (prepared_field.frequencies.get(name) orelse return error.InvalidArgument).value;
+            } else try self.snap.?.termDocFreqs(self.a, field.key_ptr.*, names, values);
             for (names, values) |name, value| frequencies.getPtr(name).?.value = value;
         }
     }
@@ -4484,7 +4600,7 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     defer arena.deinit();
     var stats_arena = std.heap.ArenaAllocator.init(alloc);
     defer stats_arena.deinit();
-    var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snap, .count = snap.scoringDocCount(), .overrides = request.distributed_text_stats };
+    var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snap, .count = snap.scoringDocCount(), .overrides = request.distributed_text_stats, .preparation = if (request.text_navigation_plan) |prepared| if (prepared.stats.count == snap.scoringDocCount() and request.distributed_text_stats.len == 0) prepared else null else null };
     try stats.collect(.{ .bool_query = bq });
     try stats.load();
     var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present() };
@@ -9877,4 +9993,69 @@ test "streaming boolean inherited publication cutoff prunes before payload admis
     try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
     try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_pruned);
     try std.testing.expectEqual(@as(u64, 0), diagnostics.segments_searched);
+}
+
+test "external lake metadata navigation shares scorer lowering and conservative signed phrase bounds" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "first", .data = "{}", .terms = &.{ .{ .term = "common", .freq = 2, .norm = 10, .positions = &.{ 0, 2 } }, .{ .term = "rare", .freq = 1, .norm = 10, .positions = &.{1} } } },
+        .{ .id = "second", .data = "{}", .terms = &.{.{ .term = "common", .freq = 1, .norm = 100, .positions = &.{0} }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Source = struct {
+        snapshot: *const index_mod.IndexSnapshot,
+        alloc: Allocator,
+        unknown: bool = false,
+        fn average(raw: *anyopaque, field: []const u8) f32 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).snapshot.textAvgDocLen(field);
+        }
+        fn frequencies(raw: *anyopaque, alloc: Allocator, field: []const u8, terms: []const []const u8, values: []u32) !void {
+            try @as(*@This(), @ptrCast(@alignCast(raw))).snapshot.termDocFreqs(alloc, field, terms, values);
+        }
+        fn summary(raw: *anyopaque, field: []const u8, term: []const u8, avg: f32, config: inverted.BM25Config) !index_mod.IndexSnapshot.TextTermSummary {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.unknown) return .{ .frequency = 1, .tf_upper = std.math.inf(f32) };
+            var reader = (try self.snapshot.segments[0].reader.invertedIndexScoped(self.alloc, field)) orelse return .{ .frequency = 0, .tf_upper = 0 };
+            defer reader.deinit();
+            const lookup = (try reader.lookup(term)) orelse return .{ .frequency = 0, .tf_upper = 0 };
+            var postings = try lookup.iterator(self.alloc);
+            defer postings.deinit();
+            var upper: f32 = 0;
+            while (try postings.next()) |hit| upper = @max(upper, inverted.bm25ScoreWithIdf(hit.freq, hit.norm, avg, 1, config));
+            return .{ .frequency = lookup.docFreq(), .tf_upper = upper };
+        }
+    };
+    var source: Source = .{ .snapshot = writer.snapshot(), .alloc = a };
+    const common: SearchQuery = .{ .term = .{ .field = "title", .term = "common" } };
+    const rare: SearchQuery = .{ .term = .{ .field = "title", .term = "rare" } };
+    const queries = [_]SearchQuery{
+        common,
+        .{ .match = .{ .field = "title", .text = "COMMON rare common", .boost = 2 } },
+        .{ .bool_query = .{ .must = &.{common}, .should = &.{rare}, .boost = 0.5 } },
+        .{ .bool_query = .{ .should = &.{ common, rare }, .must_not = &.{rare} } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "rare" }, .boost = 3 } },
+        .{ .bool_query = .{ .must = &.{common}, .boost = -1 } },
+    };
+    for (queries) |query| {
+        const plan = (try TextNavigationPlan.create(a, query, .{ .ptr = &source, .count = source.snapshot.scoringDocCount(), .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
+        defer plan.deinit();
+        const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
+        var result = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false });
+        defer result.deinit();
+        var prepared = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .text_navigation_plan = plan });
+        defer prepared.deinit();
+        try std.testing.expectEqual(result.hits.len, prepared.hits.len);
+        for (result.hits, prepared.hits) |hit, cached| {
+            try std.testing.expect(upper >= hit.score);
+            try std.testing.expectEqual(hit.doc_id, cached.doc_id);
+            try std.testing.expectEqual(hit.score, cached.score);
+        }
+        source.unknown = true;
+        try std.testing.expect(std.math.isInf(try plan.bound(.{ .ptr = &source, .read = Source.summary })));
+        source.unknown = false;
+    }
+    try std.testing.expect((try TextNavigationPlan.create(a, .{ .bool_query = .{ .must_not = &.{rare} } }, .{ .ptr = &source, .count = 2, .average = Source.average, .frequencies = Source.frequencies }, .{})) == null);
 }

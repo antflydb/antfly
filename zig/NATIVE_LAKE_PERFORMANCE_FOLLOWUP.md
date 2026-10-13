@@ -2,8 +2,10 @@
 
 Status: active follow-up. Native execution, public snapshot tokens, exact filters,
 and reader leases are implemented on top of PR #1006. The contracts below describe
-implemented refinements and their validation. Cross-source-file compaction, a
-publication-wide best-first frontier, and representative archive benchmarks remain
+implemented refinements and their validation. Publication-wide best-first text
+navigation and bounded profiling/composed text admission are implemented in the
+active follow-up. Cross-source-file compaction, durable cloud generation proofs,
+overlay/early-source admission, and representative archive benchmarks remain
 pending; their requirements are recorded at the end.
 
 ## Native sparse predicate intersection
@@ -2839,27 +2841,26 @@ The intended implementation separates maintenance file state from serving packs:
   A refresh work-count test must prove that unrelated historical payloads are
   neither read nor rewritten.
 
-A publication-wide best-first frontier also remains unimplemented. It needs
-conservative query bounds attached to authenticated routing subtrees and a bounded
-frontier that can descend promising subtrees before opening their inventories.
-The current cross-window score cutoff is implemented; it does not eliminate the
-initial routing walk or turn sequential windows into global best-first traversal.
+The active follow-up now implements publication-wide best-first text navigation
+over the existing authenticated term-directory subtree reductions, described
+below. It does not require a new artifact format or a complete routing walk.
 
 ### Follow-up after PR #1063: implementation and qualification scope
 
 PR #1063 merged as `68eece3fd6240f844cca890de36b9d1238084428`. The next
 follow-up starts from that main commit, including the main changes which arrived
-after the earlier `d1182ab89d` qualification. This section defines the pending
-implementation; it does not claim that the following capabilities have shipped.
-The follow-up remains a draft until the relevant correctness and work-count
-gates pass against its final code and merged base.
+after the earlier `d1182ab89d` qualification. The frontier and bounded profiling/
+composed-text work below are implemented in the working branch; the historical
+pack and cloud-generation migrations remain pending. The follow-up remains a
+draft until its correctness and work-count gates pass against its final code
+and merged base.
 
 | Workstream | Existing behavior | Required outcome |
 | --- | --- | --- |
-| Global search frontier | Routing windows follow immutable file order; score-bound planning is local to each admitted window. | Visit promising authenticated routing subtrees first and prune uncompetitive subtrees before inventory admission. |
+| Global search frontier | Implemented: authenticated term reductions prioritize disjoint segment hash ranges before inventory admission. | Qualify score, tie, source, count and bounded-work contracts. |
 | Historical serving compaction | Small fresh runs compact within a changed source file. | Compact across source files with authenticated physical spans, bounded maintenance work, and cheap appends. |
 | Cloud retained closures | Unsupported provider evidence requires complete retained-artifact audits. | Reuse closure proofs backed by durable object generations and provider-enforced retention, without trusting mutable live names. |
-| Broader bounded admission | Profiling, overlays, composed/vector retrieval, and early-source shapes keep their existing planners. | Carry bounded admission and ownership through those shapes while preserving their existing result contracts. |
+| Broader bounded admission | Implemented for profiling and text components of composed/vector retrieval; overlays and early-source ranking retain existing planners. | Extend bounded ownership to overlay/early-source shapes with coherent scoring statistics and source dependencies. |
 
 #### Global search frontier
 
@@ -2884,6 +2885,50 @@ ties, filters, exclusions, highlights and cursor pages with full admission, and
 prove that a competitive late-file subtree can be reached without admitting all
 earlier windows. Include equal-bound, unknown-bound, cancellation, and frontier
 pressure cases.
+
+Implemented frontier details:
+
+- The complete v2 term directory already carries conservative authenticated
+  per-term subtree reductions. A metadata-only plan uses the native analyzer
+  and Boolean lowerer, collection lengths and exact publication-wide DF. The
+  same preparation lends analyzed tokens and global frequencies to native
+  scoring windows. Negative/nonfinite boosts or bounds conservatively disable
+  score pruning; baseline-only and unsupported query shapes use the existing
+  complete planner.
+- The priority queue holds at most 512 disjoint ranges. Under pressure, a
+  257-entry DFS stack completes an overflow subtree, preserving coverage and
+  avoiding repeated admissions. Query scratch, syntax and navigation cache
+  share an 8 MiB budget; authenticated term-tree misses have a separate 256 MiB
+  read budget. Navigation failure propagates rather than returning partial
+  ranked results. Optional preparation admission failures keep the established
+  sequential routing path.
+- The global cutoff excludes only strictly lower bounds. A winner's immutable
+  file identity and original file rank supply the existing full-corpus tie
+  order, independent of traversal and window-local native ordinals. The same
+  physical rank mapping drives predicate and hydration translation. Count-only
+  and typed field/cursor sorts retain their exact existing execution paths;
+  skipped ranked matches yield `gte` totals.
+- Profiling no longer disables bounded admission. Counters sum window work,
+  capacities and collector sizes report peaks, and inconsistent plan labels
+  report `mixed_window_plans`. Text components of composed/hybrid queries use
+  bounded admission; their parent retains source/publication leases, fusion
+  and final physical hydration. Stored-source highlights retain only final
+  winning locations.
+- `antfly_lake_text_frontier_*_total` metrics expose admitted segments, subtree
+  reductions, pruned ranges, overflow subtrees and charged term-tree metadata
+  bytes, including work from interrupted constructed frontiers. Global DF
+  reads retain the existing lake cache/provider counters. These are work
+  counters, not archive-scale speedup claims.
+
+The deterministic navigation fixture places the strong term match last among
+8,192 immutable segments and checks that it is reached first with less than
+2 MiB of further term-tree reads and no inventory directory. A one-entry queue
+must visit every segment once. Shared native tests compare exact scores and
+winner order across analyzed, Boolean, signed and phrase shapes, including
+unknown bounds. Real Parquet coverage compares full admission with bounded
+profiles, metadata filters, exclusions, hybrids, hidden highlights and cursor
+pages before and after restart. Final build/test results are recorded below
+once qualification completes.
 
 #### Historical serving packs
 

@@ -12149,6 +12149,7 @@ pub fn searchTextQuery(
                 .include_stored = load_stored_in_search_engine,
                 .distributed_text_stats = effective_req.distributed_text_stats,
                 .minimum_competitive_score = effective_req.minimum_competitive_score,
+                .text_navigation_plan = effective_req.text_navigation_plan,
                 .filter_doc_nums = native_constraints.filter_doc_nums,
                 .filter_doc_nums_positive = native_constraints.positive_filter,
                 .exclude_doc_nums = native_constraints.exclude_doc_nums,
