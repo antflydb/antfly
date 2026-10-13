@@ -42265,6 +42265,7 @@ test "Metal OCR carrier cache preserves shapes roles and retained growth views" 
 }
 
 test "Metal OCR canonical quantized head frame matches singleton logits and suppressed tokens" {
+    const metal_runtime = metal_runtime_mod;
     if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const rows = 3;
@@ -42316,6 +42317,7 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
             reference_tokens[row] = @intCast((try metal_runtime.argmaxLogitsSuppressDevice(provider, logits, vocab, &.{ 0, 1, 2048 })) orelse return error.TestUnexpectedResult);
         }
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
         var n = try MetalCompute.ocrRowwisePrepared(&compute, &compute, input, 0, width, width, 1e-6);
         defer n.deinit();
         var logits = try MetalCompute.ocrRowwisePrepared(&compute, &compute, n, 0, width, vocab, null);
