@@ -1,5 +1,7 @@
 # Gemma4 and CLAP audio throughput
 
+Dated decisions and rejected trials: [media throughput history](history/gemma4/media-throughput-2026-10.md#audio-preparation-and-embedding-batches).
+
 Audio follow-up to [Gemma4 vision throughput](gemma4-vision-throughput.md), in the
 same change. Audio measurements compare against `6017034d7a`, which already
 includes the earlier GPU media residency work. [Machine-readable results](audio-throughput.json)

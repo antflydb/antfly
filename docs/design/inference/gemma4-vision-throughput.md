@@ -1,5 +1,7 @@
 # Gemma4 vision throughput: attention, submission, occupancy and preparation
 
+Dated decisions and rejected trials: [media throughput history](history/gemma4/media-throughput-2026-10.md#vision-flash-frames-and-preparation-overlap).
+
 Implementation and local qualification, 2026-10-11. This follows the resident
 multimodal work in PR #1086. The branch starts from `origin/main` at
 `d3bbb9a0c6`, merges that PR, and measures the merged baseline `14f39270e8`.

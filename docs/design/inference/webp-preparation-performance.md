@@ -1,5 +1,7 @@
 # WebP preparation performance
 
+Dated decisions and rejected trials: [media throughput history](history/gemma4/media-throughput-2026-10.md#jpeg-and-webp-preparation).
+
 The shared CPU WebP decoder now borrows lossless prefix tables, uses an eight-bit
 LSB-first lookup for short codes, and uses canonical length ranges for longer
 codes and short input tails. The previous implementation copied a large table
