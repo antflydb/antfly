@@ -20,6 +20,7 @@ Run with Python's Unicode 16.0.0 database; output is checked in so runtime
 behavior never depends on the host OS or locale.
 """
 
+import subprocess
 import unicodedata as u
 from pathlib import Path
 
@@ -76,6 +77,13 @@ for name, fields, rows in [
             + " },\n"
         )
     out.append("};\n")
+formatted = subprocess.run(
+    ["zig", "fmt", "--stdin"],
+    input="".join(out),
+    capture_output=True,
+    check=True,
+    text=True,
+).stdout
 Path(__file__).resolve().parents[1].joinpath("src/unicode_slug_data.zig").write_text(
-    "".join(out)
+    formatted
 )
