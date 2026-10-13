@@ -292,7 +292,6 @@ const PathFingerprint = struct {
 const BackendBuildInfo = struct {
     inference_version: []const u8,
     enable_native: bool,
-    enable_onnx: bool,
     enable_mlx: bool,
     enable_pjrt: bool,
     skip_openapi: bool,
@@ -2248,8 +2247,6 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
             .build = .{
                 .inference_version = build_info.version(),
                 .enable_native = build_options.enable_native,
-                // ONNX Runtime was removed; kept for recipe metadata compatibility.
-                .enable_onnx = false,
                 .enable_mlx = false,
                 .enable_pjrt = build_options.enable_pjrt,
                 .skip_openapi = build_options.skip_openapi,
