@@ -85,15 +85,26 @@ pub const Binding = struct {
         if (self.roots.len != 0) self.a.free(self.roots);
     }
 };
+/// A valid legacy checkpoint can contribute artifacts outside the published
+/// map. Its closure must be bootstrapped even when the publication is complete.
+pub fn seedComplete(seed: ?catalog.Publication, checkpoint: ?catalog.Publication, signature: catalog.Signature, namespace: ?catalog.Digest, fresh: bool) bool {
+    if (checkpoint) |saved| {
+        if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, namespace) and saved.cloud_generations == null) return false;
+    }
+    return if (seed) |publication| if (publication.cloud_generations) |cloud| cloud.complete else false else fresh;
+}
+
 /// Full migration audit is bounded by the existing closure census limits. If
 /// its optional certificate budget is exhausted, keep version-qualified records
 /// already observed and retain ordinary required-read/audit semantics.
 pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog.Publication, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, table_id: u64, identity: [32]u8, context: local.serverless_query_lake_read_context.Context, token: Token, inherited_certificate: bool) !void {
     const fresh_provider_now = if (inherited_certificate) try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)) else null;
     const inherit = fresh_provider_now != null and fresh_provider_now.? +| 60_000 < object.cloud_certificate_until_ms;
-    if (!inherit and !writer.disabled) {
-        // Rebase expired/legacy evidence over the exact live closure. Orphan
-        // records cannot retain zero/expired evidence indefinitely.
+    if ((!writer.complete or (writer.qualified_retention and !inherit)) and !writer.disabled) {
+        // Completeness of exact immutable selectors is independent of optional
+        // retention evidence. Inherit a complete map without a closure census
+        // when certificates are disabled. Bootstrap and proof renewal alone
+        // rebase over the live closure; ordinary reuse still checks existence.
         writer.rebase();
         var collector: @import("lake_index_gc.zig").Collector = .{ .a = std.heap.page_allocator, .table = table_id, .authority = undefined, .store = object.artifactStore(), .identity = identity, .context = context, .token = @splat(1), .namespace = publication.namespace, .audit_only = true, .remaining_reads = 512 * 1024 * 1024 };
         defer {
@@ -366,7 +377,7 @@ test "external lake global frontier wrapped publication builds real Parquet pack
             const self: *@This() = @ptrCast(@alignCast(raw));
             try saved.validate();
             const cloud = saved.cloud_generations orelse return error.MissingCheckpointGenerationMap;
-            try std.testing.expect(!cloud.complete and cloud.certificate == null);
+            try std.testing.expect(cloud.complete and cloud.certificate == null);
             self.checkpoints += 1;
         }
     };
@@ -433,4 +444,62 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     const rotated_scope = (try stores.uploadScopeFromArtifactId(rotated_root.artifact_id)).?;
     try std.testing.expectEqual(publication_api.uploadDomainWithNamespace(4, rotated_identity, rotated.value.namespace), rotated_scope.domain);
     try std.testing.expect(rotated.value.published.?.cloud_generations.?.complete);
+}
+
+test "external lake global frontier complete cloud maps refresh without retention certificates or payload audits" {
+    const a = std.testing.allocator;
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try Object.initWithClient(a, client, "bucket", "native");
+    defer object.deinit();
+    const identity: [32]u8 = @splat(3);
+    const namespace: [32]u8 = @splat(4);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(7, identity, namespace);
+    const scope: stores.UploadScope = .{ .domain = domain, .attempt = @splat(2) };
+    var writer: maps.Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope, .complete = true };
+    defer writer.deinit();
+    object.cloud_writer = &writer;
+    defer object.cloud_writer = null;
+    var artifacts = object.artifactStore();
+    var inventory = try artifacts.putScoped(scope, "first inventory", .none);
+    defer inventory.deinit(a);
+    var publication: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = namespace, .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = identity }, .published_at_ms = 101, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len } };
+    try finish(a, &writer, &object, &publication, &.{}, 7, identity, .{ .io = std.testing.io }, .none, false);
+    const first = publication.cloud_generations.?;
+    defer maps.freeRef(a, first.root);
+    try std.testing.expect(first.complete and first.certificate == null);
+    try std.testing.expectEqual(@as(usize, 0), provider.stats);
+    var legacy_checkpoint = publication;
+    legacy_checkpoint.cloud_generations = null;
+    try std.testing.expect(!seedComplete(publication, legacy_checkpoint, publication.signature, namespace, false));
+    try std.testing.expect(seedComplete(publication, publication, publication.signature, namespace, false));
+    legacy_checkpoint.signature.source[0] ^= 1;
+    try std.testing.expect(seedComplete(publication, legacy_checkpoint, publication.signature, namespace, false));
+    // Reopen the persistent map into a fresh builder, including a new attempt.
+    writer.rebase();
+    writer.reader.root = try maps.cloneRef(a, first.root);
+    writer.scope.attempt[15] += 1;
+    var next = try artifacts.putScoped(writer.scope, "next inventory", .none);
+    defer next.deinit(a);
+    publication.generation += 1;
+    publication.cloud_generations = null;
+    publication.inventory = .{ .kind = .external_base_source, .artifact_id = next.artifact_id, .checksum = next.checksum, .byte_len = next.byte_len };
+    publication.base_source.external_parquet.file_inventory_artifact = next.artifact_id;
+    const before = provider.serial;
+    try finish(a, &writer, &object, &publication, &.{}, 7, identity, .{ .io = std.testing.io }, .none, false);
+    defer maps.freeRef(a, publication.cloud_generations.?.root);
+    try std.testing.expect(publication.cloud_generations.?.complete);
+    try std.testing.expect(publication.cloud_generations.?.certificate == null);
+    try std.testing.expect(provider.serial - before <= 2);
+    try std.testing.expectEqual(@as(usize, 0), provider.stats);
+    var retained = (try writer.lookup(a, inventory.artifact_id, .none)).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqualStrings(inventory.provider_version.?, retained.generation);
+    // Optional bootstrap auditing cannot exceed its payload budget before I/O.
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 7, .authority = undefined, .store = artifacts, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .namespace = namespace, .audit_only = true, .remaining_reads = 0 };
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, collector.mark(.{ .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }));
+    try std.testing.expectEqual(@as(usize, 0), provider.stats);
 }

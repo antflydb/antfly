@@ -112,7 +112,21 @@ pub const Reader = struct {
     cache: [16]?Cached = @splat(null),
     cache_bytes: usize = 0,
     clock: u64 = 0,
-    const Cached = struct { ref: Ref, bytes: []u8, used: u64 };
+    decoded_hits: u64 = 0,
+    const Cached = struct { ref: Ref, bytes: []u8, arena: *std.heap.ArenaAllocator, node: Node, cost: usize, used: u64 };
+    fn freeCached(self: *Reader, value: Cached) void {
+        value.arena.deinit();
+        self.cache_allocator.destroy(value.arena);
+        freeRef(self.cache_allocator, value.ref);
+        self.cache_allocator.free(value.bytes);
+    }
+    fn cloneNode(a: A, node: Node) !Node {
+        const records = try a.alloc(Record, node.records.len);
+        for (records, node.records) |*out, record| out.* = try record.clone(a);
+        const children = try a.alloc(Child, node.children.len);
+        for (children, node.children) |*out, child| out.* = .{ .slot = child.slot, .ref = try cloneRef(a, child.ref) };
+        return .{ .version = node.version, .depth = node.depth, .leaf = node.leaf, .records = records, .children = children };
+    }
     pub fn resetBudget(self: *Reader) void {
         lock(&self.mu);
         defer self.mu.unlock();
@@ -120,8 +134,7 @@ pub const Reader = struct {
     }
     pub fn deinit(self: *Reader) void {
         for (self.cache) |entry| if (entry) |value| {
-            freeRef(self.cache_allocator, value.ref);
-            self.cache_allocator.free(value.bytes);
+            self.freeCached(value);
         };
         self.cache = @splat(null);
         self.cache_bytes = 0;
@@ -151,10 +164,9 @@ pub const Reader = struct {
                 if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) {
                     if (cached.ref.byte_len != ref.byte_len or !std.mem.eql(u8, cached.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
                     cached.used = self.clock;
-                    const node = try std.json.parseFromSliceLeaky(Node, a, cached.bytes, .{ .allocate = .alloc_always });
-                    try node.validate(depth);
-                    try self.validateDomain(node, ref);
-                    return node;
+                    if (cached.node.depth != depth) return error.InvalidCloudGenerationMap;
+                    self.decoded_hits += 1;
+                    return cloneNode(a, cached.node);
                 }
             };
             try api.chargeReadBudget(&self.remaining_bytes, ref.byte_len);
@@ -184,9 +196,26 @@ pub const Reader = struct {
         };
         const ca = self.cache_allocator;
         const owned = try ca.dupe(u8, result.body);
-        errdefer ca.free(owned);
-        const owned_ref = try cloneRef(ca, ref);
-        errdefer freeRef(ca, owned_ref);
+        const owned_ref = cloneRef(ca, ref) catch |err| {
+            ca.free(owned);
+            return err;
+        };
+        const parsed = ca.create(std.heap.ArenaAllocator) catch |err| {
+            freeRef(ca, owned_ref);
+            ca.free(owned);
+            return err;
+        };
+        parsed.* = .init(ca);
+        var retained = false;
+        defer if (!retained) {
+            parsed.deinit();
+            ca.destroy(parsed);
+            freeRef(ca, owned_ref);
+            ca.free(owned);
+        };
+        const decoded = try std.json.parseFromSliceLeaky(Node, parsed.allocator(), owned, .{ .allocate = .alloc_if_needed });
+        const cost = owned.len + parsed.queryCapacity() + @sizeOf(std.heap.ArenaAllocator) + @sizeOf(Cached) + owned_ref.artifact_id.len + owned_ref.checksum.len + owned_ref.generation.len;
+        if (cost > self.cache_limit) return node;
         var index: usize = 0;
         while (true) {
             var free: ?usize = null;
@@ -196,20 +225,48 @@ pub const Reader = struct {
                     if (oldest == null or value.used < self.cache[oldest.?].?.used) oldest = i;
                 } else free = i;
             }
-            if (free != null and owned.len <= self.cache_limit - self.cache_bytes) {
+            if (free != null and cost <= self.cache_limit - self.cache_bytes) {
                 index = free.?;
                 break;
             }
             const victim = oldest orelse return error.InvalidCloudGenerationMap;
             const old = self.cache[victim].?;
-            self.cache_bytes -= old.bytes.len;
-            freeRef(ca, old.ref);
-            ca.free(old.bytes);
+            self.cache_bytes -= old.cost;
+            self.freeCached(old);
             self.cache[victim] = null;
         }
-        self.cache[index] = .{ .ref = owned_ref, .bytes = owned, .used = self.clock };
-        self.cache_bytes += owned.len;
+        self.cache[index] = .{ .ref = owned_ref, .bytes = owned, .arena = parsed, .node = decoded, .cost = cost, .used = self.clock };
+        self.cache_bytes += cost;
+        retained = true;
         return node;
+    }
+    const Step = union(enum) { next: Ref, found: ?Record };
+    fn select(node: Node, a: A, id: []const u8, digest: [32]u8, depth: u8) !Step {
+        if (node.depth != depth) return error.InvalidCloudGenerationMap;
+        if (node.leaf) {
+            var lo: usize = 0;
+            var hi = node.records.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, node.records[mid].id, id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            return .{ .found = if (lo < node.records.len and std.mem.eql(u8, node.records[lo].id, id)) try node.records[lo].clone(a) else null };
+        }
+        for (node.children) |child| if (child.slot == slot(digest, depth)) return .{ .next = try cloneRef(std.heap.page_allocator, child.ref) };
+        return .{ .found = null };
+    }
+    fn cachedStep(self: *Reader, a: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8) !?Step {
+        lock(&self.mu);
+        defer self.mu.unlock();
+        self.clock +|= 1;
+        for (&self.cache) |*entry| if (entry.*) |*value| {
+            if (!std.mem.eql(u8, value.ref.artifact_id, ref.artifact_id) or !std.mem.eql(u8, value.ref.generation, ref.generation)) continue;
+            if (value.ref.byte_len != ref.byte_len or !std.mem.eql(u8, value.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
+            value.used = self.clock;
+            self.decoded_hits += 1;
+            return try select(value.node, a, id, digest, depth);
+        };
+        return null;
     }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
         _ = try api.sha256ChecksumFromArtifactId(id);
@@ -223,20 +280,18 @@ pub const Reader = struct {
         defer if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
         var depth: u8 = 0;
         while (true) : (depth += 1) {
-            const node = try self.read(arena.allocator(), ref, depth, token);
-            if (node.leaf) {
-                for (node.records) |record| if (std.mem.eql(u8, record.id, id)) return try record.clone(a);
-                if (self.complete) return error.CloudGenerationMissing;
-                return null;
-            }
-            const wanted = slot(digest, depth);
-            const next = for (node.children) |child| {
-                if (child.slot == wanted) break child.ref;
-            } else {
-                if (self.complete) return error.CloudGenerationMissing;
-                return null;
+            try token.check();
+            const step = (try self.cachedStep(a, ref, id, digest, depth)) orelse cold: {
+                const node = try self.read(arena.allocator(), ref, depth, token);
+                break :cold try select(node, a, id, digest, depth);
             };
-            const retained = try cloneRef(std.heap.page_allocator, next);
+            const retained = switch (step) {
+                .found => |record| {
+                    if (record == null and self.complete) return error.CloudGenerationMissing;
+                    return record;
+                },
+                .next => |next| next,
+            };
             if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
             owned_ref = retained;
             ref = retained;
@@ -540,6 +595,17 @@ test "external lake global frontier generation maps pin restart reads and rewrit
         try std.testing.expectEqualStrings("payload-v1", found.generation);
     }
     try std.testing.expectError(error.CloudGenerationMissing, reopened.lookup(a, &ids[512], .none));
+    var warmed = (try reopened.lookup(a, &ids[0], .none)).?;
+    warmed.deinit(a);
+    const charged = reopened.remaining_bytes;
+    const hits = reopened.decoded_hits;
+    for (0..100) |_| {
+        var selected = (try reopened.lookup(a, &ids[0], .none)).?;
+        selected.deinit(a);
+    }
+    try std.testing.expectEqual(charged, reopened.remaining_bytes);
+    try std.testing.expect(reopened.decoded_hits >= hits + 100);
+    try std.testing.expect(reopened.cache_bytes <= reopened.cache_limit);
     // Replacing the live map name cannot redirect an authenticated edge.
     const path = try key(a, "maps", first.artifact_id);
     defer a.free(path);

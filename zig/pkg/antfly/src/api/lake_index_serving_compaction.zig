@@ -41,11 +41,14 @@ const Builder = struct {
     open_packs: std.ArrayList(Chunk) = .empty,
     added: std.ArrayList(Chunk) = .empty,
     removed: std.ArrayList(Chunk) = .empty,
-    pending: [8]Input = undefined,
-    count: usize = 0,
-    bytes: u64 = 0,
-    spans: usize = 0,
-    pending_arena: std.heap.ArenaAllocator,
+    // Eight-way merges at each of two source-span tiers produce up to 64
+    // tiny-file spans per historical pack, without opening 64 inputs at once.
+    pending: [2][8]Input = undefined,
+    count: [2]usize = @splat(0),
+    bytes: [2]u64 = @splat(0),
+    spans: [2]usize = @splat(0),
+    open_counts: [2]usize = @splat(0),
+    pending_arena: [2]std.heap.ArenaAllocator,
     pack_count: u32 = 0,
     serving_bytes: u64 = 0,
     fn check(self: *@This()) !void {
@@ -56,7 +59,7 @@ const Builder = struct {
         for (group.summaries, group.segments) |summary, segment| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), sign);
     }
     fn owner(self: *@This(), group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
-        const a = self.pending_arena.child_allocator;
+        const a = self.pending_arena[0].child_allocator;
         const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
         defer a.free(bytes);
         for (group.sources) |span| {
@@ -67,30 +70,34 @@ const Builder = struct {
         }
     }
     fn add(self: *@This(), input: Input) !void {
+        return self.addAt(if (input.sources.len < 8) 0 else 1, input);
+    }
+    fn addAt(self: *@This(), level: usize, input: Input) !void {
         try self.check();
-        if (self.count != 0 and (self.bytes + input.admission.bytes > 16 * 1024 * 1024 or self.spans + input.sources.len > 64)) try self.flush();
-        const a = self.pending_arena.allocator();
+        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > 64)) try self.flush(level);
+        const a = self.pending_arena[level].allocator();
         const bytes = try std.json.Stringify.valueAlloc(a, input, .{});
-        self.pending[self.count] = try std.json.parseFromSliceLeaky(Input, a, bytes, .{ .allocate = .alloc_always });
-        self.count += 1;
-        self.bytes += input.admission.bytes;
-        self.spans += input.sources.len;
-        if (self.count == 8) try self.flush();
+        self.pending[level][self.count[level]] = try std.json.parseFromSliceLeaky(Input, a, bytes, .{ .allocate = .alloc_always });
+        self.count[level] += 1;
+        self.bytes[level] += input.admission.bytes;
+        self.spans[level] += input.sources.len;
+        if (self.count[level] == 8 or self.spans[level] == 64) try self.flush(level);
     }
-    fn flush(self: *@This()) !void {
-        if (self.count == 0) return;
-        try self.emit(self.pending[0..self.count]);
-        self.count = 0;
-        self.bytes = 0;
-        self.spans = 0;
-        _ = self.pending_arena.reset(.free_all);
+    fn flush(self: *@This(), level: usize) anyerror!void {
+        if (self.count[level] == 0) return;
+        try self.emit(self.pending[level][0..self.count[level]], level);
+        self.count[level] = 0;
+        self.bytes[level] = 0;
+        self.spans[level] = 0;
+        _ = self.pending_arena[level].reset(.free_all);
     }
-    fn emit(self: *@This(), inputs: []const Input) anyerror!void {
+    fn emit(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
         try self.check();
         var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = 64 * 1024 * 1024 };
         const a = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
+        var arena_live = true;
+        defer if (arena_live) arena.deinit();
         const out = arena.allocator();
         var sources: std.ArrayList(Span) = .empty;
         var count: u32 = 0;
@@ -111,8 +118,8 @@ const Builder = struct {
                 error.OutOfMemory => {
                     if (inputs.len == 1) return err;
                     const mid = inputs.len / 2;
-                    try self.emit(inputs[0..mid]);
-                    try self.emit(inputs[mid..]);
+                    try self.emit(inputs[0..mid], level);
+                    try self.emit(inputs[mid..], level);
                     return;
                 },
                 else => return err,
@@ -121,8 +128,8 @@ const Builder = struct {
             if (encoded.len > 32 * 1024 * 1024) {
                 if (inputs.len == 1) return error.NativeLakeTextCorpusTooLarge;
                 const mid = inputs.len / 2;
-                try self.emit(inputs[0..mid]);
-                try self.emit(inputs[mid..]);
+                try self.emit(inputs[0..mid], level);
+                try self.emit(inputs[mid..], level);
                 return;
             }
             const ref = try @import("lake_index_seekable_text.zig").publish(a, out, self.store, encoded, self.token);
@@ -132,6 +139,19 @@ const Builder = struct {
             if (admission.doc_count != count) return error.InvalidNativeLakeTextCorpus;
             group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{try corpus.statistics.publishSegmentWithIo(a, self.store, encoded, self.token, self.context.io)}) };
         }
+        if (level == 0 and group.sources.len >= 8 and group.sources.len < 64 and group.admissions[0].bytes < 2 * 1024 * 1024) {
+            // Only final packs own directory/ownership/statistics entries.
+            // Intermediate immutable segments remain ordinary attempt orphans.
+            var carry = std.heap.ArenaAllocator.init(self.a);
+            defer carry.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(carry.allocator(), Input{ .ref = group.segments[0], .admission = group.admissions[0], .sources = group.sources, .original_docs = count, .summary = group.summaries[0] }, .{});
+            const input = try std.json.parseFromSliceLeaky(Input, carry.allocator(), encoded, .{ .allocate = .alloc_always });
+            // A second-tier flush must not overlap the first merge workspace.
+            arena.deinit();
+            arena_live = false;
+            try self.addAt(1, input);
+            return;
+        }
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
         group.file = .{ .id = id, .digest = digest };
@@ -139,7 +159,11 @@ const Builder = struct {
         const manifest = try put(out, self.out, self.store, group, self.token);
         try self.added.append(self.out, manifest);
         try self.owner(group, manifest, false);
-        if (group.sources.len < 8 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_packs.items.len < 7) try self.open_packs.append(self.out, manifest);
+        const tier: usize = if (group.sources.len < 8) 0 else 1;
+        if (group.sources.len < 64 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
+            try self.open_packs.append(self.out, manifest);
+            self.open_counts[tier] += 1;
+        }
         try self.contribution(group, 1);
         self.pack_count = try std.math.add(u32, self.pack_count, 1);
         self.serving_bytes = try std.math.add(u64, self.serving_bytes, group.admissions[0].bytes);
@@ -207,8 +231,8 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
     terms.enableDurable(pages.store());
     var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
     defer ownership.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .pending_arena = .init(a) };
-    defer builder.pending_arena.deinit();
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .pending_arena = .{ .init(a), .init(a) } };
+    defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
         prior = try corpus.servingRoot(ca, store.*, old, token, null);
@@ -271,7 +295,8 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
         }
         if (lower != rows) return error.InvalidNativeLakeTextCorpus;
     }
-    try builder.flush();
+    try builder.flush(0);
+    try builder.flush(1);
     var root = current;
     root.serving = null;
     root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
@@ -357,16 +382,21 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             for (next.hits, ranked[3..6]) |hit, expected_hit| try std.testing.expectEqual(expected_hit.doc_id, hit.doc_id);
         }
     };
-    const refs = try ca.alloc(Chunk, 17);
-    for (refs[0..16], 0..) |*ref, i| ref.* = try Helper.file(ca, &store, i, @intCast(i + 1));
-    var current = try Helper.root(ca, &store, refs[0..16]);
+    const refs = try ca.alloc(Chunk, 129);
+    for (refs[0..128], 0..) |*ref, i| ref.* = try Helper.file(ca, &store, i, @intCast(i + 1));
+    var current = try Helper.root(ca, &store, refs[0..128]);
     var first_plan = try Helper.plan(ca, current, store, null);
     defer first_plan.deinit();
     current.serving = try publish(a, ca, &store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
     const first = try corpus.servingRoot(ca, store, current, .none, null);
     try std.testing.expectEqual(@as(u32, 2), first.segment_count);
+    try std.testing.expectEqual(@as(usize, 0), first.open_packs.len);
     const first_packs = try corpus.text_directory.fileRecords(ca, first, store, null, .none);
-    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 32);
+    for (first_packs) |pack| {
+        const group = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
+        try std.testing.expectEqual(@as(usize, 64), group.sources.len);
+    }
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
     // A serving publication retains canonical maintenance metadata, without
     // retaining a second full copy of every original posting payload.
     const root_ref = try put(ca, ca, &store, current, .none);
@@ -377,7 +407,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         collector.marked.deinit(a);
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = root_ref.artifact_id, .checksum = root_ref.checksum, .byte_len = root_ref.byte_len });
-    for (refs[0..16]) |ref| {
+    for (refs[0..128]) |ref| {
         const group = try corpus.loadFileManifest(ca, store, ref, current.domain, .none, null);
         try std.testing.expect(collector.marked.contains(group.physical_manifest.?.artifact_id));
         for (group.segments) |segment| {
@@ -385,10 +415,10 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             try store.delete(segment.artifact_id);
         }
     }
-    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 32);
-    refs[16] = try Helper.file(ca, &store, 16, 17);
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
+    refs[128] = try Helper.file(ca, &store, 128, 129);
     var appended = try Helper.root(ca, &store, refs);
-    var append_plan = try Helper.plan(ca, appended, store, "source-16");
+    var append_plan = try Helper.plan(ca, appended, store, "source-128");
     defer append_plan.deinit();
     appended.serving = try publish(a, ca, &store, appended, current, &append_plan, .{ .io = std.testing.io }, .none);
     const appended_root = try corpus.servingRoot(ca, store, appended, .none, null);
@@ -406,12 +436,12 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     var replace_plan = try Helper.plan(ca, replaced, store, "source-0");
     defer replace_plan.deinit();
     replaced.serving = try publish(a, ca, &store, replaced, appended, &replace_plan, .{ .io = std.testing.io }, .none);
-    try Helper.verify(ca, store, try Helper.reopen(ca, &store, replaced), 34);
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, replaced), 258);
     // The old publication still resolves the replaced source's original rows.
-    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 32);
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
     var removed = try Helper.root(ca, &store, refs[1..]);
     var remove_plan = try Helper.plan(ca, removed, store, "missing");
     defer remove_plan.deinit();
     removed.serving = try publish(a, ca, &store, removed, replaced, &remove_plan, .{ .io = std.testing.io }, .none);
-    try Helper.verify(ca, store, try Helper.reopen(ca, &store, removed), 32);
+    try Helper.verify(ca, store, try Helper.reopen(ca, &store, removed), 256);
 }

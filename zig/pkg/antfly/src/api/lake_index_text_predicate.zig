@@ -257,11 +257,12 @@ pub const Identities = struct {
     }
     const TieContext = struct {
         spans: []const FileSpan,
-        files: []const [32]u8,
+        file_ranks: []const u32,
+        file_count: usize,
         archive_docs: u32,
         fn rank(raw: *const anyopaque, doc: u32) u64 {
             const self: *const @This() = @ptrCast(@alignCast(raw));
-            if (doc >= self.archive_docs) return (@as(u64, self.files.len) << 32) | (doc - self.archive_docs);
+            if (doc >= self.archive_docs) return (@as(u64, self.file_count) << 32) | (doc - self.archive_docs);
             var lo: usize = 0;
             var hi = self.spans.len;
             while (lo < hi) {
@@ -270,14 +271,7 @@ pub const Identities = struct {
             }
             if (lo == self.spans.len) return std.math.maxInt(u64);
             const item = self.spans[lo];
-            const id = corpus.term_directory.identity(item.file);
-            lo = 0;
-            hi = self.files.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (std.mem.order(u8, &self.files[mid], &id) == .lt) lo = mid + 1 else hi = mid;
-            }
-            return (@as(u64, lo) << 32) | (item.span.original(doc) catch return std.math.maxInt(u64));
+            return (@as(u64, self.file_ranks[lo]) << 32) | (item.span.original(doc) catch return std.math.maxInt(u64));
         }
     };
     fn initPacked(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot, offsets: []const u32) !Identities {
@@ -338,7 +332,19 @@ pub const Identities = struct {
             }
         }.less);
         const tie = try a.create(TieContext);
-        tie.* = .{ .spans = result.spans, .files = hashes, .archive_docs = offsets[segment] };
+        const ranks = try a.alloc(u32, result.spans.len);
+        for (result.spans, ranks) |item, *rank| {
+            const id = corpus.term_directory.identity(item.file);
+            var lo: usize = 0;
+            var hi = hashes.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, &hashes[mid], &id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            rank.* = @intCast(lo);
+        }
+        a.free(hashes);
+        tie.* = .{ .spans = result.spans, .file_ranks = ranks, .file_count = result.files.count(), .archive_docs = offsets[segment] };
         result.tie_rank = .{ .ptr = tie, .rank = TieContext.rank };
         return result;
     }

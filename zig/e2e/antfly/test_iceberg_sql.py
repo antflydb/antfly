@@ -721,8 +721,10 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / source_format
-    parts, rows = (65, 64) if layout == "files" else (1, 196609)
-    expected = {3 * 64, 31 * 64, 64 * 64} if layout == "files" else {0, 65536, 196608}
+    # More than three 64-span packs guarantees an unrelated serving descriptor
+    # regardless of immutable file-hash order, after two-level compaction.
+    parts, rows = (193, 64) if layout == "files" else (1, 196609)
+    expected = {3 * 64, 31 * 64, 192 * 64} if layout == "files" else {0, 65536, 196608}
     batches = [
         pa.table(
             {

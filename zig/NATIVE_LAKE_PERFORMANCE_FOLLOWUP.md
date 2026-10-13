@@ -3339,13 +3339,13 @@ not qualify live-provider retention enforcement or complete either persisted
 format migration identified above.
 
 
-## Cross-file serving packs and durable cloud publications (protocol 37)
+## Cross-file serving packs and durable cloud publications (protocol 38)
 
 This section supersedes the earlier pending migration notes. Native text root v11
 separates canonical per-source-file maintenance state from an independent packed
 serving root. Roots v9/v10, including main's v10 `compacted`/`members` layout,
 remain readable for recovery and retained requests. Builders advertise v11 and
-refresh older publications; older workers cannot admit protocol-37 publications.
+refresh older publications; older workers cannot admit protocol-38 publications.
 `loadRoot` retains its maintenance-reader contract, while query directory loading
 resolves the authenticated serving root.
 
@@ -3357,11 +3357,14 @@ cursor boundaries retain file-identity/original-rank order despite physical
 repacking, parallel scoring or accepted-WAL composition. Conservative equal-score
 block bounds cannot prune a better logical tie using a physical document number.
 
-Serving construction has eight-input fan-in, a 16 MiB input target, a 32 MiB
-output cap, a 64 MiB merge workspace and at most 64 source spans per run. Oversized
-optional merges split into smaller batches. A durable paged source-to-pack
-ownership index locates packs touched by replacement/removal; up to seven small
-open tails are explicit in the root. Unchanged closed historical packs are reused
+Serving construction has two bounded merge levels, each with eight-input fan-in,
+a 16 MiB input target, a 32 MiB output cap and a 64 MiB merge workspace. Small
+first-level runs feed the second level, producing historical runs with up to 64
+source spans. The first workspace is released before a second-level merge starts.
+Oversized optional merges split into smaller batches. A durable paged source-to-pack
+ownership index locates packs touched by replacement/removal; at most seven small
+open tails per level (14 total) are explicit in the root. Reader protocol 38 fences
+the expanded tail representation; protocol-37 generations remain recoverable. Unchanged closed historical packs are reused
 without opening their posting payloads. Small appends consolidate current tails;
 source removal drops only that source's native ranges from affected packs.
 Publication atomically binds serving runs, ownership and collection statistics.
@@ -3371,7 +3374,7 @@ units. GC retains their physical-hole metadata/statistics without retaining a
 second copy of original postings or obsolete admission/opening artifacts. Packed
 runs retain the physical manifests needed for their source spans. Retained reader
 publications mark their own older serving roots before sweeping. The deterministic
-regression packs 16 files into two runs, preserves both runs on append, checks
+regression packs 128 files into two runs, preserves both runs on append, checks
 replacement/removal and logical score/cursor ordering, deletes original posting
 payloads, and verifies restart and subsequent updates still work.
 
@@ -3379,8 +3382,11 @@ Cloud publications persist an immutable hash-radix generation map. Every payload
 record pins its exact S3 version/GCS generation, and every map edge—including the
 publication root—pins the map page's own provider generation. Incremental updates
 rewrite changed radix paths. Maps use at most 128 records/leaf and 1 MiB/page;
-readers have an 8 MiB raw-page cache and reclaim bounded lookup scratch after each
-range request. Query owners never rebind a shared store to another publication.
+readers have an 8 MiB cache of authenticated raw pages and decoded navigation.
+The bound includes parsed arena capacity and reference ownership. Cache-hit point
+lookups binary-search decoded records and copy only the selected generation;
+posting range reads do not repeatedly parse map JSON. Cold lookups reclaim bounded
+scratch after each range request. Query owners never rebind a shared store to another publication.
 Native runtime caches charge map storage to their existing memory budgets.
 
 Generation maps travel with durable builder checkpoints, accepted recent vector
@@ -3503,3 +3509,48 @@ readers, the requested generation and unpublished/undurable copies protected.
 Recompute shared physical extents after eviction before granting the byte budget.
 Never delete durable cursor authority to make room for a local cache. Recovery
 reads the same remote generation; it cannot recapture current native rows.
+
+
+### PR #1112: incremental cloud maps and compact serving navigation
+
+Exact-generation map completeness is independent of retention certificates.
+Fresh builds journal every immutable upload; durable checkpoints preserve selector
+completeness without asserting a publication certificate. Complete inherited maps rewrite only
+changed radix paths even when `qualified_retention` is false. Ordinary required
+reads and reuse existence audits stay authoritative. Incomplete legacy/bootstrap
+maps and qualified proof renewal retain a live-closure census. Its payload
+verification is charged before I/O, including providers without native SHA-256
+metadata, so the 512 MiB read bound covers streamed verification too. A bound
+failure retains an incomplete map and ordinary required-read semantics.
+
+Implicitly ordered window mergers always use original file identity/rank, including
+baseline Boolean queries and navigation-budget fallbacks. Physical packed offsets
+never decide global equal-score winners. The local tie callback precomputes a
+compact file ordinal per source span during admission; its hot comparison does a
+span lookup and original-rank translation without hashing file names or searching
+the file table. Eligible leading `_score DESC` orders use the same conservative
+global frontier as implicit score order. Equal bounds remain admissible for typed
+secondary keys; backward, ascending, exact-count and distributed-statistic shapes
+keep their complete traversal contracts.
+
+Two levels of bounded size-based compaction combine eight small first-level packs
+into up to 64 source spans per historical run. Only final runs publish directory,
+ownership and serving-statistics entries; intermediate immutable data remain
+attempt-scoped orphans for ordinary GC. Closed runs stay untouched on small
+appends, while explicit per-level tails permit subsequent consolidation. Native
+text metadata stays v11; reader protocol 38 protects the larger tail bound.
+
+
+Refinement qualification on Zig 0.17.0/macOS ARM64 with `origin/main` at
+`0bbd1807c1`: full Debug lake integration passes 424 tests (158 shared and 266
+server tests), and all 23 focused contracts pass in Debug and ReleaseFast without
+failures or leaks. The final Debug server/focused build passes 85/85 steps; the
+optimized focused build passes 50/50 steps. The focused optimized compiler owner
+peaked near 10 GB, so its declared RSS reservation now includes measured headroom
+instead of requiring a second compilation. Object-store contracts, Apache source
+boundaries, license headers, changed-source formatting/Python syntax and Git
+whitespace checks pass. All 13 selected real Parquet/Iceberg E2Es pass in 275.89
+seconds. The fragmented-file fixture has 193 files, guaranteeing an unrelated
+serving descriptor even after 64-span packing. These checks establish result
+contracts and bounded work; they do not claim archive-scale latency improvements
+or live-provider retention qualification.

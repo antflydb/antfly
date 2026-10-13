@@ -263,7 +263,7 @@ pub const Root = struct {
         if (self.compacted) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
-        if (self.open_packs.len > 7) return error.InvalidNativeLakeTextCorpus;
+        if (self.open_packs.len > 14) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;

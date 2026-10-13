@@ -1292,7 +1292,7 @@ const Execution = struct {
         }
         const frontier_mod = @import("lake_index_text_frontier.zig");
         var frontier: ?*frontier_mod = null;
-        if (ordering == null and !req.count_only and req.distributed_text_stats.len == 0) {
+        if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
@@ -1403,7 +1403,7 @@ const Execution = struct {
             request.include_stored = false;
             request.highlight = null;
             request.text_navigation_plan = if (frontier orelse preparation) |value| value.plan else null;
-            if (ordering == null and !req.count_only) request.minimum_competitive_score = competitive_cutoff;
+            if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) request.minimum_competitive_score = competitive_cutoff;
             const previous_cutoff = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
@@ -1434,16 +1434,11 @@ const Execution = struct {
             for (page.hits) |hit| {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
                 const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
-                if (frontier != null) {
-                    const position: @import("lake_index_text_directory.zig").Position = if (recent_window)
-                        .{ .file = @splat(0), .rank = hit.native_text_doc_id.?, .recent = true }
-                    else archive: {
-                        const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
-                        const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
-                        break :archive try identities.logicalPosition(hit.native_text_doc_id.?);
-                    };
-                    try winners.addPositioned(hit, position, location);
-                } else try winners.addLocated(hit, ordinal, location);
+                const identities: ?*const @import("lake_index_text_predicate.zig").Identities = if (ordering == null and !recent_window) archive: {
+                    const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
+                    break :archive @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
+                } else null;
+                try winners.addWindowHit(hit, ordinal, identities, recent_window, location);
             }
             // Raise cutoff promptly while winners improve; amortize setup when
             // weak/equal bounds keep admitting segments without improving K.
@@ -2783,6 +2778,12 @@ fn mergeWindowProfile(target: *types.SortProfile, source: types.SortProfile) voi
     }
 }
 
+fn scoreFrontierEligible(req: types.SearchRequest, ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder) bool {
+    if (req.count_only or req.distributed_text_stats.len != 0 or req.search_before.len != 0) return false;
+    const effective = if (ordering) |order| order.effective.req else return true;
+    return effective.order_by.len != 0 and std.mem.eql(u8, effective.order_by[0].field, "_score") and effective.order_by[0].desc;
+}
+
 const PagedWinners = struct {
     const Winner = struct {
         hit: types.SearchHit,
@@ -2838,6 +2839,15 @@ const PagedWinners = struct {
     }
     fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredHighlightLocation) !void {
         return self.addWinner(hit, ordinal, null, highlight);
+    }
+    fn addWindowHit(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, identities: ?*const @import("lake_index_text_predicate.zig").Identities, recent: bool, highlight: ?StoredHighlightLocation) !void {
+        if (self.heap.context != null) return self.addLocated(hit, ordinal, highlight);
+        const doc = hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus;
+        const position: @import("lake_index_text_directory.zig").Position = if (recent)
+            .{ .file = @splat(0), .rank = doc, .recent = true }
+        else
+            try (identities orelse return error.InvalidNativeLakeTextCorpus).logicalPosition(doc);
+        return self.addPositioned(hit, position, highlight);
     }
     fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
         return self.addWinner(hit, 0, position, highlight);
@@ -2933,12 +2943,13 @@ test "external lake paged native text winners share typed ordering and backward 
     }
 }
 
-test "external lake paged explicit score cutoff preserves ties and rejects ascending or backward pages" {
+test "external lake global frontier explicit score cutoff preserves ties and rejects ascending or backward pages" {
     const a = std.testing.allocator;
     for ([_]bool{ true, false }) |descending| {
         const fields = [_]types.SortField{.{ .field = "_score", .desc = descending }};
         var order = try local.storage_db_query_search_exec.SearchHitOrder.init(a, .{ .order_by = &fields }, null);
         defer order.deinit(a);
+        try std.testing.expectEqual(descending, scoreFrontierEligible(order.effective.req, &order));
         var heap = PagedWinners.initOrdered(a, 1, &order);
         defer heap.deinit();
         var values = try a.alloc(std.json.Value, order.effective.req.order_by.len);
@@ -2953,6 +2964,7 @@ test "external lake paged explicit score cutoff preserves ties and rejects ascen
         } else try std.testing.expect(heap.cutoff() == null);
         order.effective.req.search_before = values;
         try std.testing.expect(heap.cutoff() == null);
+        try std.testing.expect(!scoreFrontierEligible(order.effective.req, &order));
     }
 }
 
@@ -3017,4 +3029,35 @@ test "external lake bounded window profiles sum work and preserve actual peaks" 
     try std.testing.expectEqual(@as(usize, 4), target.collector_heap_peak);
     try std.testing.expect(!target.index_sort_match);
     try std.testing.expect(target.native_loader);
+}
+
+test "external lake global frontier fallback windows merge packed logical ties without a pruning plan" {
+    const a = std.testing.allocator;
+    const predicate = @import("lake_index_text_predicate.zig");
+    const first_hash = corpus.term_directory.identity("source-first");
+    const second_hash = corpus.term_directory.identity("source-second");
+    const logical_first = if (std.mem.order(u8, &first_hash, &second_hash) == .lt) "source-first" else "source-second";
+    const logical_last = if (std.mem.eql(u8, logical_first, "source-first")) "source-second" else "source-first";
+    var heap = PagedWinners.init(a, 2);
+    defer heap.deinit();
+    // Two bounded windows arrive in physical pack order, opposite source order.
+    // This is the production fallback merger; it owns no frontier or cutoff plan.
+    for ([_][]const u8{ logical_last, logical_first }, 0..) |file, window| {
+        const spans = [_]std.meta.Elem(@FieldType(predicate.Identities, "spans")){.{ .file = file, .span = .{ .lower = 0, .upper = 2, .rows = &.{} } }};
+        const identities: predicate.Identities = .{ .offsets = &.{ 0, 2 }, .spans = &spans };
+        for (0..2) |doc| {
+            const id = try std.fmt.allocPrint(a, "{s}-{d}", .{ file, doc });
+            defer a.free(id);
+            try heap.addWindowHit(.{ .id = id, .score = 0, .native_text_doc_id = @intCast(doc) }, window * 2 + doc, &identities, false, null);
+        }
+    }
+    const hits = try heap.finish(0);
+    defer a.free(hits);
+    defer for (hits) |*hit| hit.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    for (hits, 0..) |hit, rank| {
+        const expected = try std.fmt.allocPrint(a, "{s}-{d}", .{ logical_first, rank });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, hit.id);
+    }
 }

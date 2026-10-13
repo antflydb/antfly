@@ -180,6 +180,9 @@ pub const Collector = struct {
                 defer metadata.deinit(self.store.allocator);
                 size = metadata.byte_len;
             }
+            // Charge payload verification too: providers without authoritative
+            // SHA-256 metadata may stream the entire object.
+            try stores.chargeReadBudget(&self.remaining_reads, size);
             try self.store.verifyContentWithCancellationUsingAllocator(self.a, ref.artifact_id, size, ref.checksum, self.cancellation());
         }
         const owned = try self.a.dupe(u8, ref.artifact_id);

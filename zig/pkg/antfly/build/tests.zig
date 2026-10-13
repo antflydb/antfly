@@ -2656,7 +2656,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const text_frontier_tests = b.addTest(.{
         .root_module = text_frontier_mod,
         .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL" }),
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The combined real-file/cloud owner peaks near 10 GB under optimized
+        // codegen; declare headroom instead of compiling twice on RSS retry.
+        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
