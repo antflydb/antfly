@@ -91,3 +91,8 @@ test {
 test "external lake SQL schema cache discovery" {
     _ = @import("api/sql_schema_cache.zig");
 }
+
+// Filtered roots must reach the mounted transport tests through a named anchor.
+test "api HTTP runtime discovery" {
+    _ = httpx_handler;
+}
