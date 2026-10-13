@@ -3460,8 +3460,9 @@ Merged main base: `db86342bd8` (PR #1118). Zig 0.17.0, macOS arm64.
 - The standalone object-store suite passes 91 tests; its two real-provider
   integration tests remain intentionally disabled. GCS wire pagination and
   cancellation, exact selectors and retention proof parsing are covered.
-- The complete standalone server builds. Selected real Parquet/Iceberg flows
-  cover source append/replacement/removal/reintroduction, rare-query admission,
+- The complete standalone server builds. All 13 selected real Parquet/Iceberg
+  E2Es pass against the final server (284.71 seconds), covering source
+  append/replacement/removal/reintroduction, rare-query admission,
   metadata conjunctions and sorted cursors, accepted text/dense/sparse/hybrid
   cuts, cold restart, hidden highlights and 31-candidate score transforms.
 - Authored embedded and Apache source boundaries, changed Python syntax,
