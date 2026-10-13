@@ -313,6 +313,23 @@ pub const View = struct {
     /// compact slots, offsets and padding. JSONB and NUMERIC bytes must have
     /// crossed their canonical validation gates before hashing.
     pub fn updateLogicalHash(self: View, hasher: *std.crypto.hash.Blake3) void {
+        // JSONB display bytes are not a logical hash. Their admitted codec
+        // supplies numeric normalization through the explicit provider below.
+        std.debug.assert(self.kind != .jsonb);
+        self.updateLogicalHashInner(hasher, {}) catch unreachable;
+    }
+
+    /// The low-level frame owns no JSON parser or allocator. The provider
+    /// hashes a JSONB element's logical length and normalized bytes. Publish
+    /// the complete continuation only after every element succeeds.
+    pub fn updateLogicalHashWithJson(self: View, hasher: *std.crypto.hash.Blake3, json: anytype) !void {
+        if (self.kind != .jsonb) return self.updateLogicalHash(hasher);
+        var staged = hasher.*;
+        try self.updateLogicalHashInner(&staged, json);
+        hasher.* = staged;
+    }
+
+    fn updateLogicalHashInner(self: View, hasher: *std.crypto.hash.Blake3, json: anytype) anyerror!void {
         hasher.update("sql-array-logical-v1");
         hasher.update(&.{ @backingInt(self.kind), self.rank });
         var number: [8]u8 = undefined;
@@ -326,6 +343,10 @@ pub const View = struct {
             const raw = self.cellUnchecked(i);
             hasher.update(&.{@intFromBool(raw.sql_null)});
             if (raw.sql_null) continue;
+            if (self.kind == .jsonb) {
+                if (comptime @TypeOf(json) == void) unreachable else try json.hashJsonb(hasher, raw.bytes);
+                continue;
+            }
             std.mem.writeInt(u64, &number, raw.bytes.len, .little);
             hasher.update(&number);
             // NUMERIC display scale and floating zero signs survive physical

@@ -276,6 +276,8 @@ test "relational index system SQL public arrays bind precise storage and coerce 
         try std.testing.expect(!column.is_json);
         try std.testing.expectEqual(storage_schema.RelationalJsonKind.none, column.json_kind);
     }
+    try std.testing.expect(runtime.requires_jsonb_array_display);
+    try std.testing.expect(!runtime.requires_json_expressions);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"a":{"dimensions":[{"length":2,"lower_bound":-3}],"values":["9007199254740993",null],"sql_nulls":[false,true]},"f":{"dimensions":[{"length":3,"lower_bound":1}],"values":[0.1,"NaN","Infinity"],"sql_nulls":[false,false,false]},"j":{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]}}
     , .{ .parse_numbers = false });
@@ -785,6 +787,49 @@ fn requiresJsonbDisplay(schema: ParsedTableSchema) bool {
     if (schema.storage_mode != .relational) return false;
     for (schema.document_schemas) |document| for (document.properties) |property| {
         if (documentPropertyUsesJsonEncoding(property)) return true;
+    };
+    return false;
+}
+
+fn jsonbArrayJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("sql_type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "jsonb")) {
+        if (expression.object.get("type")) |ty| if (ty == .string and std.mem.eql(u8, ty.string, "sql_array")) return true;
+        if (expression.object.get("op")) |op| if (op == .string and std.mem.eql(u8, op.string, "array")) return true;
+    };
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (jsonbArrayJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn jsonbArrayWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.sql_type == .jsonb and (expression.type == .sql_array or expression.op == .array)) return true;
+    if (expression.args) |args| for (args) |arg| if (jsonbArrayWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresJsonbArrayDisplay(schema: ParsedTableSchema) bool {
+    if (schema.storage_mode != .relational) return false;
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (property.field_type) |kind| {
+            if (std.mem.eql(u8, kind, "sql_array") and property.sql_type == .jsonb) return true;
+        }
+    };
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (jsonbArrayWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (jsonbArrayWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (jsonbArrayWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (jsonbArrayJson(expression, 0)) return true;
+        };
     };
     return false;
 }
@@ -1405,6 +1450,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_text_expressions = requiresTextExpressions(schema),
         .requires_numeric_functions = requiresNumericFunctions(schema),
         .requires_jsonb_display = requiresJsonbDisplay(schema),
+        .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1438,6 +1484,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_text_expressions = requiresTextExpressions(schema),
         .requires_numeric_functions = requiresNumericFunctions(schema),
         .requires_jsonb_display = requiresJsonbDisplay(schema),
+        .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

@@ -2145,7 +2145,7 @@ test "relational index system SQL array restore checks canonical JSONB beyond va
     std.mem.writeInt(u32, frame[8..12], 1, .little);
     std.mem.writeInt(i32, frame[12..16], 1, .little);
     std.mem.writeInt(u32, frame[21..25], 3, .little);
-    @memcpy(frame[25..], "1.0");
+    @memcpy(frame[25..], "1e0");
     const cell: Cell = .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .jsonb, .value = .{ .bytes_val = &frame } };
     try std.testing.expectError(error.NonCanonicalSqlArrayStorage, serializeOrdinal(alloc, 1, &.{column}, &.{cell}, @splat(0)));
     const checksummed = try serializePreparedOrdinalWithLayout(alloc, 1, &.{column}, &.{cell}, @splat(0), &layout);

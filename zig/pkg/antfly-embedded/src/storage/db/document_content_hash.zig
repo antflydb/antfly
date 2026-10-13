@@ -279,7 +279,7 @@ fn hashRelationalCellCanonical(
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
             const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
-            view.updateLogicalHash(hasher);
+            try @import("../../sql/array_storage.zig").updateLogicalHash(alloc, view, hasher);
         },
         .string, .blob, .geoshape => {
             hasher.update("s");
@@ -323,12 +323,22 @@ fn hashCanonicalJsonBytes(hasher: *std.crypto.hash.Blake3, encoded: []const u8) 
 /// Stream only numeric normalization into the existing length-framed semantic
 /// hash. No DOM, key sorting, or payload-sized canonical buffer is constructed.
 pub fn hashCanonicalJsonStorageBytes(alloc: std.mem.Allocator, hasher: *std.crypto.hash.Blake3, encoded: []const u8) !void {
+    return hashCanonicalJsonStorageFrame(alloc, hasher, encoded, true);
+}
+
+/// JSONB array elements already have a domain/null frame. Preserve the older
+/// logical array hash by framing the normalized length, not display-byte size.
+pub fn hashCanonicalJsonStorageElement(alloc: std.mem.Allocator, hasher: *std.crypto.hash.Blake3, encoded: []const u8) !void {
+    return hashCanonicalJsonStorageFrame(alloc, hasher, encoded, false);
+}
+
+fn hashCanonicalJsonStorageFrame(alloc: std.mem.Allocator, hasher: *std.crypto.hash.Blake3, encoded: []const u8, tag: bool) !void {
     var count: std.Io.Writer.Discarding = .init(&.{});
     try writeCanonicalJsonStorageSemantic(alloc, &count.writer, encoded);
     // Publish the continuation only after both passes succeed. Faulted or
     // canceled preparation must not leave a caller's shared hash half-framed.
     var staged = hasher.*;
-    staged.update("j");
+    if (tag) staged.update("j");
     hashInt(&staged, u64, count.count);
     var buffer: [1024]u8 = undefined;
     var sink: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .initHasher(staged, &buffer);
@@ -389,28 +399,190 @@ pub fn canonicalJsonStorageValueAlloc(alloc: std.mem.Allocator, value: std.json.
 }
 
 fn canonicalJsonEncodedValueAlloc(alloc: std.mem.Allocator, value: std.json.Value, preserve_display: bool) ![]u8 {
+    return canonicalJsonEncodedValueWithBudgetAlloc(alloc, value, preserve_display, null, 16 * 1024 * 1024);
+}
+
+/// The caller has admitted the JSON text domain. Preserve native SQL errors,
+/// lend the existing work/cancellation identity to formatting, and bound the
+/// physical output independently of the caller's retained-memory allocator.
+pub fn canonicalJsonbValueAlloc(alloc: std.mem.Allocator, value: std.json.Value, work: *@import("../../sql/json_order.zig").Budget, max_bytes: usize) ![]u8 {
+    const bytes = try canonicalJsonEncodedValueWithBudgetAlloc(alloc, value, true, work, max_bytes);
+    if (bytes.len > max_bytes) {
+        alloc.free(bytes);
+        return if (work.shared) |context| context.limit() else error.SqlProgramLimitExceeded;
+    }
+    return bytes;
+}
+
+/// Strict physical admission without allocating a second JSON payload. The
+/// caller owns the parsed value; only object-key ordering needs scratch.
+pub fn canonicalJsonbValueMatches(alloc: std.mem.Allocator, value: std.json.Value, encoded: []const u8, work: *@import("../../sql/json_order.zig").Budget) !bool {
+    const Compare = struct {
+        expected: []const u8,
+        position: usize = 0,
+        work: *@import("../../sql/json_order.zig").Budget,
+        failure: ?anyerror = null,
+        writer: std.Io.Writer,
+
+        fn consume(self: *@This(), bytes: []const u8, repeated: ?u8, count: usize) std.Io.Writer.Error!void {
+            if (count > self.expected.len - self.position) return error.WriteFailed;
+            var offset: usize = 0;
+            while (offset < count) {
+                const end = offset + @min(count - offset, 256);
+                self.work.consume(end - offset) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+                const target = self.expected[self.position + offset .. self.position + end];
+                const same = if (repeated) |byte| std.mem.allEqual(u8, target, byte) else std.mem.eql(u8, target, bytes[offset..end]);
+                if (!same) return error.WriteFailed;
+                offset = end;
+            }
+            self.position += count;
+        }
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            const buffered = writer.buffered();
+            try self.consume(buffered, null, buffered.len);
+            writer.end = 0;
+            var written: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try self.consume(bytes, null, bytes.len);
+                written += bytes.len;
+            }
+            const last = data[data.len - 1];
+            if (last.len == 1) {
+                try self.consume(&.{}, last[0], splat);
+            } else for (0..splat) |_| try self.consume(last, null, last.len);
+            return written + last.len * splat;
+        }
+    };
+    var buffer: [1024]u8 = undefined;
+    var compare: Compare = .{ .expected = encoded, .work = work, .writer = .{ .buffer = &buffer, .vtable = &.{ .drain = Compare.drain } } };
+    // The comparator rejects excess bytes immediately. Do not use the source
+    // length as a numeric formatter limit: a short noncanonical exponent must
+    // be a representation mismatch, not manufactured quota exhaustion.
+    writeCanonicalJsonValue(alloc, &compare.writer, value, true, work, 16 * 1024 * 1024) catch |err| {
+        if (err == error.WriteFailed) return if (compare.failure) |failure| failure else false;
+        return err;
+    };
+    compare.writer.flush() catch return if (compare.failure) |failure| failure else false;
+    return compare.position == encoded.len;
+}
+
+test "SQL JSONB strict canonical matching streams large payloads without a second allocation" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const encoded = try a.alloc(u8, payload.len + 2);
+    defer a.free(encoded);
+    encoded[0] = '"';
+    @memcpy(encoded[1 .. encoded.len - 1], payload);
+    encoded[encoded.len - 1] = '"';
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    try std.testing.expect(try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .string = payload }, encoded, &work));
+    work = .{};
+    try std.testing.expect(!try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .string = payload }, encoded[0 .. encoded.len - 1], &work));
+    work = .{};
+    try std.testing.expect(!try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .number_string = "1e5" }, "1e5", &work));
+    work = .{};
+    try std.testing.expect(try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .number_string = "0.00" }, "0.00", &work));
+    var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
+    work = .{ .shared = &context };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .string = payload }, encoded, &work));
+    try std.testing.expect(context.failure.? == error.SqlProgramLimitExceeded);
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) anyerror!void {
+            return error.SqlExecutionCancelled;
+        }
+    };
+    context = .{ .alloc = std.mem.Allocator.failing, .checkpoint = Cancel.poll };
+    work = .{ .shared = &context };
+    try std.testing.expectError(error.SqlExecutionCancelled, canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .string = payload }, encoded, &work));
+    try std.testing.expect(context.failure.? == error.SqlExecutionCancelled);
+    // The output bound is checked before a payload-sized writer allocation,
+    // even when the backing allocator cannot allocate anything.
+    context = .{ .alloc = std.mem.Allocator.failing };
+    work = .{ .shared = &context };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, canonicalJsonbValueAlloc(std.mem.Allocator.failing, .{ .string = payload }, &work, 4));
+    try std.testing.expect(context.failure.? == error.SqlProgramLimitExceeded);
+    const canonical = "{\"b\":[1.20,0.00],\"long\":true}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, canonical, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const Faults = struct {
+        fn run(alloc: std.mem.Allocator, value: std.json.Value, bytes: []const u8) !void {
+            var budget: @import("../../sql/json_order.zig").Budget = .{};
+            try std.testing.expect(try canonicalJsonbValueMatches(alloc, value, bytes, &budget));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Faults.run, .{ parsed.value, canonical });
+}
+
+fn canonicalJsonEncodedValueWithBudgetAlloc(alloc: std.mem.Allocator, value: std.json.Value, preserve_display: bool, work: ?*@import("../../sql/json_order.zig").Budget, max_bytes: usize) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
+    const Bounded = struct {
+        target: *std.Io.Writer,
+        remaining: usize,
+        limit_hit: bool = false,
+        writer: std.Io.Writer,
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            const buffered = w.buffered();
+            var count: usize = 0;
+            for (data, 0..) |bytes, i| {
+                const n = if (i + 1 == data.len) splat else 1;
+                count = std.math.add(usize, count, std.math.mul(usize, bytes.len, n) catch return error.WriteFailed) catch return error.WriteFailed;
+            }
+            const total = std.math.add(usize, buffered.len, count) catch return error.WriteFailed;
+            if (total > self.remaining) {
+                self.limit_hit = true;
+                return error.WriteFailed;
+            }
+            try self.target.writeAll(buffered);
+            w.end = 0;
+            for (data, 0..) |bytes, i| {
+                const n = if (i + 1 == data.len) splat else 1;
+                try self.target.splatBytesAll(bytes, n);
+            }
+            self.remaining -= total;
+            return count;
+        }
+    };
+    var buffer: [1024]u8 = undefined;
+    var bounded: Bounded = .{ .target = &writer.writer, .remaining = max_bytes, .writer = .{ .buffer = &buffer, .vtable = &.{ .drain = Bounded.drain } } };
+    const output = if (work != null) &bounded.writer else &writer.writer;
     // This writer only targets an allocating memory buffer, never external IO.
     // Preserve allocation-failure semantics for callers' quota/fault handling.
-    writeCanonicalJsonValue(alloc, &writer.writer, value, preserve_display) catch |err| return switch (err) {
-        error.WriteFailed => error.OutOfMemory,
+    writeCanonicalJsonValue(alloc, output, value, preserve_display, work, max_bytes) catch |err| return switch (err) {
+        error.WriteFailed => if (bounded.limit_hit) (if (work.?.shared) |context| context.limit() else error.SqlProgramLimitExceeded) else error.OutOfMemory,
         else => err,
     };
+    output.flush() catch return if (bounded.limit_hit) (if (work.?.shared) |context| context.limit() else error.SqlProgramLimitExceeded) else error.OutOfMemory;
     return try writer.toOwnedSlice();
 }
 
-fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value, preserve_display: bool) !void {
+fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value, preserve_display: bool, work: ?*@import("../../sql/json_order.zig").Budget, max_bytes: usize) !void {
+    if (work) |budget| try budget.consume(1);
     switch (value) {
         .array => |array| {
             try writer.writeByte('[');
             for (array.items, 0..) |item, index| {
                 if (index != 0) try writer.writeByte(',');
-                try writeCanonicalJsonValue(alloc, writer, item, preserve_display);
+                try writeCanonicalJsonValue(alloc, writer, item, preserve_display, work, max_bytes);
             }
             try writer.writeByte(']');
         },
         .object => |object| {
+            if (work) |budget| {
+                var maximum: usize = 0;
+                for (object.keys()) |key| maximum = @max(maximum, key.len);
+                const levels = if (object.count() == 0) 0 else std.math.log2_int_ceil(usize, object.count()) + 1;
+                const sorting = std.math.mul(usize, object.count(), levels *| (maximum +| 1)) catch return error.SqlProgramLimitExceeded;
+                try budget.consume(sorting);
+            }
             const keys = try alloc.alloc([]const u8, object.count());
             defer alloc.free(keys);
             var index: usize = 0;
@@ -419,14 +591,15 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             std.mem.sort([]const u8, keys, {}, lessThanString);
             try writer.writeByte('{');
             for (keys, 0..) |key, key_index| {
+                if (work) |budget| try budget.consume(key.len);
                 if (key_index != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(key, .{}, writer);
                 try writer.writeByte(':');
-                try writeCanonicalJsonValue(alloc, writer, object.get(key).?, preserve_display);
+                try writeCanonicalJsonValue(alloc, writer, object.get(key).?, preserve_display, work, max_bytes);
             }
             try writer.writeByte('}');
         },
-        .number_string => |number| try writeCanonicalJsonEncodedNumber(alloc, writer, number, preserve_display),
+        .number_string => |number| try writeCanonicalJsonEncodedNumber(alloc, writer, number, preserve_display, work, max_bytes),
         .float => |number| {
             // The same logical JSONB value can arrive as a native float or
             // an exact parsed number token. Normalize both with the identical
@@ -436,16 +609,20 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             const coefficient = try parts.coefficientText(&coefficient_buffer);
             var buffer: [800]u8 = undefined;
             const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() }) catch unreachable;
-            try writeCanonicalJsonEncodedNumber(alloc, writer, raw, preserve_display);
+            try writeCanonicalJsonEncodedNumber(alloc, writer, raw, preserve_display, work, max_bytes);
+        },
+        .string => |text| {
+            if (work) |budget| try budget.consume(text.len);
+            try std.json.Stringify.value(value, .{}, writer);
         },
         else => try std.json.Stringify.value(value, .{}, writer),
     }
 }
 
-fn writeCanonicalJsonEncodedNumber(alloc: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8, preserve_display: bool) !void {
+fn writeCanonicalJsonEncodedNumber(alloc: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8, preserve_display: bool, shared_work: ?*@import("../../sql/json_order.zig").Budget, max_bytes: usize) !void {
     if (!preserve_display) return writeCanonicalJsonNumber(alloc, writer, raw);
     var work: @import("../../sql/json_order.zig").Budget = .{};
-    try @import("../../sql/jsonb_text.zig").number(raw, writer, 16 * 1024 * 1024, &work);
+    try @import("../../sql/jsonb_text.zig").number(raw, writer, max_bytes, shared_work orelse &work);
 }
 
 /// Emit one exact JSON number in a unique scientific representation without
@@ -708,7 +885,7 @@ fn hashRelationalColumnValue(
             const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
             defer alloc.free(bytes);
             const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
-            view.updateLogicalHash(hasher);
+            try @import("../../sql/array_storage.zig").updateLogicalHash(alloc, view, hasher);
         },
         .numeric => {
             const numeric = @import("../../sql/numeric_value.zig");

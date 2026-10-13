@@ -4624,3 +4624,63 @@ headers and original inventory integrity passed. Original accounting remains
 479 implemented / 136 rejected / 73 superseded / 898 unresolved. PR #1061 was
 verified open and draft; this checkpoint is not public JSON activation or full
 SQL parity completion.
+
+### JSONB array physical display and logical identity (2026-10-13)
+
+JSONB array elements now preserve PostgreSQL decimal display scale in the flat
+physical array codec. Logical hashing instead frames normalized element lengths
+and bytes, preserving the existing array hash domain and distinguishing JSON
+null from SQL NULL. The low-level array frame accepts an explicit JSON logical
+hash provider; primitive array hashes retain their allocation-free path.
+Continuation publication is failure-atomic across every element.
+
+ASCH capability 31 and the transactional catalog fence the new array policy,
+including native-only JSONB array columns. Public runtime/CHECK layouts derive
+a separate JSONB-array capability from columns and nested declaration programs.
+This does not enable capability 30's still-guarded public JSON literal grammar.
+Old-format JSONB array layouts are rejected before allocation; no alternate
+legacy array decoder was added. Text-index projection identity excludes the
+irrelevant capability, with strict Boolean and truncation validation retained.
+
+Strict array restore compares canonical display output directly with the
+original bytes, without allocating a second complete JSON payload. A 1 MiB
+string verifies under an allocator that cannot allocate; object ordering still
+requires bounded key scratch. Formatting shares the enclosing work/cancellation
+identity, charges key-ordering work, and checks output limits before allocating
+the output payload. Genuine OOM, sticky quota exhaustion and cancellation remain
+distinct. Native JSON-literal fingerprint preparation uses the same bounded
+formatter. Forged AROW checksums do not authorize noncanonical exponent bytes.
+
+Independent PostgreSQL 18.6 evidence verifies five complete JSONB array binary,
+text and element-display references, including decimal scale, exponent expansion,
+zero scale/sign, object display order, multidimensional and negative-bound arrays,
+and JSON-null versus SQL-NULL elements. Native persistence decodes these binary
+references, checks dimensions/provenance and exact element displays after storage,
+and verifies canonical re-encoding. These are persistence contracts: the captured
+whole-array PostgreSQL text is not claimed as native wire-output qualification.
+The native LSM test also proves a scale-only update from 1.2 to 1.20 survives
+reopen and portable restore despite equal semantic hashes.
+
+Focused Debug codec/streaming qualification passed 25 tests, and the additional
+logical-frame regression passed independently after correcting its expected
+existing canonical representation. The first full native run exposed the old
+restore fixture treating 1.0 as noncanonical; it now forges 1e0 and retains both
+serialization and recomputed-checksum rejection assertions. The exhaustive
+rewrite-cache allocation sweep now disables address-dependent backing resizes,
+without dropping fault indices or weakening ownership assertions.
+Final native/API Debug qualification passed 249 native and 113 transaction tests,
+zero failures/leaks, with 60/60 build steps. Final full SQL Debug qualification
+passed 1,027 tests with three existing skips, zero failures/leaks and 21/21 steps.
+Its initial compatibility-test expectation incorrectly used an exponent where
+the existing semantic normalizer emits plain 1.2; the corrected reference passed
+both its isolated regression and the fresh full run. PostgreSQL reference tests, formatting,
+control-catalog freshness, the 2,046-file Apache boundary/license headers and
+original inventory integrity passed. Cache GC was previewed only; nothing was
+deleted while other worktrees were building.
+
+Original accounting remains 479 implemented / 136 rejected / 73 superseded /
+898 unresolved. PR #1061 remains open and draft. No original case receives credit
+from this shared codec work. Remaining work includes PostgreSQL-compatible array
+text output and shared wire admission, public JSON-program grammar/lowering and
+schema-definition identity, typed projected tuple/vector consumption, and the
+remaining exact original-case activation and distributed fault proofs.

@@ -153,6 +153,12 @@ pub const Catalog = struct {
             if (self.schema_format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 29 and schema.requires_jsonb_display) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 30 and schema.requires_json_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 31) {
+                if (schema.requires_jsonb_array_display) return error.UnsupportedTableCapabilityVersion;
+                for (schema.relational_columns) |column| {
+                    if (column.column_type == .sql_array and column.sql_element_type == .jsonb) return error.UnsupportedTableCapabilityVersion;
+                }
+            }
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };

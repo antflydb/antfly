@@ -2351,9 +2351,9 @@ fn prepareJsonLiteral(execution: *Execution, value: std.json.Value) !JsonLiteral
         var scratch: ExecutionScratch = undefined;
         scratch.init(execution);
         defer scratch.deinit();
-        const encoded = @import("../storage/db/document_content_hash.zig").canonicalJsonStorageValueAlloc(execution.alloc, value) catch |err| {
+        const encoded = @import("../storage/db/document_content_hash.zig").canonicalJsonbValueAlloc(execution.alloc, value, &work, max_output_bytes) catch |err| {
             if (err == error.RelationalRowResultTooLarge) return execution.limit();
-            if (err == error.InvalidBatchRequest) return error.InvalidRelationalExpressionType;
+            if (err == error.InvalidBatchRequest or err == error.SqlNumericOutOfRange) return error.InvalidRelationalExpressionType;
             return scratch.failure(err);
         };
         if (encoded.len > max_output_bytes) return execution.limit();

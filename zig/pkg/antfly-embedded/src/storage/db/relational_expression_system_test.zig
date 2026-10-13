@@ -360,6 +360,55 @@ test "relational index system JSONB semantic hashing scratch is independent of p
     try std.testing.expectEqualSlices(u8, &lhs, &rhs);
 }
 
+test "relational index system JSONB array scale update survives LSM reopen and portable restore" {
+    const a = std.testing.allocator;
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("jsonb-array-scale-reopen");
+    defer directory.cleanup();
+    var target = try TestDirectory.init("jsonb-array-scale-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(a,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"}},"additionalProperties":false}}}}
+        );
+        try std.testing.expect(db.core.schema.?.requires_jsonb_array_display);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        // Equal logical values with different display scale must still replace
+        // their physical postimage; the content hash is not a write dedup key.
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"j":{"dimensions":[{"length":3,"lower_bound":-2}],"values":[1.2,null,null],"sql_nulls":[false,false,true]}}
+        }} });
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"j":{"dimensions":[{"length":3,"lower_bound":-2}],"values":[1.20,null,null],"sql_nulls":[false,false,true]}}
+        }} });
+        try @import("../portable_backup.zig").exportPortable(a, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(a, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_jsonb_array_display);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        const bytes = (try db.get(a, "row")).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var array = try @import("../../sql/array_wire.zig").decode(a, .jsonb, parsed.value.object.get("j").?, .{});
+        defer array.deinit();
+        try std.testing.expectEqual(@as(i32, -2), array.value.dimensions[0].lower);
+        try std.testing.expectEqualStrings("1.20", array.value.elements[0].value.number_string);
+        try std.testing.expect(array.value.elements[1].value == .null and !array.value.elements[1].sql_null);
+        try std.testing.expect(array.value.elements[2].sql_null);
+    }
+}
+
 test "relational index system JSONB scale survives LSM reopen and strict portable restore" {
     const a = std.testing.allocator;
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
