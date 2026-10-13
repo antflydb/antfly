@@ -330,8 +330,8 @@ def main():
     )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
-    if not 2 <= args.composed_current_rows <= 10000:
-        parser.error("composed current rows must be between 2 and 10000")
+    if not 2 <= args.composed_current_rows <= 4096:
+        parser.error("composed current rows must be between 2 and 4096")
     if args.benchmark_composed and not args.qualify_composed_sources:
         parser.error("composed benchmarks require --qualify-composed-sources")
     if args.docker and not args.filesystem_source:
@@ -1082,35 +1082,18 @@ def main():
                 "points",
                 "created_at",
             ]
-            if args.filesystem_source:
-                import pyarrow.dataset as dataset
-
-                paths = sorted((args.filesystem_source / "archive").glob("*.parquet"))
-                if not paths:
-                    raise ValueError(
-                        "Local composed fixture needs original archive/*.parquet payloads"
-                    )
-                recent_rows = (
-                    dataset.dataset([str(path) for path in paths], format="parquet")
-                    .to_table(columns=columns)
-                    .sort_by([("created_at", "descending"), ("hn_id", "ascending")])
-                    .slice(0, args.composed_current_rows)
-                    .to_pylist()
-                )
-                recent = {
-                    "rows": [[row[name] for name in columns] for row in recent_rows]
-                }
-            else:
-                recent = call(
-                    "POST",
-                    "/sql",
-                    {
-                        "statement": "SELECT "
-                        + ", ".join(columns)
-                        + " FROM hn_archive_poc ORDER BY created_at DESC LIMIT "
-                        + str(args.composed_current_rows)
-                    },
-                )
+            recent = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(columns)
+                    + " FROM hn_archive_poc WHERE created_at IS NOT NULL ORDER BY created_at DESC LIMIT "
+                    + str(args.composed_current_rows),
+                    # HTTP SQL's row budget is separate from the statement LIMIT.
+                    "limit": args.composed_current_rows,
+                },
+            )
             assert len(recent["rows"]) == args.composed_current_rows
             documents = []
             for row in recent["rows"]:

@@ -82,9 +82,29 @@ pub const SegmentRouting = struct {
     fields: []const Field,
     descriptor: ?artifacts.ChunkRef = null,
 };
+pub const Member = struct {
+    file: state.File,
+    physical: artifacts.ChunkRef,
+    source_lower: u32,
+    lower: u32,
+    count: u32,
+};
+pub fn validateMembers(members: []const Member, domain: [32]u8, lower: u32, count: u32) !void {
+    var next = lower;
+    for (members) |member| {
+        if (member.lower != next or member.count == 0) return error.InvalidNativeLakeTextCorpus;
+        try state.validate(&.{member.file}, domain);
+        try text_directory.validateRef(member.physical, domain);
+        _ = try std.math.add(u32, member.source_lower, member.count);
+        next = try std.math.add(u32, next, member.count);
+    }
+    if (next != try std.math.add(u32, lower, count)) return error.InvalidNativeLakeTextCorpus;
+}
 pub const FileGroup = struct {
     file: state.File,
     sources: []const source_spans.Span = &.{},
+    /// Historical v10 compaction coordinates, normalized before serving.
+    members: []const Member = &.{},
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
     summaries: []const ?statistics.Ref = &.{},
@@ -184,6 +204,7 @@ pub const Root = struct {
     version: u16 = metadata_version,
     /// Independent serving packs; this root retains per-file maintenance statistics.
     serving: ?artifacts.ChunkRef = null,
+    compacted: ?artifacts.ChunkRef = null,
     serving_bytes: u64 = 0,
     pack_ownership: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
@@ -239,6 +260,8 @@ pub const Root = struct {
     fn validateAlloc(self: Root, a: A) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
         if (self.serving) |ref| try text_directory.validateRef(ref, self.domain);
+        if (self.compacted) |ref| try text_directory.validateRef(ref, self.domain);
+        if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
         if (self.open_packs.len > 7) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
@@ -320,9 +343,9 @@ pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: 
     return .{ .root = try servingRoot(a, store, try loadRootDirectory(a, store, ref, cancellation, cache), cancellation, cache) };
 }
 pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    const ref = outer.serving orelse return outer;
-    const root = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache);
-    if (root.serving != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents) return error.InvalidNativeLakeTextCorpus;
+    const ref = outer.serving orelse outer.compacted orelse return outer;
+    const root = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = if (outer.serving != null) metadata_version else 10, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache);
+    if (root.serving != null or root.compacted != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents or root.collection.?.fields.len != outer.collection.?.fields.len or root.stored_projection != outer.stored_projection or !std.mem.eql(u8, root.config_json, outer.config_json)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
 /// One independently admitted immutable file manifest. Share validation with
@@ -333,8 +356,13 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
     if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
     defer a.free(bytes);
-    const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    var group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
     if (group.selected.len != 0) return error.InvalidNativeLakeTextCorpus;
+    if (group.members.len != 0) {
+        if (group.sources.len != 0 or group.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
+        group.sources = try source_spans.fromMembers(a, group.members, domain);
+        group.members = &.{};
+    }
     try group.validate(domain);
     return group;
 }
@@ -665,7 +693,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
@@ -963,7 +991,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
 // bound memory and avoid downloading the archive; normal serving continues to
 // authenticate posting ranges. Metadata trees are read and authenticated in
 // bounded pages, including descendants not touched by incremental updates.
-fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) anyerror!void {
     var retained_backend = backend;
     const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;
     try context.ensureActive();
@@ -1201,7 +1229,7 @@ fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts
     for (slots) |slot| if (slot) |ref| try refs.append(a, ref);
     return refs.toOwnedSlice(a);
 }
-fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
+pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
     const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
     defer a.free(bytes);
     if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;

@@ -33,13 +33,24 @@ pub const Navigation = struct {
 };
 pub const Stats = struct {
     navigation: Navigation = .{},
+    best_first_calls: u64 = 0,
+    best_first_segments: u64 = 0,
+    best_first_pruned_nodes: u64 = 0,
     calls: [count]u64 = @splat(0),
     nanoseconds: [count]u64 = @splat(0),
 };
 pub const Metrics = struct {
     navigation: [@typeInfo(Navigation).@"struct".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
+    best_first_calls: std.atomic.Value(u64) = .init(0),
+    best_first_segments: std.atomic.Value(u64) = .init(0),
+    best_first_pruned_nodes: std.atomic.Value(u64) = .init(0),
     calls: [count]std.atomic.Value(u64) = @splat(.init(0)),
     nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
+    pub fn recordBestFirst(self: *Metrics, segments: u64, pruned: u64) void {
+        _ = self.best_first_calls.fetchAdd(1, .monotonic);
+        _ = self.best_first_segments.fetchAdd(segments, .monotonic);
+        _ = self.best_first_pruned_nodes.fetchAdd(pruned, .monotonic);
+    }
     pub fn recordNavigation(self: *Metrics, value: Navigation) void {
         inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, i| _ = self.navigation[i].fetchAdd(@field(value, field), .monotonic);
     }

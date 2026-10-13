@@ -325,8 +325,8 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
-                    if (root.serving) |serving| {
-                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+                    if (root.serving orelse root.compacted) |serving| {
+                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = if (root.serving != null) @import("lake_index_native_text.zig").metadata_version else 10, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
                         if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
                     }
                     try self.markPages(a, root.domain, root.serving_inventory, false);

@@ -42,6 +42,7 @@ pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
     sources: []const corpus.source_spans.Span = &.{},
+    members: []const corpus.Member = &.{},
     file: state.File,
     manifest: Chunk,
     physical: ?Chunk = null,
@@ -50,6 +51,19 @@ pub const SegmentRecord = struct {
     route: corpus.SegmentRouting,
     rows: []const corpus.physical.Block,
 };
+fn parseSegment(a: A, bytes: []const u8, options: std.json.ParseOptions) !SegmentRecord {
+    var record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, options);
+    if (record.members.len != 0) {
+        if (record.sources.len != 0) return error.InvalidNativeLakeTextCorpus;
+        const scope = (try stores.uploadScopeFromArtifactId(record.manifest.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+        record.sources = try corpus.source_spans.fromMembers(a, record.members, scope.domain);
+        // v10 retained a physical wrapper for merged members. Actual physical
+        // lookups resolve the member manifests, independently of that wrapper.
+        record.physical = null;
+        record.members = &.{};
+    }
+    return record;
+}
 pub fn validateRef(ref: Chunk, domain: Id) !void {
     if (ref.byte_len == 0 or ref.byte_len > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
@@ -408,7 +422,7 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
 pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
     const bytes = try get(a, storage, root.directories.segments, id);
     defer a.free(bytes);
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, root.domain);
     return record.route.bytes;
@@ -521,7 +535,7 @@ pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactS
         try read.check();
         const bytes = try get(scratch, read.pages.store(), root.directories.segments, id);
         defer scratch.free(bytes);
-        record.* = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+        record.* = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
         if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
         try validateSegment(record.*, root.domain);
     }
@@ -558,7 +572,7 @@ fn loadRouting(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
 }
 fn appendRouting(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, expected: [36]u8, bytes: []const u8) !void {
     if (records.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     const file_id = corpus.term_directory.identity(record.file.id);
     if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, domain);
@@ -631,13 +645,13 @@ pub fn walkSegments(a: A, root: corpus.Root, store: stores.ArtifactStore, token:
 fn visitSegment(a: A, domain: Id, id: Id, bytes: []const u8, visitor: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, arena.allocator(), bytes, .{});
+    const record = try parseSegment(arena.allocator(), bytes, .{});
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateSegment(record, domain);
     try visitor.record(record);
 }
 fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: Id, bytes: []const u8) !void {
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateSegment(record, domain);
     try records.append(a, record);
@@ -987,7 +1001,7 @@ pub const RoutingCursor = struct {
     }
     fn emit(self: *RoutingCursor, key_: [36]u8) !Id {
         _ = self.scratch.reset(.retain_capacity);
-        const record = try std.json.parseFromSliceLeaky(SegmentRecord, self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
+        const record = try parseSegment(self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
         const file = corpus.term_directory.identity(record.file.id);
         if (!std.mem.eql(u8, key_[0..32], &file) or std.mem.readInt(u32, key_[32..36], .big) != record.ordinal) return error.InvalidNativeLakeTextCorpus;
         if (record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;

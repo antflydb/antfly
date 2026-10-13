@@ -39,3 +39,16 @@ pub fn validate(spans: []const Span, count: u32, domain: [32]u8) !void {
     }
     if (lower != count) return error.InvalidNativeLakeTextCorpus;
 }
+
+/// v10 packs contain complete single-run members; reject ambiguous subsets.
+pub fn fromMembers(a: std.mem.Allocator, members: anytype, domain: [32]u8) ![]const Span {
+    const result = try a.alloc(Span, members.len);
+    var count: u32 = 0;
+    for (result, members) |*span, member| {
+        if (member.source_lower != 0) return error.InvalidNativeLakeTextCorpus;
+        span.* = .{ .file = member.file, .physical = member.physical, .file_rows = member.count, .file_lower = 0, .pack_lower = member.lower, .count = member.count };
+        count = try std.math.add(u32, count, member.count);
+    }
+    try validate(result, count, domain);
+    return result;
+}
