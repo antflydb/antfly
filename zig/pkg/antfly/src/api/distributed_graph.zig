@@ -16814,7 +16814,12 @@ test "distributed graph metric post processing applies max results after filter 
         }
     };
     try FailureRunner.run(alloc, &graph, roots[0..3], targets[0..3]);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, FailureRunner.run, .{ &graph, roots[0..3], targets[0..3] });
+    // Enumerating thousands of failures does not need a stack trace for every
+    // successful allocation. Keep SafeAllocator's leak, double-free and
+    // write-after-free checks; FailingAllocator records the injected failure.
+    var fault_allocator = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), fault_allocator.deinit()) catch @panic("failure inventory leaked");
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(fault_allocator.allocator(), FailureRunner.run, .{ &graph, roots[0..3], targets[0..3] });
 }
 
 test "distributed graph metric post processing applies max results after filter and order decoder ownership failures" {
