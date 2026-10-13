@@ -4264,8 +4264,11 @@ native cold generated-JSON regression. An initial SQL-owner filter correctly
 failed discovery; the lifecycle regression was moved to its actual native
 storage owner and ran with a nonempty audited runtime filter. Full native
 Debug qualification passed 223 main-owner tests and one linked test, with
-zero failures/leaks (50/50 steps). Full SQL Debug qualification is separate
-and still pending for this checkpoint.
+zero failures/leaks (50/50 steps). Full SQL Debug qualification for owner
+checkpoint 0dbc48d9bd also passed 797 main-owner and 226 linked tests, with
+three existing skips, zero failures/leaks and 21/21 steps. Later preparation
+integration changes require their own qualification and are not covered by
+these checkpoint results.
 
 Preparation integration remains open: the row owner must span validation,
 defaults/generated/CHECK/index execution and physical encoding, returning or
