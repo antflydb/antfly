@@ -1,0 +1,12 @@
+test-video
++- run test 245 pass, 2 skip, 2 fail (249 total)
+error: 'src.mjpeg_metal_test.test.video Metal native depth and chroma preparation owns planes and matches CPU' failed without output
+error: 'src.preparation.test.video portable integer RGB SIMD matches scalar across tails strides chroma and ranges' failed without output
+failed command: /private/tmp/antfly-av1-model-qualification-local/o/befc7d9f3a004e01db1b4a181906257e/test --cache-dir=/private/tmp/antfly-av1-model-qualification-local --seed=0x5a8917ee --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 245/249 tests passed (2 skipped, 2 failed)
+test-video transitive failure
++- run test 245 pass, 2 skip, 2 fail (249 total)
+   +- compile test safe native success 1m MaxRSS:1G
+      +- WriteFile video_prepare_shader.h cached
+

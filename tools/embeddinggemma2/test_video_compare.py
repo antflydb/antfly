@@ -21,6 +21,7 @@ import tempfile
 import io
 import urllib.error
 import unittest
+from types import SimpleNamespace
 
 if __package__:
     from . import video_compare as video
@@ -168,6 +169,71 @@ class VideoRetrievalContracts(unittest.TestCase):
                 path.write_text(json.dumps(modified))
                 with self.assertRaises(ValueError):
                     video.corpus(path)
+
+
+class CompletedReferenceEvidenceTests(unittest.TestCase):
+    def test_complete_vectors_keep_rank_failures_when_stress_failed(self):
+        data = {"documents": [{"id": "a"}, {"id": "b"}], "queries": [{"id": "q"}]}
+        metadata = {
+            "corpus_sha256": "corpus",
+            "checkpoint_receipt_sha256": "weights",
+            "precision": "float32",
+        }
+        expected = dict(
+            metadata,
+            status="pass",
+            cases={
+                "q": {"vector": [1.0, 0.0]},
+                "a": {"vector": [1.0, 0.0]},
+                "b": {"vector": [0.0, 1.0]},
+            },
+        )
+        expected["retrieval"] = video.retrieval(
+            data, {n: c["vector"] for n, c in expected["cases"].items()}
+        )
+        result = dict(
+            metadata,
+            status="failed",
+            failure={"http_status": 503},
+            cases={
+                "q": {"vector": [1.0, 0.0]},
+                "a": {"vector": [0.6, 0.8]},
+                "b": {"vector": [0.8, 0.6]},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reference.json"
+            path.write_text(json.dumps(expected))
+            args = SimpleNamespace(reference=path, top_k=[1, 2], score_tolerance=1e-4)
+            video.collect_reference_evidence(args, data, result)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure"], {"http_status": 503})
+        self.assertEqual(result["retrieval"]["rankings"]["q"], ["b", "a"])
+        self.assertFalse(result["retrieval_agreement"]["pass"])
+        self.assertEqual(
+            result["retrieval_agreement"]["queries"]["q"]["top_k_overlap"]["1"], 0.0
+        )
+        self.assertGreater(result["vector_agreement"]["a"]["max_abs"], 1e-4)
+
+    def test_missing_cases_are_not_reported_as_complete_reference_evidence(self):
+        metadata = {
+            "corpus_sha256": "corpus",
+            "checkpoint_receipt_sha256": "weights",
+            "precision": "float32",
+        }
+        data = {"documents": [{"id": "a"}], "queries": [{"id": "q"}]}
+        vectors = {"q": {"vector": [1.0, 0.0]}, "a": {"vector": [1.0, 0.0]}}
+        expected = dict(
+            metadata, status="pass", cases=dict(vectors, missing={"vector": [0.0, 1.0]})
+        )
+        result = dict(metadata, status="running", cases=vectors)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reference.json"
+            path.write_text(json.dumps(expected))
+            args = SimpleNamespace(reference=path, top_k=[1], score_tolerance=1e-4)
+            with self.assertRaisesRegex(ValueError, "reference cases differ"):
+                video.collect_reference_evidence(args, data, result)
+        self.assertNotIn("vector_agreement", result)
 
 
 class FailureDetailsTests(unittest.TestCase):

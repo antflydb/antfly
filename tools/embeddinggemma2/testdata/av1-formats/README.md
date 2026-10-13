@@ -32,3 +32,7 @@ The subsequent gray-sample policy correction is recorded in
 `zig/lib/video/testdata/av1-gray-model-validation`: monochrome vectors now pass
 on CPU/Metal, while the seven color-format cases and full-corpus rankings remain
 unqualified. The earlier failing reports remain historical reproduction evidence.
+
+The subsequent combined RGB correction is in
+`zig/lib/video/testdata/av1-combined-model-validation`: all three 4:4:4 vectors
+now pass CPU/Metal gates. Four 4:2:0/4:2:2 cases and full rankings remain failing.

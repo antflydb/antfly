@@ -1,0 +1,6 @@
+1/5 video_test_root.test_0...OK
+2/5 src.mod.test_0...OK
+3/5 src.codecs.test.test_0...OK
+4/5 src.webm_pictures.test_0...OK
+5/5 src.preparation.test.video portable integer RGB SIMD matches scalar across tails strides chroma and ranges...OK
+All 5 tests passed.

@@ -1574,3 +1574,18 @@ declarations. The two monochrome AV1 pretrained cases pass the unchanged vector
 gate; the remaining seven expanded color-format cases and full-corpus retrieval
 still fail. Actual Linux ARM64 executes the pixel oracle, with pretrained Linux
 qualification still required. See the [correction receipts](../video/testdata/av1-gray-model-validation/README.md).
+
+### Native-depth 4:4:4 preparation and real-stream qualification
+
+The software WebM model and benchmark share explicit monochrome/4:4:4 SDR profile
+selection. Combined native-depth color rounding is implemented in Zig scalar,
+portable SIMD and Metal paths; independent RGB vectors characterize all supported
+depths and ranges. The current SDR BT.2020 display rejection is retained explicitly.
+The normalized-plane qualifier now reads depth/chroma from each stream manifest
+while retaining previous 8-bit 4:2:0 defaults. A reproducible 1,253-picture Sintel
+AV1 High 4:4:4 derivative matches every independent decoded picture and supplies
+completed scalar/SIMD/Metal preparation receipts. Model vector/ranking evidence
+is retained before subsequent stress checks. The three 4:4:4 pretrained cases now pass CPU/Metal gates; four color-format cases
+and full-corpus rankings still fail, and Metal retry remains capacity-denied.
+Filtered chroma preparation, pretrained full-corpus parity, broader display/layer policies and the active
+non-CUDA scope still require completion. See the [qualification record](../video/testdata/av1-combined-model-validation/README.md).

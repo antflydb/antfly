@@ -1,0 +1,19 @@
+native colour [1.28628875000868]
+native gray [0.0961063330178149]
+native av1-c0-8 [4.395510957983788]
+native av1-c0-12 [4.2664902079850435]
+native av1-c1-12 [4.373568459006492]
+native av1-c2-8 [4.274987125012558]
+native av1-c2-10 [4.262555291992612]
+native av1-c2-12 [4.258991000009701]
+native av1-c3-8 [4.270610792038497]
+native av1-c3-10 [4.262285874981899]
+native av1-c3-12 [4.258327750023454]
+Traceback (most recent call last):
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/video_compare.py", line 946, in <module>
+    main()
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/video_compare.py", line 927, in main
+    compare.assert_agreement(
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/compare.py", line 91, in assert_agreement
+    raise ValueError(f"F32 parity failed: {result}")
+ValueError: F32 parity failed: {'cosine': 0.9954462199550146, 'max_abs': 0.012924348004162312, 'actual_norm': 0.9999999999930087}

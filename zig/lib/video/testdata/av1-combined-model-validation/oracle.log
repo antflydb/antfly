@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded; 5/5 tests passed
+test-video success
++- run test 5 pass (5 total) 178ms MaxRSS:7M
+   +- compile test safe native success 33s MaxRSS:829M
+      +- WriteFile video_prepare_shader.h success
+

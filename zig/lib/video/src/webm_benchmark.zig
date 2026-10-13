@@ -67,7 +67,7 @@ const Context = struct {
             9 => .bt2020_ncl,
             else => return error.UnsupportedVideoColor,
         };
-        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .rgb_rounding = if (frame.width % 16 == 0) .q13_components else .q16_luma, .admission_pool = self.pool };
+        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format), .admission_pool = self.pool };
         const start = now(self.io);
         if (self.metal) |owner| {
             var prepared = try owner.submitHost(self.a, frame.host(), options, .{});

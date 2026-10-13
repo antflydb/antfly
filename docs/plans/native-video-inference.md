@@ -1791,3 +1791,20 @@ reconstruction and high-depth color quantization, followed by complete pretraine
 CPU/Metal/Linux qualification; this fix does not establish expanded-format parity.
 The retained capacity-denial/retry reports and correction receipts are in
 `zig/lib/video/testdata/av1-gray-model-validation`.
+
+Native-depth 4:4:4 color preparation now combines Q13 matrix products before
+rounding, with portable Zig SIMD for 8-bit rows and matching Metal arithmetic.
+A 54-case independent RGB oracle and actual Linux/Metal checks qualify this
+policy; a reproducible full Sintel AV1 High 4:4:4 workload preserves all 1,253
+independent picture hashes and measures scalar/SIMD/Metal preparation. Its
+shared-host preparation measurements exclude pretrained inference. The model
+harness preserves vector/ranking evidence before later stress failures.
+Filtered chroma reconstruction for 4:2:2/high-depth 4:2:0, complete pretrained
+CPU/Metal/Linux parity, wide-gamut display/layer policies and the full remaining
+non-CUDA scope remain required. See `zig/lib/video/testdata/av1-combined-model-validation`.
+
+The corrected 8/10/12-bit 4:4:4 pretrained vectors pass unchanged CPU/Metal gates.
+Four 4:2:0/4:2:2 vectors and full rankings remain failing. CPU serial/retry
+requests complete, while Metal records all vectors before a capacity-denied
+retry. Neither the preparation benchmark nor partial vector correction closes
+the full-pipeline qualification requirement.

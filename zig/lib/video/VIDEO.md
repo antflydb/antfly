@@ -2376,3 +2376,43 @@ pass. Shared-host timings support no throughput claim. See
 [correction receipts](testdata/av1-gray-model-validation/README.md). Chroma
 reconstruction, high-depth color quantization, layer-model policy and all broader
 active non-CUDA requirements remain work.
+
+### Native-depth 4:4:4 combined RGB qualification
+
+Software WebM SDR preparation now evaluates a complete Q13 color transform before
+channel rounding for 4:4:4, preserving native depth. CPU and Metal share the
+profile; 8-bit CPU conversion uses Zig portable vectors with scalar tails. A
+shared policy selector also keeps the maintained WebM benchmark aligned with
+model preparation. The explicit reference profile preserves signed Q22 clipping
+behavior for out-of-nominal limited-range codes; ordinary float rendering retains
+its existing policy. This does not implement filtered chroma reconstruction for
+4:2:2/high-depth 4:2:0.
+
+The independent 54-case RGB oracle covers three geometries, three depths
+(8/10/12), three matrices and both ranges. Primitive BT.2020 arithmetic is
+characterized there; SDR BT.2020 display remains explicitly rejected by the
+current preparation policy and is tested as a rejection. Supported CPU SIMD and
+Metal paths retain matrix/range/depth/stride/rotation checks. Ownership cases now
+refill nonzero source planes after overwriting producer storage, so later modes
+continue testing real pixels. ReleaseSafe macOS passes 247 video checks (two skips)
+and 49 model checks. Actual Linux ARM64 passes 221 video checks (28 skips), plus
+a fresh targeted portable SIMD/rejection execution.
+
+A maintained 854×480, 1,253-picture Sintel AV1 High 4:4:4 derivative adds real-stream
+qualification: every normalized native picture matches independent FFmpeg plane
+hashes. The clip is a derivative of pinned 4:2:0 material, adding no chroma detail.
+Repeated generation reproduces its coded bytes and picture hashes. Preparation
+of 53 pictures has identical scalar/SIMD patch hashes; shared-host warm preparation
+medians are about 535 ms scalar and 348 ms SIMD. Completed Metal preparation
+records uploads, GPU time, device allocation and process peak memory. These
+samples exclude pretrained inference and support no full-pipeline speedup claim.
+
+The inference harness now records complete vector and ranking evidence before
+independent cancellation/retry and sustained-load checks, preserving numerical
+results if later admission fails. Existing parity and stress gates remain active.
+All three 4:4:4 pretrained vectors pass on CPU and Metal (maximum coordinate
+error below 3.1e-7), alongside the corrected monochrome cases. Four color-format
+vector cases and full-corpus rankings still fail. CPU serial/retry checks complete;
+Metal completes vectors before its retry is capacity-denied. These results and
+the remaining pipeline gaps are recorded in [qualification receipts](testdata/av1-combined-model-validation/README.md).
+The full non-CUDA scope remains active.

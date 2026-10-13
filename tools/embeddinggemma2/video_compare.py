@@ -660,6 +660,8 @@ def native(args, data, result):
             compare.publish(args.output, result)
             print(args.backend, row["id"], samples, flush=True)
         result["model_identity"] = identity
+        collect_reference_evidence(args, data, result)
+        compare.publish(args.output, result)
         first = data["documents"][0]["id"]
         result["disconnect_retry"] = disconnect_and_retry(
             url, bodies[first], result["cases"][first]["vector"]
@@ -802,6 +804,41 @@ def pytorch(args, data, result):
     result["torch"] = torch.__version__
 
 
+def collect_reference_evidence(args, data, result):
+    """Retain complete vector/ranking evidence before independent stress checks."""
+    result["retrieval"] = retrieval(
+        data, {name: case["vector"] for name, case in result["cases"].items()}
+    )
+    if not args.reference:
+        return None
+    expected = json.loads(args.reference.read_text())
+    if (
+        any(
+            result[k] != expected[k]
+            for k in ("corpus_sha256", "checkpoint_receipt_sha256", "precision")
+        )
+        or expected["status"] != "pass"
+    ):
+        raise ValueError("incomplete or mismatched reference")
+    if set(result["cases"]) != set(expected["cases"]):
+        raise ValueError("reference cases differ")
+    result["vector_agreement"] = {
+        n: compare.agreement(c["vector"], expected["cases"][n]["vector"])
+        for n, c in result["cases"].items()
+    }
+    result["reference_sha256"] = reference.sha256(args.reference)
+    result["retrieval_agreement"] = rank_agreement(
+        result["retrieval"],
+        expected["retrieval"],
+        args.top_k,
+        args.score_tolerance,
+    )
+    result["reference_evidence_stage"] = (
+        "completed measured corpus vectors; stress outcomes remain separate"
+    )
+    return expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -878,32 +915,8 @@ def main():
         result["binary_sha256"] = reference.sha256(args.binary)
     try:
         (native if args.backend in ("native", "metal") else pytorch)(args, data, result)
-        result["retrieval"] = retrieval(
-            data, {n: r["vector"] for n, r in result["cases"].items()}
-        )
-        if args.reference:
-            expected = json.loads(args.reference.read_text())
-            if (
-                any(
-                    result[k] != expected[k]
-                    for k in ("corpus_sha256", "checkpoint_receipt_sha256", "precision")
-                )
-                or expected["status"] != "pass"
-            ):
-                raise ValueError("incomplete or mismatched reference")
-            if set(result["cases"]) != set(expected["cases"]):
-                raise ValueError("reference cases differ")
-            result["vector_agreement"] = {
-                n: compare.agreement(c["vector"], expected["cases"][n]["vector"])
-                for n, c in result["cases"].items()
-            }
-            result["reference_sha256"] = reference.sha256(args.reference)
-            result["retrieval_agreement"] = rank_agreement(
-                result["retrieval"],
-                expected["retrieval"],
-                args.top_k,
-                args.score_tolerance,
-            )
+        expected = collect_reference_evidence(args, data, result)
+        if expected is not None:
             for name, case in result["cases"].items():
                 reference_case = expected["cases"][name]
                 if (

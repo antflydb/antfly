@@ -43,6 +43,18 @@ float3 tone_rgb(float3 encoded, constant Params &p, device const float *eotf) {
     float3 srgb = select(1.055f * pow(linear, float3(1.0f / 2.4f)) - 0.055f, 12.92f * linear, linear <= 0.0031308f);
     return clamp(floor(srgb * 255.0f + 0.5f), 0.0f, 255.0f);
 }
+float3 rgb_combined(int y, int2 uv, constant Params &p) {
+    int scale = 1 << (p.depth - 8);
+    int4 c = p.bt709 == 1 ? (p.full ? int4(12901, -1534, -3835, 15201) : int4(14686, -1747, -4366, 17305))
+           : p.bt709 == 2 ? (p.full ? int4(12080, -1348, -4680, 15412) : int4(13752, -1535, -5328, 17545))
+                          : (p.full ? int4(11485, -2819, -5850, 14516) : int4(13075, -3209, -6660, 16525));
+    int luma = (y - (p.full ? 0 : 16 * scale)) * (p.full ? 8192 : 9539);
+    int shift = p.depth + 5;
+    int3 sums = int3(luma + uv.y * c.x, luma + uv.x * c.y + uv.y * c.z, luma + uv.x * c.w);
+    int3 rounded = (sums + (1 << (shift - 1))) >> shift;
+    rounded = select(rounded, int3(0), rounded >= 512);
+    return float3(clamp(rounded, 0, 255));
+}
 float3 rgb_q16(int y, int2 uv_delta, constant Params &p) {
     int4 c = p.bt709 == 1 ? (p.full ? int4(103206, -12275, -30678, 121608) : int4(100902, -12001, -29993, 118894))
            : p.bt709 == 2 ? (p.full ? int4(96638, -10783, -37443, 123299) : int4(94482, -10543, -36607, 120547))
@@ -69,6 +81,7 @@ float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read>
     float stored_scale = float(1u << p.sample_shift);
     float y = floor(round(yplane.read(xy).r * storage_max) / stored_scale) / scale;
     float2 uv = floor(round(uvplane.read(xy / 2).rg * storage_max) / stored_scale) / scale - 128.0f;
+    if (p.rounding == 4 && p.tone == 0) return rgb_combined(int(y * scale), int2(uv * scale), p);
     if (p.rounding == 2 && p.depth == 8 && p.tone == 0) return rgb_q16(int(y), int2(uv), p);
     if (p.rounding == 1 && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }
@@ -137,6 +150,7 @@ float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::
     float y = float(yplane.read(xy).r >> p.sample_shift) / scale;
     float2 uv = float2(0.0f);
     if (p.chroma != 0) uv = float2(uvplane.read(xy / uint2(p.chroma == 3 ? 1 : 2, p.chroma == 1 ? 2 : 1)).rg >> p.sample_shift) / scale - 128.0f;
+    if (p.rounding == 4 && p.tone == 0) return rgb_combined(int(y * scale), int2(uv * scale), p);
     if (p.rounding == 2 && p.depth == 8 && p.tone == 0) return rgb_q16(int(y), int2(uv), p);
     if (p.rounding == 1 && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }

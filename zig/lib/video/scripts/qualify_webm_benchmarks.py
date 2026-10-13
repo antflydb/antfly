@@ -39,7 +39,14 @@ def validate(stream, rows):
             row["depth"],
             row["chroma"],
             row["sha256"],
-        ) != (index, stream["width"], stream["height"], 8, 1, digest):
+        ) != (
+            index,
+            stream["width"],
+            stream["height"],
+            stream.get("depth", 8),
+            stream.get("chroma", 1),
+            digest,
+        ):
             mismatches.append(index)
     return {
         "status": "pass"
@@ -61,7 +68,7 @@ def run(binary, corpus, output, codec):
     report = {
         "version": 1,
         "status": "running",
-        "scope": "Every visible native 8-bit 4:2:0 picture; FFmpeg independent NV12 SHA-256 reference",
+        "scope": "Every visible native picture; independent normalized-plane SHA-256 reference",
         "codec_filter": codec,
         "platform": platform.platform(),
         "tool_sha256": sha(Path(__file__)),

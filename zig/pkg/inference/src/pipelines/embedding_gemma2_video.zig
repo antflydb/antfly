@@ -1262,7 +1262,7 @@ const Capture = struct {
             .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
         };
         var options = try webmPolicy(track, frame.width, frame.height, signal);
-        if (frame.chroma_format == 0 and options.tone_mapping == .none) options.rgb_rounding = .gray_samples;
+        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format);
         options.admission_pool = self.pool;
         if (self.metal) |metal| {
             const prepared = try metal.submitHost(self.a, host, options, self.control);

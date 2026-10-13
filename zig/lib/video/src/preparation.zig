@@ -38,7 +38,17 @@ extern fn av_prepared_destroy(*anyopaque) void;
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
 pub const ToneMapping = @import("tone.zig").Policy;
-pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples };
+pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples, q13_combined };
+/// Pinned SDR software-video processor profile, independent of CPU dispatch.
+/// HDR has a separate rendering policy and must not select this profile.
+pub fn softwareSdrRounding(coded_width: u32, chroma: u8) RgbRounding {
+    return switch (chroma) {
+        0 => .gray_samples,
+        3 => .q13_combined,
+        else => if (coded_width % 16 == 0) .q13_components else .q16_luma,
+    };
+}
+
 pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
     width: u32,
@@ -129,6 +139,7 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
     var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv, bit_depth) >> format.sampleShift()))) / scale - 128;
     var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv + bytes, bit_depth) >> format.sampleShift()))) / scale - 128;
+    if (rounding == .q13_combined) return rgbCombined(@intFromFloat(luma * scale), @intFromFloat(u * scale), @intFromFloat(v * scale), bit_depth, format.fullRange(), matrix);
     if (rounding == .q16_luma and bit_depth == 8 and tone_mapping == .none) return rgbQ16(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
     if (rounding == .q13_components and bit_depth == 8 and tone_mapping == .none) return rgbQ13(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
     if (!format.fullRange()) {
@@ -208,6 +219,33 @@ fn rgbQ16(y: i32, u_delta: i32, v_delta: i32, full: bool, matrix: Matrix) [3]u8 
     }
     return output;
 }
+// Quantize the complete color transform once, preserving native sample depth.
+// The Q13 matrix is evaluated before channel rounding, rather than rounding
+// each component independently. This is an explicit SDR preparation policy.
+fn combinedCoefficients(full: bool, matrix: Matrix) [4]i32 {
+    return switch (matrix) {
+        .bt601 => if (full) .{ 11485, -2819, -5850, 14516 } else .{ 13075, -3209, -6660, 16525 },
+        .bt709 => if (full) .{ 12901, -1534, -3835, 15201 } else .{ 14686, -1747, -4366, 17305 },
+        .bt2020_ncl => if (full) .{ 12080, -1348, -4680, 15412 } else .{ 13752, -1535, -5328, 17545 },
+    };
+}
+fn rgbCombined(y: i32, u: i32, v: i32, depth: u8, full: bool, matrix: Matrix) [3]u8 {
+    const scale = @as(i32, 1) << @as(u5, @intCast(depth - 8));
+    const coefficients = combinedCoefficients(full, matrix);
+    const luma = (y - @as(i32, if (full) 0 else 16) * scale) * @as(i32, if (full) 8192 else 9539);
+    const shift: u5 = @intCast(depth + 5);
+    const bias = @as(i32, 1) << (shift - 1);
+    const sums = [3]i32{ luma + v * coefficients[0], luma + u * coefficients[1] + v * coefficients[2], luma + u * coefficients[3] };
+    var output: [3]u8 = undefined;
+    // The explicit reference profile preserves its signed Q22 output domain.
+    // Out-of-nominal limited-range samples can cross its positive sign bit;
+    // those excursions map to zero before the final RGB8 saturation.
+    for (sums, &output) |sum, *channel| {
+        const value = (sum + bias) >> shift;
+        channel.* = @intCast(if (value >= 512) 0 else std.math.clamp(value, 0, 255));
+    }
+    return output;
+}
 // Coefficients are independently quantized from the BT.601/BT.709 matrix
 // and range expansion. Signed shifts deliberately floor each component.
 fn rgbQ13(y: i32, u: i32, v: i32, full: bool, matrix: Matrix) [3]u8 {
@@ -282,7 +320,7 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     for (0..height) |y| {
         try control.check();
         var x: usize = 0;
-        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and (options.rgb_rounding == .q13_components or options.rgb_rounding == .q16_luma)) {
+        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and (options.rgb_rounding == .q13_components or options.rgb_rounding == .q16_luma or options.rgb_rounding == .q13_combined)) {
             while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x + options.crop.left, y + options.crop.top, options);
         }
         while (x < width) : (x += 1) {
@@ -320,7 +358,15 @@ fn integerRgbRow8(out: []u8, host: HostSurface, x: usize, y: usize, options: Opt
     }
     var values: [3]V = undefined;
     const full = host.format.fullRange();
-    if (options.rgb_rounding == .q16_luma) {
+    if (options.rgb_rounding == .q13_combined) {
+        const c = combinedCoefficients(full, options.matrix);
+        const yy = (luma - @as(V, @splat(if (full) 0 else 16))) * @as(V, @splat(if (full) 8192 else 9539));
+        values = .{ yy + v * @as(V, @splat(c[0])), yy + u * @as(V, @splat(c[1])) + v * @as(V, @splat(c[2])), yy + u * @as(V, @splat(c[3])) };
+        for (&values) |*channel| {
+            const rounded = (channel.* + @as(V, @splat(4096))) >> @as(@Vector(8, u5), @splat(13));
+            channel.* = @select(i32, rounded >= @as(V, @splat(512)), @as(V, @splat(0)), rounded);
+        }
+    } else if (options.rgb_rounding == .q16_luma) {
         const c = q16Coefficients(full, options.matrix);
         const uu = u + @as(V, @splat(128));
         const vv = v + @as(V, @splat(128));
@@ -711,7 +757,7 @@ test "video portable integer RGB SIMD matches scalar across tails strides chroma
     var uv: [1024]u8 = undefined;
     for (&y, 0..) |*value, i| value.* = @intCast((i * 37 + 11) % 256);
     for (&uv, 0..) |*value, i| value.* = @intCast((i * 61 + 7) % 256);
-    for ([_]u32{ 1, 7, 8, 9, 15, 16, 17, 26, 33 }) |width| for (0..4) |chroma| for ([_]bool{ false, true }) |full| for ([_]Matrix{ .bt601, .bt709 }) |matrix| for ([_]RgbRounding{ .q13_components, .q16_luma }) |rounding| {
+    for ([_]u32{ 1, 7, 8, 9, 15, 16, 17, 26, 33 }) |width| for (0..4) |chroma| for ([_]bool{ false, true }) |full| for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]RgbRounding{ .q13_components, .q16_luma, .q13_combined }) |rounding| {
         const cw = if (chroma == 3) width else (width + 1) / 2;
         const ch: u32 = if (chroma == 1) 3 else 5;
         const ys: usize = width + 5;
@@ -721,6 +767,11 @@ test "video portable integer RGB SIMD matches scalar across tails strides chroma
             if (chroma == 0) .{ .bytes = &.{}, .width = 0, .height = 0, .stride = 0 } else .{ .bytes = uv[0 .. us * ch], .width = cw, .height = ch, .stride = us },
         } };
         const options = Options{ .width = 96, .height = 48, .matrix = matrix, .rgb_rounding = rounding, .torchvision = true };
+        if (matrix == .bt2020_ncl) {
+            try std.testing.expectError(error.UnsupportedVideoColor, referenceHostScalar(a, host, options, .{}));
+            try std.testing.expectError(error.UnsupportedVideoColor, referenceHost(a, host, options, .{}));
+            continue;
+        }
         const expected = try referenceHostScalar(a, host, options, .{});
         defer a.free(expected);
         const actual = try referenceHost(a, host, options, .{});
@@ -783,5 +834,40 @@ test "video monochrome sample rounding matches exhaustive independent RGB oracle
             }
         }
     }
+    try std.testing.expectEqual(expected.len, at);
+}
+
+test "video combined native-depth RGB matches independent matrices ranges and odd geometries" {
+    const expected = @embedFile("../testdata/rgb-combined-reference.bin");
+    var at: usize = 0;
+    for ([_][2]u32{ .{ 9, 7 }, .{ 26, 16 }, .{ 127, 95 } }) |size| for ([_]u8{ 8, 10, 12 }) |depth| {
+        const count = @as(usize, size[0]) * size[1];
+        const bytes: usize = if (depth == 8) 1 else 2;
+        const yplane = try std.testing.allocator.alloc(u8, count * bytes);
+        defer std.testing.allocator.free(yplane);
+        const uvplane = try std.testing.allocator.alloc(u8, count * 2 * bytes);
+        defer std.testing.allocator.free(uvplane);
+        for (0..count) |i| {
+            const maximum = @as(usize, 1) << @as(u4, @intCast(depth));
+            const samples = [3]u16{ @intCast((i * 37 + 11) % maximum), @intCast((i * 61 + 7) % maximum), @intCast((i * 73 + 29) % maximum) };
+            if (depth == 8) {
+                yplane[i] = @intCast(samples[0]);
+                uvplane[i * 2] = @intCast(samples[1]);
+                uvplane[i * 2 + 1] = @intCast(samples[2]);
+            } else {
+                std.mem.writeInt(u16, yplane[i * 2 ..][0..2], samples[0], .little);
+                std.mem.writeInt(u16, uvplane[i * 4 ..][0..2], samples[1], .little);
+                std.mem.writeInt(u16, uvplane[i * 4 + 2 ..][0..2], samples[2], .little);
+            }
+        }
+        const planes = [2]apple.Plane{ .{ .bytes = yplane, .width = size[0], .height = size[1], .stride = size[0] * bytes }, .{ .bytes = uvplane, .width = size[0], .height = size[1], .stride = size[0] * 2 * bytes } };
+        for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]bool{ false, true }) |full| {
+            for (0..size[1]) |row| for (0..size[0]) |col| {
+                const actual = rgb(planes, col, row, if (full) .nv12_full else .nv12_video, matrix, depth, 3, .q13_combined, .none);
+                try std.testing.expectEqualSlices(u8, expected[at..][0..3], &actual);
+                at += 3;
+            };
+        };
+    };
     try std.testing.expectEqual(expected.len, at);
 }

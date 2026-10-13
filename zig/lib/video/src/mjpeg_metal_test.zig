@@ -279,17 +279,23 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
             defer a.free(uv);
             @memset(y, 0);
             @memset(uv, 0);
-            for (0..height) |row| for (0..width) |x| {
-                const value: u16 = @intCast((row * 41 + x * 19) % (@as(usize, 1) << @as(u4, @intCast(depth))));
-                if (depth == 8) y[row * ys + x] = @intCast(value) else std.mem.writeInt(u16, y[row * ys + x * 2 ..][0..2], value, .little);
-            };
-            for (0..ch) |row| for (0..cw * 2) |x| {
-                const value: u16 = @intCast((row * 23 + x * 61 + 53) % (@as(usize, 1) << @as(u4, @intCast(depth))));
-                if (depth == 8) uv[row * uvs + x] = @intCast(value) else std.mem.writeInt(u16, uv[row * uvs + x * 2 ..][0..2], value, .little);
-            };
-            for (std.enums.values(video.preparation.RgbRounding)) |rounding| for (std.enums.values(video.preparation.Rotation)) |rotation| for ([_]bool{ false, true }) |full| {
-                const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = if (full) .bt601 else .bt709, .centered = full, .rgb_rounding = rounding };
+            for (std.enums.values(video.preparation.RgbRounding)) |rounding| for (std.enums.values(video.preparation.Rotation)) |rotation| for ([_]bool{ false, true }) |full| for (std.enums.values(video.preparation.Matrix)) |matrix| {
+                // Refill after the prior ownership case overwrote producer storage.
+                for (0..height) |row| for (0..width) |x| {
+                    const value: u16 = @intCast((row * 41 + x * 19) % (@as(usize, 1) << @as(u4, @intCast(depth))));
+                    if (depth == 8) y[row * ys + x] = @intCast(value) else std.mem.writeInt(u16, y[row * ys + x * 2 ..][0..2], value, .little);
+                };
+                for (0..ch) |row| for (0..cw * 2) |x| {
+                    const value: u16 = @intCast((row * 23 + x * 61 + 53) % (@as(usize, 1) << @as(u4, @intCast(depth))));
+                    if (depth == 8) uv[row * uvs + x] = @intCast(value) else std.mem.writeInt(u16, uv[row * uvs + x * 2 ..][0..2], value, .little);
+                };
+                const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = matrix, .centered = full, .rgb_rounding = rounding };
                 const host = video.preparation.HostSurface{ .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .format = if (full) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = y, .width = width, .height = height, .stride = ys }, .{ .bytes = uv, .width = cw, .height = ch, .stride = uvs } } };
+                if (matrix == .bt2020_ncl) {
+                    try std.testing.expectError(error.UnsupportedVideoColor, video.preparation.referenceHost(a, host, options, .{}));
+                    try std.testing.expectError(error.UnsupportedVideoColor, metal.submitHost(a, host, options, .{}));
+                    continue;
+                }
                 const expected = try video.preparation.referenceHost(a, host, options, .{});
                 defer a.free(expected);
                 var result = try metal.submitHost(a, host, options, .{});
@@ -326,7 +332,7 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
                 const actual = try result.readback(a);
                 defer a.free(actual);
                 compare(expected, actual) catch |err| {
-                    std.debug.print("native Metal depth {d} chroma {d} rotation {s} full {any}\n", .{ depth, chroma, @tagName(rotation), full });
+                    std.debug.print("native Metal depth {d} chroma {d} rotation {s} full {any} matrix {s} rounding {s}\n", .{ depth, chroma, @tagName(rotation), full, @tagName(matrix), @tagName(rounding) });
                     return err;
                 };
             };
