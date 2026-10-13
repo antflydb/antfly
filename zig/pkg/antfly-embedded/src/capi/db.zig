@@ -353,10 +353,17 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
     if (resolvers != .array) return;
     for (resolvers.array.items) |item| {
         if (item != .object) continue;
-        const cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
+        var cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
+        // Config replay may include catalog metadata read back by a caller.
+        // Curation is owned by the merge API and cannot be replaced inline.
+        cfg.value.merges = &.{};
+        cfg.value.merge_generation = 0;
+        cfg.value.merge_state_version = 0;
+        cfg.value.resolution_generation = 0;
+        cfg.value.namespace_generation = 0;
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
@@ -735,9 +742,54 @@ pub const HandleGuard = struct {
     entry_error: ?capi.ErrorCode = null,
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
+    suspended_query_root: ?*Handle = null,
+
+    /// Keep registry references and the provider snapshot alive, releasing both
+    /// process and file locks while inference runs on an owned request plan.
+    pub fn suspendQuery(self: *HandleGuard) void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        const root = connection.current.?;
+        root.query_borrows += 1;
+        self.suspended_query_root = root;
+        connection.detach();
+        if (self.path_lease) |lease| {
+            var owned = lease;
+            owned.close();
+        }
+        self.path_lease = null;
+        self.connection_gate_held = false;
+        connection.gate.mutex.unlock(handleLockIo());
+        connection.mutex.unlock(handleLockIo());
+    }
+
+    pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
+        if (self.suspended_query_root == null) return true;
+        // Original registry references keep the connection/owner alive.
+        const next = enterHandle(ptr, .read) orelse return false;
+        const connection = self.connection.?;
+        if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
+        self.suspended_query_root.?.query_borrows -= 1;
+        connection.collectRetired();
+        if (!next.connection_gate_held) connection.gate.mutex.unlock(handleLockIo());
+        if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+        HandleRegistry.leave(self.slot);
+        self.* = next;
+        return true;
+    }
 
     pub fn leave(self: HandleGuard) void {
         const io = handleLockIo();
+        if (self.suspended_query_root) |root| {
+            const connection = self.connection.?;
+            connection.gate.mutex.lockUncancelable(io);
+            root.query_borrows -= 1;
+            connection.collectRetired();
+            connection.gate.mutex.unlock(io);
+            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+            HandleRegistry.leave(self.slot);
+            return;
+        }
         if (self.connection) |connection| {
             if (self.pinned_store_readonly) |was_readonly| {
                 const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
@@ -2234,9 +2286,9 @@ pub const JsonGraphNode = struct {
 
 pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path_slice = cStringSpan(path) orelse");
+    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
@@ -2296,7 +2348,7 @@ pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
 
 pub export fn antfly_open_options_init(options: ?*capi.OpenOptions) capi.ErrorCode {
     capi.clearLastError();
-    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const opts = options orelse");
+    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": options pointer must not be null");
     opts.* = .{};
     return .ok;
 }
@@ -2478,7 +2530,7 @@ pub fn openLiteHandle(
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
     const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
@@ -2686,9 +2738,9 @@ pub fn openDirectoryHandle(
     create: bool,
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
-    if (create) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (create)");
+    if (create) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": directory storage must be opened; this entry point cannot create it");
     const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
     out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
@@ -2731,7 +2783,7 @@ pub fn openGenericHandle(
     var backoff_ms: i64 = 1;
     while (true) {
         const remaining_ns = deadline_ns - std.Io.Timestamp.now(io, .awake).toNanoseconds();
-        if (remaining_ns <= 0) return capi.recordError(.busy, @src().fn_name ++ ": if (remaining_ns <= 0)");
+        if (remaining_ns <= 0) return capi.recordError(.busy, @src().fn_name ++ ": timed out waiting for the Lite writer lock");
         const sleep_ns = @min(@as(i96, backoff_ms) * std.time.ns_per_ms, remaining_ns);
         io.sleep(.fromNanoseconds(sleep_ns), .awake) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         const code = openGenericHandleOnce(path, resolved, create, out_handle);
@@ -2759,18 +2811,18 @@ pub fn cStringSpan(path: ?[*:0]const u8) ?[]const u8 {
 
 pub export fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path_slice = cStringSpan(path) orelse");
+    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
     return openGenericHandle(path_slice, resolved, false, out);
 }
 
 pub export fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
-    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path_slice = cStringSpan(path) orelse");
+    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
     return openGenericHandle(path_slice, resolved, true, out);
 }
@@ -2779,7 +2831,7 @@ pub export fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) 
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{}, false, out_handle);
 }
@@ -2788,7 +2840,7 @@ pub export fn antfly_lite_create(path: ?[*:0]const u8, out_handle: ?*?*anyopaque
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{}, true, out_handle);
 }
@@ -2797,7 +2849,7 @@ pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyo
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{ .profile = .hosted }, false, out_handle);
 }
@@ -2806,7 +2858,7 @@ pub export fn antfly_lite_create_hosted(path: ?[*:0]const u8, out_handle: ?*?*an
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{ .profile = .hosted }, true, out_handle);
 }
@@ -2815,7 +2867,7 @@ pub export fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*an
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, false, out_handle);
 }
@@ -2824,7 +2876,7 @@ pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?
     capi.clearLastError();
     const path_slice = cStringSpan(path) orelse {
         if (out_handle) |out| out.* = null;
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     };
     return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
 }
@@ -2837,8 +2889,8 @@ pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
 
 pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -2862,8 +2914,8 @@ pub const directory_storage_status: lite_backend.StorageStatus = .{
 
 pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -2898,13 +2950,13 @@ pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buf
 
 pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .maintain) orelse");
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out_buf_ptr = resetOutBuffer(out_buf) orelse");
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     const handle = guard.handle;
 
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
@@ -2919,7 +2971,7 @@ pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) 
 
 pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -2929,21 +2981,21 @@ pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slic
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
     if (!liteOpenModeCanWrite(handle.open_mode)) return capi.mapError(error.ReadOnly);
     @import("tables.zig").load(handle) catch |err| return capi.mapError(err);
-    if (backup.len == 0 or backup.ptr == null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (backup.len == 0 or backup.ptr == null)");
-    if (handle.embedded_tables.count() != 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (handle.embedded_tables.count() != 0)");
-    if (handle.sql_cursors.count() != 0 or handle.sql_sessions.count() != 0) return capi.recordError(.busy, @src().fn_name ++ ": if (handle.sql_cursors.count() != 0 or handle.sql_sessions.count() != 0)");
+    if (backup.len == 0 or backup.ptr == null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": backup bytes must be nonempty and have a non-null pointer");
+    if (handle.embedded_tables.count() != 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": backup import requires a database without named tables");
+    if (handle.sql_cursors.count() != 0 or handle.sql_sessions.count() != 0) return capi.recordError(.busy, @src().fn_name ++ ": close SQL cursors and sessions before importing a backup");
     for (handle.table_handles.items) |id| {
         const child, const slot = handle_registry.enter(id) orelse continue;
         _ = child;
         HandleRegistry.leave(slot);
-        return capi.recordError(.busy, @src().fn_name ++ ": validation failed");
+        return capi.recordError(.busy, @src().fn_name ++ ": close table handles before importing a backup");
     }
     @import("database_backup.zig").validate(handle.alloc, backup.bytes()) catch |err| return capi.mapError(err);
     if (handle.owned_lite_backend != null) {
         @import("database_backup.zig").importLite(handle, backup.bytes()) catch |err| return capi.mapError(err);
     } else {
-        if (!(handle.db.isPortableImportTargetEmpty(handle.alloc) catch |err| return capi.mapError(err))) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (!(handle.db.isPortableImportTargetEmpty(handle.alloc) catch |err|");
-        const path = handle.embedded_path orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path = handle.embedded_path orelse");
+        if (!(handle.db.isPortableImportTargetEmpty(handle.alloc) catch |err| return capi.mapError(err))) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": backup import requires an empty destination database");
+        const path = handle.embedded_path orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
         var io_impl = std.Io.Threaded.init(handle.alloc, .{});
         defer io_impl.deinit();
         // No child, session, or cursor borrows the runtime. Close its read lease
@@ -2987,10 +3039,10 @@ pub export fn antfly_restore_backup_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const path = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path = cStringSpan(dest_path) orelse");
-    if (backup.len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (backup.len == 0)");
-    if (backup.ptr == null and backup.len != 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (backup.ptr == null and backup.len != 0)");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const path = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
+    if (backup.len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": backup bytes must not be empty");
+    if (backup.ptr == null and backup.len != 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": backup pointer must not be null when length is nonzero");
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
 
     const alloc = std.heap.c_allocator;
@@ -3018,9 +3070,9 @@ pub export fn antfly_restore_backup_file_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const destination = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const destination = cStringSpan(dest_path) orelse");
-    const source = cStringSpan(backup_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const source = cStringSpan(backup_path) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const destination = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
+    const source = cStringSpan(backup_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
 
     const alloc = std.heap.c_allocator;
@@ -3042,8 +3094,8 @@ pub export fn antfly_restore_backup_file_json(
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3054,13 +3106,13 @@ pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Bu
         out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
     }
-    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
 }
 
 pub export fn antfly_lite_check_file_json(path: ?[*:0]const u8, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const path_slice = cStringSpan(path) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const path_slice = cStringSpan(path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
     const alloc = std.heap.c_allocator;
     const report = lite_backend.checkFile(alloc, path_slice) catch |err| return capi.mapError(err);
     out.* = stringifyJson(report) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -3074,8 +3126,8 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .maintain) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3083,11 +3135,11 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
-        const dest = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const dest = cStringSpan(dest_path) orelse");
+        const dest = cStringSpan(dest_path) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": path pointer must not be null");
         out.* = stringifyJson(backend.copyStableSnapshot(dest, replace) catch |err| return capi.mapError(err)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
     }
-    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
 }
 
 pub export fn antfly_lite_copy_stable_snapshot_file_json(
@@ -3097,7 +3149,7 @@ pub export fn antfly_lite_copy_stable_snapshot_file_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    _ = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": _ = resetOutBuffer(out_buf) orelse");
+    _ = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
     var handle_ptr: ?*anyopaque = null;
     const open_status = antfly_lite_open_readonly(src_path, &handle_ptr);
     if (open_status != .ok) return open_status;
@@ -3120,8 +3172,8 @@ pub fn prepareLiteCompact(handle: *Handle) !void {
 
 pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3137,13 +3189,13 @@ pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.
         out.* = stringifyJson(report) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
     }
-    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
 }
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3154,7 +3206,7 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
     }
-    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+    return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
 }
 
 pub const LiteReplayGeneratedEnrichmentsReport = struct {
@@ -3163,8 +3215,8 @@ pub const LiteReplayGeneratedEnrichmentsReport = struct {
 
 pub export fn antfly_db_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
-    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = resetOutBuffer(out_buf) orelse");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .maintain) orelse");
+    const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -3387,7 +3439,7 @@ pub export fn antfly_db_set_readable_lease_hook(
     callback: ?ReadableLeaseHookFn,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4171,14 +4223,14 @@ pub export fn antfly_db_begin_transaction_with_id(
     participant_count: usize,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const txn_id = txn_id_ptr orelse");
+    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
     beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4192,15 +4244,15 @@ pub export fn antfly_db_write_transaction(
     predicate_count: usize,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const txn_id = txn_id_ptr orelse");
-    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null))");
+    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
+    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
     writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4215,14 +4267,14 @@ pub export fn antfly_db_batch(
     sync_level: u8,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null))");
+    if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4233,7 +4285,7 @@ pub export fn antfly_db_batch_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4259,19 +4311,19 @@ pub export fn antfly_db_resolve_intents(
     commit_version: u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const txn_id = txn_id_ptr orelse");
+    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
         1 => .committed,
         2 => .aborted,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction status must be 0 (pending), 1 (committed), or 2 (aborted)"),
     };
     handle.database().*.resolveTransactionIntents(txn_id.*, txn_status, commit_version) catch |err| return capi.mapError(err);
     return .ok;
@@ -4283,16 +4335,16 @@ pub export fn antfly_db_get_transaction_status(
     out_status: ?*u8,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const out = out_status orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_status orelse");
+    const out = out_status orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = 0;
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const txn_id = txn_id_ptr orelse");
+    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
     const status = handle.database().*.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
     out.* = @backingInt(status);
     return .ok;
@@ -4304,16 +4356,16 @@ pub export fn antfly_db_get_commit_version(
     out_commit_version: ?*u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const out = out_commit_version orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_commit_version orelse");
+    const out = out_commit_version orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = 0;
     const handle = guard.handle;
-    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const txn_id = txn_id_ptr orelse");
+    const txn_id = txn_id_ptr orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": transaction ID pointer must not be null");
     out.* = handle.database().*.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -4324,7 +4376,7 @@ pub export fn antfly_db_get_timestamp(
     out_timestamp: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4341,7 +4393,7 @@ pub export fn antfly_db_lookup_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4364,7 +4416,7 @@ pub export fn antfly_db_get_raw(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4386,7 +4438,7 @@ pub export fn antfly_db_lookup_artifact_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4417,7 +4469,7 @@ pub export fn antfly_decode_artifact_id_json(
     const artifact_id = decodeBase64Alloc(alloc, artifact_id_b64.bytes()) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer alloc.free(artifact_id);
 
-    var artifact_ref = (db_mod.artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id) catch |err| return capi.mapErrorContext(err, @src().fn_name)) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": var artifact_ref = (db_mod.artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id) catch |err|");
+    var artifact_ref = (db_mod.artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id) catch |err| return capi.mapErrorContext(err, @src().fn_name)) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": artifact ID has an invalid public encoding");
     defer artifact_ref.deinit(alloc);
 
     var payload = JsonArtifactRef.init(alloc, artifact_ref) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -4432,7 +4484,7 @@ pub export fn antfly_db_get_schema_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4452,7 +4504,7 @@ pub export fn antfly_db_set_schema_json(
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4465,7 +4517,7 @@ pub export fn antfly_db_set_schema_json(
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .maintain) orelse");
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4507,8 +4559,8 @@ pub export fn antfly_db_run_until_idle_json(
     out_buf_ptr: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out_buf = resetOutBuffer(out_buf_ptr) orelse");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .maintain) orelse");
+    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4545,8 +4597,8 @@ pub export fn antfly_db_pending_work_stats_json(
     out_buf_ptr: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out_buf = resetOutBuffer(out_buf_ptr) orelse");
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4563,7 +4615,7 @@ pub fn antflyDbExtractEnrichmentsJson(
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4588,7 +4640,9 @@ pub fn antflyDbComputeEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    capi.clearLastError();
+    out_buf.* = .{};
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4614,7 +4668,7 @@ pub export fn antfly_db_update_range(
     end: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4633,7 +4687,7 @@ pub export fn antfly_db_get_range_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4651,7 +4705,7 @@ pub export fn antfly_db_get_split_state_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4672,7 +4726,7 @@ pub export fn antfly_db_set_split_state_json(
     state_json: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4698,7 +4752,7 @@ pub export fn antfly_db_set_split_state_json(
         2 => .splitting,
         3 => .finalizing,
         4 => .rolling_back,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": split phase must be in the range 0 through 4"),
     };
     handle.database().*.setSplitState(.{
         .phase = phase,
@@ -4712,7 +4766,7 @@ pub export fn antfly_db_set_split_state_json(
 
 pub export fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4728,7 +4782,7 @@ pub export fn antfly_db_get_split_delta_seq(
     out_seq: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4744,7 +4798,7 @@ pub export fn antfly_db_get_split_delta_final_seq(
     out_seq: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4760,7 +4814,7 @@ pub export fn antfly_db_set_split_delta_final_seq(
     seq: u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4773,7 +4827,7 @@ pub export fn antfly_db_set_split_delta_final_seq(
 
 pub export fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4790,7 +4844,7 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4817,7 +4871,7 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
 
 pub export fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4833,7 +4887,7 @@ pub export fn antfly_db_list_indexes_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4862,7 +4916,7 @@ pub export fn antfly_db_list_enrichments_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4881,7 +4935,7 @@ pub export fn antfly_db_scan_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4953,7 +5007,7 @@ pub export fn antfly_db_scan_hashes(
     out_result: *capi.ScanHashResult,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4998,7 +5052,7 @@ pub export fn antfly_db_scan_hashes(
                     std.heap.c_allocator.free(entry.id_ptr.?[0..entry.id_len]);
                 }
             }
-            return capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+            return capi.recordError(.internal, @src().fn_name ++ ": allocating scan hash entry IDs failed: OutOfMemory");
         };
         @memcpy(id, item.id);
         entries[i] = .{
@@ -5020,7 +5074,7 @@ pub export fn antfly_db_stats_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5294,7 +5348,7 @@ pub fn searchPublicQueryJson(
 pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
     out_buf.* = .{};
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5303,9 +5357,9 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
     const handle = guard.handle;
     if (handle.parent_id != null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": SQL sessions require a root database handle");
     // Managed owners require Raft routing and credentials supplied by API SQL.
-    if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null)");
+    if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
     executeEmbeddedSql(handle, "default", request_json.bytes(), out_buf) catch |err| {
-        if (err == error.RowPolicyAuthenticationRequired) return capi.recordError(.unsupported, @src().fn_name ++ ": if (err == error.RowPolicyAuthenticationRequired)");
+        if (err == error.RowPolicyAuthenticationRequired) return capi.recordError(.unsupported, @src().fn_name ++ ": row policy requires an authenticated identity");
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
         if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("Embedded SQL execution internal failure err={s}", .{@errorName(err)});
         if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch |encoding_error| return capi.mapErrorContext(encoding_error, @src().fn_name);
@@ -5450,7 +5504,7 @@ pub export fn antfly_db_search_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5542,7 +5596,7 @@ pub export fn antfly_db_search_json(
             .k = parsed.value.k,
         };
     } else {
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": search mode must be full_text, dense, or sparse");
     }
 
     var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
@@ -5622,14 +5676,14 @@ pub export fn antfly_db_search_dense(
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (vector_ptr == null or vector_len == 0)");
+    if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": query vector must be nonempty and have a non-null pointer");
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
 
@@ -5654,14 +5708,14 @@ pub export fn antfly_db_search_dense_profile(
     out_profile: *capi.DenseSearchProfile,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (vector_ptr == null or vector_len == 0)");
+    if (vector_ptr == null or vector_len == 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": query vector must be nonempty and have a non-null pointer");
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
 
     var profiled = searchDenseOwnedProfiled(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
@@ -5697,7 +5751,7 @@ pub export fn antfly_db_search_dense_profile(
 
 pub export fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5712,7 +5766,7 @@ pub export fn antfly_db_dense_fixed_packed_result(
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5732,7 +5786,7 @@ pub export fn antfly_db_search_dense_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5765,7 +5819,7 @@ pub export fn antfly_db_search_dense_wire_profile(
     out_profile: *capi.DenseWireSearchProfile,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5818,7 +5872,7 @@ pub export fn antfly_db_search_text_match(
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5861,7 +5915,7 @@ pub export fn antfly_db_search_text_match_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5885,7 +5939,7 @@ pub export fn antfly_db_search_text_term_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5909,7 +5963,7 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5933,7 +5987,7 @@ pub export fn antfly_db_search_hits_json(
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5962,8 +6016,8 @@ pub export fn antfly_db_search_hits_json(
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer parsed.deinit();
 
-    if (parsed.value.include_stored) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (parsed.value.include_stored)");
-    if (!std.mem.eql(u8, parsed.value.return_mode, "parent")) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (!std.mem.eql(u8, parsed.value.return_mode, \"parent\"))");
+    if (parsed.value.include_stored) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": ID-only search does not support include_stored");
+    if (!std.mem.eql(u8, parsed.value.return_mode, "parent")) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": ID-only search requires return_mode parent");
 
     var query_arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer query_arena.deinit();
@@ -5999,12 +6053,12 @@ pub export fn antfly_db_search_hits_json(
             .k = parsed.value.k,
         };
     } else {
-        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": hit-only search mode must be full_text or sparse");
     }
 
     var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
-    if (result.graph_results.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (result.graph_results.len > 0)");
+    if (result.graph_results.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": ID-only search cannot return graph result documents");
 
     const result_alloc = std.heap.c_allocator;
     const hits = result_alloc.alloc(capi.DenseSearchHit, result.hits.len) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -6016,7 +6070,7 @@ pub export fn antfly_db_search_hits_json(
         result_alloc.free(hits);
     }
     for (result.hits, 0..) |hit, i| {
-        if (hit.stored_data != null or hit.chunk_hits.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (hit.stored_data != null or hit.chunk_hits.len > 0)");
+        if (hit.stored_data != null or hit.chunk_hits.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": ID-only search cannot return stored documents or chunk hits");
         const id = result_alloc.dupe(u8, hit.id) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         hits[i] = .{
             .id_ptr = id.ptr,
@@ -6521,7 +6575,7 @@ pub export fn antfly_db_execute_graph_queries_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -6542,7 +6596,7 @@ pub export fn antfly_db_execute_graph_queries_json(
 
     if (parsed.value.identity_read_generation == null) {
         for (parsed.value.named_sets) |named_set| {
-            if (named_set.hit_ids_b64.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (named_set.hit_ids_b64.len > 0)");
+            if (named_set.hit_ids_b64.len > 0) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": named ID sets require a pinned read generation");
         }
     }
 
@@ -6597,7 +6651,7 @@ pub export fn antfly_db_aggregate_hits_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -6607,7 +6661,7 @@ pub export fn antfly_db_aggregate_hits_json(
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     defer parsed.deinit();
 
-    if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null)");
+    if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": hit IDs require identity_read_generation");
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, parsed.value.identity_read_generation) catch |err| return capi.mapError(err);
 
     const requests = toAggregationRequest(handle.alloc, parsed.value.aggregations) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -6857,12 +6911,256 @@ pub fn legacyGraphWeightBound(value: f64) ?f64 {
     return if (value > 0 and std.math.isFinite(value)) value else null;
 }
 
+/// Render using the durable resolver's exact template and Unicode tables. No writes.
+pub export fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, mention_json: capi.Slice, out_buffer: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "resolver key output pointer must not be null");
+    out.* = .{};
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(configs);
+    }
+    for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        const Mention = struct { text: []const u8, label: []const u8, local_id: []const u8 = "query" };
+        var parsed = std.json.parseFromSlice(Mention, handle.alloc, mention_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver mention JSON");
+        defer parsed.deinit();
+        const resolver_lib = @import("antfly_resolver");
+        const routing = @import("../storage/db/resolution_runtime.zig");
+        const excluded = routing.siblingClaimedLabelsAlloc(handle.alloc, configs, &cfg) catch |err| return capi.mapError(err);
+        defer routing.freeSiblingClaimedLabels(handle.alloc, excluded);
+        var resolver = resolver_lib.Resolver.initFromParts(handle.alloc, cfg.table, cfg.key_template, .{ .labels = cfg.labels, .exclude_labels = excluded }, cfg.type_must_match, "") catch |err| return capi.mapError(err);
+        defer resolver.deinit();
+        if (!resolver.consumesLabel(parsed.value.label)) return capi.mapErrorContext(error.InvalidArgument, "mention label is not consumed by this resolver");
+        const minted = resolver.renderKeyAlloc(handle.alloc, .{ .text = parsed.value.text, .label = parsed.value.label, .local_id = parsed.value.local_id }) catch |err| return capi.mapErrorContext(err, "rendering resolver key");
+        defer handle.alloc.free(minted);
+        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer handle.alloc.free(effective_aliases);
+        const key = resolver_lib.canonicalAliasKey(effective_aliases, minted) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration() }) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+/// Extract ad-hoc text (or accept extraction JSON) and resolve against the
+/// durable resolver, including aliases and ANN. Never publishes query artifacts.
+pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buffer: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "query resolution output pointer must not be null");
+    out.* = .{};
+    var guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    var handle = guard.handle;
+    const alloc = handle.alloc;
+    var request = std.json.parseFromSlice(std.json.Value, alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid query resolution JSON");
+    defer request.deinit();
+    if (request.value != .object) return capi.mapErrorContext(error.InvalidArgument, "query request must be an object containing text or extraction");
+    const text = request.value.object.get("text");
+    const extraction = request.value.object.get("extraction");
+    if ((text == null) == (extraction == null)) return capi.mapErrorContext(error.InvalidArgument, "supply exactly one of text or extraction");
+    if (text) |value| {
+        if (value != .string) return capi.mapErrorContext(error.InvalidArgument, "query text must be a string");
+    }
+    if (extraction) |value| {
+        if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
+    }
+    const configs = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(alloc);
+        alloc.free(configs);
+    }
+    for (configs) |*cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
+        // Native connections cache producers on their provider-owning snapshot;
+        // read-only databases otherwise have no enrichment producer. Repeated
+        // queries reuse transport/capability/model state. Only construction is locked;
+        // invocation contexts share the runtime's synchronized capability cache.
+        const producer_handle = if (guard.connection != null) handle.parent_handle orelse handle else handle;
+        const cached_producer = text != null and (guard.connection != null or handle.database().enrichment_runtime == null);
+        if (cached_producer) {
+            producer_handle.query_producer_mutex.lockUncancelable(handleLockIo());
+            defer producer_handle.query_producer_mutex.unlock(handleLockIo());
+            if (producer_handle.query_producer == null) {
+                const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
+                producer_handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(alloc, io, .{ .antfly_provider = producer_handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+            }
+        }
+        const extracted = if (text) |value| extracted: {
+            var plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor");
+            defer plan.deinit(alloc);
+            if (guard.connection != null) guard.suspendQuery();
+            const bytes = if (cached_producer)
+                plan.produce(alloc, value.string, producer_handle.query_producer.?.producer().withInvocationContext(.{})) catch |err| return capi.mapErrorContext(err, "extracting query text")
+            else
+                handle.database().extractResolverQueryAlloc(alloc, cfg.*, value.string, null) catch |err| return capi.mapErrorContext(err, "extracting query text");
+            if (!guard.resumeQuery(handle_ptr)) {
+                alloc.free(bytes);
+                return capi.mapErrorContext(error.Busy, "query handle closed during extraction; retry");
+            }
+            if (guard.entry_error) |code| {
+                alloc.free(bytes);
+                return capi.ensureError(code, @src().fn_name);
+            }
+            handle = guard.handle;
+            // Canonical lookup uses the latest snapshot. Configuration changes
+            // require a retry rather than mixing two resolver/schema versions.
+            const current = handle.database().listResolvers(alloc) catch |err| {
+                alloc.free(bytes);
+                return capi.mapError(err);
+            };
+            defer {
+                for (current) |*entry| entry.deinit(alloc);
+                alloc.free(current);
+            }
+            var unchanged = current.len == configs.len;
+            if (unchanged) for (current, configs) |a, b| {
+                if (!a.eql(b)) {
+                    unchanged = false;
+                    break;
+                }
+            };
+            var latest_plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| {
+                alloc.free(bytes);
+                return capi.mapError(err);
+            };
+            defer latest_plan.deinit(alloc);
+            if (!unchanged or !plan.eql(latest_plan)) {
+                alloc.free(bytes);
+                return capi.mapErrorContext(error.Busy, "resolver or extractor configuration changed during extraction; retry");
+            }
+            break :extracted bytes;
+        } else std.json.Stringify.valueAlloc(alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
+        defer alloc.free(extracted);
+        const resolution = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, @import("entity_sink.zig").candidateSource(handle), handle.database().resolution_embedder) catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
+        defer alloc.free(resolution);
+        var parsed_extraction = std.json.parseFromSlice(std.json.Value, alloc, extracted, .{}) catch |err| return capi.mapError(err);
+        defer parsed_extraction.deinit();
+        var parsed_resolution = std.json.parseFromSlice(std.json.Value, alloc, resolution, .{}) catch |err| return capi.mapError(err);
+        defer parsed_resolution.deinit();
+        out.* = stringifyJson(.{ .extraction = parsed_extraction.value, .resolution = parsed_resolution.value }) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+/// Persist a resolver-level redirect and enqueue corpus re-resolution atomically.
+/// Call run_until_idle before expecting all existing mention edges to be re-keyed.
+pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, merge_json: capi.Slice) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    const Merge = struct { key: []const u8, target: []const u8 };
+    var parsed = std.json.parseFromSlice(Merge, handle.alloc, merge_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver merge JSON");
+    defer parsed.deinit();
+    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(configs);
+    }
+    for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
+        defer aliases.deinit(handle.alloc);
+        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer handle.alloc.free(effective_aliases);
+        for (effective_aliases) |alias| {
+            if (std.mem.eql(u8, alias.key, parsed.value.key)) {
+                if (std.mem.eql(u8, alias.target, parsed.value.target)) return .ok;
+                return capi.mapErrorContext(error.InvalidArgument, "key already redirects; merge its canonical target instead");
+            }
+        }
+        aliases.appendSlice(handle.alloc, cfg.merges) catch |err| return capi.mapError(err);
+        aliases.append(handle.alloc, .{ .key = parsed.value.key, .target = parsed.value.target }) catch |err| return capi.mapError(err);
+        var next = cfg;
+        next.merges = aliases.items;
+        next.merge_state_version = 1;
+        next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+/// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
+/// The resolver, identity state and replay cursors commit together.
+pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    const KeyMap = struct { key: []const u8, target: []const u8 };
+    const Request = struct { table: []const u8, key_template: []const u8, reset_merges: bool = false, key_map: ?[]const KeyMap = null, aliases: ?[]const @import("antfly_resolver").KeyAlias = null };
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (request.key_map != null and request.aliases != null) return capi.mapErrorContext(error.InvalidArgument, "explicit aliases require reset_merges:true");
+    if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
+    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(configs);
+    }
+    for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        // Validate the destination before publishing identity state.
+        _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
+        var next = cfg;
+        next.table = request.table;
+        next.key_template = request.key_template;
+        var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
+        defer aliases.deinit(handle.alloc);
+        var merges: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
+        defer merges.deinit(handle.alloc);
+        if (request.key_map) |mapping| {
+            for (mapping, 0..) |item, i| {
+                if (item.key.len == 0 or item.target.len == 0) return capi.mapErrorContext(error.InvalidArgument, "namespace mapping keys must be non-empty");
+                for (mapping[0..i]) |prior| if (std.mem.eql(u8, prior.key, item.key)) return capi.mapErrorContext(error.InvalidArgument, "duplicate source key in namespace mapping");
+            }
+            const Map = struct {
+                fn find(items: []const KeyMap, key: []const u8) ?[]const u8 {
+                    for (items) |item| if (std.mem.eql(u8, item.key, key)) return item.target;
+                    return null;
+                }
+            };
+            for (cfg.aliases) |alias| aliases.append(handle.alloc, .{
+                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
+                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
+            }) catch |err| return capi.mapError(err);
+            for (cfg.merges) |alias| merges.append(handle.alloc, .{
+                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
+                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
+            }) catch |err| return capi.mapError(err);
+        }
+        next.aliases = request.aliases orelse aliases.items;
+        next.merges = merges.items;
+        next.merge_generation = if (merges.items.len > 0)
+            std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow")
+        else
+            0;
+        next.merge_state_version = if (merges.items.len > 0) 1 else 0;
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
 pub export fn antfly_db_add_index_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -6888,7 +7186,7 @@ pub export fn antfly_db_add_index_json(
         const config = std.json.parseFromSliceLeaky(std.json.Value, a, normalized_config, .{}) catch |err| return capi.mapError(err);
         if (config != .object) return capi.mapError(error.InvalidIndexConfig);
         if (config.object.get("sparse")) |sparse| {
-            if (sparse != .bool) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": if (sparse != .bool)");
+            if (sparse != .bool) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": sparse must be a JSON boolean");
             if (sparse.bool) break :blk .sparse_vector;
         }
         break :blk .dense_vector;
@@ -6925,7 +7223,29 @@ pub export fn antfly_db_add_index_json(
     else
         parsed.value.config_json;
     defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
-    handle.database().*.addIndex(.{
+    // Native clients replay inline configs on every open. Admit an identical
+    // existing index idempotently, while retaining duplicate-config conflicts.
+    var existing_index = false;
+    if (handle.lite_profile == .native) {
+        const installed = handle.database().listIndexes(handle.alloc) catch |err| {
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        };
+        defer db_mod.types.freeIndexConfigs(handle.alloc, installed);
+        for (installed) |cfg| {
+            if (!std.mem.eql(u8, cfg.name, parsed.value.name)) continue;
+            const same = cfg.kind == kind and (@import("../storage/db/enrichment/config_validation.zig").producerJsonValuesEqual(handle.alloc, cfg.config_json, stored_config_json) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            });
+            if (!same) {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapErrorContext(error.InvalidArgument, "index already exists with a different configuration");
+            }
+            existing_index = true;
+        }
+    }
+    if (!existing_index) handle.database().*.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
         .config_json = stored_config_json,
@@ -6941,10 +7261,12 @@ pub export fn antfly_db_add_index_json(
     // all-or-nothing.
     if (handle.lite_profile == .native and kind == .graph) {
         registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
-            _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
+            if (!existing_index) _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
                 std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
             };
             if (rollback) |*undo| undo.restore();
+            if (err == error.ResolverMergeNamespaceChange)
+                return capi.mapErrorContext(err, "changing a resolver table or key_template requires explicitly resetting or migrating its durable merges");
             return capi.mapError(err);
         };
     }
@@ -6958,13 +7280,13 @@ pub export fn antfly_db_delete_index(
     out_deleted: ?*bool,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_deleted orelse");
+    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
     const handle = guard.handle;
     out.* = handle.database().*.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
@@ -6976,7 +7298,7 @@ pub export fn antfly_db_add_enrichment_json(
     config_json: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -6999,16 +7321,16 @@ pub export fn antfly_db_delete_enrichment(
     out_deleted: ?*bool,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_deleted orelse");
+    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = false;
     const handle = guard.handle;
-    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const kind = parseEnrichmentKind(kind_slice.bytes()) orelse");
+    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": unknown enrichment kind");
     out.* = handle.database().*.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -7022,7 +7344,7 @@ pub export fn antfly_db_get_edges_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7033,7 +7355,7 @@ pub export fn antfly_db_get_edges_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
     };
     const edges = handle.database().*.getEdges(handle.alloc, index_name.bytes(), key.bytes(), edge_type.bytes(), dir) catch |err| return capi.mapError(err);
     defer graphFreeEdges(handle.alloc, edges);
@@ -7057,7 +7379,7 @@ pub export fn antfly_db_traverse_edges_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7087,7 +7409,7 @@ pub export fn antfly_db_traverse_edges_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
     };
     const results = handle.database().*.traverseEdges(handle.alloc, parsed.value.index_name, start_key, .{
         .edge_types = parsed.value.edge_types,
@@ -7124,7 +7446,7 @@ pub export fn antfly_db_get_neighbors_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7135,7 +7457,7 @@ pub export fn antfly_db_get_neighbors_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
     };
     const results = handle.database().*.getNeighbors(handle.alloc, index_name.bytes(), key.bytes(), edge_type.bytes(), dir) catch |err| return capi.mapError(err);
     defer traversalFreeResults(handle.alloc, results);
@@ -7159,7 +7481,7 @@ pub export fn antfly_db_find_shortest_path_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7190,7 +7512,7 @@ pub export fn antfly_db_find_shortest_path_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
     };
     const weight_mode: db_mod.types.GraphPathWeightMode = if (std.mem.eql(u8, parsed.value.weight_mode, "min_weight"))
         .min_weight
@@ -7221,7 +7543,7 @@ pub export fn antfly_db_find_k_shortest_paths_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7253,7 +7575,7 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         0 => .out,
         1 => .in,
         2 => .both,
-        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
     };
     const weight_mode: db_mod.types.GraphPathWeightMode = if (std.mem.eql(u8, parsed.value.weight_mode, "min_weight"))
         .min_weight
@@ -7291,7 +7613,7 @@ pub export fn antfly_db_match_pattern_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7347,7 +7669,7 @@ pub export fn antfly_db_match_pattern_json(
             0 => .out,
             1 => .in,
             2 => .both,
-            else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
+            else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": graph direction must be 0 (out), 1 (in), or 2 (both)"),
         };
         pattern[i] = .{
             .alias = step.alias,
@@ -7389,7 +7711,7 @@ pub export fn antfly_db_create_shadow_index_manager(
     original_range_end: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7402,7 +7724,7 @@ pub export fn antfly_db_create_shadow_index_manager(
 
 pub export fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7418,7 +7740,7 @@ pub export fn antfly_db_get_shadow_index_dir(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7436,7 +7758,7 @@ pub export fn antfly_db_find_median_key(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .read) orelse");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7459,7 +7781,7 @@ pub export fn antfly_db_split(
     prepare_only: bool,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7485,7 +7807,7 @@ pub export fn antfly_db_finalize_split(
     new_end: capi.Slice,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .exclusive) orelse");
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -7505,7 +7827,7 @@ pub export fn antfly_db_snapshot(
     out_size: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const guard = enterHandle(handle_ptr, .write) orelse");
+    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);

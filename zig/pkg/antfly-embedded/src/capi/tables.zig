@@ -339,23 +339,23 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
             _ = root.table_handles.swapRemove(i);
         }
     }
-    if (root.table_handles.items.len >= 1024) return h.capi.recordError(.busy, @src().fn_name ++ ": if (root.table_handles.items.len >= 1024)");
+    if (root.table_handles.items.len >= 1024) return h.capi.recordError(.busy, @src().fn_name ++ ": open table handle limit (1024) exceeded");
     const db = get(root, name.bytes()) catch |err| return h.capi.mapError(err);
     const child = root.alloc.create(h.Handle) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     child.* = .{ .alloc = root.alloc, .db = undefined, .selected_db = db, .parent_id = ptr, .parent_handle = root, .open_mode = root.open_mode, .lite_profile = root.lite_profile, .lite_generated_enrichment_replay = root.lite_generated_enrichment_replay };
-    child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch {
+    child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch |err| {
         root.alloc.destroy(child);
-        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": allocating the selected table name");
     };
     child.selected_table_id = db.core.identity_namespace.table_id;
-    const id = h.handle_registry.register(child) catch {
+    const id = h.handle_registry.register(child) catch |err| {
         root.alloc.free(child.selected_table_name.?);
         root.alloc.destroy(child);
-        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": registering the table handle");
     };
-    root.table_handles.append(root.alloc, id) catch {
+    root.table_handles.append(root.alloc, id) catch |err| {
         h.closeHandleId(id);
-        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
+        return h.capi.mapErrorContext(err, @src().fn_name ++ ": tracking the open table handle");
     };
     out.* = id;
     return .ok;

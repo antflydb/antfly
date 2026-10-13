@@ -27907,6 +27907,8 @@ pub const DB = struct {
         /// nonblocking: a refresh holding a group activity must not wait for
         /// in-flight resolution or promotion callbacks.
         drain_backfill: bool = true,
+        /// Only the explicit namespace migration operation may bypass this guard.
+        migrate_namespace: bool = false,
     };
 
     /// Add or replace a resolver. Inserts and material config changes re-resolve
@@ -27937,7 +27939,10 @@ pub const DB = struct {
                 defer probe.abort();
                 try self.requireOnlineArtifactCatalogMutableLocked(&probe);
             }
-            const result = try self.core.upsertResolver(cfg);
+            const result = if (options.migrate_namespace)
+                try self.core.index_manager.upsertResolverWithNamespaceMigration(self.core.store, cfg, true)
+            else
+                try self.core.upsertResolver(cfg);
             if (result != .updated_no_backfill) {
                 if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
             }
@@ -29080,6 +29085,54 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
+    }
+
+    /// Run only this resolver's configured text extractor, without scheduling
+    /// enrichments or publishing a synthetic document. Producer invocation
+    /// retains the runtime's memory plan, cancellation and transport controls.
+    pub const ResolverQueryPlan = struct {
+        config_json: []u8,
+        content_type: []u8,
+        pub fn deinit(self: *ResolverQueryPlan, alloc: Allocator) void {
+            alloc.free(self.config_json);
+            alloc.free(self.content_type);
+        }
+        pub fn eql(self: ResolverQueryPlan, other: ResolverQueryPlan) bool {
+            return std.mem.eql(u8, self.config_json, other.config_json) and std.mem.eql(u8, self.content_type, other.content_type);
+        }
+        pub fn produce(self: ResolverQueryPlan, alloc: Allocator, text: []const u8, producer: asset_producer_mod.Producer) ![]u8 {
+            return producer.produce(alloc, .{ .producer_type = .extractor, .config_json = self.config_json, .content_type = self.content_type, .source_text = text, .item_id = "query" });
+        }
+    };
+
+    /// Capture everything needed for inference before releasing the database gate.
+    pub fn resolverQueryPlanAlloc(self: *DB, alloc: Allocator, cfg: index_manager_mod.ResolverConfig) !ResolverQueryPlan {
+        if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
+        const enrichments = try self.listEnrichments(alloc);
+        defer {
+            for (enrichments) |*enrichment| enrichment.deinit(alloc);
+            alloc.free(enrichments);
+        }
+        for (enrichments) |enrichment| {
+            if (enrichment.kind != .asset or !std.mem.eql(u8, enrichment.name, cfg.source_artifact)) continue;
+            var config = try asset_producer_mod.parseProducerConfig(alloc, enrichment.producer_json);
+            defer config.deinit(alloc);
+            if (config.type != .extractor) return error.InvalidArgument;
+            const json = try alloc.dupe(u8, config.config_json);
+            errdefer alloc.free(json);
+            return .{ .config_json = json, .content_type = try alloc.dupe(u8, enrichment.content_type) };
+        }
+        return error.InvalidArgument;
+    }
+
+    pub fn extractResolverQueryAlloc(self: *DB, alloc: Allocator, cfg: index_manager_mod.ResolverConfig, text: []const u8, producer_override: ?asset_producer_mod.Producer) ![]u8 {
+        var plan = try self.resolverQueryPlanAlloc(alloc, cfg);
+        defer plan.deinit(alloc);
+        const producer = producer_override orelse if (self.enrichment_runtime) |runtime|
+            if (runtime.config.asset_producer) |configured| configured.withInvocationContext(.{ .io = runtime.config.io, .cancellation = runtime.config.cancellation }) else return error.SqlFeatureNotSupported
+        else
+            return error.SqlFeatureNotSupported;
+        return plan.produce(alloc, text, producer);
     }
 
     pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {

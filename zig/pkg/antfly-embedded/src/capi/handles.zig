@@ -100,6 +100,13 @@ pub const Handle = struct {
     // this caller intent across its own reconfigure passes -- see its doc
     // comment.
     lite_generated_enrichment_replay: bool = false,
+    /// Lazy foreground producer for read-only text queries. The mutex covers
+    /// construction; each call uses a scoped invocation context.
+    query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
+    query_producer_mutex: std.Io.Mutex = .init,
+    /// Protected by the native path gate; pins provider and extractor lifetime.
+    query_borrows: usize = 0,
+
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads
     // and data writes and exclusively for schema/admin changes. Data writes
@@ -179,7 +186,16 @@ pub fn stopLiteEmbeddedInference(handle: *Handle) void {
     }
 }
 
+pub fn invalidateQueryProducer(handle: *Handle) void {
+    if (handle.query_producer) |producer| {
+        producer.deinit();
+        handle.alloc.destroy(producer);
+        handle.query_producer = null;
+    }
+}
+
 pub fn closeHandle(handle: *Handle) void {
+    invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);

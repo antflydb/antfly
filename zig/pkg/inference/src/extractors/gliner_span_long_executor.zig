@@ -25,10 +25,28 @@ const compute = @import("../ops/ops.zig");
 const wire = @import("extraction_v2.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const A = std.mem.Allocator;
-const window_limits = @import("../models/gliner_span_window_limits.zig").qualified;
+
+// Preserve generic caller limits; only the exact qualified 1B route supplies
+// the separately published caps. Generic planner byte/word defaults are unchanged.
+fn planningLimits(options: executor.Options) @import("../models/gliner_span_window_limits.zig").Limits {
+    return options.long_document_limits orelse .{
+        .max_windows = options.max_sequences_per_item,
+        .max_request_tokens = options.max_request_tokens,
+    };
+}
+
+test "span window limits remain model scoped" {
+    const generic = planningLimits(.{ .max_sequences_per_item = 128, .max_request_tokens = 200000 });
+    try std.testing.expectEqual(@as(usize, 128), generic.max_windows);
+    try std.testing.expectEqual(@as(usize, 200000), generic.max_request_tokens);
+    const qualified = planningLimits(.{ .max_sequences_per_item = 128, .max_request_tokens = 200000, .long_document_limits = @import("../models/gliner_span_window_limits.zig").qualified });
+    try std.testing.expectEqual(@as(usize, 64), qualified.max_windows);
+    try std.testing.expectEqual(@as(usize, 65536), qualified.max_request_tokens);
+}
 
 pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing: processor.Options, options: executor.Options) !executor.PreparedItem {
     const selected = item.options.long_document;
+    const limits = planningLimits(options);
     var body_words: usize = @min(selected.window_words, preprocessing.max_sequence_tokens);
     if (selected.overlap_words >= body_words) return error.InvalidExtractionOptions;
     while (true) {
@@ -38,9 +56,9 @@ pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing
             .word_splitter = item.options.word_splitter,
             .max_window_body_words = body_words,
             .overlap_words = selected.overlap_words,
-            .max_windows = @min(selected.max_windows, @min(options.max_sequences_per_item, window_limits.max_windows)),
-            .max_document_bytes = window_limits.max_document_bytes,
-            .max_document_words = window_limits.max_document_words,
+            .max_windows = @min(selected.max_windows, @min(options.max_sequences_per_item, limits.max_windows)),
+            .max_document_bytes = limits.max_document_bytes,
+            .max_document_words = limits.max_document_words,
             .control = options.control,
             .inference_fingerprint = @splat(0),
         });
@@ -61,7 +79,7 @@ pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing
             };
             built += 1;
             total = try std.math.add(usize, total, batch.input_ids.len);
-            if (total > @min(options.max_request_tokens, window_limits.max_request_tokens)) return error.ExtractionRequestLimitExceeded;
+            if (total > @min(options.max_request_tokens, limits.max_request_tokens)) return error.ExtractionRequestLimitExceeded;
         }
         if (too_long) {
             for (batches[0..built]) |*batch| batch.deinit();

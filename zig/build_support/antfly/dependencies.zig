@@ -643,12 +643,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     a2a_mod.addImport("antfly-json", json_mod);
     const matcher_mod = b.addModule("antfly_matcher", .{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     const resolver_mod = b.addModule("antfly_resolver", .{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
