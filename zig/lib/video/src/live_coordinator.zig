@@ -18,7 +18,6 @@ const std = @import("std");
 const media = @import("antfly_media");
 const windows = @import("live_windows.zig");
 const sampling = @import("sampling.zig");
-const h264 = @import("h264.zig");
 const pictures = @import("h264_pictures.zig");
 const avc = @import("avc.zig");
 pub const Options = struct {
@@ -31,6 +30,7 @@ pub const Options = struct {
 };
 pub const Prepared = struct {
     window: windows.Window,
+    logical: ?pictures.Index = null,
     policy: sampling.TimestampPolicy,
     ordinal: usize,
     source_start_ns: i64,
@@ -39,12 +39,14 @@ pub const Prepared = struct {
     dash_timing: ?media.hls.DashTiming = null,
     hls_timing: ?media.live_mp4.HlsTiming = null,
     pub fn deinit(self: *Prepared) void {
+        if (self.logical) |*logical| logical.deinit();
         self.window.deinit();
         self.* = undefined;
     }
 };
 /// Single consumer. Unit ownership transfers only after successful append.
 /// A prepared output owns independent storage; commit only after delivery succeeds.
+pub const Stats = struct { validation_walks: usize = 0, metadata_snapshots: usize = 0 };
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -56,6 +58,9 @@ pub const Coordinator = struct {
     sealed_ns: ?i64 = null,
     tail_ns: i64 = 0,
     pending_ns: ?i64 = null,
+    logical: ?pictures.Index = null,
+    logical_base: usize = 0,
+    stats: Stats = .{},
     ordinal: usize = 0,
     finished: bool = false,
     epoch_committed: bool = false,
@@ -70,6 +75,7 @@ pub const Coordinator = struct {
     pub fn deinit(self: *Coordinator) void {
         for (self.units[0..self.count]) |*unit| unit.deinit();
         if (self.pending) |*unit| unit.deinit();
+        if (self.logical) |*logical| logical.deinit();
         self.reservation.deinit();
         self.* = undefined;
     }
@@ -108,18 +114,26 @@ pub const Coordinator = struct {
         var view = try windows.join(self.allocator, "live-probe", self.units[0 .. self.count + 1], self.options.window);
         defer view.deinit();
         var sealed = self.sealed_ns;
+        var pending_ns: ?i64 = null;
+        var logical: ?pictures.Index = null;
+        defer if (logical) |*index| index.deinit();
         if (view.reader.track.codec == .mjpeg) {
             const last = view.reader.packets[view.reader.packets.len - 1];
             sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
         } else {
-            var logical = try pictures.streaming(self.allocator, &view.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
-            defer logical.deinit();
+            logical = try pictures.streaming(self.allocator, &view.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
             const last = view.reader.packets[view.reader.packets.len - 1];
             var frontier = try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale);
-            if (logical.pending_pts) |pts| frontier = @min(frontier, try ns(pts, view.reader.track.timescale));
+            if (logical.?.pending_pts) |pts| frontier = @min(frontier, try ns(pts, view.reader.track.timescale));
             sealed = @max(sealed orelse 0, frontier);
-            self.pending_ns = if (logical.pending_pts) |pts| try ns(pts, view.reader.track.timescale) else null;
+            pending_ns = if (logical.?.pending_pts) |pts| try ns(pts, view.reader.track.timescale) else null;
         }
+        if (self.logical) |*previous| previous.deinit();
+        self.logical = logical;
+        logical = null;
+        self.logical_base = 0;
+        self.pending_ns = pending_ns;
+        if (self.logical != null) self.stats.validation_walks += 1;
         self.count += 1;
         self.retained_bytes += bytes;
         // Start remains fixed after the first window has been delivered.
@@ -153,17 +167,13 @@ pub const Coordinator = struct {
         var window = try windows.join(self.allocator, "live-model-window", self.units[0..self.count], self.options.window);
         errdefer window.deinit();
         var eligible = false;
-        var logical_sampling = false;
+        var logical: ?pictures.Index = null;
+        errdefer if (logical) |*index| index.deinit();
         if (window.reader.track.codec == .avc) {
-            const cfg = try h264.configParse(self.allocator, window.reader.track.avcc);
-            defer cfg.groups.deinit(self.allocator);
-            logical_sampling = window.reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes;
-        }
-        if (logical_sampling) {
-            var logical = try pictures.streaming(self.allocator, &window.reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
-            defer logical.deinit();
-            if (logical.pending_pts) |pts| if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * window.reader.track.timescale) return error.InvalidLiveWatermark;
-            for (logical.pictures) |picture| {
+            const validated = self.logical orelse return error.InvalidLivePictureIndex;
+            logical = try validated.cloneRebased(self.allocator, self.logical_base, window.reader.packets.len, self.options.window.stream.admission_pool, self.options.window.stream.control);
+            if (logical.?.pending_pts) |pts| if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * window.reader.track.timescale) return error.InvalidLiveWatermark;
+            for (logical.?.pictures) |picture| {
                 const time = @as(i128, picture.pts) * std.time.ns_per_s;
                 eligible = eligible or (time >= @as(i128, start) * window.reader.track.timescale and time < @as(i128, end) * window.reader.track.timescale);
             }
@@ -173,7 +183,8 @@ pub const Coordinator = struct {
                 eligible = eligible or (time >= @as(i128, start) * window.reader.track.timescale and time < @as(i128, end) * window.reader.track.timescale);
             }
         }
-        return .{ .window = window, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
+        if (logical != null) self.stats.metadata_snapshots += 1;
+        return .{ .window = window, .logical = logical, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
     }
     pub fn commit(self: *Coordinator, prepared: *const Prepared) !void {
         try self.options.window.stream.control.check();
@@ -195,8 +206,7 @@ pub const Coordinator = struct {
             }
         } else {
             var reader = prepared.window.reader;
-            var logical = try pictures.streaming(self.allocator, &reader, .{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } });
-            defer logical.deinit();
+            const logical = prepared.logical orelse return error.InvalidLivePictureIndex;
             for (logical.pictures) |picture| {
                 if (try ns(picture.pts, reader.track.timescale) > end) continue;
                 var payload = try reader.readPacket(picture.first_packet);
@@ -228,11 +238,17 @@ pub const Coordinator = struct {
             }
         }
         var released: usize = 0;
-        for (self.units[0..keep]) |unit| released = try std.math.add(usize, released, try charge(unit));
+        var removed_packets: usize = 0;
+        for (self.units[0..keep]) |unit| {
+            released = try std.math.add(usize, released, try charge(unit));
+            removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
+        }
+        const next_base = try std.math.add(usize, self.logical_base, removed_packets);
         self.start_ns = end;
         self.epoch_committed = true;
         self.ordinal += 1;
         self.retained_bytes -= released;
+        self.logical_base = next_base;
         for (self.units[0..keep]) |*unit| unit.deinit();
         std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
         self.count -= keep;
@@ -264,6 +280,9 @@ pub const Coordinator = struct {
                 self.sealed_ns = null;
                 self.tail_ns = 0;
                 self.pending_ns = null;
+                if (self.logical) |*logical| logical.deinit();
+                self.logical = null;
+                self.logical_base = 0;
                 self.finished = false;
                 self.epoch_committed = false;
             }
@@ -538,4 +557,39 @@ test "live coordinator unfinished fields cap automatic and explicit watermarks" 
     try std.testing.expect(saw_pending and saw_ready);
     try std.testing.expectEqual(@as(?i64, null), flow.pending_ns);
     try flow.finish();
+}
+
+test "live coordinator reuses admitted validation metadata across prepare commit and eviction" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var ingest = try media.live_mp4.Ingest.init(a, "reuse", fixture[0..797], .{ .stream = .{ .admission_pool = &pool } });
+    defer ingest.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .window = .{ .stream = .{ .admission_pool = &pool } } });
+    defer flow.deinit();
+    var one = try part(&ingest, 797, 11206);
+    defer if (one) |*unit| unit.deinit();
+    var two = try part(&ingest, 11206, 20811);
+    defer if (two) |*unit| unit.deinit();
+    try flow.append(&one);
+    try flow.append(&two);
+    try std.testing.expectEqual(@as(usize, 2), flow.stats.validation_walks);
+    // Preparation and commit no longer need transient decoder workspace budget.
+    const limit = pool.limits.host_bytes;
+    pool.limits.host_bytes = pool.snapshot().host_bytes + 128 * 1024;
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.logical != null);
+    try flow.commit(&prepared);
+    try std.testing.expectEqual(@as(usize, 2), flow.stats.validation_walks);
+    try std.testing.expect(flow.logical_base > 0);
+    try flow.finish();
+    var tail = (try flow.prepare()).?;
+    defer tail.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tail.logical.?.pictures[0].first_packet);
+    try flow.commit(&tail);
+    try std.testing.expectEqual(@as(usize, 2), flow.stats.validation_walks);
+    try std.testing.expectEqual(@as(usize, 2), flow.stats.metadata_snapshots);
+    try std.testing.expect(prepared.logical.?.pictures.len > tail.logical.?.pictures.len);
+    pool.limits.host_bytes = limit;
 }

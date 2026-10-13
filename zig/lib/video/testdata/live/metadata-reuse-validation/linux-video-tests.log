@@ -1,0 +1,17 @@
+1/16 video_test_root.test_0...OK
+2/16 src.mod.test_0...OK
+3/16 src.transport_avc.test.native TS AVC packet adapter decodes every selected picture against independent FFmpeg...OK
+4/16 src.transport_avc.test.native TS AVC adapter allocation failures release normalized payload metadata and admission...OK
+5/16 src.transport_avc.test.native TS AVC HLS factory preserves packet leases through discontinuity and transport retry...OK
+6/16 src.transport_avc.test.native TS AVC HLS factory allocation failures reclaim both epochs and state...OK
+7/16 src.transport_avc.test.native TS AVC rejects reused or unowned PES timestamps...OK
+8/16 src.transport_avc.test.native TS AVC access units preserve Annex B leading zero bytes...OK
+9/16 src.codecs.test.test_0...OK
+10/16 src.webm_pictures.test_0...OK
+11/16 src.h264_pictures.test.AVC logical picture index counts field pairs partitions and configuration epochs...OK
+12/16 src.h264_pictures.test.AVC logical index bounds callback metadata and releases shared decode admission...OK
+13/16 src.h264_pictures.test.AVC streaming index holds incomplete field pairs until their mate arrives...OK
+14/16 src.h264_pictures.test.AVC streaming index rejects corrupt NALs rather than manufacturing a pending tail...OK
+15/16 src.h264_pictures.test.AVC logical snapshots rebase retained suffix and keep independent admission...OK
+16/16 src.avc.test.AVC rejects malformed lengths and in-band parameter changes before decode...OK
+All 16 tests passed.

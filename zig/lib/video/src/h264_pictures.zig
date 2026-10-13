@@ -24,11 +24,41 @@ pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []h264.Picture,
     timescale: u32,
+    packet_count: usize = 0,
     pending_pts: ?i64 = null,
     pending_first_packet: ?usize = null,
+    reservation: media.admission.Token = .{},
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.pictures);
+        self.reservation.deinit();
         self.* = undefined;
+    }
+    /// Own a metadata snapshot after whole-unit preroll eviction. The source
+    /// owns its original allocation; this result can outlive it independently.
+    pub fn cloneRebased(self: Index, a: std.mem.Allocator, base: usize, packet_count: usize, pool: ?*media.admission.Pool, control: media.source.Control) !Index {
+        try control.check();
+        const end = try std.math.add(usize, base, packet_count);
+        if (end != self.packet_count) return error.InvalidLivePictureIndex;
+        var count: usize = 0;
+        for (self.pictures) |picture| {
+            if (picture.first_packet >= end) return error.InvalidLivePictureIndex;
+            if (picture.first_packet >= base) count += 1;
+        }
+        if (self.pending_first_packet) |pending| if (pending < base or pending >= end) return error.InvalidLivePictureIndex;
+        const bytes = try std.math.mul(usize, count, @sizeOf(h264.Picture));
+        var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const owned = try a.alloc(h264.Picture, count);
+        errdefer a.free(owned);
+        var at: usize = 0;
+        for (self.pictures) |picture| {
+            try control.check();
+            if (picture.first_packet < base) continue;
+            owned[at] = picture;
+            owned[at].first_packet -= base;
+            at += 1;
+        }
+        return .{ .allocator = a, .pictures = owned, .timescale = self.timescale, .packet_count = packet_count, .pending_pts = self.pending_pts, .pending_first_packet = if (self.pending_first_packet) |pending| pending - base else null, .reservation = reservation };
     }
     /// Return transport selectors for logical pictures in presentation order.
     /// The first member selects the complete field/partition assembly on replay.
@@ -120,7 +150,14 @@ pub fn streaming(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Optio
 fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, partial: bool) !Index {
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
+    if (options.max_pictures == 0) return error.ResourceLimitExceeded;
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    // Account both growth buffers and transient old/new realloc owners. The
+    // fixed initial growth allowance also covers very small configured limits.
+    const slots = try std.math.mul(usize, try std.math.add(usize, options.max_pictures, 8), 3);
+    const metadata_bound = try std.math.mul(usize, slots, @sizeOf(h264.Picture) + @sizeOf(u8));
+    var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = metadata_bound }) else media.admission.Token{};
+    errdefer reservation.deinit();
     var collector = Collector{ .allocator = a, .limit = options.max_pictures };
     defer collector.pictures.deinit(a);
     defer collector.planes.deinit(a);
@@ -157,7 +194,12 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
         }
     }
     collector.pictures.items.len = kept;
-    return .{ .allocator = a, .pictures = try collector.pictures.toOwnedSlice(a), .timescale = reader.track.timescale, .pending_pts = collector.pending_pts, .pending_first_packet = collector.pending_first_packet };
+    const owned = try collector.pictures.toOwnedSlice(a);
+    errdefer a.free(owned);
+    collector.planes.deinit(a);
+    collector.planes = .empty;
+    try reservation.resize(.{ .host_bytes = owned.len * @sizeOf(h264.Picture) });
+    return .{ .allocator = a, .pictures = owned, .timescale = reader.track.timescale, .packet_count = reader.packets.len, .pending_pts = collector.pending_pts, .pending_first_packet = collector.pending_first_packet, .reservation = reservation };
 }
 
 test "AVC logical picture index counts field pairs partitions and configuration epochs" {
@@ -201,7 +243,7 @@ test "AVC logical index bounds callback metadata and releases shared decode admi
     try std.testing.expectEqual(before, pool.snapshot().host_bytes);
     var pictures = try index(a, &reader, .{});
     defer pictures.deinit();
-    try std.testing.expectEqual(before, pool.snapshot().host_bytes);
+    try std.testing.expectEqual(before + pictures.pictures.len * @sizeOf(h264.Picture), pool.snapshot().host_bytes);
 }
 
 test "AVC streaming index holds incomplete field pairs until their mate arrives" {
@@ -240,4 +282,27 @@ test "AVC streaming index rejects corrupt NALs rather than manufacturing a pendi
     const header = @as(usize, @intCast(reader.packets[0].offset)) + reader.track.nal_length_bytes;
     bytes[header] |= 128;
     try std.testing.expectError(error.MalformedVideoPacket, streaming(a, &reader, .{}));
+}
+
+test "AVC logical snapshots rebase retained suffix and keep independent admission" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .identity = "snapshot", .admission_pool = &pool, .storage = .{ .borrowed = @embedFile("../testdata/h264-dynamic-geometry.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const before = pool.snapshot().host_bytes;
+    var original = try streaming(a, &reader, .{});
+    var original_live = true;
+    defer if (original_live) original.deinit();
+    const base = original.pictures[1].first_packet;
+    var copy = try original.cloneRebased(a, base, reader.packets.len - base, &pool, .{});
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 2), copy.pictures.len);
+    try std.testing.expectEqual(@as(usize, 0), copy.pictures[0].first_packet);
+    try std.testing.expectEqual(@as(u32, 96), copy.pictures[0].width);
+    try std.testing.expectError(error.InvalidLivePictureIndex, original.cloneRebased(a, 0, reader.packets.len - 1, &pool, .{}));
+    original.deinit();
+    original_live = false;
+    try std.testing.expectEqual(before + copy.pictures.len * @sizeOf(h264.Picture), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(u32, 80), copy.pictures[1].width);
 }

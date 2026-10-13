@@ -1911,3 +1911,44 @@ or transport dependency is added. Protocol basis: [HLS 2nd edition draft 22,
 sections 4.4.5.2 and 6.3.7](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-22).
 
 See [qualification receipts](../media/testdata/hls-delta-validation/README.md).
+
+
+### Reuse validated live AVC metadata
+
+The coordinator retains the completed/pending logical-picture index from each
+successful append. Preparation owns an admitted metadata snapshot; commit uses
+that snapshot and still validates IDR payloads before moving the cursor. Whole-unit
+preroll eviction records a packet base, and snapshots rebase only retained
+pictures. Packet-count/selector bounds and pending barriers prevent invalid
+suffixes. Appending or draining an epoch replaces/releases the old index only
+after fallible validation succeeds. Delivered metadata outlives coordinator
+mutation and source release independently.
+
+Logical indexes now retain shared admission for owned metadata. Construction
+accounts conservatively for ArrayList growth/reallocation, then shrinks the
+reservation to retained picture bytes after temporary owners are released.
+Snapshots acquire their own reservation before copying. A regression prepares
+and commits with only 128 KiB admission headroom, which cannot admit a fresh
+native decoding workspace. Existing IO/cancellation/allocation failure and
+field-assembly checks still pass.
+
+Source-pinned before/after coordinator measurements preserve source intervals,
+eligibility and ordered packet clock/payload digests. The small real Sintel case
+reduces validation walks from 9 to 6 and pooled warm median time from 218.6 to
+132.1 ms. Normalized-clock interleaved field packets reduce walks from 72 to 24
+and median time from 29.4 to 6.6 ms. A remux-only 52-second, 480x320 real clip
+delivers 27 identical windows with 54 versus 27 walks; its single warm diagnostic
+sample changes from 40.5 to 24.4 seconds. These measure the serial control plane,
+including owner release, rather than full model throughput. They exclude file
+acquisition. Admitted peak rises by roughly 0.8 MiB because metadata construction
+is now conservatively charged; this is not an RSS measurement.
+
+Current pretrained CPU, Metal and actual Linux ARM64 live windows remain exactly
+equal to complete-clip source-time vectors on all three recorded Sintel windows,
+with 246 tokens each. Pinned PyTorch rankings/top-k and score gates pass. The
+qualification reports expose coordinator validation/snapshot counts separately
+from model work. Wider field/dynamic pretrained parity, append-time incremental
+decoding, repeated model planning, cross-window projection reuse and full-pipeline
+performance remain required by the full active non-CUDA scope.
+
+See [qualification receipts](testdata/live/metadata-reuse-validation/README.md).

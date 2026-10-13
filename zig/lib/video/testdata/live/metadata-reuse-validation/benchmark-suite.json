@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "id": "sintel-6s",
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ]
+    },
+    {
+      "id": "interleaved-fields",
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/lib/video/testdata/h264-paff-interleaved-fragments-10-2.mp4",
+      "packet_units": true,
+      "normalize_clock": true,
+      "duration_ns": 250000000
+    }
+  ]
+}

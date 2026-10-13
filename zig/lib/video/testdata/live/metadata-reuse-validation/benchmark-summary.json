@@ -1,0 +1,57 @@
+{
+  "sintel-6s": {
+    "windows": 3,
+    "warm_samples_per_variant": 20,
+    "warm_median_ns": {
+      "before": 218645021.0,
+      "after": 132131521.0
+    },
+    "reduction": 0.39568017421261104,
+    "validation_walks": {
+      "before": 9,
+      "after": 6
+    },
+    "admitted_peak_bytes": {
+      "before": 101177924,
+      "after": 101990501
+    },
+    "exact_packet_window_digest": true,
+    "normalized_packet_clocks": false
+  },
+  "interleaved-fields": {
+    "windows": 24,
+    "warm_samples_per_variant": 20,
+    "warm_median_ns": {
+      "before": 29363104.0,
+      "after": 6602854.5
+    },
+    "reduction": 0.7751309091845331,
+    "validation_walks": {
+      "before": 72,
+      "after": 24
+    },
+    "admitted_peak_bytes": {
+      "before": 1373547,
+      "after": 2185548
+    },
+    "exact_packet_window_digest": true,
+    "normalized_packet_clocks": true
+  },
+  "sintel-52s-480x320": {
+    "windows": 27,
+    "cold_ns": {
+      "before": 41177422208,
+      "after": 20406768167
+    },
+    "warm_ns": {
+      "before": 40477523834,
+      "after": 24399620375
+    },
+    "validation_walks": {
+      "before": 54,
+      "after": 27
+    },
+    "exact_packet_window_digest": true,
+    "single_warm_sample_diagnostic": true
+  }
+}

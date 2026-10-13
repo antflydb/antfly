@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded
+install-live-coordinator-benchmark success
++- install live-coordinator-benchmark success
+   +- compile exe live-coordinator-benchmark safe native success 20s MaxRSS:650M
+      +- WriteFile video_prepare_shader.h cached
+

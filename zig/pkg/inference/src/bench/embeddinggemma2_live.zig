@@ -33,6 +33,8 @@ const Measurement = struct {
     input_tokens: usize,
     stream_seconds: f64,
     baseline_seconds: f64,
+    coordinator_validation_walks: usize,
+    coordinator_metadata_snapshots: usize,
     max_abs: f32,
     cosine: f64,
     vector: []f32,
@@ -140,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
             }
             const cosine = dot / @sqrt(left * right);
             if (max_abs > 0.00001 or cosine < 0.999999) return error.StreamParityFailed;
-            try results.append(a, .{ .case = case.id, .ordinal = event.ordinal, .epoch = event.epoch, .start_ns = event.source_start_ns, .end_ns = event.source_end_ns, .input_tokens = result.input_tokens, .stream_seconds = stream_seconds, .baseline_seconds = baseline_seconds, .max_abs = max_abs, .cosine = cosine, .vector = try a.dupe(f32, result.vector), .baseline_vector = try a.dupe(f32, baseline.vector) });
+            try results.append(a, .{ .case = case.id, .ordinal = event.ordinal, .epoch = event.epoch, .start_ns = event.source_start_ns, .end_ns = event.source_end_ns, .input_tokens = result.input_tokens, .stream_seconds = stream_seconds, .baseline_seconds = baseline_seconds, .coordinator_validation_walks = coordinator.stats.validation_walks, .coordinator_metadata_snapshots = coordinator.stats.metadata_snapshots, .max_abs = max_abs, .cosine = cosine, .vector = try a.dupe(f32, result.vector), .baseline_vector = try a.dupe(f32, baseline.vector) });
             windows += 1;
             std.debug.print("live {s}/{d}: tokens={d} max_abs={d} seconds={d}\n", .{ case.id, event.ordinal, result.input_tokens, max_abs, stream_seconds });
         }

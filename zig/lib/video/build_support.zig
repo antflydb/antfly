@@ -108,6 +108,15 @@ pub fn addBenchmarks(b: *std.Build, root: std.Build.LazyPath, target: std.Build.
     b.step("bench-video", "Measure completed decode/preparation latency, GPU time and memory").dependOn(&run.step);
     b.step("check-video-benchmark", "Compile the native video benchmark").dependOn(&executable.step);
     b.step("install-video-benchmark", "Install completed video benchmarking for external execution").dependOn(&b.addInstallArtifact(executable, .{}).step);
+    const live_source = b.option([]const u8, "live-benchmark-video-source", "Alternate maintained video module root for source-pinned coordinator comparison");
+    const live_core = b.createModule(.{ .root_source_file = if (live_source) |source| .{ .cwd_relative = source } else root.path(b, "src/mod.zig"), .target = target, .optimize = optimize });
+    configure(b, live_core, root, target, null);
+    const live_root = b.createModule(.{ .root_source_file = root.path(b, "src/live_coordinator_benchmark.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    live_root.addImport("antfly_video", live_core);
+    live_root.addImport("antfly_media", live_core.import_table.get("antfly_media").?);
+    const live_exe = b.addExecutable(.{ .name = "live-coordinator-benchmark", .root_module = live_root, .use_llvm = executable.use_llvm });
+    b.step("install-live-coordinator-benchmark", "Install completed live validation/window benchmark").dependOn(&b.addInstallArtifact(live_exe, .{}).step);
+
     const webm_module = b.createModule(.{ .root_source_file = root.path(b, "webm_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     configure(b, webm_module, root, target, null);
     // Benchmark-only source substitution permits matched experiments without
