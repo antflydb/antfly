@@ -13705,7 +13705,7 @@ export interface components {
             provider: "antfly";
             /**
              * @description The name of the generator model.
-             * @example onnxruntime/Gemma-3-ONNX
+             * @example ggml-org/gemma-4-E4B-it-GGUF
              */
             model: string;
             /**
@@ -13949,6 +13949,16 @@ export interface components {
             source_artifact_kind?: "asset" | "chunk" | "any";
             resolution_artifact: string;
             key_template: string;
+            /**
+             * @description Materialize canonical entity documents. False resolves graph keys without promotion.
+             * @default true
+             */
+            promote?: boolean;
+            /** @description Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution. */
+            aliases?: {
+                key: string;
+                target: string;
+            }[];
             /** @description Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table). */
             labels?: string[];
             /** @default true */
@@ -17520,6 +17530,8 @@ export interface components {
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Optional result key. Defaults to the metric name. */
             name?: string;
             /** @description Graph index that owns the published metric. */
@@ -17548,6 +17560,8 @@ export interface components {
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Graph index that owns the published metric. */
             index: string;
             /** @description Graph metric name to blend into the search hit score. */
@@ -17908,6 +17922,11 @@ export interface components {
             edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
             /** @default 100 */
             limit?: number;
+            /**
+             * @description Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+             * @default true
+             */
+            deduplicate_nodes?: boolean;
             /** @default false */
             include_paths?: boolean;
             /**
@@ -19269,6 +19288,15 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            /**
+             * @description Pull-time qualified request profiles for this exact artifact,
+             *     including backend, supported features and min/max geometry.
+             *     Runtime admission revalidates artifact identity and resource limits.
+             *     Omitted for artifacts without a qualification receipt.
+             */
+            qualified_limits?: {
+                [key: string]: unknown;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
@@ -19517,7 +19545,7 @@ export interface components {
             presence_penalty?: number;
             /**
              * @description Structured output control. OpenAI-compatible entry point for requesting JSON output.
-             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
              */
             response_format?: components["schemas"]["InferenceGenerateResponseFormat"];
             /**
@@ -19784,7 +19812,7 @@ export interface components {
          *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
          */
-        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        InferenceModelBackend: "auto" | "native" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
         /**
          * @description Optional artifact format preference for loading a model.
          * @enum {string}
@@ -19806,7 +19834,6 @@ export interface components {
          *
          *     Backends:
          *     - `native` - Native CPU backend
-         *     - `onnx` - ONNX Runtime backend
          *     - `metal` - Apple Metal backend
          *     - `cuda` - NVIDIA CUDA backend
          *     - `xla` - PJRT/XLA compiled backend
@@ -20069,11 +20096,6 @@ export interface components {
              * @example true
              */
             native?: boolean;
-            /**
-             * @description Whether the ONNX Runtime backend is built into this runtime
-             * @example false
-             */
-            onnx?: boolean;
             /**
              * @description Whether the Metal backend is built into this runtime
              * @example true

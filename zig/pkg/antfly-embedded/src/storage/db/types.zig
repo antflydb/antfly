@@ -1861,6 +1861,10 @@ pub const SearchRequest = struct {
     remote_snapshot: ?[]const u8 = null,
     /// Borrowed, trusted coordinator control; never accepted from public JSON.
     native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    /// Trusted lower bound from already retained publication-wide winners.
+    /// Strict score pruning only: equal scores retain their global tie chance.
+    /// Never populated from public JSON or forwarded to count-only execution.
+    minimum_competitive_score: ?f32 = null,
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2090,6 +2094,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
+    "minimum_competitive_score",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {
@@ -2311,6 +2316,8 @@ pub const GraphMetricFreshness = enum {
     fresh,
 };
 
+pub const GraphMetricDirection = enum { out, in, both };
+
 pub const GraphMetricQuery = struct {
     index_name: []const u8,
     metric_name: []const u8,
@@ -2324,6 +2331,7 @@ pub const GraphMetricQuery = struct {
     /// Damping override for personalized reads. Null keeps the metric's
     /// configured damping. Only valid together with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2345,6 +2353,7 @@ pub const GraphMetricRerank = struct {
     seed_nodes: []const []const u8 = &.{},
     /// Damping override for personalized blends. Only valid with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;
@@ -2944,8 +2953,10 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
     metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
     metric_value_names: [][]u8 = &.{},
+    metric_owners: []graph_query_mod.GraphMetricOwner = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2986,9 +2997,12 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |columns| columns.deinit(alloc);
         if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
         for (self.metric_value_names) |name| alloc.free(name);
         if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.metric_owners) |*owner| owner.deinit(alloc);
+        alloc.free(self.metric_owners);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -3236,6 +3250,7 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,
     has_lease: bool = false,

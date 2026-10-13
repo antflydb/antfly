@@ -218,14 +218,24 @@ const Stream = struct {
     position_arena: std.heap.ArenaAllocator,
     hits: []Hit = &.{},
     hidden: []bool = &.{},
+    page_rows: usize = batch_size,
     at: usize = 0,
     failed: ?Response = null,
     fn refill(self: *Stream, stable: A, response_a: A, root: V, orders: []const Order, rrf: bool, executor: Executor) !void {
         try executor.checkpoint(executor.ptr);
+        // Small public pages should not hydrate/highlight an entire 128-row
+        // batch per source. Fully suppressed overlay batches grow geometrically
+        // to preserve bounded archive-scale traversal and amortize refill I/O.
+        if (self.hidden.len != 0) {
+            const fully_hidden = for (self.hidden) |hidden| {
+                if (!hidden) break false;
+            } else true;
+            if (fully_hidden) self.page_rows = @min(batch_size, self.page_rows * 2);
+        }
         _ = self.arena.reset(.free_all);
         const pa = self.arena.allocator();
         var request = try clone(pa, root, V);
-        try request.object.put(pa, "limit", .{ .integer = batch_size });
+        try request.object.put(pa, "limit", .{ .integer = @intCast(self.page_rows) });
         if (rrf) {
             const encoded = try std.json.Stringify.valueAlloc(pa, [_]Order{.{ .field = "_score", .desc = true }}, .{});
             try request.object.put(pa, "order_by", try std.json.parseFromSliceLeaky(V, pa, encoded, .{}));
@@ -265,7 +275,7 @@ const Stream = struct {
             if (remaining != expected and try std.math.add(usize, self.position.raw_count, remaining) != expected) return error.CatalogGenerationChanged;
         } else self.position.total = remaining;
         const available = self.position.total.? - self.position.raw_count;
-        if (items != .array or items.array.items.len != @min(batch_size, available)) return error.QueryCandidateBudgetExceeded;
+        if (items != .array or items.array.items.len != @min(self.page_rows, available)) return error.QueryCandidateBudgetExceeded;
         self.hits = try pa.alloc(Hit, items.array.items.len);
         self.hidden = try pa.alloc(bool, self.hits.len);
         @memset(self.hidden, false);
@@ -412,6 +422,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         restored = std.json.parseFromSliceLeaky(Continuation, scratch, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
         if (restored.?.version != 2 or restored.?.sources.len != leaves.len or !std.mem.eql(u8, restored.?.fingerprint, &fingerprint)) return error.CatalogGenerationChanged;
     }
+    const initial_rows = if (count or aggregations != null or graph_spec != null) batch_size else @max(1, @min(batch_size, offset +| limit +| 1));
     const streams = try scratch.alloc(Stream, leaves.len);
     var initialized: usize = 0;
     defer for (streams[0..initialized]) |*stream| {
@@ -425,7 +436,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         const name = leaf.object.get("table") orelse return error.InvalidQueryRequest;
         if (name != .string or name.string.len == 0) return error.InvalidQueryRequest;
         if ((try names.getOrPut(scratch, name.string)).found_existing) return error.InvalidQueryRequest;
-        stream.* = .{ .position = if (restored) |state| state.sources[i] else .{ .table = name.string }, .arena = std.heap.ArenaAllocator.init(budget.allocator()), .position_arena = std.heap.ArenaAllocator.init(budget.allocator()) };
+        stream.* = .{ .page_rows = initial_rows, .position = if (restored) |state| state.sources[i] else .{ .table = name.string }, .arena = std.heap.ArenaAllocator.init(budget.allocator()), .position_arena = std.heap.ArenaAllocator.init(budget.allocator()) };
         initialized += 1;
         if (!std.mem.eql(u8, stream.position.table, name.string) or stream.position.raw_count < stream.position.visible_count or (stream.position.total != null and stream.position.raw_count > stream.position.total.?)) return error.InvalidQueryRequest;
         // Reauthorize even exhausted leaves. A previous page cannot freeze grants.
@@ -737,13 +748,15 @@ test "external lake keyed composition hides a newer nonmatching row and tombston
 test "external lake disjoint RRF union proves a bounded window over archive-scale totals" {
     const Fixture = struct {
         fn checkpoint(_: *anyopaque) !void {}
-        fn execute(_: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
+        fn execute(raw: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
             const query = try std.json.parseFromSliceLeaky(V, scratch, body, .{});
             const start = if (query.object.get("search_after")) |after| (try std.fmt.parseInt(usize, after.array.items[1].string, 10)) + 1 else 0;
             const maximum = try integer(query.object.get("limit").?);
+            const observed: *usize = @ptrCast(@alignCast(raw));
+            observed.* = @max(observed.*, maximum);
             var hits: std.ArrayList(V) = .empty;
             for (start..@min(start + maximum, 1000000)) |rank| {
                 const id = try std.fmt.allocPrint(scratch, "{d:0>8}", .{rank});
@@ -753,13 +766,14 @@ test "external lake disjoint RRF union proves a bounded window over archive-scal
             return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .hits = .{ .total = .{ .value = 1000000 - start, .relation = "exact" }, .hits = hits.items } }} }, .{}), false);
         }
     };
-    var marker: u8 = 0;
+    var marker: usize = 0;
     const a = std.testing.allocator;
     var response = try execute(a, "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"limit\":2}", .{ .ptr = &marker, .execute = Fixture.execute, .checkpoint = Fixture.checkpoint });
     defer response.deinit(a);
     var decoded = try std.json.parseFromSlice(V, a, response.body, .{});
     defer decoded.deinit();
     const hits = decoded.value.object.get("responses").?.array.items[0].object.get("hits").?;
+    try std.testing.expectEqual(@as(usize, 3), marker);
     try std.testing.expectEqual(@as(i64, 2000000), hits.object.get("total").?.object.get("value").?.integer);
     try std.testing.expectEqual(@as(usize, 2), hits.object.get("hits").?.array.items.len);
 }

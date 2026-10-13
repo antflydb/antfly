@@ -20,7 +20,7 @@ Antfly already provides the substrate for this:
   and entity enrichment, plus source adapters (S3, web, filesystem, git, GDrive)
 - Antfly core — tables, hybrid indexes, graph with typed edges, retrieval
   agent with streaming tool use
-- Termite — rerankers, embedders, chunkers, NER, relation extraction
+- Antfly Inference — rerankers, embedders, chunkers, NER, relation extraction
 
 The missing piece is the warehouse bridge: a managed way to pull
 agent-relevant slices of BigQuery/Snowflake into Antfly, keep them in sync,
@@ -73,7 +73,7 @@ signal for extractor and index tuning.
 └──────────────▲─────────────────────────────────▲────────────────┘
                │                                 │
 ┌──────────────┴────────────────┐  ┌─────────────┴────────────────┐
-│  Warehouse Bridge (GKE job)   │  │  Termite (ML inference)      │
+│  Warehouse Bridge (GKE job)   │  │  Antfly Inference (ML inference)      │
 │  - BQ Storage Read API        │  │  - embedders                 │
 │  - Snowflake Streams / CDC    │  │  - rerankers                 │
 │  - view-scoped "contexts"     │  │  - GLiNER NER                │
@@ -156,7 +156,7 @@ tenancy model simple.
 One or more Antfly tables per context, configured with:
 
 - `full_text_v0` index over `title + content`
-- `embeddings` index with chunked content (Termite chunker)
+- `embeddings` index with chunked content (Antfly Inference chunker)
 - `graph` index with `entity_extraction` enabled (see
   entity relationship extraction (a dependency with no retained standalone plan))
 
@@ -284,7 +284,7 @@ The dashboard surface (Antfarm, built on `@antfly/components`) exposes:
 
 - **Antfly**: GKE Autopilot, antfly-operator manages the StatefulSet.
   Persistent disks for Pebble; GCS for AFB portable backups.
-- **Termite**: GKE node pool with GPU for embedders/rerankers; termite
+- **Antfly Inference**: GKE node pool with GPU for embedders/rerankers; termite
   operator manages scaling. CPU-only pool for GLiNER/REBEL if latency is
   acceptable.
 - **Warehouse Bridge**: Cloud Run job (scheduled) + Pub/Sub subscriber

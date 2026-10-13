@@ -746,6 +746,7 @@ pub const Status = enum(u32) {
     invalid_runnable_policy = 0x10005,
     invalid_runnable_transition = 0x10006,
     manager_cleanup_capacity_unavailable = 0x10007,
+    seed_replica_policy_mismatch = 778,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

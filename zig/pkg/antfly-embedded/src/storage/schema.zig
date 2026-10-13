@@ -260,6 +260,8 @@ pub const IndexSortField = struct {
 };
 
 pub const TableSchema = struct {
+    /// Decoder provenance only; never part of schema semantics or serialized bytes.
+    decoded_format_version: u32 = storage_format_version,
     version: u32 = 0,
     default_type: []const u8 = "_default",
     ttl_duration_ns: u64 = 0,
@@ -331,6 +333,51 @@ pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
     return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
+/// Bind schemas actually emitted by v0.2.1-v0.2.5 (ASCH v12) to their
+/// public validator. Only metadata absent from that writer may be recovered;
+/// every field it wrote must still match. Modern epochs remain strictly equal.
+pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, derived: TableSchema) !bool {
+    if (try schemasEqual(alloc, stored, derived)) return true;
+    if (stored.decoded_format_version != 12 or stored.storage_mode != .document or
+        derived.storage_mode != .document or derived.requires_public_schema or
+        derived.external_base_source != null or
+        derived.requires_typed_expressions or derived.requires_predicate_expressions or
+        derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
+        derived.requires_numeric_modifiers or derived.requires_array_expressions or
+        derived.requires_array_constructors) return false;
+    var projection = derived;
+    projection.relational_columns = &.{};
+    const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
+    defer alloc.free(documents);
+    for (documents) |*document| {
+        document.declared_paths = &.{};
+        document.unindexed_paths = &.{};
+    }
+    projection.full_text_documents = documents;
+    const old_bytes = try serializeSchemaFormat(alloc, stored, 12);
+    defer alloc.free(old_bytes);
+    const projected_bytes = try serializeSchemaFormat(alloc, projection, 12);
+    defer alloc.free(projected_bytes);
+    return std.mem.eql(u8, old_bytes, projected_bytes);
+}
+
+/// Recover additive runtime metadata from an authenticated public contract
+/// without rewriting the released writer's active or historical schema bytes.
+fn deserializeStoredSchema(alloc: Allocator, data: []const u8, public_json: ?[]const u8) !TableSchema {
+    const stored = try deserializeSchema(alloc, data);
+    errdefer freeSchema(alloc, stored);
+    if (stored.decoded_format_version != 12 or public_json == null) return stored;
+    const public_schema = @import("../schema/mod.zig");
+    var parsed = try public_schema.parseValidatedTableSchema(alloc, public_json.?);
+    defer parsed.deinit(alloc);
+    var derived = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
+    errdefer freeSchema(alloc, derived);
+    if (!try schemasEqualForPublicBinding(alloc, stored, derived)) return error.InvalidSchemaUpdateRequest;
+    derived.decoded_format_version = stored.decoded_format_version;
+    freeSchema(alloc, stored);
+    return derived;
+}
+
 fn encodedSchemasEqual(alloc: Allocator, existing: []const u8, incoming: []const u8) !bool {
     if (std.mem.eql(u8, existing, incoming)) return true;
     if (existing.len < 12 or incoming.len < 12 or
@@ -345,7 +392,7 @@ fn encodedSchemasEqual(alloc: Allocator, existing: []const u8, incoming: []const
     defer freeSchema(alloc, old_schema);
     const next_schema = try deserializeSchema(alloc, incoming);
     defer freeSchema(alloc, next_schema);
-    return schemasEqual(alloc, old_schema, next_schema);
+    return schemasEqualForPublicBinding(alloc, old_schema, next_schema);
 }
 
 /// Serialize only the schema state that changes a full-text generation's
@@ -1111,6 +1158,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
     };
 
     const result: TableSchema = .{
+        .decoded_format_version = fmt_version,
         .version = version,
         .external_base_source = external,
         .default_type = default_type,
@@ -1733,7 +1781,11 @@ pub fn loadSchema(store: anytype, alloc: Allocator) !?TableSchema {
     };
     const data = try alloc.dupe(u8, raw);
     defer alloc.free(data);
-    return try deserializeSchema(alloc, data);
+    const public_json = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    return try deserializeStoredSchema(alloc, data, public_json);
 }
 
 pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?TableSchema {
@@ -1749,7 +1801,13 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     };
     const data = try alloc.dupe(u8, raw);
     defer alloc.free(data);
-    return try deserializeSchema(alloc, data);
+    const public_key = try @import("../schema/mod.zig").versionedSchemaKeyAlloc(alloc, version);
+    defer alloc.free(public_key);
+    const public_json = txn.get(public_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    return try deserializeStoredSchema(alloc, data, public_json);
 }
 
 /// Load every immutable schema layout stored for row decoding. The returned
@@ -4126,4 +4184,58 @@ test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000015Z", formatted);
     try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs(formatted));
+}
+
+test "schema v02 public binding preserves writer fields and refuses modern conflicts" {
+    const alloc = std.testing.allocator;
+    const api = @import("../schema/mod.zig");
+    const json = @embedFile("testdata/v02-server/schema.json");
+    const bytes = @embedFile("testdata/v02-server/schema.asch");
+    var parsed = try api.parseValidatedTableSchema(alloc, json);
+    defer parsed.deinit(alloc);
+    const derived = try api.deriveRuntimeTableSchema(alloc, parsed);
+    defer freeSchema(alloc, derived);
+    const stored = try deserializeSchema(alloc, bytes);
+    defer freeSchema(alloc, stored);
+    try std.testing.expect(!stored.requires_public_schema);
+    try std.testing.expect(!try schemasEqual(alloc, stored, derived));
+    try std.testing.expect(try schemasEqualForPublicBinding(alloc, stored, derived));
+    const bound = try deserializeStoredSchema(alloc, bytes, json);
+    defer freeSchema(alloc, bound);
+    try std.testing.expect(try schemasEqual(alloc, bound, derived));
+    var conflict = derived;
+    conflict.ttl_duration_ns = 42;
+    try std.testing.expect(!try schemasEqualForPublicBinding(alloc, stored, conflict));
+    conflict = stored;
+    conflict.decoded_format_version = storage_format_version;
+    try std.testing.expect(!try schemasEqualForPublicBinding(alloc, conflict, derived));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deserializeStoredSchema(alloc, bytes, "{\"version\":0,\"default_type\":\"different\"}"));
+
+    const path = try tempTestPath(alloc, "schema-v02-preserved");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const version_key = try schemaVersionKeyAlloc(alloc, 0);
+    defer alloc.free(version_key);
+    const public_key = try api.versionedSchemaKeyAlloc(alloc, 0);
+    defer alloc.free(public_key);
+    try store.putBatch(&.{
+        .{ .key = schema_key, .value = bytes },
+        .{ .key = version_key, .value = bytes },
+        .{ .key = "\x00\x00__metadata__:schema_json", .value = json },
+        .{ .key = public_key, .value = json },
+    }, &.{});
+    const active = (try loadSchema(&store, alloc)).?;
+    defer freeSchema(alloc, active);
+    const historical = (try loadSchemaVersion(&store, alloc, 0)).?;
+    defer freeSchema(alloc, historical);
+    try std.testing.expect(try schemasEqual(alloc, active, derived));
+    try std.testing.expect(try schemasEqual(alloc, historical, derived));
+    try std.testing.expect(!try saveSchema(&store, alloc, derived));
+    for ([_][]const u8{ schema_key, version_key }) |key| {
+        const actual = try store.get(alloc, key);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, bytes, actual);
+    }
 }

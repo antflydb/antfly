@@ -6621,12 +6621,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
+    // Leave enough time to reach the final hop under concurrent build load.
+    // Resetting the budget at each redirect still exceeds the elapsed bound.
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]bool{ false, true }) |coordinated| {
             var server = try TestServer.start(alloc, io, &.{
-                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 500 * std.time.ns_per_ms } },
+                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 3000 * std.time.ns_per_ms } },
             });
             defer server.deinit();
             const Task = struct {
@@ -6641,7 +6643,7 @@ test "request redirects share a deadline for buffered streaming and cancellable 
                 .keep_alive = false,
                 .cancel_in_flight_on_shutdown = coordinated,
                 .retry_policy = .{ .max_retries = 0 },
-                .timeouts = .{ .request_ms = 250 },
+                .timeouts = .{ .request_ms = 1500 },
             });
             defer client.deinit();
             const url = try std.fmt.allocPrint(alloc, "{s}/first", .{server.baseUrl()});
@@ -6650,14 +6652,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
             defer output.deinit(alloc);
             const start = common.milliTimestamp(io);
             // Exercise both default and per-request budgets.
-            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 250 else null };
+            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 1500 else null };
             if (to_writer) {
                 try std.testing.expectError(error.Timeout, client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null));
                 try std.testing.expectEqual(@as(usize, 0), output.items.len);
             } else {
                 try std.testing.expectError(error.Timeout, client.get(url, opts));
             }
-            try std.testing.expect(common.milliTimestamp(io) - start < 350);
+            try std.testing.expect(common.milliTimestamp(io) - start < 2000);
             try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, server.route_hits);
             try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
         }

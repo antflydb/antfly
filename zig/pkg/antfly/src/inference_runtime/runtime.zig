@@ -1477,6 +1477,7 @@ test "inference runtime preload parser preserves registry variants and explicit 
 
     try std.testing.expectError(error.InvalidArguments, preload_model_spec.parse("embedder:"));
     try std.testing.expectError(error.InvalidArguments, preload_model_spec.parse("embedder:metal:"));
+    try std.testing.expectError(error.InvalidArguments, parsePreloadModelFlag("embedder:onnx:owner/model"));
 }
 
 test "inference runtime preserves effective process envelope provenance" {

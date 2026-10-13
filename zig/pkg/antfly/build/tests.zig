@@ -1493,6 +1493,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native doc values plan rejects runtime value kind mismatch",
         "required native sort fails on absent physical doc value section",
         "required native sort fails on sparse doc value entry miss",
+        "pattern native pointer scalar filters",
         "pattern typed structured filters accept explicit path alias",
         "pattern typed structured filters reject ambiguous field and path aliases",
         "pattern typed structured filters reject malformed and unbounded ranges",
@@ -2637,6 +2638,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
+    b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -2733,7 +2736,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics" },
+        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -3772,7 +3775,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster production managed index publication recovery exact replay"},
+        .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_managed_index_vopr_tests = b.addRunArtifact(production_cluster_managed_index_vopr_tests);
@@ -5855,6 +5858,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",
+        "distributed graph supports cross-range traverse target selectors",
+        "distributed graph traverse target nodes filter returned nodes without pruning frontier",
+        "distributed graph traverse routes cross-table frontier by table generation",
+        "distributed graph path materialization preserves table provenance",
+        "public graph metric borrowed wire",
+        "graph metric native response adoption",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
@@ -6104,6 +6113,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const v02_upgrade_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_marker_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"ensureCompatible"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_upgrade_step = b.step("antfly-v02-upgrade-test", "Verify released v0.2.1+ schema/backup fixtures and directory admission");
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_upgrade_tests).step);
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_marker_tests).step);
+    lib_storage_test_step.dependOn(v02_upgrade_step);
+
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },
@@ -6737,6 +6761,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.artifact_footprint.",
             "storage.artifact_input_capture.",
             "storage.artifact_publication_dispatch.",
+            "storage.prepared_score_plan.",
             "storage.projection_seal.",
             "storage.retained_frame.",
             "storage.admission_waiter.",
@@ -6749,6 +6774,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.prepared_score_plan.",
+            "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
             "storage.typed_json.",

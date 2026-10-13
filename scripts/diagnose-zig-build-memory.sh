@@ -38,6 +38,7 @@ Options:
   --sample-seconds SEC   Duration for macOS sample. Default: 10
   --no-stack-sample      Disable macOS sample capture
   --label LABEL          Label used in output file names
+  --command              Run the exact command after -- instead of constructing a Zig build
   -h, --help             Show this help
 
 Environment:
@@ -66,9 +67,14 @@ stack_sample="1"
 label=""
 zig_bin="${ZIG_BIN:-zig}"
 extra_args=()
+command_mode=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --command)
+            command_mode=1
+            shift
+            ;;
         --zig-dir)
             zig_dir="$2"
             shift 2
@@ -138,6 +144,11 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$command_mode" = 1 ] && [ "${#extra_args[@]}" = 0 ]; then
+    echo "--command requires a command after --" >&2
+    exit 2
+fi
+
 if [ ! -f "${zig_dir}/build.zig" ]; then
     echo "no build.zig found in ${zig_dir}" >&2
     exit 2
@@ -161,10 +172,14 @@ if [ -z "${label}" ]; then
 fi
 
 timeline="${out_dir}/${label}.rss.tsv"
+cpu_timeline="${out_dir}/${label}.cpu.tsv"
 summary="${out_dir}/${label}.summary.txt"
 build_log="${out_dir}/${label}.build.log"
 sample_file="${out_dir}/${label}.sample.txt"
 max_command_file="${out_dir}/${label}.max-command.txt"
+memory_report="${out_dir}/${label}.memory.json"
+response_dir="${out_dir}/${label}.response-files"
+rm -f "${memory_report}"
 
 rss_kb_for_pid() {
     ps -o rss= -p "$1" 2>/dev/null | awk '{print $1}'
@@ -199,6 +214,7 @@ rss_mb_from_kb() {
 }
 
 printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
+printf 'elapsed_s\tpid\tcpu_time\tcpu_percent\tsample_id\n' > "${cpu_timeline}"
 
 start_epoch="$(date +%s)"
 sample_taken="0"
@@ -210,7 +226,11 @@ max_cmd=""
 
 (
     cd "${zig_dir}"
-    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" ${extra_args[@]+"${extra_args[@]}"}
+    if [ "$command_mode" = 1 ]; then
+        "${extra_args[@]}"
+    else
+        "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" ${extra_args[@]+"${extra_args[@]}"}
+    fi
 ) >"${build_log}" 2>&1 &
 build_pid="$!"
 
@@ -229,6 +249,13 @@ while kill -0 "${build_pid}" 2>/dev/null; do
         [ -n "${rss_kb}" ] || continue
         cmd="$(ps -o command= -p "${pid}" 2>/dev/null | tr '\t' ' ' || true)"
         rss_mb="$(rss_mb_from_kb "${rss_kb}")"
+        cpu_time="$(ps -o time= -p "${pid}" 2>/dev/null | awk '{$1=$1; print}' || true)"
+        cpu_percent="$(ps -o %cpu= -p "${pid}" 2>/dev/null | awk '{$1=$1; print}' || true)"
+        # A compiler may exit between the RSS and CPU observations. Retain the
+        # valid RSS sample, but omit an incomplete CPU-clock observation.
+        if [ -n "$cpu_time" ] && [ -n "$cpu_percent" ]; then
+            printf '%s\t%s\t%s\t%s\t%s\n' "${elapsed}" "${pid}" "${cpu_time}" "${cpu_percent}" "${sample_id}" >> "${cpu_timeline}"
+        fi
 
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" "${sample_id}" \
@@ -263,6 +290,12 @@ end_epoch="$(date +%s)"
 elapsed_total="$((end_epoch - start_epoch))"
 max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
 
+# Large compilations use @response files. Retain them before another packaging
+# invocation replaces its cache, and resolve unit attribution while readable.
+memory_report_status=0
+python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
+    --output "${memory_report}" --capture-response-dir "${response_dir}" || memory_report_status=$?
+
 {
     echo "label=${label}"
     echo "status=${build_status}"
@@ -272,13 +305,25 @@ max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
     echo "optimize=${optimize}"
     echo "strip=${strip}"
     echo "install_step=${install_step}"
-    echo "jobs=${jobs}"
+    if [ "$command_mode" = 1 ]; then
+        echo "jobs=command-defined"
+        printf 'command='
+        printf '%q ' "${extra_args[@]}"
+        printf '\n'
+    else
+        echo "jobs=${jobs}"
+    fi
+    echo "command_mode=${command_mode}"
     echo "max_rss_kb=${max_rss_kb}"
     echo "max_rss_mb=${max_rss_mb}"
     echo "max_pid=${max_pid}"
     echo "sample_taken=${sample_taken}"
     echo "sample_pid=${sample_pid}"
     echo "timeline=${timeline}"
+    echo "cpu_timeline=${cpu_timeline}"
+    echo "memory_report_status=${memory_report_status}"
+    echo "memory_report=${memory_report}"
+    echo "response_dir=${response_dir}"
     echo "build_log=${build_log}"
     if [ "${sample_taken}" = "1" ]; then
         echo "sample_file=${sample_file}"

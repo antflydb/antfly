@@ -673,6 +673,7 @@ from .graph_relationship_property_predicate import GraphRelationshipPropertyPred
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
+from .graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
@@ -856,6 +857,7 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
@@ -2173,6 +2175,7 @@ __all__ = (
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
+    "GraphResolverConfigAliasesItem",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
     "GraphResolverConfigSourceArtifactKind",
@@ -2356,6 +2359,7 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",

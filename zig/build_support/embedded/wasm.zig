@@ -219,12 +219,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     }));
     const wasm_matcher_mod = b.createModule(.{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     const wasm_resolver_mod = b.createModule(.{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
@@ -327,7 +327,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
 
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
-    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
@@ -391,6 +390,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    inference_wasm_inference_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);

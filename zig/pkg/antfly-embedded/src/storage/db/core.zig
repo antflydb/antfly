@@ -89,6 +89,7 @@ pub const PreparedSchemaMetadata = struct {
     relational_indexes: ?relational_index_catalog_mod.PreparedPublication = null,
     integrity_catalog: ?integrity_catalog_mod.Update = null,
     same_version_layout_matches: bool = false,
+    legacy_public_binding: bool = false,
     generated_semantics_match: bool = true,
     combined_writes: []docstore_mod.KVPair,
 
@@ -541,7 +542,8 @@ pub const DBCore = struct {
                 errdefer if (validator_owned) if (validator) |*compiled| compiled.deinit(alloc);
                 const active_encoded = try schema_mod.serializeSchema(alloc, active_schema);
                 defer alloc.free(active_encoded);
-                const active_clone = try schema_mod.deserializeSchema(alloc, active_encoded);
+                var active_clone = try schema_mod.deserializeSchema(alloc, active_encoded);
+                active_clone.decoded_format_version = active_schema.decoded_format_version;
                 var clone_owned = true;
                 errdefer if (clone_owned) schema_mod.freeSchema(alloc, active_clone);
                 const active_epoch = try schema_registry_mod.Epoch.createOwnedValidated(alloc, active_clone, validator);
@@ -1360,6 +1362,14 @@ pub const DBCore = struct {
                 const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
                 defer self.alloc.free(base_encoded);
                 prepared.same_version_layout_matches = std.mem.eql(u8, base_encoded, prepared.encoded);
+                // Released distributed owners may have only ASCH v12 locally;
+                // their public contract arrives from metadata during startup.
+                // Bind additive derivation only when that validator is present.
+                const candidate = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
+                if (!prepared.same_version_layout_matches and candidate.validator() != null)
+                    prepared.same_version_layout_matches = try schema_mod.schemasEqualForPublicBinding(self.alloc, view.tableSchema().*, table_schema);
+                prepared.legacy_public_binding = prepared.same_version_layout_matches and
+                    view.tableSchema().decoded_format_version == 12 and view.validator() == null and candidate.validator() != null;
             }
         }
         const next_view = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
@@ -1371,7 +1381,7 @@ pub const DBCore = struct {
         // existing immutable epoch. Bind the index plan to that exact epoch,
         // not the candidate which publication will discard. Owner startup and
         // idempotent schema retries both exercise this path.
-        const index_view = if (prepared.same_version_layout_matches) prepared.base_schema_view.? else next_view;
+        const index_view = if (prepared.same_version_layout_matches and !prepared.legacy_public_binding) prepared.base_schema_view.? else next_view;
         prepared.relational_indexes = declarations: {
             if (next_view.validator()) |validator| {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1549,6 +1559,7 @@ pub const DBCore = struct {
         try self.validateImmutablePublicSchemaMetadata(
             table_schema.version,
             same_active_epoch,
+            prepared.legacy_public_binding,
             metadata_writes,
             metadata_deletes,
         );
@@ -1637,9 +1648,7 @@ pub const DBCore = struct {
                     if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
                         if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
                     } else {
-                        var encoded_namespace: [24]u8 = undefined;
-                        doc_identity.encodeNamespace(&encoded_namespace, participants.namespace);
-                        try txn.put(&internal_keys.identity_namespace_key, &encoded_namespace);
+                        try doc_identity.writeNamespaceTxn(txn, participants.namespace);
                     }
                     try catalog.stage(txn);
                     try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
@@ -1660,7 +1669,7 @@ pub const DBCore = struct {
         // The current resident epoch and index snapshot were fenced above and
         // already describe these exact bytes. Keep their identities stable so
         // reopening/configuring an owner does not invalidate prepared writes.
-        if (unchanged) {
+        if (unchanged and !prepared.legacy_public_binding) {
             if (child_fence) |expected| {
                 var replay = try self.store.beginReadTxn();
                 defer replay.abort();
@@ -1680,7 +1689,7 @@ pub const DBCore = struct {
             participants,
         );
         const next_schema = prepared.resident_schema orelse unreachable;
-        if (!changed or self.schema == null) {
+        if ((!changed and !prepared.legacy_public_binding) or self.schema == null) {
             if (self.schema == null) {
                 self.schema = next_schema;
                 prepared.resident_schema = null;
@@ -1695,7 +1704,10 @@ pub const DBCore = struct {
         }
         const next_epoch = prepared.epoch orelse unreachable;
         prepared.epoch = null;
-        prepared.publication.?.publish(next_epoch);
+        if (prepared.legacy_public_binding)
+            prepared.publication.?.publishLegacyBinding(next_epoch)
+        else
+            prepared.publication.?.publish(next_epoch);
         prepared.publication = null;
         if (prepared.relational_indexes) |*indexes| self.relational_indexes.publishCommitted(indexes);
         self.table_catalog = next_catalog;
@@ -1706,6 +1718,7 @@ pub const DBCore = struct {
         self: *DBCore,
         version: u32,
         same_active_epoch: bool,
+        legacy_public_binding: bool,
         metadata_writes: []const docstore_mod.KVPair,
         metadata_deletes: []const []const u8,
     ) !void {
@@ -1744,15 +1757,19 @@ pub const DBCore = struct {
         };
         defer if (existing_active) |value| self.alloc.free(value);
         if (incoming_active) |incoming| {
-            const existing = existing_active orelse return error.ImmutableSchemaVersionConflict;
-            if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
+            if (existing_active) |existing| {
+                if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
+            } else if (!legacy_public_binding) return error.ImmutableSchemaVersionConflict;
         }
         if (deletes_active and existing_active != null) return error.ImmutableSchemaVersionConflict;
         // A legacy database may lack the versioned copy. Backfill it only from
         // the identical active validator; otherwise adding one would mutate
         // the meaning of an already-published epoch.
         if (incoming_versioned) |incoming| if (existing_versioned == null) {
-            const existing = existing_active orelse return error.ImmutableSchemaVersionConflict;
+            const existing = existing_active orelse if (legacy_public_binding)
+                incoming_active orelse return error.ImmutableSchemaVersionConflict
+            else
+                return error.ImmutableSchemaVersionConflict;
             if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
         };
     }
@@ -1874,7 +1891,8 @@ pub const DBCore = struct {
         errdefer if (validator_owned) epoch_validator.?.deinit(self.alloc);
         const encoded = try schema_mod.serializeSchema(self.alloc, schema);
         defer self.alloc.free(encoded);
-        const cloned = try schema_mod.deserializeSchema(self.alloc, encoded);
+        var cloned = try schema_mod.deserializeSchema(self.alloc, encoded);
+        cloned.decoded_format_version = schema.decoded_format_version;
         var cloned_owned = true;
         errdefer if (cloned_owned) schema_mod.freeSchema(self.alloc, cloned);
         const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, cloned, epoch_validator);
@@ -2745,7 +2763,7 @@ fn buildRecoveryIntentBatch(
         identity_visibility_deletes.deinit(alloc);
     }
     const identity_live_before = (try doc_identity.fastStatsFromStore(identity_ctx.store)).live_ordinals;
-    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
         alloc,
         identity_ctx.store,
         context_snapshot.namespace,

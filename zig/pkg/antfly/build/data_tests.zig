@@ -67,7 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "lsm backend physical split preserves L0 overwrite and tombstone order",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime kernel resource metrics",
-        "data runtime status refresh publishes synthetic missing status for absent local group db",
+        "data runtime status refresh uses control metadata to publish synthetic missing status",
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",

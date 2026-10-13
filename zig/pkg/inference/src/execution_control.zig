@@ -136,12 +136,10 @@ pub const ProgressSink = struct {
 };
 
 /// Describes the strongest interruption boundary required by an execution
-/// primitive. Cooperative work and native APIs with a real termination handle
-/// may run in-process. Driver calls which cannot be interrupted must be owned
-/// by a supervised worker process.
+/// primitive. Cooperative work may run in-process. Driver calls which cannot be
+/// interrupted must be owned by a supervised worker process.
 pub const Interruption = enum {
     cooperative,
-    native_terminable,
     process_required,
 };
 

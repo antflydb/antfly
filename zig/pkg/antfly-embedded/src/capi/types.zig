@@ -95,7 +95,9 @@ pub const OpenOptions = extern struct {
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,
-    reserved: [8]u64 = @splat(0),
+    reserved: [6]u64 = @splat(0),
+    /// Base directory for models used by database enrichments.
+    models_dir: Slice = .{},
 };
 
 /// Options for `antfly_inference_open`. Same prefix-compatible contract as
@@ -291,14 +293,83 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
     };
 }
 
+// Thread-local diagnostics, valid until the next error-returning C call.
+// Bindings must copy the detail on the same OS thread as the native call.
+threadlocal var last_error_code: ErrorCode = .ok;
+threadlocal var last_error_detail: [:0]const u8 = "";
+
+pub fn clearLastError() void {
+    last_error_code = .ok;
+    last_error_detail = "";
+}
+
+pub fn lastErrorDetail() [*:0]const u8 {
+    return last_error_detail.ptr;
+}
+
+pub fn lastErrorCode() ErrorCode {
+    return last_error_code;
+}
+
+threadlocal var last_error_buffer: [2048]u8 = undefined;
+
+/// Copy a diagnostic before temporary request/SQL storage is released.
+pub fn recordError(code: ErrorCode, detail: []const u8) ErrorCode {
+    last_error_code = code;
+    const count = @min(detail.len, last_error_buffer.len - 1);
+    if (detail.ptr != last_error_buffer[0..].ptr) @memcpy(last_error_buffer[0..count], detail[0..count]);
+    last_error_buffer[count] = 0;
+    last_error_detail = last_error_buffer[0..count :0];
+    return code;
+}
+
+pub fn ensureError(code: ErrorCode, context: []const u8) ErrorCode {
+    if (code == .ok) {
+        clearLastError();
+        return code;
+    }
+    if (last_error_code == code and last_error_detail.len != 0) return code;
+    return recordError(code, context);
+}
+
+pub fn mapErrorContext(err: anyerror, context: []const u8) ErrorCode {
+    const code = classifyError(err);
+    const detail = std.fmt.bufPrint(&last_error_buffer, "{s}: {s}", .{ context, @errorName(err) }) catch @errorName(err);
+    return recordError(code, detail);
+}
+
 pub fn mapError(err: anyerror) ErrorCode {
+    last_error_detail = @errorName(err);
+    last_error_code = classifyError(err);
+    return last_error_code;
+}
+
+fn classifyError(err: anyerror) ErrorCode {
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
-        error.SqlFeatureNotSupported => .unsupported,
+        error.SqlFeatureNotSupported, error.UnsupportedResolverCatalogVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
+        error.InvalidGraphMetricDirection,
+        error.GraphMetricDirectionRequiresSeeds,
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.DuplicateField,
+        error.InvalidNumber,
+        error.Overflow,
+        error.InvalidUtf8,
+        error.InvalidCharacter,
+        error.InvalidPadding,
+        error.UnexpectedToken,
+        error.UnknownField,
+        error.MissingField,
+        error.InvalidEnumTag,
+        error.InvalidResolverAlias,
+        error.InvalidResolverAliasCycle,
+        error.ResolverMergeNamespaceChange,
+        error.EmptyEntityKey,
         error.InvalidArgument,
         error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
@@ -378,6 +449,11 @@ pub fn mapError(err: anyerror) ErrorCode {
         // actual bug from the caller's side of the C ABI.
         error.InvalidCreateTableRequest,
         error.UnsupportedCreateTableRequest,
+        error.InvalidIndexRequest,
+        error.InvalidIndexName,
+        error.MissingIndexName,
+        error.InvalidIndexType,
+        error.MissingIndexType,
         error.InvalidIndexConfig,
         error.InvalidEnrichmentConfig,
         error.ConflictingEnrichmentConfig,
@@ -469,4 +545,19 @@ test "bounded Lite retirement admission is retryable while uncertain publication
     inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
         try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
     }
+}
+
+test "capi C ABI retains codes for generic failures and copies contextual diagnostics" {
+    clearLastError();
+    try std.testing.expectEqual(ErrorCode.busy, recordError(.busy, "SQL session limit reached"));
+    try std.testing.expectEqual(ErrorCode.busy, lastErrorCode());
+    try std.testing.expectEqualStrings("SQL session limit reached", std.mem.span(lastErrorDetail()));
+    try std.testing.expectEqual(ErrorCode.invalid_argument, mapErrorContext(error.InvalidCharacter, "scan: invalid base64 key"));
+    _ = mapErrorContext(error.InvalidArgument, "add_index: sparse must be boolean");
+    try std.testing.expectEqualStrings("add_index: sparse must be boolean: InvalidArgument", std.mem.span(lastErrorDetail()));
+    _ = ensureError(.internal, "serialization failed");
+    try std.testing.expectEqual(ErrorCode.internal, lastErrorCode());
+    clearLastError();
+    try std.testing.expectEqual(ErrorCode.ok, lastErrorCode());
+    try std.testing.expectEqualStrings("", std.mem.span(lastErrorDetail()));
 }

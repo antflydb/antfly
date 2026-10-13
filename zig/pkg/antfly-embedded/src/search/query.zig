@@ -1943,7 +1943,10 @@ fn executeFilterControlled(alloc: Allocator, snap: *const index_mod.IndexSnapsho
     defer all_ids.deinit(alloc);
 
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         if (authority) |owner| try owner.check();
         if (control) |budget| try budget.checkpoint();
         var bm = if (filter == .term and control != null) blk: {
@@ -1994,7 +1997,10 @@ pub fn executeFilterBitmap(
 
     var doc_offset: u32 = 0;
     var has_result = false;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -2030,7 +2036,10 @@ pub fn countFilterIntersection(
 ) !usize {
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -2068,7 +2077,8 @@ pub fn countFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSn
     if (authority) |owner| try owner.check();
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var seg = &snap.segments[segment_idx];
         if (authority) |owner| try owner.check();
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
         if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
@@ -2080,6 +2090,9 @@ pub fn countFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSn
                 continue;
             }
         }
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        seg = segment_lease.entry;
         var bm = try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer bm.deinit();
 

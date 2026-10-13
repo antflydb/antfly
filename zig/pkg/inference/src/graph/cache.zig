@@ -734,19 +734,19 @@ test "GraphCache session compiled model runtime is independent of graph entries"
         .executor_deinit_order = &executor_deinit_order,
     };
 
-    cache.putSessionCompiledModelRuntime(.onnx, .whole_model, .{
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, .{
         .ptr = &ctx,
         .vtable = &MockModelRuntimeCtx.runtime_vtable,
     });
 
-    try std.testing.expect(cache.getSessionCompiledModelRuntime(.onnx, .whole_model) != null);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) != null);
     try std.testing.expect(cache.getSessionCompiledModelRuntime(.pjrt, .whole_model) == null);
 
     cache.selectSessionCompiledModelRuntimeBackend(.pjrt, .whole_model);
 
     try std.testing.expectEqual(@as(usize, 1), runtime_deinit_order);
     try std.testing.expectEqual(@as(usize, 0), executor_deinit_order);
-    try std.testing.expect(cache.getSessionCompiledModelRuntime(.onnx, .whole_model) == null);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) == null);
     try std.testing.expect(cache.compiled_model_runtime == null);
     try std.testing.expectEqual(@as(?contracts.BackendKind, .pjrt), cache.compiled_model_runtime_backend);
     try std.testing.expectEqual(@as(?CompiledAttachmentTarget, .whole_model), cache.compiled_model_runtime_attachment_target);
@@ -771,7 +771,7 @@ test "freeCompiledPartitions calls executor deinit" {
         .key = .{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode },
         .graph = g,
         .last_used = 0,
-        .compiled_partitions_backend = .onnx,
+        .compiled_partitions_backend = .metal,
         .compiled_partitions_status = .ready,
         .compiled_partitions = try makeMockCompiledPartitions(allocator, &ctxs),
     };
@@ -828,7 +828,7 @@ test "LRU eviction calls freeCompiledPartitions" {
         .executor = .{ .ptr = @ptrCast(&mock_ctx), .vtable = &MockExecutorCtx.vtable },
     };
     lru_entry.compiled_partitions = cps;
-    lru_entry.compiled_partitions_backend = .onnx;
+    lru_entry.compiled_partitions_backend = .metal;
     lru_entry.compiled_partitions_status = .ready;
 
     // Now the LRU entry is config_hash=0 (even though we just touched it via
@@ -899,7 +899,7 @@ test "cache replacement calls freeCompiledPartitions" {
         .executor = .{ .ptr = @ptrCast(&mock_ctx), .vtable = &MockExecutorCtx.vtable },
     };
     entry.compiled_partitions = cps;
-    entry.compiled_partitions_backend = .onnx;
+    entry.compiled_partitions_backend = .metal;
     entry.compiled_partitions_status = .ready;
 
     try std.testing.expectEqual(@as(usize, 0), deinit_count);
@@ -943,11 +943,11 @@ test "selectCompiledPartitionsBackend resets mismatched backend caches" {
     };
     defer entry.graph.deinit();
 
-    entry.selectCompiledPartitionsBackend(.onnx, .partitioned);
+    entry.selectCompiledPartitionsBackend(.metal, .partitioned);
 
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
     try std.testing.expect(entry.compiled_partitions == null);
-    try std.testing.expectEqual(@as(?contracts.BackendKind, .onnx), entry.compiled_partitions_backend);
+    try std.testing.expectEqual(@as(?contracts.BackendKind, .metal), entry.compiled_partitions_backend);
     try std.testing.expectEqual(@as(?CompiledAttachmentTarget, .partitioned), entry.compiled_partitions_attachment_target);
     try std.testing.expectEqual(CompiledPartitionCacheStatus.uninitialized, entry.compiled_partitions_status);
 }

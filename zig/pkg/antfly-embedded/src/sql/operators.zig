@@ -561,6 +561,18 @@ pub const GroupBatch = struct {
     ordinals: []const u64,
 };
 pub const GroupResult = struct {
+    /// Compact in-process partials materialize one reducer at a time. The
+    /// reader and its packed inputs live until the provider's next page;
+    /// allocations made by read belong to the consumer's per-partial scratch.
+    pub const StateReader = struct {
+        ptr: *const anyopaque,
+        count: usize,
+        read: *const fn (*const anyopaque, Allocator, usize) anyerror!Aggregate,
+    };
+    /// In-process partials borrow typed reducers from the page arena. Durable
+    /// and backend interchange continues to use versioned aggregate cells.
+    typed_states: ?[]const Aggregate = null,
+    state_reader: ?StateReader = null,
     keys: []const Datum,
     aggregates: []const Datum,
     ordinal: u64,
@@ -919,6 +931,7 @@ pub const Grouped = struct {
     results: std.heap.ArenaAllocator,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     rows_seen: u64 = 0,
+    source_ordinal: ?u64 = null,
     hash_probes: u64 = 0,
     last_group: ?usize = null,
     failed: bool = false,
@@ -1006,6 +1019,21 @@ pub const Grouped = struct {
         self.result_cursor += 1;
         return result;
     }
+    pub fn nextTypedPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.external) |external| {
+            // Decode once at the spill boundary, before any compact join pair.
+            const result = try external.nextPartial(a) orelse return null;
+            const states = try a.alloc(Aggregate, result.aggregates.len);
+            for (states, result.aggregates, self.specs) |*state, cell, spec| state.* = try @import("aggregate_partial.zig").decode(a, cell, spec);
+            return .{ .keys = result.keys, .aggregates = &.{}, .typed_states = states, .ordinal = result.ordinal };
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const index = self.result_cursor;
+        self.result_cursor += 1;
+        const states = try a.alloc(Aggregate, self.specs.len);
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+        return .{ .keys = try self.key_columns.row(a, index), .aggregates = &.{}, .typed_states = states, .ordinal = self.groups.items[index].ordinal };
+    }
     pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
         if (self.external) |external| return external.nextPartial(a);
         if (self.result_cursor == self.groups.items.len) return null;
@@ -1057,7 +1085,7 @@ pub const Grouped = struct {
             if (!try self.canRetain(keys, inputs)) try self.startSpill();
         }
         if (self.external) |external| {
-            try external.add(keys, inputs, self.rows_seen);
+            try external.add(keys, inputs, self.source_ordinal orelse self.rows_seen);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
             return;
         }
@@ -1117,6 +1145,18 @@ pub const Grouped = struct {
     /// Admission precedes mutation; disk, DISTINCT and pattern reducers use
     /// the same ordered fallback as row input.
     pub fn addEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize) !void {
+        return self.addEncodedColumnsIdentified(keys, inputs, count, null);
+    }
+    /// Source identity lets disjoint key partitions retain columnar state
+    /// without rehashing or losing first-occurrence ordinals after selection.
+    pub const InputIdentity = struct { ordinals: []const u64, hashes: []const ?u64 };
+    pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
+        const previous_ordinal = self.source_ordinal;
+        defer self.source_ordinal = previous_ordinal;
+        if (identity) |ids| {
+            if (ids.ordinals.len != count or ids.hashes.len != count) return error.InvalidSqlBackendResponse;
+            for (ids.hashes) |hash| if (hash == null) return error.InvalidSqlBackendResponse;
+        }
         if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         for (keys) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
@@ -1141,6 +1181,7 @@ pub const Grouped = struct {
             for (0..count) |index| {
                 for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
                 for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
+                if (identity) |ids| self.source_ordinal = ids.ordinals[index];
                 try self.add(row_keys, row_inputs);
             }
             return;
@@ -1148,9 +1189,10 @@ pub const Grouped = struct {
         const ids = try a.alloc(usize, count);
         self.key_count = keys.len;
         errdefer self.failed = true;
-        const hashes = try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
+        const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
         for (ids, 0..) |*id, index| {
             for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+            if (identity) |identity_| self.source_ordinal = identity_.ordinals[index];
             id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
@@ -1282,6 +1324,26 @@ pub const Grouped = struct {
             state.* = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
             initialized += 1;
         }
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, require_fit);
+    }
+    pub fn importTypedPartialMapped(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64) !void {
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
+    }
+    fn importTypedPartialMappedAdmitted(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
+        if (slots) |mapping| {
+            if (mapping.len == 0 or mapping.len != states.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
+            for (mapping, 0..) |slot, i| {
+                if (slot >= self.specs.len) return error.InvalidSqlSpill;
+                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
+            }
+        } else if (states.len != self.specs.len) return error.InvalidSqlSpill;
+        for (states, 0..) |state, i| {
+            const spec = self.specs[if (slots) |mapping| mapping[i] else i];
+            if (state.kind != spec.kind or state.input_type != spec.input_type or state.input_element != spec.input_element or state.distinct != spec.distinct) return error.InvalidSqlSpill;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
         var input_storage: [256]Datum = undefined;
         const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
@@ -1308,10 +1370,10 @@ pub const Grouped = struct {
                     state.distinct = spec.distinct;
                     initialized_dense += 1;
                 }
-                for (mapping, cells) |slot, value| {
+                for (mapping, states) |slot, value| {
                     // A separate decode gives the dense frame its own payload
                     // ownership and keeps failure cleanup independent.
-                    const replacement = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
+                    const replacement = try @import("aggregate_partial.zig").decode(a, try @import("aggregate_partial.zig").cell(a, value), self.specs[slot]);
                     dense[slot].deinit();
                     dense[slot] = replacement;
                 }
@@ -1535,7 +1597,7 @@ pub const Grouped = struct {
         _ = try self.key_columns.append(keys);
         for (self.state_columns) |*column| try column.append(alloc);
         const index = self.groups.items.len;
-        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.rows_seen });
+        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.source_ordinal orelse self.rows_seen });
         self.heads.putAssumeCapacity(hash, index);
         return index;
     }
@@ -2551,5 +2613,41 @@ test "SQL variable extrema batch admission spills before retaining payloads" {
             count += 1;
         }
         try std.testing.expectEqual(keys.len, count);
+    }
+}
+
+test "external lake SQL identified group columns separate source ordinals from input cardinality" {
+    const a = std.testing.allocator;
+    const Batch = @import("execution_batch.zig").Batch;
+    const values = [_]Datum{ Datum.json(.{ .integer = 11 }), Datum.json(.{ .integer = 22 }) };
+    const indices = [_]u32{ 1, 0, 1 };
+    const columns = [_]Batch{.{ .dictionary = .{ .values = &values, .indices = &indices } }};
+    const hashes = try @import("batch_hash.zig").encodedColumns(a, &columns, indices.len, true);
+    defer a.free(hashes);
+    var context: u8 = 0;
+    for ([_]bool{ false, true }) |disk| {
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check };
+        defer manager.deinit();
+        const grouped = try Grouped.create(a, &.{.{ .kind = .count }}, .{ .bytes = 1024 * 1024, .spill = &manager });
+        defer grouped.deinit();
+        if (disk) {
+            grouped.key_count = columns.len;
+            try grouped.startSpill();
+        }
+        try grouped.addEncodedColumnsIdentified(&columns, &columns, indices.len, .{ .ordinals = &.{ 100, 900, 5000 }, .hashes = hashes });
+        try std.testing.expectEqual(@as(u64, 3), grouped.rows_seen);
+        try std.testing.expect(grouped.source_ordinal == null);
+        var count: usize = 0;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        while (try grouped.nextTypedPartialResult(scratch.allocator())) |group| {
+            const is_eleven = group.keys[0].value.integer == 11;
+            try std.testing.expectEqual(@as(u64, if (is_eleven) 900 else 100), group.ordinal);
+            try std.testing.expectEqual(@as(u64, if (is_eleven) 1 else 2), group.typed_states.?[0].count);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), count);
     }
 }

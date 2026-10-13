@@ -459,7 +459,72 @@ pub const Context = struct {
     pub fn conditions(self: Context, table_def: catalog.Table, predicate: ?*const ast.Predicate) !BoundPredicates {
         var conditions_out: BoundPredicates = .{};
         try self.bindConditions(table_def, predicate, &conditions_out);
+        // The bound program, including casts and parameter identities, is the
+        // authority for exact operands. JSON-only AST lowering cannot prove
+        // the comparison domain of NUMERIC versus floating-point values.
+        if (table_def.external_base_source != null) if (self.binding.scalars.predicate) |*program| {
+            try self.bindNumericConditions(table_def, program, program.root, &conditions_out, 0);
+        };
         return conditions_out;
+    }
+
+    fn constantOperand(program: *const @import("scalar.zig").Program, index: u32, depth: usize) bool {
+        if (depth >= 128 or index >= program.instructions.len) return false;
+        return switch (program.instructions[index].operation) {
+            .literal, .parameter => true,
+            .cast => |cast| constantOperand(program, cast.operand, depth + 1),
+            .unary => |unary| (unary.op == .positive or unary.op == .negative) and constantOperand(program, unary.operand, depth + 1),
+            else => false,
+        };
+    }
+    fn bindNumericConditions(self: Context, table: catalog.Table, program: *const @import("scalar.zig").Program, index: u32, output: *BoundPredicates, depth: usize) anyerror!void {
+        if (depth >= 128 or index >= program.instructions.len) return error.InvalidSqlProgram;
+        const instruction = program.instructions[index];
+        if (instruction.operation != .binary) return;
+        const binary = instruction.operation.binary;
+        if (binary.op == .@"and") {
+            try self.bindNumericConditions(table, program, binary.left, output, depth + 1);
+            return self.bindNumericConditions(table, program, binary.right, output, depth + 1);
+        }
+        var op: catalog.Condition.Op = switch (binary.op) {
+            .eq => .eq,
+            .neq => .neq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            else => return,
+        };
+        var col = binary.left;
+        var value_index = binary.right;
+        if (program.instructions[col].operation != .column) {
+            col = binary.right;
+            value_index = binary.left;
+            op = switch (op) {
+                .lt => .gt,
+                .lte => .gte,
+                .gt => .lt,
+                .gte => .lte,
+                else => op,
+            };
+        }
+        if (program.instructions[col].operation != .column or !constantOperand(program, value_index, 0)) return;
+        const ordinal = program.instructions[col].operation.column;
+        if (ordinal >= self.binding.scalars.columns.len) return error.InvalidSqlProgram;
+        const column = try table.column(self.binding.scalars.columns[ordinal].name);
+        if (column.element_type != .numeric) return;
+        const descriptor = program.instructions[value_index].type;
+        // Mixed floating comparisons intentionally use SQL's floating domain;
+        // an exact NUMERIC tuple seek would not implement that equivalence.
+        if (descriptor.kind != .integer and !(descriptor.kind == .number and descriptor.element_type == .numeric)) return;
+        const raw = try program.evaluateInstruction(self.arena, value_index, self.parameters);
+        if (raw.sql_null) {
+            output.empty = true;
+            return;
+        }
+        const value_ = try describe.coerceDatum(self.arena, raw, column.type, column.element_type);
+        try output.terms.append(self.arena, .{ .column = column.path, .op = op, .value = try self.outputDatum(value_, column.type, column.element_type), .operand = value_ });
+        if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
 
     fn bindConditions(self: Context, table_def: catalog.Table, predicate: ?*const ast.Predicate, output: *BoundPredicates) anyerror!void {
@@ -2452,9 +2517,13 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
 
 const TestBackend = struct {
     estimate_scans: bool = false,
+    enable_dynamic_filters: bool = false,
+    dynamic_filters: usize = 0,
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
+    group_every: ?usize = null,
+    group_modulo: ?usize = null,
     metadata_count: ?u64 = null,
     cancelled: bool = false,
     ambiguous: bool = false,
@@ -2477,10 +2546,11 @@ const TestBackend = struct {
         alloc: std.mem.Allocator,
         cursors: []catalog.Cursor,
         states: []State,
-        const State = struct { owner: *Statement, table: catalog.Table, request: catalog.Scan, after: ?[]const u8 = null, done: bool = false };
+        const State = struct { owner: *Statement, table: catalog.Table, request: catalog.Scan, after: ?[]const u8 = null, done: bool = false, started: bool = false };
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const state: *State = @ptrCast(@alignCast(ptr));
             if (state.done) return .{ .rows = &.{} };
+            state.started = true;
             var request = state.request;
             request.limit = limit;
             request.after = state.after;
@@ -2490,6 +2560,13 @@ const TestBackend = struct {
             state.after = next_key;
             state.done = page.after == null;
             return page;
+        }
+        fn setFilter(ptr: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!state.started);
+            try std.testing.expect(filter.sealed);
+            state.owner.backend.dynamic_filters += 1;
+            return false; // The fixture keeps row execution to verify exact results.
         }
         fn closeCursor(_: *anyopaque) void {
             @panic("statement-owned cursor closed individually");
@@ -2513,7 +2590,7 @@ const TestBackend = struct {
         owner.* = .{ .backend = backend, .alloc = alloc, .cursors = cursors, .states = states };
         for (scans, states, cursors) |request, *state, *cursor| {
             state.* = .{ .owner = owner, .table = request.table, .request = request.request };
-            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor, .estimated_rows = if (backend.estimate_scans) backend.row_count else null };
+            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor, .estimated_rows = if (backend.estimate_scans) backend.row_count else null, .set_dynamic_filter = if (backend.enable_dynamic_filters) Statement.setFilter else null };
         }
         backend.statement_opens += 1;
         backend.statement_scan_count = scans.len;
@@ -2535,7 +2612,7 @@ const TestBackend = struct {
         const rows = try alloc.alloc(catalog.Row, count_rows);
         for (rows, from..) |*row, index| {
             var object: std.json.ObjectMap = .empty;
-            try object.put(alloc, "id", .{ .number_string = "9007199254740993" });
+            try object.put(alloc, "id", if (self.group_modulo) |modulo| .{ .integer = @intCast(index % modulo) } else if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
@@ -4645,11 +4722,17 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
-test "SQL joins consume native column batches without invoking the JSON cursor" {
+test "lake SQL joins negotiate exact key spooling and consume native column batches" {
     const Native = struct {
         var installs: usize = 0;
+        var exact: bool = false;
+        fn wants(_: *anyopaque, _: []const @import("dynamic_filter.zig").Column) !bool {
+            return exact;
+        }
         fn install(_: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
             try std.testing.expect(filter.sealed);
+            try std.testing.expectEqual(exact, filter.spill_manager != null);
+            try std.testing.expectEqual(exact, filter.hasExact());
             installs += 1;
             return true;
         }
@@ -4682,25 +4765,30 @@ test "SQL joins consume native column batches without invoking the JSON cursor" 
                 cursor.next = rows;
                 cursor.next_columns = columns;
                 cursor.set_dynamic_filter = install;
+                cursor.wants_exact_filter = wants;
             }
             return statement;
         }
     };
-    Native.installs = 0;
-    var fixture: TestBackend = .{ .row_count = 1537 };
-    var backend = fixture.coordinated();
-    var vtable = backend.vtable.*;
-    vtable.open_statement = Native.open;
-    backend.vtable = &vtable;
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*), sum(l.id) FROM things l JOIN things r ON l.id=r.id", .{});
-    defer compiled.deinit();
-    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 7, .execution_batch_rows = 1024 });
-    defer result.deinit();
-    try std.testing.expectEqualStrings("1537", result.output.rows[0][0].string);
-    try std.testing.expectEqualStrings("1180416", result.output.rows[0][1].string);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pages);
-    try std.testing.expectEqual(@as(usize, 1), Native.installs);
-    try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    for ([_]bool{ false, true }) |exact| {
+        Native.exact = exact;
+        Native.installs = 0;
+        var fixture: TestBackend = .{ .row_count = 5000 };
+        var backend = fixture.coordinated();
+        backend.execution_io = std.testing.io;
+        var vtable = backend.vtable.*;
+        vtable.open_statement = Native.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*), sum(l.id) FROM things l JOIN things r ON l.id=r.id", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 7, .execution_batch_rows = 1024 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("12497500", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+        try std.testing.expectEqual(@as(usize, 1), Native.installs);
+        try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    }
 }
 
 test "SQL batched join defers probe expression errors beyond a satisfied limit" {
@@ -4728,7 +4816,7 @@ test "SQL review regression nested probe projection preserves satisfied limit" {
     try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
 }
 
-test "SQL native aggregate materialization retains projection and fails closed after selection" {
+test "external lake SQL native aggregate materialization retains projection and fails closed after selection" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -4823,11 +4911,45 @@ test "SQL native aggregate materialization retains projection and fails closed a
     try std.testing.expectEqualStrings("2", count_result.output.rows[0][0].string);
     try std.testing.expectEqual(@as(usize, 2), driver.opened);
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+    // Stored groups may serve predicates and FILTERs over their direct keys.
+    // Other input columns retain the row path. Empty filters preserve groups.
+    var keyed = try compiler.compile(a, "SELECT id, SUM(id), COUNT(*) FROM docs GROUP BY id", .{});
+    defer keyed.deinit();
+    const keyed_bound = try @import("aggregate_binding.zig").bind(scratch, table, keyed.statement.select, &.{});
+    driver.recipe = (try @import("aggregate_materialization.zig").fromBound(scratch, table, keyed_bound)).?;
+    const keyed_source = try operators.Grouped.create(a, keyed_bound.specs, .{});
+    defer keyed_source.deinit();
+    for (0..2) |_| try keyed_source.add(&.{Datum.json(.{ .integer = 9007199254740993 })}, &.{ Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .integer = 1 }) });
+    const keyed_partials = try scratch.alloc(operators.GroupResult, 1);
+    keyed_partials[0] = (try keyed_source.nextPartialResult(scratch)).?;
+    driver.partials = keyed_partials;
+    for ([_]struct { sql: []const u8, rows: usize, sum: ?[]const u8, count: []const u8 }{
+        .{ .sql = "SELECT id, SUM(id), COUNT(*) FROM docs WHERE id >= 9007199254740993 GROUP BY id", .rows = 1, .sum = "18014398509481986", .count = "2" },
+        .{ .sql = "SELECT id, SUM(id) FILTER (WHERE id < 0), COUNT(*) FILTER (WHERE id > 0) FROM docs GROUP BY id", .rows = 1, .sum = null, .count = "2" },
+        .{ .sql = "SELECT id, SUM(id) FILTER (WHERE NULL), COUNT(*) FILTER (WHERE NULL) FROM docs GROUP BY id", .rows = 1, .sum = null, .count = "0" },
+        .{ .sql = "SELECT id, SUM(id), COUNT(*) FROM docs WHERE id < 0 GROUP BY id", .rows = 0, .sum = null, .count = "0" },
+    }) |case| {
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        const before = driver.opened;
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(before + 1, driver.opened);
+        try std.testing.expectEqual(driver.opened, driver.closed);
+        try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        if (case.rows != 0) {
+            if (case.sum) |sum| try std.testing.expectEqualStrings(sum, result.output.rows[0][1].string) else try std.testing.expect(result.output.sql_nulls.?[0][1]);
+            try std.testing.expectEqualStrings(case.count, result.output.rows[0][2].string);
+        }
+    }
+    const before_failure = driver.opened;
+
     driver.recipe = recipe;
     driver.partials = partials;
     driver.fail = true;
     try std.testing.expectError(error.ArtifactChecksumMismatch, execute(a, driver.backend(), &reference, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 3), driver.opened);
+    try std.testing.expectEqual(before_failure + 1, driver.opened);
     try std.testing.expectEqual(driver.opened, driver.closed);
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
 }
@@ -5191,6 +5313,192 @@ test "SQL captured search scans bind execution parameters without mutating plans
     try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
 }
 
+test "external lake SQL exact join partial aggregation preserves fanout NULLs filters and fallback" {
+    const a = std.testing.allocator;
+    const from = " FROM (VALUES (1,2,true),(1,3,false),(1,NULL,NULL),(2,7,true),(NULL,99,true)) l(k,v,b) JOIN (VALUES (1,5,true),(1,6,false),(2,8,NULL),(3,9,true),(NULL,9,true)) r(k,v,b) ON l.k=r.k";
+    for ([_][]const u8{
+        "SELECT l.k, COUNT(*), COUNT(l.v), SUM(l.v), SUM(r.v), MIN(l.v), MAX(r.v), BOOL_AND(l.b), BOOL_OR(r.b)",
+        "SELECT l.k, SUM(l.v) FILTER (WHERE l.k=1), COUNT(*) FILTER (WHERE l.k=2)",
+        "SELECT l.k, SUM(l.v), COUNT(*)",
+        "SELECT l.k, SUM(CAST(l.v AS DOUBLE PRECISION)), COUNT(DISTINCT r.v)",
+        "SELECT l.b, COUNT(*) FILTER (WHERE l.b IS NULL), SUM(l.v) FILTER (WHERE l.b IS NOT NULL)",
+    }, 0..) |select, i| {
+        const tail = if (i == 2) " WHERE l.k>=2 GROUP BY l.k ORDER BY l.k" else if (i == 4) " GROUP BY l.b ORDER BY l.b" else " GROUP BY l.k ORDER BY l.k";
+        const sql = try std.mem.concat(a, u8, &.{ select, from, tail });
+        defer a.free(sql);
+        const fallback_sql = try std.mem.concat(a, u8, &.{ select, from, " AND (l.v IS NOT DISTINCT FROM l.v)", tail });
+        defer a.free(fallback_sql);
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var baseline = try compiler.compile(a, fallback_sql, .{});
+        defer baseline.deinit();
+        var actual = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer actual.deinit();
+        var expected = try execute(a, backend.iface(), &baseline, &.{}, .{});
+        defer expected.deinit();
+        const actual_rows = try std.json.Stringify.valueAlloc(a, actual.output.rows, .{});
+        defer a.free(actual_rows);
+        const expected_rows = try std.json.Stringify.valueAlloc(a, expected.output.rows, .{});
+        defer a.free(expected_rows);
+        try std.testing.expectEqualStrings(expected_rows, actual_rows);
+        try std.testing.expectEqualDeep(expected.output.sql_nulls, actual.output.sql_nulls);
+    }
+    // Native signed limbs must preserve an intermediate SUM outside i64,
+    // including negative sign extension, before multiplicity is applied.
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, "SELECT COUNT(*), SUM(l.v), SUM(r.v), MIN(l.v) FROM (VALUES (1,-9223372036854775807-1),(1,-1),(1,9223372036854775807)) l(k,v) JOIN (VALUES (1,-3),(1,1)) r(k,v) ON l.k=r.k", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("6", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("-4", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("-6", result.output.rows[0][2].string);
+        try std.testing.expectEqualStrings("-9223372036854775808", result.output.rows[0][3].string);
+    }
+    // 24 input rows produce 144 pairs. A 64-row execution budget admits the
+    // compact partial path, while expanding the pairs exceeds that budget.
+    const repeated = "(VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1))";
+    const sql = try std.fmt.allocPrint(a, "SELECT COUNT(*), SUM(l.k) FROM {s} l(k) JOIN {s} r(k) ON l.k=r.k", .{ repeated, repeated });
+    defer a.free(sql);
+    var backend: TestBackend = .{};
+    var compiled = try compiler.compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.iface(), &compiled, &.{}, .{ .scan_rows = 64 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("144", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("144", result.output.rows[0][1].string);
+    const fallback = try std.mem.concat(a, u8, &.{ sql, " AND (l.k IS NOT DISTINCT FROM l.k)" });
+    defer a.free(fallback);
+    var baseline = try compiler.compile(a, fallback, .{});
+    defer baseline.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(a, backend.iface(), &baseline, &.{}, .{ .scan_rows = 64 }));
+}
+
+test "external lake SQL finalized join state preserves empty globals HAVING and delivery" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*), SUM(l.v) FROM (VALUES (1,2)) l(k,v) JOIN (VALUES (2)) r(k) ON l.k=r.k",
+        "SELECT l.v, COUNT(*), SUM(r.k) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k GROUP BY l.v HAVING COUNT(*)>1 ORDER BY SUM(r.k) DESC LIMIT 1",
+        "SELECT l.v, COUNT(*), SUM(r.k) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k WHERE l.v=2 GROUP BY l.v",
+        "SELECT l.v, COUNT(*), SUM(r.k) FILTER (WHERE l.v=2) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k GROUP BY l.v ORDER BY l.v",
+    }) |sql| {
+        const end = (std.mem.indexOf(u8, sql, "l.k=r.k") orelse unreachable) + "l.k=r.k".len;
+        const fallback = try std.mem.concat(a, u8, &.{ sql[0..end], " AND (l.k IS NOT DISTINCT FROM l.k)", sql[end..] });
+        defer a.free(fallback);
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var reference = try compiler.compile(a, fallback, .{});
+        defer reference.deinit();
+        var actual = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer actual.deinit();
+        var expected = try execute(a, backend.iface(), &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualDeep(expected.output.rows, actual.output.rows);
+        try std.testing.expectEqualDeep(expected.output.sql_nulls, actual.output.sql_nulls);
+    }
+}
+
+test "external lake SQL plain count consumes resident and spilled typed join partials" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k",
+        "SELECT COUNT(*) FROM (VALUES (NULL),(NULL)) l(k) JOIN (VALUES (NULL),(NULL)) r(k) ON l.k=r.k",
+    }, 0..) |sql, index| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (index == 0) "4" else "0", result.output.rows[0][0].string);
+    }
+    var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };
+    var backend = source.coordinated();
+    backend.execution_io = std.testing.io;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+    defer manager.deinit();
+    backend.spill_manager = &manager;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*) FROM things l JOIN things r ON l.id=r.id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
+    defer result.deinit();
+    try std.testing.expect(manager.written_bytes > 0);
+    try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+    // Retaining every join key proves that compact pairs are already distinct
+    // final groups. Keep those streaming rather than doing a second reduction.
+    var keyed = try compiler.compile(a, "SELECT l.id, COUNT(*) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id LIMIT 3", .{});
+    defer keyed.deinit();
+    var groups = try execute(a, backend, &keyed, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
+    defer groups.deinit();
+    try std.testing.expectEqual(@as(usize, 3), groups.output.rows.len);
+    for (groups.output.rows, 0..) |row, index| {
+        var expected: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{index}), row[0].string);
+        try std.testing.expectEqualStrings("16", row[1].string);
+    }
+}
+
+test "external lake SQL join partial state spills and unwinds allocation failures" {
+    const a = std.testing.allocator;
+    var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };
+    var backend = source.coordinated();
+    backend.execution_io = std.testing.io;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+    defer manager.deinit();
+    backend.spill_manager = &manager;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l.id=r.id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
+    defer result.deinit();
+    try std.testing.expect(manager.written_bytes > 0);
+    try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("4095", result.output.rows[0][2].string);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var test_backend: TestBackend = .{};
+            var query = try compiler.compile(allocator, "SELECT COUNT(*), SUM(l.n) FROM (VALUES (1,2),(1,3)) l(k,n) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k", .{});
+            defer query.deinit();
+            var output = try execute(allocator, test_backend.iface(), &query, &.{}, .{});
+            defer output.deinit();
+            try std.testing.expectEqualStrings("4", output.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("10", output.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{});
+}
+
+test "external lake SQL join partials install scan filters before either oriented probe" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*), SUM(l.id) FROM things l JOIN (VALUES (9007199254740993),(9007199254740993)) r(k) ON l.id=r.k",
+        "SELECT COUNT(*), SUM(r.id) FROM (VALUES (9007199254740993),(9007199254740993)) l(k) JOIN things r ON l.k=r.id",
+    }) |sql| {
+        var source: TestBackend = .{ .row_count = 256, .estimate_scans = true, .enable_dynamic_filters = true };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, source.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("512", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("4611686018427388416", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 1), source.dynamic_filters);
+    }
+}
+
+test "external lake SQL unique join keys replay the bounded cost sample exactly once" {
+    const a = std.testing.allocator;
+    var source: TestBackend = .{ .row_count = 12000 };
+    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l._id), MAX(r._id) FROM things l JOIN things r ON l._id=r._id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, source.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12000", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("9999", result.output.rows[0][2].string);
+}
+
 test "SQL DDL scratch is reclaimable under the statement cap while receipts survive" {
     const Fake = struct {
         fn ddl(_: *anyopaque, allocators: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
@@ -5221,4 +5529,56 @@ test "SQL DDL scratch is reclaimable under the statement cap while receipts surv
     try std.testing.expect(result.peakMemoryBytes() < 2 * 1024 * 1024);
     try std.testing.expectEqualStrings("child", result.output.ddl_receipt.?.table);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", result.output.ddl_receipt.?.fk_generation_publication_id.?);
+}
+
+test "external lake SQL parallel partition reducers preserve spilled count sum and groups" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |parallel| {
+        var source: TestBackend = .{ .row_count = 32768, .group_every = 2 };
+        var backend = source.coordinated();
+        backend.execution_io = if (parallel) std.testing.io else null;
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+        defer manager.deinit();
+        backend.spill_manager = &manager;
+        var compiled = try compiler.compile(a, "SELECT l.id, COUNT(*), SUM(l.id), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id DESC LIMIT 3", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 16 * 1024 * 1024, .page_rows = 1024, .scan_rows = 200000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, 0..) |row, index| {
+            const id = 16383 - index;
+            const key = try std.fmt.allocPrint(a, "{d}", .{id});
+            defer a.free(key);
+            const sum = try std.fmt.allocPrint(a, "{d}", .{id * 4});
+            defer a.free(sum);
+            try std.testing.expectEqualStrings(key, row[0].string);
+            try std.testing.expectEqualStrings("4", row[1].string);
+            try std.testing.expectEqualStrings(sum, row[2].string);
+            try std.testing.expectEqualStrings(key, row[3].string);
+            try std.testing.expectEqualStrings(key, row[4].string);
+        }
+        try std.testing.expect(result.state.budget.peak <= 16 * 1024 * 1024);
+    }
+}
+
+// Repeated keys straddle every input page and lane boundary; grouping by a
+// deterministic hash must preserve multiplicity for both join orientations.
+test "external lake SQL key owned reducers preserve interleaved groups across pages" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |parallel| {
+        var source: TestBackend = .{ .row_count = 4096, .group_modulo = 8 };
+        var backend = source.coordinated();
+        backend.execution_io = if (parallel) std.testing.io else null;
+        var compiled = try compiler.compile(a, "SELECT l.id, COUNT(*), SUM(r.id) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 16 * 1024 * 1024, .page_rows = 257, .scan_rows = 10000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 8), result.output.rows.len);
+        for (result.output.rows, 0..) |row, id| {
+            const sum = try std.fmt.allocPrint(a, "{d}", .{id * 512 * 512});
+            defer a.free(sum);
+            try std.testing.expectEqualStrings("262144", row[1].string);
+            try std.testing.expectEqualStrings(sum, row[2].string);
+        }
+    }
 }

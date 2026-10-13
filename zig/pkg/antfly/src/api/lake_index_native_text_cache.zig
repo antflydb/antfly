@@ -35,12 +35,34 @@ pub const Cache = struct {
     bytes: u64 = 0,
     reservations: std.AutoHashMapUnmanaged([32]u8, Reservation) = .empty,
     tick: u64 = 0,
+    admissions: std.AutoHashMapUnmanaged([32]u8, *Admission) = .empty,
+    inventory_budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 },
+    inventory_builds: std.atomic.Value(u64) = .init(0),
     closing: bool = false,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     // Includes schema arenas, cold segment payloads, decoded native metadata
     // and statistics across every corpus, rather than only encoded file size.
     heap_budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 256 * 1024 * 1024 },
 
+    const Admission = struct {
+        references: usize = 1,
+        finished: std.atomic.Value(bool) = .init(false),
+        ready: std.Io.Event = .unset,
+    };
+    fn releaseAdmission(self: *Cache, flight: *Admission) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        flight.references -= 1;
+        if (flight.references == 0) std.heap.page_allocator.destroy(flight);
+    }
+    fn finishAdmission(self: *Cache, key: [32]u8, flight: *Admission, io: std.Io) void {
+        platform.sync.lockYielding(&self.mutex);
+        _ = self.admissions.remove(key);
+        flight.finished.store(true, .release);
+        flight.ready.set(io);
+        self.mutex.unlock();
+        self.releaseAdmission(flight);
+    }
     const Charge = struct { key: [32]u8, bytes: u64 };
     const Reservation = struct { references: usize, bytes: u64 };
     fn charge(compatible: [32]u8, id: []const u8, bytes: u64) Charge {
@@ -76,21 +98,27 @@ pub const Cache = struct {
     }
 
     pub fn acquire(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, root: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
+        return self.acquireSelected(io, store, root_ref, root, schema_json, cached, context, cancellation, null);
+    }
+    pub fn acquireSelected(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, root: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation, selection: ?[]const [32]u8) !local.storage_db_query_search_exec.PinnedTextSource {
         while (true) {
-            return self.acquireOnce(io, store, root_ref, root, schema_json, cached, context, cancellation) catch |err| {
+            return self.acquireOnce(io, store, root_ref, root, schema_json, cached, context, cancellation, selection) catch |err| {
                 if (err == error.NativeLakeTextCacheRetry) continue;
                 if (err == error.NativeLakeTextCacheBusy) self.evictIdle();
                 return err;
             };
         }
     }
-    fn acquireOnce(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, root: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
+    fn acquireOnce(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, directory: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation, selection: ?[]const [32]u8) !local.storage_db_query_search_exec.PinnedTextSource {
         try context.ensureActive();
+        try cancellation.check();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-text-snapshot-cache-v1");
         hash.update(&cached.scope);
         hash.update(root_ref.artifact_id);
         hash.update(schema_json);
+        hash.update(if (selection != null) "selected-files-v1" else "full-corpus-v1");
+        if (selection) |files| for (files) |file| hash.update(&file);
         var key: [32]u8 = undefined;
         hash.final(&key);
         platform.sync.lockYielding(&self.mutex);
@@ -101,12 +129,68 @@ pub const Cache = struct {
                 _ = entry.references.fetchAdd(1, .monotonic);
                 self.mutex.unlock();
                 errdefer entry.release();
-                try entry.awaitReady(io, context);
+                entry.awaitReady(io, context) catch |err| {
+                    if (entry.state.load(.acquire) != .failed) return err;
+                    try context.ensureActive();
+                    try cancellation.check();
+                    return error.NativeLakeTextCacheRetry;
+                };
                 return try entry.source(store, cached, context, cancellation);
             }
         };
+        if (self.closing) {
+            self.mutex.unlock();
+            return error.Canceled;
+        }
+        if (self.admissions.get(key)) |flight| {
+            flight.references += 1;
+            self.mutex.unlock();
+            defer self.releaseAdmission(flight);
+            while (!flight.finished.load(.acquire)) {
+                try context.ensureActive();
+                try cancellation.check();
+                flight.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+            }
+            try context.ensureActive();
+            try cancellation.check();
+            // A leader owns only its own authority. Retry the resident entry
+            // (or a failed admission) under this waiter's capability.
+            return error.NativeLakeTextCacheRetry;
+        }
+        if (self.admissions.count() >= 16) {
+            self.mutex.unlock();
+            return error.NativeLakeTextCacheBusy;
+        }
+        const flight = std.heap.page_allocator.create(Admission) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        flight.* = .{};
+        self.admissions.put(std.heap.page_allocator, key, flight) catch |err| {
+            self.mutex.unlock();
+            std.heap.page_allocator.destroy(flight);
+            return err;
+        };
         self.mutex.unlock();
-        try root.validate();
+        defer self.finishAdmission(key, flight, io);
+        _ = self.inventory_builds.fetchAdd(1, .monotonic);
+        // Directory decoding finishes before acquiring child cache flights.
+        // A large manifest can safely request exclusive decode admission.
+        var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
+        var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
+        defer metadata_arena.deinit();
+        const inventory = (if (selection) |files|
+            corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
+        else
+            corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
+            if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
+            return err;
+        };
+        defer inventory.deinit();
+        const root = inventory.root;
         var bytes: u64 = root_ref.byte_len;
         for (root.segments) |segment| bytes = std.math.add(u64, bytes, segment.byte_len) catch return error.NativeLakeTextCorpusTooLarge;
         if (bytes > (if (root.seekable) self.max_seekable_bytes orelse self.max_bytes else self.max_bytes) or self.max_entries == 0) return error.NativeLakeTextCorpusTooLarge;
@@ -135,7 +219,12 @@ pub const Cache = struct {
                 _ = entry.references.fetchAdd(1, .monotonic);
                 self.mutex.unlock();
                 errdefer entry.release();
-                try entry.awaitReady(io, context);
+                entry.awaitReady(io, context) catch |err| {
+                    if (entry.state.load(.acquire) != .failed) return err;
+                    try context.ensureActive();
+                    try cancellation.check();
+                    return error.NativeLakeTextCacheRetry;
+                };
                 return try entry.source(store, cached, context, cancellation);
             }
             if (entry.references.load(.acquire) != 1) {
@@ -282,6 +371,8 @@ pub const Cache = struct {
             entry.*.release();
         }
         entries.deinit(std.heap.page_allocator);
+        std.debug.assert(self.admissions.count() == 0 and self.inventory_budget.live == 0);
+        self.admissions.deinit(std.heap.page_allocator);
         std.debug.assert(self.bytes == 0 and self.reservations.count() == 0);
         self.reservations.deinit(std.heap.page_allocator);
         std.debug.assert(self.heap_budget.live == 0);
@@ -321,7 +412,12 @@ const Entry = struct {
     statistics_version: u8 = 0,
     term_statistics: ?corpus.statistics.Ref = null,
     segment_summaries: []const ?corpus.statistics.Ref = &.{},
+    term_directory: corpus.term_directory.Roots = .{},
+    statistics_identities: []const [32]u8 = &.{},
+    statistics_ordinals: []const corpus.statistics.IdentityOrdinal = &.{},
+    statistics_routing: []const local.index.IndexSnapshot.TextCandidate = &.{},
     domain: [32]u8 = @splat(0),
+    descriptors: @import("lake_index_seekable_text.zig").Descriptors = .empty,
     identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
     selected_field: ?[]const u8 = null,
@@ -334,9 +430,13 @@ const Entry = struct {
         self.seekable = root.seekable;
         self.statistics_version = root.statistics_version;
         self.term_statistics = root.term_statistics;
+        self.term_directory = root.term_directory;
         self.domain = root.domain;
         const a = self.arena.allocator();
-        if (root.statistics_version == 1) {
+        if (root.statistics_version >= 1) {
+            const identities_ = try a.alloc([32]u8, root.segments.len);
+            for (identities_, root.segments) |*id, segment| id.* = corpus.term_directory.identity(segment.artifact_id);
+            self.statistics_identities = identities_;
             const refs = try a.alloc(?corpus.statistics.Ref, root.segments.len);
             var position_: usize = 0;
             for (root.file_groups) |group| {
@@ -366,6 +466,28 @@ const Entry = struct {
         defer removed.deinit(self.allocator);
         var additions: std.ArrayList(artifacts.ChunkRef) = .empty;
         defer additions.deinit(self.allocator);
+        var admission_by_id: std.StringHashMapUnmanaged(local.segment.SegmentReader.Admission) = .empty;
+        defer admission_by_id.deinit(self.allocator);
+        const Route = struct { segment: corpus.SegmentRouting, manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize };
+        var routing_by_id: std.StringHashMapUnmanaged(Route) = .empty;
+        defer routing_by_id.deinit(self.allocator);
+        if (root.manifests.len == root.file_groups.len) for (root.file_groups, root.manifests) |group, manifest| {
+            const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, manifest.artifact_id), .checksum = try a.dupe(u8, manifest.checksum), .byte_len = manifest.byte_len };
+            for (group.segments, 0..) |segment, ordinal| try self.descriptors.put(a, try a.dupe(u8, segment.artifact_id), .{ .manifest = ref, .ordinal = ordinal });
+        };
+        if (root.routing.len != 0) for (root.routing, root.manifests) |routes, manifest| {
+            for (routes, 0..) |route, ordinal| try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len }, .ordinal = ordinal });
+        };
+        // Exact per-segment descriptors belong to this generation, including
+        // when its immutable physical reader is shared with another corpus.
+        for (root.routing) |routes| for (routes) |route| if (route.descriptor) |descriptor| {
+            const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, descriptor.artifact_id), .checksum = try a.dupe(u8, descriptor.checksum), .byte_len = descriptor.byte_len };
+            try self.descriptors.put(a, try a.dupe(u8, route.ref.artifact_id), .{ .manifest = ref, .ordinal = 0 });
+            try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = ref, .ordinal = 0 });
+        };
+        for (root.file_groups) |group| if (group.admissions.len != 0) {
+            for (group.segments, group.admissions) |ref, metadata| try admission_by_id.put(self.allocator, ref.artifact_id, metadata);
+        };
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(self.allocator);
         var shared: std.ArrayList(local.index.IndexWriter.ImmutableSegment) = .empty;
@@ -400,6 +522,29 @@ const Entry = struct {
         defer self.allocator.free(replacements);
         var loaded: usize = 0;
         defer for (replacements[0..loaded]) |*replacement| deinitReplacement(replacement, self.allocator);
+        // Transport cohorts populate original content-addressed cache entries.
+        // Bound optional warming independently of archive size; ordinary required
+        // reads remain authoritative if residency is denied or the bound is hit.
+        if (additions.items.len != 0) {
+            var cold = std.StringHashMap(void).init(self.allocator);
+            defer cold.deinit();
+            for (additions.items) |ref| try cold.put(ref.artifact_id, {});
+            var opening_bytes: usize = 16 * 1024 * 1024;
+            for (root.file_groups) |group| {
+                const needed = for (group.segments) |ref| {
+                    if (cold.contains(ref.artifact_id)) break true;
+                } else false;
+                if (!needed) continue;
+                for (group.opening_packs) |pack| {
+                    if (pack.decoded_bytes > opening_bytes) continue;
+                    opening_bytes -= pack.decoded_bytes;
+                    @import("lake_index_text_opening_pack.zig").warm(self.allocator, store, pack, root.domain, cached, cancellation) catch |err| switch (err) {
+                        error.OutOfMemory, error.CacheBudgetExceeded => {},
+                        else => return err,
+                    };
+                }
+            }
+        }
         var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true, .resource_manager = self.resource_manager };
         var read_bytes: u64 = 512 * 1024 * 1024;
         var position: usize = 0;
@@ -413,10 +558,27 @@ const Entry = struct {
             for (position..end) |ordinal| {
                 const ref = additions.items[ordinal];
                 try cancellation.check();
+                if (routing_by_id.get(ref.artifact_id)) |route| {
+                    const seekable = @import("lake_index_seekable_text.zig");
+                    var data = try seekable.loadRouted(self.allocator, .{ .store = store, .cache = cached, .context = cached.context, .cancellation = cancellation, .resource_manager = self.resource_manager }, ref, route.segment.bytes, route.manifest, route.ordinal);
+                    errdefer data.deinit(self.allocator);
+                    const reader = try local.segment.SegmentReader.initRouting(self.allocator, route.segment.doc_count, route.segment.fields, seekable.routedReader);
+                    replacements[loaded] = .{ .id = ids.items[ordinal], .data = data, .prepared_reader = reader };
+                    loaded += 1;
+                    continue;
+                }
+                // Descriptor admission performs no artifact reads. Do not
+                // charge unvisited directory payloads or queue an I/O-sized
+                // CPU job for these small, bounded metadata copies.
+                if (admission_by_id.get(ref.artifact_id)) |metadata| {
+                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal], metadata);
+                    loaded += 1;
+                    continue;
+                }
                 try stores.chargeReadBudget(&read_bytes, ref.byte_len);
-                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation, ids.items[ordinal] });
+                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation, ids.items[ordinal], admission_by_id.get(ref.artifact_id) });
                 if (tasks[ordinal - position] == null) {
-                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal]);
+                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal], admission_by_id.get(ref.artifact_id));
                     loaded += 1;
                 }
             }
@@ -440,12 +602,55 @@ const Entry = struct {
         defer self.allocator.free(ordered_ids);
         for (root.segments, ordered_ids) |segment, *id| id.* = self.segments.get(segment.artifact_id).?.id;
         try self.writer.?.orderImmutableSegments(ordered_ids);
+        // A formerly selected subset can become the complete corpus after
+        // file removal. Both directions need private, generation-owned scoring
+        // state even when ordering and physical readers remain unchanged.
+        const physical = self.writer.?.acquireSnapshot();
+        defer physical.release();
+        var documents: u64 = 0;
+        const field_count = if (root.collection) |totals| totals.fields.len else physical.global_total_field_len.count();
+        const fields = try a.alloc(local.index.IndexWriter.CollectionField, field_count);
+        if (root.collection) |totals| {
+            documents = totals.documents;
+            for (fields, totals.fields) |*field, total| field.* = .{ .name = total.name, .total_length = total.total_length };
+        } else {
+            if (root.partial_inventory) return error.InvalidNativeLakeTextCorpus;
+            for (physical.segments) |segment| documents += segment.reader.doc_count;
+            var totals = physical.global_total_field_len.iterator();
+            for (fields) |*field| {
+                const total = totals.next().?;
+                field.* = .{ .name = total.key_ptr.*, .total_length = total.value_ptr.* };
+            }
+        }
+        if (documents > std.math.maxInt(u32)) return error.InvalidNativeLakeTextCorpus;
+        try self.writer.?.sealImmutableCollection(@intCast(documents), fields);
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
+        if (root.statistics_version >= 1) {
+            const ordinals = try a.alloc(corpus.statistics.IdentityOrdinal, root.segments.len);
+            var offset: u32 = 0;
+            for (ordinals, self.statistics_identities, snapshot.segments, 0..) |*ordinal, id, segment, i| {
+                ordinal.* = .{ .identity = id, .segment_idx = i, .doc_offset = offset };
+                offset = try std.math.add(u32, offset, segment.reader.doc_count);
+            }
+            std.mem.sort(corpus.statistics.IdentityOrdinal, ordinals, {}, corpus.statistics.identityLess);
+            self.statistics_ordinals = ordinals;
+            const routing = try a.alloc(local.index.IndexSnapshot.TextCandidate, ordinals.len);
+            for (routing, ordinals) |*candidate, ordinal| candidate.* = .{ .segment_idx = ordinal.segment_idx, .doc_offset = ordinal.doc_offset };
+            self.statistics_routing = routing;
+        }
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
-    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64) anyerror!local.index.ReplacementSegmentData {
+    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64, metadata: ?local.segment.SegmentReader.Admission) anyerror!local.index.ReplacementSegmentData {
+        if (metadata) |admitted| {
+            var data = try @import("lake_index_seekable_text.zig").loadAdmitted(a, .{ .store = loader.store, .cache = loader.cache, .context = loader.cache.context, .cancellation = cancellation, .resource_manager = loader.resource_manager }, ref, admitted);
+            errdefer data.deinit(a);
+            var reader = try local.segment.SegmentReader.initAuthenticated(a, data.native, admitted);
+            errdefer reader.deinit();
+            try cancellation.check();
+            return .{ .id = id, .data = data, .prepared_reader = reader };
+        }
         const mapped = loader.loader();
         var data = try mapped.load(mapped.ptr, a, ref, cancellation);
         errdefer data.deinit(a);
@@ -476,9 +681,15 @@ const Entry = struct {
         entry: *Entry,
         read: @import("lake_index_seekable_text.zig").Read,
         statistics: corpus.statistics.Reader = undefined,
+        fn checkRead(raw: *anyopaque) !void {
+            const read: *const @import("lake_index_seekable_text.zig").Read = @ptrCast(@alignCast(raw));
+            try read.context.ensureActive();
+            try read.cancellation.check();
+        }
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const entry = self.entry;
+            self.statistics.deinit();
             entry.allocator.destroy(self);
             entry.release();
         }
@@ -487,10 +698,10 @@ const Entry = struct {
         if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
-        lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        const snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
-        if (self.statistics_version == 1) {
-            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries };
+        lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager, .descriptors = if (self.descriptors.count() != 0) &self.descriptors else null } };
+        const snapshot = self.writer.?.acquireSnapshotWithReadCapability(.{ .ptr = &lease.read, .check = QueryLease.checkRead, .io = context.io }) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
+        if (self.statistics_version >= 1) {
+            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .routing = self.statistics_routing, .allocator = self.allocator, .partial_inventory = self.identities.partial_inventory };
             snapshot.text_statistics = lease.statistics.interface();
         }
         return .{ .read_context = &lease.read, .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };

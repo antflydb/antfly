@@ -3744,19 +3744,15 @@ pub const HttpHandler = struct {
         for (status_initialized[0..dependency_count]) |initialized| if (!initialized)
             return error.InvalidQueryRequest;
 
-        const projected_value_count = std.math.mul(usize, active_rows.len, query.metrics.len) catch
-            return error.GraphMetricQueryBudgetExceeded;
-        var projected_retained_bytes = std.math.mul(usize, projected_value_count, @sizeOf(graph_query_mod.GraphMetricValue)) catch
-            return error.GraphMetricQueryBudgetExceeded;
-        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, active_rows.len, @sizeOf(graph_query_mod.GraphResultNode)) catch
-            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
-        const selection_words = std.math.divCeil(usize, result.nodes.len, @bitSizeOf(usize)) catch return error.GraphMetricQueryBudgetExceeded;
-        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, selection_words, @sizeOf(usize)) catch
-            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        var projected_retained_bytes = graph_query_mod.GraphQueryEngine.compactMaterializationBytes(query.metrics.len, active_rows, result.nodes.len) catch return error.GraphMetricQueryBudgetExceeded;
         projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf([]u8)) catch
             return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
         projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf(db_types.GraphMetricStatus)) catch
             return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, projection_name_count, @sizeOf([]u8) + @sizeOf([]const u8)) catch return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        for (projection_names_buffer[0..projection_name_count]) |name| {
+            projected_retained_bytes = std.math.add(usize, projected_retained_bytes, name.len) catch return error.GraphMetricQueryBudgetExceeded;
+        }
         for (statuses[0..dependency_count]) |status| {
             // The status and the projection dictionary intentionally own
             // independent copies: status may be omitted from the response
@@ -3803,19 +3799,41 @@ pub const HttpHandler = struct {
                 return error.InvalidQueryRequest;
             projection_metric_value_names[i] = metric_value_names[dependency_index];
         }
+        const owned_projection_names = try self.alloc.alloc([]u8, projection_name_count);
+        var owned_name_count: usize = 0;
+        var projection_names_owned = true;
+        errdefer if (projection_names_owned) {
+            for (owned_projection_names[0..owned_name_count]) |name| self.alloc.free(name);
+            self.alloc.free(owned_projection_names);
+        };
+        for (projection_metric_value_names, owned_projection_names) |name, *owned| {
+            owned.* = try self.alloc.dupe(u8, name);
+            owned_name_count += 1;
+        }
         const previous_metric_values_slab = result.metric_values_slab;
-        const replacement_metric_values_slab = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumns(
+        const replacement_columns = if (projection_name_count != 0) try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumnsCompact(
             self.alloc,
-            projection_metric_value_names,
+            self.alloc,
+            self.alloc,
+            owned_projection_names,
             projection_columns,
             active_rows,
             &result.nodes,
-        );
-        result.metric_values_slab = replacement_metric_values_slab;
+        ) else empty: {
+            _ = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumns(self.alloc, &.{}, &.{}, active_rows, &result.nodes);
+            self.alloc.free(owned_projection_names);
+            break :empty null;
+        };
+        projection_names_owned = false;
+        result.metric_values_slab = &.{};
         if (previous_metric_values_slab.len > 0) self.alloc.free(previous_metric_values_slab);
+        if (result.metric_columns) |owner| owner.deinit(self.alloc);
+        result.metric_columns = replacement_columns;
         for (result.metric_value_names) |name| self.alloc.free(name);
         if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
-        result.metric_value_names = metric_value_names;
+        result.metric_value_names = &.{};
+        for (metric_value_names) |name| self.alloc.free(name);
+        self.alloc.free(metric_value_names);
         metric_names_owned = false;
         for (result.metric_status) |*status| status.deinit(self.alloc);
         if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
@@ -15257,4 +15275,22 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless graph metric compact admission charges actual final backing" {
+    const a = std.testing.allocator;
+    const n = 50_000;
+    const rows = try a.alloc(usize, n);
+    defer a.free(rows);
+    for (rows, 0..) |*row, i| row.* = i;
+    const exact = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(4, rows, n);
+    try std.testing.expectEqual(n * 4 * @sizeOf(f64) + @sizeOf(graph_query_mod.GraphMetricColumns), exact);
+    const query_runtime = @import("../query/runtime.zig");
+    var budget = query_runtime.GraphMetricReadBudget{ .limits = .{ .max_retained_bytes = 2 * 1024 * 1024 } };
+    try budget.chargeRetained(exact);
+    const partial = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(4, rows[0..20_000], n);
+    var small = query_runtime.GraphMetricReadBudget{ .limits = .{ .max_retained_bytes = 2 * 1024 * 1024 } };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, small.chargeRetained(partial));
+    const zero = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(0, rows, n);
+    try std.testing.expectEqual(@as(usize, 0), zero);
 }

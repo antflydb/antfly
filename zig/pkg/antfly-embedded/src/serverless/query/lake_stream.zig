@@ -114,7 +114,8 @@ pub const Stream = struct {
     filter: ?@import("lake_parquet_cursor.zig").Cursor.Filter = null,
     filter_columns: []const []const u8 = &.{},
     mapped_columns: std.ArrayList(types.ColumnVector) = .empty,
-    lookahead: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+    lookahead: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
+    lookahead_next_input: usize = 0,
     bloom_lookahead: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
     bloom_next_input: usize = 0,
     lookahead_cancelled: std.atomic.Value(bool) = .init(false),
@@ -130,11 +131,10 @@ pub const Stream = struct {
     }
     fn joinLookahead(self: *Stream, cancel: bool) void {
         if (cancel) self.lookahead_cancelled.store(true, .release);
-        if (self.lookahead) |*task| {
-            const io = self.source.scanner.shared_reader.?.context.io.?;
-            if (cancel) task.cancel(io) catch {} else task.await(io) catch {};
-            self.lookahead = null;
-        }
+        if (self.source.scanner.shared_reader) |reader| if (reader.context.io) |io| for (&self.lookahead) |*slot| if (slot.*) |*task| {
+            if (cancel) task.cancel(io) catch {} else if (task.isComplete()) task.await(io) catch {} else continue;
+            slot.* = null;
+        };
         self.joinBloomLookahead(cancel);
     }
     fn joinBloomLookahead(self: *Stream, cancel: bool) void {
@@ -173,17 +173,27 @@ pub const Stream = struct {
             if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
             // Probe before the first matching group, including all-negative
             // cursor scans. A monotonic plan position avoids duplicate jobs.
-            self.bloom_lookahead[slot] = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
+            self.bloom_lookahead[slot] = if (reader.context.execution) |execution|
+                (@import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(64 * 1024, std.heap.page_allocator, warmBloomChild, .{ self, plan.inventory, input.row_group_ordinal }, discardWarm) catch null
+            else
+                reader.scheduler.submitIoTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
             if (self.bloom_lookahead[slot] == null) return; // Required reads remain synchronous on pressure.
             slot += 1;
         }
     }
+    fn warmBloomChild(self: *Stream, inventory: external.Inventory, ordinal: u32, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return self.warmBloomFor(inventory, ordinal, execution);
+    }
     fn warmBloom(self: *Stream, inventory: external.Inventory, ordinal: u32) anyerror!void {
+        return self.warmBloomFor(inventory, ordinal, null);
+    }
+    fn warmBloomFor(self: *Stream, inventory: external.Inventory, ordinal: u32, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
         var worker: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (execution) |owner| worker.bindExecution(owner);
         var stats: Stats = .{};
         _ = try bloomGroupMayMatch(std.heap.page_allocator, worker.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker.context, &stats);
     }
@@ -211,7 +221,9 @@ pub const Stream = struct {
         // by the same scheduler used by kernels, spill writes and prefetch.
         var bloom_stats: Stats = .{};
         if (!try bloomGroupMayMatch(std.heap.page_allocator, worker_reader.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker_reader.context, &bloom_stats)) return;
-        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(std.heap.page_allocator, worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
+        var budget: @import("../../sql/memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = self.lookaheadWorkspace() };
+        defer std.debug.assert(budget.live == 0);
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(budget.allocator(), worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
             .max_rows = self.limits.max_row_group_rows,
             .max_input_bytes = @min(self.limits.max_input_bytes, 2 * 1024 * 1024),
             .max_decoded_bytes = @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024),
@@ -226,37 +238,56 @@ pub const Stream = struct {
         try cursor.prepareEvidence();
         try worker_reader.context.ensureActive();
     }
+    fn lookaheadWorkspace(self: *const Stream) usize {
+        return @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +|
+            @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024) *| 2;
+    }
     fn startLookahead(self: *Stream) void {
         if (self.identity_only or self.partition_count != 1) return;
-        if (self.lookahead != null) return;
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
         const plan = self.discovered orelse return;
         const current = self.page_cursor orelse return;
-        const ordinal = for (plan.row_group_plan.row_groups[self.group_index..]) |input| {
-            const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
-            if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
-            if (groupMayMatch(plan.inventory.files[0].row_groups[input.row_group_ordinal], self.groupPredicates())) break input.row_group_ordinal;
-        } else return;
-        // Names and masks live in the current cursor until clearFile joins.
-        const stable_names = self.alloc.alloc([]const u8, current.columns.len) catch return;
-        const stable_required = self.alloc.alloc(bool, current.columns.len) catch {
-            self.alloc.free(stable_names);
-            return;
-        };
-        for (current.columns, stable_names, stable_required) |column, *name, *needed| {
-            name.* = column.chunk.column_id;
-            needed.* = column.required;
+        self.joinLookahead(false);
+        // Descriptor ownership spans the file, independently of page cursors.
+        if (self.lookahead_names.len == 0) {
+            const names = self.alloc.alloc([]const u8, current.columns.len) catch return;
+            const required = self.alloc.alloc(bool, current.columns.len) catch {
+                self.alloc.free(names);
+                return;
+            };
+            for (current.columns, names, required) |column, *name, *needed| {
+                name.* = column.chunk.column_id;
+                needed.* = column.required;
+            }
+            self.lookahead_names = names;
+            self.lookahead_required = required;
         }
-        self.lookahead_names = stable_names;
-        self.lookahead_required = stable_required;
         self.lookahead_cancelled.store(false, .release);
-        const bytes = @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +| @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024);
-        if (reader.context.execution) |execution| {
-            const scope = @import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = reader.context.wait.? };
-            self.lookahead = scope.submit(bytes, std.heap.page_allocator, warmGroupChild, .{ self, plan.inventory, ordinal, stable_names, stable_required }, discardWarm) catch null;
-        } else self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, bytes, warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
-        if (self.lookahead != null) self.lookahead_started += 1 else self.freeLookaheadDescriptors();
+        self.lookahead_next_input = @max(self.lookahead_next_input, self.group_index);
+        for (&self.lookahead) |*slot| {
+            if (slot.* != null) continue;
+            while (self.lookahead_next_input < plan.row_group_plan.row_groups.len) {
+                const input = plan.row_group_plan.row_groups[self.lookahead_next_input];
+                const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
+                if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) {
+                    self.lookahead_next_input += 1;
+                    continue;
+                };
+                if (!groupMayMatch(group, self.groupPredicates())) {
+                    self.lookahead_next_input += 1;
+                    continue;
+                }
+                slot.* = if (reader.context.execution) |execution|
+                    (@import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(self.lookaheadWorkspace(), std.heap.page_allocator, warmGroupChild, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required }, discardWarm) catch null
+                else
+                    reader.scheduler.submitTransient(io, self.lookaheadWorkspace(), warmGroup, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required });
+                if (slot.* == null) return; // Retry on the next pull as pressure falls.
+                self.lookahead_next_input += 1;
+                self.lookahead_started += 1;
+                break;
+            }
+        }
     }
     fn freeLookaheadDescriptors(self: *Stream) void {
         self.alloc.free(self.lookahead_names);
@@ -284,6 +315,9 @@ pub const Stream = struct {
             const max = page.max orelse continue;
             const matches = switch (predicate.value) {
                 .integer => |value| blk: {
+                    // Byte-array page bounds are byte strings, even when their
+                    // length happens to be 4/8. Never reinterpret them as ints.
+                    if (!std.mem.eql(u8, chunk.physical_type, "int32") and !std.mem.eql(u8, chunk.physical_type, "int64")) continue;
                     const low = metricInteger(min) orelse continue;
                     const high = metricInteger(max) orelse continue;
                     if (low > high) continue;
@@ -555,6 +589,7 @@ pub const Stream = struct {
     };
     pub fn deinit(self: *Stream) void {
         self.clearFile();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         if (self.owns_work) if (self.work) |work| {
             for (work.plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
             self.alloc.free(work.plans);
@@ -572,7 +607,7 @@ pub const Stream = struct {
     fn clearFile(self: *Stream) void {
         self.joinLookahead(true);
         self.freeLookaheadDescriptors();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        if (self.source.scanner.shared_reader) |reader| reader.clearFile();
         self.clearBatch();
         if (self.page_cursor) |*cursor| cursor.deinit();
         self.page_cursor = null;
@@ -600,20 +635,21 @@ pub const Stream = struct {
         self.file_predicates = &.{};
         self.group_index = 0;
         self.bloom_next_input = 0;
+        self.lookahead_next_input = 0;
     }
     /// The returned vectors remain valid until the next pull or close.
     pub fn next(self: *Stream) !?types.ColumnBatch {
         try self.context.ensureActive();
         self.clearBatch();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(false);
+        if (self.source.scanner.shared_reader) |reader| reader.reapPrefetch();
         while (true) {
             if (self.page_cursor) |*cursor| {
                 if (try cursor.next()) |batch| {
+                    self.startLookahead();
                     if (cursor.position == cursor.group.row_count) try self.prefetchNext();
                     return try self.logicalBatch(batch);
                 }
                 self.joinLookahead(false);
-                self.freeLookaheadDescriptors();
                 cursor.deinit();
                 self.page_cursor = null;
             }
@@ -772,6 +808,7 @@ pub const Stream = struct {
         }
         // Next-file footer lookahead also helps single-row-group datasets.
         for (self.files[self.file_index..]) |index| {
+            if (self.selection) |selection| if (!selection.fileMayMatch(index)) continue;
             if (self.source.lazy_versions and !self.source.isFilePinned(index)) continue;
             const upcoming = self.source.fileAt(index);
             if (!self.fileMatches(upcoming)) continue;
@@ -905,7 +942,7 @@ pub const Stream = struct {
                 const leaf = leafFor(expected, footer.schema_columns);
                 if (leaf) |found| {
                     const actual_kind = try @import("lake_schema.zig").parquetKind(found);
-                    if (!std.mem.eql(u8, actual_kind, expected.kind) or (expected.required and found.nullable)) {
+                    if (!expected.accepts(actual_kind) or (expected.required and found.nullable)) {
                         std.log.warn("external lake column schema mismatch column={s} expected={s} actual={s} required={} nullable={}", .{ expected.name, expected.kind, actual_kind, expected.required, found.nullable });
                         return error.ExternalLakeSchemaMismatch;
                     }

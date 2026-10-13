@@ -4261,6 +4261,27 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return self.getWithLease(key, false);
         }
 
+        /// Presence owns no value bytes. Mutable decisions happen under the
+        /// writer lock; immutable and SST decisions use a pinned read layout.
+        pub fn contains(self: *@This(), key: []const u8) !bool {
+            self.backend.recordPointGet();
+            if (self.stable_point_view) {
+                if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded(null);
+                return try containsFromReadView(self.backend, &.{}, self.read_view.?, self.namespace, key);
+            }
+            var layout = blk: {
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                if (self.backend.mutable.findIndex(self.namespace, key)) |idx| {
+                    self.backend.recordMutableHit();
+                    return !self.backend.mutable.entryAt(idx).tombstone;
+                }
+                break :blk try CurrentReadLayout(BackendType).capturePoint(self.backend, self.allocator);
+            };
+            defer layout.deinitAfterUnlockedRead();
+            return try containsFromReadView(self.backend, layout.immutable_memtables, layout.read_view, self.namespace, key);
+        }
+
         /// Opt-in for short projection scopes. Ordinary probes deliberately
         /// copy values so long-lived maintenance probes do not pin generations.
         pub fn getLeased(self: *@This(), key: []const u8) ![]const u8 {
@@ -5937,6 +5958,107 @@ fn getFromDirectoryPointCandidatesPlanned(
         start = end;
     }
     return error.NotFound;
+}
+
+/// A nullable decision distinguishes an absent key from a visible tombstone.
+/// Never copy a selected row: callers need only its tombstone bit.
+fn presenceInRun(backend: anytype, run: *Run, namespace: backend_types.Namespace, key: []const u8) !?bool {
+    if (!runMayContain(run.*, namespace, key)) return null;
+    backend.recordRunProbe();
+    if (run.state) |*state| {
+        const idx = state.findIndex(namespace, key) orelse return null;
+        return !state.entryAt(idx).tombstone;
+    }
+    if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, false)) return null;
+    if (run.path == null) {
+        const table = try tableForRunMaybeLocked(backend, run, false);
+        const idx = try table.findIndex(namespace.name, key) orelse return null;
+        return !(try table.entryAt(idx)).tombstone;
+    }
+    var index_handle: ?cache_mod.Handle = if (backend.options.cache != null) try loadRunTableIndexHandle(backend, run) else null;
+    defer if (index_handle) |*handle| handle.release();
+    const index = if (index_handle) |handle| handle.runTableIndex() else try indexForRunNoCache(backend, run);
+    try requireTableBlocks(index);
+    const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
+    const block = index.blocks[block_index];
+    if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
+    if (!block.maybeContains(namespace.name, key)) {
+        backend.recordBloomNegative();
+        return null;
+    }
+    const window = index.blockWindow(block_index);
+    if (backend.options.cache) |cache| {
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        if (cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, window.physicalLen())) |retained| {
+            var handle = retained;
+            defer handle.release();
+            backend.recordSharedBlockCacheHit();
+            const found = try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), block_index, namespace.name, key) orelse return null;
+            return !found.entry.tombstone;
+        }
+    }
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+            defer lease.release();
+            const found = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse return null;
+            return !found.entry.tombstone;
+        }
+    }
+    if (window.compression == .prefix or window.compression == .prefix_snappy) {
+        var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window, true) else null;
+        defer if (workspace) |*work| work.release();
+        const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        const payload = try loadRunTableBlockWithStats(backend, scratch, run.path.?, offset, window.physicalLen());
+        defer scratch.free(payload);
+        try lsm_table_file.validateBlockPayload(payload, window.checksum);
+        const decoded = if (window.compression == .prefix_snappy) blk: {
+            try lsm_table_file.validatePrefixDecodedSize(payload, window.len);
+            break :blk try @import("../../encoding/snappy.zig").decode(scratch, payload);
+        } else payload;
+        defer if (window.compression == .prefix_snappy) scratch.free(decoded);
+        var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, window.len);
+        defer reader.deinit(scratch);
+        if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
+        const found = try reader.find(scratch, namespace.name, key) orelse return null;
+        return !found.entry.tombstone;
+    }
+    if (backend.options.cache != null) {
+        var handle = try loadRunTableBlockHandle(backend, run, index, window, namespace.retainDataBlocks());
+        defer handle.release();
+        const found = try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), block_index, namespace.name, key) orelse return null;
+        return !found.entry.tombstone;
+    }
+    const bytes = try loadOwnedBlockForWindow(backend, run, index, window);
+    defer backend.allocator.free(bytes);
+    const found = try lsm_table_file.findExactEntryInBlock(index, bytes, block_index, namespace.name, key) orelse return null;
+    return !found.entry.tombstone;
+}
+
+fn containsFromReadView(backend: anytype, immutable_memtables: []const *const State, view: RunReadView, namespace: backend_types.Namespace, key: []const u8) !bool {
+    for (immutable_memtables) |state| if (state.findIndex(namespace, key)) |idx| {
+        backend.recordMutableHit();
+        return !state.entryAt(idx).tombstone;
+    };
+    if (view.directory()) |directory| {
+        var cursor = directory.readPoint(namespace.name, key);
+        while (cursor.next()) |handle| {
+            var run = handle.run.*;
+            run.shared_read_version = true;
+            if (try presenceInRun(backend, &run, namespace, key)) |present| return present;
+        }
+        return false;
+    }
+    if (findRunGroupIndex(view.l0_groups, namespace, key)) |group| {
+        for (view.l0_groups[group].run_indices) |idx| {
+            if (try presenceInRun(backend, &view.runs[idx], namespace, key)) |present| return present;
+        }
+    }
+    for (view.levels) |level| {
+        const idx = findRunIndexInLevel(view.runs, level, namespace, key) orelse continue;
+        if (try presenceInRun(backend, &view.runs[idx], namespace, key)) |present| return present;
+    }
+    return false;
 }
 
 fn getFromReadView(
@@ -14035,4 +14157,101 @@ pub fn qualifyControlledOwnedPointBatch(control: read_admission.Port, fixture: u
     try std.testing.expectEqualSlices(u8, &large, values[1].?);
     try std.testing.expectEqualSlices(u8, &large, values[2].?);
     try std.testing.expect(values[3] == null);
+}
+test "lsm presence probes avoid value copies across source tiers (#1095)" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    for ([_]lsm_table_file.CompressionPolicy{ .none, .snappy_adaptive }) |compression| {
+        for ([_]bool{ false, true }) |with_cache| {
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
+            defer cache.deinit();
+            var backend = try Backend.open(a, "/presence-probe", .{
+                .storage = storage.storage(),
+                .cache = if (with_cache) &cache else null,
+                .flush_threshold = 8 * 1024 * 1024,
+                .compact_threshold_runs = 100,
+                .l0_overlap_compact_threshold_runs = 100,
+                .table_block_compression = compression,
+            });
+            defer backend.close();
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            const large = try a.alloc(u8, 1024 * 1024);
+            defer a.free(large);
+            @memset(large, 'v');
+            {
+                var write = try store.beginWrite();
+                errdefer write.abort();
+                try write.put("large", large);
+                try write.put("small", "value");
+                try write.put("empty", "");
+                // Shared long keys force the prefix reader, while the wide
+                // standalone row exercises raw/Snappy blocks.
+                for (0..64) |i| {
+                    var key_buf: [128]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "tenant:shared-prefix-for-presence-metadata-only-read:document:{d:0>3}", .{i});
+                    try write.put(key, "value");
+                }
+                try write.commit();
+            }
+            for (0..3) |tier| {
+                if (tier == 1) {
+                    backend.options.flush_threshold = 1;
+                    var write = try store.beginWrite();
+                    errdefer write.abort();
+                    try write.put("trigger", "freeze");
+                    try write.commit();
+                } else if (tier == 2) {
+                    while (try backend.runMaintenanceStep()) {}
+                    try std.testing.expect(run_store.count(&backend) != 0);
+                }
+                const before = backend.snapshotReadStats().point_value_copies;
+                var probe = try store.beginProbe();
+                defer probe.abort();
+                for (0..2) |pass| {
+                    if (tier == 2 and pass == 1 and with_cache) {
+                        // Warm decoded blocks exercise the borrowed-cache
+                        // path as well as the first cold compressed lookup.
+                        for (0..run_store.count(&backend)) |i| {
+                            var run = run_store.at(&backend, i).*;
+                            var index_handle = try loadRunTableIndexHandle(&backend, &run);
+                            defer index_handle.release();
+                            const index = index_handle.runTableIndex();
+                            for (0..index.blocks.len) |block_index| {
+                                var block_handle = try loadRunTableBlockHandle(&backend, &run, index, index.blockWindow(block_index), true);
+                                block_handle.release();
+                            }
+                        }
+                    }
+                    try std.testing.expect(try probe.contains("large"));
+                    try std.testing.expect(try probe.contains("small"));
+                    try std.testing.expect(try probe.contains("empty"));
+                    try std.testing.expect(try probe.contains("tenant:shared-prefix-for-presence-metadata-only-read:document:017"));
+                    try std.testing.expect(!try probe.contains("larg"));
+                    try std.testing.expect(!try probe.contains("missing"));
+                }
+                try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
+            }
+            // A newer tombstone decides presence even when an older SST has
+            // the value, and a later resurrection must reverse that decision.
+            for ([_]bool{ false, true }) |resurrect| {
+                {
+                    var write = try store.beginWrite();
+                    errdefer write.abort();
+                    if (resurrect) try write.put("large", large) else try write.delete("large");
+                    try write.commit();
+                }
+                for (0..2) |phase| {
+                    if (phase == 1) while (try backend.runMaintenanceStep()) {};
+                    const before = backend.snapshotReadStats().point_value_copies;
+                    var probe = try store.beginProbe();
+                    defer probe.abort();
+                    try std.testing.expectEqual(resurrect, try probe.contains("large"));
+                    try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
+                }
+            }
+        }
+    }
 }

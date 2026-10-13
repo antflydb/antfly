@@ -5,7 +5,7 @@ Licensed Apache-2.0 (see [LICENSE](LICENSE)).
 
 The client is generated at build time by [Progenitor](https://github.com/oxidecomputer/progenitor)
 from the crate-local `openapi.yaml` (see `build.rs`). This bundled input is
-synchronized from the root public spec by `make build-docs` / `make generate`,
+synchronized from the root public spec by `make generate`,
 and SDK CI checks that the two files match. Published crates therefore build
 without a repository checkout. Before generation, `build.rs`
 preprocesses the spec (stripping non-JSON media types, unifying error

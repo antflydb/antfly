@@ -40,8 +40,8 @@ frontend/importer → ml.graph.Graph → graph.Runtime → backend executors
 Examples:
 
 ```
-ONNX file     → ml.graph.Graph → graph.Runtime → native / Metal / PJRT / ONNX executors
-traced model  → ml.graph.Graph → graph.Runtime → native / Metal / PJRT / ONNX executors
+ONNX file     → ml.graph.Graph → graph.Runtime → native / Metal / PJRT executors
+traced model  → ml.graph.Graph → graph.Runtime → native / Metal / PJRT executors
 debug capture → ml.graph.Graph → graph.Runtime → selected backend policy
 ```
 
@@ -72,8 +72,8 @@ This makes the layering:
 
 - frontend/importer layer: ONNX import, traced generation graphs, debug captures
 - graph runtime layer: planning, partitioning, liveness, memory, execution policy
-- backend graph executor layer: native interpreter, Metal partition executor, PJRT/ONNX partition executors
-- backend kernel/runtime layer: raw Metal kernels, native kernels, ORT, PJRT
+- backend graph executor layer: native interpreter, Metal partition executor, PJRT partition executor
+- backend kernel/runtime layer: raw Metal kernels, native kernels, CUDA kernels, PJRT
 
 `ModelRuntime` remains a higher-level model/session runtime. It is still needed
 for decoder state, KV cache ownership, sampling, and phase-aware prefill/decode
@@ -96,12 +96,10 @@ The generic runtime seam lives in `src/graph/runtime.zig`.
 `ImportedOnnxSession` is one caller of that runtime, not the owner of a separate
 ONNX-specific execution architecture.
 
-Explicit graph-runtime selection is authoritative for imported static graphs:
-when a CLI/API path sets `--graph-runtime`, `SessionManager` routes `.onnx`
-loads through Antfly inference's imported graph runtime instead of the external ONNX
-Runtime binding, and `ModelManager` preserves that strategy through per-backend
-session-manager clones. This prevents a model phase from silently bypassing the
-generic graph runtime while sidecar phases use it.
+`.onnx` loads always go through Antfly inference's imported graph runtime; there
+is no external ONNX Runtime binding. When a CLI/API path sets `--graph-runtime`,
+`ModelManager` preserves that strategy through per-backend session-manager
+clones, so sidecar phases use the same runtime selection as the main model.
 
 The stable public API remains `Session.run`, which returns host `Tensor` values.
 Imported graph sessions now also expose an internal resident extension:
@@ -211,7 +209,7 @@ text runs `1/4/16/32`, image and audio run `1/4/16`. `--compare-quant` emits a
 dense baseline row and a quantized candidate row for each target/batch pair.
 
 ```sh
-zig build bench-clipclap-native -Donnx=false -Dmetal=false -- \
+zig build bench-clipclap-native -Dmetal=false -- \
   --matrix --compare-quant --quant q5_k --warmup-iters 3 --measure-iters 15 \
   --format csv
 ```
@@ -228,7 +226,7 @@ checks; promotion gates should use representative model dimensions.
 
 ```sh
 zig build bench-clipclap-native -Denable-native-quant-dispatch-stats=true \
-  -Donnx=false -Dmetal=false -- \
+  -Dmetal=false -- \
   --target clip_text --batch 1 --clip-text-layers 1 --quant q5_k \
   --warmup-iters 1 --measure-iters 5 --format csv
 ```
@@ -240,7 +238,7 @@ the rows share the same synthetic model dimensions and random seed.
 
 ```sh
 zig build bench-clipclap-native -Denable-native-quant-dispatch-stats=true \
-  -Donnx=false -Dmetal=false -- \
+  -Dmetal=false -- \
   --target clip_text --batch 1 --clip-text-layers 1 --quant q5_k \
   --compare-dispatch --warmup-iters 1 --measure-iters 5 --format csv
 ```
@@ -251,7 +249,7 @@ dense-dequant-plus-SGEMM timings for each supported quant/shape pair and skips
 K-block formats whose block width does not divide the candidate input width.
 
 ```sh
-zig build bench-clipclap-kernels -Donnx=false -Dmetal=false -- \
+zig build bench-clipclap-kernels -Dmetal=false -- \
   --only-clipclap-quant-policy --warmup-iters 1 --measure-iters 5
 ```
 
@@ -309,8 +307,9 @@ The `ComputeBackend` vtable (`src/ops/ops.zig`) abstracts tensor operations. Hos
 
 Compiled backends are registered under `src/graph/` and selected through the graph layer rather than generation-specific special cases:
 
-- **ONNX** (`src/graph/compiled_onnx.zig`)
 - **PJRT / XLA** (`src/graph/compiled_pjrt.zig`)
+- **Metal** whole-model executor (`src/graph/compiled_metal.zig`)
+- **WebGPU** partitions in WASM builds (`src/graph/compiled_webgpu.zig`)
 
 The shared interface lives in:
 
@@ -381,19 +380,17 @@ Artifact sidecars (`*.antfly.json`) are termite-specific metadata. They record:
 - attention mode
 - backend-specific metadata needed to run the artifact safely
 
-This sidecar is required because the artifact file itself (`.onnx`, `.mlmodelc`) does not carry enough information for antfly inference to know whether it matches a particular generation request.
+This sidecar is required because the artifact file itself (`.hlo`, `.pjrt_exec`) does not carry enough information for antfly inference to know whether it matches a particular generation request.
 
 Offline artifacts are currently exact shape buckets. A different prompt can use an existing artifact only when the rendered/tokenized prompt matches the artifact's recorded `seq_len`, `query_seq_len`, attention mode, and ABI. A prompt with a different token count needs a separate artifact or future dynamic/bucketed-shape support.
 
-For ONNX whole-graph artifacts, `run-artifact --compare-host` compares artifact outputs against traced native graph captures for the same rendered prompt shape. The compare summary includes top-1 agreement plus last-logit and graph-output diffs, so a "sensible output" smoke test can be upgraded into an exact-shape correctness check.
+For PJRT whole-graph artifacts, `run-artifact --compare-host` compares artifact outputs against traced native graph captures for the same rendered prompt shape. The compare summary includes top-1 agreement plus last-logit and graph-output diffs, so a "sensible output" smoke test can be upgraded into an exact-shape correctness check.
 
 ### Debug Artifacts
 
 Node-level artifacts are now part of the correctness workflow:
 
 - `--node-index N --node-closure` exports the dependency cone for one traced node.
-- `--debug-output-node N` adds traced nodes as extra artifact outputs for `run-artifact --compare-host`.
-- `--onnx-reuse-initializers-from <base.onnx>` regenerates a small debug ONNX protobuf that reuses an existing external weight blob instead of writing duplicate multi-GiB weights.
 
 Closure artifacts must preserve the same runtime ABI as the full graph for stateful attention. In particular, skip-KV/shared-KV `fused_gqa_causal_attention` K/V inputs are runtime cache inputs, not compile-time constants. Walking through those placeholder nodes creates false diffs in dependency-closed artifacts, so closure selection leaves them as external inputs and export keeps them materialized through the artifact input ABI.
 
@@ -427,7 +424,7 @@ These are the current graph/backend architecture decisions:
 
 1. Host backends and compiled backends are different layers.
    - `native` / `metal` are host execution backends.
-   - `onnx` / `pjrt` are compiled graph backends.
+   - `pjrt` is a compiled graph backend.
 
 2. Compiled backends should move toward offline compile + load-only runtime.
    - Request-path inline compilation is acceptable for experimentation and bounded partition artifacts.
@@ -458,7 +455,7 @@ These are the current graph/backend architecture decisions:
    - Quantized sources should stay quantized until the final streaming conversion step instead of being widened into one large dense buffer first.
 
 8. `ModelExecutor` / `ModelRuntime` is the shared, type-erased whole-model runtime surface, distinct from `PartitionExecutor`.
-   - Whole-model backends (ONNX, PJRT) attach a prefill artifact plus an optional decode artifact as one phase-aware executor through this surface.
+   - Whole-model backends (PJRT) attach a prefill artifact plus an optional decode artifact as one phase-aware executor through this surface.
    - Partitioned execution keeps its own, stricter per-op eligibility rules and remains a separate path from whole-model attachment.
 
 ## Plan
@@ -471,12 +468,11 @@ Near-term graph/backend work:
    - Backend docs and user-facing examples should point at package manifests first.
 
 2. Keep converging whole-model backends on shared `ModelExecutor` / `ModelRuntime`.
-   - ONNX and PJRT/XLA already attach whole-model packages through that surface.
-   - Compiled backend definitions now declare whole-model runtime strategy explicitly: unsupported or offline artifact.
+   - PJRT/XLA already attaches whole-model packages through that surface.
+   - Compiled backend definitions declare their whole-model runtime strategy explicitly.
    - Partitioned execution remains useful for experimentation, bounded artifacts, and stepping-stone adoption.
 
 3. Keep moving runtime state ownership into the backend.
-   - ONNX whole-model packages already retain ORT values for backend-owned past/present KV.
    - PJRT whole-model packages still need more of the decode path to stop being host-assisted.
    - Long-term whole-model backends should not require steady-state duplicate full-model residency.
 
@@ -484,8 +480,6 @@ Near-term graph/backend work:
    - Dense native weights should stream at native width when the artifact dtype matches.
    - Quantized GGUF weights should dequantize row-by-row into the artifact sink.
    - Large export estimates and profiling should measure this path directly instead of inferring from execution tensors.
-   - The first true quantized ONNX target should be weight-only `Q8_0`, not K-quants.
-   - That first path should use backend-native source metadata plus ONNX `DequantizeLinear(block_size=...)`, not a fake dense fallback.
 
 ## Current Progress
 

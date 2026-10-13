@@ -27504,7 +27504,7 @@ components:
         model:
           type: string
           description: The name of the generator model.
-          example: onnxruntime/Gemma-3-ONNX
+          example: ggml-org/gemma-4-E4B-it-GGUF
         api_url:
           type: string
           format: uri
@@ -27923,6 +27923,28 @@ components:
           type: string
         key_template:
           type: string
+        promote:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+          description: Materialize canonical entity documents. False resolves graph keys without promotion.
+        aliases:
+          type: array
+          description: Explicit redirects between fully rendered keys in this resolver's table; no entity
+            documents required. Changes trigger corpus re-resolution.
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - key
+              - target
+            properties:
+              key:
+                type: string
+                minLength: 1
+              target:
+                type: string
+                minLength: 1
         labels:
           type: array
           items:
@@ -34157,6 +34179,11 @@ components:
         - index
         - metric
       properties:
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes
+            and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing
+            entity seeds to reach documents through incoming mention edges.
         name:
           type: string
           minLength: 1
@@ -34214,6 +34241,11 @@ components:
         - index
         - metric
       properties:
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes
+            and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing
+            entity seeds to reach documents through incoming mention edges.
         index:
           type: string
           description: Graph index that owns the published metric.
@@ -35223,6 +35255,13 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
+        deduplicate_nodes:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: Return each node once across all starts. Set false with include_paths to return
+            each reaching path, including its start node. Depth, result, and work limits still bound path
+            enumeration.
         include_paths:
           type: boolean
           default: false
@@ -37851,6 +37890,17 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: >
+            Pull-time qualified request profiles for this exact artifact,
+
+            including backend, supported features and min/max geometry.
+
+            Runtime admission revalidates artifact identity and resource limits.
+
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:
@@ -38247,7 +38297,7 @@ components:
             Structured output control. OpenAI-compatible entry point for requesting JSON output.
 
             `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into
-            a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+            a native constrained-decoding grammar on the native backend.
         grammar:
           type: string
           description: >
@@ -38763,7 +38813,6 @@ components:
       enum:
         - auto
         - native
-        - onnx
         - metal
         - cuda
         - xla
@@ -38804,8 +38853,6 @@ components:
 
         - `native` - Native CPU backend
 
-        - `onnx` - ONNX Runtime backend
-
         - `metal` - Apple Metal backend
 
         - `cuda` - NVIDIA CUDA backend
@@ -38824,7 +38871,7 @@ components:
         - `tpu` - Google TPU (used by XLA)
 
         - `cpu` - Force CPU only
-      pattern: ^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$
+      pattern: ^(native|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$
     InferenceModelRef:
       type: object
       additionalProperties: false
@@ -39212,10 +39259,6 @@ components:
           type: boolean
           description: Whether the native CPU backend is built into this runtime
           example: true
-        onnx:
-          type: boolean
-          description: Whether the ONNX Runtime backend is built into this runtime
-          example: false
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime

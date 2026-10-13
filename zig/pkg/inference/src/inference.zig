@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // Antfly inference: ML service for embeddings, chunking, and reranking.
-// Zig implementation with ONNX Runtime, Metal, CUDA, WASM, and native backends.
+// Zig implementation with native CPU, Metal, CUDA, PJRT, and WASM backends; ONNX
+// models run on Antfly's own ONNX implementation.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -120,6 +121,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
     _ = @import("hard_cancellation_watchdog.zig");
@@ -188,6 +190,8 @@ test {
     _ = @import("architectures/gliner/boundary_scorer_device_test.zig");
     _ = @import("architectures/gliner/boundary_family_device_test.zig");
     _ = @import("extractors/gliner_decide_1b_parity_test.zig");
+    _ = @import("extractors/gliner_window_parity_test.zig");
+    _ = @import("extractors/gliner_graph_qualification_fixtures.zig");
     _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");
     _ = @import("ops/native_activation_policy_test.zig");
@@ -249,6 +253,10 @@ test {
     _ = @import("metal_generated_quant_stats.zig");
     _ = @import("readers/reader.zig");
     _ = @import("readers/multistage_reader.zig");
+    _ = @import("readers/moondream_reader.zig");
+    _ = @import("pipelines/moondream.zig");
+    _ = @import("pipelines/moondream_parity_test.zig");
+    _ = @import("architectures/moondream.zig");
     _ = native_extract;
     _ = compare_generate;
     _ = run_options;

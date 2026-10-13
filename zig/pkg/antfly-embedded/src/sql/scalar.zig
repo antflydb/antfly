@@ -180,9 +180,12 @@ pub const Column = struct {
     /// They are binding metadata, never additional physical row values.
     aliases: []const []const u8 = &.{},
 };
-/// Resolve the SQL width of a direct column consistently for binding and
-/// persisted aggregate recipes. Untyped integer/number columns retain the
-/// same default widths as ordinary scalar expressions.
+/// Canonical SQL identity for both bound expressions and native materialized
+/// inputs. Legacy integer/number declarations use the same default widths.
+pub fn columnType(column: anytype) Type {
+    return .{ .kind = column.type, .nullable = column.nullable, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+}
+/// Resolve explicit and default scalar widths for expression and recipe identities.
 pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
     return element orelse (if (kind == .integer) arrays.ElementType.int64 else if (kind == .number) arrays.ElementType.float64 else null);
 }
@@ -1108,7 +1111,7 @@ test "SQL multidimensional constructors flatten typed cells and bound dynamic wo
             try std.testing.expect(array.elements[3].sql_null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var constant = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[1,2],[3,4]])", .{});
     defer constant.deinit();
     var dynamic = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[$1,2],[$2,4]])", .{});
@@ -2106,7 +2109,7 @@ const Binder = struct {
                     try modifier.validate();
                 }
                 if (column.type == .array and column.element_type == null) return error.InvalidSqlProgram;
-                break :blk .{ .kind = column.type, .nullable = column.nullable, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+                break :blk columnType(column);
             },
             .cast => |cast| blk: {
                 if (cast.type == .array and cast.element_type == null) return error.InvalidSqlProgram;

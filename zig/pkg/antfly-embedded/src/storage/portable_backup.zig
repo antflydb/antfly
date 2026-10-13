@@ -1763,7 +1763,8 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, table_catalog.key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
+        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key);
 }
 
 /// True only for durable keys that a validated portable import may create.
@@ -2607,7 +2608,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
                 };
                 const derived = try public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema);
                 defer storage_schema.freeSchema(alloc, derived);
-                if (!try storage_schema.schemasEqual(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
+                if (!try storage_schema.schemasEqualForPublicBinding(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
             } else if (epoch.layout.schema.requires_public_schema or state.phase == .public_layouts) return error.InvalidBackupRequest;
             state.cursor = try owned.dupe(u8, kv.key);
             count += 1;
@@ -2719,7 +2720,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             state.ordinal += 1;
         }
         if (state.ordinal == state.object_count) state.phase = .layouts;
-        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{});
+        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{}, null);
         try writes.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
         try cancellation.check();
         try validateAndImportDocumentEntries(alloc, store, selected, &archive, writes.items);
@@ -2931,7 +2932,7 @@ fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, c
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, schema, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, schema, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -3140,14 +3141,16 @@ fn validateAndImportPortableStagingAfterHeader(
         .snapshot_alloc = alloc,
     };
     defer archive.deinit(alloc);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, store);
+    defer probe.deinit(alloc);
     var imported_identity = false;
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
     var payload_bytes: u64 = 0;
     const restore_started_ns = platform_time.monotonicNs();
-    while (reader.hasRemaining()) {
+    while (probe.first != null or reader.hasRemaining()) {
         try opts.cancellation.check();
-        const block = try reader.readBlock(alloc);
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (block_index == 0 and block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
         if (block.block_type == .bundle_manifest) {
@@ -3158,7 +3161,7 @@ fn validateAndImportPortableStagingAfterHeader(
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (block.block_type == .metadata_batch and archive.saw_document_block)
+        if (!probe.metadata_primed and block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
         switch (block.block_type) {
             .document_batch => {
@@ -3174,7 +3177,7 @@ fn validateAndImportPortableStagingAfterHeader(
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .metadata_batch => try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
+            .metadata_batch => if (!probe.metadata_primed) try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
             .chunk_batch => if (opts.import_derived_indexes) try importChunkBatch(alloc, store, block.payload),
             .artifact_batch => if (opts.import_derived_indexes) try importPublicArtifactBatch(alloc, store, block.payload, .asset),
             .resolution_batch => if (opts.import_derived_indexes) try importResolutionArtifactBatch(alloc, store, block.payload),
@@ -3284,10 +3287,12 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         .source_copy = opts.source_copy,
     };
     defer archive.deinit(alloc);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, null);
+    defer probe.deinit(alloc);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
-    while (reader.hasRemaining()) {
-        const block = try reader.readBlock(alloc);
+    while (probe.first != null or reader.hasRemaining()) {
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (header.format_version == backup_codec.format_version and block_index == 0 and
             block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
@@ -3299,16 +3304,77 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (header.format_version == backup_codec.format_version and
+        if (!probe.metadata_primed and header.format_version == backup_codec.format_version and
             block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
-        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
+        if (!probe.metadata_primed or block.block_type != .metadata_batch)
+            try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
         if (block.block_type == .document_batch) archive.saw_document_block = true;
         block_index += 1;
     }
     if (header.format_version == backup_codec.format_version and !saw_bundle_manifest)
         return error.InvalidBackupManifest;
     try archive.finish(alloc);
+}
+
+const PortableMetadataProbe = struct {
+    metadata_primed: bool = false,
+    first: ?backup_codec.Block = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.first) |block| alloc.free(block.payload);
+    }
+
+    fn next(self: *@This(), alloc: Allocator, reader: anytype) !backup_codec.Block {
+        if (self.first) |block| {
+            self.first = null;
+            return block;
+        }
+        return reader.readBlock(alloc);
+    }
+};
+
+// Released v0.2.1+ AFB2 writers place documents before their schema metadata.
+// Authenticate a bounded streaming metadata pass first, then reset the same
+// source and validate every row with its schema. Reader.reset also checks the
+// archive fingerprint across passes; newer reader levels retain strict ordering.
+fn primeReleasedPortableMetadata(
+    alloc: Allocator,
+    reader: anytype,
+    opts: ImportOptions,
+    archive: *PortableArchiveValidation,
+    store: ?*DocStore,
+) !PortableMetadataProbe {
+    if (archive.format_version != backup_codec.format_version) return .{};
+    if (!reader.hasRemaining()) return error.InvalidBackupManifest;
+    const first = try reader.readBlock(alloc);
+    var first_owned = true;
+    defer if (first_owned) alloc.free(first.payload);
+    if (first.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+    var manifest = try backup_bundle.parseManifest(alloc, first.payload);
+    defer manifest.deinit();
+    if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+    if (manifest.value.compatibility.min_afb_reader != backup_bundle.base_afb_reader_version) {
+        // Current archives continue their authenticated pass with this block.
+        // Reset is only legal after the footer has completed the pass.
+        first_owned = false;
+        return .{ .first = first };
+    }
+    while (reader.hasRemaining()) {
+        try opts.cancellation.check();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type == .bundle_manifest) return error.InvalidBackupManifest;
+        if (block.block_type == .metadata_batch) {
+            if (store) |staging| {
+                try validateAndImportMetadataBatchPayload(alloc, staging, block.payload, archive);
+            } else {
+                try validateMetadataBatchPayload(alloc, block.payload, archive);
+            }
+        }
+    }
+    try reader.reset(alloc);
+    return .{ .metadata_primed = true };
 }
 
 const ArchiveSchemaLayout = struct {
@@ -3371,6 +3437,9 @@ const PortableArchiveValidation = struct {
     saw_index_catalog: bool = false,
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
+    saw_resolver_merges: bool = false,
+    resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
+    resolver_merge_data: ?[]u8 = null,
 
     const DecodedEpoch = struct {
         version: u32,
@@ -3521,6 +3590,11 @@ const PortableArchiveValidation = struct {
     }
 
     pub fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.resolver_configs) |configs| {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        if (self.resolver_merge_data) |data| alloc.free(data);
         self.source_generation_admissions.deinit(alloc);
         if (self.source_integrity_catalog) |*catalog| catalog.deinit();
         if (self.index_projection) |*projection| projection.deinit(alloc);
@@ -3616,6 +3690,17 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
+        defer alloc.free(resolver_bytes);
+        const configs = try resolver_catalog.deserializeCatalog(alloc, resolver_bytes);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        resolver_catalog.applyMergeState(alloc, configs, self.resolver_merge_data orelse "[]") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMetadataBatch,
+        };
         if (self.cohort != null and !self.saw_cohort) return error.BackupIntegrityFailure;
         if (self.source_copy != null and !self.saw_source_copy) return error.BackupIntegrityFailure;
         if (self.source_integrity != null and (self.source_integrity_catalog == null or !self.source_integrity_activation)) return error.BackupIntegrityFailure;
@@ -3657,7 +3742,7 @@ const PortableArchiveValidation = struct {
                     else => return error.InvalidBackupRequest,
                 };
                 defer storage_schema.freeSchema(alloc, derived);
-                const schemas_match = storage_schema.schemasEqual(alloc, runtime_schema, derived) catch |err| switch (err) {
+                const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, runtime_schema, derived) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidBackupRequest,
                 };
@@ -3677,7 +3762,7 @@ const PortableArchiveValidation = struct {
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, layout.schema.*, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, layout.schema.*, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -4542,9 +4627,16 @@ fn validateMetadataEntries(
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
-            for (configs) |*config| config.deinit(alloc);
-            alloc.free(configs);
+            archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, resolver_catalog.merge_catalog_key)) {
+            if (archive.saw_resolver_merges) return error.InvalidMetadataBatch;
+            resolver_catalog.validateSerializedMergeState(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.resolver_merge_data = try alloc.dupe(u8, entry.value);
+            archive.saw_resolver_merges = true;
         }
     }
 }
@@ -6349,10 +6441,15 @@ test "import preflights logical block payloads before mutating destination" {
 
 test "import preflights durable catalogs before mutating destination" {
     const alloc = std.testing.allocator;
+    const required_catalog = try resolver_catalog.serializeCatalog(alloc, &.{.{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 }});
+    defer alloc.free(required_catalog);
     const cases = [_]struct { key: []const u8, value: []const u8 }{
         .{ .key = "\x00\x00__metadata__:indexes", .value = "not-an-index-catalog" },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "not-json" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "[{\"name\":\"orphan\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = required_catalog },
     };
     for (cases) |case| {
         var tmp_src = std.testing.tmpDir(.{});
@@ -6452,11 +6549,14 @@ test "export and import preserves doc identity metadata" {
         &initial_identity,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try src.putBatch(initial_identity.items, &.{});
 
     var tombstone_identity = std.ArrayListUnmanaged(KVPair).empty;
     defer freeAllocatedKVPairs(alloc, &tombstone_identity);
+    var live_deletes_tombstone_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         &src,
@@ -6466,8 +6566,9 @@ test "export and import preserves doc identity metadata" {
         &tombstone_identity,
         &.{},
         &.{"doc:b"},
+        &live_deletes_tombstone_identity,
     );
-    try src.putBatch(tombstone_identity.items, &.{});
+    try src.putBatch(tombstone_identity.items, live_deletes_tombstone_identity.items);
 
     var out: ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -6575,6 +6676,7 @@ test "import rejects doc identity metadata with invalid canonical ids" {
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
@@ -6622,6 +6724,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
@@ -7065,7 +7168,7 @@ test "export skips derived data" {
     }
 }
 
-test "portable relationships preserve parallel identities and arbitrary endpoints" {
+test "portable backup relationships preserve parallel identities and arbitrary endpoints" {
     const alloc = std.testing.allocator;
     var tmp_src = std.testing.tmpDir(.{});
     defer tmp_src.cleanup();
@@ -7095,6 +7198,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
         defer manifest.deinit();
         try std.testing.expectEqual(backup_bundle.relationship_reader_version, manifest.value.compatibility.min_afb_reader);
     }
+    try validatePortable(alloc, out.items);
 
     for ([_]bool{ false, true }) |staged| {
         var tmp_dst = std.testing.tmpDir(.{});
@@ -7114,7 +7218,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
     }
 }
 
-test "portable graph retirements are primary and require reader version four" {
+test "portable backup graph retirements are primary and require reader version four" {
     const alloc = std.testing.allocator;
     const stamped = @import("graph_cleanup_contract.zig").retirementValue(42);
     for ([_][]const u8{ "1", &stamped }) |retirement| {
@@ -7145,6 +7249,7 @@ test "portable graph retirements are primary and require reader version four" {
             defer manifest.deinit();
             try std.testing.expectEqual(backup_bundle.retirement_reader_version, manifest.value.compatibility.min_afb_reader);
         }
+        try validatePortable(alloc, out.items);
         for ([_]bool{ false, true }) |staged| {
             for ([_]bool{ false, true }) |derived| {
                 var tmp_dst = std.testing.tmpDir(.{});
@@ -7170,4 +7275,52 @@ test "portable graph retirements are primary and require reader version four" {
             }
         }
     }
+}
+
+test "portable backup v02 released AFB2 validates imports and binds public schemas" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("testdata/v02-server/portable.afb");
+    try validatePortable(alloc, bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try importPortable(alloc, &store, bytes);
+    try validateCompleteDatabaseImageAlloc(alloc, &store);
+    const runtime = (try storage_schema.loadSchema(&store, alloc)).?;
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(u32, 12), runtime.decoded_format_version);
+    try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+    const key = try internal_keys.documentKeyAlloc(alloc, "a");
+    defer alloc.free(key);
+    const row = try store.get(alloc, key);
+    defer alloc.free(row);
+    try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
+    try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+}
+
+test "resolver import cross checks merge catalog before publication" {
+    const alloc = std.testing.allocator;
+    const cfg: resolver_catalog.ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 };
+    const catalog = try resolver_catalog.serializeCatalog(alloc, &.{cfg});
+    defer alloc.free(catalog);
+    const cases = [_]?[]const u8{
+        null,
+        "[]",
+        "[{\"name\":\"unrelated\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+        "[{\"name\":\"r\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+    };
+    for (cases, 0..) |merges, i| {
+        var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try validateMetadataEntries(alloc, &.{.{ .key = "\x00\x00__metadata__:resolvers", .value = catalog }}, &archive);
+        if (merges) |data| try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = data }}, &archive);
+        if (i == 3) try archive.finish(alloc) else try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    }
+    // A valid sidecar cannot introduce a resolver absent from the catalog.
+    var orphan: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer orphan.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = cases[3].? }}, &orphan);
+    try std.testing.expectError(error.InvalidMetadataBatch, orphan.finish(alloc));
 }

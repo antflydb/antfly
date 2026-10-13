@@ -188,6 +188,8 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Optional planning prefetch; required reads and publication proofs remain authoritative.
+        navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
             retention_ms: u64 = 300_000,
             max_native_cuts: usize = 64,

@@ -267,12 +267,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .pic = true,
     });
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
-    const native_inference = b.addLibrary(.{
-        .name = "antfly-embedded-inference",
-        .linkage = .static,
-        .root_module = native_inference_mod,
-        .max_rss = 12 * 1024 * 1024 * 1024,
-    });
+    const native_inference = @import("shared_library.zig").addProviderArchive(
+        b,
+        native_inference_mod,
+        "antfly-embedded-inference",
+        12 * 1024 * 1024 * 1024,
+    );
     const native_enrichment_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/enrichment_compute_root.zig"),
         .target = target,
@@ -280,12 +280,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .pic = true,
     });
     antfly_imports.configureEnrichment(b, native_enrichment_mod, link_libc);
-    const native_enrichment = b.addLibrary(.{
-        .name = "antfly-embedded-enrichment",
-        .linkage = .static,
-        .root_module = native_enrichment_mod,
-        .max_rss = 8 * 1024 * 1024 * 1024,
-    });
+    const native_enrichment = @import("shared_library.zig").addProviderArchive(
+        b,
+        native_enrichment_mod,
+        "antfly-embedded-enrichment",
+        8 * 1024 * 1024 * 1024,
+    );
     const libantfly_link_mod = capi_mod;
     libantfly_link_mod.strip = strip;
     libantfly_link_mod.linkLibrary(native_inference);
@@ -540,6 +540,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference pulls a model with progress",
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
+        "capi native text queries overlap writer commits and retain retired providers",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
@@ -576,6 +577,27 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_test_step = b.step("capi-test", "Run C API tests");
     capi_test_step.dependOn(&run_capi_tests.step);
+
+    // Resolver and scorer are owned by embedded storage. Run their pure tests
+    // in embedded CI as well as the compatibility lib-* test targets.
+    const matcher_tests = b.addTest(.{ .root_module = antfly_imports.matcher });
+    const run_matcher = b.addRunArtifact(matcher_tests);
+    b.step("embedded-matcher-test", "Test the embedded entity matching scorer").dependOn(&run_matcher.step);
+    capi_test_step.dependOn(&run_matcher.step);
+    const resolver_tests = b.addTest(.{ .root_module = antfly_imports.resolver });
+    const run_resolver = b.addRunArtifact(resolver_tests);
+    b.step("embedded-resolver-test", "Test the embedded resolver and Unicode helpers").dependOn(&run_resolver.step);
+    capi_test_step.dependOn(&run_resolver.step);
+    const resolution_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/resolver_replay_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureEmbedded(b, resolution_test_mod, link_libc);
+    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{"resolver backfill skips"} });
+    const run_resolution = b.addRunArtifact(resolution_tests);
+    b.step("embedded-resolver-replay-test", "Test selective embedded resolver replay").dependOn(&run_resolution.step);
+    capi_test_step.dependOn(&run_resolution.step);
 
     return .{
         .native_inference = native_inference,

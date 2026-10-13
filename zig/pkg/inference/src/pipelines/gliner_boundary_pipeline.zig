@@ -1276,7 +1276,9 @@ pub const fp16_encoder_confidence_tolerance: f32 = 7.5e-4;
 /// larger, but still bounded and deterministic, cross-window delta. Measured
 /// via the real long executor (session_factory + Node.extractDirect, not a
 /// diagnostic) over VOPR.md's "Completion-Claim Audit" (37KB, multi-window),
-/// PDF.md's corpus-maximum section (~99KB), and both corpus-minimum
+/// PDF.md's corpus-maximum section (~99KB) -- both now frozen snapshots of
+/// those sections at commit 3ce5aff4ea, under
+/// testdata/gliner25/long_document_probe/ -- and both corpus-minimum
 /// documents, order-independent identity matching (label+text+span) so a
 /// harmless near-tie reordering of the final entities array is never
 /// conflated with a decision difference: every one of 445 matched

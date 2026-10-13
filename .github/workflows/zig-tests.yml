@@ -612,6 +612,8 @@ jobs:
 
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
@@ -664,6 +666,37 @@ jobs:
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          model_dir="$models_root/fastino/gliner2.5-base-v1"
+          trap 'rm -rf "$models_root"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
+          cd zig
+          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
+            '-Dtest-filter=--test-filter=capi native text queries' -j1
+          cd ..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
+              --output "$RUNNER_TEMP/lite-extraction-eval.json"
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lite-extraction-evaluation
+          path: ${{ runner.temp }}/lite-extraction-eval.json
+          if-no-files-found: error
 
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
@@ -1028,6 +1061,8 @@ jobs:
 
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
@@ -1084,6 +1119,37 @@ jobs:
           python3 zig/tools/check_embedded_isolated_build.py --
           --maxrss ${{ steps.cpus.outputs.max_rss }}
           --summary all
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: always() && !cancelled() && success()
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          model_dir="$models_root/fastino/gliner2.5-base-v1"
+          trap 'rm -rf "$models_root"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
+          cd zig
+          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
+            '-Dtest-filter=--test-filter=capi native text queries' -j1
+          cd ..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
+              --output "$RUNNER_TEMP/lite-extraction-eval.json"
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Upload real-model extraction evaluation
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lite-extraction-evaluation
+          path: ${{ runner.temp }}/lite-extraction-eval.json
+          if-no-files-found: error
 
       - name: Release correctness-fixture workspace
         if: always() && env.ANTFLY_TEST_WORKSPACE != ''
@@ -1630,7 +1696,7 @@ jobs:
           fi
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not iceberg_integration and not slow" e2e/antfly
+            -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -1780,7 +1846,7 @@ jobs:
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
         run: |
-          python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
+          uv run --project zig/e2e/antfly python -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
 
       - name: Run base E2E
         env:

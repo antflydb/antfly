@@ -17,12 +17,19 @@
 //! file offsets, decoded scores, or caller output buffers. Values are always
 //! resolved through the current scope's pinned checkpoint.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const keys = @import("internal_keys.zig");
 const ScoreSink = @import("backend_types.zig").ScoreSink;
 
 // A rebuild gets a process-unique identity, including after deinit and address
 // reuse. Row/column permutations keep the canonical physical key identity.
-var next_identity = std.atomic.Value(u64).init(1);
+var next_identity = platform.atomic.Value(u64).init(1);
+pub fn newCanonicalIdentity() u64 {
+    const identity = next_identity.fetchAdd(1, .monotonic);
+    if (identity == 0 or identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
+    return identity;
+}
+
 pub const PreparedScorePlan = struct {
     pub const max_bytes = 256 * 1024;
     pub const max_keys = 4096;
@@ -36,7 +43,7 @@ pub const PreparedScorePlan = struct {
         }
     };
     backing: ?std.mem.Allocator = null,
-    storage: ?[]u8 = null,
+    storage: ?[]align(@alignOf(usize)) u8 = null,
     nodes: []const []const u8 = &.{},
     prefixes: []const ?[]const u8 = &.{},
     read_keys: []const []const u8 = &.{},
@@ -58,10 +65,53 @@ pub const PreparedScorePlan = struct {
     column_sorted: []const usize = &.{},
     column_count: usize = 0,
     column_order_identity: bool = true,
+    dense_columns: bool = false,
+    // Immutable multi-chunk scans do not churn the single-entry decoded cache.
+    // This is a read admission hint, not part of canonical key identity.
+    retain_decoded: bool = true,
 
     pub fn deinit(self: *@This()) void {
         if (self.storage) |storage| self.backing.?.free(storage);
         self.* = .{};
+    }
+
+    /// Deep, independently owned snapshot of a valid plan. Canonical bytes and
+    /// their identity are unchanged; all descriptors and mappings are relocated.
+    /// Storage alignment is explicit so offsets remain valid on any allocator.
+    pub fn clone(self: *const @This(), a: std.mem.Allocator) !@This() {
+        if (!self.valid or self.identity == 0) return error.InvalidBatch;
+        const old = self.storage orelse return error.InvalidBatch;
+        const storage = try a.alignedAlloc(u8, .of(usize), old.len);
+        @memcpy(storage, old);
+        var copy = self.*;
+        copy.backing = a;
+        copy.storage = storage;
+        const nodes = relocate([]const u8, self.nodes, old, storage);
+        for (nodes) |*node| node.* = relocate(u8, node.*, old, storage);
+        copy.nodes = nodes;
+        const prefixes = relocate(?[]const u8, self.prefixes, old, storage);
+        for (prefixes) |*prefix| if (prefix.*) |value| {
+            prefix.* = relocate(u8, value, old, storage);
+        };
+        copy.prefixes = prefixes;
+        const keys_copy = relocate([]const u8, self.read_keys, old, storage);
+        for (keys_copy) |*key| key.* = relocate(u8, key.*, old, storage);
+        copy.read_keys = keys_copy;
+        copy.targets = relocate(Target, self.targets, old, storage);
+        copy.ends = relocate(usize, self.ends, old, storage);
+        inline for (.{ "row_remap", "row_identity", "row_heads", "row_cursors", "duplicate_next", "column_remap", "column_identity", "column_consumed" }) |field| {
+            @field(copy, field) = relocate(u16, @field(self, field), old, storage);
+        }
+        copy.column_sorted = relocate(usize, self.column_sorted, old, storage);
+        return copy;
+    }
+
+    fn relocate(comptime T: type, values: []const T, old: []const u8, storage: []u8) []T {
+        if (values.len == 0) return &.{};
+        const offset = @intFromPtr(values.ptr) - @intFromPtr(old.ptr);
+        std.debug.assert(offset <= old.len and values.len * @sizeOf(T) <= old.len - offset);
+        const ptr: [*]T = @ptrCast(@alignCast(storage.ptr + offset));
+        return ptr[0..values.len];
     }
 
     pub fn prepare(self: *@This(), backing: std.mem.Allocator, prefixes: []const ?[]const u8, nodes: []const []const u8) !bool {
@@ -77,7 +127,7 @@ pub const PreparedScorePlan = struct {
             self.deinit();
             self.backing = backing;
             const capacity = @min(max_bytes, std.math.ceilPowerOfTwo(usize, estimate) catch max_bytes);
-            self.storage = try backing.alloc(u8, capacity);
+            self.storage = try backing.alignedAlloc(u8, .of(usize), capacity);
         }
         self.valid = false;
         var buffer = std.heap.FixedBufferAllocator.init(self.storage.?);
@@ -227,8 +277,16 @@ pub const PreparedScorePlan = struct {
         self.targets = targets;
         self.read_keys = read_keys[0..unique];
         self.ends = ends[0..unique];
-        self.identity = next_identity.fetchAdd(1, .monotonic);
-        if (self.identity == 0 or self.identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
+        // Prove once that canonical scores consist of whole contiguous columns.
+        // Duplicate keys, interleaved prefixes and unsorted rows use fanout.
+        self.dense_columns = nodes.len != 0 and unique == targets.len;
+        if (self.dense_columns) for (targets, 0..) |target, i| {
+            if (target.row != i % nodes.len or target.column != columns[i / nodes.len]) {
+                self.dense_columns = false;
+                break;
+            }
+        };
+        self.identity = newCanonicalIdentity();
         self.valid = true;
         return true;
     }
@@ -272,7 +330,8 @@ pub const PreparedScorePlan = struct {
         return true;
     }
 
-    fn matches(self: *const @This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
+    /// Exact logical input comparison, respecting current row/column remaps.
+    pub fn matches(self: *const @This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
         return self.prefixesMatch(prefixes) and self.nodesMatch(nodes);
     }
 
@@ -362,7 +421,54 @@ pub const PreparedScorePlan = struct {
             return .{ .context = self, .write = if (self.plan.column_order_identity)
                 (if (self.plan.row_order_identity) completeCanonical else completeRemapped)
             else
-                (if (self.plan.row_order_identity) completeColumns else completeBoth) };
+                (if (self.plan.row_order_identity) completeColumns else completeBoth), .write_decoded = if (self.plan.dense_columns and self.plan.row_order_identity and self.plan.nodes.len >= 8)
+                decodedDense
+            else if (self.plan.column_order_identity)
+                (if (self.plan.row_order_identity) decodedCanonical else decodedRemapped)
+            else
+                (if (self.plan.row_order_identity) decodedColumns else decodedBoth) };
+        }
+        fn decodedDense(ctx: *anyopaque, scores: []const f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const rows = self.plan.nodes.len;
+            std.debug.assert(scores.len == self.plan.read_keys.len);
+            for (self.plan.column_sorted[0..self.plan.column_count], 0..) |column, ordinal| {
+                const output = self.columns[if (self.plan.column_order_identity) column else self.plan.column_remap[column]];
+                for (scores[ordinal * rows ..][0..rows], output) |score, *value| {
+                    value.* = if (std.math.isNan(score)) null else score;
+                }
+            }
+        }
+        fn decodedCanonical(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, false, false);
+        }
+        fn decodedRemapped(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, true, false);
+        }
+        fn decodedColumns(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, false, true);
+        }
+        fn decodedBoth(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, true, true);
+        }
+        fn writeDecoded(ctx: *anyopaque, scores: []const f64, comptime remapped: bool, comptime columns_remapped: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(scores.len == self.plan.read_keys.len);
+            // Lift the unique-target decision out of the per-score delivery.
+            if (scores.len == self.plan.targets.len) {
+                for (scores, self.plan.targets) |score, target| {
+                    self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = if (std.math.isNan(score)) null else score;
+                }
+            } else {
+                var start: usize = 0;
+                for (scores, self.plan.ends) |score, end| {
+                    const value: ?f64 = if (std.math.isNan(score)) null else score;
+                    for (self.plan.targets[start..end]) |target| {
+                        self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = value;
+                    }
+                    start = end;
+                }
+            }
         }
         fn completeCanonical(ctx: *anyopaque, index: usize, score: ?f64) void {
             writeRows(ctx, index, score, false, false);
@@ -514,4 +620,87 @@ test "prepared score plan identity survives permutations and changes after rebui
     plan.deinit();
     try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"q"}, &.{ "a", "b" }));
     try std.testing.expect(plan.identity != rebuilt);
+}
+
+test "prepared score bulk delivery preserves null duplicate and permutation fanout" {
+    const a = std.testing.allocator;
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    const prefixes = [_]?[]const u8{ "p/", null, "q/", "p/" };
+    const reordered = [_]?[]const u8{ "q/", "p/", null, "p/" };
+    const nodes = [_][]const u8{ "a", "b", "a" };
+    const permuted = [_][]const u8{ "b", "a", "a" };
+    for (0..4) |mode| {
+        try std.testing.expect(try plan.prepare(a, if (mode & 1 == 0) &prefixes else &reordered, if (mode & 2 == 0) &nodes else &permuted));
+        var expected: [4][3]?f64 = @splat(@splat(null));
+        var actual: [4][3]?f64 = @splat(@splat(null));
+        var first = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &expected[0], &expected[1], &expected[2], &expected[3] } };
+        var second = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &actual[0], &actual[1], &actual[2], &actual[3] } };
+        var values: [4]f64 = undefined;
+        for (values[0..plan.read_keys.len], 0..) |*score, i| {
+            score.* = if (i == 1) std.math.nan(f64) else @floatFromInt(i);
+            const sink = first.completeSink();
+            sink.write(sink.context, i, if (std.math.isNan(score.*)) null else score.*);
+        }
+        second.completeSink().deliverDecoded(values[0..plan.read_keys.len]);
+        for (expected, actual) |want, got| try std.testing.expectEqualSlices(?f64, &want, &got);
+    }
+}
+
+test "prepared score dense columns preserve missing scores null columns and remaps" {
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    const prefixes = [_]?[]const u8{ "q/", null, "p/" };
+    const nodes = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    const reordered = [_]?[]const u8{ "p/", "q/", null };
+    const reversed = [_][]const u8{ "h", "g", "f", "e", "d", "c", "b", "a" };
+    for (0..4) |mode| {
+        try std.testing.expect(try plan.prepare(std.testing.allocator, if (mode & 1 == 0) &prefixes else &reordered, if (mode & 2 == 0) &nodes else &reversed));
+        try std.testing.expect(plan.dense_columns);
+        var expected: [3][8]?f64 = @splat(@splat(null));
+        var actual: [3][8]?f64 = @splat(@splat(null));
+        var scalar = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &expected[0], &expected[1], &expected[2] } };
+        var bulk = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &actual[0], &actual[1], &actual[2] } };
+        const values = [_]f64{ 3, std.math.nan(f64), 5, 8, 1, 2, 3, 4, 9, 8, 7, std.math.nan(f64), 5, 4, 3, 2 };
+        const sink = scalar.completeSink();
+        for (values, 0..) |value, i| sink.write(sink.context, i, if (std.math.isNan(value)) null else value);
+        bulk.completeSink().deliverDecoded(&values);
+        for (expected, actual) |first, second| try std.testing.expectEqualSlices(?f64, &first, &second);
+    }
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{ "p/", "p/" }, &nodes));
+    try std.testing.expect(!plan.dense_columns);
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &prefixes, &.{ "a", "a" }));
+    try std.testing.expect(!plan.dense_columns);
+}
+
+test "prepared score plan clone owns remapped descriptors and preserves canonical identity" {
+    const a = std.testing.allocator;
+    var source = PreparedScorePlan{};
+    defer source.deinit();
+    const prefixes = [_]?[]const u8{ "p/", null, "p/", "q/" };
+    const reordered = [_]?[]const u8{ "q/", "p/", null, "p/" };
+    const nodes = [_][]const u8{ "", "a\x00", "b", "a\x00" };
+    const permuted = [_][]const u8{ "b", "a\x00", "", "a\x00" };
+    try std.testing.expect(try source.prepare(a, &prefixes, &nodes));
+    try std.testing.expect(try source.prepare(a, &reordered, &permuted));
+    var copy = try source.clone(a);
+    defer copy.deinit();
+    try std.testing.expectEqual(source.identity, copy.identity);
+    var expected: [4][4]?f64 = @splat(@splat(null));
+    var actual: [4][4]?f64 = @splat(@splat(null));
+    var output = PreparedScorePlan.Output{ .plan = &source, .columns = &.{ &expected[0], &expected[1], &expected[2], &expected[3] } };
+    var values: [6]f64 = undefined;
+    for (&values, 0..) |*value, i| value.* = if (i == 2) std.math.nan(f64) else @floatFromInt(i);
+    output.completeSink().deliverDecoded(&values);
+    source.deinit();
+    try std.testing.expect(copy.matches(&reordered, &permuted));
+    var cloned = PreparedScorePlan.Output{ .plan = &copy, .columns = &.{ &actual[0], &actual[1], &actual[2], &actual[3] } };
+    cloned.completeSink().deliverDecoded(&values);
+    for (expected, actual) |first, second| try std.testing.expectEqualSlices(?f64, &first, &second);
+    // Rebuild the original and mutate the independent copy's mapping.
+    try std.testing.expect(try source.prepare(a, &.{"other"}, &.{"different"}));
+    try std.testing.expect(source.identity != copy.identity);
+    const identity = copy.identity;
+    try std.testing.expect(try copy.prepare(a, &prefixes, &nodes));
+    try std.testing.expectEqual(identity, copy.identity);
 }

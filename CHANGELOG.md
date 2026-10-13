@@ -16,6 +16,11 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Trusted-principal authorization** — reject requests carrying a trusted
+  principal when no verifier is configured, including MCP and inference routes
+  with local authentication disabled. MCP sessions cannot preserve a previous
+  request's broader permissions.
+
 - **PostgreSQL integration naming** — rename the Cargo package from `pgaf` to
   `antfly-postgres`, the PostgreSQL extension and query-builder schema to
   `antfly_postgres`, and move its source to `rs/crates/postgres`. Enable it with

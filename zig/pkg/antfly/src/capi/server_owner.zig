@@ -6091,8 +6091,10 @@ pub fn searchStorageKernelQueryJson(
     table_reads_api.checkQueryDeadline(controls) catch |err|
         return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(controls) catch |err|
+        handle.prepareSearchRequest(controls) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query preparation conflict", .{});
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+        };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
             @ptrCast(&handle.db),
@@ -6106,6 +6108,7 @@ pub fn searchStorageKernelQueryJson(
             request.control.execution_runnable,
             out_failure,
         ) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query provider conflict operation={d} provider_error={s}", .{ out_failure.operation, out_failure.boundedErrorName() });
             // A valid provider failure already carries the exact envelope.
             // Consumer-side allocation/protocol failures originate in this
             // outer operation and receive their own identity.

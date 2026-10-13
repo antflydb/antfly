@@ -20,7 +20,9 @@ use std::path::Path;
 use antfly_embedded_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
 
 use crate::error::{Error, Result};
-use crate::ffi::{HandleGate, borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
+use crate::ffi::{
+    HandleGate, borrow_slice, check, path_has_suffix, path_to_bytes, path_to_cstring, take_buffer,
+};
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
 
 /// The Antfly C ABI version this binding expects.
@@ -297,6 +299,10 @@ impl Database {
         c_opts.inference_scratch_budget_mb = options.scratch_budget_mb;
         c_opts.inference_process_memory_budget_mb = options.process_memory_budget_mb;
         c_opts.busy_timeout_ms = options.busy_timeout_ms();
+        let models_dir_bytes = options.models_dir.as_deref().map(path_to_bytes);
+        if let Some(bytes) = &models_dir_bytes {
+            c_opts.models_dir = borrow_slice(bytes);
+        }
 
         if let Some(ttl) = &options.ttl_cleanup {
             c_opts.flags |= sys::ANTFLY_OPEN_FLAG_TTL_CLEANUP;
@@ -505,6 +511,51 @@ impl Database {
 
     pub fn indexes_json(&self) -> Result<Vec<u8>> {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_list_indexes_json(h, out) })
+    }
+
+    /// Render the durable template and follow key aliases, without writes or ANN search.
+    pub fn render_resolver_key_json(
+        &self,
+        resolver: &str,
+        mention: impl AsRef<[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(mention.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_render_resolver_key_json(
+                h,
+                borrow_slice(resolver.as_bytes()),
+                input,
+                out,
+            )
+        })
+    }
+
+    /// Resolve text or extraction mentions, including aliases and ANN, without writes.
+    pub fn resolve_query_json(&self, resolver: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_resolve_query_json(h, borrow_slice(resolver.as_bytes()), input, out)
+        })
+    }
+
+    /// Persist a {"key","target"} redirect. Drain to re-key existing resolution edges.
+    pub fn merge_resolver_keys_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_merge_resolver_keys_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
+    }
+
+    /// Atomically reset or migrate resolver identities; drain afterward.
+    pub fn set_resolver_namespace_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_set_resolver_namespace_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
     }
 
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {

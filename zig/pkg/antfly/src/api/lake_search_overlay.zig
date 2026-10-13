@@ -59,14 +59,16 @@ pub const Overlay = struct {
         base: search.PinnedTextSource,
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.base.deinit();
-            self.a.destroy(self);
+            const a = self.a;
+            var base = self.base;
+            a.destroy(self);
+            base.deinit();
         }
     };
     /// The input pin transfers only on success. Tombstones have private shared
     /// cells, so archive readers cannot see another query's pending deletes.
     pub fn compose(self: *const Overlay, base: search.PinnedTextSource, excluded: *const Bitmap, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
-        const a = base.snapshot.alloc;
+        const a = base.snapshot.inventoryAllocator();
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
         const sources = try a.alloc(local.index.IndexWriter.ImmutableSegment, base.snapshot.segments.len);
@@ -118,7 +120,12 @@ pub const Overlay = struct {
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .base = base };
-        const snapshot = if (base.read_context) |read_context| try writer.acquireSnapshotWithReadContext(read_context) else writer.acquireSnapshot();
+        const snapshot = if (base.snapshot.read_context_check) |check|
+            try writer.acquireSnapshotWithReadCapability(.{ .ptr = base.snapshot.read_context.?, .check = check, .io = base.snapshot.read_context_io })
+        else if (base.read_context) |read_context|
+            try writer.acquireSnapshotWithReadContext(read_context)
+        else
+            writer.acquireSnapshot();
         return .{ .snapshot = snapshot, .read_context = base.read_context, .name = base.name, .text_analysis = base.text_analysis, .runtime_schema = base.runtime_schema, .selected_field = base.selected_field, .owner = owner, .release_owner = Owner.release };
     }
 };
@@ -206,4 +213,51 @@ test "external lake overlay recognizes the synthetic empty baseline without assu
     try std.testing.expectEqual(@as(u64, 0), try snapshotCoverage(root, id));
     try requireNativeAncestry(root, id);
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, snapshotCoverage(root, "empty:other-1:" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+}
+
+test "external lake masked overlays retain physical allocation ownership and query cancellation" {
+    const a = std.testing.allocator;
+    var writer = try local.index.IndexWriter.init(a);
+    var writer_open = true;
+    defer if (writer_open) writer.deinit();
+    var segment = local.segment.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("one", "{}");
+    try segment.addStoredDoc("two", "{}");
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    const Control = struct {
+        cancelled: bool = false,
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.cancelled) return error.Canceled;
+        }
+    };
+    var control: Control = .{};
+    const facade = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &control, .check = Control.check });
+    var base: search.PinnedTextSource = .{ .snapshot = facade, .read_context = &control, .name = "text", .text_analysis = .{}, .runtime_schema = null };
+    var transferred = false;
+    defer if (!transferred) base.deinit();
+    try std.testing.expect(facade.alloc.ptr != a.ptr or facade.alloc.vtable != a.vtable);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const overlay = try Overlay.init(arena.allocator(), .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{} });
+    var mask = Bitmap.init(a);
+    defer mask.deinit();
+    try mask.add(1);
+    var joined = try overlay.compose(base, &mask, .{});
+    transferred = true;
+    defer joined.deinit();
+    try std.testing.expect(joined.snapshot.read_context_check != null);
+    try std.testing.expectEqual(@as(u32, 1), joined.snapshot.segments[0].shared.deleted_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), base.snapshot.segments[0].shared.deleted_count.load(.acquire));
+    writer.deinit();
+    writer_open = false;
+    try joined.snapshot.checkScoringReadContext();
+    try std.testing.expect(control.checks > 0);
+    control.cancelled = true;
+    try std.testing.expectError(error.Canceled, joined.snapshot.checkScoringReadContext());
 }

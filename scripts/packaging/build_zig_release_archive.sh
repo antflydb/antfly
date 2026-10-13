@@ -213,7 +213,6 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dantfly-version="$version"
-  -Donnx=false
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"
@@ -229,16 +228,20 @@ zig_install_args=(
 )
 
 run_zig_build_steps() {
+  # Darwin storage reserves 28 GiB and API reserves 24 GiB. Use the bounded
+  # runner's 80% host/cgroup budget for Darwin rather than an arbitrary cap
+  # that rejects these units or prevents safe overlap on larger CI hosts.
   local -a command=(
     python3
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
-    --max-rss-cap
-    21474836480
-    --
-    build
   )
+  case "$target" in
+    *macos*) ;;
+    *) command+=(--max-rss-cap 21474836480) ;;
+  esac
+  command+=(-- build --summary all)
 
   if [[ "$product" = lite || "$product" = embedded ]]; then
     command+=(--build-file embedded.build.zig)

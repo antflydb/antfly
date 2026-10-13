@@ -388,6 +388,9 @@ pub fn create(b: *std.Build) ?void {
         return subprocess.run(
             [self.zig, "build", "check-storage-compilation", "-j2", *args],
             cwd=self.root,
+            # Fixture-generated sources belong to its own lifetime, even when
+            # the caller configures a disposable phase cache for other builds.
+            env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(self.root / ".zig-cache")},
             text=True,
             capture_output=True,
             timeout=120,
@@ -396,6 +399,18 @@ pub fn create(b: *std.Build) ?void {
     def test_extra_owner_fixture_does_not_expand_audit(self):
         result = self.build()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inherited_local_cache_stays_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory)
+            marker = shared / "caller-owned"
+            marker.write_text("preserve")
+            with mock.patch.dict(os.environ, {"ZIG_LOCAL_CACHE_DIR": str(shared)}):
+                result = self.build()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list(shared.iterdir()), [marker])
+            self.assertEqual(marker.read_text(), "preserve")
+            self.assertTrue((self.root / ".zig-cache" / "o").is_dir())
 
     def test_missing_required_artifact_reports_its_identity(self):
         for name in ("storage-owner-source-tests", "api-table-read-tests"):
