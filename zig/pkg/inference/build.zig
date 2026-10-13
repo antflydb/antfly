@@ -1073,6 +1073,92 @@ pub fn build(b: *std.Build) void {
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
 
+    const gemma4_image_bench = b.addExecutable(.{
+        .name = "antfly-gemma4-image-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_image.zig"), .target = target, .optimize = optimize }),
+    });
+    gemma4_image_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_image_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(gemma4_image_bench.root_module);
+    gemma4_image_bench.root_module.link_libc = true;
+    const install_gemma4_image_bench = b.addInstallArtifact(gemma4_image_bench, .{});
+    b.step("build-gemma4-image-bench", "Build the synchronized Gemma4 image benchmark").dependOn(&install_gemma4_image_bench.step);
+    const run_gemma4_image_bench = b.addRunArtifact(gemma4_image_bench);
+    run_gemma4_image_bench.addPassthruArgs();
+    b.step("bench-gemma4-image", "Benchmark Gemma4 vision and image embeddings").dependOn(&run_gemma4_image_bench.step);
+
+    const audio_embedding_bench = b.addExecutable(.{
+        .name = "antfly-audio-embedding-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/audio_embedding.zig"), .target = target, .optimize = optimize }),
+    });
+    audio_embedding_bench.root_module.addImport("build_options", build_options_mod);
+    audio_embedding_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(audio_embedding_bench.root_module);
+    audio_embedding_bench.root_module.link_libc = true;
+    const install_audio_embedding_bench = b.addInstallArtifact(audio_embedding_bench, .{});
+    b.step("build-audio-embedding-bench", "Build the synchronized real-model audio embedding benchmark").dependOn(&install_audio_embedding_bench.step);
+
+    if (target.result.os.tag == .macos) {
+        const pdf_ocr_bench = b.addExecutable(.{
+            .name = "antfly-pdf-ocr-comparison",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_ocr_comparison.zig"), .target = target, .optimize = optimize }),
+        });
+        pdf_ocr_bench.root_module.addImport("inference_internal", inference_internal_mod);
+        pdf_ocr_bench.root_module.addCSourceFile(.{ .file = b.path(b.fmt("{s}/lib/readers/src/apple_vision.m", .{shared_lib_root})), .flags = &.{"-fobjc-arc"} });
+        for ([_][]const u8{ "Vision", "Foundation", "CoreGraphics", "ImageIO" }) |framework| pdf_ocr_bench.root_module.linkFramework(framework, .{});
+        runtime_graph.identities.addImports(pdf_ocr_bench.root_module);
+        pdf_ocr_bench.root_module.link_libc = true;
+        b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
+    }
+
+    // Standalone PDF benchmark shares image/hash identity with inference.
+    // Font data belongs only to this tool, not the production inference graph.
+    const pdf_fonts_files = b.addWriteFiles();
+    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Regular.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Bold.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+    const pdf_fonts = b.createModule(.{ .root_source_file = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/pdf_standard_fonts.zig", .{shared_lib_root})), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
+    const pdf_font = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/font/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    const pdf_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/pdf/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    pdf_module.addImport("antfly_image", antfly_image_mod);
+    pdf_module.addImport("antfly_hash", antfly_image_mod.import_table.get("antfly_hash").?);
+    pdf_module.addImport("antfly_font", pdf_font);
+    pdf_module.addImport("pdf_standard_fonts", pdf_fonts);
+    pdf_module.addImport("antfly_platform", configured_platform_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_module, target);
+        pdf_module.linkFramework("CoreFoundation", .{});
+        pdf_module.linkFramework("CoreGraphics", .{});
+    }
+    const gemma4_pdf_bench = b.addExecutable(.{ .name = "antfly-gemma4-pdf-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_pdf.zig"), .target = target, .optimize = optimize }) });
+    gemma4_pdf_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_pdf_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    gemma4_pdf_bench.root_module.addImport("antfly_pdf", pdf_module);
+    runtime_graph.identities.addImports(gemma4_pdf_bench.root_module);
+    gemma4_pdf_bench.root_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, gemma4_pdf_bench.root_module, target);
+        gemma4_pdf_bench.root_module.linkFramework("Foundation", .{});
+        gemma4_pdf_bench.root_module.linkFramework("Metal", .{});
+        gemma4_pdf_bench.root_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_test_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_gpu.zig"), .target = target, .optimize = optimize });
+    pdf_gpu_test_module.addImport("antfly_pdf", pdf_module);
+    pdf_gpu_test_module.addImport("build_options", build_options_mod);
+    pdf_gpu_test_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_gpu_test_module, target);
+        pdf_gpu_test_module.linkFramework("Foundation", .{});
+        pdf_gpu_test_module.linkFramework("Metal", .{});
+        pdf_gpu_test_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_tests = b.addTest(.{ .root_module = pdf_gpu_test_module });
+    b.step("pdf-gpu-test", "Validate prototype eligibility and GPU/native pixel parity").dependOn(&b.addRunArtifact(pdf_gpu_tests).step);
+    const install_gemma4_pdf_bench = b.addInstallArtifact(gemma4_pdf_bench, .{});
+    b.step("build-gemma4-pdf-bench", "Build the real-PDF Gemma4 benchmark and Metal painter prototype").dependOn(&install_gemma4_pdf_bench.step);
+    const run_gemma4_pdf_bench = b.addRunArtifact(gemma4_pdf_bench);
+    run_gemma4_pdf_bench.addPassthruArgs();
+    b.step("bench-gemma4-pdf", "Compare CPU/GPU page painting and resident Gemma4 embedding").dependOn(&run_gemma4_pdf_bench.step);
+
     const embeddinggemma2_attention_check = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-attention-check",
         .root_module = b.createModule(.{

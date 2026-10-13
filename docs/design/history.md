@@ -111,6 +111,9 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 ## Additional records
 
+- [Media and OCR optimization](inference/history/gemma4/media-optimization-2026-10.md) — final results, rejected trials and pinned detailed evidence; current [batching](../../zig/pkg/inference/BATCHING.md#gpu-residency-for-media-embeddings) and [OCR contracts](inference/gemma4-ocr-optimization.md).
+
+
 - [Apache Lite and inference licensing](../reference/licensing/history/apache2-lite-inference-2026-09.md) — implementation, review, packaging, and WASM validation.
 - [Laya qualification](inference/history/laya/qualification.md) — measured CPU/Metal accuracy and performance.
 - [Laya investigation](inference/history/laya/support-investigation.md) — original placement decisions and implementation follow-up.
