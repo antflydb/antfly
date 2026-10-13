@@ -22,10 +22,11 @@ subsystem designs.
 ### Relocated Implementation Logs
 
 Dated implementation logs, defect ledgers, benchmark diaries, and roadmap
-restatements moved out of the Zig design docs on 2026-09-16. The original
-narrative is retained, with links updated for the consolidated documentation
-layout. Durable decisions were folded into the design doc first,
-and the design doc keeps a pointer. The placement rule is
+restatements moved out of the Zig design docs on 2026-09-16. Durable decisions
+were folded into the design doc first, and the design doc keeps a pointer.
+Logs longer than ~300 lines were later condensed into summaries of decisions,
+rejected approaches, and key measurements; each summary links to its full
+verbatim text at a pinned commit. The placement rule is
 recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 | Area | Document | Design doc | Summary |

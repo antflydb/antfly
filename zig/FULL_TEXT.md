@@ -510,7 +510,10 @@ profiles, and index-size measurements to evaluate:
 Every format change must version the persisted section, retain corruption
 checks, include merge/reopen tests, and report both speed and size. A microbench
 improvement is insufficient if full-corpus latency, RSS, or index size regresses
-materially.
+materially. A candidate format change must report persisted bytes, bytes decoded
+for each query class, CPU/query, query RSS, indexing peak RSS, and merge I/O; it
+is rejected if it merely trades the disk gap for selective-query CPU or memory
+amplification ([history](../docs/design/full-text/history/implementation-progress-2026-07.md)).
 
 ### Query Setup and Allocation Cost
 
@@ -619,6 +622,29 @@ unavailable during maintenance. A nonzero cached status count proves
 non-emptiness even when stale, but only a fresh zero snapshot proves an empty
 table — an explicit `startup_catch_up/opening` zero snapshot must omit
 optional storage status rather than render a false `empty=true`.
+
+### Portable SIMD
+
+Postings decode uses Zig `@Vector` operations with a scalar tail/reference
+path, letting Zig/LLVM lower the same source to NEON, SSE/AVX, WASM SIMD, or
+scalar code. Architecture-specific intrinsics, inline assembly, and target-name
+branches are allowed only as a separately measured fallback when `@Vector`
+cannot express a required operation or produces demonstrably inadequate code on
+a supported production target; such an exception keeps the same scalar
+reference tests and may not change the portable on-disk format
+([history](../docs/design/full-text/history/implementation-progress-2026-07.md)).
+
+### Segment residency
+
+Every persistent text writer publishes a conservative resident estimate to the
+`full_text.segment_residency` slice (512 MiB soft / 768 MiB hard by default;
+provisioned storage scales the hard limit to one eighth of detected memory,
+clamped between 256 MiB and 2 GiB, with a 75 percent soft watermark). On
+`shrink_cache` the writer advises the coldest clean live mapping cold: soft
+pressure preserves segments touched in the previous 30 seconds, hard pressure
+lowers that to five seconds, and active readers are never selected. Native LSM
+run files are range-read, not mmap-backed, so they are not candidates for this
+controller ([history](../docs/design/full-text/history/implementation-progress-2026-07.md)).
 
 ### Format evolution
 

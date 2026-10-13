@@ -564,6 +564,10 @@ path.
   the same campaign, and the watchdog protocol
   (`scripts/perf_watchdog_experiment.sh`, one experiment per boot, ≥300 s soak)
   for barrier/concurrency changes.
+- Never use `TERMITE_METAL_TRACE_FRAME_LIFECYCLE` for absolute short-frame
+  numbers, only for span structure: per-frame stderr lands on the critical
+  path and distorted short-context runs badly (48.5 vs 84.6 tok/s median)
+  ([history](../../../../../docs/design/inference/history/gemma4/metal-perf-plan.md)).
 
 ### Current reference numbers (M4 Pro, 2026-08)
 
@@ -646,6 +650,11 @@ Ranked; each item needs the gates above and a rollback env.
    zero-swap boot, resolve the E2B free-form fixture mismatch (164 vs a
    180-word floor), and retain evidence outside `/private/tmp` with hosted
    M-series perf CI on `decode_tok_s`, `planned_barriers`, and route counters.
+8. **Cross-session GPU mutex**: the one-GPU-job rule is still convention; the
+   2026-08-28 round saw two independent agents start GPU campaigns 24 s apart,
+   and the ledger asks for an enforced lock file. No script under
+   `scripts/gemma4/` takes one yet
+   ([history](../../../../../docs/design/inference/history/gemma4/metal-perf-plan.md)).
 
 The CUDA SM89/E2B track is owned by
 [CUDA_TUNING.md](../../CUDA_TUNING.md#gemma-4-e2b-sm89-optimization-status).

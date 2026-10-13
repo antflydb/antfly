@@ -172,6 +172,13 @@ on that metadata process while keeping the recovery driver, so admitted merges
 can finish or durably cancel and release their fences. The adapter requires
 the compiled native bundle, non-serverless mode and internal service
 authentication; unsupported deployments keep the guarded ordinary workflow.
+The online-merge admission guard is a property of upgraded metadata admission
+and data proposal processes, not a fleet-wide feature flag during a rolling
+upgrade: an older metadata leader paired with an older data leader can still
+start an online attempt. Disable online admission on every metadata process or
+drain old leaders before relying on the guarded ordinary fallback across the
+fleet; replay of already-committed attempts remains supported
+([history](relational/history/indexes-extraction.md)).
 
 Open: a repeated full mounted fault matrix (one mounted fault case passes), and
 compaction/selective-query performance comparison for sparse replacement.
@@ -204,12 +211,17 @@ Before advertising the expanded protocol, finish and validate:
    existing or receiver-verified reconstructed inventory, and direct/accepted-upstream asset callbacks are wired),
    including remaining input proofs and absence cleanup. Direct document-vector
    authored certification now bypasses inference; historical/adopted authored
-   output still requires receiver-local adoption evidence.
+   output still requires receiver-local adoption evidence. Staged output sets
+   beyond the atomic command limit (large staged outputs) remain required before
+   wiring the extraction worker ([history](ordered-artifacts/history/activation-gate-log.md)).
 3. Historic provenance carried with retained effects and snapshots, atomic
    receiver-local adoption certificates, and contender/promotion recovery.
    The direct-index ordered adoption participant is wired and tested locally,
    but its bounded coordinator, distributed retry outcomes, other producer
-   families and admission/activation barrier are not complete.
+   families and admission/activation barrier are not complete. Graph effect
+   rebinding and promotion identity on adoption, retained-tail provenance, and
+   bounded reclamation of abandoned merge evidence also remain open as of the
+   activation-gate log ([history](ordered-artifacts/history/activation-gate-log.md)).
 4. Complete scoped regeneration through the required-stream driver and all-member capability/catalog
    barriers, followed by the distributed crash, lost-reply, leadership-change,
    and standby-promotion fault matrix.
