@@ -34712,7 +34712,13 @@ fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool
 
 test "document extraction accepts validated reader no-text results without hiding invalid output" {
     const Runner = struct {
-        fn run(alloc: Allocator) !void {
+        fn run(backing: Allocator) !void {
+            // In-place growth depends on OS mapping state. Enumerate every
+            // allocation failure through the deterministic allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const alloc: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             for ([_][]const u8{ "", "EFTA02731411" }) |embedded| {
                 var unit = try cloneDocumentExtractionUnit(alloc, .{
                     .unit_id = @constCast("page-1"),
