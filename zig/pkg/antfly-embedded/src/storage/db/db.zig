@@ -18177,6 +18177,12 @@ pub const DB = struct {
     }
 
     fn lookupPrimarySnapshot(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *@import("../docstore.zig").DocStore.Txn) !?types.LookupResult {
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        return self.lookupPrimarySnapshotWithSchema(alloc, key, opts, probe, schema_view);
+    }
+
+    fn lookupPrimarySnapshotWithSchema(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -18184,10 +18190,7 @@ pub const DB = struct {
             break :bound try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         } else try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
-        // Each row uses its authenticated schema epoch. A batch shares the
-        // same immutable storage snapshot through projection and predicates.
-        var schema_view = self.core.acquireSchemaView();
-        defer if (schema_view) |*view| view.release();
+        // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
         const raw = probe.getLeased(store_key) catch |err| switch (err) {
@@ -38555,35 +38558,48 @@ pub const DB = struct {
     fn attachDistributedDocumentAuthority(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
         if (req.document_authority_mode == .none) return;
         if (req.document_authority_group == 0 or req.include_stored or req.return_mode != .parent or req.highlight != null or req.graph_queries.len != 0 or req.aggregations_json.len != 0) return error.InvalidQueryRequest;
-        var read = try self.core.store.beginReadTxn();
-        defer read.abort();
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
+        try self.attachDistributedDocumentAuthorityAtSnapshot(alloc, req, result, null, schema_view);
+    }
+
+    fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult, pinned: ?*docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !void {
+        if (req.document_authority_mode == .none) return;
+        var read: ?docstore_mod.DocStore.Txn = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
+        defer if (read) |*owned| owned.abort();
         var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scratch.deinit();
         var eager_bytes: usize = 0;
         for (result.hits, 0..) |*hit, index| {
-            // The enclosing apply-shared query lease fences writes. Retire
-            // borrowed/decompressed primary pages between bounded windows.
+            // Apply-shared fences ordinary reads; captured dense reads fork
+            // the original visibility cut. Retire page scratch every 64 hits.
             if (index != 0 and index % 64 == 0) {
-                read.abort();
-                read = try self.core.store.beginReadTxn();
+                read.?.abort();
+                read = null;
+                read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
             }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
             const a = scratch.allocator();
             const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, a, hit.id, schema_view);
-            const raw = read.getLeased(store_key) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            const cached = try @import("../document_mutation_revision.zig").loadContent(&read.?, store_key);
             var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
-            const version = try lookupSnapshotTimestamp(a, hit.id, &read);
+            const primary_bytes = if (cached) |content| cached: {
+                digest = content.digest;
+                break :cached content.bytes;
+            } else legacy: {
+                const raw = read.?.getLeased(store_key) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+                std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                break :legacy raw.len;
+            };
+            const version = try lookupSnapshotTimestamp(a, hit.id, &read.?);
             const authority: types.document_authority.Authority = .{ .group = req.document_authority_group, .version = version, .digest = digest };
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
-            const eager = req.document_authority_mode == .candidates and raw.len <= 8 * 1024 and raw.len <= 64 * 1024 -| eager_bytes;
+            const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshot(a, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read)
+                try self.lookupPrimarySnapshotWithSchema(a, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view)
             else
                 null;
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
@@ -41591,13 +41607,14 @@ pub const DB = struct {
     }
 
     fn snapshotDenseRequestEligible(req: types.SearchRequest) bool {
+        if (req.document_authority_mode == .hydrate or (req.document_authority_mode == .candidates and req.document_authority_group == 0)) return false;
         if (req.include_stored or (req.query != .dense_knn and !db_query_search.isDefaultMatchAll(req.query))) return false;
         // Default-deny future request fields. This first snapshot path handles
         // plain document-member score pages; filters, hydration, grouping and
         // composed queries keep their existing synchronization.
         var remaining = req;
         const defaults: types.SearchRequest = .{};
-        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation" }) |field| {
+        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
             @field(remaining, field) = @field(defaults, field);
         }
         // Empty slices from a decoded wire envelope need not share the
@@ -41705,7 +41722,9 @@ pub const DB = struct {
         const summary = self.core.identity_visibility.summary orelse return declineDenseSnapshot("identity_summary");
         if (!doc_identity.allVisibleFromSummary(summary, snapshot_req.identity_read_generation)) return declineDenseSnapshot("visibility");
         try self.proveVectorSearchAccessPath(req.index_name, .dense_vector, false);
-        var captured = (try self.core.index_manager.captureDenseReadSnapshot(entry, self.core.nextDerivedSequence())) orelse return declineDenseSnapshot("generation_bundle");
+        var schema_view = if (req.document_authority_mode != .none) self.core.acquireSchemaView() else null;
+        defer if (schema_view) |*view| view.release();
+        var captured = (try self.core.index_manager.captureDenseReadSnapshotWithPrimary(entry, self.core.nextDerivedSequence(), req.document_authority_mode != .none)) orelse return declineDenseSnapshot("generation_bundle");
         defer captured.deinit();
         // Every mutable input is now captured; index lifetime remains protected
         // by the catalog lease until result metadata is fully materialized.
@@ -41725,6 +41744,17 @@ pub const DB = struct {
                 error.IncompletePublishedSnapshot, error.DenseSnapshotNeedsPrimary => return null,
                 else => return err,
             };
+            errdefer result.result.deinit();
+            if (snapshot_req.document_authority_mode != .none) {
+                try externalizeSearchResultArtifactIds(alloc, &result.result);
+                self.attachDistributedDocumentAuthorityAtSnapshot(alloc, snapshot_req, &result.result, try captured.documentReadTxn(), schema_view) catch |err| switch (err) {
+                    error.ReadSnapshotForkUnsupported => {
+                        result.result.deinit();
+                        return declineDenseSnapshot("primary_fork");
+                    },
+                    else => return err,
+                };
+            }
             result.profile.search_route = if (captured.source.snapshot_native_only) "hbc_snapshot_native" else "hbc_snapshot";
             return .{ .request = snapshot_req, .result = result.result, .dense_profile = result.profile };
         }
@@ -41735,6 +41765,14 @@ pub const DB = struct {
         errdefer result.deinit();
         db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| started, result.sort_profile);
         try externalizeSearchResultArtifactIds(alloc, &result);
+        if (snapshot_req.document_authority_mode != .none)
+            self.attachDistributedDocumentAuthorityAtSnapshot(alloc, snapshot_req, &result, try captured.documentReadTxn(), schema_view) catch |err| switch (err) {
+                error.ReadSnapshotForkUnsupported => {
+                    result.deinit();
+                    return declineDenseSnapshot("primary_fork");
+                },
+                else => return err,
+            };
         return .{ .request = snapshot_req, .result = result, .dense_profile = null };
     }
 
@@ -134866,4 +134904,38 @@ test "db default text index preserves empty-only primary population after reopen
             }
         }
     }
+}
+
+test "public graph metric borrowed wire captured document authority survives writes and window retirement" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("pinned-content-authority");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 16 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const original = try std.fmt.allocPrint(a, "{{\"padding\":\"{s}\"}}", .{padding});
+    defer a.free(original);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = original }} });
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    // Mutation occurs after capture, exactly as it can after a dense query
+    // releases apply-shared. Every retired window must fork the old cut.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} });
+    const hits = try a.alloc(types.SearchHit, 65);
+    @memset(hits, .{ .id = &.{} });
+    var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 65 };
+    defer result.deinit();
+    for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+    try db.attachDistributedDocumentAuthorityAtSnapshot(a, .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 }, &result, &pinned, schema);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(original, &digest, .{});
+    for (hits) |hit| {
+        try std.testing.expectEqualSlices(u8, &digest, &hit.document_authority.?.digest);
+        try std.testing.expect(hit.stored_data == null);
+    }
+    std.debug.print("PINNED_CONTENT_AUTHORITY rows=65 retired_windows=1 old_digest_preserved=65\n", .{});
 }

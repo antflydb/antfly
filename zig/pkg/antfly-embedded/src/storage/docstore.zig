@@ -771,7 +771,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -795,7 +795,7 @@ pub const DocStore = struct {
                     else => return err,
                 };
             }
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -947,7 +947,7 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -984,7 +984,7 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -1020,7 +1020,7 @@ pub const DocStore = struct {
                         else => return err,
                     };
                 }
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -6265,4 +6265,52 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("last", &expected, .{});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(key, "first");
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const before = (try revision.loadContent(&pinned, key)).?;
+            {
+                var writer = try store.beginWriteTxn();
+                defer writer.abort();
+                try writer.put(key, "aborted");
+            }
+            {
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                try batch.asTxn().appendPut(key, "last");
+                try batch.commit();
+            }
+            try std.testing.expectEqualSlices(u8, &before.digest, &(try revision.loadContent(&pinned, key)).?.digest);
+        }
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualSlices(u8, &expected, &(try revision.loadContent(&current, key)).?.digest);
+        try std.testing.expectEqualStrings("last", try current.get(key));
+        if (pass == 1) {
+            try store.delete(key);
+            var deleted = try store.beginReadTxn();
+            defer deleted.abort();
+            try std.testing.expect((try revision.loadContent(&deleted, key)) == null);
+            try std.testing.expectError(error.NotFound, deleted.get(key));
+        }
+    }
 }
