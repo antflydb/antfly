@@ -331,6 +331,7 @@ pub const AntflyRootImports = struct {
         "mcp",
         "matcher",
         "raft_engine",
+        "resolver",
         "toon",
         "usermgr_openapi",
         "public_server_openapi",
