@@ -1843,9 +1843,25 @@ pub fn forwardGreedyTokensBatch(
         .output_token_ids = token_ids[0..items.len],
     };
     if (!try cb.decoderRuntimeDecodeBatch(&request)) return null;
-    for (choices, token_ids[0..items.len], items) |*choice, token, item| {
+    for (choices, token_ids[0..items.len], items, 0..) |*choice, token, item, row| {
         if (token < 0 or token >= cfg.vocab_size) return error.InvalidModelOutput;
         var selected = token;
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) {
+            // Matrix runs first with the canonical committed prefix. This
+            // singleton rewrites the same current KV positions across all
+            // layers, and its choice is emitted. Thus the NEXT step again has
+            // canonical history; no divergent token or matrix KV accumulates.
+            var canonical = (try tryBackendOwnedGreedyTokenResult(cb, allocator, cfg, configured_layers, item.token_id, item.seq_len, item.decode_context, true)) orelse return error.UnsupportedBackend;
+            defer canonical.deinit(cb);
+            selected = canonical.token_id;
+            const hidden = canonical.final_hidden orelse return error.UnexpectedNull;
+            const logits = (try cb.decoderRuntimeApplyLinear(&.{ .slot = finalLmHeadSlot(configured_layers), .input = hidden, .in_dim = cfg.hidden_size, .out_dim = cfg.vocab_size })) orelse return error.UnsupportedBackend;
+            defer cb.free(logits);
+            const values = try cb.toFloat32(logits, allocator);
+            defer allocator.free(values);
+            const summary = try @import("../util/ocr_parity.zig").ocrLogitSummary(values, cfg.suppressTokenIds());
+            std.debug.print("ocr-parity-step row={d} seq={d} input={d} matrix={d} canonical={d} match={} canonical_runner_up={d} canonical_margin={e} head_matches={}\n", .{ row, item.seq_len, item.token_id, token, selected, token == selected, summary.runner_up, summary.margin, summary.token == selected });
+        }
         if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CONFIRM_EOS") and cfg.isEosToken(@intCast(token))) {
             // The batched suffix has written this input token's KV already.
             // Recompute the same position without appending another slot. A
@@ -1854,6 +1870,7 @@ pub fn forwardGreedyTokensBatch(
             if (selected < 0 or selected >= cfg.vocab_size) return error.InvalidModelOutput;
             if (getenvBool("TERMITE_METAL_TRACE_GEMMA4_OCR_STOP")) std.debug.print("metal-ocr-stop-check: seq={d} batched={d} canonical={d} replaced={}\n", .{ item.seq_len, token, selected, selected != token });
         }
+        if (selected < 0 or selected >= cfg.vocab_size) return error.InvalidModelOutput;
         choice.* = @intCast(selected);
     }
     success = true;

@@ -64,7 +64,16 @@ def flags_for(case):
     batch = 1
     extra = []
     cohort = re.fullmatch(r"cohort([24])w(4|8|16)", case)
-    if cohort or case in {"normoff", "ffnoff", "differential"}:
+    if cohort or case in {
+        "normoff",
+        "ffnoff",
+        "differential",
+        "stepdiff",
+        "qkvoff",
+        "pleoff",
+        "tailoff",
+        "canonical",
+    }:
         batch = int(cohort[2]) if cohort else 8
         flags.update(
             ANTFLY_GEMMA4_METAL_OCR_BATCH="1",
@@ -74,10 +83,18 @@ def flags_for(case):
         )
         if case == "normoff":
             flags["TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"] = "1"
-        if case == "ffnoff":
+        if case in {"qkvoff", "canonical"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
+        if case in {"pleoff", "canonical"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
+        if case in {"tailoff", "canonical"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
+        if case in {"ffnoff", "canonical"}:
             flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
         if case == "differential":
             flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL"] = "1"
+        if case == "stepdiff":
+            flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP"] = "1"
     elif re.fullmatch(r"mtp[1-4](frame)?", case):
         flags.update(
             ANTFLY_GEMMA4_MTP_MULTIMODAL="1",
@@ -167,7 +184,7 @@ def profile(log):
     for line in log.splitlines():
         if "ocr-parity stage=" in line:
             parity.append(dict(re.findall(r"(\w+)=([^\s]+)", line)))
-        elif "ocr-parity-choice " in line:
+        elif "ocr-parity-choice " in line or "ocr-parity-step " in line:
             choices.append(dict(re.findall(r"(\w+)=([^\s]+)", line)))
     result["parity"] = {
         "stage_samples": len(parity),
@@ -238,7 +255,7 @@ def run(args):
             "batch": batch,
             "server_flags": flags,
             "server_command": command,
-            "diagnostic": case == "differential",
+            "diagnostic": case in {"differential", "stepdiff"},
             "directory": directory.name,
         }
         samples = []
