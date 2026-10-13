@@ -650,12 +650,66 @@ readiness warming remains enabled, and other local builds shared the development
 host. These small normalized-data runs establish correctness and reduced query
 I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
 
-The 1,024-file **cold composed search still returns HTTP 422
+At PR #1117, the 1,024-file **cold composed search returned HTTP 422
 `query_candidate_budget_exceeded` on both executables**. The composed stream
 requires exact leaf totals, while large ranked pages can return lower-bound totals.
 This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
 1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
 fails. The smaller 67-file development composition check passes, but it does not
 qualify this larger cold composed workload. Fixing that leaf-count contract and
-full-archive/cloud qualification remain follow-ups. No cloud job or deployment was
-launched for this comparison.
+full-archive/cloud qualification were the next follow-ups. No cloud job or deployment
+was launched for this comparison.
+
+### Composed cardinality and release handoff follow-up
+
+A bounded ordered page and an exact relation count are separate contracts. The
+composed executor now accepts a full requested ordered leaf window whose total
+relation is `gte`. It keeps the exact total unknown and returns a conservative
+visible-prefix lower bound. It does not add page-local lower bounds, because leaf
+adapters can report either full-relation or remaining-relation counts. A short
+window with an unknown lower-bound total still fails closed. An exact short or
+empty terminal window proves exhaustion; full and remaining exact counts are
+validated against the retained position. Explicit union `count: true` still
+requires exact leaf counts, while overlay counts stream through visibility.
+Replacement lookups retain their exact, bounded completeness requirement.
+
+Retained source continuations use version 3 and pin catalog/schema/policy identity
+independently of cardinality. Version 2 cursors remain readable: their existing
+exact total establishes that the identity was already bound. Refills reauthorize
+exhausted sources and verify immutable serving tokens. Unknown cardinality cannot
+allow a drop/recreate or schema/policy change to silently rebind a cursor. The
+merge loop checks exhaustion again after refill before indexing a possibly empty
+terminal batch.
+
+The regional runner now forwards `benchmark_composed` and
+`composed_current_rows`. The archive acceptance profile requires cold and warm
+measurements for both the historical/current union and the saved replacement
+overlay, in addition to existing suppression and retained-cursor checks. Results
+bind each public hit's table, ID and score, so equal IDs across sources do not hide
+ordering changes. The 1,000-row current fixture is bounded diagnostic coverage;
+it does not represent a year's worth of current HN data. Percentiles use nearest
+rank consistently. Missing measurements, a different fixture size or exceeded
+latency limits fail the gate.
+
+The full-archive follow-up profile must explicitly match the existing shared
+ledger before execution. A dry run reports remaining run slots, unreserved budget
+and whether another reservation can be admitted. Updating a profile cannot reset
+the retained ledger or create retry capacity. New billing and cloud-preflight
+records remain local; reconcile posted gross compute and retain unexported
+storage/network allowances before admitting another worker. Promotion credits do
+not reduce budget accounting.
+
+After local qualification, merge the fix and run the human-approved CI gate on
+its final revision. Publish an immutable native runtime release and verify the
+release/image digest includes this merge and #1117. Select that release in the
+Colony development catalog, preserving the existing rollback reference and
+leaving auto-upgrade disabled. The actual deploy uses an organization-owned
+Antfly Cloud instance, with its tenant identity and credential-refresh path; a
+standalone benchmark pod or retained 20 GiB claim does not qualify that path.
+Verify restricted object access, both HN tables and saved overlay, publication,
+cursor retention and replacement-owner recovery through the managed API. Reuse
+the pinned 334-object, 47,717,307-row export after verifying its live generations.
+Run the regional latency matrix only after budget admission is restored through
+reviewed reconciliation or a new explicit ceiling. Public DNS remains gated on
+managed deployment qualification. This follow-up does not create a release,
+promote the development catalog or deploy a tenant.

@@ -1126,7 +1126,7 @@ IDs/scores and reduce first-search provider reads from 1,461 to 405 and bytes fr
 50.85 MB to 24.33 MB. First highlighted search is 136–240 ms, warm p95 51–55 ms,
 and post-restart search 95–102 ms on this fixture. Filter/cursor results are mixed;
 these are local normalized-data checks, not archive/cloud SLO qualification.
-The large cold composed-query count contract still rejects lower-bound leaf totals
-on both the baseline and follow-up. SQL fixture seeding itself passes with the
+At PR #1117, the large cold composed-query count contract rejected lower-bound
+leaf totals on both the baseline and that follow-up. SQL fixture seeding itself passes with the
 explicit response budget. See the qualification plan for retained raw samples,
 provenance, query bounds and this remaining limitation.

@@ -2844,3 +2844,18 @@ conservative query bounds attached to authenticated routing subtrees and a bound
 frontier that can descend promising subtrees before opening their inventories.
 The current cross-window score cutoff is implemented; it does not eliminate the
 initial routing walk or turn sequential windows into global best-first traversal.
+
+### Composed ranked pages with lower-bound cardinality
+
+Publication traversal can prove a top-k ordered window without visiting every
+matching posting, so a ranked leaf total may be `gte`. Composition must consume
+that full window without requiring an archive-wide exact count. Keep unknown
+cardinality separate from catalog binding and serving-token validation. Do not
+sum fluctuating full/remaining lower bounds or infer exhaustion from them. A short
+unknown-count page must carry exact exhaustion evidence; otherwise fail closed.
+Explicit counts and bounded replacement lookups retain exactness requirements.
+Version 3 continuations retain the independent identity binding; version 2 exact
+continuations remain readable. Recheck exhaustion after refill before reading a
+candidate from a terminal empty page. Regression coverage must include changing
+bounds, full and remaining terminal counts, identity changes, legacy cursors,
+masked overlays and million-row relations with bounded page work.
