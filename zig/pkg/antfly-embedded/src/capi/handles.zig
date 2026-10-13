@@ -101,7 +101,7 @@ pub const Handle = struct {
     // comment.
     lite_generated_enrichment_replay: bool = false,
     /// Lazy foreground producer for read-only text queries. The mutex covers
-    /// creation and invocation; no writable enrichment worker is installed.
+    /// construction; each call uses a scoped invocation context.
     query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
     query_producer_mutex: std.Io.Mutex = .init,
 
@@ -184,12 +184,16 @@ pub fn stopLiteEmbeddedInference(handle: *Handle) void {
     }
 }
 
-pub fn closeHandle(handle: *Handle) void {
+pub fn invalidateQueryProducer(handle: *Handle) void {
     if (handle.query_producer) |producer| {
         producer.deinit();
         handle.alloc.destroy(producer);
         handle.query_producer = null;
     }
+}
+
+pub fn closeHandle(handle: *Handle) void {
+    invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);

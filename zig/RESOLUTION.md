@@ -848,7 +848,11 @@ Query extraction and resolution never publish a synthetic document, resolution
 artifact, promotion, graph edge, or replay record. They also work on read-only
 handles. Read-only text queries lazily cache a foreground extractor producer on
 the handle, reusing its inference provider and loaded models across calls.
-Producer invocations are serialized and the cache is released on close.
+Only cache construction holds the producer mutex; each extraction gets an
+invocation context and uses the synchronized capability cache. Native Lite
+connection/snapshot locks and model execution gates still apply. Snapshot refresh
+invalidates named-table caches before freeing their borrowed inference provider;
+the next query binds to the new provider. The cache is released on close.
 They use resolver-level aliases and ignore document-specific curation
 since the query has no stored document identity. Queries currently require an
 asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
@@ -871,7 +875,9 @@ the same source. Removing a resolver deliberately removes its associated merge
 state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
 import validate and preserve durable merge state. Once merges exist, changes to
 `table` or `key_template` are rejected with a namespace diagnostic; callers must
-explicitly reset or migrate the identities before changing their namespace.
+explicitly reset or migrate the identities before changing their namespace
+using `set_resolver_namespace` (C `antfly_db_set_resolver_namespace_json`, Go
+`SetResolverNamespaceJSON`, Rust `set_resolver_namespace_json`).
 The effective resolution revision advances on either a config change or merge,
 even when the incoming config generation equals the preceding merge revision.
 For example, config generation 2 → merge → config generation 3 yields effective
@@ -879,6 +885,37 @@ revisions 2 → 3 → 4. Identical config replay leaves the revision unchanged.
 Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
 rather than silently resolving keys differently. Both mention and relation
 edges are reconciled on the root drain, including removal of old endpoints.
+
+The namespace request contains `table`, `key_template`, and exactly one of:
+
+- `reset_merges:true`: explicitly discard durable redirects and inline aliases.
+- `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
+  stored inline/durable alias source and target into the new namespace. Incomplete
+  maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
+  fail before mutation. Existing merges are transformed, preserving identity
+  relationships rather than deleting the resolver.
+
+The operation validates the destination table and commits the config, merge store,
+and replay cursors atomically. Call `run_until_idle` to reconcile resolver-owned
+mention/relation edges. Application-owned documents and references are not
+renamed. Update your declarative inline config to the new table/template and
+mapped inline aliases before reapplying it; an old config is rejected while
+migrated merges remain. Changing an existing physical index config still requires
+its normal delete/recreate lifecycle, which preserves the resolver and merges.
+Existing artifact/index repair APIs rebuild derived state under the declared
+identity rules; they do not infer a key migration. This namespace operation
+reuses the existing resolver replay/repair pipeline for derived reconciliation.
+
+Only material resolution changes (including an explicit `config_generation`
+bump) schedule replay; changing revision bookkeeping alone does not. A changed
+scorer, routing rule or identity rule can affect every subscribed document and
+requires scanning its source corpus. Backfill skips source artifacts whose
+subscribing curated resolvers already have the current combined revision, avoiding
+unrelated journal writes, ANN searches and embedding generation. Legacy resolvers
+without a combined revision retain their conservative replay behavior. Identical
+config reapplication incurs no backfill. Portable import cross-checks sidecar
+records against the resolver catalog before publishing destination state,
+including missing required records and orphan/duplicate records.
 
 Default resolver catalogs omit new default fields (`aliases:[]`, `promote:true`,
 and zero merge metadata), retaining the previous wire shape. The current reader
@@ -901,7 +938,8 @@ mention path with real embeddings and checks ad-hoc ANN query resolution.
 The opt-in Go Qwen test also exercises this contract. Neither test writes a candidate entity
 or its vector by hand.
 
-The required pinned CPU extraction CI test sets
+Both base and full-validation jobs run the required real extraction and public
+Qwen embedding gates. The pinned CPU extraction CI test sets
 `ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1`: missing runtime/model support is an error,
 not a skip. CI then runs `scripts/eval_extract.py` through its real-model gate on
 `regression.jsonl`, compares plain/described schemas, checks minimum precision

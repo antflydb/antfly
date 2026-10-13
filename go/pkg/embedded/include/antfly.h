@@ -460,6 +460,12 @@ antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resol
  * references and manually supplied graph edges are not rewritten. */
 antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
 
+/** Set {table,key_template} and choose reset_merges:true (clears inline aliases too)
+ * or key_map:[{key,target},...] mapping every inline/durable alias endpoint.
+ * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
+ * Application-owned documents/references are not renamed. */
+antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
+
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);

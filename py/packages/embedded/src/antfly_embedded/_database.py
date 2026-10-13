@@ -468,6 +468,16 @@ class Database:
         finally:
             self._release()
 
+    def set_resolver_namespace(self, resolver: str, request: JSONInput) -> None:
+        """Reset or explicitly migrate aliases/merges into a new table/template; drain afterward."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            errors.raise_for_code(self._lib.antfly_db_set_resolver_namespace_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
     def add_index(self, config: JSONInput) -> None:
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 

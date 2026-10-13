@@ -725,6 +725,15 @@ func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
 	})
 }
 
+// SetResolverNamespaceJSON atomically resets or migrates resolver identities; drain afterward.
+func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.withInput(request, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_db_set_resolver_namespace_json((*C.antfly_db)(handle), name, input)
+	})
+}
+
 // AddIndexJSON adds an index from its JSON configuration.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {

@@ -3438,6 +3438,8 @@ const PortableArchiveValidation = struct {
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
     saw_resolver_merges: bool = false,
+    resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
+    resolver_merge_data: ?[]u8 = null,
 
     const DecodedEpoch = struct {
         version: u32,
@@ -3588,6 +3590,11 @@ const PortableArchiveValidation = struct {
     }
 
     pub fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.resolver_configs) |configs| {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        if (self.resolver_merge_data) |data| alloc.free(data);
         self.source_generation_admissions.deinit(alloc);
         if (self.source_integrity_catalog) |*catalog| catalog.deinit();
         if (self.index_projection) |*projection| projection.deinit(alloc);
@@ -3683,6 +3690,17 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
+        defer alloc.free(resolver_bytes);
+        const configs = try resolver_catalog.deserializeCatalog(alloc, resolver_bytes);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        resolver_catalog.applyMergeState(alloc, configs, self.resolver_merge_data orelse "[]") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMetadataBatch,
+        };
         if (self.cohort != null and !self.saw_cohort) return error.BackupIntegrityFailure;
         if (self.source_copy != null and !self.saw_source_copy) return error.BackupIntegrityFailure;
         if (self.source_integrity != null and (self.source_integrity_catalog == null or !self.source_integrity_activation)) return error.BackupIntegrityFailure;
@@ -4609,8 +4627,7 @@ fn validateMetadataEntries(
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
-            for (configs) |*config| config.deinit(alloc);
-            alloc.free(configs);
+            archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
         } else if (std.mem.eql(u8, entry.key, resolver_catalog.merge_catalog_key)) {
             if (archive.saw_resolver_merges) return error.InvalidMetadataBatch;
@@ -4618,6 +4635,7 @@ fn validateMetadataEntries(
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
+            archive.resolver_merge_data = try alloc.dupe(u8, entry.value);
             archive.saw_resolver_merges = true;
         }
     }
@@ -6423,11 +6441,15 @@ test "import preflights logical block payloads before mutating destination" {
 
 test "import preflights durable catalogs before mutating destination" {
     const alloc = std.testing.allocator;
+    const required_catalog = try resolver_catalog.serializeCatalog(alloc, &.{.{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 }});
+    defer alloc.free(required_catalog);
     const cases = [_]struct { key: []const u8, value: []const u8 }{
         .{ .key = "\x00\x00__metadata__:indexes", .value = "not-an-index-catalog" },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "not-json" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
         .{ .key = resolver_catalog.merge_catalog_key, .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "[{\"name\":\"orphan\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = required_catalog },
     };
     for (cases) |case| {
         var tmp_src = std.testing.tmpDir(.{});
@@ -7270,4 +7292,29 @@ test "portable backup v02 released AFB2 validates imports and binds public schem
     try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
     try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+}
+
+test "resolver import cross checks merge catalog before publication" {
+    const alloc = std.testing.allocator;
+    const cfg: resolver_catalog.ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 };
+    const catalog = try resolver_catalog.serializeCatalog(alloc, &.{cfg});
+    defer alloc.free(catalog);
+    const cases = [_]?[]const u8{
+        null,
+        "[]",
+        "[{\"name\":\"unrelated\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+        "[{\"name\":\"r\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+    };
+    for (cases, 0..) |merges, i| {
+        var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try validateMetadataEntries(alloc, &.{.{ .key = "\x00\x00__metadata__:resolvers", .value = catalog }}, &archive);
+        if (merges) |data| try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = data }}, &archive);
+        if (i == 3) try archive.finish(alloc) else try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    }
+    // A valid sidecar cannot introduce a resolver absent from the catalog.
+    var orphan: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer orphan.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = cases[3].? }}, &orphan);
+    try std.testing.expectError(error.InvalidMetadataBatch, orphan.finish(alloc));
 }

@@ -1659,6 +1659,33 @@ fn repairAssetSourceIndexWindow(
     };
 }
 
+/// Backfill scans may visit unrelated source streams. Avoid journal writes,
+/// candidate searches and inference when every subscriber is already current.
+fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStore, resolvers: []const ResolverConfig, key: []const u8) !bool {
+    var source = (try parseSourceArtifactKeyAlloc(gpa, key)) orelse return false;
+    defer source.deinit(gpa);
+    for (resolvers) |*cfg| {
+        if (!resolverMatchesArtifact(cfg, source.source_artifact_kind, source.artifact_name)) continue;
+        // Legacy resolvers require a caller-owned config_generation bump.
+        // Without a combined revision clock, an equal generation alone cannot
+        // prove that a changed config has already been replayed.
+        if (cfg.merge_generation == 0) return true;
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, source.resolution_scope_key, cfg.resolution_artifact);
+        defer gpa.free(resolution_key);
+        const bytes = (try store.get(gpa, resolution_key)) orelse return true;
+        defer gpa.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return true;
+        const revision = parsed.value.object.get("config_generation") orelse return true;
+        if (revision != .integer or revision.integer < 0 or @as(u64, @intCast(revision.integer)) != cfg.effectiveGeneration()) return true;
+    }
+    return false;
+}
+
 pub fn enqueueReresolveBacklogWindow(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
@@ -1760,6 +1787,12 @@ pub fn enqueueReresolveBacklogWindow(
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
+    var i: usize = 0;
+    while (i < asset_keys.items.len) {
+        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_keys.items[i])) {
+            i += 1;
+        } else gpa.free(@constCast(asset_keys.orderedRemove(i)));
+    }
     const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
@@ -4541,4 +4574,30 @@ test "SourceCandidateProvider ann blocking generates missing mention embeddings"
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "resolver backfill skips current revisions and unrelated source streams" {
+    const alloc = std.testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "kg");
+    defer alloc.free(key);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolved");
+    defer alloc.free(resolution_key);
+    var cfg: ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .merge_generation = 3 };
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    try store.put(resolution_key, "{\"config_generation\":3,\"entities\":[]}");
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 4;
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 0;
+    try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[]}");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.merge_generation = 4;
+    cfg.source_artifact = "unrelated";
+    try std.testing.expect(!try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+    cfg.source_artifact = "kg";
+    try store.put(resolution_key, "invalid");
+    try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
 }

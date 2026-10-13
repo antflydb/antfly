@@ -6933,17 +6933,19 @@ pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_nam
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
         // Read-only databases have no enrichment worker. Retain a lazy producer
         // on the handle so repeated queries reuse transport/capability state and
-        // the handle's inference provider/model cache. Serialize its foreground
-        // invocations independently of persistent database writes.
+        // the handle's inference provider/model cache. Only construction is locked;
+        // invocation contexts share the runtime's synchronized capability cache.
         const cached_producer = text != null and handle.database().enrichment_runtime == null;
-        if (cached_producer) handle.query_producer_mutex.lockUncancelable(handleLockIo());
-        defer if (cached_producer) handle.query_producer_mutex.unlock(handleLockIo());
-        if (cached_producer and handle.query_producer == null) {
-            const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
-            handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+        if (cached_producer) {
+            handle.query_producer_mutex.lockUncancelable(handleLockIo());
+            defer handle.query_producer_mutex.unlock(handleLockIo());
+            if (handle.query_producer == null) {
+                const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
+                handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+            }
         }
         const extracted = if (text) |value|
-            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (cached_producer) handle.query_producer.?.producer() else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
+            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (cached_producer) handle.query_producer.?.producer().withInvocationContext(.{}) else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
         else
             std.json.Stringify.valueAlloc(handle.alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
         defer handle.alloc.free(extracted);
@@ -6994,6 +6996,67 @@ pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolv
         next.merge_state_version = 1;
         next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
         _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+/// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
+/// The resolver, identity state and replay cursors commit together.
+pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    const KeyMap = struct { key: []const u8, target: []const u8 };
+    const Request = struct { table: []const u8, key_template: []const u8, reset_merges: bool = false, key_map: ?[]const KeyMap = null };
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
+    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(configs);
+    }
+    for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        // Validate the destination before publishing identity state.
+        _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
+        var next = cfg;
+        next.table = request.table;
+        next.key_template = request.key_template;
+        var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
+        defer aliases.deinit(handle.alloc);
+        var merges: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
+        defer merges.deinit(handle.alloc);
+        if (request.key_map) |mapping| {
+            for (mapping, 0..) |item, i| {
+                if (item.key.len == 0 or item.target.len == 0) return capi.mapErrorContext(error.InvalidArgument, "namespace mapping keys must be non-empty");
+                for (mapping[0..i]) |prior| if (std.mem.eql(u8, prior.key, item.key)) return capi.mapErrorContext(error.InvalidArgument, "duplicate source key in namespace mapping");
+            }
+            const Map = struct {
+                fn find(items: []const KeyMap, key: []const u8) ?[]const u8 {
+                    for (items) |item| if (std.mem.eql(u8, item.key, key)) return item.target;
+                    return null;
+                }
+            };
+            for (cfg.aliases) |alias| aliases.append(handle.alloc, .{
+                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
+                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
+            }) catch |err| return capi.mapError(err);
+            for (cfg.merges) |alias| merges.append(handle.alloc, .{
+                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
+                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
+            }) catch |err| return capi.mapError(err);
+        }
+        next.aliases = aliases.items;
+        next.merges = merges.items;
+        next.config_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
+        next.merge_generation = if (merges.items.len > 0) next.config_generation else 0;
+        next.merge_state_version = if (merges.items.len > 0) 1 else 0;
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");

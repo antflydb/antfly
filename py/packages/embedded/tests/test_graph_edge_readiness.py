@@ -341,6 +341,60 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         assert len(restored.edges("knowledge", "concept/qwen_embedding", "uses", 0)) == 1
         assert restored.edges("knowledge", "concept/qwen", "uses", 0) == []
+        restored.create_table("canonical", {})
+        migrated = {
+            "table": "canonical",
+            "key_template": "topic/{{ uslug _entity.text }}",
+            "key_map": [
+                {"key": "concept/qwen3", "target": "topic/qwen3"},
+                {"key": "concept/qwen", "target": "topic/qwen"},
+                {"key": "concept/qwen_embedding", "target": "topic/qwen_embedding"},
+            ],
+        }
+        incomplete = {**migrated, "key_map": migrated["key_map"][:1]}
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="every inline alias endpoint"):
+            restored.set_resolver_namespace("concepts", incomplete)
+        assert (
+            restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
+            == "concept/qwen_embedding"
+        )
+        with pytest.raises(antfly_embedded.NotFoundError, match="destination table"):
+            restored.set_resolver_namespace("concepts", {**migrated, "table": "absent"})
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="exclusively"):
+            restored.set_resolver_namespace("concepts", {**migrated, "reset_merges": True})
+        with restored.open_table("default") as source_table:
+            source_table.set_resolver_namespace("concepts", migrated)
+        restored.run_until_idle()
+        assert (
+            restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
+            == "topic/qwen_embedding"
+        )
+        assert (
+            restored.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["table"] == "canonical"
+        )
+        assert len(restored.edges("knowledge", "topic/qwen_embedding", "uses", 0)) == 1
+        assert restored.edges("knowledge", "concept/qwen_embedding", "uses", 0) == []
+    with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
+        assert (
+            restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
+            == "topic/qwen_embedding"
+        )
+        restored.set_resolver_namespace(
+            "concepts",
+            {
+                "table": "default",
+                "key_template": "fresh/{{ uslug _entity.text }}",
+                "reset_merges": True,
+            },
+        )
+        restored.run_until_idle()
+        assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
+        assert len(restored.edges("knowledge", "fresh/qwen3", "uses", 0)) == 1
+        assert restored.edges("knowledge", "topic/qwen_embedding", "uses", 0) == []
+    with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
+        assert (
+            restored.resolve_query("concepts", request)["resolution"]["entities"][0]["doc_ref"]["key"] == "fresh/qwen3"
+        )
     with antfly_embedded.open_readonly(aflite_path) as db:
         result = db.resolve_query("concepts", request)
         assert result["resolution"]["config_generation"] == 2

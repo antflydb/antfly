@@ -27530,6 +27530,8 @@ pub const DB = struct {
         /// nonblocking: a refresh holding a group activity must not wait for
         /// in-flight resolution or promotion callbacks.
         drain_backfill: bool = true,
+        /// Only the explicit namespace migration operation may bypass this guard.
+        migrate_namespace: bool = false,
     };
 
     /// Add or replace a resolver. Inserts and material config changes re-resolve
@@ -27560,7 +27562,10 @@ pub const DB = struct {
                 defer probe.abort();
                 try self.requireOnlineArtifactCatalogMutableLocked(&probe);
             }
-            const result = try self.core.upsertResolver(cfg);
+            const result = if (options.migrate_namespace)
+                try self.core.index_manager.upsertResolverWithNamespaceMigration(self.core.store, cfg, true)
+            else
+                try self.core.upsertResolver(cfg);
             if (result != .updated_no_backfill) {
                 if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
             }

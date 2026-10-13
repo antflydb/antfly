@@ -547,6 +547,17 @@ impl Database {
         })
     }
 
+    /// Atomically reset or migrate resolver identities; drain afterward.
+    pub fn set_resolver_namespace_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_set_resolver_namespace_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
+    }
+
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(config.as_ref(), |h, input| unsafe {
             sys::antfly_db_add_index_json(h, input)

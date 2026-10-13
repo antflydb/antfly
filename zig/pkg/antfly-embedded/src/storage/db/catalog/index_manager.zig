@@ -12236,7 +12236,6 @@ pub const IndexManager = struct {
 
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return existing.promote != next.promote or
-            existing.merge_generation != next.merge_generation or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
             !std.mem.eql(u8, existing.table, next.table) or
@@ -12278,34 +12277,42 @@ pub const IndexManager = struct {
     /// changes ask the caller to re-resolve existing extraction artifacts because
     /// their incremental replay hints will not fire on their own.
     pub fn upsertResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
+        return self.upsertResolverWithNamespaceMigration(store, input_cfg, false);
+    }
+
+    pub fn upsertResolverWithNamespaceMigration(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig, migrate_namespace: bool) !ResolverUpsertResult {
         var cfg = input_cfg;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-            if (cfg.merge_generation == 0) {
+            if (cfg.merge_generation == 0 and !migrate_namespace) {
                 cfg.merges = entry.merges;
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
             try cfg.validate();
-            if (entry.merges.len > 0 and
+            if (!migrate_namespace and entry.merges.len > 0 and
                 (!std.mem.eql(u8, entry.table, cfg.table) or !std.mem.eql(u8, entry.key_template, cfg.key_template)))
                 return error.ResolverMergeNamespaceChange;
             if (entry.eql(cfg)) return .updated_no_backfill;
+            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             // Once curated identities exist, merge_generation is the combined
             // revision clock. A config bump can equal a previous merge revision;
             // every change must still invalidate older resolution artifacts.
-            if (entry.merges.len > 0) {
+            if (material_changed and entry.merges.len > 0) {
                 const revision = try std.math.add(u64, entry.effectiveGeneration(), 1);
-                cfg.merge_generation = @max(revision, @max(cfg.config_generation, cfg.merge_generation));
-            }
+                if (cfg.merges.len == 0) {
+                    cfg.config_generation = @max(revision, cfg.config_generation);
+                    cfg.merge_generation = 0;
+                    cfg.merge_state_version = 0;
+                } else cfg.merge_generation = @max(revision, @max(cfg.config_generation, cfg.merge_generation));
+            } else if (!material_changed) cfg.merge_generation = entry.merge_generation;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
-            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
             self.persistResolverCatalog(store, if (material_changed) .mark_reresolve_dirty else .catalog_only) catch |err| {

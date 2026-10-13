@@ -657,6 +657,11 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly","model":"explicit-base","schema":{"entities":["company","person","product","location"]}}}},"resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}],"edge_types":[{"name":"mentions"}],"metrics":{"ppr":{"kind":"pagerank","enabled":true}}}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(id, .fromSlice("queries"), .fromSlice("{}")));
+    var queries: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("queries"), &queries));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(queries, .fromSlice(config)));
+    api.antfly_db_close(queries);
     var batch_response: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&batch_response);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"claim:example\":{\"body\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}},\"sync_level\":\"write\"}"), &batch_response));
@@ -738,6 +743,31 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     try std.testing.expectEqual(cached_producer, repeated_guard.handle.query_producer.?);
     try std.testing.expectEqual(readonly_sequence, repeated_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
     repeated_guard.leave();
+    var readonly_table: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("queries"), &readonly_table));
+    defer api.antfly_db_close(readonly_table);
+    var table_query: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&table_query);
+    const text_request = "{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
+    const child, const slot = api.handle_registry.enter(readonly_table).?;
+    try std.testing.expect(child.query_producer != null);
+    api.HandleRegistry.leave(slot);
+    var writer: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &options, &writer));
+    defer api.antfly_db_close(writer);
+    var write_result: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&write_result);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(writer, .fromSlice("{\"inserts\":{\"refresh_probe\":{\"body\":\"snapshot changed\"}}}"), &write_result));
+    // Entering any read refreshes the owner, invalidating child caches before
+    // freeing the old provider. No stale producer survives to the next query.
+    const refreshed = api.enterHandle(readonly_table, .read).?;
+    try std.testing.expect(refreshed.entry_error == null);
+    try std.testing.expect(refreshed.handle.query_producer == null);
+    refreshed.leave();
+    api.antfly_buffer_free(&table_query);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
+    try std.testing.expect(table_query.len > 0);
     const readonly_query = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
     defer readonly_query.deinit();
     const readonly_entities = readonly_query.value.object.get("resolution").?.object.get("entities").?.array.items;
@@ -914,6 +944,9 @@ test "capi resolver config merge config advances revisions and protects key name
             for (configs) |*cfg| cfg.deinit(a);
             a.free(configs);
         }
+        var metadata_only = configs[0];
+        metadata_only.merge_generation += 100;
+        try std.testing.expectEqual(@import("../storage/db/catalog/index_manager.zig").IndexManager.ResolverUpsertResult.updated_no_backfill, try guard.handle.database().upsertResolverWithResultOptions(metadata_only, .{ .drain_backfill = false }));
         var changed = configs[0];
         changed.table = "other";
         try std.testing.expectError(error.ResolverMergeNamespaceChange, guard.handle.database().upsertResolverWithResultOptions(changed, .{ .drain_backfill = false }));

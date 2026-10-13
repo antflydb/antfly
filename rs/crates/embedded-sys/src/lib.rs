@@ -651,6 +651,11 @@ unsafe extern "C" {
         resolver_name: antfly_slice,
         merge_json: antfly_slice,
     ) -> antfly_error_code;
+    pub fn antfly_db_set_resolver_namespace_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        request_json: antfly_slice,
+    ) -> antfly_error_code;
     pub fn antfly_db_add_index_json(
         db: *mut antfly_db,
         config_json: antfly_slice,
