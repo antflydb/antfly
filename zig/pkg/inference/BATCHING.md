@@ -1129,9 +1129,61 @@ retains the first changed logits, failed scoped rollbacks and final corpus gates
 The experimental `TERMITE_METAL_Q4_0_BATCH_INVARIANT=1` policy selects singleton
 Q4_0/F32 reduction geometry for two-to-eight-row projections and dispatches over
 the actual row dimension. Fused gate/up uses one cohort dispatch; attention and
-FFN down/sumsq/norm/residual tails retain the singleton family per row. Use the
+FFN projection/norm/residual tails retain the singleton family per row,
+including the default-off sum-of-squares policy. Use the
 `cohort4w8invariant` sweep case to include canonical QKV, PLE and head families.
 This does not enable matrix OCR serving automatically. Kernel bitwise equality
 is insufficient to qualify full transcripts, and the repeated-page campaign
 shows no throughput gain. [The design and evidence](../../../docs/design/inference/gemma4-ocr-optimization.md#singleton-invariant-q4-cohort-dispatch)
 retain output gates and exact source/binary/corpus pins.
+
+
+Further Metal Q4_0 experiments separate weight sharing from dispatch/allocation
+changes. `TERMITE_METAL_Q4_0_BATCH_SHARED=1` shares packed weight tiles and paired
+half-to-float scales across two/four rows, preserving the selected singleton
+lane/reduction geometry; unsupported threadgroups fall back. Native output
+checks pass, but the first representative operator measurements regress most
+shapes, so weight sharing remains an independent research switch.
+
+`TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS=1` requires the invariant policy and keeps
+its float32 attention/FFN projection, normalization and residual family in two
+cohort dispatches. Optional sum-of-squares stays off by default; float16
+projection retains the per-row fallback. `ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV=1`
+batches eligible zero-bias Q4 Q + paired K/V scratch without per-row packing.
+`ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS=1` reuses private four-row buffers for
+attention/FFN results and other semantic carriers, with retained growth views
+and existing encoder/blit hazards. PLE and final head arithmetic stay canonical.
+
+Sweep variants `tails` and `pool` qualify tails/QKV and then carrier reuse with
+weight sharing disabled; `share`, `fused` and `reuse` measure the combined
+sharing experiments. `invariantprofile` and `optimizedprofile` add sampled GPU
+stage and head-wall/allocation counters; all diagnostics and allocation probes
+are excluded from timing recommendations. Full-transcript/count/cap gates and
+bracketed repeated ordinary controls are mandatory. See the
+[shared-tile design](../../../docs/design/inference/gemma4-ocr-optimization.md#shared-q4-tiles-batched-tails-and-carrier-reuse)
+for scope, rejected prototypes and qualification evidence.
+
+
+`ANTFLY_GEMMA4_METAL_OCR_HEAD_FRAME=1` additionally groups two-to-four quantized
+heads in one prepared frame after the backbone, preserving actual one-row
+checkpoint norm/head operations and batching suppressed argmax/readback. Dense
+heads and final single rows keep the previous route. `head`/`headprofile` add it
+to the non-sharing `pool` configuration. This removes head waits without claiming
+shared head projection or enabling an approximate/transformed head. GPU stage
+samples in this configuration can include both backbone and head frames.
+
+
+At runtime `7f4d7fa577`, bracketed two-pass eight-page OCR preserves all 4,057
+completion tokens/transcripts in every condition. Ordinary takes 55.339–57.572
+seconds, `pool` 52.206/52.843 and `head` 48.819/49.304. The latter reduces mean
+recognition time by 12.8% in this campaign with weight sharing disabled. It
+remains opt-in; rendering/startup and unbracketed expanded-corpus timings do not
+establish an overall PDF throughput gain. [Pinned evidence](../../../docs/design/inference/gemma4-ocr-shared-batching.json)
+records controls, excluded noisy runs, buffer reuse, per-output hashes and
+native checks (66 selected enabled / 101 default, zero skips; nine sweep tests).
+
+The extended sixteen-page head configuration preserves all 9,126 tokens forward,
+reversed and with GPU allocation instrumentation. Across the recorded native
+conditions, 128 page observations / 79,222 tokens match references. Instrumented
+Metal/RSS measurements and GPU stage diagnostics remain separate from throughput;
+head-frame samples include a different mix of work than backbone-only samples.

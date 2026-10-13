@@ -1181,9 +1181,10 @@ bypassed for this contract. Fused gate/up activation similarly uses the
 singleton MMV pipeline across all cohort rows in one GPU dispatch.
 
 The complete operation family matters beyond ordinary matrix multiplication.
-The singleton FFN down projection fuses sum-of-squares, normalization and
-residual addition. This tail remains canonical per row; its optional float16
-projection policy is preserved. The attention output projection has an analogous
+The singleton FFN down projection uses its prepared projection, normalization
+and residual family. Its sum-of-squares projection is optional and off by
+default, as is its float16 projection. This experiment retains those policies
+and runs the tail canonically per row. The attention output projection has an analogous
 fused tail. A dedicated checked device wrapper preserves that family per row,
 including offsets and prepared normalization slots. Both operate within the
 resident frame. The `cohort4w8invariant` sweep case also retains the actual
@@ -1225,3 +1226,122 @@ sixteen text-page raster hashes match the prior corpus. Rendering and startup
 remain outside recognition timings. Shared-machine activity can affect timing;
 repeatable complete-output gates remain mandatory. Canonical OCR cohorts remain
 the default, and matrix arithmetic still requires its separate explicit opt-in.
+
+
+## Shared Q4 tiles, batched tails and carrier reuse
+
+Three separate experiments retain the singleton arithmetic while reducing GPU
+and host work. They remain opt-in, and matrix OCR still requires its separate
+explicit switch. These changes target Q4_0 float32 Metal decode; they do not
+establish a CUDA, audio or end-to-end PDF rendering speedup.
+
+`TERMITE_METAL_Q4_0_BATCH_SHARED=1` uses threadgroup memory to load packed Q4
+weight tiles once for two or four page rows. Three-row cohorts pad the fourth
+row without skipping barriers. Each page keeps the singleton SIMD groups,
+accumulator shape, lane stripe, block traversal and reduction order. Fused
+paired gate/up additionally converts each weight block's half scale to float
+once for the cohort; nibble arithmetic and activation remain per row. This is
+weight/scale reuse, not full pre-dequantization into a persistent dense model.
+The selected singleton NR/NSG variant must support the larger threadgroup and
+scratch; unsupported cases retain the invariant MMV route. An initial prototype
+that widened per-thread accumulator arrays changed outputs by up to 16 ULP and
+was rejected rather than relaxing the bitwise gate.
+
+`TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS=1` projects all rows, then performs the
+singleton normalization/residual reduction in one threadgroup per row. Attention
+and FFN tails need two dispatches per cohort instead of two per page. Both the
+ordinary projection and optional sum-of-squares family preserve their existing
+policy; sum-of-squares remains off by default. The optional float16 projection
+retains the previous per-row fallback. `ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV=1` also
+uses the existing prepared QKV scratch for eligible zero-bias Q4 slots, keeping
+the actual scalar Q plus paired K/V operation family and removing per-row
+packing copies. Other formats keep the previous canonical path. PLE and final
+head scoring still use their canonical per-row arithmetic.
+
+`ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS=1` caches private GPU buffers by semantic
+role, including attention and FFN results, Q/K/V, normalization, PLE and
+coordinated hidden-state buffers. Buffers reserve four-row capacity and grow
+when the model width increases. Retained views keep superseded allocations
+alive; encoder/blit range tracking orders consumers before overwrites. This
+removes repeated GPU buffer allocation while retaining small host tensor
+wrappers. Differential diagnostics disable this reuse to avoid aliasing their
+reference values.
+
+The sweep exposes independent `tails`/`pool` cases without weight sharing and
+combined `share`/`fused`/`reuse` cases. `invariantprofile`, `optimizedprofile`
+and `headprofile` are diagnostics. GPU stage samples cover only sampled decode
+frames (including an optional head frame); separately recorded canonical head wall time must not
+be added to overlapping per-request counters. Diagnostic/probe timings are
+excluded from throughput qualification. Native tests cover distinct rows,
+partial tiles, actual E2B FFN dimensions, bitwise QKV and both tail policies,
+requested output-buffer reuse, carrier-role separation and retained growth
+views. Full OCR qualification and before/after ordinary timing controls remain
+required before promoting any experiment.
+
+
+`ANTFLY_GEMMA4_METAL_OCR_HEAD_FRAME=1` groups eligible quantized page heads in
+one additional prepared frame after the backbone finishes. It calls the actual
+checkpoint/full-logit norm and head operations with one-row views, packs their
+results on GPU and performs batched suppressed argmax with one wait and a
+small token-only readback. It does not select a transformed or approximate head.
+This reduces head synchronization while retaining per-row projection arithmetic;
+heads do not yet share their weights in a matrix kernel. Dense heads and final
+one-row cohorts retain the existing route. The `head` sweep adds this experiment
+to `pool`, leaving the slower shared-weight prototype disabled. Native head
+validation compares full Q4_0/Q6_K logits bit for bit against unframed singleton
+operations and checks suppression, partial tiles, token choices, frame ownership
+and one additional frame submission. Full OCR gates are still required.
+
+
+At frozen runtime `7f4d7fa577`, the original eight-page corpus matches every
+transcript and all 4,057 completion tokens in both passes of each condition.
+Fresh ordinary controls bracket the candidates on the same serving binary:
+
+| Configuration | Recognition seconds per eight-page pass |
+| --- | --- |
+| Ordinary, before | 57.572, 56.526 |
+| Invariant tails + QKV scratch + carrier reuse (`pool`) | 52.843, 52.206 |
+| Above plus canonical head frame (`head`) | 49.304, 48.819 |
+| Ordinary, after | 55.524, 55.339 |
+
+The combined head-frame case reduces mean recognition time by 12.8% (14.6%
+higher throughput) against these four ordinary controls; its repeated timing
+range is disjoint from every control. Tails/QKV/reuse alone reduce mean time by
+6.6%. These are recognition measurements for this campaign; PDF rendering and
+startup are excluded, and independent-machine replication remains needed.
+Weight sharing is disabled in both faster cases. All options remain experimental.
+The repeated Attention-page head-frame runs also match all 2,968 tokens per pass
+at 31.224/31.334 seconds, without new ordinary brackets for that fixed-page case.
+The sixteen-page forward window matches all 9,126 tokens at 119.520 seconds,
+and reversed order matches the same 9,126 tokens at 114.568 seconds.
+Neither expanded run has a fresh ordinary timing bracket.
+
+Validation at this runtime passes 66 selected GPU/decoder/scheduler/MTP/QKV/HTTP
+checks with experiments enabled, all 101 compiled checks at default flags and
+the optional sum-of-squares parity check, without skips. Nine sweep tests pass.
+The earlier `5a641bd8e3` repeated-page campaign matches all 48 page observations
+and 35,616 tokens across six cases, but changing shared-machine load invalidates
+its timing interpretation; the remaining pool/control runs were explicitly
+reclassified as correctness stress before overlapping validation builds.
+The synthetic operator report records 48 matching same-shape hashes, including
+slower sharing kernels. The worktree-owned build cache replaces temporary
+caches that disappeared during validation. [The pinned shared-batching evidence](gemma4-ocr-shared-batching.json)
+records exact flags, source/binary/harness/corpus hashes, output gates,
+allocation counters and excluded timing conditions.
+
+
+The exact sixteen-page condition also passes allocation instrumentation, again
+matching all 9,126 tokens. Its sampled maximum Metal resources are 3.710 GiB;
+process-tree RSS is 3.457 GiB. These measure different, overlapping resources
+and must not be added. The probe samples after waits, so the Metal maximum is
+not an instantaneous transient peak; instrumented timing is excluded.
+
+
+Both diagnostic conditions retain exact repeated-page output and resolve sixteen
+complete GPU stage samples. The baseline samples cover backbone frames;
+head-frame samples mix backbone and head work, so their average frame time is
+not a direct speedup comparison. The optimized diagnostic reaches eight carrier
+allocations and 135,160 reuse events. Across the recorded native-cohort
+conditions, 128 page observations and 79,222 completion tokens pass full output
+gates, including diagnostics and allocation instrumentation. This is empirical
+parity on the recorded PDFs, with the ordinary serving policy unchanged.
