@@ -205,6 +205,9 @@ pub const Root = struct {
     /// Independent serving packs; this root retains per-file maintenance statistics.
     serving: ?artifacts.ChunkRef = null,
     compacted: ?artifacts.ChunkRef = null,
+    /// Resumable delta: the published maintenance/serving baseline stays rooted.
+    checkpoint_base: ?artifacts.ChunkRef = null,
+    checkpoint_removed: []const []const u8 = &.{},
     serving_bytes: u64 = 0,
     pack_ownership: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
@@ -261,7 +264,12 @@ pub const Root = struct {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
         if (self.serving) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.compacted) |ref| try text_directory.validateRef(ref, self.domain);
+        if (self.checkpoint_base) |ref| {
+            try text_directory.validateRef(ref, self.domain);
+            if (self.serving != null or self.inventory_version != 1 or self.statistics_version != 1) return error.InvalidNativeLakeTextCorpus;
+        }
         if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
+        if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
         if (self.open_packs.len > 14) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
@@ -700,6 +708,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         } else null;
         var exact_seed: ?Root = null;
         var seed_artifact: ?[]const u8 = null;
+        var seed_ref: ?artifacts.ChunkRef = null;
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
@@ -711,6 +720,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (root.seekable and root.statistics_version >= 1 and std.mem.eql(u8, &root.recipe, &recipe) and std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 seed_artifact = declaration.artifact.artifact_id;
+                seed_ref = .{ .artifact_id = declaration.artifact.artifact_id, .checksum = declaration.artifact.checksum, .byte_len = declaration.artifact.byte_len };
                 exact_seed = root;
             }
         }
@@ -724,16 +734,24 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
             try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
             seed_artifact = declaration.artifact.artifact_id;
+            seed_ref = .{ .artifact_id = declaration.artifact.artifact_id, .checksum = declaration.artifact.checksum, .byte_len = declaration.artifact.byte_len };
             break root;
         } else null;
         const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
-        const manifest_seed = if (seed) |root| !paged_seed and root.manifests.len != 0 and root.file_groups.len == 0 else false;
+        const manifest_seed = if (seed) |root| !paged_seed and (root.manifests.len != 0 or root.checkpoint_base != null) and root.file_groups.len == 0 else false;
         const reference_seed = paged_seed or manifest_seed;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
         defer previous_groups.deinit(a);
         var previous_refs: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
         defer previous_refs.deinit(a);
-        const records = if (paged_seed) try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, store.*, cancellation) else &.{};
+        const baseline_ref: ?artifacts.ChunkRef = if (seed) |old| old.checkpoint_base orelse (if (old.serving != null) seed_ref else null) else null;
+        const baseline: ?Root = if (seed) |old| if (old.checkpoint_base != null) try checkpointBase(ca, store.*, old, cancellation) else if (old.serving != null) old else null else null;
+        const baseline_records = if (baseline) |old| try text_directory.fileRecords(ca, old, store.*, null, cancellation) else &.{};
+        const records = if (paged_seed) (if (baseline != null) baseline_records else try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation)) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, baseline_records, store.*, cancellation) else &.{};
+        var checkpoint_removed: std.ArrayList([]const u8) = .empty;
+        var baseline_by_id: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
+        defer baseline_by_id.deinit(a);
+        for (baseline_records) |record| try baseline_by_id.put(a, record.file.id, record);
         const previous = try ca.alloc(state.File, if (reference_seed) records.len else if (seed) |root| root.file_groups.len else 0);
         if (reference_seed) {
             for (previous, records) |*file, record| {
@@ -746,6 +764,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         };
         var plan = try state.Plan.init(a, ca, provider, previous);
         defer plan.deinit();
+        for (baseline_records) |record| if (!plan.by_id.contains(record.file.id)) try checkpoint_removed.append(ca, record.file.id);
         if (paged_seed) {
             var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
             for (records) |record| if (!plan.unchanged(record.file)) try removed_refs.append(ca, record.manifest);
@@ -764,6 +783,15 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var input_bytes: usize = 0;
         const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
         @memset(file_manifests, null);
+        const delta_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
+        @memset(delta_manifests, null);
+        if (seed) |old| if (old.checkpoint_base != null) {
+            const delta_records = try checkpointDeltaFiles(a, ca, old, store.*, cancellation);
+            for (delta_records) |record| if (plan.by_id.get(record.file.id)) |index| {
+                delta_manifests[index] = record.manifest;
+            };
+        };
+
         for (records) |record| if (plan.by_id.get(record.file.id)) |index| {
             file_manifests[index] = record.manifest;
         };
@@ -803,7 +831,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var summaries: std.ArrayList(?statistics.Ref) = .empty;
             var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
             if (!changed) {
-                if (paged_seed) continue;
+                if (paged_seed or (baseline != null and reference_seed)) continue;
                 const previous_group = if (manifest_seed) try loadRecordedFile(fa, store.*, previous_refs.get(file.id) orelse return error.InvalidNativeLakeTextCorpus, seed.?.domain, cancellation) else previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
@@ -901,8 +929,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (provider.progress != null) {
                 var checkpoint_arena = std.heap.ArenaAllocator.init(a);
                 defer checkpoint_arena.deinit();
-                const manifests = try presentManifests(checkpoint_arena.allocator(), file_manifests);
-                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
+                delta_manifests[file_ordinal] = file_manifests[file_ordinal];
+                const manifests = try presentManifests(checkpoint_arena.allocator(), if (baseline_ref != null) delta_manifests else file_manifests);
+                const partial: Root = .{ .checkpoint_base = baseline_ref, .checkpoint_removed = checkpoint_removed.items, .statistics_version = 1, .term_statistics = global_statistics, .statistics_deltas = try df.durable.?.snapshot(checkpoint_arena.allocator()), .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
                 try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
             }
         }
@@ -914,7 +943,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer spill_manager.deinit();
         var directory_builder = term_directory.Builder.init(a, &spill_manager);
         defer directory_builder.deinit();
-        const prior_directory: term_directory.Roots = if (seed) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
+        var removed_files: std.ArrayList(text_directory.FileRecord) = .empty;
+        var added_files: std.ArrayList(text_directory.FileRecord) = .empty;
+        for (baseline_records) |record| {
+            const index = plan.by_id.get(record.file.id);
+            if (index != null and std.mem.eql(u8, &record.file.digest, &plan.files[index.?].digest)) continue;
+            try removed_files.append(ca, record);
+        }
+        for (plan.files, file_manifests) |file, slot| {
+            if (baseline_by_id.get(file.id)) |old| if (std.mem.eql(u8, &old.file.digest, &file.digest)) continue;
+            try added_files.append(ca, .{ .file = file, .manifest = slot orelse return error.InvalidNativeLakeTextCorpus });
+        }
+        const prior_directory: term_directory.Roots = if (baseline) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
         const incremental_directory = prior_directory.leaves != null;
         var stats_reads: u64 = 512 * 1024 * 1024;
         var stats_writes: u64 = 512 * 1024 * 1024;
@@ -924,7 +964,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // A disabled optional directory has no complete base to update. Paged
         // seeds hold only changed maintenance groups, so stream unchanged
         // contributions from the canonical serving directory when bootstrapping.
-        if (paged_seed and !incremental_directory) {
+        if (baseline != null and !incremental_directory) {
             const Bootstrap = struct {
                 a: A,
                 pages: *@import("../serverless/graph_segment/page_store.zig").PageStore,
@@ -942,24 +982,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 }
             };
             var bootstrap: Bootstrap = .{ .a = a, .pages = &stats_pages, .plan = &plan, .builder = &directory_builder, .provider = provider, .cancellation = cancellation };
-            try text_directory.walkSegments(a, seed.?, store.*, cancellation, &bootstrap);
+            try text_directory.walkSegments(a, baseline.?, store.*, cancellation, &bootstrap);
         }
-        if (seed) |old| for (old.file_groups) |group| {
-            const current = plan.by_id.get(group.file.id);
-            if (current != null and !plan.changed[current.?]) continue;
-            for (group.summaries, group.segments) |ref, segment| {
-                try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), -1, null, if (incremental_directory) &directory_builder else null);
-            }
-        };
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
-        if (paged_seed) {
-            totals.documents = seed.?.collection.?.documents;
-            totals.segments = seed.?.segment_count;
-            for (seed.?.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
-            for (seed.?.manifests) |ref| {
+        var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+        if (baseline) |old| {
+            totals.documents = old.collection.?.documents;
+            totals.segments = old.segment_count;
+            for (old.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
+            for (removed_files.items) |record| {
+                try removed_refs.append(ca, record.manifest);
                 _ = file_arena.reset(.free_all);
-                const group = try loadFileManifest(file_arena.allocator(), store.*, ref, seed.?.domain, cancellation, null);
+                const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, old.domain, cancellation, null);
                 try totals.add(group, true);
                 if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
                     try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
@@ -967,21 +1002,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var current_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-        for (file_manifests, plan.changed) |slot, changed| {
-            if (paged_seed and !changed) continue;
-            const ref = slot orelse return error.InvalidNativeLakeTextCorpus;
-            try current_refs.append(ca, ref);
+        for (added_files.items) |record| {
+            try current_refs.append(ca, record.manifest);
             _ = file_arena.reset(.free_all);
-            const group = try loadFileManifest(file_arena.allocator(), store.*, ref, store.upload_scope.?.domain, cancellation, null);
+            const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, store.upload_scope.?.domain, cancellation, null);
             for (group.summaries, group.segments) |summary, segment| {
-                if (changed or !incremental_directory) try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+                try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
             }
             try totals.add(group, false);
         }
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
-        const directories = try text_directory.publishManifests(a, store, current_refs.items, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+        const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
-        root.serving = try @import("lake_index_serving_compaction.zig").publish(a, ca, store, root, seed, &plan, provider.context, cancellation);
+        root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -1008,6 +1041,12 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     try context.ensureActive();
     try cancellation.check();
     if (certified) return;
+    if (root.checkpoint_base) |base_ref| {
+        var base_arena = std.heap.ArenaAllocator.init(backing_a);
+        defer base_arena.deinit();
+        const held = try checkpointBase(base_arena.allocator(), backend, root, cancellation);
+        try validateReuse(backing_a, backend, held, base_ref.artifact_id, context, cancellation);
+    }
     const tree = @import("../serverless/graph_segment/page_tree.zig");
     var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing_a };
     const a = locked.allocator();
@@ -1222,7 +1261,30 @@ fn loadRecordedFile(a: A, store: stores.ArtifactStore, record: text_directory.Fi
     return group;
 }
 
-fn checkpointFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+pub fn checkpointBase(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation) !Root {
+    const ref = root.checkpoint_base orelse return error.InvalidNativeLakeTextCorpus;
+    const base = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, null);
+    if (base.checkpoint_base != null or base.serving == null or !std.mem.eql(u8, &base.domain, &root.domain) or !std.mem.eql(u8, &base.recipe, &root.recipe)) return error.InvalidNativeLakeTextCorpus;
+    return base;
+}
+fn checkpointFiles(a: A, out: A, root: Root, records: []const text_directory.FileRecord, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+    const delta = try checkpointDeltaFiles(a, out, root, store, cancellation);
+    if (root.checkpoint_base == null) return delta;
+    var merged: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
+    defer merged.deinit(a);
+    var removed: std.StringHashMapUnmanaged(void) = .empty;
+    defer removed.deinit(a);
+    for (root.checkpoint_removed) |id| try removed.put(a, id, {});
+    for (records) |record| if (!removed.contains(record.file.id)) {
+        try merged.put(a, record.file.id, record);
+    };
+    for (delta) |record| try merged.put(a, record.file.id, record);
+    const result = try out.alloc(text_directory.FileRecord, merged.count());
+    var it = merged.valueIterator();
+    for (result) |*record| record.* = it.next().?.*;
+    return result;
+}
+fn checkpointDeltaFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
     const records = try out.alloc(text_directory.FileRecord, root.manifests.len);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

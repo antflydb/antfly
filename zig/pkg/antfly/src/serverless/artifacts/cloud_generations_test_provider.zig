@@ -24,6 +24,7 @@ pub const Provider = struct {
     now_ms: u64 = 100,
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
+    retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     pub fn init(a: A) Provider {
         return .{ .memory = .init(a) };
     }
@@ -158,6 +159,7 @@ pub const Provider = struct {
     }
     fn retention(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: ?os.CancellationToken) !?os.VersionRetention {
         const self = owner(raw);
+        if (self.retention_hook) |hook| try hook.call(hook.ptr);
         return if (self.now_ms < self.until_ms) .{ .observed_ms = self.now_ms, .until_ms = self.until_ms } else null;
     }
     fn time(raw: *anyopaque, _: A, _: []const u8, _: ?os.CancellationToken) !?u64 {

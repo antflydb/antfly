@@ -131,7 +131,7 @@ const BuildProgress = struct {
         // A checkpoint is a closed subset of finished declarations. Preserve
         // selector completeness so restart does not turn an incremental build
         // into a migration audit; it carries no publication certificate.
-        if (map_root) |root| saved.cloud_generations = .{ .root = root, .complete = writer.?.complete and !writer.?.disabled };
+        if (map_root) |root| saved.cloud_generations = .{ .root = root, .complete = writer.?.complete and !writer.?.disabled, .vacuum = writer.?.vacuum_progress };
         saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
         try self.lease.save_checkpoint.?(self.lease.ptr, saved);
     }
@@ -199,7 +199,8 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     // builder verifies and records them; a query's complete binding stays strict.
     if (cloud_binding) |*held| held.reader.complete = false;
     var cloud_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
-    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = cloud_memory.allocator(), .reader = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = if (cloud_binding) |held| try maps.cloneRef(cloud_memory.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = cloud_api.seedComplete(cloud_seed, current.value.checkpoint, signature, current.value.namespace, !reuse or (current.value.published == null and current.value.checkpoint == null)) } else null else null;
+    var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = cloud_memory.allocator() };
+    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .vacuum_progress = if (cloud_seed) |seed_| if (seed_.cloud_generations) |cloud| cloud.vacuum else .{} else .{}, .reader = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = if (cloud_binding) |held| try maps.cloneRef(map_alloc.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = cloud_api.seedComplete(cloud_seed, current.value.checkpoint, signature, current.value.namespace, !reuse or (current.value.published == null and current.value.checkpoint == null)) } else null else null;
     const previous_writer = if (cloud_object) |object| object.cloud_writer else null;
     if (cloud_writer) |*writer| cloud_object.?.cloud_writer = writer;
     defer if (cloud_writer) |*writer| {

@@ -62,6 +62,7 @@ pub const ObjectStore = struct {
     cloud_retention_qualified: bool = false,
     cloud_reader: ?*@import("cloud_generations.zig").Reader = null,
     cloud_writer: ?*@import("cloud_generations.zig").Writer = null,
+    cloud_vacuum: ?@import("cloud_generations.zig").VacuumCut = null,
     cloud_certified_roots: []const [32]u8 = &.{},
     cloud_certificate_until_ms: u64 = 0,
     verified_mu: std.atomic.Mutex = .unlocked,

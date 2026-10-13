@@ -117,9 +117,23 @@ pub fn finish(a: A, writer: *maps.Writer, object: *Object, publication: *catalog
             else => return err,
         };
     }
+    var vacuum_progress = writer.vacuum_progress;
+    // Completed GC evidence proves absence without per-record provider HEADs.
+    if (object.cloud_vacuum) |cut| {
+        var vacuum_object = try Object.initWithClientOptions(a, object.client, object.bucket, object.prefix, .{ .read_only = true });
+        defer vacuum_object.deinit();
+        var vacuum_store = vacuum_object.artifactStore();
+        if (try writer.finish(token)) |flushed| maps.freeRef(writer.a, flushed);
+        vacuum_progress = writer.vacuum(&vacuum_store, cut, vacuum_progress, token) catch blk: {
+            try token.check();
+            try context.ensureActive();
+            break :blk vacuum_progress;
+        };
+        writer.vacuum_progress = vacuum_progress;
+    }
     const root = (try writer.finish(token)) orelse return;
     defer maps.freeRef(writer.a, root);
-    publication.cloud_generations = .{ .root = try maps.cloneRef(a, root), .complete = writer.complete and !writer.disabled };
+    publication.cloud_generations = .{ .root = try maps.cloneRef(a, root), .complete = writer.complete and !writer.disabled, .vacuum = vacuum_progress };
     if (!publication.cloud_generations.?.complete or !writer.qualified_retention or root.retention_until_ms == 0) return;
     const provider_now = (try object.client.providerTime(object.bucket, @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn))) orelse return;
     if (provider_now +| 60_000 >= root.retention_until_ms) return;
@@ -339,6 +353,8 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     defer a.free(parquet);
     var put = try source_client.putObject("antfly", "part.parquet", parquet, .{});
     put.deinit(a);
+    var second_put = try source_client.putObject("antfly", "part-2.parquet", parquet, .{});
+    second_put.deinit(a);
     const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
     defer a.free(schema);
     var base = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
@@ -412,12 +428,82 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     defer writer.deinit();
     const hits = try writer.snapshot().search(a, "body", &.{"quasar"}, 10);
     defer a.free(hits.hits);
-    try std.testing.expectEqual(@as(u32, 2), hits.total_count);
+    try std.testing.expectEqual(@as(u32, 4), hits.total_count);
     try std.testing.expect(try artifacts.retainedClosure(declaration.artifact.artifact_id, .none));
     // Derived map loss after protection expires must rebuild from Parquet,
     // without re-installing the unavailable map in the fresh recovery attempt.
     provider.now_ms = provider.until_ms;
     var raw_artifacts = object.artifactStore();
+    // Interrupt an actual Parquet append after its durable text checkpoint,
+    // with original canonical postings already reclaimed.
+    const maintenance = try corpus.loadRootDirectory(ca, raw_artifacts, declaration.artifact, .none, null);
+    const maintenance_files = try corpus.text_directory.fileRecords(ca, maintenance, raw_artifacts, null, .none);
+    for (maintenance_files) |record| {
+        const group = try corpus.loadFileManifest(ca, raw_artifacts, record.manifest, maintenance.domain, .none, null);
+        for (group.segments) |segment| try raw_artifacts.delete(segment.artifact_id);
+    }
+    var appended_put = try source_client.putObject("antfly", "part-3.parquet", parquet, .{});
+    appended_put.deinit(a);
+    var append_source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = base }, .{});
+    defer append_source.deinit();
+    var append_table = table;
+    append_table.lake_index_catalog_json = encoded;
+    const append_pending = try publication_api.begin(a, std.testing.io, append_table, &append_source, identity, .{}, 101, 1000);
+    defer a.free(append_pending);
+    append_table.lake_index_catalog_json = append_pending;
+    const Resume = struct {
+        a: A,
+        table: local.common_topology_records.TableRecord,
+        store: *stores.ArtifactStore,
+        stop: bool = true,
+        saw_base: bool = false,
+        fn snapshot(raw: *anyopaque, alloc: A) !local.common_topology_records.TableRecord {
+            var record = @as(*@This(), @ptrCast(@alignCast(raw))).table;
+            record.lake_index_catalog_json = try alloc.dupe(u8, record.lake_index_catalog_json);
+            return record;
+        }
+        fn save(raw: *anyopaque, saved: catalog.Publication) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var current = try catalog.parse(self.a, self.table.lake_index_catalog_json);
+            defer current.deinit();
+            self.table.lake_index_catalog_json = try catalog.encode(self.a, try current.value.saveCheckpoint(saved, saved.published_at_ms));
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            var hydrated = saved;
+            try @import("lake_index_directory.zig").hydrate(scratch.allocator(), self.store.*, &hydrated, .none, null);
+            for (hydrated.declarations) |entry| if (entry.artifact.kind == .text_segment) {
+                const partial = try corpus.loadRootDirectory(scratch.allocator(), self.store.*, entry.artifact, .none, null);
+                if (partial.checkpoint_base != null and partial.manifests.len != 0) {
+                    self.saw_base = true;
+                    if (self.stop) return error.TestInterrupted;
+                }
+            };
+        }
+    };
+    var resumer: Resume = .{ .a = ca, .table = append_table, .store = &store };
+    const lease: publication_api.Lease = .{ .ptr = &resumer, .snapshot = Resume.snapshot, .save_checkpoint = Resume.save };
+    try std.testing.expectError(error.TestInterrupted, publication_api.buildWithLease(a, &store, append_table, &append_source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now }, lease));
+    try std.testing.expect(resumer.saw_base);
+    resumer.stop = false;
+    const resumed = try publication_api.buildWithLease(a, &store, resumer.table, &append_source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now }, lease);
+    defer a.free(resumed);
+    var resumed_catalog = try catalog.parse(a, resumed);
+    defer resumed_catalog.deinit();
+    var resumed_publication = resumed_catalog.value.published.?;
+    {
+        var resume_binding = (try Binding.init(a, &object, resumed_publication, .none)).?;
+        defer resume_binding.deinit();
+        try @import("lake_index_directory.zig").hydrate(ca, store, &resumed_publication, .none, null);
+        const resumed_declaration = for (resumed_publication.declarations) |entry| {
+            if (std.mem.eql(u8, entry.name, declaration.name)) break entry;
+        } else return error.MissingTextPublication;
+        const resumed_root = try corpus.loadServing(ca, store, resumed_declaration.artifact, .none, null);
+        var resumed_writer = try corpus.loadWriter(a, store, resumed_root, .none, null, null);
+        defer resumed_writer.deinit();
+        const resumed_hits = try resumed_writer.snapshot().search(a, "body", &.{"quasar"}, 10);
+        defer a.free(resumed_hits.hits);
+        try std.testing.expectEqual(@as(u32, 6), resumed_hits.total_count);
+    }
     try raw_artifacts.delete(selected.cloud_generations.?.root.artifact_id);
     table.lake_index_catalog_json = encoded;
     const rebuilding = try publication_api.begin(a, std.testing.io, table, &source, identity, .{}, 101, 1000);
@@ -444,6 +530,41 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     const rotated_scope = (try stores.uploadScopeFromArtifactId(rotated_root.artifact_id)).?;
     try std.testing.expectEqual(publication_api.uploadDomainWithNamespace(4, rotated_identity, rotated.value.namespace), rotated_scope.domain);
     try std.testing.expect(rotated.value.published.?.cloud_generations.?.complete);
+    // A removal already folded into durable DF deltas must not be subtracted
+    // again when the same partial refresh resumes.
+    try source_client.deleteObject("antfly", "part-2.parquet", .{});
+    var fourth_put = try source_client.putObject("antfly", "part-4.parquet", parquet, .{});
+    fourth_put.deinit(a);
+    var removal_source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = base }, .{});
+    defer removal_source.deinit();
+    var removal_table = append_table;
+    removal_table.lake_index_catalog_json = resumed;
+    const removal_pending = try publication_api.begin(a, std.testing.io, removal_table, &removal_source, identity, .{}, 101, 1000);
+    defer a.free(removal_pending);
+    removal_table.lake_index_catalog_json = removal_pending;
+    resumer.table = removal_table;
+    resumer.stop = true;
+    resumer.saw_base = false;
+    try std.testing.expectError(error.TestInterrupted, publication_api.buildWithLease(a, &store, removal_table, &removal_source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now }, lease));
+    resumer.stop = false;
+    const removal_resumed = try publication_api.buildWithLease(a, &store, resumer.table, &removal_source, identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now }, lease);
+    defer a.free(removal_resumed);
+    var removal_catalog = try catalog.parse(a, removal_resumed);
+    defer removal_catalog.deinit();
+    var removal_publication = removal_catalog.value.published.?;
+    var removal_binding = (try Binding.init(a, &object, removal_publication, .none)).?;
+    defer removal_binding.deinit();
+    try @import("lake_index_directory.zig").hydrate(ca, store, &removal_publication, .none, null);
+    const removal_declaration = for (removal_publication.declarations) |entry| {
+        if (std.mem.eql(u8, entry.name, declaration.name)) break entry;
+    } else return error.MissingTextPublication;
+    const removal_root = try corpus.loadServing(ca, store, removal_declaration.artifact, .none, null);
+    try std.testing.expectEqual(@as(u32, 6), removal_root.collection.?.documents);
+    var removal_writer = try corpus.loadWriter(a, store, removal_root, .none, null, null);
+    defer removal_writer.deinit();
+    var frequencies: [1]u32 = undefined;
+    try removal_writer.snapshot().termDocFreqs(a, "body", &.{"quasar"}, &frequencies);
+    try std.testing.expectEqual(@as(u32, 6), frequencies[0]);
 }
 
 test "external lake global frontier complete cloud maps refresh without retention certificates or payload audits" {
@@ -502,4 +623,80 @@ test "external lake global frontier complete cloud maps refresh without retentio
     var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 7, .authority = undefined, .store = artifacts, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .namespace = namespace, .audit_only = true, .remaining_reads = 0 };
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, collector.mark(.{ .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }));
     try std.testing.expectEqual(@as(usize, 0), provider.stats);
+}
+
+test "external lake global frontier completed cloud GC publishes durable vacuum evidence" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try Object.initWithClient(a, client, "bucket", "native");
+    defer object.deinit();
+    var artifacts = object.artifactStore();
+    const identity: [32]u8 = @splat(5);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(7, identity, namespace);
+    const scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var writer: maps.Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope, .complete = true };
+    defer writer.deinit();
+    object.cloud_writer = &writer;
+    var inventory = try artifacts.putScoped(scope, "live inventory", .none);
+    defer inventory.deinit(a);
+    var orphan = try artifacts.putScoped(scope, "obsolete publication payload", .none);
+    defer orphan.deinit(a);
+    var publication: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .store_locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "s3://bucket/native" }, .namespace = namespace, .generation = 1, .token = scope.attempt, .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = identity }, .published_at_ms = 101, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len } };
+    try finish(ca, &writer, &object, &publication, &.{}, 7, identity, .{ .io = std.testing.io }, .none, false);
+    object.cloud_writer = null;
+    const Harness = struct {
+        a: A,
+        state: @import("../metadata/lake_index_lifecycle.zig").State,
+        fn read(raw: *anyopaque, alloc: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return @import("../metadata/lake_index_lifecycle.zig").encode(alloc, @as(*@This(), @ptrCast(@alignCast(raw))).state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, change: @import("../metadata/lake_index_lifecycle.zig").Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (revision != self.state.revision) return error.CatalogGenerationChanged;
+            self.state = try change.apply(self.a, self.state);
+        }
+    };
+    var harness: Harness = .{ .a = ca, .state = try (@import("../metadata/lake_index_lifecycle.zig").State{}).synchronize(ca, .{ .namespace = namespace, .generation = 1, .published = publication }) };
+    const authority: @import("lake_index_reader_lease.zig").Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
+    provider.now_ms = provider.until_ms;
+    var completed = false;
+    for (0..128) |_| {
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 7, .authority = authority, .store = artifacts, .identity = identity, .context = .{ .io = std.testing.io }, .options = .{ .dry_run = false, .max_marked = 2, .max_deleted = 2 }, .token = @splat(7) };
+        if ((try collector.run()).complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    const lifecycle_bytes = try @import("../metadata/lake_index_lifecycle.zig").encode(ca, harness.state);
+    const restarted = try @import("../metadata/lake_index_lifecycle.zig").parse(ca, lifecycle_bytes);
+    const cut = restarted.stores[0].vacuum orelse return error.MissingVacuumEvidence;
+    var removed = try writer.lookup(a, orphan.artifact_id, .none);
+    defer if (removed) |*record| record.deinit(a);
+    try std.testing.expect(removed != null);
+    const progress = try writer.vacuum(&artifacts, cut, .{}, .none);
+    try std.testing.expect(progress.done);
+    try std.testing.expect((try writer.lookup(a, orphan.artifact_id, .none)) == null);
+    var live = (try writer.lookup(a, inventory.artifact_id, .none)).?;
+    live.deinit(a);
+    // A later collection roots the persisted mark pages, without treating the
+    // IDs stored in that evidence as payload roots.
+    harness.state = restarted;
+    completed = false;
+    for (0..128) |_| {
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 7, .authority = authority, .store = artifacts, .identity = identity, .context = .{ .io = std.testing.io }, .options = .{ .dry_run = false, .max_marked = 2, .max_deleted = 2 }, .token = @splat(6) };
+        if ((try collector.run()).complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
 }

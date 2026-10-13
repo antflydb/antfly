@@ -3554,3 +3554,63 @@ seconds. The fragmented-file fixture has 193 files, guaranteeing an unrelated
 serving descriptor even after 64-span packing. These checks establish result
 contracts and bounded work; they do not claim archive-scale latency improvements
 or live-provider retention qualification.
+
+### PR #1112: checkpoint lineage, concurrent map journals, and GC-backed vacuum
+
+Reader protocol 39 adds a resumable text checkpoint baseline and completed-file
+changes. The baseline is an authenticated canonical root with its packed serving
+root, rather than a list of original posting references. Checkpoints retain only
+newly completed manifests and explicit removed-file identities beside that base
+and the durable signed DF runs. Recovery and GC traverse the packed baseline as
+maintenance metadata, while new manifests retain their pending posting payloads.
+The source digest comparison against the baseline remains independent of which
+files were completed before interruption. Removed identities keep recovery from
+subtracting already checkpointed DF contributions twice.
+
+Final publication updates canonical directories, term directories, collection
+counters, serving ownership, and packs from the same changed-file set. Resuming a
+checkpoint reuses baseline directory roots and statistics; completed new files
+still enter serving compaction even though they need no further source scan.
+Compaction receives the delta directly and uses ownership point seeks for affected
+packs, eliminating its two full file-reference inventory reloads. Source planning
+still enumerates the source inventory and compact canonical file records once;
+this does not claim constant-time source discovery.
+
+The cloud writer snapshots immutable map roots under a short bookkeeping lock.
+Remote lookups and retention proofs run outside it and can overlap across shared
+scheduler lanes. Flushes detach bounded batches, perform remote COW writes outside
+the bookkeeping lock, and install the new root atomically. Waiting flushers use an
+I/O mutex. A journal admission limit of 256 pending records applies backpressure;
+the existing 64 MiB managed build allocator is shared through a locked allocator.
+Publication/checkpoint barriers join active capture operations before flushing.
+A failed flush disables completeness rather than publishing a partial journal as
+complete. Query map caches continue to own their decoded navigation separately.
+
+Completed cloud GC persists its authenticated paged mark set and upload floor/cutoff
+in the matching lifecycle store binding. Subsequent collections retain those mark
+pages as bookkeeping, without treating their stored IDs as payload roots. A new
+publication can therefore remove old, unmarked generation-map records without
+probing every payload or repeating a closure census. Records outside the proven
+upload range remain untouched. Vacuum visits at most four radix leaves per pass,
+with bounded map/mark reads, and persists its hash-order cursor in the publication
+and builder checkpoints. It carries an unfinished cursor across newer GC cuts so
+frequent collections cannot repeatedly starve the tail. Changed paths are COW;
+older reader publications continue using their own immutable generation roots.
+Interrupted optional vacuum work leaves the prior map and cursor intact. Cloud GC
+work/frontier artifacts become ordinary later collection candidates; only the
+current vacuum evidence pages remain rooted. Live provider retention qualification
+remains deferred, as previously requested.
+
+Qualification for these refinements on Zig 0.17.0/macOS ARM64, with latest main
+`0bbd1807c1` included: the final Debug server/integration/focused build passes all
+95 steps, with 427 integration executions (158 shared and 269 server) and 26
+focused executions (one shared and 25 server), without failures or leaks. The
+same 26 focused contracts pass in ReleaseFast. The real-Parquet scripted-provider
+flow interrupts and resumes both an append and an append/removal after reclaiming
+original postings, and checks exact collection/DF counts. Delta compaction also
+runs with canonical file inventories unavailable. Scripted cloud tests verify
+concurrent retention proofs, multi-pass vacuum, old-reader selectors, cancellation,
+and completed GC evidence across restart and a later collection. All 14 selected
+real Parquet/Iceberg E2Es pass in 282.74 seconds. Object-store contracts, Apache
+source boundaries, license headers, changed-source formatting and Git whitespace
+checks pass. No archive-scale latency or live-provider qualification is claimed.

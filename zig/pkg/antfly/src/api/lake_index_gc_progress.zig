@@ -296,6 +296,9 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     const publications = try state.gcPublications(a);
     var cloud_union: ?@import("lake_cloud_publication.zig").UnionBinding = if (collector.store.providerStore()) |object| try @import("lake_cloud_publication.zig").UnionBinding.init(collector.a, object, publications, collection.retired, collector.namespace, collector.identity) else null;
     defer if (cloud_union) |*binding| binding.deinit();
+    if (collection.progress == null) for (state.stores) |binding| {
+        if (std.mem.eql(u8, &binding.identity, &collector.identity)) if (binding.vacuum) |cut| if (cut.marks) |root| try progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false } });
+    };
     if (collection.progress == null) for (publications) |publication| {
         if (!std.meta.eql(publication.namespace, collector.namespace) or !std.mem.eql(u8, &publication.signature.store, &collector.identity)) continue;
         const retired = for (collection.retired) |generation| {
@@ -381,12 +384,16 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         return collector.result;
     }
     const cloud_checkpoints = if (collector.store.providerStore()) |object| object.fs_client == null and object.client.vtable.list_object_versions != null else false;
-    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints } });
+    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints, .vacuum = if (cloud_checkpoints) .{ .domain = domain, .floor = progress.value.floor, .cutoff = progress.value.cutoff, .marks = progress.value.marks } else null } });
     // Legacy nonce staging predates journal-discoverable pending-v2 files.
     // Its advisory migration cleanup must never gate collection completion.
     collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation()) catch |err| {
         std.log.warn("completed lake GC legacy staging cleanup deferred: {t}", .{err});
     };
+    if (cloud_checkpoints) {
+        collector.result.complete = true;
+        return collector.result; // mark pages are now durable vacuum evidence
+    }
     // The metadata receipt is durable before private checkpoint reclamation.
     // Interrupted cleanup leaves ordinary below-cutoff orphans for the next GC.
     const Cleanup = struct {

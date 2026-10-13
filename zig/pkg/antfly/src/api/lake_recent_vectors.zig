@@ -126,7 +126,8 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     const object = artifacts.providerStore();
     const maps = @import("../serverless/artifacts/cloud_generations.zig");
     var map_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
-    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_memory.allocator(), .reader = .{ .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
+    var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = map_memory.allocator() };
+    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .reader = .{ .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
     const previous_writer = if (object) |provider| provider.cloud_writer else null;
     const previous_reader = if (object) |provider| provider.cloud_reader else null;
     if (map_writer) |*writer| {

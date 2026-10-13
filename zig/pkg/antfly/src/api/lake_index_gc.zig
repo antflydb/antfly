@@ -92,6 +92,9 @@ pub const Collector = struct {
             try self.check();
             try self.markPublication(publication);
         }
+        for (state.stores) |binding| {
+            if (std.mem.eql(u8, &binding.identity, &self.identity)) if (binding.vacuum) |cut| try self.markPages(a, cut.domain, cut.marks, false);
+        }
         self.result.marked = self.marked.count();
         // No destructive work until the complete bounded mark phase succeeds.
         try self.check();
@@ -328,6 +331,10 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    if (root.checkpoint_base) |base| {
+                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = base.artifact_id, .checksum = base.checksum, .byte_len = base.byte_len };
+                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+                    }
                     if (root.serving orelse root.compacted) |serving| {
                         const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = if (root.serving != null) @import("lake_index_native_text.zig").metadata_version else 10, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
                         if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);

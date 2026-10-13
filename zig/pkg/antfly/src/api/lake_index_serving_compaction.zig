@@ -210,7 +210,25 @@ fn put(a: A, out: A, store: *stores.ArtifactStore, value: anytype, token: Cancel
     defer if (ref.provider_version) |version| writer.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
+pub const Delta = struct { removed: []const corpus.text_directory.FileRecord, added: []const corpus.text_directory.FileRecord };
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root, previous: ?corpus.Root, plan: *const state.Plan, context: local.serverless_query_lake_read_context.Context, token: Cancellation) !Chunk {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const base: ?corpus.Root = if (previous) |old| if (old.checkpoint_base != null) try corpus.checkpointBase(ca, store.*, old, token) else old else null;
+    const removed = if (base) |old| try corpus.text_directory.fileRecords(ca, old, store.*, null, token) else &.{};
+    const files = try corpus.text_directory.fileRecords(ca, current, store.*, null, token);
+    var added: std.ArrayList(corpus.text_directory.FileRecord) = .empty;
+    var previous_files: std.StringHashMapUnmanaged(state.File) = .empty;
+    defer previous_files.deinit(a);
+    for (removed) |record| try previous_files.put(a, record.file.id, record.file);
+    for (files) |record| {
+        if (previous_files.get(record.file.id)) |old| if (std.mem.eql(u8, &old.digest, &record.file.digest)) continue;
+        try added.append(ca, record);
+    }
+    return publishDelta(a, out, store, current, base, .{ .removed = removed, .added = added.items }, plan, context, token);
+}
+pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root, previous: ?corpus.Root, delta: Delta, plan: *const state.Plan, context: local.serverless_query_lake_read_context.Context, token: Cancellation) !Chunk {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
@@ -245,8 +263,7 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
         // Paged ownership lookup touches only changed/removed source prefixes.
         var affected: std.StringHashMapUnmanaged(Chunk) = .empty;
         defer affected.deinit(a);
-        const original = try corpus.text_directory.fileRecords(ca, previous.?, store.*, null, token);
-        for (original) |record| {
+        for (delta.removed) |record| {
             if (plan.unchanged(record.file)) continue;
             const prefix = corpus.term_directory.identity(record.file.id);
             var cursor = try tree.Cursor.init(a, pages.store(), old.pack_ownership, &prefix, null);
@@ -267,7 +284,8 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
             const group = try corpus.loadFileManifest(sa, store.*, ref.*, current.domain, token, null);
             if (group.segments.len != 1 or group.sources.len == 0) return error.InvalidNativeLakeTextCorpus;
             var sources: std.ArrayList(Span) = .empty;
-            for (group.sources) |span| if (plan.unchanged(span.file)) {
+            for (group.sources) |span| if (plan.by_id.get(span.file.id)) |ordinal| {
+                if (!std.mem.eql(u8, &span.file.digest, &plan.files[ordinal].digest)) continue;
                 try sources.append(sa, span);
             };
             try builder.removed.append(ca, ref.*);
@@ -278,9 +296,7 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
             if (sources.items.len != 0) try builder.add(.{ .ref = group.segments[0], .admission = group.admissions[0], .sources = sources.items, .original_docs = group.admissions[0].doc_count, .summary = group.summaries[0] });
         }
     }
-    const files = try corpus.text_directory.fileRecords(ca, current, store.*, null, token);
-    for (files) |record| {
-        if (prior != null and plan.unchanged(record.file)) continue;
+    for (delta.added) |record| {
         try builder.check();
         _ = scratch.reset(.free_all);
         const sa = scratch.allocator();
@@ -417,10 +433,25 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     }
     try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
     refs[128] = try Helper.file(ca, &store, 128, 129);
+    const checkpoint: corpus.Root = .{ .checkpoint_base = root_ref, .statistics_version = 1, .seekable = true, .domain = current.domain, .binding = current.binding, .config_json = current.config_json, .recipe = current.recipe, .manifests = refs[128..129] };
+    const checkpoint_ref = try put(ca, ca, &store, checkpoint, .none);
+    const recovered = try corpus.loadRootDirectory(ca, store, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = checkpoint_ref.artifact_id, .checksum = checkpoint_ref.checksum, .byte_len = checkpoint_ref.byte_len }, .none, null);
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = checkpoint_ref.artifact_id, .checksum = checkpoint_ref.checksum, .byte_len = checkpoint_ref.byte_len });
+    try std.testing.expect(collector.marked.contains(root_ref.artifact_id));
     var appended = try Helper.root(ca, &store, refs);
     var append_plan = try Helper.plan(ca, appended, store, "source-128");
     defer append_plan.deinit();
-    appended.serving = try publish(a, ca, &store, appended, current, &append_plan, .{ .io = std.testing.io }, .none);
+    // The appended file is already complete in the recovered checkpoint.
+    @memset(append_plan.changed, false);
+    appended.serving = try publish(a, ca, &store, appended, recovered, &append_plan, .{ .io = std.testing.io }, .none);
+    // Delta publication must not reopen either canonical file inventory.
+    // Make those inventories unavailable while retaining serving ownership.
+    var delta_base = current;
+    delta_base.directories.files = null;
+    var delta_current = appended;
+    delta_current.directories.files = null;
+    const added: corpus.text_directory.FileRecord = .{ .file = append_plan.files[128], .manifest = refs[128] };
+    appended.serving = try publishDelta(a, ca, &store, delta_current, delta_base, .{ .removed = &.{}, .added = &.{added} }, &append_plan, .{ .io = std.testing.io }, .none);
     const appended_root = try corpus.servingRoot(ca, store, appended, .none, null);
     try std.testing.expectEqual(@as(u32, 3), appended_root.segment_count);
     const appended_packs = try corpus.text_directory.fileRecords(ca, appended_root, store, null, .none);

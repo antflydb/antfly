@@ -16496,7 +16496,13 @@ pub const ApiHttpServer = struct {
         try source.attachCache(&self.lake_read_cache, schema.external_base_source.?.binding, context);
         var reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null;
         defer if (reader_lease) |lease| lease.deinit();
+        var vacuum_arena = std.heap.ArenaAllocator.init(a);
+        defer vacuum_arena.deinit();
         if (self.source.lakeIndexLifecycleAuthority(.{})) |authority| {
+            const lifecycle_state = try authority.readState(vacuum_arena.allocator(), table.table_id);
+            for (lifecycle_state.stores) |binding_| if (std.mem.eql(u8, &binding_.identity, &store.identity)) {
+                store.implementation.cloud_vacuum = binding_.vacuum;
+            };
             var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
             defer state.deinit();
             if (state.value.published) |published| {
