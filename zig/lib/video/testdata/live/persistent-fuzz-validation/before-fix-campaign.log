@@ -1,0 +1,20 @@
+fuzz-video
++- run test failure
+failed with error.IncompleteVideoPicture
+error: test 'src.h264_fuzz_test.test.video fuzz H264 persistent payloads append eviction snapshots and replay' exited with code 1; input saved to '/private/tmp/antfly-persistent-fuzz-1013-local/f/crash'
+failed command: /private/tmp/antfly-persistent-fuzz-1013-local/o/08eb838cc85a3d21c9be3f1578c2780f/test --cache-dir=/private/tmp/antfly-persistent-fuzz-1013-local --seed=0xf0d3e39e --listen=-
+
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.h264_fuzz_test.test.video fuzz H264 persistent payloads append eviction snapshots and replay" (1164b55bc8bf372b)
+Runs: 0 -> 44745
+Unique runs: 0 -> 1136
+Coverage: 0/32593 -> 5268/32593 (16.16%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 3m MaxRSS:9M
+   +- compile test safe native success 57s MaxRSS:998M
+

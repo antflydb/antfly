@@ -400,13 +400,13 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
         };
         if (selectors.items.len == 0) return error.EmptyVideo;
         stats = session.decodeSelected(selectors.items, &collector, discard) catch |err| caught: {
-            if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
+            if (!partial or err != error.PendingVideoPicture or collector.pending_first_packet == null) return err;
             break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
         };
     } else {
         const ends = try codedEnds(reader, 0, reader.packets.len, decode.max_packet_bytes) orelse return error.EmptyVideo;
         stats = h264.decodeSelected(a, reader, &ends, decode, &collector, discard) catch |err| caught: {
-            if (!partial or err != error.IncompleteVideoPicture or collector.pending_first_packet == null) return err;
+            if (!partial or err != error.PendingVideoPicture or collector.pending_first_packet == null) return err;
             break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
         };
     }

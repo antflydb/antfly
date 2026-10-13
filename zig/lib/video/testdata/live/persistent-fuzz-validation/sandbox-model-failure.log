@@ -1,0 +1,28 @@
+test-video-model
++- run test 44 pass, 3 skip, 2 fail (49 total)
+metal-runtime-create: device=nil
+error: 'ops.metal_compute.test.embeddinggemma2 Metal video buffer survives producer destruction and enters resident linear' failed:
+       metal-runtime-create: device=nil
+       metal-runtime-create: device=nil
+error: 'ops.metal_compute.test.embeddinggemma2 Metal video producer prepares while compute lease is held and drains on abandonment' failed without output
+failed command: /private/tmp/antfly-configuration-compaction-model-local/o/18a8cfc7b5798e367fd1bacaf69ee4ef/test --cache-dir=/private/tmp/antfly-configuration-compaction-model-local --seed=0x97fd69cd --listen=-
+
+Build Summary: 11/13 steps succeeded (1 failed); 44/49 tests passed (3 skipped, 2 failed)
+test-video-model transitive failure
++- run test 44 pass, 3 skip, 2 fail (49 total)
+   +- compile test safe native success 3m MaxRSS:2G
+      +- WriteFile macos-sdk-libc.txt success
+      +- run exe jit-source-identity (metal_identity.zig) success 209ms
+      |  +- compile exe jit-source-identity safe native success 9s MaxRSS:322M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- options success
+      +- WriteFile tokenizer.json success
+      +- WriteFile video_prepare_shader.h success
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 141ms
+         +- compile exe patch_sentencepiece_proto safe native success 9s MaxRSS:299M
+         |  +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) success 128ms
+         |  +- compile exe protoc-zig safe native success 11s MaxRSS:373M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

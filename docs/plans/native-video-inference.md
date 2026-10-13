@@ -1745,3 +1745,27 @@ This phase reuses those oracles and does not rerun full-replay inference.
 Broader changing-tool pretrained qualification, persistent-owner fuzzing, sustained
 full-pipeline measurements and remaining original non-CUDA scope remain active.
 No runtime dependency is added. See [qualification receipts](../../zig/lib/video/testdata/live/configuration-compaction-validation/README.md).
+
+### Stateful AVC fuzzing and corrupt pending-tail rejection
+
+A maintained Zig coverage-guided target preserves MP4 indexes while mutating coded
+payloads. Six seeds cover prediction, dynamic geometry/PPS, interleaved split PAFF,
+partitions and high-depth separate colour planes. Chunked appends and accepted
+evictions compare logical metadata/pending assemblies with full-prefix replay;
+held snapshots remain unchanged. Destruction verifies zero shared admission and
+packet retention. Resource/deadline/allocation bounds are excluded from successful
+output equivalence. This compares metadata, not mutated pixel conformance.
+
+The first campaign found replay swallowing a corrupt incomplete colour plane when
+another plane had reported pending metadata. A distinct pending-tail error now
+identifies recoverable selected field/partition packet boundaries. The recovered
+930-byte input fails before the fix and now explicitly requires corruption
+rejection, alongside replay/incremental equivalence.
+
+ReleaseSafe macOS passes 244 video tests (two skips), 23 live checks and 49
+CPU/Metal model checks. Actual Linux ARM64 passes 219 video tests (27 skips) and
+23 live checks. The new campaign log records actual execution/coverage counts;
+the initial failing campaign and before-fix reproduction remain in the receipts.
+No new pretrained or performance claim is made. Broader real-stream/conformance,
+changing-tool pretrained, full-pipeline performance and protocol work remains
+active. No runtime dependency is added. See [qualification receipts](../../zig/lib/video/testdata/live/persistent-fuzz-validation/README.md).

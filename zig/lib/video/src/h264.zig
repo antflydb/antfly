@@ -1752,7 +1752,10 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
             }
             workspace.active = false;
         };
-        if (unfinished_selected) return error.IncompleteVideoPicture;
+        // Only this boundary condition is recoverable by streaming indexing.
+        // An incomplete frame rejected elsewhere is corruption, even when a
+        // different independent plane has already reported pending metadata.
+        if (unfinished_selected) return error.PendingVideoPicture;
         packet_index = partition_span.last;
     }
     live.next_packet = packet_index;
