@@ -4479,3 +4479,66 @@ with allocation sweeps. Formatting, source-catalog freshness, Apache boundary
 and license checks, and original inventory integrity passed. Cache GC was
 previewed while other builds were active; nothing was deleted. Origin/main
 e8666a5b75 was already contained in the branch. No public API changed.
+
+### Authenticated JSON provenance through CHECK and activation pages
+
+Typed document preparation now retains its schema-authenticated JsonNulls owner
+through CHECK validation, including preserve/restore preparation. Untyped JSON
+callers retain their existing SQL NULL interpretation. Normal and activation
+CHECK interfaces share the same PreparedInput path and verify the execution
+context and byte-counter identity before using supplied provenance. A present
+JSON null cannot become SQL NULL merely because validation crosses another
+internal interface.
+
+Distributed native activation responses previously discarded the marker set
+already produced by their selected cold projection. Producer and coordinator
+now use one shared activation Row contract, including nonempty JSON-null
+markers alongside the exact primary version/content observation. Empty marker
+sets add no wire field. The coordinator authenticates each marker against its
+pinned relational layout and projected root datum, rejects duplicates, and
+does not run full-root required-field validation on a narrow CHECK projection.
+Source predicates continue to guard the original complete primary row rather
+than a hash of its projection.
+
+Projected JSON parsing, provenance ownership and every CHECK plan share one
+bounded page execution allowance. Retained parent-arena capacity is not refunded
+between rows. Request cancellation/deadline checks propagate into sampled VM
+work. An expression quota failure shrinks the worker page where possible; a
+singleton returns the resource error with no failed-row publication or cursor
+advance. Resource exhaustion is not evidence of a violated constraint.
+
+Focused Debug proofs include ingress/cold null agreement using an internal VM
+fixture, owner/counter mismatch rejection, sticky budget/cancellation and
+allocation-fault cleanup. Real LSM projections round-trip through the shared
+wire contract without losing JSON null or adding empty metadata. Coordinator
+projection tests cover malformed provenance, exact source guards, genuine CHECK
+diagnostics, all observed allocation failures, and bounded admission across a
+page whose individual rows fit. Real worker fault tests cover shrinking/retry
+and byte-for-byte unchanged singleton checkpoints with no commit. Their catalog
+fixture was corrected to publish production CHECK fingerprints rather than
+omitting the authority that native loading requires.
+
+This does not activate public JSON column/literal compilation. The internal VM
+fixture is deliberately not evidence for public grammar or original sql-0671.
+Capability fencing, immutable JSON literal identity, SQL/public/client lowering,
+legacy-result ownership, typed projected tuple/vector consumers and complete
+end-to-end activation remain open. Original case dispositions are unchanged.
+
+Full transaction qualification exposed an existing range-guard/savepoint fault
+sweep reporting NondeterministicMemoryUsage. The unmodified test also failed in
+isolation. Its arena resize/remap fallback now uses the same deterministic
+backing allocator as the newer fault suites: no in-place resize success can
+change allocation counts between the baseline and injected failures. Every
+allocation-failure check and semantic assertion remains enabled; the isolated
+Debug sweep passes with this change.
+
+Final reviewed-source Debug qualification passed 1,025 SQL owner/linked tests
+(three existing skips, zero failures/leaks, 21/21 steps), 241 native tests
+(zero failures/leaks, 50/50 steps), and all 113 transaction contract tests
+(zero failures/leaks, 50/50 steps). Focused projection/VM, coordinator and real
+worker fault regressions passed. Formatting, source-catalog freshness, Apache
+boundary/license headers and original inventory integrity passed. The initial
+sandboxed formatter invocation could not reach the pnpm registry; the permitted
+network-enabled final check passed. Cache GC was previewed without deletion.
+Original accounting remains 479 implemented / 136 rejected / 73 superseded /
+898 unresolved. No public OpenAPI grammar was activated by this checkpoint.

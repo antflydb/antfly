@@ -1394,6 +1394,53 @@ test "relational index system typed JSON null survives preparation normalization
     try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "bad", .value = input_write.value, .json_null_fields = &.{"missing"} }} }));
 }
 
+test "relational index system activation projection transports only present JSON null markers" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("activation-json-provenance");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"j":{"type":"json"},"s":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"j\":null,\"s\":null}", .json_null_fields = &.{"j"} },
+        .{ .key = "b", .value = "{\"j\":{},\"s\":null}" },
+    } });
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{ "j", "s" }, .include_primary_digest = true });
+    defer reader.deinit();
+    var page = try reader.nextPage(alloc, db.backend_runtime.io(), .{});
+    defer page.deinit();
+    const Row = @import("relational_integrity_activation_contract.zig").Row;
+    const wire_rows = try alloc.alloc(Row, page.rows.len);
+    defer alloc.free(wire_rows);
+    for (wire_rows, page.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
+    const Response = struct {
+        rows: []const Row,
+        pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try @import("relational_integrity_json.zig").write(response, stream);
+        }
+    };
+    const wire = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = wire_rows }, .{});
+    defer alloc.free(wire);
+    var parsed = try std.json.parseFromSlice(struct {
+        rows: []const @import("../../api/relational_integrity_commit.zig").BackfillRow,
+    }, alloc, wire, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.rows.len);
+    const first = parsed.value.rows[0];
+    const second = parsed.value.rows[1];
+    try std.testing.expectEqualStrings("a", first.key);
+    try std.testing.expectEqual(@as(usize, 1), first.json_null_fields.len);
+    try std.testing.expectEqualStrings("j", first.json_null_fields[0]);
+    try std.testing.expect(first.expected_content_digest != null);
+    try std.testing.expectEqualStrings("b", second.key);
+    try std.testing.expectEqual(@as(usize, 0), second.json_null_fields.len);
+    try std.testing.expect(second.expected_content_digest != null);
+    // Empty metadata adds no wire field; omitting it must still decode as the
+    // empty marker set, never turn a SQL NULL into present JSON null.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "\"json_null_fields\""));
+}
+
 test "relational index system typed JSON null obeys composed JSON constraints" {
     const schema_api = @import("../../schema/mod.zig");
     for ([_]struct { constraint: []const u8, accepted: bool }{

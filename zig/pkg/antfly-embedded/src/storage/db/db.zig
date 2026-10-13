@@ -18794,10 +18794,10 @@ pub const DB = struct {
             })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
-            const Row = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 };
+            const Row = @import("relational_integrity_activation_contract.zig").Row;
             const rows = try alloc.alloc(Row, page.rows.rows.len);
             defer alloc.free(rows);
-            for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest };
+            for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
             const Response = struct {
                 rows: []const Row,
                 command: activation.Command,

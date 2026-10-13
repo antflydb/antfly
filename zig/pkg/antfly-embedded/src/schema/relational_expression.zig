@@ -241,6 +241,87 @@ test "relational index system shared prepared input pins JSON null authority wit
     try std.testing.expectEqual(@as(usize, 3), input.preparations);
 }
 
+test "relational index system typed CHECK transport agrees with cold JSON null provenance" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "s", .path = "s", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var physical = try codec.PhysicalLayout.init(a, table);
+    defer physical.deinit();
+    const encoded = try codec.serializePreparedOrdinalDeferredHash(a, 1, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "null" } },
+        .{ .ordinal = 1, .path = "s", .is_json = true, .is_null = true, .value_type = .bytes_val, .value = .{ .bytes_val = "" } },
+    }, &physical);
+    defer a.free(encoded);
+    try codec.finalizeOrdinalMetadata(encoded, @splat(0), 0);
+    const cold = try codec.ordinalRowView(encoded, table, &physical);
+    const Run = struct {
+        fn run(backing: Allocator, row: codec.OrdinalRowView) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const owned = region.allocator();
+            const document = try std.json.parseFromSliceLeaky(std.json.Value, owned, "{\"j\":null,\"s\":null}", .{});
+            // Internal VM fixture only: public JSON compilation remains
+            // guarded until capability, literal identity and lowering activate.
+            var plans = [_]Plan{
+                .{ .arena = .init(backing), .nodes = &.{ .{ .op = .column, .kind = .json, .column_name = "j" }, .{ .op = .is_not_null, .kind = .boolean, .children = &.{0} } }, .dependencies = &.{0}, .fingerprint = @splat(0), .result_kind = .boolean, .literal_bytes = 0 },
+                .{ .arena = .init(backing), .nodes = &.{ .{ .op = .column, .kind = .json, .column_name = "s", .ordinal = 1 }, .{ .op = .is_null, .kind = .boolean, .children = &.{0} } }, .dependencies = &.{1}, .fingerprint = @splat(0), .result_kind = .boolean, .literal_bytes = 0 },
+            };
+            defer for (&plans) |*plan| plan.deinit();
+            // Borrow the pinned physical layout and plans; Set.deinit would
+            // incorrectly free these independently owned fixture resources.
+            const set: checks.Set = .{ .alloc = backing, .table = row.table_schema, .layout = row.layout.*, .definitions = &.{}, .plans = &plans };
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(owned, &bytes);
+            var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            nulls.initRegion(owned, bytes, &execution.numeric);
+            defer nulls.deinit();
+            try nulls.bindAdmission(&bytes);
+            try nulls.import(&.{"j"});
+            try std.testing.expectEqual(@as(?usize, null), try set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+            try std.testing.expectEqual(@as(?checks.Set.Failure, null), try set.firstFailureTypedJsonWithExecution(&execution, document, &nulls));
+            try std.testing.expectEqual(@as(?usize, null), try set.firstViolationRow(backing, row));
+            try std.testing.expectEqual(@as(?usize, 0), try set.firstViolationJsonWithExecution(&execution, document));
+            try nulls.import(&.{"s"});
+            try std.testing.expectEqual(@as(?usize, 1), try set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+            const failure = (try set.firstFailureTypedJsonWithExecution(&execution, document, &nulls)).?;
+            try std.testing.expectEqual(@as(usize, 1), failure.index);
+            var other_bytes: usize = max_allocated_bytes;
+            var other = Execution.init(owned, &other_bytes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, set.firstViolationTypedJsonWithExecution(&other, document, &nulls));
+            var foreign: @import("../sql/row_value.zig").JsonNulls = undefined;
+            foreign.initRegion(owned, bytes, &execution.numeric);
+            defer foreign.deinit();
+            try foreign.bindAdmission(&other_bytes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, set.firstViolationTypedJsonWithExecution(&execution, document, &foreign));
+            var limited_bytes: usize = 0;
+            var limited = Execution.init(owned, &limited_bytes);
+            var limited_nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+            limited_nulls.initRegion(owned, 0, &limited.numeric);
+            defer limited_nulls.deinit();
+            try limited_nulls.bindAdmission(&limited_bytes);
+            // Activation cannot persist a shared budget failure as a bad row.
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.firstFailureTypedJsonWithExecution(&limited, document, &limited_nulls));
+            limited_bytes = max_allocated_bytes;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.firstViolationTypedJsonWithExecution(&limited, document, &limited_nulls));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            execution.numeric.checkpoint = Cancel.poll;
+            execution.numeric.since_poll = 256;
+            try std.testing.expectError(error.Canceled, set.firstFailureTypedJsonWithExecution(&execution, document, &nulls));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, set.firstViolationTypedJsonWithExecution(&execution, document, &nulls));
+        }
+    };
+    try Run.run(a, cold);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{cold});
+}
+
 test "relational index system shared prepared input decodes cold JSON once and keeps cancellation sticky" {
     const a = std.testing.allocator;
     const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .relational_columns = &.{

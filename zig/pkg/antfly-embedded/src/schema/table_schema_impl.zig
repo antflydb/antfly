@@ -1120,9 +1120,9 @@ pub fn validateDocumentValueWithPlan(
     if (compiled == null and schema.storage_mode == .relational) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null);
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null, null);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null);
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null, null);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1144,7 +1144,7 @@ pub fn prepareDocumentValueWithPlan(
         try expressions.applyJsonWithExecution(&execution, value);
         try compiled.normalizeSql(&execution, value, false, .derived);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution, null);
 }
 
 /// Compatibility boundary for callers that cannot consume changed metadata.
@@ -1238,7 +1238,7 @@ pub fn prepareTypedDocumentWithNulls(owned_alloc: std.mem.Allocator, scratch: st
         if (compiled.expressions) |expressions|
             try expressions.verifyTypedJsonWithExecution(&execution, value.*, names);
     }
-    try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution);
+    try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution, &nulls);
     var output_bytes = std.math.mul(usize, names.len, @sizeOf([]const u8)) catch return execution.limit();
     for (names) |name| output_bytes = std.math.add(usize, output_bytes, name.len) catch return execution.limit();
     if (output_bytes > budget) return execution.limit();
@@ -1267,6 +1267,10 @@ fn validateDocumentValueInternal(
     // assertion on restore or public validation. Expressions have already run.
     sql_admitted: bool,
     shared_execution: ?*@import("relational_expression.zig").Execution,
+    // Only typed preparation supplies this schema-authenticated owner. Keep
+    // its identity and allowance through CHECKs; pointers alone only authorize
+    // recursive property validation and cannot recreate SQL null provenance.
+    json_null_owner: ?*@import("../sql/row_value.zig").JsonNulls,
 ) !void {
     if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
@@ -1373,11 +1377,19 @@ fn validateDocumentValueInternal(
     }
     if (schema.checks) |checks| if (checks.value.len != 0) {
         if (compiled) |plan| {
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         } else {
             var plan = try CompiledValidationPlan.init(alloc, schema);
             defer plan.deinit(alloc);
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         }
     };
 }
@@ -3273,7 +3285,7 @@ test "relational declarations validation shares one allowance across NUMERIC con
     defer document.deinit();
     var budget: usize = expressions.max_allocated_bytes;
     var row = expressions.Execution.init(a, &budget);
-    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row);
+    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null);
     const used = 8 * 1024 * 1024 - row.numeric.remaining;
     try std.testing.expect(used > 1);
     try std.testing.expect(budget < expressions.max_allocated_bytes - @sizeOf(@import("numeric_constraints.zig").Execution));
@@ -3282,9 +3294,9 @@ test "relational declarations validation shares one allowance across NUMERIC con
     budget = expressions.max_allocated_bytes;
     row = expressions.Execution.init(a, &budget);
     row.numeric.remaining = used - 1;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
     row.numeric.remaining = 8 * 1024 * 1024;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
 }
 
 test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {
