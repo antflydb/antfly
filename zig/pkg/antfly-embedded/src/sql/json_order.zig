@@ -21,9 +21,17 @@ const Json = std.json.Value;
 const Order = std.math.Order;
 /// Validate nesting before a dynamic JSON tree is constructed. The scanner
 /// owns only a bounded nesting stack; strings and numeric tokens are borrowed.
-pub fn admitText(a: std.mem.Allocator, text: []const u8, budget: *Budget) !void {
+pub fn admitText(text: []const u8, budget: *Budget) !void {
     try budget.consume(text.len);
-    var scanner = std.json.Scanner.initCompleteInput(a, text);
+    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlInvalidTextEncoding;
+    // Sixty-four admitted levels plus one overflow bit. Preflight must not
+    // allocate a dynamic stack (or any DOM) for an invalid input.
+    var stack: [9]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&stack);
+    const owned = fixed.allocator().alloc(u8, stack.len) catch unreachable;
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), text);
+    scanner.stack.bytes = std.array_list.Managed(u8).fromOwnedSlice(fixed.allocator(), owned);
+    scanner.stack.bytes.items.len = 0;
     defer scanner.deinit();
     var depth: usize = 0;
     while (true) {
@@ -33,6 +41,12 @@ pub fn admitText(a: std.mem.Allocator, text: []const u8, budget: *Budget) !void 
         };
         try budget.consume(1);
         switch (token) {
+            .number => |raw| _ = try @import("jsonb_number.zig").Layout.init(raw, budget),
+            .string, .partial_string => |raw| try validateJsonbString(raw, budget),
+            .partial_string_escaped_1 => |raw| try validateJsonbString(&raw, budget),
+            .partial_string_escaped_2 => |raw| try validateJsonbString(&raw, budget),
+            .partial_string_escaped_3 => |raw| try validateJsonbString(&raw, budget),
+            .partial_string_escaped_4 => |raw| try validateJsonbString(&raw, budget),
             .object_begin, .array_begin => {
                 depth += 1;
                 if (depth > 64) return error.SqlProgramLimitExceeded;
@@ -88,6 +102,36 @@ pub const Budget = struct {
     }
 };
 
+/// Admit already materialized JSONB once at its typed ownership boundary.
+/// Generic document JSON and semantic JSON-number hashing remain unrestricted
+/// by PostgreSQL's JSONB numeric limits.
+pub fn validateJsonbDomain(value: Json, budget: *Budget, depth: usize) !void {
+    try budget.consume(1);
+    if (depth > 64) return if (budget.shared) |context| context.limit() else error.SqlProgramLimitExceeded;
+    switch (value) {
+        .string => |raw| try validateJsonbString(raw, budget),
+        .number_string => |raw| _ = try @import("jsonb_number.zig").Layout.init(raw, budget),
+        .float => |number| if (!std.math.isFinite(number)) return error.SqlTypeMismatch,
+        .array => |items| for (items.items) |item| try validateJsonbDomain(item, budget, depth + 1),
+        .object => |items| for (items.keys(), items.values()) |key, item| {
+            try validateJsonbString(key, budget);
+            try validateJsonbDomain(item, budget, depth + 1);
+        },
+        else => {},
+    }
+}
+
+fn validateJsonbString(text: []const u8, budget: *Budget) !void {
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const end = offset + @min(text.len - offset, 256);
+        try budget.consume(end - offset);
+        if (std.mem.indexOfScalar(u8, text[offset..end], 0) != null) return error.SqlJsonUnicodeEscape;
+        offset = end;
+    }
+    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
+}
+
 /// PostgreSQL JSONB strings and object keys obey the text domain recursively.
 /// Share this allocation-free walk between arrays, native ingress and restore.
 pub fn validateTextDomain(value: Json, budget: *Budget, depth: usize) !void {
@@ -114,36 +158,36 @@ fn validateText(text: []const u8, budget: *Budget) !void {
 /// The caller owns the allocation region and its byte admission. All retained
 /// tokens own their bytes, including exact decimal tokens and escaped strings.
 pub fn parseTextLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget) !Json {
-    try admitText(a, text, budget);
-    return std.json.parseFromSliceLeaky(Json, a, text, .{ .allocate = .alloc_always, .parse_numbers = false, .max_value_len = text.len }) catch |err| return switch (err) {
-        error.OutOfMemory => err,
-        else => error.SqlInvalidTextRepresentation,
-    };
+    try admitText(text, budget);
+    return parseTreeLeaky(a, text, budget, true);
 }
 
 /// Temporary structural comparison may borrow unescaped tokens from a pinned
 /// immutable input. The input and allocator must both outlive the returned
 /// tree; unlike parseTextLeaky this is not independently owned decoded data.
 pub fn parsePinnedTextLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget) !Json {
-    try admitText(a, text, budget);
-    // std.json.Value.jsonParse requests alloc_always regardless of the
-    // caller option. Keep standard scanner syntax/UTF-8/escape validation,
-    // but assemble this temporary tree from its explicitly borrowed tokens.
+    try admitText(text, budget);
+    return parseTreeLeaky(a, text, budget, false);
+}
+
+fn parseTreeLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget, owned: bool) !Json {
+    // One cooperative assembler supplies both lifetime policies. Owned mode
+    // copies tokens; pinned mode borrows unescaped immutable source slices.
     var scanner = std.json.Scanner.initCompleteInput(a, text);
     defer scanner.deinit();
-    const value = try pinnedNode(a, &scanner, budget, text.len, try pinnedNext(a, &scanner, text.len), 0);
-    if (try pinnedNext(a, &scanner, text.len) != .end_of_document) return error.SqlInvalidTextRepresentation;
+    const value = try parseNode(a, &scanner, budget, text.len, try nextToken(a, &scanner, text.len, owned), 0, owned);
+    if (try nextToken(a, &scanner, text.len, owned) != .end_of_document) return error.SqlInvalidTextRepresentation;
     return value;
 }
 
-fn pinnedNext(a: std.mem.Allocator, scanner: *std.json.Scanner, max_len: usize) !std.json.Token {
-    return scanner.nextAllocMax(a, .alloc_if_needed, max_len) catch |err| return switch (err) {
+fn nextToken(a: std.mem.Allocator, scanner: *std.json.Scanner, max_len: usize, owned: bool) !std.json.Token {
+    return scanner.nextAllocMax(a, if (owned) .alloc_always else .alloc_if_needed, max_len) catch |err| return switch (err) {
         error.OutOfMemory => err,
         else => error.SqlInvalidTextRepresentation,
     };
 }
 
-fn pinnedNode(a: std.mem.Allocator, scanner: *std.json.Scanner, budget: *Budget, max_len: usize, token: std.json.Token, depth: usize) anyerror!Json {
+fn parseNode(a: std.mem.Allocator, scanner: *std.json.Scanner, budget: *Budget, max_len: usize, token: std.json.Token, depth: usize, owned: bool) anyerror!Json {
     try budget.consume(1);
     if (depth > 64) return if (budget.shared) |context| context.limit() else error.SqlProgramLimitExceeded;
     return switch (token) {
@@ -155,9 +199,9 @@ fn pinnedNode(a: std.mem.Allocator, scanner: *std.json.Scanner, budget: *Budget,
         .array_begin => value: {
             var items = std.json.Array.init(a);
             while (true) {
-                const next = try pinnedNext(a, scanner, max_len);
+                const next = try nextToken(a, scanner, max_len, owned);
                 if (next == .array_end) break;
-                try items.append(try pinnedNode(a, scanner, budget, max_len, next, depth + 1));
+                try items.append(try parseNode(a, scanner, budget, max_len, next, depth + 1, owned));
             }
             break :value .{ .array = items };
         },
@@ -165,14 +209,13 @@ fn pinnedNode(a: std.mem.Allocator, scanner: *std.json.Scanner, budget: *Budget,
             var items: std.json.ObjectMap = .empty;
             while (true) {
                 try budget.consume(1);
-                const next = try pinnedNext(a, scanner, max_len);
+                const next = try nextToken(a, scanner, max_len, owned);
                 if (next == .object_end) break;
                 const key = switch (next) {
                     .string, .allocated_string => |text| text,
                     else => return error.SqlInvalidTextRepresentation,
                 };
-                if (items.contains(key)) return error.SqlInvalidTextRepresentation;
-                const child = try pinnedNode(a, scanner, budget, max_len, try pinnedNext(a, scanner, max_len), depth + 1);
+                const child = try parseNode(a, scanner, budget, max_len, try nextToken(a, scanner, max_len, owned), depth + 1, owned);
                 try items.put(a, key, child);
             }
             break :value .{ .object = items };
@@ -181,23 +224,240 @@ fn pinnedNode(a: std.mem.Allocator, scanner: *std.json.Scanner, budget: *Budget,
     };
 }
 
+const DomainReference = struct {
+    entries: []const struct {
+        input: []const u8,
+        @"error": ?[]const u8 = null,
+        kind: ?[]const u8 = null,
+        length: ?usize = null,
+        md5: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+    },
+    binary_errors: []const struct { binary: []const u8, @"error": []const u8 },
+};
+
+fn domainArrayBinary(a: std.mem.Allocator, input: []const u8) ![]u8 {
+    const bytes = try a.alloc(u8, 25 + input.len);
+    std.mem.writeInt(i32, bytes[0..4], 1, .big);
+    std.mem.writeInt(i32, bytes[4..8], 0, .big);
+    std.mem.writeInt(u32, bytes[8..12], 3802, .big);
+    std.mem.writeInt(i32, bytes[12..16], 1, .big);
+    std.mem.writeInt(i32, bytes[16..20], 1, .big);
+    std.mem.writeInt(i32, bytes[20..24], @intCast(input.len + 1), .big);
+    bytes[24] = 1;
+    @memcpy(bytes[25..], input);
+    return bytes;
+}
+
+fn domainArrayText(a: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"");
+    for (input) |byte| {
+        if (byte == '"' or byte == '\\') try out.writer.writeByte('\\');
+        try out.writer.writeByte(byte);
+    }
+    try out.writer.writeAll("\"}");
+    return out.toOwnedSlice();
+}
+
+test "SQL JSONB domain matches PostgreSQL owned pinned scalar and array admission" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(DomainReference, a, @embedFile("fixtures/sql_jsonb_domain_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 22), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        const binary = try domainArrayBinary(a, entry.input);
+        defer a.free(binary);
+        const text = try domainArrayText(a, entry.input);
+        defer a.free(text);
+        for (0..5) |mode| {
+            var memory: @import("memory_budget.zig") = .{ .backing = a, .limit = 4096 };
+            var region: std.heap.ArenaAllocator = .init(memory.allocator());
+            defer region.deinit();
+            const r = region.allocator();
+            var work: Budget = .{ .remaining = 4096 };
+            var frame: ?@import("parameter_frame.zig").Frame = null;
+            defer if (frame) |*owned| owned.deinit();
+            const result: anyerror!Json = switch (mode) {
+                0 => parseTextLeaky(r, entry.input, &work),
+                1 => parsePinnedTextLeaky(r, entry.input, &work),
+                2 => if (@import("array_text.zig").decodeLeaky(r, .jsonb, text, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
+                3 => if (@import("array_binary.zig").decodeLeaky(r, .jsonb, binary, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
+                4 => value: {
+                    frame = @import("parameter_frame.zig").Frame.prepare(a, &.{.{ .kind = .json, .element_type = .jsonb }}, &.{.{ .text = entry.input }}, .{ .bytes = 4096, .work = 4096 }) catch |err| break :value err;
+                    try std.testing.expect(!frame.?.values[0].sql_null);
+                    break :value frame.?.values[0].value;
+                },
+                else => unreachable,
+            };
+            if (entry.@"error") |code| {
+                if (result) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(code, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            const value = try result;
+            try std.testing.expect(memory.peak <= 4096);
+            work = .{};
+            const display = try @import("jsonb_text.zig").format(a, value, 256 * 1024, &work);
+            defer a.free(display);
+            try std.testing.expectEqual(entry.length.?, try std.unicode.utf8CountCodepoints(display));
+            var digest: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(display, &digest, .{});
+            try std.testing.expectEqualStrings(entry.md5.?, &std.fmt.bytesToHex(digest, .lower));
+            if (entry.text) |expected| try std.testing.expectEqualStrings(expected, display);
+        }
+    }
+    for (fixture.value.binary_errors) |entry| {
+        const bytes = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(bytes);
+        _ = try std.fmt.hexToBytes(bytes, entry.binary);
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        var work: Budget = .{};
+        if (@import("array_binary.zig").decodeElementLeaky(region.allocator(), .jsonb, bytes, &work)) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(entry.@"error", @import("errors.zig").describe(err).code);
+    }
+}
+
+test "SQL JSONB domain admits non-rendered large parameters without exponent expansion" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |array| {
+        const statement = if (array) "cardinality($1)" else "jsonb_typeof($1)";
+        const descriptor: @import("scalar.zig").Type = .{ .kind = if (array) .array else .json, .element_type = .jsonb };
+        var compiled = try @import("compiler.zig").compileScalar(a, statement, .{});
+        defer compiled.deinit();
+        var program = try @import("scalar.zig").bindTyped(a, compiled.expression, &.{}, &.{descriptor}, .{});
+        defer program.deinit();
+        var frame = try @import("parameter_frame.zig").Frame.prepare(a, program.parameter_descriptors, &.{.{ .text = if (array) "{1e131071}" else "1e131071" }}, .{ .bytes = 4096, .work = 512 });
+        defer frame.deinit();
+        try std.testing.expect(frame.budget.peak <= 4096);
+        const bound = try program.bindParameters(&frame);
+        const result = try bound.evaluate(std.mem.Allocator.failing, &.{}, .{ .steps = 512 });
+        if (array) try std.testing.expectEqual(@as(i64, 1), result.value.integer) else try std.testing.expectEqualStrings("number", result.value.string);
+        try std.testing.expectError(error.SqlNumericOutOfRange, @import("parameter_frame.zig").Frame.prepare(a, program.parameter_descriptors, &.{.{ .text = if (array) "{1e131072}" else "1e131072" }}, .{ .bytes = 4096, .work = 512 }));
+    }
+}
+
+test "SQL JSONB domain validates discarded duplicate values before allocating a DOM" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"k\":1e131072,\"k\":2}", "{\"k\":\"\\u0000\",\"k\":2}" }) |input| {
+        var memory: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 };
+        var work: Budget = .{};
+        const expected = if (std.mem.indexOf(u8, input, "131072") != null) error.SqlNumericOutOfRange else error.SqlJsonUnicodeEscape;
+        try std.testing.expectError(expected, parseTextLeaky(memory.allocator(), input, &work));
+        try std.testing.expect(memory.peak <= 128);
+        try std.testing.expectEqual(@as(usize, 0), memory.live);
+    }
+    var work: Budget = .{ .remaining = 64 };
+    try std.testing.expectError(error.SqlNumericOutOfRange, parseTextLeaky(std.mem.Allocator.failing, "1e131072", &work));
+    work = .{ .remaining = 64 };
+    try validateJsonbDomain(.{ .number_string = "1e131071" }, &work, 0);
+    try std.testing.expect(work.remaining > 32);
+    const document = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(a, .{ .number_string = "1e999999999999999999999" });
+    defer a.free(document);
+    try std.testing.expectEqualStrings("1e999999999999999999999", document);
+}
+
+test "SQL JSONB domain parser preserves lifetimes and every allocation failure" {
+    const a = std.testing.allocator;
+    const input = "{\"k\":[\"old\",1],\"\\u006b\":{\"text\":\"line\\ntext\",\"n\":1.20}}";
+    const Faults = struct {
+        fn run(alloc: std.mem.Allocator, pinned: bool) !void {
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            var work: Budget = .{};
+            const value = if (pinned) try parsePinnedTextLeaky(region.allocator(), input, &work) else try parseTextLeaky(region.allocator(), input, &work);
+            try std.testing.expectEqual(@as(usize, 1), value.object.count());
+            try std.testing.expectEqualStrings("1.20", value.object.get("k").?.object.get("n").?.number_string);
+        }
+    };
+    var deterministic = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    for ([_]bool{ false, true }) |pinned| try std.testing.checkAllAllocationFailures(deterministic.allocator(), Faults.run, .{pinned});
+    const copied = try a.dupe(u8, input);
+    defer a.free(copied);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var work: Budget = .{};
+    var value = try parseTextLeaky(region.allocator(), copied, &work);
+    @memset(copied, 0);
+    try std.testing.expectEqualStrings("line\ntext", value.object.get("k").?.object.get("text").?.string);
+    try std.testing.expectEqualStrings("1.20", value.object.get("k").?.object.get("n").?.number_string);
+    try value.object.getPtr("k").?.object.put(region.allocator(), "after", .{ .bool = true });
+}
+
+test "SQL JSONB domain cancellation is sticky through lexical and DOM phases" {
+    const a = std.testing.allocator;
+    const source = "[{\"n\":1.20,\"v\":[\"a\",\"b\"]},{\"n\":2.00,\"v\":[\"c\",\"d\"]}]";
+    const Counter = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        fn poll(ptr: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == self.stop) return error.QueryCanceled;
+        }
+    };
+    // Repeat enough nodes to checkpoint during DOM assembly, not only the
+    // lexical pass. Source construction is outside the measured region.
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    defer encoded.deinit();
+    try encoded.writer.writeByte('[');
+    for (0..32) |i| {
+        if (i != 0) try encoded.writer.writeByte(',');
+        try encoded.writer.writeAll(source);
+    }
+    try encoded.writer.writeByte(']');
+    for ([_]bool{ false, true }) |pinned| {
+        var counter: Counter = .{};
+        var owner: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Counter.poll, .ptr = &counter };
+        var work: Budget = .{ .shared = &owner };
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        if (pinned) _ = try parsePinnedTextLeaky(region.allocator(), encoded.written(), &work) else _ = try parseTextLeaky(region.allocator(), encoded.written(), &work);
+        try std.testing.expect(counter.calls > 4);
+        for (1..counter.calls + 1) |stop| {
+            var failed: Counter = .{ .stop = stop };
+            owner = .{ .alloc = a, .checkpoint = Counter.poll, .ptr = &failed };
+            work = .{ .shared = &owner };
+            var temporary = std.heap.ArenaAllocator.init(a);
+            defer temporary.deinit();
+            if (pinned) try std.testing.expectError(error.QueryCanceled, parsePinnedTextLeaky(temporary.allocator(), encoded.written(), &work)) else try std.testing.expectError(error.QueryCanceled, parseTextLeaky(temporary.allocator(), encoded.written(), &work));
+            try std.testing.expect(owner.failure.? == error.QueryCanceled);
+            const remaining = owner.remaining;
+            try std.testing.expectError(error.QueryCanceled, parseTextLeaky(std.mem.Allocator.failing, "1", &work));
+            try std.testing.expectEqual(remaining, owner.remaining);
+        }
+    }
+    var limited: @import("numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
+    var work: Budget = .{ .shared = &limited };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parseTextLeaky(std.mem.Allocator.failing, "1.20", &work));
+    try std.testing.expect(limited.failure.? == error.SqlProgramLimitExceeded);
+    var genuine: @import("numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing };
+    work = .{ .shared = &genuine };
+    try std.testing.expectError(error.OutOfMemory, parseTextLeaky(std.mem.Allocator.failing, "[1]", &work));
+    try std.testing.expect(genuine.failure == null);
+}
+
 test "SQL pinned JSON structural parsing preserves borrowed tokens escapes and strict syntax" {
     const a = std.testing.allocator;
     const inputs = [_][]const u8{
-        "null",      "true",            "false",                                      "[]", "{}", "9007199254740993.000", "-1e1000",
-        "\"plain\"", "\"line\\ntext\"", "{\"\\u0078\":[1,null,true,{},[\"a\\tb\"]]}",
+        "{\"x\":1,\"x\":2}", "{\"k\":1,\"\\u006b\":1.20}",
+        "null",              "true",
+        "false",             "[]",
+        "{}",                "9007199254740993.000",
+        "-1e1000",           "\"plain\"",
+        "\"line\\ntext\"",   "{\"\\u0078\":[1,null,true,{},[\"a\\tb\"]]}",
     };
     for (inputs) |input| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var work: Budget = .{};
         const pinned = try parsePinnedTextLeaky(arena.allocator(), input, &work);
-        var owned = try std.json.parseFromSlice(Json, a, input, .{ .parse_numbers = false });
+        var owned = try std.json.parseFromSlice(Json, a, input, .{ .parse_numbers = false, .duplicate_field_behavior = .use_last });
         defer owned.deinit();
         try std.testing.expectEqual(Order.eq, try compare(pinned, owned.value, &work, 0));
         if (std.mem.eql(u8, input, "\"plain\"")) try std.testing.expectEqual(@intFromPtr(input.ptr + 1), @intFromPtr(pinned.string.ptr));
     }
-    for ([_][]const u8{ "{", "[] true", "{\"x\":1,\"x\":2}", "[1,]", "1e", "\"bad\\xescape\"" }) |input| {
+    for ([_][]const u8{ "{", "[] true", "[1,]", "1e", "\"bad\\xescape\"" }) |input| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var work: Budget = .{};
@@ -243,9 +503,9 @@ test "JSON text admission bounds nesting before DOM allocation and unwinds fault
     defer arena.deinit();
     _ = try parseTextLeaky(arena.allocator(), nested[1..130], &budget);
     budget = .{ .remaining = 1 };
-    try std.testing.expectError(error.SqlProgramLimitExceeded, admitText(a, "[0]", &budget));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, admitText("[0]", &budget));
     budget = .{};
-    try std.testing.expectError(error.SqlInvalidTextRepresentation, admitText(a, "[0,]", &budget));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, admitText("[0,]", &budget));
     const Faults = struct {
         fn run(backing: std.mem.Allocator) !void {
             var region = std.heap.ArenaAllocator.init(backing);

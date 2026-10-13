@@ -137,7 +137,6 @@ pub const JsonRow = struct {
         if (bytes.len > self.context.max_input_bytes) return self.context.limit();
         var work: json_order.Budget = .{ .shared = self.context };
         const value = json_order.parsePinnedTextLeaky(self.arena.allocator(), bytes, &work) catch |err| return self.failure(err);
-        json_order.validateTextDomain(value, &work, 0) catch |err| return self.failure(err);
         const json = self.arena.allocator().create(Json) catch |err| return self.failure(err);
         json.* = .{ .value = value };
         self.entries.put(self.arena.allocator(), ordinal, .{ .bytes = bytes, .json = json }) catch |err| return self.failure(err);
@@ -153,7 +152,7 @@ pub const JsonRow = struct {
         if (self.admission) |*admission| admission.begin();
         defer if (self.admission) |*admission| admission.finish();
         var work: json_order.Budget = .{ .shared = self.context };
-        json_order.validateTextDomain(value, &work, 0) catch |err| return self.failure(err);
+        json_order.validateJsonbDomain(value, &work, 0) catch |err| return self.failure(err);
         const root = self.arena.allocator().create(Json) catch |err| return self.failure(err);
         root.* = .{ .value = value };
         return root;
@@ -324,7 +323,7 @@ test "SQL JSON pinned DOM roots own headers without reparsing or cloning admitte
     try std.testing.expectEqual(@as(usize, 0), owner.decodes);
     try std.testing.expectEqual(@as(usize, 1024 * 1024) - bytes, owner.memory.footprint());
     const retained = owner.memory.footprint();
-    try std.testing.expectError(error.SqlTypeMismatch, owner.pinValue(.{ .string = "\x00" }));
+    try std.testing.expectError(error.SqlJsonUnicodeEscape, owner.pinValue(.{ .string = "\x00" }));
     try std.testing.expectEqual(retained, owner.memory.footprint());
     const Run = struct {
         fn run(alloc: std.mem.Allocator, source: std.json.Value) !void {
@@ -676,18 +675,24 @@ test "SQL row values JSON cache retains cancellation and rejects malformed sourc
         try std.testing.expectError(error.QueryCanceled, row.resetRow());
         try std.testing.expectEqual(@as(usize, 0), row.entries.count());
     }
-    for ([_][]const u8{ "{", "[1,]", "{\"x\":1,\"x\":2}", "\"\\u0000\"", "\"bad\\xescape\"" }) |invalid| {
+    for ([_][]const u8{ "{", "[1,]", "\"\\u0000\"", "\"bad\\xescape\"" }) |invalid| {
         var fresh: Context = .{ .alloc = a };
         var row: JsonRow = undefined;
         row.init(a, 1024 * 1024, &fresh);
         defer row.deinit();
         _ = row.decodePinned(1, invalid) catch |err| {
-            try std.testing.expect(err == error.SqlInvalidTextRepresentation or err == error.SqlTypeMismatch);
+            try std.testing.expect(err == error.SqlInvalidTextRepresentation or err == error.SqlJsonUnicodeEscape);
             try std.testing.expectEqual(@as(usize, 0), row.entries.count());
             continue;
         };
         return error.TestExpectedError;
     }
+    var duplicate_context: Context = .{ .alloc = a };
+    var duplicate_row: JsonRow = undefined;
+    duplicate_row.init(a, 1024 * 1024, &duplicate_context);
+    defer duplicate_row.deinit();
+    const duplicate = try duplicate_row.decodePinned(1, "{\"x\":1,\"x\":2}");
+    try std.testing.expectEqualStrings("2", duplicate.value.object.get("x").?.number_string);
     var fresh: Context = .{ .alloc = a, .max_input_bytes = 1 };
     var row: JsonRow = undefined;
     row.init(a, 1024 * 1024, &fresh);

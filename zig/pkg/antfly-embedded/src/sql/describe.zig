@@ -860,12 +860,8 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
         // Admit nesting before constructing the tree: otherwise a 1 MiB SQL
         // string of brackets could allocate a huge dynamic JSON value before
         // the later copy's depth guard gets a chance to reject it.
-        try admitJsonLiteral(allocator, node.string);
-        const parsed = std.json.parseFromSliceLeaky(Json, allocator, node.string, .{ .parse_numbers = false, .allocate = .alloc_always }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SqlTypeMismatch,
-        };
-        return parsed;
+        var work: @import("json_order.zig").Budget = .{};
+        return @import("json_order.zig").parseTextLeaky(allocator, node.string, &work);
     }
     return coerce(switch (node) {
         .null => .null,
@@ -876,14 +872,6 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
         .string => |value_| .{ .string = value_ },
         .parameter => unreachable,
     }, kind);
-}
-
-fn admitJsonLiteral(allocator: std.mem.Allocator, text: []const u8) !void {
-    var work: @import("json_order.zig").Budget = .{};
-    @import("json_order.zig").admitText(allocator, text, &work) catch |err| return switch (err) {
-        error.OutOfMemory, error.SqlProgramLimitExceeded => err,
-        else => error.SqlTypeMismatch,
-    };
 }
 
 /// Output aliases have SQL precedence over source columns in ORDER BY.
@@ -1360,7 +1348,7 @@ test "SQL JSON literal coercion preserves exact number text and typed parameters
     try std.testing.expectEqualStrings("plain text", scalar.string);
     const typed_parameter = try coerce(.{ .string = "{}" }, .json);
     try std.testing.expect(typed_parameter == .string);
-    try std.testing.expectError(error.SqlTypeMismatch, bindLiteral(arena.allocator(), .{ .string = "not JSON" }, .json));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, bindLiteral(arena.allocator(), .{ .string = "not JSON" }, .json));
     try std.testing.expect((try bindLiteral(arena.allocator(), .{ .string = "null" }, .json)) == .null);
     try std.testing.expect((try bindLiteral(arena.allocator(), .null, .json)) == .null);
     const nested_null = try bindLiteral(arena.allocator(), .{ .string = "{\"n\":null}" }, .json);

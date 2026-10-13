@@ -169,11 +169,9 @@ pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, wor
         .boolean => .{ .bool = bytes[0] != 0 },
         .uuid => .{ .string = try a.dupe(u8, &uuid.format(bytes[0..16].*)) },
         .jsonb => blk: {
-            if (bytes.len < 2 or bytes[0] != 1) return error.InvalidSqlBinaryRepresentation;
-            break :blk @import("json_order.zig").parseTextLeaky(a, bytes[1..], work) catch |err| return switch (err) {
-                error.OutOfMemory, error.SqlProgramLimitExceeded => err,
-                else => if (work.shared) |context| context.failure orelse error.InvalidSqlBinaryRepresentation else error.InvalidSqlBinaryRepresentation,
-            };
+            if (bytes.len == 0) return error.SqlProtocolViolation;
+            if (bytes[0] != 1) return error.SqlJsonbUnsupportedVersion;
+            break :blk try @import("json_order.zig").parseTextLeaky(a, bytes[1..], work);
         },
     });
 }

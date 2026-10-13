@@ -410,7 +410,6 @@ fn dupeBytes(a: A, bytes: []const u8, work: *arrays.Budget) ![]u8 {
 
 fn decodeJsonb(a: A, owner: A, bytes: []const u8, work: *arrays.Budget) !std.json.Value {
     var value = try json_order.parseTextLeaky(a, bytes, work);
-    try json_order.validateTextDomain(value, work, 0);
     if (!try canonical_json.canonicalJsonbValueMatches(a, value, bytes, work)) return error.NonCanonicalSqlArrayStorage;
     try json_order.rehomeArrayAllocators(&value, owner, work, 0);
     return value;
@@ -669,7 +668,7 @@ fn rawVariableFrame(a: A, kind: arrays.ElementType, text: []const u8) ![]u8 {
 
 test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes without repairing them" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ " 1", "1e0", "{\"b\":1,\"a\":2}", "[1, 2]", "\"\\u0061\"" }) |text| {
+    for ([_][]const u8{ " 1", "1e0", "{\"b\":1,\"a\":2}", "{\"x\":1,\"x\":2}", "[1, 2]", "\"\\u0061\"" }) |text| {
         const bytes = try rawJsonbFrame(a, text);
         defer a.free(bytes);
         _ = try layout.View.open(.jsonb, bytes, .{}); // Directory integrity is insufficient.
@@ -678,7 +677,7 @@ test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes 
     }
     const invalid_text = try rawJsonbFrame(a, "{\"nested\":[\"a\\u0000b\"]}");
     defer a.free(invalid_text);
-    try std.testing.expectError(error.SqlTypeMismatch, validateCanonical(a, .jsonb, invalid_text, .{}));
+    try std.testing.expectError(error.SqlJsonUnicodeEscape, validateCanonical(a, .jsonb, invalid_text, .{}));
     const syntax = try rawJsonbFrame(a, "invalid");
     defer a.free(syntax);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, validateCanonical(a, .jsonb, syntax, .{}));

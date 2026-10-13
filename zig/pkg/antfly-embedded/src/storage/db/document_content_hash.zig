@@ -393,7 +393,7 @@ pub fn canonicalJsonStorageValueAlloc(alloc: std.mem.Allocator, value: std.json.
     return canonicalJsonEncodedValueAlloc(memory.allocator(), value, true) catch |err| return switch (err) {
         error.OutOfMemory => if (memory.isExhausted()) error.RelationalRowResultTooLarge else err,
         error.SqlProgramLimitExceeded => error.RelationalRowResultTooLarge,
-        error.SqlTypeMismatch, error.SqlNumericOutOfRange => error.InvalidBatchRequest,
+        error.SqlTypeMismatch, error.SqlNumericOutOfRange, error.SqlInvalidTextRepresentation, error.SqlJsonUnicodeEscape, error.SqlInvalidTextEncoding => error.InvalidBatchRequest,
         else => err,
     };
 }

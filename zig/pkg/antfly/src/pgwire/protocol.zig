@@ -167,7 +167,7 @@ pub const Session = struct {
         self.setDeadline(self.limits.startup_timeout_ms);
         const started = self.startup() catch |err| {
             if (err == error.Canceled) return err;
-            if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
+            if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), sqlMessage(err));
             try self.writer.flush();
             return err;
         };
@@ -214,7 +214,7 @@ pub const Session = struct {
                 }
                 if (self.status == .idle) self.finishSqlCursors(false);
                 if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
-                if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
+                if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), sqlMessage(err));
                 if (tag == 'Q') try self.ready();
             };
             try self.writer.flush();
@@ -1776,6 +1776,13 @@ test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
     try std.testing.expectEqualStrings("42804", sqlstate(error.SqlBinaryTypeMismatch));
     try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
     try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
+    try std.testing.expectEqualStrings("22P05", sqlstate(error.SqlJsonUnicodeEscape));
+    try std.testing.expectEqualStrings("08P01", sqlstate(error.SqlProtocolViolation));
+    try std.testing.expectEqualStrings("XX000", sqlstate(error.SqlJsonbUnsupportedVersion));
+    try std.testing.expectEqualStrings("53200", sqlstate(error.OutOfMemory));
+    try std.testing.expectEqualStrings("54000", sqlstate(error.SqlProgramLimitExceeded));
+    try std.testing.expect(std.mem.indexOf(u8, sqlMessage(error.SqlJsonUnicodeEscape), "SqlJsonUnicodeEscape") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlMessage(error.InvalidParameter), "InvalidParameter") == null);
     try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
 }
 
@@ -1789,7 +1796,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
-        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch => @import("antfly_local_sources").sql_errors.describe(err).code,
+        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch, error.SqlJsonUnicodeEscape, error.SqlProtocolViolation, error.SqlJsonbUnsupportedVersion => @import("antfly_local_sources").sql_errors.describe(err).code,
         error.SqlNumericOutOfRange => "22003",
         error.SqlInvalidTextEncoding => "22021",
         error.SqlArraySubscriptError => "2202E",
@@ -1802,7 +1809,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.DuplicatePortal => "42P03",
         error.DuplicateCursorName => "42P03",
         error.ProtocolViolation => "08P01",
-        error.OutOfMemory, error.ProgramLimitExceeded => "54000",
+        error.OutOfMemory => "53200",
+        error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
@@ -1829,4 +1837,16 @@ fn sqlstate(err: anyerror) []const u8 {
         error.CachedPlanResultTypeChanged, error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
         else => "XX000",
     };
+}
+
+fn sqlMessage(err: anyerror) []const u8 {
+    const diagnostic = @import("antfly_local_sources").sql_errors.describe(err);
+    const code = sqlstate(err);
+    if (std.mem.eql(u8, diagnostic.code, code)) return diagnostic.message;
+    if (std.mem.eql(u8, code, "08P01")) return "The PostgreSQL protocol message is incomplete or malformed.";
+    if (std.mem.eql(u8, code, "22P02")) return "A parameter payload has invalid PostgreSQL input syntax.";
+    if (std.mem.eql(u8, code, "57014")) return "The query was cancelled.";
+    if (std.mem.eql(u8, code, "0A000")) return "The request requires an unsupported PostgreSQL protocol feature.";
+    if (std.mem.startsWith(u8, code, "28")) return "PostgreSQL authentication failed.";
+    return "The PostgreSQL protocol request could not be completed.";
 }

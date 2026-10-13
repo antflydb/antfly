@@ -2346,7 +2346,10 @@ const JsonLiteral = struct { value: Value, encoded_bytes: usize, fingerprint: [3
 fn prepareJsonLiteral(execution: *Execution, value: std.json.Value) !JsonLiteral {
     const order = @import("../sql/json_order.zig");
     var work: order.Budget = .{ .shared = &execution.numeric };
-    order.validateTextDomain(value, &work, 0) catch |err| return if (err == error.SqlTypeMismatch) error.InvalidRelationalExpressionType else executionFailure(err);
+    order.validateJsonbDomain(value, &work, 0) catch |err| return switch (err) {
+        error.SqlTypeMismatch, error.SqlInvalidTextRepresentation, error.SqlNumericOutOfRange, error.SqlJsonUnicodeEscape, error.SqlInvalidTextEncoding => error.InvalidRelationalExpressionType,
+        else => executionFailure(err),
+    };
     const identity = blk: {
         var scratch: ExecutionScratch = undefined;
         scratch.init(execution);

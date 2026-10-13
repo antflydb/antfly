@@ -191,6 +191,15 @@ pub fn typeSize(kind: Type) i16 {
 pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !std.json.Value {
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (param_oid == 3802) {
+        const sources = @import("antfly_local_sources");
+        var work: sources.sql_array_value.Budget = .{};
+        const datum = if (format == 0)
+            try sources.sql_array_text.decodeElementLeaky(alloc, .jsonb, bytes, &work)
+        else
+            try sources.sql_array_binary.decodeElementLeaky(alloc, .jsonb, bytes, &work);
+        return datum.value;
+    }
     if (param_oid == 1700) {
         const sources = @import("antfly_local_sources");
         var context: sources.sql_numeric_value.Context = .{ .alloc = alloc };
@@ -235,7 +244,6 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
             break :blk try timestampEnvelope(alloc, value.timestamp_tz);
         },
         114 => try parseJson(alloc, bytes),
-        3802 => if (bytes.len > 0 and bytes[0] == 1) try parseJson(alloc, bytes[1..]) else error.InvalidParameter,
         2950 => if (bytes.len == 16) .{ .string = blk: {
             const canonical = @import("antfly_local_sources").common_uuid.format(bytes[0..16].*);
             break :blk try alloc.dupe(u8, &canonical);
@@ -593,7 +601,7 @@ test "pgwire JSON parameter nesting is bounded independently of frame bytes" {
     var bytes: [130]u8 = undefined;
     @memset(bytes[0..65], '[');
     @memset(bytes[65..], ']');
-    try std.testing.expectError(error.InvalidParameter, decode(arena.allocator(), 3802, 0, &bytes));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decode(arena.allocator(), 3802, 0, &bytes));
     try std.testing.expectEqualStrings("[{]}", (try decode(arena.allocator(), 3802, 0, "\"[{]}\"")).string);
 }
 
@@ -729,6 +737,36 @@ test "pgwire direct cell encoding matches allocated text and binary formats" {
         try encodeInto(a, &out.writer, case.kind, format, case.value);
         try std.testing.expectEqualSlices(u8, expected, out.written());
     };
+}
+
+test "pgwire JSONB parameter admission shares scalar and array domain errors" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    for ([_]struct { input: []const u8, code: []const u8 }{
+        .{ .input = "1e131072", .code = "22003" },
+        .{ .input = "0e-16384", .code = "22003" },
+        .{ .input = "{\"k\":1e131072,\"k\":2}", .code = "22003" },
+        .{ .input = "{\"k\":\"\\u0000\",\"k\":2}", .code = "22P05" },
+        .{ .input = "01", .code = "22P02" },
+    }) |entry| for ([_]u16{ 0, 1 }) |format| {
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const r = region.allocator();
+        var binary: std.Io.Writer.Allocating = .init(r);
+        try binary.writer.writeByte(1);
+        try binary.writer.writeAll(entry.input);
+        const input = if (format == 0) entry.input else binary.written();
+        if (decode(r, 3802, format, input)) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(entry.code, sources.sql_errors.describe(err).code);
+    };
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const value = try decode(region.allocator(), 3802, 0, "{\"k\":1,\"\\u006b\":1.20}");
+    try std.testing.expectEqual(@as(usize, 1), value.object.count());
+    try std.testing.expectEqualStrings("1.20", value.object.get("k").?.number_string);
+    try std.testing.expectError(error.SqlProtocolViolation, decode(region.allocator(), 3802, 1, ""));
+    try std.testing.expectError(error.SqlJsonbUnsupportedVersion, decode(region.allocator(), 3802, 1, "\x02null"));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, decode(region.allocator(), 3802, 1, "\x01"));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, decode(region.allocator(), 3802, 1, "\x01\"\xff\""));
 }
 
 test "pgwire JSONB array columns emit exact PostgreSQL display and binary payloads" {
