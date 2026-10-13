@@ -78,6 +78,60 @@ class SweepTests(unittest.TestCase):
         flags, _, _ = sweep.flags_for("mtp2frame")
         self.assertEqual(flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"], "1")
 
+    def test_recommendation_excludes_failed_quality_and_overlapping_ranges(self):
+        ordinary = {
+            "case": "ordinary",
+            "eligible_for_throughput_comparison": True,
+            "seconds": [10, 11],
+            "seconds_per_committed_token": [0.10, 0.11],
+        }
+        bad = {
+            "case": "bad",
+            "eligible_for_throughput_comparison": False,
+            "seconds": [1, 1],
+            "seconds_per_committed_token": [0.01, 0.01],
+        }
+        overlap = {
+            "case": "mtp2",
+            "eligible_for_throughput_comparison": True,
+            "seconds": [9, 11],
+            "seconds_per_committed_token": [0.09, 0.11],
+        }
+        self.assertFalse(sweep.recommend([ordinary, bad, overlap])["qualified_speedup"])
+        faster = {
+            "case": "cohort4w8",
+            "eligible_for_throughput_comparison": True,
+            "seconds": [5, 6],
+            "seconds_per_committed_token": [0.05, 0.06],
+        }
+        self.assertTrue(
+            sweep.recommend([ordinary, bad, faster, ordinary])["qualified_speedup"]
+        )
+
+    def test_incomplete_or_unbracketed_campaign_cannot_qualify(self):
+        ordinary = {
+            "case": "ordinary",
+            "eligible_for_throughput_comparison": True,
+            "seconds": [10, 11],
+            "seconds_per_committed_token": [0.10, 0.11],
+        }
+        faster = {
+            "case": "cohort2w4",
+            "eligible_for_throughput_comparison": True,
+            "seconds": [5, 6],
+            "seconds_per_committed_token": [0.05, 0.06],
+        }
+        self.assertFalse(sweep.recommend([ordinary, faster])["qualified_speedup"])
+        self.assertFalse(
+            sweep.recommend([ordinary, faster, ordinary], complete=False)[
+                "qualified_speedup"
+            ]
+        )
+
+    def test_rss_counts_worker_descendants_and_excludes_unrelated_processes(self):
+        table = "10 1 100\n11 10 200\n12 11 300\n13 1 999\n"
+        self.assertEqual(sweep.process_tree_rss(table, 10), 600 * 1024)
+
     def test_profile_retains_first_divergence_and_changed_choices(self):
         log = "ocr-parity stage=attn-norm layer=0 row=1 seq=300 input=5 max_abs=1e-7 mean_abs=2e-8 nonfinite=0 matrix_hash=ab canonical_hash=cd\nocr-parity-choice row=1 seq=300 input=5 matrix=1 canonical=2 match=false matrix_margin=1e-6 canonical_margin=2e-6\n"
         result = sweep.profile(log)["parity"]

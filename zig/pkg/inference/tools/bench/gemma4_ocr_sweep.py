@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -63,7 +64,9 @@ def flags_for(case):
     }
     batch = 1
     extra = []
-    cohort = re.fullmatch(r"cohort([24])w(4|8|16)", case)
+    cohort = re.fullmatch(
+        r"cohort([24])w(4|8|16)(qkv|tail|ple|canonical|reduce|reduceall)?", case
+    )
     if cohort or case in {
         "normoff",
         "ffnoff",
@@ -73,6 +76,8 @@ def flags_for(case):
         "pleoff",
         "tailoff",
         "canonical",
+        "reduce",
+        "reduceall",
     }:
         batch = int(cohort[2]) if cohort else 8
         flags.update(
@@ -83,11 +88,27 @@ def flags_for(case):
         )
         if case == "normoff":
             flags["TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"] = "1"
+        variant = cohort[3] if cohort else None
+        if variant in {"qkv", "canonical"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
+        if variant in {"ple", "canonical", "reduceall"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
+        if variant in {"tail", "canonical", "reduceall"}:
+            flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
+        if variant in {"canonical", "reduce", "reduceall"}:
+            flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
+        if variant in {"reduce", "reduceall"}:
+            flags["TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"] = "1"
+            flags["TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH"] = "1"
+        if case in {"reduce", "reduceall"}:
+            flags["TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"] = "1"
+            flags["TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH"] = "1"
+            flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
         if case in {"qkvoff", "canonical"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV"] = "1"
-        if case in {"pleoff", "canonical"}:
+        if case in {"pleoff", "canonical", "reduceall"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE"] = "1"
-        if case in {"tailoff", "canonical"}:
+        if case in {"tailoff", "canonical", "reduceall"}:
             flags["ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL"] = "1"
         if case in {"ffnoff", "canonical"}:
             flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
@@ -95,7 +116,7 @@ def flags_for(case):
             flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL"] = "1"
         if case == "stepdiff":
             flags["ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP"] = "1"
-    elif re.fullmatch(r"mtp[1-4](frame)?", case):
+    elif re.fullmatch(r"mtp[1-4](frame|verify|all|seedreduce)?", case):
         flags.update(
             ANTFLY_GEMMA4_MTP_MULTIMODAL="1",
             ANTFLY_GEMMA4_MTP_ACCEPT_BONUS="1",
@@ -106,8 +127,19 @@ def flags_for(case):
             ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY="1",
             TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE="1",
         )
-        if case.endswith("frame"):
+        if case.endswith("seedreduce"):
+            # Recheck the rejected seed schedule only with target Q4 matrix
+            # reductions/FFN rolled back. Complete-output gates still apply.
+            flags["ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET"] = "1"
+            flags["TERMITE_METAL_DISABLE_Q4_0_SMALL_BATCH"] = "1"
+            flags["TERMITE_METAL_DISABLE_ANTFLY_Q4_0_SMALL_BATCH"] = "1"
+            flags["TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN"] = "1"
             flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"] = "1"
+        if case.endswith(("frame", "all")):
+            flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"] = "1"
+        if case.endswith(("verify", "all")):
+            flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME"] = "1"
+            flags["TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME"] = "1"
         extra = ["--draft-model", "assistant", "--speculative-k", case[3]]
     elif case != "ordinary":
         raise ValueError("Unknown case: " + case)
@@ -168,6 +200,9 @@ def qualification(report, reference):
 def profile(log):
     result = {}
     for label, key in [
+        ("generate_timing_ms:", "total"),
+        ("metal_ocr_profile:", "decode_hits"),
+        ("metal_ocr_mtp_profile:", "rounds"),
         ("mtp_phase_profile:", "draft_steps"),
         ("mtp_draft_profile:", "resident_steps"),
         ("metal_ocr_matrix_frame:", "rows"),
@@ -198,6 +233,67 @@ def profile(log):
     return result
 
 
+def process_tree_rss(ps_rows, root_pid):
+    rows = []
+    for line in ps_rows.splitlines():
+        fields = line.split()
+        if len(fields) == 3:
+            try:
+                rows.append(tuple(int(x) for x in fields))
+            except ValueError:
+                continue
+    owned = {root_pid}
+    while True:
+        children = {pid for pid, parent, _ in rows if parent in owned}
+        expanded = owned | children
+        if expanded == owned:
+            break
+        owned = expanded
+    return sum(rss * 1024 for pid, _, rss in rows if pid in owned)
+
+
+def recommend(runs, complete=True):
+    eligible = [
+        r
+        for r in runs
+        if r.get("eligible_for_throughput_comparison") and len(r["seconds"]) >= 2
+    ]
+    controls = [
+        value
+        for r in eligible
+        if r["case"] == "ordinary"
+        for value in r["seconds_per_committed_token"]
+    ]
+    if not eligible:
+        return {
+            "qualified_speedup": False,
+            "reason": "No repeated complete-output eligible cases",
+        }
+    best = min(
+        eligible, key=lambda r: statistics.median(r["seconds_per_committed_token"])
+    )
+    values = best["seconds_per_committed_token"]
+    ordinary_indices = [
+        i for i, r in enumerate(runs) if r in eligible and r["case"] == "ordinary"
+    ]
+    best_index = runs.index(best)
+    bracketed = len(ordinary_indices) >= 2 and min(ordinary_indices) < best_index < max(
+        ordinary_indices
+    )
+    return {
+        "measured_fastest_case": best["case"],
+        "median_seconds_per_committed_token": statistics.median(values),
+        "qualified_speedup": bool(
+            complete
+            and bracketed
+            and controls
+            and best["case"] != "ordinary"
+            and max(values) < min(controls)
+        ),
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication.",
+    }
+
+
 def run(args):
     args.output_dir.mkdir(parents=True, exist_ok=False)
     corpus = json.loads(args.corpus.read_text())
@@ -210,10 +306,16 @@ def run(args):
     summary = {
         "runtime_source_revision": args.source_revision,
         "binary_sha256": binary_hash,
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "corpus": str(args.corpus.resolve()),
         "reverse_rows": args.reverse,
         "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
-        "memory_scope": "sampled process RSS, not total unified GPU memory",
+        "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+        "memory_probe_sha256": hashlib.sha256(
+            args.memory_probe.read_bytes()
+        ).hexdigest()
+        if args.memory_probe
+        else None,
         "runs": [],
     }
     for index, case in enumerate(args.cases):
@@ -228,6 +330,8 @@ def run(args):
             )
         }
         env.update(flags)
+        if args.memory_probe:
+            env["DYLD_INSERT_LIBRARIES"] = str(args.memory_probe.resolve())
         command = [
             str(args.binary.resolve()),
             "run",
@@ -255,7 +359,8 @@ def run(args):
             "batch": batch,
             "server_flags": flags,
             "server_command": command,
-            "diagnostic": case in {"differential", "stepdiff"},
+            "diagnostic": case in {"differential", "stepdiff"}
+            or args.memory_probe is not None,
             "directory": directory.name,
         }
         samples = []
@@ -268,12 +373,11 @@ def run(args):
             def sample_rss():
                 while not stop.wait(0.5):
                     try:
-                        rss = subprocess.check_output(
-                            ["ps", "-o", "rss=", "-p", str(server.pid)], text=True
-                        ).strip()
-                        if rss:
-                            samples.append(int(rss) * 1024)
-                    except (subprocess.CalledProcessError, ValueError):
+                        table = subprocess.check_output(
+                            ["ps", "-axo", "pid=,ppid=,rss="], text=True
+                        )
+                        samples.append(process_tree_rss(table, server.pid))
+                    except (OSError, subprocess.CalledProcessError, ValueError):
                         return
 
             sampler = None
@@ -322,6 +426,19 @@ def run(args):
                 ] + extra
                 entry["benchmark_command"] = bench
                 subprocess.run(bench, check=True)
+            except Exception as error:
+                entry["error"] = {"type": type(error).__name__, "message": str(error)}
+                entry["eligible_for_throughput_comparison"] = False
+                summary["runs"].append(entry)
+                summary["completed"] = index == len(args.cases) - 1
+                summary["recommendation"] = recommend(
+                    summary["runs"], summary["completed"]
+                )
+                (args.output_dir / "summary.json").write_text(
+                    json.dumps(summary, indent=2) + "\n"
+                )
+                if not args.keep_going:
+                    raise
             finally:
                 stop.set()
                 if sampler:
@@ -332,6 +449,9 @@ def run(args):
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.wait()
+        if "error" in entry:
+            print(case, "FAILED", entry["error"], flush=True)
+            continue
         report = json.loads(
             (directory / ("gemma4-b" + str(batch) + ".json")).read_text()
         )
@@ -339,9 +459,58 @@ def run(args):
             reference = report
         entry.update(
             seconds=report["totals"],
-            sampled_peak_rss_bytes=max(samples, default=None),
+            sampled_peak_process_tree_rss_bytes=max(samples, default=None),
             profile=profile((directory / "server.log").read_text()),
         )
+        # Request profiles contain the singleton warm pages; strip them before
+        # computing decode work/rates. Matrix frame samples have no such warm.
+        for name in [
+            "generate_timing_ms",
+            "metal_ocr_profile",
+            "metal_ocr_mtp_profile",
+            "mtp_phase_profile",
+            "mtp_draft_profile",
+        ]:
+            entry["profile"][name] = entry["profile"][name][args.warmups :]
+        durations = sorted(x["total"] for x in entry["profile"]["generate_timing_ms"])
+        entry["generation_pipeline_wall_ms"] = {
+            "samples": len(durations),
+            "p50": statistics.median(durations) if durations else None,
+            "p95": durations[max(0, (len(durations) * 95 + 99) // 100 - 1)]
+            if durations
+            else None,
+            "max": max(durations, default=None),
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed.",
+        }
+        entry["http_wave_seconds"] = [wave["seconds"] for wave in report["waves"]]
+        mtp = entry["profile"]["metal_ocr_mtp_profile"]
+        drafted = sum(x["drafted"] for x in mtp)
+        entry["mtp_work"] = {
+            "rounds": sum(x["rounds"] for x in mtp),
+            "drafted": drafted,
+            "matched": sum(x["matched"] for x in mtp),
+            "acceptance_rate": sum(x["matched"] for x in mtp) / drafted
+            if drafted
+            else None,
+            "phase_wall_ns": {
+                key: sum(x.get(key, 0) for x in entry["profile"]["mtp_phase_profile"])
+                for key in ["draft_ns", "verify_ns", "materialize_ns"]
+            },
+        }
+        if args.memory_probe:
+            probe_rows = []
+            for line in (directory / "server.log").read_text().splitlines():
+                if "metal-memory-probe " in line:
+                    probe_rows.append(
+                        {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)}
+                    )
+            entry["sampled_max_metal_allocated_bytes"] = max(
+                (x["bytes"] for x in probe_rows), default=None
+            )
+            entry["metal_memory_samples"] = len(probe_rows)
+            entry["metal_memory_scope"] = (
+                "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded."
+            )
         if reference:
             entry.update(qualification(report, reference))
             entry["eligible_for_throughput_comparison"] = (
@@ -354,6 +523,8 @@ def run(args):
                 )
             ]
         summary["runs"].append(entry)
+        summary["completed"] = index == len(args.cases) - 1
+        summary["recommendation"] = recommend(summary["runs"], summary["completed"])
         (args.output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
@@ -382,5 +553,15 @@ if __name__ == "__main__":
         "--reverse",
         action="store_true",
         help="Reverse the page order without changing inputs",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Record failed cases and continue; failed/partial cases never qualify",
+    )
+    parser.add_argument(
+        "--memory-probe",
+        type=Path,
+        help="Inject the optional local Metal allocation probe; instrumentation makes timings diagnostic only",
     )
     run(parser.parse_args())
