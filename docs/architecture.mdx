@@ -28,7 +28,7 @@ Topology and persistence are independent choices. A deployment mode answers whic
 | Embedded | none; the application links `libantfly` | The application opens the database directly, with no server | `lite`, `local` |
 | Standalone | `antfly standalone` | One process owns metadata, data, the APIs, and inference | `lite`, `local` |
 | Distributed | `antfly metadata`, `antfly data` | Split roles with Raft replication; scales horizontally | `local` |
-| Serverless (unreleased) | `antfly serverless` | Stateless compute over object-backed durable state | `object` |
+| Serverless (in progress) | `antfly serverless` | Stateless compute over object-backed durable state | `object` |
 
 | Engine | Durable representation |
 | --- | --- |
@@ -117,7 +117,7 @@ Memory is governed per process. `ResourceManager` owns the physical budget share
 | Embedded (Lite) | Single writer. Durability is the `fsync` policy, with no replication. |
 | Standalone | Optional Postgres-style hot standby (`antfly standby`): WAL streaming to replicas, fenced promotion, planned `antfly standby switchover`, and `antfly standby follow` to repoint standbys. |
 | Distributed | Multi-Raft replication for metadata and each shard, with quorum writes and online shard splits. |
-| Serverless (unreleased) | Durable state in object storage, with stateless, replaceable compute. |
+| Serverless (in progress) | Durable state in object storage, with stateless, replaceable compute. |
 
 - **Backups and restore.** Table and cluster backups go to local disk, S3, or GCS as content-addressed manifests and blobs, and incremental capture is supported. There is no point-in-time recovery or WAL archive; restore picks one backup manifest. Design: [BACKUPS.md](https://github.com/antflydb/antfly/blob/main/zig/BACKUPS.md), [HOT_STANDBY.md](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md).
 - **Shard split and merge.** Automatic split and merge on `max_shard_size_bytes` (default 64 MiB) is opt-in: set the top-level node config `disable_shard_alloc: false`. Design: [DB.md: Shard Split Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#shard-split-contract), [SCALING.md](https://github.com/antflydb/antfly/blob/main/zig/SCALING.md).
