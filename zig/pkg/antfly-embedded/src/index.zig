@@ -1014,6 +1014,15 @@ pub const IndexSnapshot = struct {
             if (flight.failure) |failure| return failure;
         }
     }
+    /// Immutable composition must allocate through the inventory owner. A
+    /// query facade's locked allocator is tied to that facade's lifetime and
+    /// is not the allocator that owns shared readers and visibility cells.
+    pub fn inventoryAllocator(self: *const IndexSnapshot) Allocator {
+        var owner = self;
+        while (owner.inventory_owner) |parent| owner = parent;
+        return owner.alloc;
+    }
+
     /// Compatibility borrow: the returned pointer is stable until snapshot
     /// release. Streaming consumers should use a lease to bound visited readers.
     pub fn readSegment(self: *const IndexSnapshot, ordinal: usize) !*SegmentEntry {

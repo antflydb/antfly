@@ -21,6 +21,8 @@ to configuration, results, or stdout. This does not change cloud IAM or buckets.
 """
 
 import argparse
+import hashlib
+import struct
 import json
 import shutil
 import statistics
@@ -72,6 +74,55 @@ def wait_for_index(
             failure["observations"] += 1
             failure["last_elapsed_seconds"] = elapsed
         sleep(min(1, max(0, deadline - now())))
+
+
+def prepare_filesystem_source(source, state):
+    """Stage flat Parquet inputs in the filesystem object-store layout."""
+    source = source.resolve()
+    objects = source / "archive" / "buckets" / "antfly" / "objects"
+    if objects.is_dir():
+        return source
+    files = sorted((source / "archive").glob("*.parquet"))
+    if not files:
+        raise ValueError(
+            "Filesystem source needs archive/*.parquet or its native bucket layout"
+        )
+    root = state / "local-source"
+    objects = root / "archive" / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True, exist_ok=True)
+    if any(
+        path.name not in {item.name for item in files}
+        for path in objects.glob("*.parquet")
+    ):
+        raise ValueError(
+            "Staged source has extra Parquet objects; use a fresh qualification state"
+        )
+    for path in files:
+        destination = objects / path.name
+        with path.open("rb") as source_file:
+            digest = hashlib.file_digest(source_file, "sha256").hexdigest()
+        # FilesystemClient's AFOBJ001 envelope carries payload length, content-type
+        # length and the payload SHA-256. Discovery/range offsets use that envelope.
+        header = (
+            b"AFOBJ001" + struct.pack("<QI", path.stat().st_size, 0) + digest.encode()
+        )
+        if destination.exists():
+            with destination.open("rb") as staged:
+                valid = (
+                    staged.read(len(header)) == header
+                    and hashlib.file_digest(staged, "sha256").hexdigest() == digest
+                )
+            if not valid:
+                raise ValueError(
+                    "Staged source changed; use a fresh qualification state"
+                )
+        else:
+            temporary = destination.with_suffix(".staging")
+            with temporary.open("wb") as output, path.open("rb") as input_file:
+                output.write(header)
+                shutil.copyfileobj(input_file, output, length=1024 * 1024)
+            temporary.replace(destination)
+    return root
 
 
 def create_current_table(call, current):
@@ -318,12 +369,17 @@ def main():
             capture_output=True,
             text=True,
         ).stdout.strip()
+    local_source_root = (
+        prepare_filesystem_source(args.filesystem_source, args.state)
+        if args.filesystem_source
+        else None
+    )
     env = dict(os.environ, HN_GCS_BEARER=token)
 
     def connection(capability, prefix):
         if args.filesystem_source:
             root = (
-                args.filesystem_source.resolve()
+                local_source_root
                 if capability == "lake_read"
                 else args.state.resolve() / "artifacts"
             )
@@ -491,7 +547,9 @@ def main():
                 value = json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
             # Avoid echoing arbitrary server/provider bodies into task output.
-            detail = exc.read().decode(errors="replace").replace(token, "[redacted]")
+            detail = exc.read().decode(errors="replace")
+            if token:
+                detail = detail.replace(token, "[redacted]")
             raise RuntimeError(
                 f"{method} {path}: HTTP {exc.code}: {detail[:1000]}"
             ) from exc
@@ -686,6 +744,9 @@ def main():
             if (args.state / "cache").exists():
                 shutil.rmtree(args.state / "cache")
             start()
+        if not args.disable_navigation_warming:
+            readiness = call("GET", "/tables/hn_archive_poc/indexes/body_text")
+            assert readiness["status"]["readiness"]["queryable"], readiness
         if args.disable_navigation_warming:
             baseline_metrics = lake_metrics()
             assert (
@@ -1021,16 +1082,35 @@ def main():
                 "points",
                 "created_at",
             ]
-            recent = call(
-                "POST",
-                "/sql",
-                {
-                    "statement": "SELECT "
-                    + ", ".join(columns)
-                    + " FROM hn_archive_poc ORDER BY created_at DESC, hn_id LIMIT "
-                    + str(args.composed_current_rows)
-                },
-            )
+            if args.filesystem_source:
+                import pyarrow.dataset as dataset
+
+                paths = sorted((args.filesystem_source / "archive").glob("*.parquet"))
+                if not paths:
+                    raise ValueError(
+                        "Local composed fixture needs original archive/*.parquet payloads"
+                    )
+                recent_rows = (
+                    dataset.dataset([str(path) for path in paths], format="parquet")
+                    .to_table(columns=columns)
+                    .sort_by([("created_at", "descending"), ("hn_id", "ascending")])
+                    .slice(0, args.composed_current_rows)
+                    .to_pylist()
+                )
+                recent = {
+                    "rows": [[row[name] for name in columns] for row in recent_rows]
+                }
+            else:
+                recent = call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": "SELECT "
+                        + ", ".join(columns)
+                        + " FROM hn_archive_poc ORDER BY created_at DESC LIMIT "
+                        + str(args.composed_current_rows)
+                    },
+                )
             assert len(recent["rows"]) == args.composed_current_rows
             documents = []
             for row in recent["rows"]:

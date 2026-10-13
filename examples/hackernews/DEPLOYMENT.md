@@ -111,7 +111,8 @@ benchmark cannot substitute for those checks.
 
 For the runtime handoff, Colony's development release overlay is
 `config/antfly-releases-development.yaml`. Add the released image digest there with
-`auto_upgrade: false` and an explicit rollback version. Keep the existing default
+`status: candidate`, `auto_upgrade: false` and an explicit rollback version.
+Promote it to `dev_verified` only after the managed qualification passes. Keep the existing default
 runtime intact while qualifying the candidate. The managed instance update uses
 `target_antfly_image`; wait until `current_antfly_image` reports that exact digest
 and the instance is ready before issuing HN data-plane requests. Colony's

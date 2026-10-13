@@ -15122,11 +15122,10 @@ pub const ApiHttpServer = struct {
                 if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
-                    var artifacts = store.artifactStore();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
                     defer self.source.freeAdminSnapshot(&capture);
                     const cover = try @import("native_retained_cut.zig").captureCover(resolver.arena, capture, table_name, table.table_id);
-                    query_req.req.remote_snapshot = try @import("native_retained_cut.zig").saveWithCover(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(self.cfg.node_config), cover, context.cancellation);
+                    query_req.req.remote_snapshot = try @import("native_query_repository.zig").saveWithCover(alloc, &store, self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(self.cfg.node_config), cover, context.cancellation);
                     resolver.native_capture_token = query_req.req.remote_snapshot;
                 }
             }
@@ -21815,9 +21814,8 @@ pub const ApiHttpServer = struct {
                         if (!request.object.contains("remote_snapshot")) {
                             var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                             defer store.deinit();
-                            var artifacts = store.artifactStore();
                             const cover = try @import("native_retained_cut.zig").captureCover(scratch, before, binding.physical, bound.table_id);
-                            const token = try @import("native_retained_cut.zig").saveWithCover(scratch, &artifacts, try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator), runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), cover, context.cancellation);
+                            const token = try @import("native_query_repository.zig").saveWithCover(scratch, &store, runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), cover, context.cancellation);
                             try request.object.put(scratch, "remote_snapshot", .{ .string = token });
                             resolver.native_capture_token = token;
                             native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});

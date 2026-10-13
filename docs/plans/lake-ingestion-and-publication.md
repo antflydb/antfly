@@ -347,6 +347,21 @@ equate lake commitment with synchronous indexing.
 
 ## Storage durability, deployment, and cold starts
 
+Native cursor capture publishes a durable discovery witness before the cursor
+descriptor. The supervised maintenance owner can therefore collect expired
+descriptors even when physical capture fails, the process restarts, or the table
+is dropped. Descriptor creation and generation upload do not sweep retained
+history inline; deletion availability and accumulated generations must not add
+work to a foreground search. Local cut admission still enforces capacity and
+protects active readers. Deployments must keep the background artifact collector
+enabled, or run explicit maintenance when they disable automatic collection.
+
+Filesystem object-store prefix listings descend only through the prefix's
+complete path components. The final partial component remains a string filter,
+and ordering, continuation tokens, delimiter grouping and symbolic-link behavior
+retain the bucket-listing contract. Listing a cursor namespace must not traverse
+unrelated archive artifacts.
+
 Cold-query qualification must distinguish local execution, process restart,
 empty Antfly serving caches, and fully remote reads. A restart with a retained
 filesystem cache does not establish object-store cold latency. Compare prebuilt

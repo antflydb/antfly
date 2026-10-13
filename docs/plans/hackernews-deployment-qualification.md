@@ -499,3 +499,76 @@ publication and the regional query matrix through the managed API. Keep public D
 routing disabled until those gates pass. Reconcile the existing shared cloud ledger
 before additional jobs; reuse the retained archive export and preserve prior spend
 and reservations. No standalone claim or engine is required for this Cloud path.
+
+The combined local matrix exposed two follow-up implementation gaps. Planning
+warmup must read declarations from an authenticated publication directory when
+inline declarations are absent, and must not memoize an unavailable lifecycle
+authority during startup as a completed warmup. Explicit leading descending score
+ordering can carry a competitive cutoff across windows while retaining equal-score
+contenders; ascending score and backward cursor pages cannot use that minimum.
+Count-only requests retain exact execution.
+
+Composed five-hit requests previously fetched/highlighted 128 hits from each source.
+Start each source with the requested page and one lookahead, bounded by 128. Grow
+fully suppressed overlay batches geometrically to preserve archive traversal;
+count, aggregation and graph consumers retain the larger streaming batches. Cursor
+identities, source authority and total normalization must remain unchanged. Qualify
+this with the same 1,000-row current fixture and mutation/restart cursor checks.
+
+Final local evidence is in
+`examples/hackernews/combined-main-search-qualification-20261012.json`. The raw
+empty-cache matrix measured 32.25–78.91 ms first-query, 7.87–9.03 ms warm p95,
+and 29.61–38.56 ms restart latency. Readiness-enabled runs measured 30.74–49.13 ms
+first-query latency and now prove positive warmup (42 planning pages before query).
+Both physical layouts preserve exact HN IDs/scores and enumerate 4,110 cursor
+matches with filters, highlights and mutable source cursors verified after restart.
+
+Provider work is the more stable comparison: raw empty-cache reads remain
+248 requests / 25.04 MB versus the earlier 295 / 43.31 MB. The composed page-size
+fix reduces measured leaf hydration and provider work, but full composed requests
+remain much slower than single-table queries. Profile retained native snapshot
+capture, binding and response/control work before selecting another optimization.
+The SQL ordered body projection still hit its statement work limit; direct Parquet
+fixture setup is outside query timing and does not qualify that SQL shape. Keep
+these findings separate from the completed local keyword/cursor correctness gates.
+
+The follow-up composed profile found repeated directory enumeration. Native
+capability creation and generation publication now leave expiry collection to
+the supervised owner. Persist namespace discovery before the capability so a
+failed physical capture remains collectible after restart or drop. Filesystem
+prefix listing starts at the appropriate subtree, preserves partial-prefix and
+pagination semantics, and skips symbolic links as the original bucket walk did.
+Use a bounded-work regression with unrelated generations, and compare live
+current, retained current, union and saved-overlay requests after rebuilding.
+
+Restart validation also exposed field-order assumptions in lazy routing:
+canonical routing names can differ from a physical segment's writer order.
+Binding must match names and verify the same field statistics and section kinds,
+without relaxing incarnation, source or checksum validation. Catalog fixtures
+must use distinct relational index names within their shared namespace.
+
+The catalog HTTP rerun traced the remaining `InvalidSegment` to masked WAL
+composition allocating through a query facade's locked allocator. Compose
+through the pinned inventory owner's allocator, whose lifetime covers shared
+physical readers and private deletion cells. Preserve the sparse read capability
+and its cancellation checks. Destroy dependent owner objects before releasing
+the base pin that owns their allocator. Keep the immutable-sharing allocator
+guard; exercise this path with restart, nullable WAL rows and private masks.
+
+Bounded composed pages can report `hits.total.relation = "gte"` until the
+remaining source relation is visited. Exact overlay cardinality is a separate
+`count: true` request. Qualification must test the bounded cursor and exact count
+independently, without forcing every first page to scan its archive.
+
+The final optimized follow-up passes 84 local Python tests and 28 subtests,
+including four filesystem/S3 fixture cursor recovery cases. All eight catalog
+HTTP cases pass after the ownership fix. The broader lake gate passes 237 other
+regressions plus the corrected incremental stored-row assertion, without leaks.
+The final raw and 67-file layouts retain exact IDs/scores, filter behavior,
+highlights, 4,110-match cursor enumeration and mutable-source restart visibility.
+Highlighted first searches measured 76.13 ms raw and 106.48 ms fragmented;
+post-restart searches measured 29.49–35.71 ms. Eight-repeat composed runs measured
+union warm p95 60.25–65.18 ms and saved-overlay warm p95 67.54–73.56 ms. A matched
+before/after diagnostic records the large reduction from removing foreground
+collection and bucket-wide enumeration. These shared-host sample measurements
+do not establish full-archive performance or a managed Cloud SLO.

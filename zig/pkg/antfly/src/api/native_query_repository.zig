@@ -27,6 +27,31 @@ const fs = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
 const Namespace = local.storage_db_doc_identity_namespace.Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+/// Register discovery before publishing a capability. Even a failed physical
+/// capture must leave its descriptor discoverable after restart or table drop.
+pub fn saveWithCover(a: A, store: *Store, io: std.Io, table: anytype, now: u64, retention_ms: u64, cover: anytype, cancellation: Cancellation) ![]const u8 {
+    for (cover) |range| try registerOwner(a, store, range.namespace, cancellation);
+    var artifact_store = store.artifactStore();
+    const retained = @import("native_retained_cut.zig");
+    return retained.saveWithCover(a, &artifact_store, try retained.storeIdentity(a, store.locator), io, table, now, retention_ms, cover, cancellation);
+}
+fn registerOwner(a: A, store: *Store, namespace: Namespace, cancellation: Cancellation) !void {
+    try cancellation.check();
+    const key = try std.fmt.allocPrint(a, "{s}{s}native-query-owners/{d}/{d}/{d}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id });
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, namespace, .{});
+    defer a.free(bytes);
+    const bridge: TokenBridge = .{ .token = cancellation };
+    var result = store.opened.client.putObject(store.opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+        try cancellation.check();
+        switch (err) {
+            error.PreconditionFailed, error.ConditionalCheckFailed => return,
+            else => return err,
+        }
+    };
+    result.deinit(store.opened.client.allocator);
+    try cancellation.check();
+}
 const TokenBridge = struct {
     token: Cancellation,
     fn cancelled(raw: *const anyopaque) bool {
@@ -238,18 +263,7 @@ pub const Repository = struct {
         return std.fmt.allocPrint(a, "{s}{s}native-query-owners/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/" });
     }
     fn register(self: *Repository, a: A, namespace: Namespace, cancellation: Cancellation) !void {
-        const key_bytes = try std.fmt.allocPrint(a, "{s}{d}/{d}/{d}.json", .{ try self.ownerPrefix(a), namespace.table_id, namespace.shard_id, namespace.range_id });
-        const bytes = try std.json.Stringify.valueAlloc(a, namespace, .{});
-        const bridge: TokenBridge = .{ .token = cancellation };
-        var result = self.store.opened.client.putObject(self.store.opened.bucket, key_bytes, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
-            try cancellation.check();
-            switch (err) {
-                error.PreconditionFailed, error.ConditionalCheckFailed => return,
-                else => return err,
-            }
-        };
-        result.deinit(self.store.opened.client.allocator);
-        try cancellation.check();
+        try registerOwner(a, &self.store, namespace, cancellation);
     }
     /// One namespace per supervised pass. The caller owns the returned cursor;
     /// registry witnesses survive failed upload, owner loss and table drop.
@@ -381,7 +395,9 @@ pub const Repository = struct {
             return true;
         }
         try self.register(a, namespace, cancellation);
-        try self.collect(namespace, cut.nowMs(), cancellation);
+        // collectNext runs under the background maintenance owner. A new cut
+        // only publishes its own generation; sweeping older cuts here makes
+        // query latency depend on the size of unrelated retained history.
         // An immutable commit proves a prior attempt completed every chunk.
         if (self.readManifest(a, request, namespace, cancellation)) |bytes| {
             _ = try checkedManifest(a, bytes, request, namespace);

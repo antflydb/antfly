@@ -1238,7 +1238,7 @@ const Execution = struct {
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
             request.highlight = null;
-            if (ordering == null and !req.count_only) request.minimum_competitive_score = winners.cutoff();
+            if (!req.count_only) request.minimum_competitive_score = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
             if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
@@ -2441,7 +2441,14 @@ const PagedWinners = struct {
         return .{ .a = a, .limit = limit, .heap = .initContext(ordering) };
     }
     fn cutoff(self: *const PagedWinners) ?f32 {
-        if (self.limit == 0 or self.heap.items.len < self.limit or self.heap.context != null) return null;
+        if (self.limit == 0 or self.heap.items.len < self.limit) return null;
+        if (self.heap.context) |order| {
+            const req = order.effective.req;
+            // Lower score cannot outrank a leading descending score. Keep equal
+            // scores for secondary/tie ordering; backward pages have another cutoff.
+            if (req.search_before.len != 0 or req.order_by.len == 0 or
+                !std.mem.eql(u8, req.order_by[0].field, "_score") or !req.order_by[0].desc) return null;
+        }
         return self.heap.peek().?.hit.score orelse 0;
     }
     fn deinit(self: *PagedWinners) void {
@@ -2540,6 +2547,29 @@ test "external lake paged native text winners share typed ordering and backward 
         try std.testing.expectEqual(@as(usize, 2), hits.len);
         try std.testing.expectEqualStrings(if (backward) "b" else "a", hits[0].id);
         try std.testing.expectEqualStrings(if (backward) "c" else "b", hits[1].id);
+        try std.testing.expect(heap.cutoff() == null);
+    }
+}
+
+test "external lake paged explicit score cutoff preserves ties and rejects ascending or backward pages" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |descending| {
+        const fields = [_]types.SortField{.{ .field = "_score", .desc = descending }};
+        var order = try local.storage_db_query_search_exec.SearchHitOrder.init(a, .{ .order_by = &fields }, null);
+        defer order.deinit(a);
+        var heap = PagedWinners.initOrdered(a, 1, &order);
+        defer heap.deinit();
+        var values = try a.alloc(std.json.Value, order.effective.req.order_by.len);
+        defer a.free(values);
+        for (values, order.effective.req.order_by) |*value, field| value.* = if (std.mem.eql(u8, field.field, "_score")) .{ .float = 2 } else .{ .string = "z" };
+        try heap.add(.{ .id = @constCast("z"), .score = 2, .sort_values = values }, 0);
+        if (descending) {
+            try std.testing.expectEqual(@as(?f32, 2), heap.cutoff());
+            values[values.len - 1] = .{ .string = "a" };
+            try heap.add(.{ .id = @constCast("a"), .score = 2, .sort_values = values }, 1);
+            try std.testing.expectEqualStrings("a", heap.heap.peek().?.hit.id);
+        } else try std.testing.expect(heap.cutoff() == null);
+        order.effective.req.search_before = values;
         try std.testing.expect(heap.cutoff() == null);
     }
 }

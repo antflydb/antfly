@@ -1036,3 +1036,59 @@ segments to qualify bounded windows. Cross-source-file compaction and global
 best-first traversal remain separate changes. Select them based on measured
 navigation, segment-opening and posting work rather than treating the earlier
 43 MB cold-read figure as the combined implementation's result.
+
+Flat local `archive/*.parquet` inputs are staged under the qualification state's
+filesystem object-store layout with `AFOBJ001` envelopes. The envelopes contain
+payload length and SHA-256; Parquet payloads remain unchanged. Input files are not
+modified, and a reused state rejects changed or extra staged objects. An existing
+native filesystem bucket layout can be supplied directly. This setup happens
+before publication and timing.
+
+Local composition fixtures read the most recent sample rows directly from Parquet
+outside timed requests. The attempted SQL seed (`SELECT` including `body`, ordered
+by creation time with a 1,000-row limit) exceeded the statement work limit on this
+sample. That diagnostic remains a separate SQL qualification finding; successful
+composition does not imply that SQL shape has been qualified.
+
+The combined implementation is recorded in
+[`combined-main-search-qualification-20261012.json`](combined-main-search-qualification-20261012.json).
+On the raw 142,577-row sample, final empty-serving-cache searches took
+32.25–78.91 ms, warm p95 7.87–9.03 ms, and restart searches 29.61–38.56 ms.
+After default readiness warmup, first searches took 30.74–49.13 ms; 42 planning
+pages warmed before the query, with about 0.92 MB of cumulative setup reads.
+Empty-cache queries still performed 248 provider reads / 25.04 MB. This is less
+cold work than the earlier 295 reads / 43.31 MB, but remains a substantial target
+for further navigation/posting improvements.
+
+The matched DuckDB diagnostic ranged from 31.28 to 134.76 ms first-query latency
+and 11.42–21.23 ms warm p95 across its two processes. Shared-host and OS-cache
+variation prevents attributing every timing change to implementation changes.
+Both Antfly layouts preserve exact top IDs/scores through all measured cycles.
+The fragmented layout remains slower in some final runs; do not extrapolate these
+small fixtures to full-archive throughput or a service SLO.
+
+Small composed pages now fetch the requested page plus one lookahead, up to 128,
+and grow geometrically when an overlay batch is completely suppressed. This cuts
+historical leaf hydration from about 112 ms to 2.5 ms in the five-hit fixture and
+reduces its cold provider reads from 474 to 244. End-to-end composition remains
+roughly 0.6–0.9 seconds on the raw fixture, and the fragmented saved-overlay warm
+p95 reached 1.01 seconds. Remaining time lies outside the measured historical leaf
+query; native retained-snapshot capture and binding need separate profiling.
+
+A later controlled profile found foreground cursor collection and filesystem
+prefix listings traversing unrelated generations. Removing inline collection and
+confining listings to their prefix subtree cut retained-current warm requests
+from 739–1,151 ms to 53–56 ms, union requests from 742–808 ms to 64–95 ms, and
+saved-overlay requests from 743–813 ms to 68–89 ms. The fixture and exact result
+IDs/scores are unchanged. These are four warm repetitions on a shared native ARM64
+host, without an OS cache flush; the report includes every sample and labels the
+small-sample p95. They do not qualify full-archive throughput or a Cloud SLO.
+
+Expiry collection runs under the existing maintenance owner. Cursor creation
+persists discovery before the capability so interrupted physical captures remain
+collectible after restart or drop. WAL overlays use the pinned inventory owner's
+allocator and preserve sparse read capabilities and cancellation. Bounded
+composed pages can return a `gte` total; request `count: true` separately for exact
+overlay cardinality.
+No end-to-end composed speedup is claimed. Count, aggregation and graph consumers
+retain their larger streaming batches, and cursor identity/authority checks remain.
