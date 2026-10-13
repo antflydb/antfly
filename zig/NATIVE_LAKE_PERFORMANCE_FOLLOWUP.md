@@ -2850,10 +2850,10 @@ below. It does not require a new artifact format or a complete routing walk.
 PR #1063 merged as `68eece3fd6240f844cca890de36b9d1238084428`. The next
 follow-up starts from that main commit, including the main changes which arrived
 after the earlier `d1182ab89d` qualification. The frontier and bounded profiling/
-composed-text work below are implemented in the working branch; the historical
-pack and cloud-generation migrations remain pending. The follow-up remains a
-draft until its correctness and work-count gates pass against its final code
-and merged base.
+composed-text work below are implemented and qualified in this follow-up, which
+also merges main through `553e58317f60d25444a0ee80aa2cf9a20a546055` (#1113).
+The historical pack and cloud-generation migrations remain pending; the PR
+remains a draft while those broader workstreams are incomplete.
 
 | Workstream | Existing behavior | Required outcome |
 | --- | --- | --- |
@@ -2892,8 +2892,8 @@ Implemented frontier details:
   per-term subtree reductions. A metadata-only plan uses the native analyzer
   and Boolean lowerer, collection lengths and exact publication-wide DF. Bounds
   cover both constrained and unconstrained native lowering, including boosted
-  terms' f32 addition order, before physical masks are known. The same preparation lends analyzed tokens and global frequencies to native
-  scoring windows. Negative/nonfinite boosts or bounds conservatively disable
+  terms' f32 addition order, before physical masks are known. The same preparation lends analyzed
+  tokens and global frequencies to native scoring windows. Negative/nonfinite boosts or bounds conservatively disable
   score pruning; baseline-only and unsupported query shapes use the existing
   complete planner.
 - The priority queue holds at most 512 disjoint ranges. Under pressure, a
@@ -2934,8 +2934,37 @@ competitive cutoff. Shared native tests compare exact scores and
 winner order across analyzed, Boolean, signed and phrase shapes, including
 unknown bounds. Real Parquet coverage compares full admission with bounded
 profiles, metadata filters, exclusions, hybrids, hidden highlights and cursor
-pages before and after restart. Final build/test results are recorded below
-once qualification completes.
+pages before and after restart. A direct single-index attachment additionally
+asserts the `bounded_global_text_frontier` native profile label. Named and hybrid
+queries retain their parent's fusion profile.
+
+Qualification of native code at `c4897c9e94` and the final E2E fixture at
+`1ef68a3f30`, on the merged main base above, uses Zig 0.17.0 on macOS arm64:
+
+- `zig build lake-integration-test lake-text-frontier-test
+  -Doptimize=ReleaseFast -j2 --summary all`: 386 integration tests and four
+  focused tests pass, with no failures or leaks. The four focused tests are
+  also included in the integration roots and are not four additional unique
+  regressions. The deterministic frontier test covers 8,192 segments, a
+  competitive late segment, required-clause absence, equal bounds, cancellation,
+  and a one-entry priority queue under pressure.
+- `zig build antfly -Doptimize=Debug -j2 --summary all`: the complete standalone
+  server builds successfully. Real-file E2Es use a fixed copy of that binary so
+  another build cannot replace it between restart assertions.
+- The six selected real Parquet/Iceberg E2Es pass: broad native text windows
+  with scores/ties/counts/profiles/filters/hybrids/hidden highlights and ordered
+  cursor pages; independent PyIceberg schema IDs, snapshots, partitions,
+  deletes and restart; and fragmented files/segments for both formats.
+- Authored embedded production boundaries (824 sources), Apache product
+  boundaries (2,037 sources), and resolved C API/public-package module
+  boundaries (1,192/1,197 sources) pass. Changed-source formatting, Python
+  syntax and `git diff --check` pass. The repository-wide license-header check
+  still reports 15 files inherited unchanged from main; none is changed here.
+
+The fixture is a correctness and work-contract regression, not an archive-scale
+benchmark. Cross-file packing, durable provider generation proofs, overlay and
+early-source bounded admission, and measured archive-scale latency/RSS/provider
+request improvements remain pending.
 
 #### Historical serving packs
 
