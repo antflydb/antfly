@@ -1,0 +1,18 @@
+Build Summary: 15/15 steps succeeded; 224/226 tests passed (2 skipped)
+install-transport-http-tests success
++- install test success
+   +- compile test debug native success 5s MaxRSS:647M
+      +- WriteFile video_prepare_shader.h cached
+install-live-window-tests success
++- install test success
+   +- compile test debug native success 2s MaxRSS:373M
+test-transport-http success
++- run test 2 pass (2 total) 811ms MaxRSS:12M
+   +- compile test debug native (+1 more reused dependencies)
+test-live-windows success
++- run test 12 pass (12 total) 18s MaxRSS:18M
+   +- compile test debug native (reused)
+test-video success
++- run test 210 pass, 2 skip (212 total) 2m MaxRSS:330M
+   +- compile test debug native success 48s MaxRSS:1G
+      +- WriteFile video_prepare_shader.h cached

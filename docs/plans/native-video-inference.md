@@ -1258,3 +1258,26 @@ remain necessary. Automatic transport reload-to-window scheduling, decoder-order
 watermark derivation, cross-window retention/eviction and pretrained streamed
 CPU/Metal/Linux comparisons are the next implementation/qualification gaps.
 The full non-CUDA objective remains active.
+
+### Bounded live window pumping and model commit
+
+The request-local coordinator now connects existing authenticated HLS/DASH
+readers to bounded windows, explicit reload and typed model inference. It retains
+failed fetched units, drains epochs before clock resets, preserves complete
+logical preroll and future presentation samples, and advances the window only
+after fallible work succeeds. Sparse intervals are explicit gap events. Exact
+source-time sampling keeps frame identity stable across preroll eviction.
+
+Automatic frontiers validate static progressive AVC pictures and enforce a
+monotone decode-clock/`PTS >= DTS` contract; MJPEG also uses the scheduled clock.
+Field-coded and in-band configuration streams require explicit watermarks or
+EOF. Existing clip-relative sampling is unchanged. `embedNextLive` runs the
+ordinary CPU/Metal pipeline with shared model admission, reports source and
+manifest timing, and preserves the retry cursor on inference failure.
+
+Qualification lives at `zig/lib/video/testdata/live/coordinator-validation`.
+Automatic field/dynamic frontiers, pretrained streamed CPU/Metal/Linux parity,
+cross-window projection reuse and measured reduction of repeated frontier
+validation remain required. Current native decoded frontier probing establishes
+correctness, rather than maximal throughput. The full non-CUDA objective stays
+active, including broader codec/fuzz, performance and live/container scope.

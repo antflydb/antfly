@@ -101,6 +101,14 @@ pub const TimedPicture = struct { pts: i64, duration: ?u64 };
 /// can map multiple targets to one picture; duplicates are omitted. Uniform caps
 /// span the entire interval without allocating every target of a long video.
 pub fn cappedTimestamps(a: std.mem.Allocator, pictures: []const TimedPicture, timescale: u32, policy: TimestampPolicy, control: media.source.Control) ![]usize {
+    return cappedAtOrigin(a, pictures, timescale, policy, control, true);
+}
+/// Absolute source-clock selection, preserving rational tick comparisons. This
+/// is independent of which preroll pictures remain retained in a live window.
+pub fn cappedSourceTimestamps(a: std.mem.Allocator, pictures: []const TimedPicture, timescale: u32, policy: TimestampPolicy, control: media.source.Control) ![]usize {
+    return cappedAtOrigin(a, pictures, timescale, policy, control, false);
+}
+fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescale: u32, policy: TimestampPolicy, control: media.source.Control, relative: bool) ![]usize {
     try policy.validate();
     if (pictures.len == 0 or timescale == 0) return error.EmptyVideo;
     var first = pictures[0].pts;
@@ -123,6 +131,7 @@ pub fn cappedTimestamps(a: std.mem.Allocator, pictures: []const TimedPicture, ti
         if (picture.pts == latest and picture.duration == null) unknown_tail = true;
     }
     if (unknown_tail and previous != null) last = @max(last, @as(i128, latest) + (@as(i128, latest) - previous.?));
+    if (!relative) first = 0;
     const inferred = @divFloor((last - first) * 1_000_000_000 + timescale - 1, timescale);
     const end: i128 = policy.end_ns orelse (std.math.cast(i64, inferred) orelse return error.TimestampOverflow);
     if (end <= policy.start_ns) return error.EmptyVideoWindow;
@@ -271,4 +280,16 @@ test "presentation sampling handles VFR gaps overlapping pictures and repeated c
     try std.testing.expectEqualSlices(usize, &.{ 10, 11, 10, 11, 11, 11, 11, 12, 12 }, held);
     try std.testing.expectError(error.ResourceLimitExceeded, presentation(a, &pictures, .{ .start = std.math.minInt(i64), .end = std.math.maxInt(i64) }, .{ .step = 1 }, .{}));
     try std.testing.expectError(error.InvalidSamplingMetadata, presentation(a, &.{.{ .id = 0, .pts = 0, .duration = 0 }}, .{ .start = 0, .end = 1 }, .{ .step = 1 }, .{}));
+}
+
+test "source timestamp sampling retains rational VFR boundaries across preroll eviction" {
+    const a = std.testing.allocator;
+    const frames = [_]TimedPicture{ .{ .pts = 1, .duration = 1 }, .{ .pts = 2, .duration = 1 }, .{ .pts = 4, .duration = 1 } };
+    const policy = TimestampPolicy{ .start_ns = 1_333_333_333, .end_ns = 1_666_666_667, .step_ns = 1_000_000_000 };
+    const all = try cappedSourceTimestamps(a, &frames, 3, policy, .{});
+    defer a.free(all);
+    const tail = try cappedSourceTimestamps(a, frames[1..], 3, policy, .{});
+    defer a.free(tail);
+    try std.testing.expectEqualSlices(usize, &.{2}, all);
+    try std.testing.expectEqualSlices(usize, &.{1}, tail);
 }

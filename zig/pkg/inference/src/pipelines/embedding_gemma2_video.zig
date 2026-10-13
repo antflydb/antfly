@@ -39,7 +39,14 @@ pub const Encoded = struct {
 
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
-pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy };
+pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
+fn timestampSelect(a: std.mem.Allocator, metadata: []const video.sampling.TimedPicture, scale: u32, sampling: Sampling, control: media.source.Control) ![]usize {
+    return switch (sampling) {
+        .timestamps => |interval| video.sampling.cappedTimestamps(a, metadata, scale, interval, control),
+        .source_timestamps => |interval| video.sampling.cappedSourceTimestamps(a, metadata, scale, interval, control),
+        .reference => error.InvalidSamplingPolicy,
+    };
+}
 pub fn select(a: std.mem.Allocator, reader: *const media.mp4.Reader) ![]usize {
     return selectWithSampling(a, reader, .reference);
 }
@@ -56,16 +63,16 @@ pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader,
             const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
             defer a.free(metadata);
             for (logical.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
-            const selected = try video.sampling.cappedTimestamps(a, metadata, logical.timescale, sampling.timestamps, reader.input.control);
+            const selected = try timestampSelect(a, metadata, logical.timescale, sampling, reader.input.control);
             for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
             return selected;
         }
     }
-    if (sampling == .timestamps) {
+    if (sampling != .reference) {
         const metadata = try a.alloc(video.sampling.TimedPicture, reader.packets.len);
         defer a.free(metadata);
         for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration };
-        return video.sampling.cappedTimestamps(a, metadata, reader.track.timescale, sampling.timestamps, reader.input.control);
+        return timestampSelect(a, metadata, reader.track.timescale, sampling, reader.input.control);
     }
     if (reader.packets.len == 0 or reader.track.timescale == 0) return error.EmptyVideo;
     const order = try a.alloc(usize, reader.packets.len);
@@ -325,7 +332,7 @@ fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: 
     const metadata = try a.alloc(video.sampling.TimedPicture, index.pictures.len);
     defer a.free(metadata);
     for (index.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
-    return video.sampling.cappedTimestamps(a, metadata, 1_000_000_000, sampling.timestamps, control);
+    return timestampSelect(a, metadata, 1_000_000_000, sampling, control);
 }
 /// A request-owned producer with two queued preparations. It never touches model
 /// weights or a compute backend; start after admission and before the model gate.
@@ -1640,4 +1647,29 @@ test "embeddinggemma2 Metal video borrowed reader preparation matches container 
     const borrowed = try Prefetch.startReader(a, std.testing.io, device, &reader, .{}, sampling, &pool);
     defer borrowed.deinit();
     try std.testing.expectEqual(expected, try preparedReaderHash(a, borrowed));
+}
+
+test "embeddinggemma2 video source sampling preserves VFR picture identity after preroll eviction" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/mjpeg.mov");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "source-sampling" };
+    var original = try media.mp4.Reader.init(a, &source, .{});
+    defer original.deinit();
+    const packets = try a.dupe(media.mp4.Packet, original.packets[0..3]);
+    defer a.free(packets);
+    for (packets, [_]i64{ 1, 2, 4 }) |*packet, pts| {
+        packet.pts = pts;
+        packet.duration = 1;
+    }
+    var reader = original;
+    reader.track.timescale = 3;
+    reader.packets = packets;
+    const sampling = Sampling{ .source_timestamps = .{ .start_ns = 1_333_333_333, .end_ns = 1_666_666_667 } };
+    const all = try selectWithSampling(a, &reader, sampling);
+    defer a.free(all);
+    try std.testing.expectEqualSlices(usize, &.{2}, all);
+    reader.packets = packets[1..];
+    const tail = try selectWithSampling(a, &reader, sampling);
+    defer a.free(tail);
+    try std.testing.expectEqualSlices(usize, &.{1}, tail);
 }

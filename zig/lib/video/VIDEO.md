@@ -1803,3 +1803,32 @@ A caller supplies a presentation-complete window, including codec preroll and
 reordered-output dependencies, and separates configuration epochs. Automatic
 watermarks, live reload-to-window scheduling and pretrained streamed-window
 parity are still required. See [the window qualification receipt](testdata/live/validation/README.md).
+
+### Reload-to-window coordinator and exact source sampling
+
+[live_coordinator.zig](src/live_coordinator.zig) retains request-local published
+units under explicit byte/unit/packet/window bounds. Incoming units survive
+capacity failures, epoch changes drain old windows before clocks reset, and
+prepare/commit preserves the cursor across allocation, IO and cancellation
+failures. Eviction keeps validated logical IDR preroll, including the first
+member of field/partition assemblies, plus earlier-coded future presentation
+samples. Delivered windows remain independently owned.
+
+Automatic watermarks cover MJPEG and static progressive AVC using monotone
+scheduled decode clocks with enforced `PTS >= DTS`; AVC also validates complete
+pictures through the native decoder. Field-coded and in-band configuration
+streams require caller watermarks or EOF. Late/unsupported timing fails before
+ownership transfer. Source-time sampling uses exact rational comparisons and
+retains its selected picture when preroll is evicted; existing clip-relative
+sampling remains available. Empty intervals carry explicit gap events.
+
+The typed `embedding_gemma2.embedNextLive` adapter pumps currently published
+units, runs ordinary admitted native/Metal embedding and commits only after
+success. Reload/polling remains explicit. Source intervals and HLS/DASH timing
+are returned with each event. The adapter reserves conservative host capacity
+for validation/staging; limits above 64 MiB or 8192 packets are rejected before
+model admission. Current frontier validation decodes retained GOPs repeatedly;
+measuring and reducing that extra work remain required. Automatic field/dynamic
+watermarks, streamed pretrained parity and cross-window projection reuse also
+remain in the full active goal. See
+[testdata/live/coordinator-validation](testdata/live/coordinator-validation/README.md).

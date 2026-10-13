@@ -1035,3 +1035,30 @@ proves that future reordered pictures have arrived. Automatic watermark/window
 scheduling, live transport-to-model orchestration and pretrained stream-window
 parity remain follow-up work in the active objective. Qualification is recorded
 in `../video/testdata/live/validation`.
+
+### Bounded reload-to-window coordination
+
+The video coordinator owns published units and retains failed incoming units for
+retry. It caps units, retained bytes, packet count and window count. Explicit
+reload bridges preserve the existing authenticated HLS/DASH transport; polling
+sleeps remain caller-controlled and blocking reload is opt-in. Window delivery
+uses prepare/commit: fallible probing happens before cursor advancement, and
+inference failure leaves the same window available. Completed windows retain
+independent packet/configuration/identity storage after preroll eviction.
+
+Automatic frontiers currently cover MJPEG and static progressive AVC. AVC
+frontiers require full picture validation and the enforced scheduling contract
+`PTS >= DTS`; subsequent units must follow monotone decode clocks and cannot
+arrive before a sealed presentation point. Field-coded and in-band configuration
+streams use explicit watermarks or final EOF. Empty source intervals are explicit
+gap events, rather than invented embeddings. Exact source-time sampling avoids
+changes in selection when the retained preroll origin moves.
+
+`embedding_gemma2.embedNextLive` connects this coordinator to native/Metal model
+entry, commits after successful inference and reports source clocks and copied
+HLS/DASH timing. A null outer result means no ready window; a returned event with
+null embedding marks an empty interval. Conservative model admission covers
+window staging, validation and decode work. Automatic field/dynamic frontiers,
+pretrained streamed-window parity, projection reuse and reduction of repeated
+frontier decoding remain open. Receipts are in
+`../video/testdata/live/coordinator-validation`.

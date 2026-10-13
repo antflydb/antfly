@@ -15,4 +15,5 @@
 
 test {
     _ = @import("src/live_windows.zig");
+    _ = @import("src/live_coordinator.zig");
 }

@@ -83,6 +83,38 @@ pub fn embedLiveWindow(out: std.mem.Allocator, session: Session, tokenizer: Toke
     return embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control);
 }
 
+pub const LiveResult = struct {
+    result: ?Result,
+    source_start_ns: i64,
+    source_end_ns: i64,
+    policy: @import("antfly_video").sampling.TimestampPolicy,
+    ordinal: usize,
+    epoch: usize,
+    dash_timing: ?@import("antfly_media").hls.DashTiming,
+    hls_timing: ?@import("antfly_media").live_mp4.HlsTiming,
+};
+/// Pump currently published units and embed one transactional live window.
+/// Null means explicit reload is required unless the transport has ended.
+/// Failed inference/commit preserves the coordinator's retry cursor.
+pub fn embedNextLive(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, reader: anytype, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !?LiveResult {
+    const effective = control orelse Control{};
+    try effective.check();
+    if (coordinator.options.window.stream.max_bytes > 64 * 1024 * 1024 or coordinator.options.window.max_packets > 8192) return error.ResourceLimitExceeded;
+    var window_permit = try session.admitHostPreprocess(512 * 1024 * 1024);
+    defer window_permit.deinit();
+    const adapter = effective.imageWorkControl();
+    const old_control = coordinator.options.window.stream.control;
+    coordinator.options.window.stream.control = .{ .context = adapter.context, .check_fn = adapter.check_fn };
+    defer coordinator.options.window.stream.control = old_control;
+    var prepared = (try coordinator.pull(reader)) orelse return null;
+    defer prepared.deinit();
+    const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = .{ .source_timestamps = prepared.policy } } }, .{ .text = caption orelse "" } };
+    const result: ?Result = if (prepared.has_pictures) try embed(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control) else null;
+    errdefer if (result) |value| out.free(value.vector);
+    try coordinator.commit(&prepared);
+    return .{ .result = result, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing };
+}
+
 pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     return embedCached(out, session, tokenizer, group, options, lock, control, null);
 }
@@ -597,7 +629,10 @@ pub fn validateGroup(group: Group, options: Options) !void {
     for (group.content) |part| {
         const value = partBytes(part);
         if (part == .sampled_video) {
-            if (part.sampled_video.sampling == .timestamps) try part.sampled_video.sampling.timestamps.validate();
+            switch (part.sampled_video.sampling) {
+                .timestamps, .source_timestamps => |policy| try policy.validate(),
+                .reference => {},
+            }
             if (part.sampled_video.reader) |reader| {
                 if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;
                 _ = try @import("embedding_gemma2_video.zig").packetBytes(reader);
@@ -818,4 +853,18 @@ test "embeddinggemma2 video live window validates sampling before entering a mod
     const session: Session = undefined;
     const tokenizer: Tokenizer = undefined;
     try std.testing.expectError(error.InvalidSamplingPolicy, embedLiveWindow(std.testing.allocator, session, tokenizer, &.{}, .{ .step_ns = 0 }, null, .{}, null, null, null));
+}
+
+test "embeddinggemma2 video live pump checks cancellation before entering model admission" {
+    const Dummy = struct {
+        pub fn next(_: *@This()) !?@import("antfly_media").live_mp4.Segment {
+            return null;
+        }
+        pub fn ended(_: *const @This()) bool {
+            return true;
+        }
+    };
+    var reader = Dummy{};
+    var coordinator: @import("antfly_video").live_coordinator.Coordinator = undefined;
+    try std.testing.expectError(error.Timeout, embedNextLive(std.testing.allocator, @as(Session, undefined), @as(Tokenizer, undefined), &coordinator, &reader, null, .{}, null, .{ .deadline_ns = 0 }));
 }

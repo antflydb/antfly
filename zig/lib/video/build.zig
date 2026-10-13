@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     support.addTests(b, b.path("."), target, optimize);
     const live_root = b.createModule(.{ .root_source_file = b.path("live_window_test_root.zig"), .target = target, .optimize = optimize });
     live_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
-    const live_tests = b.addTest(.{ .root_module = live_root, .filters = &.{"live packet window"} });
+    const live_tests = b.addTest(.{ .root_module = live_root, .filters = &.{ "live packet window", "live coordinator", "source timestamp sampling" } });
     const run_live_tests = b.addRunArtifact(live_tests);
     run_live_tests.has_side_effects = true;
     b.step("test-live-windows", "Qualify owned HLS/DASH packet windows and shared admission").dependOn(&run_live_tests.step);
