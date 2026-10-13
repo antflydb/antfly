@@ -144,3 +144,99 @@ test "shared admission resizing retains ownership on denial and releases parse w
     try parsing.resize(.{ .host_bytes = 40, .device_bytes = 20 });
     try std.testing.expectEqual(Resources{ .host_bytes = 100, .device_bytes = 20 }, pool.snapshot());
 }
+
+/// Stable allocator owner that admits every live allocation and potential
+/// old/new moving-growth overlap before touching the backing allocator.
+/// Keep this owner immovable while its allocator is in use. Free allocations
+/// before releasing the token, or transfer allocations and token together to
+/// the backing allocator after all temporary owners have been released.
+pub const TrackedAllocator = struct {
+    backing: std.mem.Allocator,
+    reservation: @import("admission.zig").Token,
+    limit: usize,
+    live: usize = 0,
+    denied: ?anyerror = null,
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn reserve(self: *@This(), bytes: usize) bool {
+        if (bytes > self.limit) {
+            self.denied = error.ResourceLimitExceeded;
+            return false;
+        }
+        self.reservation.resize(.{ .host_bytes = bytes }) catch |err| {
+            self.denied = err;
+            return false;
+        };
+        self.denied = null;
+        return true;
+    }
+    fn restore(self: *@This(), bytes: usize) void {
+        // Restoration only shrinks an existing reservation.
+        self.reservation.resize(.{ .host_bytes = bytes }) catch unreachable;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const next = std.math.add(usize, self.live, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return null;
+        };
+        if (!self.reserve(next)) return null;
+        const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+            self.restore(self.live);
+            self.denied = null;
+            return null;
+        };
+        self.live = next;
+        self.denied = null;
+        return result;
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (len <= bytes.len) {
+            // Do not publish a smaller charge before the backing allocator has
+            // actually shrunk; another request may consume the released room.
+            if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
+            self.live = self.live - bytes.len + len;
+            self.restore(self.live);
+            self.denied = null;
+            return true;
+        }
+        const next = std.math.add(usize, self.live - bytes.len, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return false;
+        };
+        if (!self.reserve(next)) return false;
+        if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+            self.restore(self.live);
+            return false;
+        }
+        self.live = next;
+        self.denied = null;
+        return true;
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Try explicit in-place resize before reserving a possible move.
+        if (resize(raw, bytes, alignment, len, ra)) return bytes.ptr;
+        const overlap = std.math.add(usize, self.live, len) catch {
+            self.denied = error.ResourceLimitExceeded;
+            return null;
+        };
+        if (!self.reserve(overlap)) return null;
+        const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+            self.restore(self.live);
+            return null;
+        };
+        self.live = self.live - bytes.len + len;
+        self.restore(self.live);
+        self.denied = null;
+        return result;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(bytes, alignment, ra);
+        self.live -= bytes.len;
+        self.restore(self.live);
+    }
+};

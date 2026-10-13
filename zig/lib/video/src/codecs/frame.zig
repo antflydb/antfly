@@ -51,9 +51,11 @@ pub const Batch = struct {
     frames: []Frame,
     /// Native visible outputs drained, including outputs not materialized.
     output_count: usize = 0,
+    reservation: media.admission.Token = .{},
     pub fn deinit(self: *Batch) void {
         for (self.frames) |*frame| frame.deinit();
         self.allocator.free(self.frames);
+        self.reservation.deinit();
         self.* = undefined;
     }
 };

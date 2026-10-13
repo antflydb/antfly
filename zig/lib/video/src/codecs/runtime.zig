@@ -25,6 +25,7 @@ threadlocal var current: ?*Owner = null;
 /// state, are reclaimable without traversing decoder structures after failure.
 pub const Owner = struct {
     budget: Budget,
+    allocations: ?media.admission.TrackedAllocator = null,
     head: ?*Header = null,
     control: media.source.Control = .{},
     failure: ?anyerror = null,
@@ -41,6 +42,10 @@ pub const Owner = struct {
     pub fn sweep(self: *Owner) void {
         while (self.head) |h| antfly_codec_afz_free(@as([*]u8, @ptrCast(h)) + 64);
         std.debug.assert(self.budget.live == 0);
+        if (self.allocations) |*tracked| {
+            std.debug.assert(tracked.live == 0);
+            tracked.reservation.deinit();
+        }
     }
     pub fn result(self: *Owner) !void {
         if (self.failure) |err| return err;
@@ -69,7 +74,7 @@ pub export fn antfly_codec_afz_malloc(n: usize) ?*anyopaque {
         return null;
     };
     const data = owner.budget.allocator().alignedAlloc(u8, .@"64", total) catch |err| {
-        owner.failure = if (owner.budget.denied) error.ResourceLimitExceeded else err;
+        owner.failure = if (owner.budget.denied) error.ResourceLimitExceeded else if (owner.allocations) |tracked| tracked.denied orelse err else err;
         return null;
     };
     const h: *Header = @ptrCast(data.ptr);
@@ -302,4 +307,22 @@ pub fn vp9TransformRange(input: i64, depth: c_int) i64 {
         return 0;
     }
     return input;
+}
+
+test "codec realloc shared denial preserves old allocation and accounts headers" {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 300 } };
+    var owner = Owner{ .budget = .{ .backing = std.testing.allocator, .limit = 4096 }, .allocations = .{ .backing = std.testing.allocator, .limit = 4096, .reservation = try pool.acquire(.{}) } };
+    owner.budget.backing = owner.allocations.?.allocator();
+    defer owner.sweep();
+    const scope = Scope.enter(&owner);
+    defer scope.deinit();
+    const data = antfly_codec_afz_malloc(100) orelse return error.TestUnexpectedResult;
+    const bytes = @as([*]u8, @ptrCast(data))[0..100];
+    @memset(bytes, 0x5a);
+    try std.testing.expectEqual(@as(u64, 164), pool.snapshot().host_bytes);
+    try std.testing.expect(antfly_codec_afz_realloc(data, 150) == null);
+    try std.testing.expectError(error.SharedAdmissionExceeded, owner.result());
+    try std.testing.expectEqual(@as(u64, 164), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(usize, 164), owner.budget.live);
+    for (bytes) |value| try std.testing.expectEqual(@as(u8, 0x5a), value);
 }

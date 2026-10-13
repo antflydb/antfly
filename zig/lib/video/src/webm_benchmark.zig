@@ -258,19 +258,30 @@ fn benchmarkReplay(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader
         var full_stats = video.webm_pictures.ReplayStats{};
         var seek_stats = video.webm_pictures.ReplayStats{};
         var options = video.webm_pictures.Options{ .decoder = .{ .admission_pool = pool }, .replay_stats = &full_stats, .copy_unselected_outputs = copy_only };
+        // This benchmark is single-consumer; reset admission high-water between
+        // independently completed decoder owners, retaining container/index charges.
+        pool.high_water = pool.snapshot();
         const full_start = now(io);
         if (copy_only) try video.webm_pictures.walkIndexed(a, reader, options, index, selections[0..count], &baseline, Capture.accept) else try video.webm_pictures.walk(a, reader, options, selections[0..count], &baseline, Capture.accept);
         const full_ns = now(io) - full_start;
+        const full_peak = pool.high_water.host_bytes;
         options.replay_stats = &seek_stats;
         options.copy_unselected_outputs = false;
+        pool.high_water = pool.snapshot();
         const seek_start = now(io);
         try video.webm_pictures.walkIndexed(a, reader, options, index, selections[0..count], &replay, Capture.accept);
         const seek_ns = now(io) - seek_start;
+        const seek_peak = pool.high_water.host_bytes;
         if (baseline.count != count or replay.count != count) return error.ReplayParityMismatch;
         for (baseline.records[0..count], replay.records[0..count]) |expected, actual| if (!std.meta.eql(expected, actual)) return error.ReplayParityMismatch;
+        const serialized = try std.json.Stringify.valueAlloc(a, replay.records[0..count], .{});
+        defer a.free(serialized);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(serialized, &digest, .{});
+        const hex_digest = std.fmt.bytesToHex(digest, .lower);
         if (copy_only) {
             if (full_stats.packets_decoded != seek_stats.packets_decoded) return error.ReplayParityMismatch;
-            try out.print("{{\"kind\":\"replay_copy\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"selected_count\":{d},\"copy_all_ns\":{d},\"selected_ns\":{d},\"packets\":{d},\"copy_all_bytes\":{d},\"selected_bytes\":{d},\"skipped_outputs\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, count, full_ns, seek_ns, full_stats.packets_decoded, full_stats.output_copy_bytes, seek_stats.output_copy_bytes, seek_stats.outputs_skipped });
+            try out.print("{{\"kind\":\"replay_copy\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"selected_count\":{d},\"copy_all_ns\":{d},\"selected_ns\":{d},\"packets\":{d},\"copy_all_bytes\":{d},\"selected_bytes\":{d},\"skipped_outputs\":{d},\"copy_all_admitted_peak_bytes\":{d},\"selected_admitted_peak_bytes\":{d},\"selection_digest\":\"{s}\",\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, count, full_ns, seek_ns, full_stats.packets_decoded, full_stats.output_copy_bytes, seek_stats.output_copy_bytes, seek_stats.outputs_skipped, full_peak, seek_peak, hex_digest });
         } else try out.print("{{\"kind\":\"replay\",\"codec\":\"{s}\",\"iteration\":{d},\"pictures\":{d},\"first_selected\":{d},\"selected_count\":{d},\"full_ns\":{d},\"seek_ns\":{d},\"full_packets\":{d},\"seek_packets\":{d},\"first_packet\":{d},\"bootstrap_bytes\":{d},\"parity_checked\":true}}\n", .{ @tagName(reader.track.codec), iteration, index.pictures.len, first, count, full_ns, seek_ns, full_stats.packets_decoded, seek_stats.packets_decoded, seek_stats.first_packet, seek_stats.bootstrap_bytes });
         try out.flush();
     }

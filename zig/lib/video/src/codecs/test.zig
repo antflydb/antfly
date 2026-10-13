@@ -87,7 +87,7 @@ test "VP9 AV1 output survives session destruction and releases admission" {
         const item = batch.frames[0];
         try std.testing.expectEqual(@as(i64, 42), item.pts_ns);
         try std.testing.expectEqual(@as(?u64, 7), item.duration_ns);
-        try std.testing.expectEqual(@as(u64, item.bytes.len), pool.snapshot().host_bytes);
+        try std.testing.expectEqual(@as(u64, item.bytes.len + batch.frames.len * @sizeOf(decoder.Frame)), pool.snapshot().host_bytes);
         try item.host().validate();
         batch.deinit();
         try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
@@ -178,7 +178,7 @@ const Worker = struct {
     }
     fn decode(self: *Worker) !void {
         for (0..3) |_| {
-            const session = try decoder.Session.create(std.heap.page_allocator, self.codec, .{ .max_decode_bytes = 16 * 1024 * 1024, .admission_pool = self.pool });
+            const session = try decoder.Session.create(std.heap.page_allocator, self.codec, .{ .admission_pool = self.pool });
             defer session.destroy();
             var batch = try session.decode(if (self.codec == .vp9) first("vp9") else first("av1"), 0, null);
             defer batch.deinit();
@@ -571,7 +571,7 @@ test "AV1 Annex B cancellation and post-entry denial release normalization" {
     try std.testing.expectError(error.ResourceLimitExceeded, denied.decode(packet, 0, null));
     try std.testing.expect(denied.failed);
     try std.testing.expectEqual(@as(usize, 0), denied.owner.budget.live);
-    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(u64, @sizeOf(decoder.Session)), pool.snapshot().host_bytes);
 }
 
 fn selectedOutputParity(coded: []const u8, codec: decoder.Codec, options: decoder.Options) !void {
@@ -694,4 +694,84 @@ test "VP9 AV1 corruption errors are preserved when every output is skipped" {
         }
         try std.testing.expect(failures > 0);
     }
+}
+
+test "VP9 AV1 default ceilings admit actual core and independently retained batch bytes" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+        {
+            const session = try decoder.Session.create(std.testing.allocator, codec, .{ .admission_pool = &pool });
+            defer session.destroy();
+            try std.testing.expectEqual(@as(u64, @sizeOf(decoder.Session) + session.owner.budget.live), pool.snapshot().host_bytes);
+            try std.testing.expectEqual(session.owner.budget.live, session.owner.allocations.?.live);
+            {
+                var batch = try session.decode(if (codec == .vp9) first("vp9") else first("av1"), 0, null);
+                defer batch.deinit();
+                var output: usize = batch.frames.len * @sizeOf(decoder.Frame);
+                for (batch.frames) |item| output += item.bytes.len;
+                try std.testing.expectEqual(@as(u64, output + @sizeOf(decoder.Session) + session.owner.budget.live), pool.snapshot().host_bytes);
+                try std.testing.expectEqual(@as(u64, batch.frames.len * @sizeOf(decoder.Frame)), batch.reservation.resources.host_bytes);
+                try std.testing.expect(pool.snapshot().host_bytes < session.options.max_decode_bytes);
+            }
+            try std.testing.expectEqual(@as(u64, @sizeOf(decoder.Session) + session.owner.budget.live), pool.snapshot().host_bytes);
+        }
+        try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    }
+}
+test "VP9 AV1 shared denial sweeps core preserves peer charge and retains failed session object" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+        {
+            const session = try decoder.Session.create(std.testing.allocator, codec, .{ .admission_pool = &pool });
+            defer session.destroy();
+            const remaining = pool.limits.host_bytes - pool.snapshot().host_bytes;
+            var peer = try pool.acquire(.{ .host_bytes = remaining });
+            defer peer.deinit();
+            try std.testing.expectError(error.SharedAdmissionExceeded, session.decodeOutputs(if (codec == .vp9) first("vp9") else first("av1"), 0, null, .none));
+            try std.testing.expect(session.failed);
+            try std.testing.expectEqual(@as(usize, 0), session.owner.budget.live);
+            try std.testing.expectEqual(@as(usize, 0), session.owner.allocations.?.live);
+            try std.testing.expectEqual(remaining, peer.resources.host_bytes);
+            try std.testing.expectEqual(remaining + @sizeOf(decoder.Session), pool.snapshot().host_bytes);
+            try std.testing.expectError(error.InvalidDecoderSession, session.decodeOutputs(if (codec == .vp9) first("vp9") else first("av1"), 0, null, .none));
+        }
+        try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    }
+}
+test "VP9 AV1 every shared allocation failure releases core batch and session charges" {
+    inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator, c: decoder.Codec) !void {
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            const session = try decoder.Session.create(a, c, .{ .admission_pool = &pool });
+            defer session.destroy();
+            var batch = try session.decode(if (c == .vp9) first("vp9") else first("av1"), 0, null);
+            defer batch.deinit();
+        }
+    }.run, .{codec});
+}
+
+test "AV1 shared Annex B preflight denial is retryable and does not mask later corruption" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    {
+        const session = try decoder.Session.create(a, .av1, .{ .admission_pool = &pool, .av1_framing = .annex_b });
+        defer session.destroy();
+        const live = session.owner.budget.live;
+        const coded = @embedFile("../../testdata/av1-extended/av1-annex-b.ivf");
+        const packet = coded[44..][0..std.mem.readInt(u32, coded[32..36], .little)];
+        var peer = try pool.acquire(.{ .host_bytes = pool.limits.host_bytes - pool.snapshot().host_bytes });
+        defer peer.deinit();
+        try std.testing.expectError(error.SharedAdmissionExceeded, session.decodeOutputs(packet, 0, null, .none));
+        try std.testing.expect(!session.failed);
+        try std.testing.expectEqual(live, session.owner.budget.live);
+        peer.deinit();
+        try std.testing.expectError(error.InvalidVideoData, session.decodeOutputs(packet[0..1], 0, null, .none));
+        try std.testing.expect(!session.failed);
+        var result = try session.decodeOutputs(packet, 0, null, .none);
+        defer result.deinit();
+        try std.testing.expect(result.output_count > 0);
+        try std.testing.expectEqual(@as(usize, 0), result.frames.len);
+    }
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
 }

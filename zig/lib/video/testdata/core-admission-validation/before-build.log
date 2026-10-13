@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded
+install-webm-benchmark success
++- install webm-benchmark success
+   +- compile exe webm-benchmark safe native success 56s MaxRSS:1G
+      +- WriteFile video_prepare_shader.h success
+

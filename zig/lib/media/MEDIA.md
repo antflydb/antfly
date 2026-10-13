@@ -1259,3 +1259,23 @@ retrieval gates pass against pinned PyTorch. The original non-CUDA scope remains
 active; this does not add incremental live AVC validation or projection reuse.
 
 See [qualification receipts](../video/testdata/selected-output-validation/README.md).
+
+
+### Admit actual VP9/AV1 core and batch allocations
+
+Decoder sessions now charge their object footprint and each live core allocation
+instead of retaining the entire configured decode ceiling. The shared tracked
+allocator admits allocation headers, normalization and old/new growth overlap
+before allocation. Independently retained batch metadata and pixel frames own
+separate tokens. Failure sweeps core storage; the failed object remains charged
+until destruction. Shared denial preserves peers, and Annex B preflight denial
+remains retryable without masking subsequent corruption.
+
+Matched real-clip replay preserves selected-output digests and packet/copy counts.
+Peak shared admission drops from 303–305 MB to 38–70 MB across the 480p/1080p
+VP9/AV1 corpus. These are admitted bytes rather than RSS or throughput. Debug and
+ReleaseSafe pass 225 macOS video checks; actual Linux passes 200, with platform
+skips. CPU/Metal model and shared media/HTTP gates pass. The original non-CUDA
+scope remains active.
+
+See [qualification receipts](../video/testdata/core-admission-validation/README.md).

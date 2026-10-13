@@ -117,7 +117,8 @@ pub fn addBenchmarks(b: *std.Build, root: std.Build.LazyPath, target: std.Build.
     const live_exe = b.addExecutable(.{ .name = "live-coordinator-benchmark", .root_module = live_root, .use_llvm = executable.use_llvm });
     b.step("install-live-coordinator-benchmark", "Install completed live validation/window benchmark").dependOn(&b.addInstallArtifact(live_exe, .{}).step);
 
-    const webm_module = b.createModule(.{ .root_source_file = root.path(b, "webm_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const webm_source = b.option([]const u8, "webm-benchmark-root-source", "Alternate source-pinned benchmark root for historical decoder comparisons");
+    const webm_module = b.createModule(.{ .root_source_file = if (webm_source) |source| .{ .cwd_relative = source } else root.path(b, "webm_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     configure(b, webm_module, root, target, null);
     // Benchmark-only source substitution permits matched experiments without
     // changing production decoder policies or adding runtime codec dependencies.

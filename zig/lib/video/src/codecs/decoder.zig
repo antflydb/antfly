@@ -81,11 +81,14 @@ pub const Session = struct {
         if ((builtin.os.tag != .linux and builtin.os.tag != .macos) or builtin.cpu.arch.endian() != .little) return error.UnsupportedVideoBackend;
         try options.control.check();
         if (options.max_pixels == 0 or options.max_pixels > 16 * 1024 * 1024 or options.max_output_frames == 0 or options.max_output_frames > 64) return error.InvalidDecodeOptions;
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.max_decode_bytes }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Session) }) else media.admission.Token{};
         errdefer reservation.deinit();
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .codec = codec, .options = options, .reservation = reservation, .owner = .{ .budget = .{ .backing = allocator, .limit = options.max_decode_bytes }, .control = options.control } };
+        self.* = .{ .allocator = allocator, .codec = codec, .options = options, .reservation = reservation, .owner = .{ .budget = .{ .backing = allocator, .limit = options.max_decode_bytes }, .control = options.control, .allocations = .{ .backing = allocator, .limit = options.max_decode_bytes, .reservation = .{} } } };
+        self.owner.allocations.?.reservation = if (options.admission_pool) |pool| try pool.acquire(.{}) else media.admission.Token{};
+        // Allocator contexts point into the immovable heap-owned session.
+        self.owner.budget.backing = self.owner.allocations.?.allocator();
         errdefer self.owner.sweep();
         const scope = runtime.Scope.enter(&self.owner);
         defer scope.deinit();
@@ -111,14 +114,16 @@ pub const Session = struct {
         // There are no worker threads, external buffers, OS handles or callbacks
         // in these configurations. Reclaim every allocation even after a parser
         // abort, without calling a destructor on partially initialized state.
+        const allocator = self.allocator;
+        var reservation = self.reservation;
         self.owner.sweep();
-        self.reservation.deinit();
-        self.allocator.destroy(self);
+        allocator.destroy(self);
+        reservation.deinit();
     }
     fn invalidate(self: *Session) void {
         self.failed = true;
         self.owner.sweep();
-        self.reservation.deinit();
+        // The failed session object remains charged until destroy().
         self.av1_context = null;
         self.vp9_context = .{};
     }
@@ -137,6 +142,8 @@ pub const Session = struct {
             if (selection.indexes.len > self.options.max_output_frames) return error.ResourceLimitExceeded;
             for (selection.indexes) |id| if (id >= self.options.max_output_frames) return error.InvalidPacketIndex;
         }
+        self.owner.budget.denied = false;
+        self.owner.allocations.?.denied = null;
         var parts: header.Parts = .{};
         var references = self.references;
         var normalized: ?annex_b.Units = null;
@@ -154,11 +161,17 @@ pub const Session = struct {
                     self.owner.budget.denied = false;
                     return error.ResourceLimitExceeded;
                 }
-                return err;
+                return if (err == error.OutOfMemory) self.owner.allocations.?.denied orelse err else err;
             };
         }
         const coded_parts = if (normalized) |units| units.packets else parts.packets[0..parts.len];
-        var frames: std.array_list.Managed(Frame) = .init(self.allocator);
+        var metadata_allocator = media.admission.TrackedAllocator{
+            .backing = self.allocator,
+            .limit = 3 * (self.options.max_output_frames + 8) * @sizeOf(Frame),
+            .reservation = if (self.options.admission_pool) |pool| try pool.acquire(.{}) else media.admission.Token{},
+        };
+        errdefer metadata_allocator.reservation.deinit();
+        var frames: std.array_list.Managed(Frame) = .init(metadata_allocator.allocator());
         errdefer {
             for (frames.items) |*item| item.deinit();
             frames.deinit();
@@ -212,7 +225,7 @@ pub const Session = struct {
                     errdefer copy.deinit();
                     copy.output_index = output_index;
                     self.output_stats.copied_bytes +|= copy.bytes.len;
-                    try self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns);
+                    self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns) catch |err| return metadata_allocator.denied orelse err;
                 }
             },
             .vp9 => {
@@ -243,14 +256,16 @@ pub const Session = struct {
                     errdefer copy.deinit();
                     copy.output_index = output_index;
                     self.output_stats.copied_bytes +|= copy.bytes.len;
-                    try self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns);
+                    self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns) catch |err| return metadata_allocator.denied orelse err;
                 }
             },
         };
         try self.owner.result();
         try self.options.control.check();
         self.references = references;
-        return .{ .allocator = self.allocator, .frames = try frames.toOwnedSlice(), .output_count = output_count };
+        const owned = frames.toOwnedSlice() catch |err| return metadata_allocator.denied orelse err;
+        std.debug.assert(metadata_allocator.live == owned.len * @sizeOf(Frame));
+        return .{ .allocator = self.allocator, .frames = owned, .output_count = output_count, .reservation = metadata_allocator.reservation };
     }
     fn observeOutput(self: *Session, count: *usize) !usize {
         if (count.* >= self.options.max_output_frames) return error.ResourceLimitExceeded;
