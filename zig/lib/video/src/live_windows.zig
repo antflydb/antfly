@@ -120,6 +120,59 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
     return .{ .snapshot = snapshot, .epoch = first.epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .track = track, .packets = packets, .index_reservation = reservation, .limits = .{} } };
 }
 
+/// Own an equivalent reader with parameter NALs prepended to its first payload.
+/// Packet selectors/clocks are unchanged. No input or bootstrap ownership escapes.
+pub fn copyWithParameters(a: std.mem.Allocator, identity: []const u8, reader: *media.mp4.Reader, epoch: usize, parameters: []const u8, options: Options) !Window {
+    if (identity.len > options.max_identity_bytes or reader.packets.len == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    if (parameters.len != 0 and (!reader.track.inband_parameter_sets or reader.track.codec != .avc)) return error.UnsupportedDynamicVideoConfig;
+    const metadata_size = try std.math.add(usize, reader.track.avcc.len, reader.track.color_info.len);
+    var size = try std.math.add(usize, metadata_size, parameters.len);
+    for (reader.packets) |packet| size = try std.math.add(usize, size, packet.size);
+    if (size > options.stream.max_bytes) return error.ResourceLimitExceeded;
+    const count = reader.packets.len;
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, size, try std.math.mul(usize, count, @sizeOf(media.mp4.Packet))) }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = identity.len }) else media.admission.Token{};
+    errdefer identity_reservation.deinit();
+    const owned_identity = try a.dupe(u8, identity);
+    errdefer a.free(owned_identity);
+    const packets = try a.dupe(media.mp4.Packet, reader.packets);
+    errdefer a.free(packets);
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    @memcpy(bytes[0..reader.track.avcc.len], reader.track.avcc);
+    @memcpy(bytes[reader.track.avcc.len..][0..reader.track.color_info.len], reader.track.color_info);
+    var cursor = metadata_size;
+    for (packets, 0..) |*packet, i| {
+        try options.stream.control.check();
+        packet.offset = cursor;
+        if (i == 0) {
+            @memcpy(bytes[cursor..][0..parameters.len], parameters);
+            cursor += parameters.len;
+            packet.size = std.math.cast(u32, try std.math.add(usize, packet.size, parameters.len)) orelse return error.ResourceLimitExceeded;
+        }
+        var payload = try reader.readPacket(i);
+        defer payload.deinit();
+        @memcpy(bytes[cursor..][0..payload.bytes.len], payload.bytes);
+        cursor += payload.bytes.len;
+    }
+    const snapshot = try media.stream.Snapshot.copy(a, owned_identity, &.{bytes}, options.stream);
+    errdefer snapshot.deinit();
+    var metadata = try snapshot.input.read(0, metadata_size);
+    errdefer metadata.deinit();
+    var track = reader.track;
+    track.avcc = metadata.bytes[0..track.avcc.len];
+    track.color_info = metadata.bytes[track.avcc.len..];
+    try reservation.resize(.{ .host_bytes = packets.len * @sizeOf(media.mp4.Packet) });
+    return .{ .snapshot = snapshot, .epoch = epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .track = track, .packets = packets, .index_reservation = reservation, .limits = .{} } };
+}
+pub fn prefixParameters(window: *Window, parameters: []const u8, options: Options) !void {
+    if (parameters.len == 0) return;
+    const replacement = try copyWithParameters(window.reader.allocator, window.identity, &window.reader, window.epoch, parameters, options);
+    window.deinit();
+    window.* = replacement;
+}
+
 fn joinAllocationRun(a: std.mem.Allocator) !void {
     const file = @embedFile("../testdata/live/fragmented.mp4");
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };

@@ -51,6 +51,16 @@ pub const Prepared = struct {
 /// Single consumer. Unit ownership transfers only after successful append.
 /// A prepared output owns independent storage; commit only after delivery succeeds.
 pub const Stats = struct { validation_walks: usize = 0, validation_packets: usize = 0, validation_payload_bytes: u64 = 0, metadata_snapshots: usize = 0 };
+const Parameters = struct {
+    allocator: ?std.mem.Allocator = null,
+    bytes: []u8 = &.{},
+    reservation: media.admission.Token = .{},
+    fn deinit(self: *Parameters) void {
+        if (self.allocator) |a| a.free(self.bytes);
+        self.reservation.deinit();
+        self.* = .{};
+    }
+};
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -64,6 +74,7 @@ pub const Coordinator = struct {
     pending_ns: ?i64 = null,
     logical: ?pictures.Index = null,
     stream: ?*pictures.Stream = null,
+    parameters: Parameters = .{},
     logical_base: usize = 0,
     stats: Stats = .{},
     ordinal: usize = 0,
@@ -84,6 +95,7 @@ pub const Coordinator = struct {
     }
     pub fn deinit(self: *Coordinator) void {
         self.dropStream();
+        self.parameters.deinit();
         for (self.units[0..self.count]) |*unit| unit.deinit();
         if (self.pending) |*unit| unit.deinit();
         if (self.logical) |*logical| logical.deinit();
@@ -102,6 +114,40 @@ pub const Coordinator = struct {
         if (first.epoch != unit.epoch) return false;
         if (first.dash_timing) |left| return unit.dash_timing != null and std.meta.eql(left.period, unit.dash_timing.?.period);
         return unit.dash_timing == null;
+    }
+    fn joined(self: *Coordinator, identity: []const u8, count: usize) !windows.Window {
+        var view = try windows.join(self.allocator, identity, self.units[0..count], self.options.window);
+        errdefer view.deinit();
+        try windows.prefixParameters(&view, self.parameters.bytes, self.options.window);
+        return view;
+    }
+    /// Prepare an independently owned checkpoint and canonical suffix before
+    /// changing stream state or releasing any published-unit ownership.
+    fn rebaseStream(self: *Coordinator, reader: *media.mp4.Reader, removed: usize) !void {
+        if (removed == 0) return;
+        if (!reader.track.inband_parameter_sets) {
+            if (self.stream) |stream| try stream.rebase(reader, removed);
+            return;
+        }
+        const limit = (@import("h264.zig").Options{}).max_parameter_bytes;
+        var checkpoint = Parameters{ .allocator = self.allocator, .reservation = if (self.options.window.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limit }) else media.admission.Token{} };
+        errdefer checkpoint.deinit();
+        if (self.stream) |stream| {
+            checkpoint.bytes = try stream.parameterBootstrap(self.allocator, removed);
+        } else {
+            // The replay oracle also needs an owned effective-parameter suffix.
+            const registry = try @import("h264_dynamic.zig").Session.init(self.allocator, reader, .{ .max_parameter_packets = self.options.window.max_packets });
+            defer registry.deinit();
+            checkpoint.bytes = try registry.bootstrapBefore(self.allocator, removed);
+        }
+        try checkpoint.reservation.resize(.{ .host_bytes = checkpoint.bytes.len });
+        var suffix = reader.*;
+        suffix.packets = reader.packets[removed..];
+        var canonical = try windows.copyWithParameters(self.allocator, "live-parameter-checkpoint", &suffix, self.units[0].epoch, checkpoint.bytes, self.options.window);
+        defer canonical.deinit();
+        if (self.stream) |stream| try stream.rebaseWithPrefix(reader, removed, &canonical.reader);
+        self.parameters.deinit();
+        self.parameters = checkpoint;
     }
     pub fn append(self: *Coordinator, unit: *?media.live_mp4.Segment) !void {
         try self.options.window.stream.control.check();
@@ -122,7 +168,7 @@ pub const Coordinator = struct {
         }
         // Join validates complete clock/configuration compatibility transactionally.
         self.units[self.count] = value;
-        var view = try windows.join(self.allocator, "live-probe", self.units[0 .. self.count + 1], self.options.window);
+        var view = try self.joined("live-probe", self.count + 1);
         defer view.deinit();
         errdefer self.dropStream();
         var sealed = self.sealed_ns;
@@ -134,7 +180,7 @@ pub const Coordinator = struct {
             sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
         } else {
             const picture_options = pictures.Options{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } };
-            if (self.options.incremental_validation and !view.reader.track.inband_parameter_sets) {
+            if (self.options.incremental_validation) {
                 if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, &view.reader, picture_options);
                 _ = try self.stream.?.advance(&view.reader);
                 logical = try self.stream.?.snapshot(&view.reader);
@@ -158,7 +204,7 @@ pub const Coordinator = struct {
             released = try std.math.add(usize, released, try charge(old));
             removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
         }
-        if (keep != 0) if (self.stream) |stream| try stream.rebase(&view.reader, removed_packets);
+        if (keep != 0) try self.rebaseStream(&view.reader, removed_packets);
         if (self.logical) |*previous| previous.deinit();
         self.logical = logical;
         logical = null;
@@ -203,7 +249,7 @@ pub const Coordinator = struct {
         if (sealed < requested and !self.finished) return null;
         if (self.ordinal >= self.options.max_windows) return error.ResourceLimitExceeded;
         const end = @min(requested, sealed);
-        var window = try windows.join(self.allocator, "live-model-window", self.units[0..self.count], self.options.window);
+        var window = try self.joined("live-model-window", self.count);
         errdefer window.deinit();
         var eligible = false;
         var logical: ?pictures.Index = null;
@@ -241,11 +287,20 @@ pub const Coordinator = struct {
             }
         } else {
             const logical = logical_index orelse return error.InvalidLivePictureIndex;
+            var registry: ?*@import("h264_dynamic.zig").Session = null;
+            defer if (registry) |owner| owner.deinit();
             for (logical.pictures) |picture| {
                 if (try ns(picture.pts, reader.track.timescale) > cutoff) continue;
                 var payload = try reader.readPacket(picture.first_packet);
                 defer payload.deinit();
-                if (!try avc.isPortableIdr(payload.bytes, reader.track.nal_length_bytes)) continue;
+                if (!try avc.isPortableIdr(payload.bytes, reader.track.nal_length_bytes)) {
+                    if (!reader.track.inband_parameter_sets) continue;
+                    const active = if (self.stream) |stream| stream.registry else null;
+                    if (active == null and registry == null) registry = try @import("h264_dynamic.zig").Session.init(self.allocator, &reader, .{ .max_parameter_packets = self.options.window.max_packets });
+                    const planner = active orelse registry.?;
+                    const cfg = try planner.configAt(picture.first_packet);
+                    if (!try @import("h264.zig").isDependencyReset(self.allocator, cfg, payload.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                }
                 var count: usize = 0;
                 for (self.units[0..active_count], 0..) |unit, index| {
                     count += unit.reader.packets.len;
@@ -292,7 +347,7 @@ pub const Coordinator = struct {
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
         const next_base = try std.math.add(usize, self.logical_base, removed_packets);
-        if (removed_packets != 0) if (self.stream) |stream| try stream.rebase(@constCast(&prepared.window.reader), removed_packets);
+        try self.rebaseStream(@constCast(&prepared.window.reader), removed_packets);
         self.start_ns = next_start;
         self.epoch_committed = true;
         self.ordinal += 1;
@@ -332,6 +387,7 @@ pub const Coordinator = struct {
                 if (self.logical) |*logical| logical.deinit();
                 self.logical = null;
                 self.dropStream();
+                self.parameters.deinit();
                 self.logical_base = 0;
                 self.finished = false;
                 self.epoch_committed = false;
@@ -855,4 +911,111 @@ test "live coordinator incremental validation avoids old packet reconstruction a
             saved = prepared;
         }
     }
+}
+
+fn dynamicUnit(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, options: Options) !?media.live_mp4.Segment {
+    var single = reader.*;
+    single.packets = reader.packets[index .. index + 1];
+    const window = try windows.copyWithParameters(a, "dynamic-live-unit", &single, 0, &.{}, options.window);
+    return .{ .backing = window.snapshot, .reader = window.reader, .identity = window.identity, .identity_reservation = window.identity_reservation, .ordinal = index, .epoch = 0, .origin = .normalized_transport };
+}
+fn assertDynamicPixels(a: std.mem.Allocator, prepared: *const Prepared, original: *media.mp4.Reader, original_index: usize) !void {
+    var view = prepared.window.reader;
+    const reference = try @import("h264_dynamic.zig").Session.init(a, original, .{});
+    defer reference.deinit();
+    var expected = try reference.decodeFrame(original_index);
+    defer expected.deinit();
+    const independent = try @import("h264_dynamic.zig").Session.init(a, &view, .{});
+    defer independent.deinit();
+    var selector: ?usize = null;
+    for (prepared.logical.?.pictures) |picture| if (picture.pts == original.packets[original_index].pts) {
+        selector = picture.first_packet;
+        break;
+    };
+    var actual = try independent.decodeFrame(selector orelse return error.TestUnexpectedResult);
+    defer actual.deinit();
+    try std.testing.expectEqual(expected.width, actual.width);
+    try std.testing.expectEqual(expected.height, actual.height);
+    try std.testing.expectEqual(expected.bit_depth, actual.bit_depth);
+    try std.testing.expectEqual(expected.chroma_format, actual.chroma_format);
+    try std.testing.expectEqualSlices(u8, expected.nv12, actual.nv12);
+}
+fn dynamicCoordinatorRun(a: std.mem.Allocator) !void {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "dynamic-live", .storage = .{ .borrowed = @embedFile("../testdata/h264-dynamic-geometry.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const options = Options{ .duration_ns = try Coordinator.ns(reader.packets[0].duration, reader.track.timescale), .window = .{ .stream = .{ .admission_pool = &pool } } };
+    var flow = try Coordinator.init(a, options);
+    defer flow.deinit();
+    var held: ?Prepared = null;
+    defer if (held) |*prepared| prepared.deinit();
+    for (reader.packets, 0..) |_, i| {
+        var unit = try dynamicUnit(a, &reader, i, options);
+        defer if (unit) |*remaining| remaining.deinit();
+        try flow.append(&unit);
+        var prepared = (try flow.prepare()).?;
+        var transferred = false;
+        defer if (!transferred) prepared.deinit();
+        try assertFirstSample(a, &prepared);
+        try assertDynamicPixels(a, &prepared, &reader, i);
+        try flow.commit(&prepared);
+        if (i == 1) {
+            try std.testing.expect(flow.parameters.bytes.len > 0 and flow.count == 1);
+            held = prepared;
+            transferred = true;
+        }
+    }
+    try std.testing.expect(flow.stream != null);
+    try std.testing.expectEqual(reader.packets.len, flow.stats.validation_packets);
+    try assertFirstSample(a, &held.?);
+    try assertDynamicPixels(a, &held.?, &reader, 1);
+}
+test "live coordinator dynamic checkpoints preserve geometry windows and held output after eviction" {
+    try dynamicCoordinatorRun(std.testing.allocator);
+}
+test "live coordinator dynamic checkpoint construction and replacement allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dynamicCoordinatorRun, .{});
+}
+
+test "live coordinator dynamic failed append preserves owned checkpoint and retries retained preroll" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "dynamic-live-retry", .storage = .{ .borrowed = @embedFile("../testdata/h264-dynamic-geometry.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const options = Options{ .duration_ns = try Coordinator.ns(reader.packets[0].duration, reader.track.timescale), .window = .{ .stream = .{ .admission_pool = &pool } } };
+    var flow = try Coordinator.init(a, options);
+    defer flow.deinit();
+    for (0..2) |i| {
+        var unit = try dynamicUnit(a, &reader, i, options);
+        defer if (unit) |*remaining| remaining.deinit();
+        try flow.append(&unit);
+        var prepared = (try flow.prepare()).?;
+        defer prepared.deinit();
+        try flow.commit(&prepared);
+    }
+    try std.testing.expect(flow.parameters.bytes.len > 0 and flow.count == 1);
+    const checkpoint = try a.dupe(u8, flow.parameters.bytes);
+    defer a.free(checkpoint);
+    const start = flow.start_ns;
+    const ordinal = flow.ordinal;
+    var unit = try dynamicUnit(a, &reader, 2, options);
+    defer if (unit) |*remaining| remaining.deinit();
+    const at: usize = @intCast(unit.?.reader.packets[0].offset + reader.track.nal_length_bytes);
+    const original_byte = unit.?.backing.bytes[at];
+    unit.?.backing.bytes[at] |= 128;
+    try std.testing.expectError(error.MalformedVideoPacket, flow.append(&unit));
+    try std.testing.expect(unit != null and flow.stream == null);
+    try std.testing.expectEqual(start, flow.start_ns);
+    try std.testing.expectEqual(ordinal, flow.ordinal);
+    try std.testing.expectEqualSlices(u8, checkpoint, flow.parameters.bytes);
+    unit.?.backing.bytes[at] = original_byte;
+    try flow.append(&unit);
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    try assertDynamicPixels(a, &prepared, &reader, 2);
+    try flow.commit(&prepared);
 }

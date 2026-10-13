@@ -15,9 +15,11 @@ from pathlib import Path
 import video_rolling_qualification
 
 
-def validate(after, before, oracle):
-    after_agreement = video_rolling_qualification.validate(after, oracle)
-    before_agreement = video_rolling_qualification.validate(before, oracle)
+def validate(after, before, oracle, cache_policy="static_idr"):
+    after_agreement = video_rolling_qualification.validate(after, oracle, cache_policy)
+    before_agreement = video_rolling_qualification.validate(
+        before, oracle, cache_policy
+    )
     if after["backend"] != before["backend"]:
         raise ValueError("matched backend required")
     for new, old in zip(after["cases"], before["cases"]):
@@ -59,11 +61,15 @@ def main():
     parser.add_argument("--replay", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--cache-policy", choices=("static_idr", "prefix"), default="static_idr"
+    )
     args = parser.parse_args()
     result = validate(
         json.loads(args.incremental.read_text()),
         json.loads(args.replay.read_text()),
         json.loads(args.reference.read_text()),
+        args.cache_policy,
     )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 

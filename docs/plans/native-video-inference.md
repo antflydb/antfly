@@ -1672,3 +1672,51 @@ before enabling the new library path there. That integration, bounded retained
 configuration-entry compaction and the full original non-CUDA scope remain active.
 
 See [qualification receipts](../../zig/lib/video/testdata/live/dynamic-library-validation/README.md).
+
+
+### Owned dynamic live checkpoints and inference
+
+Automatic live coordination now enables persistent reconstruction for in-band
+AVC configuration streams. A separately admitted parameter checkpoint survives
+native decoder invalidation. Joined probe/prepared readers own bootstrap NALs
+prepended to the first retained payload, preserving packet selectors and clocks.
+Prepared snapshots borrow neither registry parameter memory nor released units.
+
+Commit and sparse pumping construct the next effective checkpoint and canonical
+suffix before mutating retention. Native state rebases to that canonical content
+binding only after every fallible probe/allocation succeeds; checkpoint replacement
+then becomes infallible. Failed appends discard mutated decoder state, preserving
+the prior checkpoint, metadata, cursor and incoming unit for replay/retry. Epoch
+transitions release old checkpoints after draining old outputs. Full replay uses
+the same owned suffix policy as the differential oracle.
+
+Retention now qualifies complete dynamic PAFF reset packets through their parsed
+active configuration, including an IDR first field with a non-IDR complementary
+second field. Container sync hints alone are insufficient. Native pixel comparisons
+cover changing geometry/depth/chroma before and after eviction, independently
+held old prepared windows, and malformed-append recovery. Allocation-failure tests
+cover construction/replacement and actual pixel replay from prepared storage.
+
+ReleaseSafe macOS passes 240 video tests (two skips), 23 live checks and 49
+CPU/Metal model checks. Actual Linux ARM64 passes 215 video tests (27 skips), 23
+live checks and 44 model checks (five Metal skips). A real avc3 Sintel fixture
+remuxes the same encoded pictures with inline SPS/PPS at each IDR. CPU, Metal and
+Linux preserve all six rolling/two sparse vectors exactly against complete-clip
+and replay inference, including the 124-token clipped tail. Each policy reconstructs
+60 rather than 150 packets; rolling bytes fall 81,888 to 33,683 and sparse bytes
+fall 86,518 to 33,683. Successful reconstruction counters exclude prefix hashing
+and transport reads; shared-host timings do not establish sustained throughput.
+
+Fresh pinned PyTorch CPU/MPS independently qualify all eight avc3 intervals.
+Every backend preserves exact rankings/full top-k overlap (1, 3, 5, 8), with vector
+coordinate error below 2.08e-6. Dynamic projection keys intentionally retain the
+conservative prefix policy: rolling windows record zero hits/eleven stores and
+sparse windows zero hits/four stores. The verifier declares this policy separately
+from static IDR reuse and rejects a dynamic report under the static cache gate.
+No dynamic cache throughput benefit is claimed.
+
+Retained configuration-entry compaction, stronger mixed/dynamic pretrained
+qualification, persistent-owner fuzzing, sustained full pipelines and broader
+original non-CUDA requirements remain active. No runtime dependency is added.
+
+See [qualification receipts](../../zig/lib/video/testdata/live/dynamic-coordinator-validation/README.md).

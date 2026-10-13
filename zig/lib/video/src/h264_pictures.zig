@@ -255,14 +255,21 @@ pub const Stream = struct {
     }
     /// All probes precede mutation; caller commits source eviction only on success.
     pub fn rebase(self: *Stream, reader: *media.mp4.Reader, removed: usize) !void {
+        var suffix = reader.*;
+        if (removed > reader.packets.len) return error.InvalidLivePictureIndex;
+        suffix.packets = reader.packets[removed..];
+        return self.rebaseWithPrefix(reader, removed, &suffix);
+    }
+    /// Bind the canonical retained reader, including an independently owned
+    /// parameter bootstrap, while rebasing the already validated native state.
+    pub fn rebaseWithPrefix(self: *Stream, reader: *media.mp4.Reader, removed: usize, suffix: *media.mp4.Reader) !void {
         if (!self.valid or reader.packets.len != self.position or removed > self.position) return error.InvalidLivePictureIndex;
         if (self.collector.pending_first_packet) |pending| if (pending < removed) return error.InvalidLivePictureIndex;
         for (self.collector.pictures.items, self.collector.planes.items) |picture, mask| {
             if (mask != 0 and mask != 7 and picture.first_packet < removed) return error.InvalidLivePictureIndex;
         }
-        var suffix = reader.*;
-        suffix.packets = reader.packets[removed..];
-        const binding = try prefixHash(&suffix, suffix.packets.len, self.options.decode.max_packet_bytes);
+        if (suffix.packets.len != self.position - removed) return error.InvalidLivePictureIndex;
+        const binding = try prefixHash(suffix, suffix.packets.len, self.options.decode.max_packet_bytes);
         const core_removed = removed -| self.epoch_base;
         if (!self.core.canRebase(core_removed)) return error.InvalidLivePictureIndex;
         if (self.registry) |owner| try owner.rebase(removed);

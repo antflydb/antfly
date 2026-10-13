@@ -1199,7 +1199,7 @@ fn decodeBudget(budget: *@import("decode_budget.zig").Budget, reader: *media.mp4
 }
 /// PAFF reset packets may contain an IDR first field and a non-IDR
 /// complementary second field. Hardware seeking keeps the stricter avc.isIdr.
-fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, length_bytes: u3, input: *media.source.Source) !bool {
+pub fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, length_bytes: u3, input: *media.source.Source) !bool {
     if (try @import("avc.zig").isPortableIdr(bytes, length_bytes)) {
         if (cfg.frame_only) return true;
         var reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes.len }) else media.admission.Token{};

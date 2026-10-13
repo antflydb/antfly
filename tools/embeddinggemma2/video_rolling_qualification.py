@@ -17,7 +17,9 @@ import compare
 import video_compare
 
 
-def validate(report, oracle):
+def validate(report, oracle, cache_policy="static_idr"):
+    if cache_policy not in ("static_idr", "prefix"):
+        raise ValueError("unknown projection cache policy")
     if report.get("status") != "pass" or len(report.get("cases", [])) != 8:
         raise ValueError("eight completed rolling/sparse outputs required")
     rolling = report["cases"][:6]
@@ -41,9 +43,17 @@ def validate(report, oracle):
                 raise ValueError("source interval, identity or token count changed")
             if row["vector"] != row["baseline_vector"] or row["max_abs"] != 0:
                 raise ValueError("cached live/complete-clip vector drift")
-            expected_hits = ordinal if name == "sintel-6s" else 0
+            expected_hits = (
+                ordinal if name == "sintel-6s" and cache_policy == "static_idr" else 0
+            )
             expected_stored = (
-                min(ordinal + 2, 6) if name == "sintel-6s" else 2 * (ordinal + 1)
+                (
+                    min(ordinal + 2, 6)
+                    if cache_policy == "static_idr"
+                    else min(2 * (ordinal + 1), 11)
+                )
+                if name == "sintel-6s"
+                else 2 * (ordinal + 1)
             )
             if (
                 row["live_cache_hits"] != expected_hits
@@ -66,6 +76,13 @@ def validate(report, oracle):
             "complete-clip native baselines exactly. Five rolling cache hits survive "
             "preroll eviction; sparse intervals have no shared selected pictures."
         )
+    if cache_policy == "prefix" and "documents" not in oracle:
+        result["scope"] = (
+            "Pinned PyTorch gates cover matching rolling windows 0, 2, 4 only. "
+            "All eight native outputs match complete-clip baselines exactly. "
+            "Conservative dynamic prefix keys record zero rolling cache hits."
+        )
+    result["cache_policy"] = cache_policy
     result["rolling_cache_hits"] = rolling[-1]["live_cache_hits"]
     result["rolling_cache_stored"] = rolling[-1]["live_cache_stored"]
     return result
@@ -132,9 +149,14 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--cache-policy", choices=("static_idr", "prefix"), default="static_idr"
+    )
     args = parser.parse_args()
     result = validate(
-        json.loads(args.report.read_text()), json.loads(args.reference.read_text())
+        json.loads(args.report.read_text()),
+        json.loads(args.reference.read_text()),
+        args.cache_policy,
     )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
