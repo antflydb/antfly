@@ -77,8 +77,9 @@ pub const ReaderSelection = struct {
         return a.dupe(usize, self.selected);
     }
 };
-/// A conservative visual key includes every available coded dependency through
-/// completion. Appending future packets preserves it; evicting preroll may miss.
+/// Bind coded dependencies through completion, independent of byte placement.
+/// A complete single-packet IDR with static parameter sets starts a new hash
+/// chain. Dynamic configuration and split pictures retain the conservative chain.
 fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: *const video.h264_pictures.Index, selected: []const usize, control: media.source.Control) ![]CacheKey {
     const bytes = try packetBytes(reader);
     const keys = try a.alloc(CacheKey, selected.len);
@@ -98,22 +99,45 @@ fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, l
         if (!found) return error.InvalidVideoReaderSelection;
     }
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-reader-projection-prefix-v1");
+    hash.update("antfly-reader-projection-dependencies-v2");
     hashValue(&hash, reader.track);
+    const initial = hash;
+    var base: usize = 0;
     for (reader.packets[0 .. maximum + 1], 0..) |packet, index| {
         try control.check();
         if (packet.offset > bytes.len or packet.size > bytes.len - packet.offset) return error.InvalidVideoReaderSelection;
-        hashValue(&hash, packet);
-        hashValue(&hash, bytes[@intCast(packet.offset)..][0..packet.size]);
+        const payload = bytes[@intCast(packet.offset)..][0..packet.size];
+        if (!reader.track.inband_parameter_sets and try video.avc.isPortableIdr(payload, reader.track.nal_length_bytes) and projectionReset(logical, index)) {
+            hash = initial;
+            base = index;
+        }
+        // Transport offsets and selector rebasing cannot change rendered pixels.
+        // Keep every timing, size and sync value in the content identity.
+        var descriptor = packet;
+        descriptor.offset = 0;
+        hashValue(&hash, descriptor);
+        hashValue(&hash, payload);
         for (selected, 0..) |id, slot| if (ends[slot] == index) {
             var snapshot = hash;
-            hashValue(&snapshot, index + 1);
+            hashValue(&snapshot, index - base + 1);
             var digest: [32]u8 = undefined;
             snapshot.final(&digest);
-            keys[slot] = .{ .clip = digest, .picture = id };
+            // Unknown completion metadata never permits a reset past its start.
+            if (id < base) return error.InvalidVideoReaderSelection;
+            keys[slot] = .{ .clip = digest, .picture = id - base };
         };
     }
     return keys;
+}
+fn projectionReset(logical: *const video.h264_pictures.Index, packet: usize) bool {
+    if (logical.pending_first_packet) |pending| if (pending < packet) return false;
+    var complete = false;
+    for (logical.pictures) |picture| {
+        const last = picture.last_packet orelse return false;
+        if (picture.first_packet < packet and last >= packet) return false;
+        if (picture.first_packet == packet and last == packet) complete = true;
+    }
+    return complete;
 }
 fn projectionKey(selection: ?*const ReaderSelection, clip: [32]u8, selected: []const usize, slot: usize) CacheKey {
     return if (selection) |owner| owner.projection_keys[slot] else .{ .clip = clip, .picture = selected[slot] };
@@ -2035,6 +2059,88 @@ test "embeddinggemma2 video reader projection prefixes survive append and bind f
     var display = try ReaderSelection.init(a, &reader, prefix_sampling, &logical, null, .{});
     defer display.deinit();
     try std.testing.expect(!std.mem.eql(u8, &later.projection_keys[0].clip, &display.projection_keys[0].clip));
+}
+test "embeddinggemma2 video projection keys survive IDR preroll eviction and payload relocation" {
+    const a = std.testing.allocator;
+    const owned = try a.dupe(u8, @embedFile("../testdata/video/closed.mp4"));
+    defer a.free(owned);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = owned }, .identity = "rolling-keys" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    var base: usize = 1;
+    while (base < reader.packets.len) : (base += 1) {
+        var lease = try reader.readPacket(base);
+        defer lease.deinit();
+        if (try video.avc.isPortableIdr(lease.bytes, reader.track.nal_length_bytes) and projectionReset(&logical, base)) break;
+    }
+    try std.testing.expect(base > 1 and base + 1 < reader.packets.len);
+    const target = base + 1;
+    const full = try readerProjectionKeys(a, &reader, &logical, &.{target}, .{});
+    defer a.free(full);
+    var suffix = reader;
+    suffix.packets = reader.packets[base..];
+    var suffix_index = try logical.cloneRebased(a, base, suffix.packets.len, null, .{});
+    defer suffix_index.deinit();
+    const retained = try readerProjectionKeys(a, &suffix, &suffix_index, &.{target - base}, .{});
+    defer a.free(retained);
+    try std.testing.expectEqual(full[0], retained[0]);
+    // Repack the suffix into a different allocation with different offsets.
+    const relocated_bytes = try a.alloc(u8, owned.len + 37);
+    defer a.free(relocated_bytes);
+    const descriptors = try a.dupe(media.mp4.Packet, suffix.packets);
+    defer a.free(descriptors);
+    var cursor: usize = 37;
+    for (descriptors) |*packet| {
+        @memcpy(relocated_bytes[cursor..][0..packet.size], owned[@intCast(packet.offset)..][0..packet.size]);
+        packet.offset = cursor;
+        cursor += packet.size;
+    }
+    var relocated_source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = relocated_bytes[0..cursor] }, .identity = "relocated" };
+    var relocated = suffix;
+    relocated.input = &relocated_source;
+    relocated.packets = descriptors;
+    const moved = try readerProjectionKeys(a, &relocated, &suffix_index, &.{target - base}, .{});
+    defer a.free(moved);
+    try std.testing.expectEqual(full[0], moved[0]);
+    // Earlier GOP changes cannot affect this IDR generation.
+    const old_end: usize = @intCast(reader.packets[0].offset + reader.packets[0].size - 1);
+    owned[old_end] ^= 1;
+    const unrelated = try readerProjectionKeys(a, &reader, &logical, &.{target}, .{});
+    defer a.free(unrelated);
+    try std.testing.expectEqual(full[0], unrelated[0]);
+    owned[old_end] ^= 1;
+    const dependency_end: usize = @intCast(reader.packets[base].offset + reader.packets[base].size - 1);
+    owned[dependency_end] ^= 1;
+    const changed = try readerProjectionKeys(a, &reader, &logical, &.{target}, .{});
+    defer a.free(changed);
+    try std.testing.expect(!std.mem.eql(u8, &full[0].clip, &changed[0].clip));
+    owned[dependency_end] ^= 1;
+    // avc3 parameter state before an IDR remains part of the dependency chain.
+    reader.track.inband_parameter_sets = true;
+    suffix.track.inband_parameter_sets = true;
+    const dynamic_full = try readerProjectionKeys(a, &reader, &logical, &.{target}, .{});
+    defer a.free(dynamic_full);
+    const dynamic_suffix = try readerProjectionKeys(a, &suffix, &suffix_index, &.{target - base}, .{});
+    defer a.free(dynamic_suffix);
+    try std.testing.expect(!std.mem.eql(u8, &dynamic_full[0].clip, &dynamic_suffix[0].clip));
+}
+test "embeddinggemma2 video projection reset requires complete metadata without crossing assemblies" {
+    const a = std.testing.allocator;
+    var entries = [_]video.h264.Picture{
+        .{ .first_packet = 2, .last_packet = 2, .pts = 0, .duration = 1, .width = 16, .height = 16, .bit_depth = 8, .chroma_format = 1 },
+        .{ .first_packet = 0, .last_packet = 1, .pts = 0, .duration = 1, .width = 16, .height = 16, .bit_depth = 8, .chroma_format = 1 },
+    };
+    var metadata = video.h264_pictures.Index{ .allocator = a, .pictures = &entries, .timescale = 1, .packet_count = 4 };
+    try std.testing.expect(projectionReset(&metadata, 2));
+    entries[1].last_packet = 3;
+    try std.testing.expect(!projectionReset(&metadata, 2));
+    entries[1].last_packet = null;
+    try std.testing.expect(!projectionReset(&metadata, 2));
+    entries[1].last_packet = 1;
+    metadata.pending_first_packet = 0;
+    try std.testing.expect(!projectionReset(&metadata, 2));
 }
 test "embeddinggemma2 video cached borrowed reader producer skips native reconstruction and restores tickets" {
     const a = std.testing.allocator;

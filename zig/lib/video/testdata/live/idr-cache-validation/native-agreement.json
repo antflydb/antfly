@@ -1,0 +1,84 @@
+{
+  "max_reference_abs": 2.980232238769531e-07,
+  "retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.6363852946436355,
+        "sintel-6s/1": 0.7023632053101965,
+        "sintel-6s/2": 0.6076035128282969
+      },
+      "landscape": {
+        "sintel-6s/0": 0.5913722147621481,
+        "sintel-6s/1": 0.6217556335048872,
+        "sintel-6s/2": 0.6602173192463565
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "reference_retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.636385394423811,
+        "sintel-6s/1": 0.7023632779477025,
+        "sintel-6s/2": 0.6076036912844515
+      },
+      "landscape": {
+        "sintel-6s/0": 0.5913721664002962,
+        "sintel-6s/1": 0.6217558094385871,
+        "sintel-6s/2": 0.6602172859438761
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "stream_baseline_exact": true,
+  "retrieval_agreement": {
+    "queries": {
+      "dragon": {
+        "max_score_error": 1.7845615452039e-07,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      },
+      "landscape": {
+        "max_score_error": 1.759336999418437e-07,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      }
+    },
+    "pass": true
+  },
+  "rolling_cache_hits": 5,
+  "rolling_cache_stored": 6,
+  "scope": "Pinned PyTorch gates cover rolling windows 0, 2, 4 matching the original non-overlapping intervals. All eight rolling/sparse outputs match complete-clip native baselines exactly. Five rolling cache hits survive preroll eviction; sparse intervals have no shared selected pictures."
+}

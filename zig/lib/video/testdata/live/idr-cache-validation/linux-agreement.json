@@ -1,0 +1,84 @@
+{
+  "max_reference_abs": 9.257346391677856e-07,
+  "retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.6363853014352074,
+        "sintel-6s/1": 0.7023628454749081,
+        "sintel-6s/2": 0.6076032319527609
+      },
+      "landscape": {
+        "sintel-6s/0": 0.5913720274481601,
+        "sintel-6s/1": 0.6217553757236195,
+        "sintel-6s/2": 0.660217254321124
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "reference_retrieval": {
+    "purpose": "reference preservation; no relevance labels",
+    "scores": {
+      "dragon": {
+        "sintel-6s/0": 0.636385394423811,
+        "sintel-6s/1": 0.7023632779477025,
+        "sintel-6s/2": 0.6076036912844515
+      },
+      "landscape": {
+        "sintel-6s/0": 0.5913721664002962,
+        "sintel-6s/1": 0.6217558094385871,
+        "sintel-6s/2": 0.6602172859438761
+      }
+    },
+    "rankings": {
+      "dragon": [
+        "sintel-6s/1",
+        "sintel-6s/0",
+        "sintel-6s/2"
+      ],
+      "landscape": [
+        "sintel-6s/2",
+        "sintel-6s/1",
+        "sintel-6s/0"
+      ]
+    }
+  },
+  "stream_baseline_exact": true,
+  "retrieval_agreement": {
+    "queries": {
+      "dragon": {
+        "max_score_error": 4.5933169057210677e-07,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      },
+      "landscape": {
+        "max_score_error": 4.33714967607024e-07,
+        "exact_ranking": true,
+        "top_k_overlap": {
+          "1": 1.0,
+          "3": 1.0
+        },
+        "non_tied_inversions": []
+      }
+    },
+    "pass": true
+  },
+  "rolling_cache_hits": 5,
+  "rolling_cache_stored": 6,
+  "scope": "Pinned PyTorch gates cover rolling windows 0, 2, 4 matching the original non-overlapping intervals. All eight rolling/sparse outputs match complete-clip native baselines exactly. Five rolling cache hits survive preroll eviction; sparse intervals have no shared selected pictures."
+}

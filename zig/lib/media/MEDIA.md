@@ -1324,3 +1324,38 @@ no across-eviction reuse or sustained-throughput claim is made. MacOS passes
 and 42 model checks with platform skips. The original scope remains active.
 
 See [qualification receipts](../video/testdata/live/advance-validation/README.md).
+
+
+### IDR-bound projection reuse across rolling-window eviction
+
+For static AVC parameter sets, the reader projection hash restarts at a validated
+complete single-packet IDR picture. Track/configuration/display values, source
+clocks, packet sizes/sync values and coded payloads through picture completion
+remain bound. Byte offsets are normalized and picture selectors are relative to
+the reset, so repacking identical packets or evicting an earlier GOP preserves
+identity. The full ReaderSelection binding still checks the original reader and
+sampling policy; this change does not permit transferring that selection owner
+to a different reader.
+
+Incomplete or crossing assemblies, unknown completion metadata and in-band
+parameter-set streams retain the conservative dependency chain. Container sync
+hints alone never establish an independent boundary. Changed retained dependency
+bytes or display policy invalidate projections; changes before a proven IDR do
+not. Request-local CPU/Metal cache ownership, admission and cancellation contracts
+remain unchanged.
+
+Fresh pretrained CPU, Metal and actual Linux ARM64 qualification preserves all
+six rolling and two sparse vectors/token counts exactly against complete-clip
+inference. The rolling fixture now records five hits and six stored projections
+rather than zero hits and eleven stores; sparse intervals correctly have zero
+hits. Pinned PyTorch score/ranking/top-k gates cover only the three matching
+original intervals. The checked-in rolling verifier enforces window identities,
+cache counts and baseline equality and rejects the historical zero-hit report.
+
+ReleaseSafe model gates pass 49 CPU/Metal checks on macOS and 44 checks with five
+Metal skips on actual Linux. Source/fixture/binary receipts record the exact
+scope. This continuation does not establish arbitrary stream conformance or
+sustained throughput; append-time incremental reconstruction and broader
+qualification remain active work.
+
+See [qualification receipts](../video/testdata/live/idr-cache-validation/README.md).
