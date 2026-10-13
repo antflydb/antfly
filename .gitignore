@@ -82,6 +82,8 @@ scripts/__pycache__/
 # Local package/worktree caches
 .pnpm-store/
 .worktrees/
+.zig-cache/
+zig-out/
 .tools/
 /.codex/
 /.turbo/
