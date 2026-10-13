@@ -38944,7 +38944,74 @@ pub const DB = struct {
         return try self.searchLockedWithExecutionContextImpl(alloc, identity_prefix_filter.req, exec_ctx, true, null);
     }
 
-    fn searchLockedWithExecutionContextImpl(
+    fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
+        var result = try self.searchLockedWithExecutionContextRaw(alloc, req, exec_ctx, externalize_artifact_ids, dense_profile_sink);
+        errdefer result.deinit();
+        try self.attachDistributedDocumentAuthority(alloc, req, &result);
+        return result;
+    }
+
+    fn attachDistributedDocumentAuthority(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
+        if (req.document_authority_mode == .none) return;
+        if (req.document_authority_group == 0 or req.include_stored or req.return_mode != .parent or req.highlight != null or req.graph_queries.len != 0 or req.aggregations_json.len != 0) return error.InvalidQueryRequest;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scratch.deinit();
+        var eager_bytes: usize = 0;
+        for (result.hits, 0..) |*hit, index| {
+            // The enclosing apply-shared query lease fences writes. Retire
+            // borrowed/decompressed primary pages between bounded windows.
+            if (index != 0 and index % 64 == 0) {
+                read.abort();
+                read = try self.core.store.beginReadTxn();
+            }
+            if (req.cancellation) |token| try token.check();
+            if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+            if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
+            const a = scratch.allocator();
+            const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, a, hit.id, schema_view);
+            const raw = read.getLeased(store_key) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+            const version = try lookupSnapshotTimestamp(a, hit.id, &read);
+            const authority: types.document_authority.Authority = .{ .group = req.document_authority_group, .version = version, .digest = digest };
+            // Small pages stay in one round trip; large candidates travel
+            // as proofs until their global window has been selected.
+            const eager = req.document_authority_mode == .candidates and raw.len <= 8 * 1024 and raw.len <= 64 * 1024 -| eager_bytes;
+            var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
+                try self.lookupPrimarySnapshot(a, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read)
+            else
+                null;
+            if (req.document_authority_mode == .candidates) if (projected) |*document| {
+                // Charge actual projected JSON, including native rows whose
+                // compact storage bytes can expand during serialization.
+                if (document.json.len > 8 * 1024 or document.json.len > 64 * 1024 -| eager_bytes) {
+                    document.deinit(a);
+                    projected = null;
+                } else eager_bytes += document.json.len;
+            };
+            defer if (projected) |*document| document.deinit(a);
+            if (req.document_authority_mode == .hydrate and projected == null) return error.StorageReadTemporarilyUnavailable;
+            const owned_authority = try alloc.create(types.document_authority.Authority);
+            owned_authority.* = authority;
+            errdefer alloc.destroy(owned_authority);
+            const document_bytes = if (projected) |document| try alloc.dupe(u8, document.json) else null;
+            if (hit.stored_data) |bytes| alloc.free(bytes);
+            if (hit.source_value) |*value| types.deinitJsonValue(alloc, value);
+            if (hit.column_source) |source| source.deinit();
+            hit.source_value = null;
+            hit.column_source = null;
+            if (hit.document_authority) |proof| alloc.destroy(proof);
+            hit.document_authority = owned_authority;
+            hit.stored_data = document_bytes;
+        }
+        result.document_authority_version = 1;
+    }
+
+    fn searchLockedWithExecutionContextRaw(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
@@ -42071,6 +42138,7 @@ pub const DB = struct {
     }
 
     fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
+        if (req.document_authority_mode != .none) return false;
         // Graph execution must hold apply-shared from the retirement-gate
         // check through the entire read. The published-dense lease only pins
         // dense catalog entries and cannot fence a concurrent graph seal.
@@ -43742,6 +43810,7 @@ pub const DB = struct {
         const raw = try db_query_graph.fuseNamedSets(alloc, req, named_sets, .{
             .ctx = self,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
         });
         return try filterExpiredSearchResult(self, alloc, raw);
     }

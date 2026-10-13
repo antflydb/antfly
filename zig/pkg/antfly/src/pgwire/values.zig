@@ -125,7 +125,52 @@ fn encodeNarrowScalar(writer: *std.Io.Writer, element: @import("antfly_local_sou
 /// Array payloads are validated against the bound descriptor, never inferred
 /// from JSON shape. Only two flat buffers are retained transiently; text and
 /// JSONB payloads borrow the live result owner and stream directly to pgwire.
+// A zero-buffer forwarding writer bounds output before the destination grows.
+// Encoding runs once, including JSON; no full-cell sizing traversal is needed.
+const BoundedWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{}, .end = 0 },
+    destination: *std.Io.Writer,
+    remaining: usize,
+    exceeded: bool = false,
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+        var count = std.math.mul(usize, data[data.len - 1].len, splat) catch return self.reject();
+        for (data[0 .. data.len - 1]) |part| count = std.math.add(usize, count, part.len) catch return self.reject();
+        if (count > self.remaining) return self.reject();
+        const written = try self.destination.writeSplat(data, splat);
+        self.remaining -= written;
+        return written;
+    }
+    fn reject(self: *@This()) std.Io.Writer.Error {
+        self.exceeded = true;
+        return error.WriteFailed;
+    }
+};
+
 pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
+    var bounded: BoundedWriter = .{ .destination = writer, .remaining = wire_bytes };
+    encodeColumnUnchecked(a, &bounded.writer, column, format, value, wire_bytes) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
+}
+
+/// Native pages retain typed arrays and numerics through the wire boundary.
+pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
+    if (cell.sql_null or format > 1) return error.InvalidResult;
+    if (cell.array == null and cell.numeric == null) return encodeColumnInto(a, writer, column, format, cell.value, wire_bytes);
+    _ = try columnOid(column);
+    if (cell.value != .null or (cell.array != null and cell.numeric != null)) return error.InvalidResult;
+    const sources = @import("antfly_local_sources");
+    var bounded: BoundedWriter = .{ .destination = writer, .remaining = wire_bytes };
+    if (cell.array) |array| {
+        if (column.type != .array or column.element_type != array.element_type) return error.InvalidResult;
+        if (format == 0) sources.sql_array_text.encode(a, array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err else sources.sql_array_binary.encode(a, array.*, &bounded.writer, .{ .wire_bytes = wire_bytes }) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
+    } else if (cell.numeric) |number| {
+        if (column.type != .number or column.element_type != .numeric) return error.InvalidResult;
+        var context: sources.sql_numeric_value.Context = .{ .alloc = a, .max_output_bytes = wire_bytes };
+        if (format == 0) sources.sql_numeric_value.write(&context, number.*, &bounded.writer) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err else sources.sql_numeric_binary.encode(&context, number.*, &bounded.writer) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
+    }
+}
+
+fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
     if (format > 1) return error.UnsupportedResultFormat;
     _ = try columnOid(column);
     if (column.type == .number and column.element_type == .numeric) {
@@ -140,16 +185,10 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
     if (column.type != .array) {
         if (column.element_type) |element| switch (element) {
             .int16, .int32, .float32 => {
-                var size: std.Io.Writer.Discarding = .init(&.{});
-                try encodeNarrowScalar(&size.writer, element, format, value);
-                if (size.count > wire_bytes) return error.ProgramLimitExceeded;
                 return encodeNarrowScalar(writer, element, format, value);
             },
             else => {},
         };
-        var size: std.Io.Writer.Discarding = .init(&.{});
-        try encodeInto(a, &size.writer, column.type, format, value);
-        if (size.count > wire_bytes) return error.ProgramLimitExceeded;
         return encodeInto(a, writer, column.type, format, value);
     }
     const sources = @import("antfly_local_sources");
@@ -939,4 +978,47 @@ test "pgwire array columns retain element OIDs and lossless text and binary payl
     try std.testing.expectError(error.UnsupportedParameterType, oid(.array));
     try std.testing.expectError(error.InvalidResult, columnOid(.{ .name = "missing", .type = .array }));
     try std.testing.expectEqual(Type.array, try fromOid(1016));
+}
+
+test "pgwire native array encoding avoids JSON conversion workspace" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    const elements = try a.alloc(sources.sql_array_value.Element, 4096);
+    defer a.free(elements);
+    for (elements, 0..) |*element, i| element.* = .{ .value = if (i % 17 == 0) .null else .{ .integer = @intCast(i) }, .sql_null = i % 17 == 0 };
+    const array: sources.sql_array_value.Value = .{ .element_type = .int64, .dimensions = &.{.{ .length = @intCast(elements.len), .lower = -7 }}, .elements = elements };
+    const column: Column = .{ .name = "a", .type = .array, .element_type = .int64 };
+    const Counter = sources.storage_lite_test_allocator.BudgetAllocator;
+    var peaks: [2]usize = undefined;
+    var calls: [2]usize = undefined;
+    var hashes: [2]u64 = undefined;
+    for (0..2) |mode| {
+        var measured: Counter = .{ .backing = a };
+        var output: std.Io.Writer.Allocating = .init(measured.allocator());
+        {
+            var arena = std.heap.ArenaAllocator.init(measured.allocator());
+            defer arena.deinit();
+            if (mode == 0) {
+                const envelope = try sources.sql_array_wire.toJsonLeaky(arena.allocator(), array, .{});
+                try encodeColumnInto(arena.allocator(), &output.writer, column, 1, envelope, 8 * 1024 * 1024);
+            } else {
+                try encodeCellInto(arena.allocator(), &output.writer, column, 1, .{ .array = &array, .sql_null = false }, 8 * 1024 * 1024);
+                const cold = measured.alloc_calls;
+                for (0..300) |_| {
+                    output.writer.end = 0;
+                    try encodeCellInto(arena.allocator(), &output.writer, column, 1, .{ .array = &array, .sql_null = false }, 8 * 1024 * 1024);
+                }
+                try std.testing.expectEqual(cold, measured.alloc_calls);
+            }
+            hashes[mode] = std.hash.Wyhash.hash(0, output.written());
+            peaks[mode] = measured.peak;
+            calls[mode] = measured.alloc_calls;
+        }
+        output.deinit();
+        try std.testing.expectEqual(@as(usize, 0), measured.live);
+    }
+    try std.testing.expectEqual(hashes[0], hashes[1]);
+    try std.testing.expect(peaks[1] < peaks[0]);
+    try std.testing.expect(calls[1] < calls[0]);
+    std.debug.print("PGWIRE_NATIVE_ARRAY elements=4096 before_peak={d} after_peak={d} before_allocations={d} after_allocations={d} warm_repetitions=300 warm_allocations=0\n", .{ peaks[0], peaks[1], calls[0], calls[1] });
 }

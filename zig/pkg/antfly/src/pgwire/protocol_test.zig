@@ -2528,3 +2528,77 @@ test "pgwire receipt budget survives simple SQL prepared and extended streaming 
     try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
     try std.testing.expectEqual(@as(usize, 4), mock.receipt_budget_fallbacks);
 }
+
+test "pgwire typed cells match column-aware materialized text and binary frames" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var array = try sources.sql_array_text.decode(a, .int32, "[-1:1]={1,NULL,7}", .{});
+    defer array.deinit();
+    var numeric_context: sources.sql_numeric_value.Context = .{ .alloc = a };
+    const numeric_digits: [1000]u8 = @splat('7');
+    const numeric_text = numeric_digits ++ ".123456789";
+    var numeric = try sources.sql_numeric_value.parse(&numeric_context, numeric_text);
+    defer numeric.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const row = [_]std.json.Value{
+        .{ .integer = 32767 },       .{ .integer = 2147483647 },                                                  .{ .float = 1.25 },
+        .{ .string = numeric_text }, try sources.sql_array_wire.toJsonLeaky(arena.allocator(), array.value, .{}),
+    };
+    const columns = [_]backend.Column{
+        .{ .name = "s", .type = .integer, .element_type = .int16 },
+        .{ .name = "i", .type = .integer, .element_type = .int32 },
+        .{ .name = "f", .type = .number, .element_type = .float32 },
+        .{ .name = "n", .type = .number, .element_type = .numeric },
+        .{ .name = "a", .type = .array, .element_type = .int32 },
+    };
+    const Reader = struct {
+        row: []const std.json.Value,
+        array: *const sources.sql_array_value.Value,
+        numeric: *const sources.sql_numeric_value.Value,
+        fn read(raw: *anyopaque, _: std.mem.Allocator, _: usize, column: usize) !backend.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (column) {
+                3 => .{ .numeric = self.numeric, .sql_null = false },
+                4 => .{ .array = self.array, .sql_null = false },
+                else => .{ .value = self.row[column], .sql_null = false },
+            };
+        }
+    };
+    var reader: Reader = .{ .row = &row, .array = &array.value, .numeric = &numeric.value };
+    for ([_]bool{ false, true }) |binary| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (!binary) try frame(&input.writer, 'Q', "SELECT cells\x00") else {
+            try parse(&input.writer, "q", "SELECT cells", false);
+            try bind(&input.writer, "p", "q", null);
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var rows_mock: Mock = .{ .result_override = .{ .columns = &columns, .rows = &.{&row}, .command_tag = "SELECT 1" } };
+        var cells_mock: Mock = .{ .result_override = .{ .columns = &columns, .cells = .{ .context = &reader, .count = 1, .width = columns.len, .read = Reader.read }, .command_tag = "SELECT 1" } };
+        var rows = try run(&rows_mock, input.written(), .{});
+        defer rows.deinit();
+        var cells = try run(&cells_mock, input.written(), .{});
+        defer cells.deinit();
+        try std.testing.expectEqualSlices(u8, rows.written(), cells.written());
+        const messages = try tags(a, cells.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        std.debug.print("PGWIRE_TYPED_COLUMNS binary={} columns=5 identical_frames=true native_array_numeric=true\n", .{binary});
+        // Both representations enforce the frame before emitting any DataRow.
+        // Admit startup, RowDescription and ErrorResponse; reject the large
+        // numeric DataRow in both text and binary representations.
+        var small_rows = try run(&rows_mock, input.written(), .{ .frame_bytes = 256 });
+        defer small_rows.deinit();
+        var small_cells = try run(&cells_mock, input.written(), .{ .frame_bytes = 256 });
+        defer small_cells.deinit();
+        const failures = try tags(a, small_cells.written());
+        defer a.free(failures);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
+    }
+}
