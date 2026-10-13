@@ -965,8 +965,11 @@ and titled groups retain compatibility. No CUDA performance gain is claimed.
 
 ### Gemma4 generative OCR optimization
 
-The follow-up adds `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1` within the experimental
-OCR lane: QKV, FFN, PLE and vocabulary projections span the active rows, with
+The historical matrix follow-up used `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1`
+within the experimental OCR lane. Current builds additionally require explicit
+`ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC=1` for that research path; otherwise
+cohorts preserve the complete singleton operation family. In the matrix path,
+QKV, FFN, PLE and vocabulary projections span the active rows, with
 per-page RoPE/attention and frame-local F32/F16 KV suffix writes. The four-row
 corpus run submitted one frame per multi-row step. A subsequent patch selects
 parallel RMS normalization for short matrices and groups projections into
@@ -1108,3 +1111,17 @@ batching remains opt-in: the memory-instrumented four-row/eight-window QKV run
 also omits the paragraph, so that rollback is not a robust parity fix. See
 [the investigation](../../../docs/design/inference/gemma4-ocr-parity-investigation.json)
 for source/binary pins, exact flags, latency/memory counters and rejected cases.
+
+
+Native Gemma4 OCR cohorts now preserve the complete prepared singleton operation
+family by default. The free-running matrix trace reproduced a premature EOS at
+sequence length 1,011 after an otherwise matching prefix, omitting 41 tokens.
+The legacy `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1` alone selects canonical cohorts;
+shape-dependent matrix arithmetic additionally requires explicit
+`ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC=1` (or a differential diagnostic).
+Canonical cohorts retain independent GPU KV and one shared layer-major frame;
+this correction does not require CPU image/hidden/logit processing. Matrix
+research timing gains do not qualify the normal serving path. The
+`cohort4w8stable` sweep case records its real native cohort occupancy separately
+from matrix-frame profiling. [The correctness report](../../../docs/design/inference/gemma4-ocr-paragraph-correctness.json)
+retains the first changed logits, failed scoped rollbacks and final corpus gates.

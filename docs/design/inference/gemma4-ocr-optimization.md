@@ -109,6 +109,91 @@ encountered in matrix cohorts agree with canonical token 106; none is replaced
 not establish that confirmation fixes the prior intermittent omission. Its
 34.339 s timing is diagnostic only, and no option is promoted.
 
+## Paragraph omission: free-running trace and serving correction
+
+The [paragraph correctness investigation](gemma4-ocr-paragraph-correctness.json)
+captures the first changed decision while preserving independently accumulated
+KV history. Four copies of Attention page 6 all reproduce the ordinary 742-token
+transcript in both singleton passes. The old matrix/QKV-rollback lane omits the
+paragraph in one uninstrumented pass, and the free-running trace reproduces it
+in a separate pass. The coordinator still uses two-, three- and four-row steps
+as those identical requests become ready; duplicate inputs do not freeze the
+scheduler's cohort geometry.
+
+At total sequence length 1,011, with input token 236761, ordinary selects newline
+108 and the failing matrix row selects EOS 106. The same input/token prefix
+matches in all 5,410 traced matrix-row comparisons, with exactly this one changed
+choice. The singleton newline/EOS margin is +0.0032997; the failing matrix favors
+EOS by 0.0056114. Its response ends normally with `finish_reason=stop`, at an
+exact prefix 204 characters/41 completion tokens shorter than ordinary. This
+establishes an early model stop decision rather than lost HTTP/stream bytes or
+a generation-cap failure. The trace does not restore canonical KV after each
+step, unlike the earlier differential mode that masked accumulated drift.
+
+The same-input projection differences, row-dependent operation selection and
+free-running margin movement support accumulated numerical state drift. They
+do not identify one invalid KV index or prove a single offending kernel.
+[Batch-invariant inference research](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+explains why deterministic kernels can still change an individual request's
+answer when batching changes the arithmetic; it is background, not independent
+proof of this particular failure.
+
+New attention-output and complete post-attention block rollbacks also fail the
+repeated-page gate. Combining QKV/block/PLE/tail rollbacks at `145ba9f996` still
+fails: the `strict` sweep case was only a collection of scoped switches, not the
+complete canonical operation family. In particular, the old QKV rollback used
+three standalone row projections, while ordinary dense Gemma4 uses the fused
+QKV family with paired K/V reduction. `7736ff8f80` corrects that reference and
+rollback to call the singleton fused family, copying each result before scratch
+can be reused. Other singleton KV/attention/fusion choices still matter, so no
+partial rollback is promoted as a parity guarantee.
+
+Native OCR batching now retains the complete prepared singleton operation
+family by default, including independent page KV, paired projections, KV
+publication/attention and layer/tail arithmetic. Layers remain coordinated in
+one GPU frame and only token IDs return to the host. Setting the older
+`ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1` alone no longer selects the unqualified
+matrix arithmetic. It requires an additional explicit
+`ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC=1`, or an explicit canonical-prefix
+or layer differential diagnostic. The sweep's `cohort4w8stable` case verifies
+the normal path with the legacy multirow flag still set and the new matrix flag
+zero; matrix research cases explicitly set the new flag. Matrix timing gains
+in earlier source-pinned reports remain conditional research observations.
+All normal serving defaults and model/KV admission limits remain bounded.
+
+The final `8ed689d285` serving correction matches every transcript/count in
+72 page observations (41,428 completion tokens total), including the former
+allocation-instrumented failure condition. No generation reaches its cap.
+
+| Canonical native cohort check | Recognition seconds | Completion tokens/pass |
+| --- | --- | --- |
+| Four copies of Attention page 6, two passes | 41.351 / 41.114 | 2,968 / 2,968 |
+| Original eight pages, two passes | 65.967 / 62.340 | 4,057 / 4,057 |
+| Sixteen text pages, forward | 152.964 | 9,126 |
+| Sixteen text pages, reversed | 160.773 | 9,126 |
+| Sixteen text pages, allocation-instrumented | Timing excluded | 9,126 |
+
+The occupancy logs contain actual two-, three- and four-row native cohorts.
+The runner derives these separately from matrix-frame counters and removes
+preload activity; explicit warmups may remain in occupancy counts, which are
+not committed output-token counts. The memory stress run samples 3.750 GiB
+of Metal resources and 1.466 GiB process-tree RSS as separate domains.
+These final runs verify correctness against unchanged ordinary references;
+they lack new ordinary timing brackets and do not qualify a throughput gain.
+The earlier matrix speedup cannot be retained as a normal serving claim.
+
+The corrected fused-QKV research rollback matches both repeated-page passes,
+but combining it with the other scoped rollbacks still omits paragraphs
+(2,927/2,886 versus 2,968 tokens/pass). This reinforces the distinction between
+individual row operations and the full prepared singleton family. The guard
+retains the latter, rather than changing EOS policy or forcing extra text.
+
+Final validation selects 61 native Metal/MTP/decoder/scheduler/QKV/HTTP tests:
+all pass with head-frame/replay both enabled and explicitly disabled, zero skips.
+Eight sweep tests, ReleaseFast serving build, Zig/Python formatting, license and
+whitespace checks pass. Model/corpus/source/binary/harness/probe pins and all
+failed scoped gates remain in the correctness report.
+
 ## Fixed-prefix parity and stage isolation
 
 The next qualification tools distinguish complete-step drift from individual
@@ -745,7 +830,9 @@ Four-row batching and K=2 passed all eight transcript checks, but their elapsed
 times still failed the performance gate. Serving defaults therefore retain the
 previous batch path and Metal MTP qualification policy.
 
-To exercise the new page path, set `ANTFLY_GEMMA4_METAL_OCR_BATCH=1`,
+To reproduce this historical matrix page path on current builds, additionally
+set `ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC=1`, then set
+`ANTFLY_GEMMA4_METAL_OCR_BATCH=1`,
 `ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS=4` and
 `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1`. The last switch also selects batched Q4
 feed-forward processing; `ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN=1` exposes that

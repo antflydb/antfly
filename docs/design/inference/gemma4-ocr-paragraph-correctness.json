@@ -1,0 +1,1862 @@
+{
+  "scope": "Gemma4 E2B greedy generative OCR on the same Apple M4 Max and pinned Q4_0 target/Q8_0 projector/BF16 assistant used in gemma4-ocr-parity-investigation.json. Recognition includes image prep/prefill/decode/HTTP; PDF rendering and startup excluded. Trace and memory-probe times are diagnostic only.",
+  "first_divergence": {
+    "matrix_comparisons": 5410,
+    "matched_input_comparisons": 5410,
+    "changed_choices": [
+      {
+        "matrix": {
+          "rows": "2",
+          "row": "0",
+          "seq": "1011",
+          "input": "236761",
+          "token": "106",
+          "runner_up": "108",
+          "margin": "5.6114197e-3",
+          "top_logit": "5.4355415e1",
+          "runner_up_logit": "5.4349804e1"
+        },
+        "singleton": {
+          "seq": "1011",
+          "input": "236761",
+          "token": "108",
+          "runner_up": "106",
+          "margin": "3.2997131e-3",
+          "top_logit": "5.4350384e1",
+          "runner_up_logit": "5.4347084e1",
+          "head_matches": "true"
+        }
+      }
+    ],
+    "paragraph_boundary_matrix_samples": [
+      {
+        "rows": "2",
+        "row": "1",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "1.0002136e-2",
+        "top_logit": "5.435279e1",
+        "runner_up_logit": "5.434279e1"
+      },
+      {
+        "rows": "3",
+        "row": "0",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "2.0641327e-2",
+        "top_logit": "5.4354618e1",
+        "runner_up_logit": "5.4333977e1"
+      },
+      {
+        "rows": "4",
+        "row": "1",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "1.6498566e-2",
+        "top_logit": "5.435038e1",
+        "runner_up_logit": "5.433388e1"
+      },
+      {
+        "rows": "3",
+        "row": "1",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "1.5254974e-2",
+        "top_logit": "5.4354816e1",
+        "runner_up_logit": "5.433956e1"
+      },
+      {
+        "rows": "2",
+        "row": "1",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "1.4808655e-2",
+        "top_logit": "5.4355484e1",
+        "runner_up_logit": "5.4340675e1"
+      },
+      {
+        "rows": "3",
+        "row": "1",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "1.8241882e-2",
+        "top_logit": "5.4358437e1",
+        "runner_up_logit": "5.4340195e1"
+      },
+      {
+        "rows": "2",
+        "row": "0",
+        "seq": "1011",
+        "input": "236761",
+        "token": "106",
+        "runner_up": "108",
+        "margin": "5.6114197e-3",
+        "top_logit": "5.4355415e1",
+        "runner_up_logit": "5.4349804e1"
+      },
+      {
+        "rows": "2",
+        "row": "0",
+        "seq": "1011",
+        "input": "236761",
+        "token": "108",
+        "runner_up": "106",
+        "margin": "6.122589e-3",
+        "top_logit": "5.435501e1",
+        "runner_up_logit": "5.434889e1"
+      }
+    ],
+    "scope": "Free-running histories; no canonical KV restoration. Four copies of Attention page 6, two passes.",
+    "transcript_omissions": [
+      {
+        "iteration": 1,
+        "document": "attention6-copy1",
+        "page": 6,
+        "candidate_is_exact_reference_prefix": true,
+        "missing_characters": 204,
+        "missing_completion_tokens": 41,
+        "candidate_finish_reason": "stop"
+      }
+    ]
+  },
+  "interpretation": {
+    "verified": "The failed transcript is stopped by a changed greedy EOS decision after an otherwise matching token prefix, rather than lost response bytes. Canonical-prefix-restoring diagnostics did not preserve the free-running state that exposes this difference.",
+    "arithmetic_scope": "Matrix cohorts change operation families/reduction geometry; accumulated numerical KV/hidden drift is supported by same-input projection differences and the free-running logit comparison. No single faulty kernel or invalid KV index has been established.",
+    "diagnostic_correction": "The old CANONICAL_QKV helper used three standalone row linears; ordinary dense Gemma4 uses a fused QKV family with paired K/V reduction. 7736ff8f80 corrects that helper and the local projection reference. Scoped block/projection/tail rollbacks are not equivalent to full canonical decoder execution.",
+    "serving_fix": "Native OCR cohorts retain the complete prepared singleton operation family by default. Matrix arithmetic requires both OCR_MULTIROW and new OCR_MATRIX_ARITHMETIC flags, or an explicit differential diagnostic. Page KV identities, GPU residency and shared cohort frame remain intact.",
+    "root_cause_limit": "The trace proves the early-EOS failure mechanism. Fully isolating every numerical contribution in the experimental matrix lane remains further kernel qualification work; the serving fix avoids that unqualified lane."
+  },
+  "campaigns": {
+    "paragraph-fixed-baseline": {
+      "runtime_source_revision": "90a6fd9f5b",
+      "binary_sha256": "f884050f1e92986624deb12b56486fd1e79c7ec565adafcc700df08606f30664",
+      "harness_sha256": "a1b78fa4dfcec808b19c407d361d9a3921e6da0827e12aa0571087c827ea3a10",
+      "memory_probe_sha256": null,
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "measured_fastest_case": "ordinary",
+        "median_seconds_per_committed_token": 0.014211083614049864,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "corpus_pages": [
+        {
+          "document": "attention6-copy0",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy1",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy2",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy3",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        }
+      ],
+      "runs": [
+        {
+          "case": "ordinary",
+          "http_max_body_mb": 32,
+          "batch": 1,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "diagnostic": false,
+          "directory": "0-ordinary",
+          "seconds": [
+            40.059070625000004,
+            47.744718625000004
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1304887296,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 10553.5,
+            "p95": 12696,
+            "max": 12696,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            9.642523082999999,
+            9.811154709,
+            10.135870791000002,
+            10.469287166999997,
+            10.717845333,
+            11.557719874999997,
+            12.681750957999995,
+            12.786547666000004
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.0134969914504717,
+            0.016086495493598384
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          },
+          "native_cohort_rows_counts": {
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4qkv",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+          },
+          "diagnostic": false,
+          "directory": "1-cohort4w4qkv",
+          "seconds": [
+            35.677995708,
+            34.374114333
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1563869184,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 34214.5,
+            "p95": 35543,
+            "max": 35543,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            35.677783708,
+            34.373880209
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2927,
+            2968
+          ],
+          "changed_pages": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.01218927082610181,
+            0.011581574910040431
+          ],
+          "matrix_frames": {
+            "samples": 2031,
+            "rows_counts": {
+              "2": 1143,
+              "3": 450,
+              "4": 438
+            }
+          },
+          "native_cohort_rows_counts": {
+            "1": 488,
+            "2": 1143,
+            "3": 450,
+            "4": 438
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "ordinary",
+          "http_max_body_mb": 32,
+          "batch": 1,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "diagnostic": false,
+          "directory": "2-ordinary",
+          "seconds": [
+            42.804367375,
+            41.552624957999996
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1335377920,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 10460.0,
+            "p95": 10779,
+            "max": 10779,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            10.797696458,
+            10.832098874999996,
+            10.629869,
+            10.544407458999999,
+            10.468671916000005,
+            10.360998708000004,
+            10.357922708999993,
+            10.36475291699999
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.014421956662735849,
+            0.01400021056536388
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          },
+          "native_cohort_rows_counts": {
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        }
+      ]
+    },
+    "paragraph-fixed-isolation": {
+      "runtime_source_revision": "145ba9f996",
+      "binary_sha256": "4dc3bb7926db92e6bf4396eecf7e2f0b7eee9bb24bfc1989725d9d4c7f045ff8",
+      "harness_sha256": "0e1aa8b46315c519eb2dda0df69c33fd0df7c7bdde69919c7025eb0c2c846252",
+      "memory_probe_sha256": null,
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "corpus_pages": [
+        {
+          "document": "attention6-copy0",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy1",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy2",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy3",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        }
+      ],
+      "runs": [
+        {
+          "case": "singletontrace",
+          "http_max_body_mb": 32,
+          "batch": 1,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES": "1"
+          },
+          "diagnostic": true,
+          "directory": "0-singletontrace",
+          "seconds": [
+            44.66664575,
+            46.0020595
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1363738624,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 11237.5,
+            "p95": 11667,
+            "max": 11667,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            11.094147625,
+            11.157851,
+            11.230173917000002,
+            11.184259041000004,
+            11.299308958999994,
+            11.518635291999999,
+            11.486488166,
+            11.697405374999988
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.01504940894541779,
+            0.015499346192722372
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          },
+          "native_cohort_rows_counts": {
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4qkvtrace",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES": "1"
+          },
+          "diagnostic": true,
+          "directory": "1-cohort4w4qkvtrace",
+          "seconds": [
+            32.72542812500001,
+            33.136380875
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1535590400,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 32659.0,
+            "p95": 33047,
+            "max": 33047,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            32.725319291999995,
+            33.136266958
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2927
+          ],
+          "changed_pages": [
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.011026087643194073,
+            0.011320936411001025
+          ],
+          "matrix_frames": {
+            "samples": 2088,
+            "rows_counts": {
+              "2": 1248,
+              "3": 446,
+              "4": 394
+            }
+          },
+          "native_cohort_rows_counts": {
+            "1": 474,
+            "2": 1248,
+            "3": 446,
+            "4": 394
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4attn",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_ATTN_OUTPUT": "1"
+          },
+          "diagnostic": false,
+          "directory": "2-cohort4w4attn",
+          "seconds": [
+            29.326600209,
+            28.574721667000006
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1931739136,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 28457.5,
+            "p95": 29242,
+            "max": 29242,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            29.326528459000002,
+            28.574643333000004
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2927,
+            2927
+          ],
+          "changed_pages": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.010019337276733856,
+            0.009762460426033483
+          ],
+          "matrix_frames": {
+            "samples": 2015,
+            "rows_counts": {
+              "2": 1123,
+              "3": 477,
+              "4": 415
+            }
+          },
+          "native_cohort_rows_counts": {
+            "1": 501,
+            "2": 1123,
+            "3": 477,
+            "4": 415
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4block",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_BLOCK": "1"
+          },
+          "diagnostic": false,
+          "directory": "3-cohort4w4block",
+          "seconds": [
+            37.378913125000004,
+            36.263634375
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1880457216,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 36334.5,
+            "p95": 37301,
+            "max": 37301,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            37.378848708999996,
+            36.26356591700001
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2886,
+            2927
+          ],
+          "changed_pages": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.012951806349618851,
+            0.012389352365903656
+          ],
+          "matrix_frames": {
+            "samples": 2078,
+            "rows_counts": {
+              "2": 1260,
+              "3": 419,
+              "4": 399
+            }
+          },
+          "native_cohort_rows_counts": {
+            "1": 440,
+            "2": 1260,
+            "3": 419,
+            "4": 399
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4strict",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_BLOCK": "1"
+          },
+          "diagnostic": false,
+          "directory": "4-cohort4w4strict",
+          "seconds": [
+            42.33628804200001,
+            44.074679583000005
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1762754560,
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 42434.5,
+            "p95": 44010,
+            "max": 44010,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            42.336219458,
+            44.0745375
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2886,
+            2927
+          ],
+          "changed_pages": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.014669538476091478,
+            0.015057970475913908
+          ],
+          "matrix_frames": {
+            "samples": 2017,
+            "rows_counts": {
+              "2": 1128,
+              "3": 452,
+              "4": 437
+            }
+          },
+          "native_cohort_rows_counts": {
+            "1": 435,
+            "2": 1128,
+            "3": 452,
+            "4": 437
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        }
+      ]
+    },
+    "paragraph-stable-fixed": {
+      "runtime_source_revision": "8ed689d285",
+      "binary_sha256": "070fc8ded18e42fa39fbff9f66c19090c537910b0867af3e3e61ce26cecdfeee",
+      "harness_sha256": "3c1ed7f7524af3a098c4a6b3f512d616f88acae7194aac969c74dbf7c32733e2",
+      "memory_probe_sha256": null,
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "measured_fastest_case": "cohort4w4qkv",
+        "median_seconds_per_committed_token": 0.009358687268362533,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "corpus_pages": [
+        {
+          "document": "attention6-copy0",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy1",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy2",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy3",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        }
+      ],
+      "runs": [
+        {
+          "case": "cohort4w4stable",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "0"
+          },
+          "diagnostic": false,
+          "directory": "0-cohort4w4stable",
+          "seconds": [
+            41.351008582999995,
+            41.113940583
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1274183680,
+          "native_cohort_rows_counts": {
+            "1": 459,
+            "2": 1242,
+            "3": 446,
+            "4": 412
+          },
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 41023.5,
+            "p95": 41282,
+            "max": 41282,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            41.350886249999995,
+            41.11382208399999
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.013932280519878704,
+            0.01385240585680593
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4qkv",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1"
+          },
+          "diagnostic": false,
+          "directory": "1-cohort4w4qkv",
+          "seconds": [
+            27.582030042,
+            27.971137582999994
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1440645120,
+          "native_cohort_rows_counts": {
+            "1": 463,
+            "2": 1184,
+            "3": 452,
+            "4": 433
+          },
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 27588.5,
+            "p95": 27905,
+            "max": 27905,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            27.581874833,
+            27.971018582999996
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.009293136806603774,
+            0.009424237730121292
+          ],
+          "matrix_frames": {
+            "samples": 2069,
+            "rows_counts": {
+              "2": 1184,
+              "3": 452,
+              "4": 433
+            }
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        },
+        {
+          "case": "cohort4w4strict",
+          "http_max_body_mb": 32,
+          "batch": 4,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_BLOCK": "1"
+          },
+          "diagnostic": false,
+          "directory": "2-cohort4w4strict",
+          "seconds": [
+            44.164406082999996,
+            44.134909708
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1303625728,
+          "native_cohort_rows_counts": {
+            "1": 448,
+            "2": 1233,
+            "3": 449,
+            "4": 387
+          },
+          "generation_pipeline_wall_ms": {
+            "samples": 8,
+            "p50": 44013.5,
+            "p95": 44103,
+            "max": 44103,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            44.164294334000004,
+            44.134790708000004
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            2927,
+            2886
+          ],
+          "changed_pages": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.01508862524188589,
+            0.015292761506583508
+          ],
+          "matrix_frames": {
+            "samples": 2069,
+            "rows_counts": {
+              "2": 1233,
+              "3": 449,
+              "4": 387
+            }
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts."
+        }
+      ],
+      "timing_qualification_note": "Correctness verification against unchanged ordinary references; no new ordinary before/after brackets, so no new throughput speedup is claimed."
+    },
+    "paragraph-stable-full": {
+      "runtime_source_revision": "8ed689d285",
+      "binary_sha256": "070fc8ded18e42fa39fbff9f66c19090c537910b0867af3e3e61ce26cecdfeee",
+      "harness_sha256": "0f3266835a96ebc1614473b81df2d7a3a7cdaa38e71b4cc560c7f6344ef20306",
+      "memory_probe_sha256": null,
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "measured_fastest_case": "cohort4w8stable",
+        "median_seconds_per_committed_token": 0.015813091708898202,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        }
+      ],
+      "runs": [
+        {
+          "case": "cohort4w8stable",
+          "http_max_body_mb": 32,
+          "batch": 8,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "0"
+          },
+          "diagnostic": false,
+          "directory": "0-cohort4w8stable",
+          "seconds": [
+            65.966967209,
+            62.34045891700001
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1868791808,
+          "native_cohort_rows_counts": {
+            "1": 254,
+            "2": 849,
+            "3": 392,
+            "4": 1228
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts.",
+          "generation_pipeline_wall_ms": {
+            "samples": 16,
+            "p50": 55059.5,
+            "p95": 65785,
+            "max": 65785,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            65.966870333,
+            62.34035374999999
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            4057,
+            4057
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.0162600362851861,
+            0.015366147132610305
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          }
+        }
+      ],
+      "timing_qualification_note": "Correctness verification against unchanged ordinary references; no new ordinary before/after brackets, so no new throughput speedup is claimed."
+    },
+    "paragraph-stable-extended": {
+      "runtime_source_revision": "8ed689d285",
+      "binary_sha256": "070fc8ded18e42fa39fbff9f66c19090c537910b0867af3e3e61ce26cecdfeee",
+      "harness_sha256": "0f3266835a96ebc1614473b81df2d7a3a7cdaa38e71b4cc560c7f6344ef20306",
+      "memory_probe_sha256": null,
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        }
+      ],
+      "runs": [
+        {
+          "case": "cohort4w8stable",
+          "http_max_body_mb": 32,
+          "batch": 8,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "0"
+          },
+          "diagnostic": false,
+          "directory": "0-cohort4w8stable",
+          "seconds": [
+            152.963892791
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1984937984,
+          "native_cohort_rows_counts": {
+            "1": 243,
+            "2": 800,
+            "3": 433,
+            "4": 1472
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts.",
+          "generation_pipeline_wall_ms": {
+            "samples": 16,
+            "p50": 67211.5,
+            "p95": 80636,
+            "max": 80636,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            72.16221333300001,
+            80.801401333
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.016761329475235592
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          }
+        }
+      ],
+      "timing_qualification_note": "Correctness verification against unchanged ordinary references; no new ordinary before/after brackets, so no new throughput speedup is claimed."
+    },
+    "paragraph-stable-reversed": {
+      "runtime_source_revision": "8ed689d285",
+      "binary_sha256": "070fc8ded18e42fa39fbff9f66c19090c537910b0867af3e3e61ce26cecdfeee",
+      "harness_sha256": "0f3266835a96ebc1614473b81df2d7a3a7cdaa38e71b4cc560c7f6344ef20306",
+      "memory_probe_sha256": null,
+      "reverse_rows": true,
+      "completed": true,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "corpus_pages": [
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        }
+      ],
+      "runs": [
+        {
+          "case": "cohort4w8stable",
+          "http_max_body_mb": 32,
+          "batch": 8,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "0"
+          },
+          "diagnostic": false,
+          "directory": "0-cohort4w8stable",
+          "seconds": [
+            160.772670084
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1873723392,
+          "native_cohort_rows_counts": {
+            "1": 238,
+            "2": 834,
+            "3": 460,
+            "4": 1438
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts.",
+          "generation_pipeline_wall_ms": {
+            "samples": 16,
+            "p50": 71884.0,
+            "p95": 81404,
+            "max": 81404,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            81.56939104199999,
+            79.202998292
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.017616992119658118
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          }
+        }
+      ],
+      "timing_qualification_note": "Correctness verification against unchanged ordinary references; no new ordinary before/after brackets, so no new throughput speedup is claimed."
+    },
+    "paragraph-stable-memory": {
+      "runtime_source_revision": "8ed689d285",
+      "binary_sha256": "070fc8ded18e42fa39fbff9f66c19090c537910b0867af3e3e61ce26cecdfeee",
+      "harness_sha256": "0f3266835a96ebc1614473b81df2d7a3a7cdaa38e71b4cc560c7f6344ef20306",
+      "memory_probe_sha256": "b765d526e102237606519e764b28ccbdba6f90abeb707ae5d6affce4c8e8a9f5",
+      "reverse_rows": false,
+      "completed": true,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        }
+      ],
+      "runs": [
+        {
+          "case": "cohort4w8stable",
+          "http_max_body_mb": 32,
+          "batch": 8,
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "0"
+          },
+          "diagnostic": true,
+          "directory": "0-cohort4w8stable",
+          "seconds": [
+            192.606075917
+          ],
+          "sampled_peak_process_tree_rss_bytes": 1574043648,
+          "native_cohort_rows_counts": {
+            "1": 287,
+            "2": 765,
+            "3": 455,
+            "4": 1463
+          },
+          "native_cohort_rows_counts_scope": "Derived from serving log after preload; explicit singleton warmups may be included. Scheduler occupancy only, not committed token counts.",
+          "generation_pipeline_wall_ms": {
+            "samples": 16,
+            "p50": 85260.0,
+            "p95": 101273,
+            "max": 101273,
+            "scope": "Native generation pipeline, including phase waits; excludes queueing before pipeline start and HTTP batch return. Per-page provider counter deltas may overlap and must not be summed."
+          },
+          "http_wave_seconds": [
+            91.118574542,
+            101.486295209
+          ],
+          "mtp_work": {
+            "rounds": 0,
+            "drafted": 0,
+            "matched": 0,
+            "acceptance_rate": null,
+            "phase_wall_ns": {
+              "draft_ns": 0,
+              "verify_ns": 0,
+              "materialize_ns": 0
+            }
+          },
+          "sampled_max_metal_allocated_bytes": 4026171392,
+          "metal_memory_samples": 922,
+          "metal_memory_scope": "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded.",
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.021105202270107384
+          ],
+          "matrix_frames": {
+            "samples": 0,
+            "rows_counts": {}
+          }
+        }
+      ],
+      "timing_qualification_note": "Correctness verification against unchanged ordinary references; no new ordinary before/after brackets, so no new throughput speedup is claimed."
+    }
+  },
+  "validation": {
+    "runtime_source_revision": "8ed689d285",
+    "serving_build": "8ed689d285 ReleaseFast passed",
+    "GPU_regression_selection": {
+      "selected": 61,
+      "passed": 61,
+      "skipped": 0,
+      "scope": "Actual Metal GPU execution; paired QKV, framed per-row block, MTP, decoder, scheduler and HTTP capacity checks",
+      "head_frame_and_replay_on": {
+        "passed": 61,
+        "skipped": 0
+      },
+      "head_frame_and_replay_off": {
+        "passed": 61,
+        "skipped": 0
+      }
+    },
+    "sweep_tests_passed": 8
+  },
+  "serving_fix_verification": {
+    "stable_runs": 5,
+    "completion_tokens": 41428,
+    "all_transcripts_and_counts_match": true,
+    "generation_caps": 0,
+    "page_observations": 72,
+    "scope": "8 repeated failing-page copies + 16 original-corpus pages over two passes + 16 expanded forward + 16 expanded reverse + 16 expanded allocation-instrumented. All GPU-resident canonical cohorts; matrix research cases are separate."
+  }
+}

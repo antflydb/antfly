@@ -485,6 +485,24 @@ def run(args):
             sampled_peak_process_tree_rss_bytes=max(samples, default=None),
             profile=profile((directory / "server.log").read_text()),
         )
+        # Canonical cohorts intentionally have no matrix-frame samples. Record
+        # scheduler occupancy separately so their real batching remains visible.
+        cohort_log = (directory / "server.log").read_text()
+        if "listening on 127.0.0.1:" in cohort_log:
+            cohort_log = cohort_log.split("listening on 127.0.0.1:", 1)[1]
+        entry["native_cohort_rows_counts"] = {
+            str(rows): len(matches)
+            for rows in range(1, 5)
+            if (
+                matches := re.findall(
+                    r"metal_ocr_native_decode_rows=" + str(rows) + r"\b",
+                    cohort_log,
+                )
+            )
+        }
+        entry["native_cohort_rows_counts_scope"] = (
+            "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts."
+        )
         # Request profiles contain the singleton warm pages; strip them before
         # computing decode work/rates. Matrix frame samples have no such warm.
         for name in [
