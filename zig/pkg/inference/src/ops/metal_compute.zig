@@ -42086,12 +42086,17 @@ test "Metal OCR rowwise block preserves distinct rows and canonical arithmetic o
     };
     var expected: [rows * width]f32 = undefined;
     for (0..rows) |row| {
+        // The canonical decoder is framed too. An unframed F32 dense block
+        // can select a different implementation and is not a bitwise oracle.
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
         var av = try a.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
         defer av.deinit();
         var rv = try r.retainedView(row * width * @sizeOf(f32), width * @sizeOf(f32), &.{ 1, width });
         defer rv.deinit();
         var output = (try compute.finishGatedDecoderBlockFromAttentionOutputMt(&request, 0, av, rv, null)) orelse return error.TestUnexpectedResult;
         defer output.deinit();
+        try cb.decoderRuntimeSubmitAndWaitFrame();
         @memcpy(expected[row * width ..][0..width], try output.toHostSlice());
     }
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
