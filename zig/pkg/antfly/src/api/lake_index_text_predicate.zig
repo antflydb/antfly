@@ -212,18 +212,31 @@ pub const Identities = struct {
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
     offsets: []const u32,
+    segment_ids: []const [32]u8 = &.{},
     pub fn init(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot) !Identities {
         if (root.version != corpus.metadata_version or (root.file_groups.len == 0 and snapshot.segments.len != 0)) return error.InvalidNativeLakeTextCorpus;
         const offsets = try a.alloc(u32, snapshot.segments.len + 1);
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
         var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
-        const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
         for (root.file_groups, 0..) |group, group_index| {
             const start = segment;
             segment += group.segments.len;
             if (segment > snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+            if (group.members.len != 0) {
+                try corpus.validateMembers(group.members, root.domain, 0, offsets[segment] - offsets[start]);
+                for (group.members) |member| {
+                    // Cross-file runs contain complete immutable one-run files.
+                    // Their physical manifests retain deleted holes independently.
+                    if (member.source_lower != 0 or result.files.contains(member.file.id)) return error.InvalidNativeLakeTextCorpus;
+                    const file = try a.dupe(u8, member.file.id);
+                    const entry = try result.files.getOrPut(a, file);
+                    const lower = try std.math.add(u32, offsets[start], member.lower);
+                    entry.value_ptr.* = .{ .lower = lower, .upper = try std.math.add(u32, lower, member.count), .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, member.physical.artifact_id), .checksum = try a.dupe(u8, member.physical.checksum), .byte_len = member.physical.byte_len } };
+                }
+                continue;
+            }
             const entry = try result.files.getOrPut(a, try a.dupe(u8, group.file.id));
             if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
             if (group.selected.len == 0 and root.routing.len == 0 and try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
@@ -245,9 +258,20 @@ pub const Identities = struct {
                 const ref = group.physical_manifest orelse root.manifests[group_index];
                 entry.value_ptr.manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, ref.artifact_id), .checksum = try a.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
             }
-            spans[group_index] = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+        const spans = try a.alloc(FileSpan, result.files.count());
+        var files = result.files.iterator();
+        for (spans) |*span| {
+            const file = files.next().?;
+            span.* = .{ .file = file.key_ptr.*, .span = file.value_ptr.* };
+        }
+        std.mem.sort(FileSpan, spans, {}, struct {
+            fn less(_: void, left: FileSpan, right: FileSpan) bool {
+                return left.span.lower < right.span.lower;
+            }
+        }.less);
+        for (spans, 0..) |span, index| if (index != 0 and spans[index - 1].span.upper > span.span.lower) return error.InvalidNativeLakeTextCorpus;
         result.spans = spans;
         return result;
     }

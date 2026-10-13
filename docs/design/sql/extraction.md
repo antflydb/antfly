@@ -907,6 +907,14 @@ gates are `make sql-parity-inventory-check`, `make sql-parity-evidence-check`
 and `make sql-parity-release-check` (see [the inventory](parity-inventory.md)).
 The focused tests do not satisfy the complete SQL extraction release gate.
 
+Two build-memory gates were over their declared claims as of the October 2026
+typed-values log, and neither was claimed fixed: broad optimized SQL compilation
+reported a 3.44 GB peak against its 3.22 GB declared RSS claim (a cached rerun
+passing does not prove cold compilation fits), and the broad durable-runtime
+target reported a 14.46 GB compiler peak against its 13.96 GB reservation. The
+isolated `sql-numeric-test` target does not fix either
+([history](history/typed-values-log-2026-10.md)).
+
 ## Open work
 
 - Original-corpus adjudication until `make sql-parity-release-check` passes.
