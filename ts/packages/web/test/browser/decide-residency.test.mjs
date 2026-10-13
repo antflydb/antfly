@@ -35,7 +35,7 @@ test("Decide keeps encoder activations on WebGPU with CPU output parity", {
         [...document.querySelector("input").files].map((file) => [
           file.webkitRelativePath.split("/").slice(1).join("/"),
           file,
-        ]),
+        ])
       );
       const requests = [
         [
@@ -99,7 +99,7 @@ test("Decide keeps encoder activations on WebGPU with CPU output parity", {
       assert((run.commands.deberta_disentangled_attention ?? 0) > 0, "DeBERTa must run on GPU");
       assert(
         (run.commands.modern_op ?? 0) >= run.commands.deberta_disentangled_attention,
-        "Each encoder layer must dispatch erf GELU on GPU",
+        "Each encoder layer must dispatch erf GELU on GPU"
       );
       assert((run.commands.download ?? 0) <= 2, JSON.stringify(run));
       assert(run.downloadBytes < 1024 * 1024, JSON.stringify(run));
