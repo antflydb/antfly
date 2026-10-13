@@ -500,6 +500,9 @@ pub const BatchKeys = struct {
         errdefer out.shrinkRetainingCapacity(start);
         // Only bound dependencies are decoded; unrelated wide columns stay in
         // their physical vectors. NULL slots are checked before dictionary IDs.
+        var roots: @import("../../sql/row_value.zig").JsonRow = undefined;
+        var roots_initialized = false;
+        defer if (roots_initialized) roots.deinit();
         for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
             try execution.charge(1);
             value.* = if (input) |index| blk: {
@@ -508,6 +511,28 @@ pub const BatchKeys = struct {
                 // The pinned schema owns element identity; payloads borrow the
                 // retained batch. NULLs must precede dictionary addressing.
                 if (vector.nulls.isNull(row)) break :blk .null;
+                if (column.column_type == .json) {
+                    // The schema supplies JSON identity, not the vector's
+                    // byte shape. Decode only selected dependencies, once per
+                    // row; all component programs borrow the same root owner.
+                    const bytes = switch (vector.values) {
+                        .json => |values| values[row],
+                        .bytes, .dictionary_bytes => try vector.bytesAt(row),
+                        else => return error.RowSourceColumnKindMismatch,
+                    };
+                    if (!roots_initialized) {
+                        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+                        roots_initialized = true;
+                        try roots.bindAdmission(execution.bytes);
+                    }
+                    const root = roots.decodePinned(@intCast(index), bytes) catch |err| return switch (err) {
+                        error.SqlProgramLimitExceeded => execution.limit(),
+                        error.SqlInvalidTextRepresentation => error.InvalidRelationalExpressionInput,
+                        error.InvalidSqlNumber, error.SqlNumericOutOfRange => error.RelationalExpressionOverflow,
+                        else => err,
+                    };
+                    break :blk .{ .json = root };
+                }
                 if (column.column_type == .sql_array) break :blk .{ .sql_array = .{
                     .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
                     .bytes = try vector.bytesAt(row),
@@ -1083,6 +1108,158 @@ test "relational index system array dependent scalar keys share cold dictionary 
         var expected = try testTupleAlloc(a, plan, table, &cells);
         defer expected.deinit(a);
         try std.testing.expectEqualSlices(u8, expected.bytes, actual.items);
+    }
+}
+
+test "relational index system JSON dependent scalar keys share projected and pinned row semantics" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const sources = @import("../rowsource/types.zig");
+            const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+                .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+                .{ .name = "unused", .path = "unused", .column_type = .json, .is_json = true, .json_kind = .any },
+            } };
+            var layout = try rows.PhysicalLayout.init(a, table);
+            defer layout.deinit();
+            var plan = try TuplePlan.init(a, table, &layout, &.{
+                .{ .expression_json = "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"n\"}]}", .result_type = .string },
+                .{ .expression_json = "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .result_type = .string },
+                .{ .expression_json = "{\"op\":\"jsonb_array_length\",\"args\":[{\"op\":\"jsonb_extract_path\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}]}]}", .result_type = .integer },
+            });
+            defer plan.deinit();
+            if (TuplePlan.init(a, table, &layout, &.{.{ .column = "j" }})) |result| {
+                var unexpected = result;
+                unexpected.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.UnsupportedRelationalIndexColumn) return err;
+            const payloads: []const []const u8 = &.{ "{\"n\":1.20,\"a\":[null,true]}", "null", "ignored SQL NULL", "{\"n\":-0.00,\"a\":[]}" };
+            for (0..3) |representation| {
+                const vector: sources.ColumnValues = switch (representation) {
+                    0 => .{ .json = payloads },
+                    1 => .{ .bytes = payloads },
+                    else => .{ .dictionary_bytes = .{ .values = &.{ payloads[0], payloads[1], payloads[3] }, .indices = &.{ 0, 1, std.math.maxInt(u32), 2 } } },
+                };
+                const batch: sources.ColumnBatch = .{
+                    .snapshot = .{ .table_id = "json", .snapshot_id = "one" },
+                    .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" }, .{ .relational_key = "three" }, .{ .relational_key = "four" } },
+                    .columns = &.{
+                        .{ .name = "unused", .values = .{ .json = &.{ "invalid", "invalid", "invalid", "invalid" } } },
+                        .{ .name = "j", .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } }, .values = vector },
+                    },
+                };
+                inline for (.{ false, true }) |external| {
+                    var bound = try if (external) plan.bindExternalBatch(a, batch) else plan.bindBatch(a, batch);
+                    defer bound.deinit();
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(a);
+                    for (0..4) |i| {
+                        out.clearRetainingCapacity();
+                        const actual_null = try bound.append(a, &out, i);
+                        var parsed = try std.json.parseFromSlice(std.json.Value, a, if (i == 2) "null" else payloads[i], .{ .parse_numbers = false });
+                        defer parsed.deinit();
+                        const canonical = try @import("document_content_hash.zig").canonicalJsonStorageValueAlloc(a, parsed.value);
+                        defer a.free(canonical);
+                        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "j", .is_json = true, .value_type = .bytes_val, .is_null = i == 2, .value = .{ .bytes_val = canonical } }};
+                        const encoded = try rows.serializePreparedOrdinalWithLayout(a, table.version, table.relational_columns, &cells, @splat(0), &layout);
+                        defer a.free(encoded);
+                        var expected = try plan.encodeAlloc(a, try rows.ordinalRowView(encoded, table, &layout));
+                        defer expected.deinit(a);
+                        try std.testing.expectEqual(expected.has_null, actual_null);
+                        try std.testing.expectEqualSlices(u8, expected.bytes, out.items);
+                    }
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Fixture.run, .{});
+}
+
+test "relational index system projected JSON keys share sticky work cancellation and memory admission" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true, .requires_json_expressions = true, .relational_columns = &.{
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{
+        .{ .expression_json = "{\"op\":\"jsonb_extract_path_text\",\"args\":[{\"op\":\"column\",\"column\":\"j\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"n\"}]}", .result_type = .string },
+        .{ .expression_json = "{\"op\":\"jsonb_typeof\",\"args\":[{\"op\":\"column\",\"column\":\"j\"}]}", .result_type = .string },
+    });
+    defer plan.deinit();
+    const text: [1024]u8 = @splat('x');
+    const payload = "{\"n\":\"" ++ text ++ "\"}";
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "json", .snapshot_id = "faults" },
+        .row_refs = &.{ .{ .relational_key = "valid" }, .{ .relational_key = "invalid" } },
+        .columns = &.{.{ .name = "j", .values = .{ .json = &.{ payload, "invalid" } } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn poll(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.Canceled;
+        }
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, 4096);
+    try out.appendSlice(a, "keep");
+    var polls: usize = 0;
+    var used: usize = 0;
+    var work: u64 = 0;
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{};
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expect(!try bound.appendWithExecution(a, &out, 0, &execution));
+        polls = control.polls;
+        used = expressions.max_allocated_bytes - bytes;
+        work = 8 * 1024 * 1024 - execution.numeric.remaining;
+        try std.testing.expect(polls > 2);
+        try std.testing.expect(used > text.len);
+    }
+    out.shrinkRetainingCapacity(4);
+    for (1..polls + 1) |cut| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        var control: Control = .{ .fail_at = cut };
+        execution.numeric.checkpoint = Control.poll;
+        execution.numeric.ptr = &control;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        execution.numeric.checkpoint = null;
+        try std.testing.expectError(error.Canceled, bound.appendWithExecution(a, &out, 1, &execution));
+    }
+    for ([_]bool{ false, true }) |memory| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = if (memory) used - 1 else expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        if (!memory) execution.numeric.remaining = work - 1;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 0, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, bound.appendWithExecution(a, &out, 1, &execution));
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &bytes);
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, bound.appendWithExecution(a, &out, 1, &execution));
+        try std.testing.expectEqualStrings("keep", out.items);
     }
 }
 

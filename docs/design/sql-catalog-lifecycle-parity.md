@@ -4989,11 +4989,52 @@ boundary/license headers and original inventory integrity passed.
 Before public activation, complete the generated JSON/null OpenAPI contract,
 SQL lowering, typed projected tuple/vector consumers and reader/capability
 barriers. Restore verification for generated JSONB/JSONB-array results must also
-preserve observable numeric display, not merely SQL logical equality; the
-current generic generated-value comparison is not evidence for that requirement.
+preserve observable numeric display, not merely SQL logical equality. That native
+requirement is covered by the observable generated-result verification checkpoint
+above; it does not establish public schema/SDK or distributed activation.
 The public JSON-null literal representation must also survive generated SDKs
 which omit a nil optional value; native explicit-null field-presence rules are
 not by themselves a complete SDK contract.
 Public schema/rewrite identity and distributed activation proofs still need
 end-to-end qualification. Original dispositions remain unchanged at
 479 implemented / 136 rejected / 73 superseded / 898 unresolved.
+
+### Projected JSON dependencies for scalar index keys
+
+Projected tuple construction now admits JSON dependencies through one sparse,
+row-local pinned root owner shared by every component expression. Native JSON
+vectors, plain text byte vectors and dictionary byte vectors use the schema's
+JSON identity; numeric, boolean and dense-vector physical lanes are not inferred
+to be JSON. SQL NULL is checked before dictionary addressing, while present JSON
+null retains its own root. Only referenced dependencies are parsed. The root
+owner retires after the complete tuple has been encoded, before source advance.
+
+The owner shares the caller's sticky work/cancellation context and monotonic
+retained-byte admission. Decoder arena capacity competes with expression results
+and key encoding rather than receiving a fresh per-component budget. Failures
+restore the output prefix, and exhausted/canceled invocations remain failed
+even if a later row is malformed. Direct JSON ordered keys remain unsupported;
+this is the projected-source implementation for admitted scalar JSON consumers,
+not an expansion of the durable ordered-key format.
+
+Debug contracts compare complete composite key bytes with pinned canonical AROW
+execution across three vector representations and native/external batch binding.
+They include exact numeric display, JSON null versus SQL NULL, NULL dictionary
+slots with arbitrary IDs, reordered vector columns and unused malformed JSON.
+Allocation-failure injection covers binding, decoding and canonical row/key
+preparation. A separate matrix checks every observed cancellation cut, one-unit
+short work and retained-memory limits, sticky failure and malformed-input rollback.
+
+Public JSON expression/schema/SDK activation, SQL DDL lowering, distributed
+reader barriers and original public-case qualification remain unfinished. This
+component change does not alter original dispositions or claim those features
+are activated.
+
+The final focused Debug artifact passed both new regressions without leaks, and
+two independent PostgreSQL JSONB oracle tests passed without regenerating
+fixtures. Formatting, license and inventory checks passed. The merged baseline
+also passed the full Debug gate: 1,043 SQL tests (three existing skips), 117
+pgwire tests, 257 native relational tests and 113 transaction tests (85/85 build
+steps). The full native rerun including this checkpoint is still in progress;
+the focused result is not a substitute for that gate. Cache GC was previewed
+only, with no deletions.
