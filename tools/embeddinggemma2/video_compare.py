@@ -883,6 +883,13 @@ def main():
                 n: compare.agreement(c["vector"], expected["cases"][n]["vector"])
                 for n, c in result["cases"].items()
             }
+            result["reference_sha256"] = reference.sha256(args.reference)
+            result["retrieval_agreement"] = rank_agreement(
+                result["retrieval"],
+                expected["retrieval"],
+                args.top_k,
+                args.score_tolerance,
+            )
             for name, case in result["cases"].items():
                 reference_case = expected["cases"][name]
                 if (
@@ -893,13 +900,6 @@ def main():
                 compare.assert_agreement(
                     case["vector"], expected["cases"][name]["vector"]
                 )
-            result["reference_sha256"] = reference.sha256(args.reference)
-            result["retrieval_agreement"] = rank_agreement(
-                result["retrieval"],
-                expected["retrieval"],
-                args.top_k,
-                args.score_tolerance,
-            )
             if not result["retrieval_agreement"]["pass"]:
                 raise ValueError("retrieval parity gate failed; measurements retained")
         result["status"] = "pass"

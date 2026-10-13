@@ -1769,3 +1769,16 @@ the initial failing campaign and before-fix reproduction remain in the receipts.
 No new pretrained or performance claim is made. Broader real-stream/conformance,
 changing-tool pretrained, full-pipeline performance and protocol work remains
 active. No runtime dependency is added. See [qualification receipts](../../zig/lib/video/testdata/live/persistent-fuzz-validation/README.md).
+
+#### Expanded AV1 pretrained gap measured
+
+The packet-preserving nine-format WebM corpus and completed pinned PyTorch/native
+CPU/Metal runs now demonstrate a failing reference-preservation gate despite exact
+independent decoded planes. All video vectors fail the existing 1e-4 coordinate
+gate; both query rankings change with top-1 overlap zero. The harness retains
+scores/rankings before checking vectors. Next implementation work must reconcile
+monochrome gray/range behavior, high-depth RGB quantization and 4:2:2/4:4:4
+conversion policies through independent pixel oracles, then rerun pretrained
+CPU/Metal and actual Linux. Existing successful 8-bit 4:2:0 qualification cannot
+be generalized to these formats. Layer model policy and all other active scope
+remain required. See `zig/lib/video/testdata/av1-model-validation/README.md`.

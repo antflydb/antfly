@@ -1551,3 +1551,16 @@ the initial failing campaign and before-fix reproduction remain in the receipts.
 No new pretrained or performance claim is made. Broader real-stream/conformance,
 changing-tool pretrained, full-pipeline performance and protocol work remains
 active. No runtime dependency is added. See [qualification receipts](../video/testdata/live/persistent-fuzz-validation/README.md).
+
+### Expanded AV1 model corpus qualification
+
+The new offline WebM muxer preserves pinned AV1 temporal-unit bytes for nine
+monochrome/high-depth/chroma cases and verifies packet hashes, format/count and
+complete independent decoded plane hashes. Production CPU/Metal pretrained runs
+expose RGB preparation differences against pinned PyTorch despite exact decoder
+plane agreement. All nine video cases fail the unchanged vector gate; neither
+container support nor decoded plane parity establishes model parity. The harness
+retains retrieval comparisons even when vector gates fail. See the
+[video qualification record](../video/testdata/av1-model-validation/README.md).
+Rendering parity, layer-model policy, fresh expanded-format Linux qualification
+and the remaining non-CUDA design scope stay active.

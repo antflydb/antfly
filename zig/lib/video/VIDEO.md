@@ -2321,3 +2321,31 @@ the initial failing campaign and before-fix reproduction remain in the receipts.
 No new pretrained or performance claim is made. Broader real-stream/conformance,
 changing-tool pretrained, full-pipeline performance and protocol work remains
 active. No runtime dependency is added. See [qualification receipts](testdata/live/persistent-fuzz-validation/README.md).
+
+### Expanded AV1 pretrained preservation: failing qualification
+
+A deterministic, packet-preserving WebM corpus now connects nine pinned expanded
+AV1 formats to production pretrained CPU and Metal inference: monochrome 8/12,
+4:2:0 12, and 4:2:2/4:4:4 8/10/12-bit, all 127×95 and twelve displayed pictures.
+Every packet survives muxing exactly, and independent FFmpeg decoded planes
+match the pinned AOM hashes. The maintained generator and corpus live in
+`tools/embeddinggemma2/testdata/av1-formats`.
+
+Both native backends fail the existing PyTorch vector gate for all nine video
+cases. Text queries pass. Video cosine agreement ranges approximately
+0.98844–0.99997; maximum coordinate errors are approximately 0.000967–0.020215,
+above the unchanged 1e-4 gate. CPU/Metal differences are much smaller than the
+reference differences. This exposes a preparation-policy qualification gap,
+not a decoder-plane mismatch. In the monochrome 8-bit case, FFmpeg's default
+RGB repeats unexpanded gray samples while native preparation applies the coded
+limited-range conversion. Other depth/chroma conversion differences require
+pixel-level investigation. No production rendering behavior or tolerance was
+changed to disguise the failures.
+
+The comparison harness now retains retrieval score/ranking agreement before
+asserting vector parity, so a failed vector gate still supplies retrieval evidence.
+[Receipts](testdata/av1-model-validation/README.md) preserve failed completed
+runs, source/fixture/binary identities and independent format evidence. These
+shared-host measurements are diagnostic; they make no performance claim.
+Expanded-format pretrained parity, scalable-layer model policy and fresh Linux
+model execution remain unfinished, alongside the broader active non-CUDA scope.

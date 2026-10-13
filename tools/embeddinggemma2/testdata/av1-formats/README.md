@@ -1,0 +1,29 @@
+# Expanded AV1 pretrained preservation corpus
+
+Nine generated, two-second, 127×95 clips exercise monochrome 8/12-bit,
+4:2:0 12-bit, and 4:2:2/4:4:4 8/10/12-bit AV1. Their pinned elementary
+sources and independent AOM plane goldens are in
+`zig/lib/video/testdata/av1-extended`. No application relevance labels are supplied.
+
+Regenerate from the repository root:
+
+```sh
+python3 tools/embeddinggemma2/generate_av1_model_corpus.py \
+  --output tools/embeddinggemma2/testdata/av1-formats
+```
+
+The offline generator writes deterministic WebM without changing coded temporal
+units, checks every packet hash through FFprobe, verifies geometry/depth/chroma
+and displayed counts, and compares FFmpeg's complete decoded planes with pinned
+AOM frame hashes. `formats.json` retains those checks. FFmpeg is a qualification
+tool; inference retains its pure Zig codec runtime.
+
+Use `tools/embeddinggemma2/video_compare.py` with this `corpus.json`, a pinned
+checkpoint and backends `cpu`, `native` and `metal`. Supply the CPU report through
+`--reference` for the native runs. Vector and score gates remain unchanged.
+The reports in `zig/lib/video/testdata/av1-model-validation` record failures:
+decoded plane agreement does **not** imply pretrained embedding agreement.
+
+The corpus does not cover Annex B model ingestion, scalable layers, HDR,
+rotation, Linux execution or real application quality. Those remain separate
+requirements in the active design.
