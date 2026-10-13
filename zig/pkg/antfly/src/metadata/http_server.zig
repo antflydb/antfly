@@ -7222,7 +7222,8 @@ test "metadata linearizable snapshot detects concurrent projection changes" {
     try std.testing.expect(AdminSource.sameSnapshotFence(before, after));
 
     after.metadata_raft_commit_index += 1;
-    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
+    // Pending committed work has not changed the applied snapshot.
+    try std.testing.expect(AdminSource.sameSnapshotFence(before, after));
     after.metadata_raft_commit_index = before.metadata_raft_commit_index;
     after.metadata_raft_applied_index += 1;
     try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
