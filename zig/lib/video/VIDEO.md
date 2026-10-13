@@ -2272,3 +2272,28 @@ qualification, persistent-owner fuzzing, sustained full pipelines and broader
 original non-CUDA requirements remain active. No runtime dependency is added.
 
 See [qualification receipts](testdata/live/dynamic-coordinator-validation/README.md).
+
+### Collect obsolete live AVC configurations
+
+Live registry rebasing now frees configuration maps and AVCC payloads no longer
+reachable from retained packets, epoch initialization or the active configuration.
+Selector and epoch IDs compact together after allocation/index checks, preserving
+transactional eviction and native reference state. Retained array capacity remains
+bounded by the configuration limit.
+
+A parameter-planning test activates 600 distinct PPS configurations under a
+two-entry limit, returns to one entry after each eviction and verifies admitted
+byte reclamation. Activation prefixes omit macroblocks; this is not codec
+conformance evidence. Exhaustive allocation failures and existing dynamic pixel,
+held-window and append/retry tests cover ownership and reconstruction separately.
+
+ReleaseSafe macOS passes 242 video, 23 live and 49 model checks; actual Linux
+ARM64 passes 217 video, 23 live and 44 model checks (platform skips documented).
+Fresh native CPU, Metal and Linux pretrained windows retain exact complete-clip
+and prior incremental vectors across all eight rolling/sparse intervals. Previously
+pinned CPU/MPS oracles preserve rankings and full top-k overlap (1, 3, 5, 8).
+This phase reuses those oracles and does not rerun full-replay inference.
+
+Broader changing-tool pretrained qualification, persistent-owner fuzzing, sustained
+full-pipeline measurements and remaining original non-CUDA scope remain active.
+No runtime dependency is added. See [qualification receipts](testdata/live/configuration-compaction-validation/README.md).

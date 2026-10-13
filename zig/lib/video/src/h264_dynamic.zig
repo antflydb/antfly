@@ -230,6 +230,31 @@ pub const Session = struct {
         if (!self.valid or removed > self.packet_configs.len) return error.InvalidPacketIndex;
         const allocator = self.budget.allocator();
         const selectors = try allocator.dupe(usize, self.packet_configs[removed..]);
+        errdefer allocator.free(selectors);
+        const remap = try allocator.alloc(usize, self.entries.items.len);
+        defer allocator.free(remap);
+        @memset(remap, std.math.maxInt(usize));
+        // Retain packet configurations, retained epoch initial configurations
+        // and the active configuration needed by later parameter-only appends.
+        for (selectors) |id| {
+            if (id == std.math.maxInt(usize)) continue;
+            if (id >= remap.len) return error.InvalidLivePictureIndex;
+            remap[id] = 0;
+        }
+        for (self.epochs.items) |epoch| if (epoch.end > removed) {
+            if (epoch.entry >= remap.len) return error.InvalidLivePictureIndex;
+            remap[epoch.entry] = 0;
+        };
+        if (self.active) |id| {
+            if (id >= remap.len) return error.InvalidLivePictureIndex;
+            remap[id] = 0;
+        }
+        var retained_entries: usize = 0;
+        for (remap) |*id| if (id.* != std.math.maxInt(usize)) {
+            id.* = retained_entries;
+            retained_entries += 1;
+        };
+
         var last_sequence: [32]?usize = @splat(null);
         var last_picture: [256]?usize = @splat(null);
         for (self.history.items, 0..) |parameter, i| {
@@ -265,6 +290,25 @@ pub const Session = struct {
             self.epochs.items.len = 1;
             self.epochs.items[0] = .{ .start = 0, .end = 0, .entry = active, .max_refs = self.entries.items[active].config.max_refs };
         };
+        // Everything below is infallible. Arrays compact in place so neither
+        // native state nor published snapshots borrow released registry entries.
+        var retained: usize = 0;
+        for (self.entries.items, remap) |entry_value, id| {
+            if (id == std.math.maxInt(usize)) {
+                entry_value.config.groups.deinit(allocator);
+                allocator.free(entry_value.avcc);
+            } else {
+                self.entries.items[retained] = entry_value;
+                retained += 1;
+            }
+        }
+        std.debug.assert(retained == retained_entries);
+        self.entries.items.len = retained;
+        for (selectors) |*id| if (id.* != std.math.maxInt(usize)) {
+            id.* = remap[id.*];
+        };
+        for (self.epochs.items) |*epoch| epoch.entry = remap[epoch.entry];
+        if (self.active) |id| self.active = remap[id];
         allocator.free(self.packet_configs);
         self.packet_configs = selectors;
     }
@@ -365,4 +409,117 @@ fn writeParameter(bytes: []u8, cursor: *usize, length: u3, nal: []const u8) void
     cursor.* += length;
     @memcpy(bytes[cursor.*..][0..nal.len], nal);
     cursor.* += nal.len;
+}
+
+const TestBits = struct {
+    bytes: [128]u8 = @splat(0),
+    bits: usize = 0,
+    fn bit(self: *@This(), value: u1) void {
+        self.bytes[self.bits / 8] |= @as(u8, value) << @intCast(7 - self.bits % 8);
+        self.bits += 1;
+    }
+    fn ue(self: *@This(), value: u32) void {
+        const coded = value + 1;
+        const count = 32 - @clz(coded);
+        for (0..count - 1) |_| self.bit(0);
+        var left: usize = count;
+        while (left != 0) {
+            left -= 1;
+            self.bit(@intCast((coded >> @intCast(left)) & 1));
+        }
+    }
+    fn se(self: *@This(), value: i32) void {
+        self.ue(@intCast(if (value > 0) value * 2 - 1 else -value * 2));
+    }
+    fn nal(self: *@This(), a: std.mem.Allocator, header: u8) ![]u8 {
+        self.bit(1);
+        while (self.bits % 8 != 0) self.bit(0);
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(a);
+        try list.append(a, header);
+        var zeros: usize = 0;
+        for (self.bytes[0 .. self.bits / 8]) |byte| {
+            if (zeros >= 2 and byte <= 3) {
+                try list.append(a, 3);
+                zeros = 0;
+            }
+            try list.append(a, byte);
+            zeros = if (byte == 0) zeros + 1 else 0;
+        }
+        return list.toOwnedSlice(a);
+    }
+};
+fn parameterPacket(a: std.mem.Allocator, id: u32, qp: i32) ![]u8 {
+    var pps = TestBits{};
+    pps.ue(id);
+    pps.ue(0);
+    pps.bit(0);
+    pps.bit(0);
+    pps.ue(0);
+    pps.ue(0);
+    pps.ue(0);
+    pps.bit(0);
+    pps.bit(0);
+    pps.bit(0);
+    pps.se(qp);
+    pps.se(0);
+    pps.se(0);
+    pps.bit(1);
+    pps.bit(0);
+    pps.bit(0);
+    const parameters = try pps.nal(a, 0x68);
+    defer a.free(parameters);
+    // This is a parameter-planning corpus: only the activation prefix is
+    // supplied. It does not claim valid reconstruction of macroblocks.
+    var slice = TestBits{};
+    slice.ue(0);
+    slice.ue(2);
+    slice.ue(id);
+    const activation = try slice.nal(a, 0x41);
+    defer a.free(activation);
+    const bytes = try a.alloc(u8, 8 + parameters.len + activation.len);
+    std.mem.writeInt(u32, bytes[0..4], @intCast(parameters.len), .big);
+    @memcpy(bytes[4..][0..parameters.len], parameters);
+    const at = 4 + parameters.len;
+    std.mem.writeInt(u32, bytes[at..][0..4], @intCast(activation.len), .big);
+    @memcpy(bytes[at + 4 ..], activation);
+    return bytes;
+}
+fn configurationChurn(a: std.mem.Allocator, rounds: usize) !void {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "configuration-churn", .admission_pool = &pool, .storage = .{ .borrowed = @embedFile("../testdata/h264-dynamic-pps.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var view = reader;
+    view.packets = reader.packets[0..1];
+    const owner = try Session.init(a, &view, .{ .max_configurations = 2 });
+    defer owner.deinit();
+    try owner.rebase(1);
+    for (0..rounds) |i| {
+        const bytes = try parameterPacket(a, @intCast(i % 256), @intCast(i / 256));
+        defer a.free(bytes);
+        var input = media.source.Source{ .allocator = a, .identity = "parameter-activation", .admission_pool = &pool, .storage = .{ .borrowed = bytes } };
+        var descriptor = reader.packets[0];
+        descriptor.offset = 0;
+        descriptor.size = @intCast(bytes.len);
+        view.input = &input;
+        view.packets = @as(*[1]media.mp4.Packet, @ptrCast(&descriptor));
+        try owner.append(&view);
+        try std.testing.expect(owner.entries.items.len <= 2);
+        const live = owner.budget.live;
+        try owner.rebase(1);
+        try std.testing.expectEqual(@as(usize, 1), owner.entries.items.len);
+        try std.testing.expectEqual(@as(?usize, 0), owner.active);
+        try std.testing.expectEqual(@as(usize, 0), owner.epochs.items[0].entry);
+        try std.testing.expectEqual(@as(u32, @intCast(i % 256)), owner.entries.items[0].config.pps);
+        try std.testing.expect(owner.budget.live < live);
+    }
+    try std.testing.expectEqual(rounds + 1, owner.probe_packets);
+}
+test "dynamic AVC configuration compaction bounds 600 activations under two live entries" {
+    try configurationChurn(std.testing.allocator, 600);
+}
+test "dynamic AVC configuration compaction allocation failures retain clean shared owners" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, configurationChurn, .{@as(usize, 6)});
 }
