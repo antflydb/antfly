@@ -418,4 +418,19 @@ test "external lake global frontier wrapped publication builds real Parquet pack
     defer restored.deinit();
     try std.testing.expectEqual(@as(u64, 2), restored.value.published.?.generation);
     try std.testing.expect(restored.value.published.?.cloud_generations.?.complete);
+    // A credential/backend identity rotation starts a fresh map domain, even
+    // when the same physical bucket remains reachable through the new identity.
+    const rotated_identity: [32]u8 = @splat(7);
+    table.lake_index_catalog_json = recovered;
+    const rotated_pending = try publication_api.begin(a, std.testing.io, table, &source, rotated_identity, .{}, 101, 1000);
+    defer a.free(rotated_pending);
+    table.lake_index_catalog_json = rotated_pending;
+    const rotated_encoded = try publication_api.build(a, &store, table, &source, rotated_identity, .{ .io = std.testing.io }, .none, .{ .ptr = &harness, .now_ms = Harness.now });
+    defer a.free(rotated_encoded);
+    var rotated = try catalog.parse(a, rotated_encoded);
+    defer rotated.deinit();
+    const rotated_root = rotated.value.published.?.cloud_generations.?.root;
+    const rotated_scope = (try stores.uploadScopeFromArtifactId(rotated_root.artifact_id)).?;
+    try std.testing.expectEqual(publication_api.uploadDomainWithNamespace(4, rotated_identity, rotated.value.namespace), rotated_scope.domain);
+    try std.testing.expect(rotated.value.published.?.cloud_generations.?.complete);
 }

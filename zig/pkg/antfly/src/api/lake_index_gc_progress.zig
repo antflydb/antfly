@@ -49,7 +49,7 @@ pub const Job = union(enum) {
     chunk: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
-    page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
+    page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
 pub const Progress = struct {
     collector: *gc.Collector,
@@ -145,18 +145,25 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
                     progress: *Progress,
                     ordered: bool,
                     contributions: bool,
+                    text_files: @FieldType(@FieldType(Job, "page"), "text_files"),
                     a: A,
                     pub fn child(visitor: *@This(), ref: tree.Ref) !void {
-                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .contributions = visitor.contributions } });
+                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .contributions = visitor.contributions, .text_files = visitor.text_files } });
                     }
                     pub fn record(visitor: *@This(), key: []const u8, bytes: []const u8) !void {
+                        if (visitor.text_files) |files| {
+                            if (key.len != 36 or std.mem.readInt(u32, key[32..36], .big) != 0) return error.InvalidNativeLakeGcReference;
+                            const record_ = try @import("lake_index_text_directory.zig").decodeFileRecord(visitor.a, key[0..32].*, bytes, visitor.progress.value.domain);
+                            try visitor.progress.enqueue(.{ .text_manifest = .{ .ref = record_.manifest, .seekable = files.seekable, .maintenance_only = files.maintenance_only } });
+                            return;
+                        }
                         if (visitor.contributions) {
                             const value = try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, visitor.a, bytes, .{ .allocate = .alloc_always });
                             try @import("lake_index_contributions.zig").validate(value);
@@ -168,7 +175,7 @@ pub const Progress = struct {
                         if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
                     }
                 };
-                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .contributions = job_page.contributions, .a = a };
+                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
                 try tree.walkPage(a, pages.store(), page, &visitor);
             },
         }

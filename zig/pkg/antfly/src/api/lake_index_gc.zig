@@ -332,7 +332,10 @@ pub const Collector = struct {
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.segment_files, false);
-                    try self.markPages(a, root.domain, root.directories.files, false);
+                    const paged_text_files = self.progress != null and root.inventory_version == 3 and ref.metadata_version >= 11;
+                    if (paged_text_files) {
+                        if (root.directories.files) |files| try self.progress.?.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = root.serving != null } } });
+                    } else try self.markPages(a, root.domain, root.directories.files, false);
                     try self.markPages(a, root.domain, root.directories.segments, false);
                     try self.markPages(a, root.domain, root.directories.routing, false);
                     try self.markPages(a, root.domain, root.pack_ownership, false);
@@ -345,7 +348,7 @@ pub const Collector = struct {
                         for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
                     }
 
-                    const manifests = if (root.inventory_version == 3) blk: {
+                    const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
                         const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
                         const refs = try a.alloc(artifacts.ChunkRef, records.len);
                         for (refs, records) |*manifest, record| manifest.* = record.manifest;
@@ -541,7 +544,22 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const file_record = try std.json.Stringify.valueAlloc(ca, @import("lake_index_text_directory.zig").FileRecord{ .file = .{ .id = "part", .digest = @splat(7) }, .manifest = .{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len } }, .{});
+    const FileSource = struct {
+        bytes: []const u8,
+        emitted: bool = false,
+        key: [36]u8,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.emitted) return null;
+            self.emitted = true;
+            return .{ .key = &self.key, .value = self.bytes };
+        }
+    };
+    var file_key: [36]u8 = @splat(0);
+    file_key[0..32].* = text.term_directory.identity("part");
+    var file_source: FileSource = .{ .bytes = file_record, .key = file_key };
+    const text_files = (try tree.buildSorted(a, stats_pages.store(), &file_source)).?;
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .inventory_version = 3, .file_count = 1, .segment_count = 1, .directories = .{ .files = text_files } }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };

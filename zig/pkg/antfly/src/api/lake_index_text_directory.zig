@@ -340,6 +340,9 @@ const MetadataBuilder = struct {
         _ = self.record_arena.reset(.retain_capacity);
         var ca = self.record_arena.allocator();
         const file = try std.json.Stringify.valueAlloc(ca, FileRecord{ .file = fileState(group.file), .manifest = ref }, .{});
+        // New file records are independently decodable GC units. Segment
+        // descriptors retain their separate chunked encoding for large schemas.
+        if (file.len > chunk_bytes) return error.NativeLakeTextCorpusTooLarge;
         try self.files.add(corpus.term_directory.identity(group.file.id), if (deleting) null else file, file.len);
         var records = try Segments.init(self.group_arena.allocator(), group, ref);
         while (try records.next()) |record| {
@@ -429,13 +432,16 @@ pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
     return record.route.bytes;
 }
 
-fn appendFile(a: A, result: *std.ArrayList(FileRecord), id: Id, bytes: []const u8, domain: Id) !void {
+pub fn decodeFileRecord(a: A, id: Id, bytes: []const u8, domain: Id) !FileRecord {
     const file = try std.json.parseFromSliceLeaky(FileRecord, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(file.file.id))) return error.InvalidNativeLakeTextCorpus;
     try validateRef(file.manifest, domain);
     try state.validate(&.{file.file}, domain);
-    if (result.items.len >= 16384) return error.InvalidNativeLakeTextCorpus;
-    try result.append(a, file);
+    return file;
+}
+fn appendFile(a: A, result: *std.ArrayList(FileRecord), id: Id, bytes: []const u8, domain: Id) !void {
+    if (result.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
+    try result.append(a, try decodeFileRecord(a, id, bytes, domain));
 }
 pub fn fileRecords(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation) ![]const FileRecord {
     var budget: u64 = 128 * 1024 * 1024;

@@ -3436,3 +3436,38 @@ now selects the coordinator candidate window explicitly before dispatch, for bot
 compact and multi-window corpora. Native late-visibility paging respects the same
 component window. The existing broad real-Parquet E2E requires all 31 requested
 rerank candidates and checks offsets, evaluation, pruning and hidden inputs.
+
+V11 GC traverses packed file catalogs through durable page jobs rather than
+expanding a publication-sized manifest array. New records are independently
+decodable, and the authenticated tree population must match the root's file count
+before marking can authorize a sweep. Canonical source state retains its own
+limits; serving-run counts no longer inherit the old 16,384-source-file limit.
+Backend identity or namespace changes start a fresh generation map instead of
+inheriting records from a different upload domain. The wrapped cloud regression
+also covers identity rotation against the same physical bucket.
+
+### Implementation qualification
+
+Merged main base: `db86342bd8` (PR #1118). Zig 0.17.0, macOS arm64.
+
+- The complete Debug native lake integration run passes 415 tests (156 shared
+  engine and 259 server tests), with no failures or leaks. Final paged catalog
+  traversal is also exercised by the targeted durable reader/GC history.
+- The final focused suite passes 20 tests in Debug and ReleaseFast, including
+  real-Parquet wrapped cloud publication, checkpoints, map loss recovery,
+  backend identity rotation, packed-coordinate/tie/cursor correctness, original
+  posting reclamation and locked-store cleanup. No failures or leaks.
+- The standalone object-store suite passes 91 tests; its two real-provider
+  integration tests remain intentionally disabled. GCS wire pagination and
+  cancellation, exact selectors and retention proof parsing are covered.
+- The complete standalone server builds. Selected real Parquet/Iceberg flows
+  cover source append/replacement/removal/reintroduction, rare-query admission,
+  metadata conjunctions and sorted cursors, accepted text/dense/sparse/hybrid
+  cuts, cold restart, hidden highlights and 31-candidate score transforms.
+- Authored embedded and Apache source boundaries, changed Python syntax,
+  source license headers and Git whitespace checks pass.
+
+These are functional and bounded-work qualifications. Live-provider retention
+policy enforcement and representative archive-scale latency/RSS/request-count
+benchmarks are deferred, as requested. Certificate-based audit bypass remains
+opt-in and defaults off.

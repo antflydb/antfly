@@ -326,6 +326,9 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     defer a.free(bytes);
     var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     if (root.version != ref.metadata_version) return error.InvalidNativeLakeTextCorpus;
+    // V11 file records are single-page GC units; authenticate their population
+    // before a paged mark traversal can authorize any deletion.
+    if (ref.metadata_version >= 11 and root.inventory_version == 3 and (if (root.directories.files) |files| files.records else 0) != root.file_count) return error.InvalidNativeLakeTextCorpus;
     // Historical roots remain usable by recovery/retained readers. Reconciliation
     // only advertises the new identity and upgrades protocol-33 publications.
     root.version = metadata_version;
