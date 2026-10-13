@@ -728,6 +728,7 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    decision_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -1158,6 +1159,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
         error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
@@ -1864,6 +1866,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
         .embed_rate_limited => "EmbedRateLimited",
@@ -2375,4 +2378,11 @@ test "external lake and spill errors retain exact identity across runtime archiv
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "external lake evaluation limits retain their exact boundary identity" {
+    const value = statusFromError(error.DecisionLimitExceeded);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expect(errorHasStableDetail(error.DecisionLimitExceeded));
+    try std.testing.expectEqual(error.DecisionLimitExceeded, errorFromStatus(value));
 }

@@ -402,6 +402,16 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     if (bytes.items.len == 0) return error.InvalidNativeLakeTextCorpus;
     return bytes.toOwnedSlice(a);
 }
+/// Authenticate a selected leaf's size without admitting its inventory.
+pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
+    const bytes = try get(a, storage, root.directories.segments, id);
+    defer a.free(bytes);
+    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateRouting(record, root.domain);
+    return record.route.bytes;
+}
+
 fn appendFile(a: A, result: *std.ArrayList(FileRecord), id: Id, bytes: []const u8, domain: Id) !void {
     const file = try std.json.parseFromSliceLeaky(FileRecord, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(file.file.id))) return error.InvalidNativeLakeTextCorpus;
@@ -763,6 +773,60 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     defer invalid_cursor.deinit();
     for (0..4) |_| _ = try invalid_cursor.next(&window_ids);
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, invalid_cursor.next(&window_ids));
+    // Best-first batches use the same authenticated byte envelope and carry
+    // an overflowing leaf without opening descriptors or dropping coverage.
+    {
+        var reads: u64 = 8 * 1024 * 1024;
+        var writes: u64 = 8 * 1024 * 1024;
+        var pages: pages_mod.PageStore = .{ .domain = root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const term = try corpus.statistics.keyAlloc(ca, "body", "common");
+        const prefix = try corpus.term_directory.prefixAlloc(ca, term);
+        var ordered: [9]Id = undefined;
+        for (&ordered, segments) |*id, ref| id.* = corpus.term_directory.identity(ref.artifact_id);
+        std.mem.sort(Id, &ordered, {}, struct {
+            fn less(_: void, l: Id, r: Id) bool {
+                return std.mem.order(u8, &l, &r) == .lt;
+            }
+        }.less);
+        const Source = struct {
+            prefix: []const u8,
+            ids: []const Id,
+            position: usize = 0,
+            key_: [256]u8 = undefined,
+            value: [corpus.statistics.Summary.max_bytes]u8 = undefined,
+            pub fn next(self: *@This()) !?tree.Cursor.Record {
+                if (self.position == self.ids.len) return null;
+                @memcpy(self.key_[0..self.prefix.len], self.prefix);
+                @memcpy(self.key_[self.prefix.len..][0..32], &self.ids[self.position]);
+                self.position += 1;
+                const summary: corpus.statistics.Summary = .{ .frequency = 1, .max_frequency = 1, .min_norm = 1 };
+                return .{ .key = self.key_[0 .. self.prefix.len + 32], .value = summary.encode(&self.value) };
+            }
+        };
+        var source: Source = .{ .prefix = prefix, .ids = &ordered };
+        var reduced = pages.store();
+        reduced.reduce = corpus.term_directory.reduce;
+        var frontier_root = window_root;
+        frontier_root.term_directory = .{ .version = 2, .leaves = try tree.buildSorted(a, reduced, &source) };
+        var frequency: [8]u8 = undefined;
+        std.mem.writeInt(u64, &frequency, 9, .big);
+        frontier_root.term_statistics = try tree.apply(a, pages.store(), null, &.{.{ .key = term, .value = &frequency }});
+        for ([_]u64{ max_segment_bytes, 32 * 1024 * 1024 }) |target| {
+            const frontier = (try @import("lake_index_text_frontier.zig").create(a, frontier_root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+            defer frontier.deinit();
+            var output: [3]Id = undefined;
+            var seen: usize = 0;
+            while (try frontier.nextWindow(&output, null, target)) |batch| {
+                try std.testing.expectEqual(@min(if (target == max_segment_bytes) @as(usize, 1) else output.len, ordered.len - seen), batch.len);
+                for (batch) |id| {
+                    try std.testing.expectEqual(ordered[seen], id);
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(ordered.len, seen);
+            try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads, frontier.charged_bytes);
+        }
+    }
     // Broad admission reads only the compact routing tree. Physical metadata
     // and admissions stay behind authenticated references until consumed.
     var routing_only = root;

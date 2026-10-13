@@ -28,6 +28,7 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Id = [32]u8;
 const Plan = local.search_search.TextNavigationPlan;
+const Metrics = @import("lake_query_metrics.zig").Metrics;
 const Node = struct {
     first: Id,
     last: Id,
@@ -38,6 +39,7 @@ const Node = struct {
     }
 };
 const Self = @This();
+const Pending = struct { identity: Id, bytes: u64 };
 a: A,
 budget: local.sql_memory_budget,
 scratch: std.heap.ArenaAllocator = undefined,
@@ -47,10 +49,12 @@ store: stores.ArtifactStore,
 cached: artifacts.CachedRead,
 token: Token,
 reads: u64 = 256 * 1024 * 1024,
+charged_bytes: u64 = 0,
+metrics: ?*Metrics = null,
+admission_windows: u64 = 0,
 writes: u64 = 0,
 pages: page_store.PageStore = undefined,
 cache: tree.Cache = undefined,
-stats: corpus.statistics.Reader = undefined,
 plan: ?*Plan = null,
 heap: std.PriorityQueue(Node, void, Node.priority) = .initContext({}),
 // Binary hash ranges have at most 256 branching ancestors.
@@ -62,17 +66,23 @@ pruned_ranges: u64 = 0,
 overflow_subtrees: u64 = 0,
 reductions: u64 = 0,
 admitted: u64 = 0,
+summary_cache_hits: u64 = 0,
+pending: ?Pending = null,
 
 pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema) !?*Self {
+    return createObserved(a, root, store, cached, token, text, analysis, schema, null);
+}
+pub fn createObserved(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics) !?*Self {
     if (root.inventory_version != 3 or root.collection == null or root.term_statistics == null or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
     const self = try a.create(Self);
-    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .root = root, .store = store, .cached = cached, .token = token };
+    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .root = root, .store = store, .cached = cached, .token = token, .metrics = metrics };
     const ba = self.budget.allocator();
     self.scratch = .init(ba);
     self.syntax = .init(ba);
-    self.pages = .{ .domain = root.domain, .artifacts = &self.store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true, .read_cache = .{ .ptr = self, .read = readPage } };
+    // Query-wide accounting must not use PageStore.streaming, which resets
+    // its allowance on every page read.
+    self.pages = .{ .domain = root.domain, .artifacts = &self.store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = .{ .ptr = self, .read = readPage } };
     self.cache = .{ .alloc = ba, .underlying = self.pages.store() };
-    self.stats = .{ .read = .{ .store = store, .cache = cached, .context = cached.context, .cancellation = token }, .domain = root.domain, .global = root.term_statistics, .segments = &.{}, .allocator = ba };
     errdefer self.deinit();
     const query = try local.storage_db_query_search_exec.textQueryToSearchQuery(self.syntax.allocator(), text, analysis, schema);
     self.plan = try Plan.create(ba, query, .{ .ptr = self, .count = root.collection.?.documents, .average = average, .frequencies = frequencies }, .{});
@@ -84,10 +94,12 @@ pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: arti
     return self;
 }
 pub fn deinit(self: *Self) void {
+    // Owned here so failed preparation, fallback and cancellation also account
+    // for their charged work, before any borrowed request state is released.
+    if (self.metrics) |metrics| metrics.recordNavigation(.{ .queries = 1, .admitted_segments = self.admitted, .admission_windows = self.admission_windows, .subtree_reductions = self.reductions, .pruned_ranges = self.pruned_ranges, .overflow_subtrees = self.overflow_subtrees, .metadata_read_bytes = self.charged_bytes, .summary_cache_hits = self.summary_cache_hits });
     const a = self.a;
     if (self.plan) |plan| plan.deinit();
     self.heap.deinit(self.budget.allocator());
-    self.stats.deinit();
     self.cache.deinit();
     self.scratch.deinit();
     self.syntax.deinit();
@@ -100,11 +112,29 @@ fn average(raw: *anyopaque, field: []const u8) f32 {
     for (collection.fields) |f| if (std.mem.eql(u8, f.name, field)) return @as(f32, @floatFromInt(f.total_length)) / @as(f32, @floatFromInt(collection.documents));
     return 1;
 }
-fn frequencies(raw: *anyopaque, a: A, field: []const u8, terms: []const []const u8, out: []u32) !void {
+fn frequencies(raw: *anyopaque, _: A, field: []const u8, terms: []const []const u8, out: []u32) !void {
     const self: *Self = @ptrCast(@alignCast(raw));
-    const reader = self.stats.interface();
-    try reader.frequencies(reader.ptr, a, field, terms, out);
+    if (terms.len != out.len) return error.InvalidNativeLakeTextStatistics;
+    for (terms, out) |term, *frequency| {
+        try self.check();
+        _ = self.scratch.reset(.retain_capacity);
+        const a = self.scratch.allocator();
+        const key = try corpus.statistics.keyAlloc(a, field, term);
+        var cursor = try tree.Cursor.init(a, self.cache.store(), self.root.term_statistics, key, null);
+        defer cursor.deinit();
+        const entry = (try cursor.next()) orelse {
+            frequency.* = 0;
+            continue;
+        };
+        if (!std.mem.eql(u8, entry.key, key)) {
+            frequency.* = 0;
+            continue;
+        }
+        if (entry.value.len != 8) return error.InvalidNativeLakeTextStatistics;
+        frequency.* = @intCast(@min(std.math.maxInt(u32), std.mem.readInt(u64, entry.value[0..8], .big)));
+    }
 }
+
 fn check(self: *Self) !void {
     try self.token.check();
     try self.cached.context.ensureActive();
@@ -114,6 +144,7 @@ fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serv
     try self.check();
     if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
     try stores.chargeReadBudget(budget, length);
+    self.charged_bytes += length;
     return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
 }
 const Range = struct {
@@ -122,10 +153,22 @@ const Range = struct {
     last: Id,
     found_first: ?Id = null,
     found_last: Id = undefined,
+    summaries: std.StringHashMapUnmanaged(local.index.IndexSnapshot.TextTermSummary) = .empty,
     fn summary(raw: *anyopaque, field: []const u8, term: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
         const self: *Range = @ptrCast(@alignCast(raw));
         const a = self.owner.scratch.allocator();
         const key = try corpus.statistics.keyAlloc(a, field, term);
+        // Repeated clauses and both canonical lowerings share each envelope.
+        if (self.summaries.get(key)) |value| {
+            self.owner.summary_cache_hits += 1;
+            return value;
+        }
+        const value = try self.readSummary(key, avg, config);
+        try self.summaries.put(a, key, value);
+        return value;
+    }
+    fn readSummary(self: *Range, key: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
+        const a = self.owner.scratch.allocator();
         const prefix = try corpus.term_directory.prefixAlloc(a, key);
         const lower = try std.mem.concat(a, u8, &.{ prefix, &self.first });
         const upper = try std.mem.concat(a, u8, &.{ prefix, &self.last, &.{0} });
@@ -221,6 +264,33 @@ pub fn next(self: *Self, cutoff: ?f32) !?Id {
     return null;
 }
 
+/// Bound admission by count and authenticated payload size. A carried leaf owns
+/// no descriptor, physical manifest or posting payload.
+pub fn nextWindow(self: *Self, output: []Id, cutoff: ?f32, max_bytes: u64) !?[]const Id {
+    if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
+    var count: usize = 0;
+    var bytes: u64 = 0;
+    while (count < output.len and bytes < max_bytes) {
+        try self.check();
+        const leaf: Pending = if (self.pending) |held| held else blk: {
+            const id = (try self.next(cutoff)) orelse break;
+            _ = self.scratch.reset(.retain_capacity);
+            const size = try @import("lake_index_text_directory.zig").segmentBytes(self.scratch.allocator(), self.cache.store(), self.root, id);
+            break :blk .{ .identity = id, .bytes = size };
+        };
+        if (count != 0 and leaf.bytes > max_bytes -| bytes) {
+            self.pending = leaf;
+            break;
+        }
+        self.pending = null;
+        output[count] = leaf.identity;
+        count += 1;
+        bytes += leaf.bytes;
+    }
+    if (count != 0) self.admission_windows += 1;
+    return if (count == 0) null else output[0..count];
+}
+
 test "external lake global frontier reaches late competitive segments and completes under pressure" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("text-global-frontier");
@@ -290,6 +360,8 @@ test "external lake global frontier reaches late competitive segments and comple
     try std.testing.expect(before - frontier.reads < 2 * 1024 * 1024);
     try std.testing.expectEqual(@as(u64, 1), frontier.admitted);
     try std.testing.expect(frontier.reductions > 0);
+    try std.testing.expect(frontier.summary_cache_hits > 0);
+    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads, frontier.charged_bytes);
     const strong = local.section_inverted.bm25Score(100, 100, 8192, 8192, 100, .{});
     try std.testing.expect((try frontier.next(strong)) == null);
     try std.testing.expect(frontier.pruned);
@@ -339,4 +411,18 @@ test "external lake global frontier reaches late competitive segments and comple
     };
     complete.token = .{ .ptr = complete, .is_cancelled_fn = Cancel.yes };
     try std.testing.expectError(error.Canceled, complete.next(null));
+    // Exhaustion survives a tree-cache miss even with a warm shared cache.
+    const exhausted = (try create(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+    defer exhausted.deinit();
+    exhausted.cache.deinit();
+    exhausted.reads = 0;
+    const charged = exhausted.charged_bytes;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, exhausted.next(null));
+    try std.testing.expectEqual(charged, exhausted.charged_bytes);
+    var broken = root;
+    broken.term_directory.leaves.?.digest = @splat(159);
+    var metrics: Metrics = .{};
+    try std.testing.expectError(error.FileNotFound, createObserved(a, broken, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{}, &metrics));
+    try std.testing.expectEqual(@as(u64, 1), metrics.snapshot().navigation.queries);
+    try std.testing.expect(metrics.snapshot().navigation.metadata_read_bytes > 0);
 }

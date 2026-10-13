@@ -3014,12 +3014,16 @@ pub const TextNavigationPlan = struct {
     stats: StreamingBoolStats = undefined,
     root: *const LoweredText = undefined,
     constrained_root: *const LoweredText = undefined,
+    query: SearchQuery,
+    scoring_query: SearchQuery = undefined,
+    scoring_root: *const LoweredText = undefined,
+    scoring_constrained_root: *const LoweredText = undefined,
     config: inverted.BM25Config,
 
     pub fn create(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config) !?*TextNavigationPlan {
         if (!canStreamBool(query, 0)) return null;
         const self = try a.create(TextNavigationPlan);
-        self.* = .{ .a = a, .arena = .init(a), .config = config };
+        self.* = .{ .a = a, .arena = .init(a), .config = config, .query = query };
         errdefer self.deinit();
         const scratch = self.arena.allocator();
         self.stats = .{ .a = scratch, .metadata = source, .count = source.count };
@@ -3032,6 +3036,15 @@ pub const TextNavigationPlan = struct {
             self.deinit();
             return null;
         }
+        // Match the scorer's wrapper exactly: it affects legacy normalization
+        // and f32 addition order even when membership is unchanged.
+        const children = try scratch.alloc(SearchQuery, 1);
+        children[0] = query;
+        self.scoring_query = if (query == .bool_query) query else .{ .bool_query = .{ .should = children, .min_should = 1, .pure_should_optional = true } };
+        lowerer.constrained = false;
+        self.scoring_root = try lowerer.lower(self.scoring_query);
+        lowerer.constrained = true;
+        self.scoring_constrained_root = try lowerer.lower(self.scoring_query);
         try self.stats.load();
         return self;
     }
@@ -3039,6 +3052,29 @@ pub const TextNavigationPlan = struct {
         const a = self.a;
         self.arena.deinit();
         a.destroy(self);
+    }
+    // Only borrow lowered syntax when the actual scorer query is identical.
+    // Predicate wrapping or other semantic changes keep ordinary lowering.
+    fn sameQuery(l: SearchQuery, r: SearchQuery) bool {
+        if (std.meta.activeTag(l) != std.meta.activeTag(r)) return false;
+        return switch (l) {
+            .bool_query => |left| blk: {
+                const right = r.bool_query;
+                if (left.min_should != right.min_should or left.pure_should_optional != right.pure_should_optional or left.boost != right.boost) break :blk false;
+                for ([_][]const SearchQuery{ left.must, left.should, left.must_not }, [_][]const SearchQuery{ right.must, right.should, right.must_not }) |ls, rs| {
+                    if (ls.len != rs.len) break :blk false;
+                    for (ls, rs) |lc, rc| if (!sameQuery(lc, rc)) break :blk false;
+                }
+                break :blk true;
+            },
+            inline .term, .match, .phrase, .term_phrase, .multi_phrase => |value, tag| std.meta.eql(value, @field(r, @tagName(tag))),
+            .match_none, .match_all => true,
+            else => false,
+        };
+    }
+    fn scoringRoot(self: *const TextNavigationPlan, query: SearchQuery, constrained: bool) ?*const LoweredText {
+        if (!sameQuery(query, self.scoring_query)) return null;
+        return if (constrained) self.scoring_constrained_root else self.scoring_root;
     }
     // A baseline can match documents absent from every positive term.
     fn restricted(node: *const LoweredText) bool {
@@ -3212,16 +3248,21 @@ const StreamingBoolStats = struct {
                 for (names, values) |name, value| frequencies.getPtr(name).?.value = value;
                 continue;
             }
-            if (self.snap.?.text_statistics) |reader| if (reader.prepare) |prepare| {
-                const requested = try self.a.alloc([]const u8, frequencies.count());
-                var keys = frequencies.keyIterator();
-                for (requested) |*key| key.* = keys.next().?.*;
-                try prepare(reader.ptr, self.a, field.key_ptr.*, requested);
-            };
-            if (self.snap.?.text_statistics) |reader| if (reader.candidates) |candidate_reader| {
-                var terms = frequencies.iterator();
-                while (terms.next()) |entry| entry.value_ptr.candidates = try candidate_reader(reader.ptr, self.a, field.key_ptr.*, entry.key_ptr.*);
-            };
+            // A publication-wide frontier already selected this bounded native
+            // window. Re-enumerating the global term directory per window would
+            // turn sparse metadata planning into quadratic archive work.
+            if (self.preparation == null) {
+                if (self.snap.?.text_statistics) |reader| if (reader.prepare) |prepare| {
+                    const requested = try self.a.alloc([]const u8, frequencies.count());
+                    var keys = frequencies.keyIterator();
+                    for (requested) |*key| key.* = keys.next().?.*;
+                    try prepare(reader.ptr, self.a, field.key_ptr.*, requested);
+                };
+                if (self.snap.?.text_statistics) |reader| if (reader.candidates) |candidate_reader| {
+                    var terms = frequencies.iterator();
+                    while (terms.next()) |entry| entry.value_ptr.candidates = try candidate_reader(reader.ptr, self.a, field.key_ptr.*, entry.key_ptr.*);
+                };
+            }
             var count: usize = 0;
             var entries = frequencies.iterator();
             while (entries.next()) |entry| if (entry.value_ptr.local) {
@@ -4633,7 +4674,10 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     try stats.collect(.{ .bool_query = bq });
     try stats.load();
     var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present() };
-    stats.lowered = try lowerer.lower(.{ .bool_query = bq });
+    stats.lowered = if (stats.preparation) |prepared|
+        prepared.scoringRoot(.{ .bool_query = bq }, lowerer.constrained) orelse try lowerer.lower(.{ .bool_query = bq })
+    else
+        try lowerer.lower(.{ .bool_query = bq });
     var io: ?std.Io = snap.read_context_io;
     for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) {
         io = source.ranges.read_io;
@@ -10044,6 +10088,16 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         fn frequencies(raw: *anyopaque, alloc: Allocator, field: []const u8, terms: []const []const u8, values: []u32) !void {
             try @as(*@This(), @ptrCast(@alignCast(raw))).snapshot.termDocFreqs(alloc, field, terms, values);
         }
+        fn check(_: *anyopaque) !void {}
+        fn rejectPrepare(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) !void {
+            return error.UnexpectedGlobalTermPreparation;
+        }
+        fn rejectCandidates(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !?[]const index_mod.IndexSnapshot.TextCandidate {
+            return error.UnexpectedGlobalTermPreparation;
+        }
+        fn providerSummary(raw: *anyopaque, _: Allocator, _: usize, field: []const u8, term: []const u8, avg: f32, config: inverted.BM25Config) !index_mod.IndexSnapshot.TextTermSummary {
+            return summary(raw, field, term, avg, config);
+        }
         fn summary(raw: *anyopaque, field: []const u8, term: []const u8, avg: f32, config: inverted.BM25Config) !index_mod.IndexSnapshot.TextTermSummary {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.unknown) return .{ .frequency = 1, .tf_upper = std.math.inf(f32) };
@@ -10061,7 +10115,9 @@ test "external lake metadata navigation shares scorer lowering and conservative 
     const common: SearchQuery = .{ .term = .{ .field = "title", .term = "common" } };
     const rare: SearchQuery = .{ .term = .{ .field = "title", .term = "rare" } };
     const missing: SearchQuery = .{ .term = .{ .field = "title", .term = "missing" } };
+    const custom: analysis_mod.Analyzer = .{ .tokenizer = .unicode_words, .filters = &.{.lowercase} };
     const queries = [_]SearchQuery{
+        .{ .match = .{ .field = "title", .text = "COMMON rare common", .analyzer = &custom } },
         common,
         .{ .bool_query = .{ .must = &.{ common, missing } } },
         .{ .bool_query = .{ .should = &.{ common, missing }, .min_should = 2 } },
@@ -10078,10 +10134,16 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         defer plan.deinit();
         const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
         for ([_]bool{ false, true }) |constrained| {
+            try std.testing.expectEqual(if (constrained) plan.scoring_constrained_root else plan.scoring_root, plan.scoringRoot(plan.scoring_query, constrained).?);
+            try std.testing.expect(plan.scoringRoot(.{ .term = .{ .field = "title", .term = "unrelated" } }, constrained) == null);
             const selected: []const u32 = if (constrained) &.{0} else &.{};
             var result = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = constrained });
             defer result.deinit();
+            // A selected window must not re-enumerate global term membership.
+            @constCast(source.snapshot).text_statistics = .{ .ptr = &source, .check = Source.check, .frequencies = Source.frequencies, .summary = Source.providerSummary, .prepare = Source.rejectPrepare, .candidates = Source.rejectCandidates };
+            defer @constCast(source.snapshot).text_statistics = null;
             var prepared = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = constrained, .text_navigation_plan = plan });
+            @constCast(source.snapshot).text_statistics = null;
             defer prepared.deinit();
             try std.testing.expectEqual(result.hits.len, prepared.hits.len);
             for (result.hits, prepared.hits) |hit, cached| {

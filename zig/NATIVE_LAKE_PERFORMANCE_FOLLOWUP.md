@@ -3,9 +3,10 @@
 Status: active follow-up. Native execution, public snapshot tokens, exact filters,
 and reader leases are implemented on top of PR #1006. The contracts below describe
 implemented refinements and their validation. Publication-wide best-first text
-navigation and bounded profiling/composed text admission are implemented in the
-active follow-up. Cross-source-file compaction, durable cloud generation proofs,
-overlay/early-source admission, and representative archive benchmarks remain
+navigation, adaptive native batches, shared query preparation, and bounded
+profiling/composed/pruner/reranker/evaluation admission are implemented
+in the active follow-up. Cross-source-file compaction, durable cloud generation
+proofs, WAL overlay admission, and representative archive benchmarks remain
 pending; their requirements are recorded at the end.
 
 ## Native sparse predicate intersection
@@ -2860,7 +2861,7 @@ remains a draft while those broader workstreams are incomplete.
 | Global search frontier | Implemented: authenticated term reductions prioritize disjoint segment hash ranges before inventory admission. | Qualify score, tie, source, count and bounded-work contracts. |
 | Historical serving compaction | Small fresh runs compact within a changed source file. | Compact across source files with authenticated physical spans, bounded maintenance work, and cheap appends. |
 | Cloud retained closures | Unsupported provider evidence requires complete retained-artifact audits. | Reuse closure proofs backed by durable object generations and provider-enforced retention, without trusting mutable live names. |
-| Broader bounded admission | Implemented for profiling and text components of composed/vector retrieval; overlays and early-source ranking retain existing planners. | Extend bounded ownership to overlay/early-source shapes with coherent scoring statistics and source dependencies. |
+| Broader bounded admission | Implemented for profiling, text components of composed/vector retrieval, pruners, rerankers and evaluation; overlays retain their existing planner. | Extend bounded ownership to overlay/early-source shapes with coherent scoring statistics and source dependencies. |
 
 #### Global search frontier
 
@@ -2920,9 +2921,10 @@ Implemented frontier details:
   and final physical hydration. Stored-source highlights retain only final
   winning locations.
 - `antfly_lake_text_frontier_*_total` metrics expose admitted segments, subtree
-  reductions, pruned ranges, overflow subtrees and charged term-tree metadata
-  bytes, including work from interrupted constructed frontiers. Global DF
-  reads retain the existing lake cache/provider counters. These are work
+  reductions, pruned ranges, overflow subtrees, admission windows, summary cache
+  hits and charged navigation metadata bytes, including failed preparation and
+  interrupted frontiers. The refinement below includes global DF preparation
+  in the cumulative navigation budget and counter. These are work
   counters, not archive-scale speedup claims.
 
 The deterministic navigation fixture places the strong term match last among
@@ -2964,9 +2966,10 @@ Qualification of native code at `c4897c9e94` and the final E2E fixture at
   still reports 15 files inherited unchanged from main; none is changed here.
 
 The fixture is a correctness and work-contract regression, not an archive-scale
-benchmark. Cross-file packing, durable provider generation proofs, overlay and
-early-source bounded admission, and measured archive-scale latency/RSS/provider
-request improvements remain pending.
+benchmark. At that qualification point, cross-file packing, durable provider
+generation proofs, overlay and early-source bounded admission, and measured
+archive-scale latency/RSS/provider request improvements remained pending. The
+refinement below extends bounded admission to coordinator-owned source transforms.
 
 #### Historical serving packs
 
@@ -3041,3 +3044,71 @@ restart after bounded readiness warming, and repeated warm queries. Record the
 commit, build mode, dataset shape, cache policy and resource limits with each
 measurement. Deterministic work-count regressions remain required even when
 wall-clock benchmarks improve.
+
+
+### PR #1112 refinement: cumulative work and coordinator transforms
+
+The refinement merges main through `543203fbefc3878fad1eea9a7abda201e1802941`.
+It corrects the frontier's read accounting: `PageStore.streaming` previously
+reset the nominal cumulative allowance on every page miss. The frontier now
+owns one non-replenishing 256 MiB allowance for global DF preparation,
+term-directory reductions and selected routing-size reads. A separate monotonic
+charged-byte counter records admitted read work, including shared-cache hits and
+failed provider attempts; it is not a measurement of network transfer bytes.
+A failed budget charge adds no bytes. Frontier-owned teardown records attempts,
+fallbacks, cancellation and preparation failures exactly once.
+
+A range-local cache shares each raw term summary across repeated clauses and
+both canonical bound trees. Native scoring borrows the query's original analyzer
+identities and pre-lowered syntax only when the scorer's complete query matches.
+Predicate wrapping keeps ordinary lowering. Both constrained and unconstrained
+scoring roots use the scorer's exact wrapper, preserving legacy normalization,
+Boolean grouping and f32 addition order. Each selected window still owns its
+visibility, predicates, iterators and scoring state. It does not re-enumerate the
+publication's global term directory to rediscover the same candidates.
+
+Admission starts with one segment so competitive cutoffs become available
+quickly. An unchanged full heap grows subsequent batches geometrically to at
+most 64 segments; an improving cutoff returns admission to one segment. Every
+batch also respects a 32 MiB authenticated native-payload target. An indivisible
+large segment is emitted alone, and an overflowing leaf is carried to the next
+pull without dropping coverage. Native admission continues to use the shared
+scheduler and its existing bounded parallel reader loading. Navigation counters
+include admitted windows and summary-cache hits, making setup amortization and
+metadata reuse observable independently of latency.
+
+Pruners, rerankers and evaluation now use the bounded global
+retrieval pool. The shared component-paging contract determines the reranker
+pool; candidate evaluation retrieves its declared candidate count with offset
+zero. Every child request clears coordinator-owned transforms. Source-dependent
+transforms load the global pool once with all hidden input fields intact before
+coordinator evaluation/reranking. Surviving hits reuse that source for final
+projection and highlights instead of hydrating the final page a second time.
+Pruners need only scores and avoid source hydration for rejected candidates.
+Full-match evaluation for the supported text shapes disables competitive cutoffs
+and verifies exact window
+membership, using a same-window count when local WAND returned a lower bound.
+Its byte-bounded batches grow independently of competitive cutoffs, since every
+possible match must be visited.
+It rejects a set larger than the declared evaluation budget before source
+hydration. Its limit error has an appended stable status in both runtime error
+registries, so compiled query/callback boundaries preserve the public 422
+`decision_limit_exceeded` response. Exhausted cumulative navigation reads map to
+the existing query candidate budget response. WAL overlays retain their existing
+complete planner and statistics.
+
+Regression coverage includes monotonic and exhausted budgets with a warm shared
+cache, failed-preparation accounting, range-summary reuse, size-bounded carried
+batches, exact prepared scorer parity with a custom analyzer, and a provider that
+rejects repeated global term preparation. The real-file differential fixture
+forces a zero-score Boolean baseline for its independent reference planner and
+covers pruning, hidden-field reranking, both evaluation scopes, nonzero offsets,
+full-match budget rejection and restart.
+
+Cross-source-file native serving packs and durable cloud generation certificates
+remain unimplemented. Their authenticated span/reader/GC and provider generation
+migrations are described above; no format flag, provider certificate, or
+unsupported retention guarantee is enabled by these query-path refinements.
+WAL overlay admission also remains pending the shared global-statistics and
+physical-identity extension. Archive-scale latency and provider-request savings
+have not yet been qualified.

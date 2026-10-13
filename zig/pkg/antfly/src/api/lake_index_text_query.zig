@@ -34,7 +34,7 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => error.CatalogGenerationChanged,
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
-        error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge => error.QueryCandidateBudgetExceeded,
+        error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
         else => err,
     };
@@ -215,8 +215,12 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         }
     } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
-    owner.typed_delivery = owner.overlay == null and canDeliverTypedSource(effective);
+    owner.typed_delivery = owner.overlay == null and canDeliverTypedSource(retrievalRequest(effective));
     var execution_req = effective;
+    if (effective.hasHitEvaluation()) {
+        execution_req.offset = 0;
+        execution_req.limit = effective.evaluation_limit;
+    }
     // Retrieval/ranking for these requests needs identities and scores only.
     // Hydrate the final page once, after all result movement, into retained column pages.
     if (owner.typed_delivery) execution_req.include_stored = false;
@@ -240,17 +244,31 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     };
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
+    // Source-dependent transforms consume the globally selected candidate pool,
+    // never every admitted segment's local pool. Preserve hidden input fields.
+    const candidate_sources_loaded = owner.typed_delivery and needsCandidateSource(effective);
+    if (candidate_sources_loaded) try owner.hydrateTransformCandidates(a, result.hits);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
+    // Reused source is deliberately complete, including fields hidden from
+    // the public page. The encoder must apply the final projection even when
+    // an empty projection did not originally require deferred storage shaping.
+    if (candidate_sources_loaded) effective.defer_stored_projection = true;
     var prepared_delivery = delivery;
-    const lazy_hydration = owner.typed_delivery and !effective.count_only and (effective.include_stored or effective.highlight != null) and
+    const lazy_hydration = owner.typed_delivery and !candidate_sources_loaded and !effective.count_only and (effective.include_stored or effective.highlight != null) and
         (if (delivery) |sink| sink.consume_columns and sink.spill_io != null else false);
     if (lazy_hydration) {
         owner.delivery_request = effective;
         prepared_delivery.?.hydrator = .{ .ptr = &owner, .load = Execution.hydrateDelivery, .release = Execution.releaseDelivery };
     } else if (owner.typed_delivery) {
-        if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, effective, result.hits);
+        // Transforms retain full source on surviving hits. Reuse it for wire
+        // projection/highlights rather than fetching the final page again.
+        if (!candidate_sources_loaded and !effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, effective, result.hits);
         try owner.attachHighlights(a, effective, &result);
     }
+    if (candidate_sources_loaded and !effective.include_stored) for (result.hits) |*hit| {
+        if (hit.stored_data) |bytes| a.free(bytes);
+        hit.stored_data = null;
+    };
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms);
     const response = try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
     const finished = @import("antfly_platform").time.monotonicNs();
@@ -1125,15 +1143,15 @@ const Execution = struct {
     // final top-K movement. Metadata filters, typed ordering/cursors and
     // highlights and text components of hybrid/composed retrieval share the same
     // bounded coordinator. The composed owner retains fusion and source leases;
-    // source-dependent ranking keeps its existing planner.
+    // source-dependent transforms run once on the global candidate pool.
     fn pagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
         if (self.forced_selection != null or !self.typed_delivery or self.overlay != null or
-            req.filter_text != null or req.exclusion_text != null or requiresEarlySource(req) or
+            req.filter_text != null or req.exclusion_text != null or requiresEarlySource(retrievalRequest(req)) or
             req.filter_prefix.len != 0 or req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
             req.filter_doc_ids.len != 0 or req.filter_doc_ids_positive or req.exclude_doc_ids.len != 0 or
             req.resolved_doc_filter != null or req.resolved_text_doc_filter != null or req.native_key_predicate != null or
             req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
-            req.aggregations_json.len != 0 or req.pruner != null or req.reranker != null or
+            req.aggregations_json.len != 0 or
             (!req.count_only and req.limit == 0)) return null;
         switch (text) {
             .term, .match, .phrase, .bool_query => {},
@@ -1197,15 +1215,12 @@ const Execution = struct {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
-            frontier = frontier_mod.create(a, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime) catch |err| switch (err) {
+            frontier = frontier_mod.createObserved(a, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime, &self.server.lake_query_metrics) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.NativeLakeTermDirectoryKeyTooLarge => null,
                 else => return err,
             };
         }
-        defer if (frontier) |value| {
-            self.server.lake_query_metrics.recordNavigation(.{ .queries = 1, .admitted_segments = value.admitted, .subtree_reductions = value.reductions, .pruned_ranges = value.pruned_ranges, .overflow_subtrees = value.overflow_subtrees, .metadata_read_bytes = 256 * 1024 * 1024 - value.reads });
-            value.deinit();
-        };
+        defer if (frontier) |value| value.deinit();
         var reader: ?*@import("lake_index_text_directory.zig").RoutingCursor = null;
         if (frontier == null) {
             var planning = self.*;
@@ -1218,13 +1233,15 @@ const Execution = struct {
             reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
         }
         defer if (reader) |value| value.deinit();
-        var winners = PagedWinners.initOrdered(a, if (req.count_only) 0 else @as(usize, req.offset) + req.limit, if (ordering) |*order| order else null);
+        const paging = local.storage_db_query_control_contract.componentPaging(req);
+        var winners = PagedWinners.initOrdered(a, if (req.count_only) 0 else @as(usize, paging.offset) + paging.limit, if (ordering) |*order| order else null);
         defer winners.deinit();
         var total: u32 = 0;
         var relation: types.TotalHitsRelation = .exact;
         var profiled: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
         defer profiled.deinit();
         var ids: [64][32]u8 = undefined;
+        var batch_limit: usize = 1;
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -1233,22 +1250,40 @@ const Execution = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const wa = scratch.allocator();
+            // Full-match evaluation must establish complete membership before
+            // evaluating any source; a competitive top-K cannot prove it.
+            const competitive_cutoff = if (req.evaluation_matches) null else winners.cutoff();
             const window: @import("lake_index_text_directory.zig").RoutingCursor.Window = if (frontier) |value| blk: {
-                const identity = (try value.next(winners.cutoff())) orelse break;
-                ids[0] = identity;
-                break :blk .{ .identities = ids[0..1], .doc_offset = 0 };
+                const selected_ids = (try value.nextWindow(ids[0..batch_limit], competitive_cutoff, 32 * 1024 * 1024)) orelse break;
+                break :blk .{ .identities = selected_ids, .doc_offset = 0 };
             } else (try reader.?.nextBounded(&ids, 32 * 1024 * 1024)) orelse break;
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities };
             defer child.deinit();
-            var request = req;
+            var request = retrievalRequest(req);
             request.offset = 0;
             request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
             request.include_stored = false;
             request.highlight = null;
             request.text_navigation_plan = if (frontier) |value| value.plan else null;
-            if (ordering == null and !req.count_only) request.minimum_competitive_score = winners.cutoff();
+            if (ordering == null and !req.count_only) request.minimum_competitive_score = competitive_cutoff;
+            const previous_cutoff = winners.cutoff();
             var page = try searchText(&child, wa, request, text);
             defer page.deinit();
+            if (req.evaluation_matches and page.total_hits_relation != .exact) {
+                // Local WAND may report a lower bound even when this window's
+                // retained hits cover every match. Count under the same masks
+                // and leased window instead of admitting the full inventory.
+                var count_request = request;
+                count_request.count_only = true;
+                count_request.limit = 0;
+                count_request.minimum_competitive_score = null;
+                var counted = try searchText(&child, wa, count_request, text);
+                defer counted.deinit();
+                page.total_hits = counted.total_hits;
+                page.total_hits_relation = counted.total_hits_relation;
+            }
+            if (req.evaluation_matches and (page.total_hits_relation != .exact or
+                @as(u64, total) + page.total_hits > req.evaluation_limit)) return error.DecisionLimitExceeded;
             if (req.profile) if (page.sort_profile) |profile| {
                 if (profiled.sort_profile == null) {
                     try profiled.setOwnedSortProfile(profile);
@@ -1267,11 +1302,14 @@ const Execution = struct {
                     try winners.addPositioned(hit, try identities.logicalPosition(hit.native_text_doc_id.?), location);
                 } else try winners.addLocated(hit, ordinal, location);
             }
+            // Raise cutoff promptly while winners improve; amortize setup when
+            // weak/equal bounds keep admitting segments without improving K.
+            if (frontier != null) batch_limit = if (req.evaluation_matches or (winners.cutoff() != null and winners.cutoff() == previous_cutoff)) @min(ids.len, batch_limit * 2) else 1;
         }
         if (frontier) |value| if (value.pruned) {
             relation = .gte;
         };
-        var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(req.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};
             result.sort_profile_storage = profiled.sort_profile_storage;
@@ -1532,6 +1570,22 @@ const Execution = struct {
         defer a.free(result);
         return result[0];
     }
+    fn hydrateTransformCandidates(self: *Execution, a: A, hits: []types.SearchHit) !void {
+        const keys = try a.alloc([]const u8, hits.len);
+        defer a.free(keys);
+        for (hits, keys) |hit, *key| key.* = hit.id;
+        const documents = try loadMany(self, a, keys);
+        defer {
+            for (documents) |bytes| if (bytes) |value| a.free(value);
+            a.free(documents);
+        }
+        for (hits, documents) |*hit, *bytes| {
+            const value = bytes.* orelse return error.StoredDocMissing;
+            if (hit.stored_data) |old| a.free(old);
+            hit.stored_data = value;
+            bytes.* = null;
+        }
+    }
     fn loadMany(raw: ?*anyopaque, a: A, keys: []const []const u8) ![]?[]u8 {
         return loadManySelected(raw, a, keys, null);
     }
@@ -1771,6 +1825,23 @@ fn canDeliverTypedSource(req: types.SearchRequest) bool {
         req.evaluation_limit == 0 and req.pruner == null and req.return_mode == .parent and !req.hierarchy_grouped_matches and req.hierarchy_group_level == .source and
         req.hierarchy_children == null and !req.defer_hierarchy_child_hydration and !req.hierarchy_include_source and !req.hierarchy_include_unit and
         req.hierarchy_match_include_all_fields and req.hierarchy_source_include_all_fields and req.hierarchy_unit_include_all_fields;
+}
+
+/// Coordinator-owned score transforms run once over the global candidate pool.
+/// Their dependencies must not force inventory or source loading per window.
+fn retrievalRequest(req: types.SearchRequest) types.SearchRequest {
+    var retrieval = req;
+    retrieval.reranker = null;
+    retrieval.pruner = null;
+    if (req.hasHitEvaluation()) {
+        retrieval.evaluation_limit = 0;
+        retrieval.evaluation_json = "";
+    }
+    return retrieval;
+}
+
+fn needsCandidateSource(req: types.SearchRequest) bool {
+    return req.reranker != null or req.hasHitEvaluation();
 }
 
 fn requiresEarlySource(req: types.SearchRequest) bool {
@@ -2119,6 +2190,26 @@ test "external lake typed delivery separates final projection from residual pred
     req.hierarchy_include_source = false;
     req.evaluation_limit = 1;
     try std.testing.expect(!canDeliverTypedSource(req));
+}
+
+test "external lake bounded transforms retain global candidate windows and source dependencies" {
+    var req: types.SearchRequest = .{ .limit = 7, .offset = 3, .reranker = .{ .provider = .antfly, .field = "hidden", .candidate_count = 31 } };
+    const paging = local.storage_db_query_control_contract.componentPaging(req);
+    try std.testing.expectEqual(@as(u32, 0), paging.offset);
+    try std.testing.expectEqual(@as(u32, 31), paging.limit);
+    try std.testing.expect(canDeliverTypedSource(retrievalRequest(req)));
+    try std.testing.expect(needsCandidateSource(req));
+    req.reranker = null;
+    req.pruner = .{ .min_score_ratio = 0.75 };
+    try std.testing.expect(canDeliverTypedSource(retrievalRequest(req)));
+    try std.testing.expect(!needsCandidateSource(req));
+    req.pruner = null;
+    req.evaluation_limit = 31;
+    try std.testing.expect(canDeliverTypedSource(retrievalRequest(req)));
+    try std.testing.expect(needsCandidateSource(req));
+    req.evaluation_matches = true;
+    try std.testing.expect(canDeliverTypedSource(retrievalRequest(req)));
+    try std.testing.expect(needsCandidateSource(req));
 }
 
 test "external lake sparse predicate planning defers broad masks and subtracts selective includes" {

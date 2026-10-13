@@ -11777,7 +11777,10 @@ pub fn searchTextQuery(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    var base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema);
+    // The trusted lake coordinator prepared this exact text query once under
+    // the pinned index configuration. Borrow its analyzer and syntax identities
+    // across windows; subsequent predicate/key transformations remain local.
+    var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQuery(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema);
     if (executor.native_key) |native_key| base_search_query = try projectTextQueryKeys(arena_alloc, executor.ctx, native_key, base_search_query);
     // Full-text projection publishes replacement snapshots independently of
     // query execution. Pin this generation for the entire request: a borrowed
