@@ -14164,7 +14164,8 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     defer metric_traversal.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), state.metric_calls);
     try std.testing.expectEqual(@as(usize, 1), metric_traversal.nodes.len);
-    try std.testing.expectEqual(@as(f64, 3.5), metric_traversal.nodes[0].metrics[0].score.?);
+    try std.testing.expectEqual(@as(usize, 1), metric_traversal.nodes[0].metricCount());
+    try std.testing.expectEqual(@as(f64, 3.5), metric_traversal.nodes[0].metricAt(0).score.?);
 
     var personalized_query = metric_query;
     personalized_query.query.metrics = &.{.{ .name = "rank", .freshness = .fresh, .seed_nodes = &.{"doc:a"} }};
