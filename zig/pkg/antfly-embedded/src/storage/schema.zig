@@ -302,6 +302,9 @@ pub const TableSchema = struct {
     /// Physical JSON keeps PostgreSQL numeric display scale independently of
     /// semantic content hashing. Readers must understand both representations.
     requires_jsonb_display: bool = false,
+    /// Typed JSON literals/operands in durable programs require capability 30,
+    /// independently of the display-preserving physical JSON storage policy.
+    requires_json_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -324,7 +327,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 29;
+pub const storage_format_version: u32 = 30;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -354,7 +357,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -432,6 +435,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_text_expressions = false;
     projection_schema.requires_numeric_functions = false;
     projection_schema.requires_jsonb_display = false;
+    projection_schema.requires_json_expressions = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -481,6 +485,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version < 27 and schema.requires_text_expressions) return error.UnsupportedVersion;
     if (format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedVersion;
     if (format_version < 29 and schema.requires_jsonb_display) return error.UnsupportedVersion;
+    if (format_version < 30 and schema.requires_json_expressions) return error.UnsupportedVersion;
     if (format_version < 20) for (schema.relational_columns) |column| {
         if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
     };
@@ -635,6 +640,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 27) try buf.append(alloc, @intFromBool(schema.requires_text_expressions));
     if (format_version >= 28) try buf.append(alloc, @intFromBool(schema.requires_numeric_functions));
     if (format_version >= 29) try buf.append(alloc, @intFromBool(schema.requires_jsonb_display));
+    if (format_version >= 30) try buf.append(alloc, @intFromBool(schema.requires_json_expressions));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1053,6 +1059,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_text_expressions = if (fmt_version >= 27) data[pos + 8] == 1 else false,
         .requires_numeric_functions = if (fmt_version >= 28) data[pos + 9] == 1 else false,
         .requires_jsonb_display = if (fmt_version >= 29) data[pos + 10] == 1 else false,
+        .requires_json_expressions = if (fmt_version >= 30) data[pos + 11] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1308,10 +1315,12 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 27) try cursor.readBool();
     if (format_version >= 28) try cursor.readBool();
     if (format_version >= 29) try cursor.readBool();
+    if (format_version >= 30) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_text_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
@@ -3074,7 +3083,7 @@ test "relational index system JSONB display capability fences readers and valida
     const a = std.testing.allocator;
     var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_jsonb_display = true };
     try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 28));
-    const bytes = try serializeSchema(a, current);
+    const bytes = try serializeSchemaFormat(a, current, 29);
     defer a.free(bytes);
     const decoded = try deserializeSchema(a, bytes);
     defer freeSchema(a, decoded);
@@ -3102,6 +3111,43 @@ test "relational index system JSONB display capability fences readers and valida
     defer freeSchema(a, loaded);
     try std.testing.expect(!loaded.requires_jsonb_display);
     current.requires_jsonb_display = true;
+    current.requires_public_schema = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+}
+
+test "relational index system JSON expression capability is independent of physical JSON display" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 29));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_json_expressions);
+    try std.testing.expect(!decoded.requires_jsonb_display);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const malformed = try a.dupe(u8, bytes);
+    defer a.free(malformed);
+    malformed[malformed.len - 1] = 2;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), malformed));
+    const projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(projection);
+    current.requires_json_expressions = false;
+    const ordinary = try serializeTextProjectionSchema(a, current);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, projection, ordinary);
+    const old = try serializeSchemaFormat(a, current, 29);
+    defer a.free(old);
+    const previous = try deserializeSchema(a, old);
+    defer freeSchema(a, previous);
+    try std.testing.expect(!previous.requires_json_expressions);
+    current.requires_json_expressions = true;
     current.requires_public_schema = false;
     try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
 }

@@ -94,6 +94,24 @@ test "relational index system cold generated JSON verification preserves SQL nul
     }
 }
 
+test "relational index system public JSON expressions remain gated until grammar and lowering activate" {
+    const a = std.testing.allocator;
+    const api = @import("../../schema/mod.zig");
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"n\":1.20}}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}",
+        "{\"op\":\"column\",\"column\":\"source\"}",
+    }) |expression| {
+        const definition = try std.fmt.allocPrint(
+            a,
+            "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"generated_columns\":[{{\"column\":\"g\",\"expression\":{s}}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"g\":{{\"type\":\"json\",\"nullable\":true}},\"source\":{{\"type\":\"json\",\"nullable\":true}}}},\"additionalProperties\":false}}}}}}}}",
+            .{expression},
+        );
+        defer a.free(definition);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, api.CompiledTableValidator.init(a, definition));
+    }
+}
+
 test "relational index system typed document expression preparation retains authoritative root null provenance" {
     const a = std.testing.allocator;
     const expressions = @import("../../schema/relational_expression.zig");
@@ -369,7 +387,8 @@ test "relational index system JSONB scale survives LSM reopen and strict portabl
     try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
     for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
         try std.testing.expect(db.core.schema.?.requires_jsonb_display);
-        try std.testing.expectEqual(@as(u32, 29), db.core.table_catalog.schema_format_version);
+        try std.testing.expect(!db.core.schema.?.requires_json_expressions);
+        try std.testing.expectEqual(@import("../schema.zig").storage_format_version, db.core.table_catalog.schema_format_version);
         const bytes = (try db.get(a, "row")).?;
         defer a.free(bytes);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .parse_numbers = false });

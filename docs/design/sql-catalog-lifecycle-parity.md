@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `553e58317f` in merge checkpoint `7a724db894`. Earlier implementation and
+at `f986d952d7` in merge checkpoint `728c2abdb4`. Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -4563,3 +4563,64 @@ catalog checker passed with the existing worktree Python runtime; a redundant
 uv wrapper that had not launched Python was stopped without touching shared
 cache locks. Original accounting remains unchanged. Public durable-JSON
 activation and the full original SQL parity objective are still unfinished.
+
+### Native JSON literal identity and retained evaluator results
+
+Native immutable JSON literal compilation now requires the distinct JSON
+expression capability 30. It does not borrow the schema parser's DOM: the
+compiled plan owns its header, keys, strings and nested containers. Immutable
+array metadata uses a non-allocating sentinel rather than retaining an allocator
+pointing at the compiler's movable stack arena. Plan retirement frees its whole
+arena; individual literal containers are never mutated or freed independently.
+
+Literal fingerprints use canonical JSONB display bytes, not semantic row hash
+bytes. Equivalent key orders and numeric encodings such as 1.20 and 120e-2
+have one identity. Changing display scale to 1.2 changes the program fingerprint
+even though typed logical equality remains true. Present JSON null has an
+explicit native literal marker and differs from typed SQL NULL. Invalid marker
+shapes, NUL text, numeric overflow and older reader capabilities fail closed.
+Literal preparation shares the compiler's work and retained-byte allowance.
+
+Legacy JSON/named-row/bound-row evaluator entry points now retain JSON results
+in the caller's row region before their temporary PreparedInput retires. When
+decoding could have produced a borrowed scalar, the result is copied at that
+lifetime boundary too. Explicit shared-owner callers retain the borrowing fast
+path. A compile-time source-shape mask avoids owner construction and node scans
+for ordinary scalar programs and already encoded cold NUMERIC/array operands;
+ingress values requiring preparation use the sparse cache instead.
+
+Capability 30 has strict ASCH and catalog fencing independently of capability
+29's JSONB display storage. Invalid boolean and truncated metadata are rejected
+before allocation; text-only schema projections clear both flags. The JSONB
+LSM reopen/portable restore test now requires the current catalog format and
+explicitly verifies that physical display storage alone does not activate JSON
+expressions. Its scale and text-output assertions remain unchanged.
+
+Eight focused Debug tests cover lifetime retirement, actual allocator reuse,
+zero-allocation scalar/explicit-owner paths, display-sensitive identity, native
+reader fencing and allocation-fault cleanup. Public schema admission is still
+guarded: derived public schemas do not yet request capability 30, and no OpenAPI
+or SQL lowering surface has been activated. These tests do not establish
+original sql-0671 or change any original case disposition.
+
+Remaining activation includes public feature derivation and generated grammar,
+JSON column/path lowering and typed projected tuple/vector consumers, compiled
+schema/rewrite definition identity, and generated-result display verification.
+An additional existing gap was confirmed during this audit: JSONB array storage
+still uses semantic JSON canonicalization, and its logical frame hash currently
+depends on stored JSON element bytes. Preserving JSONB array display requires
+separating that physical representation from semantic array hashing as well;
+it must not be hidden by the scalar JSON literal qualification above.
+
+Final production-source Debug qualification passed all 1,025 SQL tests (three
+existing skips, zero failures/leaks, 21/21 steps), all 247 final native tests
+(zero failures/leaks, 50/50 steps), and all 113 transaction contracts (zero
+failures/leaks, 50/50 steps). Nested literal/result array allocator lifetime is
+covered by the final native run. The initial native restart regression failed
+only because it hard-coded catalog version 29; its current-format and distinct
+capability assertions now pass without relaxing stored scale or restore checks.
+Formatting, source-catalog freshness, the 2,046-file Apache boundary/license
+headers and original inventory integrity passed. Original accounting remains
+479 implemented / 136 rejected / 73 superseded / 898 unresolved. PR #1061 was
+verified open and draft; this checkpoint is not public JSON activation or full
+SQL parity completion.
