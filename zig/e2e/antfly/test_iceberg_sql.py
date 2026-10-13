@@ -1000,8 +1000,9 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
         server.stop(test_failed=failed)
 
 
+@pytest.mark.parametrize("vector_kind", [None, "dense", "sparse", "hybrid"])
 def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, vector_kind
 ):
     """Real independent files, native CDC visibility and a durable search cut."""
     if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
@@ -1025,6 +1026,14 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         schema=Schema(
             NestedField(1, "id", LongType(), required=False),
             NestedField(2, "body", StringType(), required=False),
+            *(
+                [
+                    NestedField(3, "dense_native", StringType(), required=False),
+                    NestedField(4, "sparse_native", StringType(), required=False),
+                ]
+                if vector_kind
+                else []
+            ),
         ),
     )
     for part in range(67):
@@ -1035,6 +1044,14 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     "body": [
                         "quasar " * (i % 4 + 1) for i in range(part * 3, part * 3 + 3)
                     ],
+                    **(
+                        {
+                            "dense_native": ["[1,0]"] * 3,
+                            "sparse_native": ['{"1":1}'] * 3,
+                        }
+                        if vector_kind
+                        else {}
+                    ),
                 }
             )
         )
@@ -1101,6 +1118,14 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                                         "type": "string",
                                         "x-antfly-field": {"type": "text"},
                                     },
+                                    **(
+                                        {
+                                            "dense_native": {"type": "string"},
+                                            "sparse_native": {"type": "string"},
+                                        }
+                                        if vector_kind
+                                        else {}
+                                    ),
                                 },
                             }
                         }
@@ -1123,7 +1148,23 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                         "type": "full_text",
                         "field": "body",
                         "store_source": True,
-                    }
+                    },
+                    **(
+                        {
+                            "dense_native": {
+                                "type": "embeddings",
+                                "external": True,
+                                "dimension": 2,
+                            },
+                            "sparse_native": {
+                                "type": "embeddings",
+                                "external": True,
+                                "sparse": True,
+                            },
+                        }
+                        if vector_kind
+                        else {}
+                    ),
                 },
             },
         )
@@ -1169,6 +1210,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     break
             assert time.monotonic() < deadline, index
             time.sleep(0.1)
+        vector_image = (
+            {"dense_native": "[0,1]", "sparse_native": '{"2":2}'} if vector_kind else {}
+        )
         accepted = call(
             "POST",
             "/tables/wal_windows/lake/changes",
@@ -1180,10 +1224,17 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "key_fields": ["id"],
                 "changes": [
                     {"op": "delete", "row": {"id": 1}},
-                    {"op": "upsert", "row": {"id": 0, "body": "quasar replacement"}},
                     {
                         "op": "upsert",
-                        "row": {"id": 1000, "body": "quasar recent recent"},
+                        "row": {"id": 0, "body": "quasar replacement", **vector_image},
+                    },
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "id": 1000,
+                            "body": "quasar recent recent",
+                            **vector_image,
+                        },
                     },
                 ],
             },
@@ -1211,9 +1262,85 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert rows[1000] == "quasar recent recent"
         assert all(h.get("_highlights") for h in hits), first
         pinned = dict(query, remote_snapshot=first["remote_snapshot"])
+        hybrid_request = None
+        hybrid_first = None
+        if vector_kind:
+            embeddings = {}
+            if vector_kind in ("dense", "hybrid"):
+                embeddings["dense_native"] = [0, 1]
+            if vector_kind in ("sparse", "hybrid"):
+                embeddings["sparse_native"] = {"indices": [2], "values": [1]}
+            hybrid_request = dict(query, embeddings=embeddings, fields=["id"])
+            deadline = time.monotonic() + 120
+            while True:
+                response = requests.post(
+                    server.api_url + "/tables/wal_windows/query",
+                    json=hybrid_request,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=120,
+                )
+                if response.ok:
+                    value = response.json()
+                    hybrid_first = (
+                        value["responses"][0] if "responses" in value else value
+                    )
+                    break
+                assert response.status_code == 503 and time.monotonic() < deadline, (
+                    response.text + server.debug_logs()
+                )
+                time.sleep(0.1)
+            assert len(hybrid_first["hits"]["hits"]) == 201, hybrid_first
+            assert {h["_source"]["id"] for h in hybrid_first["hits"]["hits"]} == set(
+                rows
+            )
+            assert all(
+                h.get("_highlights") and set(h["_source"]) == {"id"}
+                for h in hybrid_first["hits"]["hits"]
+            )
+            hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
         for restart in (False, True):
             if restart:
                 server.restart()
+            if hybrid_request:
+                hybrid = call("POST", "/tables/wal_windows/query", hybrid_request)
+                assert hybrid["hits"] == hybrid_first["hits"]
+                for identifier in (2, 1000):
+                    selected = call(
+                        "POST",
+                        "/tables/wal_windows/query",
+                        dict(
+                            hybrid_request,
+                            filter_query={"term": {"path": "/id", "value": identifier}},
+                        ),
+                    )
+                    assert [h["_source"] for h in selected["hits"]["hits"]] == [
+                        {"id": identifier}
+                    ]
+                    assert selected["hits"]["hits"][0].get("_highlights")
+                vector_only = dict(hybrid_request)
+                vector_only.pop("full_text_search")
+                vector_only.pop("highlight")
+                vector_only["filter_query"] = {"term": {"path": "/id", "value": 1000}}
+                selected = call("POST", "/tables/wal_windows/query", vector_only)
+                assert [h["_source"] for h in selected["hits"]["hits"]] == [
+                    {"id": 1000}
+                ]
+                recent_vectors = dict(vector_only, limit=2)
+                recent_vectors.pop("filter_query")
+                selected = call("POST", "/tables/wal_windows/query", recent_vectors)
+                assert {h["_source"]["id"] for h in selected["hits"]["hits"]} == {
+                    0,
+                    1000,
+                }, selected
+                # Replacement vectors use a different coordinate, so querying
+                # the old sparse coordinate cannot return the archived image.
+                stale_vector = dict(
+                    vector_only,
+                    embeddings={"sparse_native": {"indices": [1], "values": [1]}},
+                    filter_query={"term": {"path": "/id", "value": 0}},
+                )
+                selected = call("POST", "/tables/wal_windows/query", stale_vector)
+                assert selected["hits"]["hits"] == [], selected
             repeated = call("POST", "/tables/wal_windows/query", pinned)
             assert repeated["hits"] == first["hits"]
             filtered = call(

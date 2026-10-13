@@ -218,7 +218,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         }
     } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(retrievalRequest(effective));
-    owner.typed_delivery = (owner.overlay == null or !has_vectors) and canDeliverTypedSource(retrievalRequest(effective));
+    owner.typed_delivery = canDeliverTypedSource(retrievalRequest(effective));
     var execution_req = effective;
     if (effective.hasHitEvaluation()) {
         execution_req.offset = 0;
