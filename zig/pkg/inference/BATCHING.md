@@ -1125,3 +1125,13 @@ research timing gains do not qualify the normal serving path. The
 `cohort4w8stable` sweep case records its real native cohort occupancy separately
 from matrix-frame profiling. [The correctness report](../../../docs/design/inference/gemma4-ocr-paragraph-correctness.json)
 retains the first changed logits, failed scoped rollbacks and final corpus gates.
+
+The experimental `TERMITE_METAL_Q4_0_BATCH_INVARIANT=1` policy selects singleton
+Q4_0/F32 reduction geometry for two-to-eight-row projections and dispatches over
+the actual row dimension. Fused gate/up uses one cohort dispatch; attention and
+FFN down/sumsq/norm/residual tails retain the singleton family per row. Use the
+`cohort4w8invariant` sweep case to include canonical QKV, PLE and head families.
+This does not enable matrix OCR serving automatically. Kernel bitwise equality
+is insufficient to qualify full transcripts, and the repeated-page campaign
+shows no throughput gain. [The design and evidence](../../../docs/design/inference/gemma4-ocr-optimization.md#singleton-invariant-q4-cohort-dispatch)
+retain output gates and exact source/binary/corpus pins.

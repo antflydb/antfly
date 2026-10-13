@@ -1,0 +1,2721 @@
+{
+  "implementation": "Opt-in TERMITE_METAL_Q4_0_BATCH_INVARIANT=1; safe canonical OCR cohorts remain the default.",
+  "model_id": "ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07",
+  "hardware": "Apple M4 Max, 32 GPU cores, 36 GiB unified memory",
+  "scope": "Q4_0 F32 linear and fused gate/up activation for 2\u20138 rows. Singleton portfolio selected with rows=1; kernel launch grid.y uses actual cohort size. Generated/JIT and row-dependent small-batch reductions bypassed. Fused attention and FFN down/sumsq/norm/residual tails retain canonical row-one family. The OCR experiment also retains row-one QKV, PLE and final head families.",
+  "qualification": "Bitwise operator equality is a necessary gate, not proof of whole-decoder equality or OCR accuracy. Full transcript and completion counts, caps, missing pages and bracketing ordinary controls determine eligibility. Diagnostic timings excluded.",
+  "gpu_tests": {
+    "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+    "selected_passed": 64,
+    "skipped": 0,
+    "rows": [
+      2,
+      3,
+      4,
+      8
+    ],
+    "ffn_shapes": [
+      [
+        64,
+        64
+      ],
+      [
+        1536,
+        6144
+      ],
+      [
+        1536,
+        12288
+      ],
+      [
+        128,
+        96
+      ]
+    ],
+    "linear_output_tails": [
+      63,
+      6143,
+      12287,
+      95
+    ],
+    "references": "Framed singleton; distinct inputs and residuals; fused projection references also traversed in reverse row order. Fused gate/up counter checks one dispatch per cohort when singleton fused policy is active.",
+    "log": "/tmp/gemma4-invariant-suite.log"
+  },
+  "harness_tests": {
+    "passed": 8
+  },
+  "fixture_recovery": {
+    "reason": "Original PDF/PNG cache was no longer present on continuation. Invalid-manifest campaigns are setup failures excluded from all output and throughput claims.",
+    "pdf_hashes": "All three re-downloaded public PDF SHA256 values match the original manifest.",
+    "raster_hashes": "All eight original pages and all sixteen expanded text pages match the committed prior corpus SHA256 values.",
+    "renderer": "Poppler pdftoppm -r 150 -scale-to 1536 -png; rendering excluded from recognition timing."
+  },
+  "shared_machine_timing": "Unrelated compiler activity was observed before the updated campaign. These are local recognition measurements; passing disjoint ranges do not establish an independently replicated production speedup.",
+  "campaigns": [
+    {
+      "runtime_source_revision": "893a21b0560ea5abceb041f00801f4768dad315a",
+      "binary_sha256": "ec0a7dc72dd8675489e07dafc2484b30b44a493f5b4ec90564b332da020f3d81",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/paragraph-fixed-corpus.json",
+      "reverse_rows": false,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": null,
+      "recommendation": {
+        "measured_fastest_case": "ordinary",
+        "median_seconds_per_committed_token": 0.012599165333052562,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "attention6-copy0",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy1",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy2",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy3",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-fixed-893a21",
+      "runs": [
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            37.22524262500001,
+            37.563402792000005
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.012542197649932616,
+            0.012656133016172508
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1322024960,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        },
+        {
+          "case": "cohort4w4invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            36.662612458,
+            37.338773290999995
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2886
+          ],
+          "changed_pages": [
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 701
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701
+            }
+          ],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": false,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.012352632229784366,
+            0.012937897883229382
+          ],
+          "native_cohort_rows_counts": {
+            "1": 429,
+            "2": 1244,
+            "3": 414,
+            "4": 423
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1575665664,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 701,
+              "finish_reason": "stop",
+              "text_sha256": "26a1d5fdb75acc9631fa40e150fa130885c020672d42717d3fd21aa83421e219",
+              "characters": 2810
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 701,
+              "finish_reason": "stop",
+              "text_sha256": "26a1d5fdb75acc9631fa40e150fa130885c020672d42717d3fd21aa83421e219",
+              "characters": 2810
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        },
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            42.270760291,
+            42.845440624999995
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.014242169909366578,
+            0.014435795358827492
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1106870272,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+      "binary_sha256": "92d93b7d87412de60abee3ad66fae96b596843820e76678068906b9b3115ecdf",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/paragraph-fixed-corpus.json",
+      "reverse_rows": false,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": null,
+      "recommendation": {
+        "measured_fastest_case": "ordinary",
+        "median_seconds_per_committed_token": 0.012470495564016172,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "attention6-copy0",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy1",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy2",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention6-copy3",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-fixed-874788",
+      "runs": [
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            37.232065584,
+            36.792796084
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.012544496490566036,
+            0.012396494637466308
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1046020096,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        },
+        {
+          "case": "cohort4w4invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            38.731273041,
+            39.218972
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.013049620296832884,
+            0.013213939353099731
+          ],
+          "native_cohort_rows_counts": {
+            "1": 470,
+            "2": 1256,
+            "3": 431,
+            "4": 411
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1393328128,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        },
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            38.024069375,
+            36.9906165
+          ],
+          "completion_tokens_per_pass": [
+            2968,
+            2968
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.012811344129043127,
+            0.01246314572102426
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1375944704,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy0",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy1",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy2",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "attention6-copy3",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+      "binary_sha256": "92d93b7d87412de60abee3ad66fae96b596843820e76678068906b9b3115ecdf",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/paragraph-stable-full/corpus.json",
+      "reverse_rows": false,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": null,
+      "recommendation": {
+        "measured_fastest_case": "ordinary",
+        "median_seconds_per_committed_token": 0.01334694004695588,
+        "qualified_speedup": false,
+        "scope": "This campaign only; passing transcripts and disjoint repeated ranges against all ordinary controls. Shared-machine timing still needs independent replication."
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-full-874788-restored",
+      "runs": [
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            53.211765666000005,
+            55.085305875
+          ],
+          "completion_tokens_per_pass": [
+            4057,
+            4057
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.013116037876756225,
+            0.013577842217155535
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1409581056,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            }
+          ]
+        },
+        {
+          "case": "cohort2w4invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "2",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            55.125522625,
+            55.269676542
+          ],
+          "completion_tokens_per_pass": [
+            4057,
+            4057
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.013587755145427656,
+            0.013623287291594774
+          ],
+          "native_cohort_rows_counts": {
+            "1": 763,
+            "2": 3237
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1359380480,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            }
+          ]
+        },
+        {
+          "case": "cohort4w8invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            63.172395459,
+            62.615992542000015
+          ],
+          "completion_tokens_per_pass": [
+            4057,
+            4057
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.015571209134582204,
+            0.015434062741434561
+          ],
+          "native_cohort_rows_counts": {
+            "1": 244,
+            "2": 809,
+            "3": 412,
+            "4": 1234
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1757315072,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            }
+          ]
+        },
+        {
+          "case": "ordinary",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0"
+          },
+          "seconds": [
+            58.281507334,
+            56.469982458000004
+          ],
+          "completion_tokens_per_pass": [
+            4057,
+            4057
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.014365666091693369,
+            0.013919147758935175
+          ],
+          "native_cohort_rows_counts": {},
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1155432448,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 1,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 1,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 1,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+      "binary_sha256": "92d93b7d87412de60abee3ad66fae96b596843820e76678068906b9b3115ecdf",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+      "reverse_rows": false,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": null,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-text16-874788",
+      "runs": [
+        {
+          "case": "cohort4w8invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            141.314369833
+          ],
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.015484809317663818
+          ],
+          "native_cohort_rows_counts": {
+            "1": 262,
+            "2": 762,
+            "3": 447,
+            "4": 1475
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 1170849792,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 2,
+              "completion_tokens": 641,
+              "finish_reason": "stop",
+              "text_sha256": "d181c9a41942138f409d77cd274c4eea83060d4bdc7bff79b62c594b5e378bdc",
+              "characters": 3038
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 11,
+              "completion_tokens": 517,
+              "finish_reason": "stop",
+              "text_sha256": "e7bda481a5209fa38a40371a2821cc5b2bd3152e796468fdd6f33b5ec6441d32",
+              "characters": 2444
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 5,
+              "completion_tokens": 738,
+              "finish_reason": "stop",
+              "text_sha256": "ddc2af7e257ac80e5e1a6b5a42e89ab16b30daaeae1be62facad5beeef9acd99",
+              "characters": 3074
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 7,
+              "completion_tokens": 805,
+              "finish_reason": "stop",
+              "text_sha256": "3805463cda6523e2ba60f80b24f048164fb5a2dc31d33e4da8a14c8aa146aa13",
+              "characters": 3293
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 4,
+              "completion_tokens": 486,
+              "finish_reason": "stop",
+              "text_sha256": "2eb41d25ae8eb9ee858fdae53215888be44fcdbf8e8f42c07f8f2e5ce4fcd587",
+              "characters": 2625
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 7,
+              "completion_tokens": 729,
+              "finish_reason": "stop",
+              "text_sha256": "817a0171b86f7df034e0ce0fae51ede609b6886d6e3b8a6cf6660c1c6c2019aa",
+              "characters": 3720
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 8,
+              "completion_tokens": 435,
+              "finish_reason": "stop",
+              "text_sha256": "42f7f1a836bd3678df6d8407113579ee412bab1b20640b97bd623e6aadf71af4",
+              "characters": 2096
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 10,
+              "completion_tokens": 718,
+              "finish_reason": "stop",
+              "text_sha256": "d5c783f6db4d111b77ee09938b5664cedc40c182009c7dd80b2eef5a2a7296be",
+              "characters": 3417
+            }
+          ]
+        },
+        {
+          "case": "cohort4w16invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "16",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            145.036606334
+          ],
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.01589268094827964
+          ],
+          "native_cohort_rows_counts": {
+            "1": 58,
+            "2": 164,
+            "3": 118,
+            "4": 2085
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 2952773632,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 2,
+              "completion_tokens": 641,
+              "finish_reason": "stop",
+              "text_sha256": "d181c9a41942138f409d77cd274c4eea83060d4bdc7bff79b62c594b5e378bdc",
+              "characters": 3038
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 11,
+              "completion_tokens": 517,
+              "finish_reason": "stop",
+              "text_sha256": "e7bda481a5209fa38a40371a2821cc5b2bd3152e796468fdd6f33b5ec6441d32",
+              "characters": 2444
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 5,
+              "completion_tokens": 738,
+              "finish_reason": "stop",
+              "text_sha256": "ddc2af7e257ac80e5e1a6b5a42e89ab16b30daaeae1be62facad5beeef9acd99",
+              "characters": 3074
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 7,
+              "completion_tokens": 805,
+              "finish_reason": "stop",
+              "text_sha256": "3805463cda6523e2ba60f80b24f048164fb5a2dc31d33e4da8a14c8aa146aa13",
+              "characters": 3293
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 4,
+              "completion_tokens": 486,
+              "finish_reason": "stop",
+              "text_sha256": "2eb41d25ae8eb9ee858fdae53215888be44fcdbf8e8f42c07f8f2e5ce4fcd587",
+              "characters": 2625
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 7,
+              "completion_tokens": 729,
+              "finish_reason": "stop",
+              "text_sha256": "817a0171b86f7df034e0ce0fae51ede609b6886d6e3b8a6cf6660c1c6c2019aa",
+              "characters": 3720
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 8,
+              "completion_tokens": 435,
+              "finish_reason": "stop",
+              "text_sha256": "42f7f1a836bd3678df6d8407113579ee412bab1b20640b97bd623e6aadf71af4",
+              "characters": 2096
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 10,
+              "completion_tokens": 718,
+              "finish_reason": "stop",
+              "text_sha256": "d5c783f6db4d111b77ee09938b5664cedc40c182009c7dd80b2eef5a2a7296be",
+              "characters": 3417
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+      "binary_sha256": "92d93b7d87412de60abee3ad66fae96b596843820e76678068906b9b3115ecdf",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+      "reverse_rows": true,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": null,
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-reverse16-874788",
+      "runs": [
+        {
+          "case": "cohort4w8invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            129.66948724999997
+          ],
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": true,
+          "seconds_per_committed_token": [
+            0.014208797638614944
+          ],
+          "native_cohort_rows_counts": {
+            "1": 279,
+            "2": 775,
+            "3": 460,
+            "4": 1456
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 2069495808,
+          "diagnostic": false,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 10,
+              "completion_tokens": 718,
+              "finish_reason": "stop",
+              "text_sha256": "d5c783f6db4d111b77ee09938b5664cedc40c182009c7dd80b2eef5a2a7296be",
+              "characters": 3417
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 8,
+              "completion_tokens": 435,
+              "finish_reason": "stop",
+              "text_sha256": "42f7f1a836bd3678df6d8407113579ee412bab1b20640b97bd623e6aadf71af4",
+              "characters": 2096
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 7,
+              "completion_tokens": 729,
+              "finish_reason": "stop",
+              "text_sha256": "817a0171b86f7df034e0ce0fae51ede609b6886d6e3b8a6cf6660c1c6c2019aa",
+              "characters": 3720
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 4,
+              "completion_tokens": 486,
+              "finish_reason": "stop",
+              "text_sha256": "2eb41d25ae8eb9ee858fdae53215888be44fcdbf8e8f42c07f8f2e5ce4fcd587",
+              "characters": 2625
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 7,
+              "completion_tokens": 805,
+              "finish_reason": "stop",
+              "text_sha256": "3805463cda6523e2ba60f80b24f048164fb5a2dc31d33e4da8a14c8aa146aa13",
+              "characters": 3293
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 5,
+              "completion_tokens": 738,
+              "finish_reason": "stop",
+              "text_sha256": "ddc2af7e257ac80e5e1a6b5a42e89ab16b30daaeae1be62facad5beeef9acd99",
+              "characters": 3074
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 11,
+              "completion_tokens": 517,
+              "finish_reason": "stop",
+              "text_sha256": "e7bda481a5209fa38a40371a2821cc5b2bd3152e796468fdd6f33b5ec6441d32",
+              "characters": 2444
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 2,
+              "completion_tokens": 641,
+              "finish_reason": "stop",
+              "text_sha256": "d181c9a41942138f409d77cd274c4eea83060d4bdc7bff79b62c594b5e378bdc",
+              "characters": 3038
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "runtime_source_revision": "874788fba0d0fda85fe8b50b46f2e198b124322b",
+      "binary_sha256": "92d93b7d87412de60abee3ad66fae96b596843820e76678068906b9b3115ecdf",
+      "harness_sha256": "cdc3bba635529e145353c417170c86f802e211d3591eae4417ef48ff392bc045",
+      "corpus": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/gemma4-vision-throughput/.benchmark-results/gemma4-ocr-optim-2026-10-11/extended-text-corpus.json",
+      "reverse_rows": false,
+      "recognition_scope": "image prep/prefill/decode/HTTP; PDF rendering/server startup excluded",
+      "memory_scope": "sum of sampled server/worker process-tree RSS; shared mappings may be double-counted; not total unified GPU memory",
+      "memory_probe_sha256": "b765d526e102237606519e764b28ccbdba6f90abeb707ae5d6affce4c8e8a9f5",
+      "recommendation": {
+        "qualified_speedup": false,
+        "reason": "No repeated complete-output eligible cases"
+      },
+      "completed": true,
+      "corpus_pages": [
+        {
+          "document": "attention",
+          "page": 1,
+          "image_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+        },
+        {
+          "document": "attention",
+          "page": 3,
+          "image_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+        },
+        {
+          "document": "attention",
+          "page": 6,
+          "image_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+        },
+        {
+          "document": "nist-2021",
+          "page": 5,
+          "image_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+        },
+        {
+          "document": "nist-2021",
+          "page": 6,
+          "image_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+        },
+        {
+          "document": "nist-2021",
+          "page": 9,
+          "image_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 8,
+          "image_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+        },
+        {
+          "document": "nbs-1907",
+          "page": 12,
+          "image_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+        },
+        {
+          "document": "attention",
+          "page": 2,
+          "image_sha256": "b4450d466dd5d89556412a7e06caa77d195e4583b9302607b60c538cb27d17e2"
+        },
+        {
+          "document": "nist-2021",
+          "page": 11,
+          "image_sha256": "b57937d64aeaecadcd07d6bd837110255306932b4b74781df12d2482142f4623"
+        },
+        {
+          "document": "attention",
+          "page": 5,
+          "image_sha256": "1b38a8bd2b51e5c9da1c555fa9c6d9b82c6b00126c05ed55393156ed72f9927d"
+        },
+        {
+          "document": "attention",
+          "page": 7,
+          "image_sha256": "48acd18d8a561ad41f6d9f4c63a517926229cd55da5d77c1457402991eaf2652"
+        },
+        {
+          "document": "nist-2021",
+          "page": 4,
+          "image_sha256": "a477d9882c9f4ea21345d9eabc129f48585c90619b8616cae63e576e0f33a443"
+        },
+        {
+          "document": "nist-2021",
+          "page": 7,
+          "image_sha256": "22ea44248730e35dfe6db03f808b5593d65aa6c36a8bb0ffd6b16479206909a0"
+        },
+        {
+          "document": "nist-2021",
+          "page": 8,
+          "image_sha256": "b9f9ebd61ccec43621d6ee9fbaf67525cf6b6f4fb140c2adf97cf55640d5111f"
+        },
+        {
+          "document": "nist-2021",
+          "page": 10,
+          "image_sha256": "a0bacbf9fed2c7e56b62b92511e175637dd475260c0e9bcb130d322ab62cb04e"
+        }
+      ],
+      "raw_directory": ".benchmark-results/gemma4-ocr-optim-2026-10-11/invariant-memory16-874788",
+      "runs": [
+        {
+          "case": "cohort4w8invariant",
+          "server_flags": {
+            "TERMITE_SERVER_GENERATE_TIMING": "1",
+            "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+            "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+            "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+            "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+            "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+            "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+            "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+            "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+            "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+            "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+            "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1"
+          },
+          "seconds": [
+            117.893282166
+          ],
+          "completion_tokens_per_pass": [
+            9126
+          ],
+          "changed_pages": [],
+          "missing_pages": [],
+          "truncated_at_cap": 0,
+          "passes_output_gate": true,
+          "eligible_for_throughput_comparison": false,
+          "seconds_per_committed_token": [
+            0.0129183960295858
+          ],
+          "native_cohort_rows_counts": {
+            "1": 250,
+            "2": 812,
+            "3": 476,
+            "4": 1434
+          },
+          "native_cohort_rows_counts_scope": "Serving scheduler occupancy after preload; may include explicit warmups. Not committed token counts.",
+          "sampled_peak_process_tree_rss_bytes": 2512486400,
+          "sampled_max_metal_allocated_bytes": 4084793344,
+          "metal_memory_samples": 514,
+          "metal_memory_scope": "MTLDevice currentAllocatedSize sampled after command-buffer waits in the owning inference process; sampled maximum, not a transient peak. Instrumented timings excluded.",
+          "diagnostic": true,
+          "outputs": [
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 1,
+              "completion_tokens": 405,
+              "finish_reason": "stop",
+              "text_sha256": "7b1226bdf3f53072bb99018347935a86d09a63a8939cacd9219f5ad975aa4b4e",
+              "characters": 1669
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 3,
+              "completion_tokens": 436,
+              "finish_reason": "stop",
+              "text_sha256": "941f03c470711e54076289801b89b5914f0cc26270eb9924ca7d33bc53777f8c",
+              "characters": 1852
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 6,
+              "completion_tokens": 742,
+              "finish_reason": "stop",
+              "text_sha256": "1d164ad96825217ca8daae5d618adf3dbd17d3d1e618efac99697633318cc6f9",
+              "characters": 3014
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 5,
+              "completion_tokens": 341,
+              "finish_reason": "stop",
+              "text_sha256": "a5db7a742bf13a8984c6e4b872ba1d29387dc35dc0b5610b19cd725ea9c7dcb5",
+              "characters": 2025
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 6,
+              "completion_tokens": 716,
+              "finish_reason": "stop",
+              "text_sha256": "978d3a3cdc8e6740b91a7c6544cf42f8ca793d9d6c2da2a7428f17b372ea9c23",
+              "characters": 3836
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 9,
+              "completion_tokens": 346,
+              "finish_reason": "stop",
+              "text_sha256": "fa04fde1d83e9fc8c299314f9567299d4e9bdedd6bc8836ae903146c20c637f9",
+              "characters": 2197
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 8,
+              "completion_tokens": 488,
+              "finish_reason": "stop",
+              "text_sha256": "8399880d0554ad9f1c62d004399985ac407686737866a6679903513b8bb40850",
+              "characters": 2699
+            },
+            {
+              "iteration": 0,
+              "document": "nbs-1907",
+              "page": 12,
+              "completion_tokens": 583,
+              "finish_reason": "stop",
+              "text_sha256": "95931db6758b5de0a3ecbfcdafe989cd176857efe179bc89bc5ef2a064da1d45",
+              "characters": 2568
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 2,
+              "completion_tokens": 641,
+              "finish_reason": "stop",
+              "text_sha256": "d181c9a41942138f409d77cd274c4eea83060d4bdc7bff79b62c594b5e378bdc",
+              "characters": 3038
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 11,
+              "completion_tokens": 517,
+              "finish_reason": "stop",
+              "text_sha256": "e7bda481a5209fa38a40371a2821cc5b2bd3152e796468fdd6f33b5ec6441d32",
+              "characters": 2444
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 5,
+              "completion_tokens": 738,
+              "finish_reason": "stop",
+              "text_sha256": "ddc2af7e257ac80e5e1a6b5a42e89ab16b30daaeae1be62facad5beeef9acd99",
+              "characters": 3074
+            },
+            {
+              "iteration": 0,
+              "document": "attention",
+              "page": 7,
+              "completion_tokens": 805,
+              "finish_reason": "stop",
+              "text_sha256": "3805463cda6523e2ba60f80b24f048164fb5a2dc31d33e4da8a14c8aa146aa13",
+              "characters": 3293
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 4,
+              "completion_tokens": 486,
+              "finish_reason": "stop",
+              "text_sha256": "2eb41d25ae8eb9ee858fdae53215888be44fcdbf8e8f42c07f8f2e5ce4fcd587",
+              "characters": 2625
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 7,
+              "completion_tokens": 729,
+              "finish_reason": "stop",
+              "text_sha256": "817a0171b86f7df034e0ce0fae51ede609b6886d6e3b8a6cf6660c1c6c2019aa",
+              "characters": 3720
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 8,
+              "completion_tokens": 435,
+              "finish_reason": "stop",
+              "text_sha256": "42f7f1a836bd3678df6d8407113579ee412bab1b20640b97bd623e6aadf71af4",
+              "characters": 2096
+            },
+            {
+              "iteration": 0,
+              "document": "nist-2021",
+              "page": 10,
+              "completion_tokens": 718,
+              "finish_reason": "stop",
+              "text_sha256": "d5c783f6db4d111b77ee09938b5664cedc40c182009c7dd80b2eef5a2a7296be",
+              "characters": 3417
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "qualified_native_outputs": 104,
+  "native_completion_tokens": 58668,
+  "serving_decision": "Keep experimental dispatch opt-in: correctness gates pass in the recorded cases, but no end-to-end throughput gain is qualified."
+}

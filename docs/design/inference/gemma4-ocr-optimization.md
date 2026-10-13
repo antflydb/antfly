@@ -1169,3 +1169,59 @@ image versus transient allocation failures. Real-model qualification adds full
 ordered transcripts and actual occupancy at both two and four rows. Formatting,
 license headers, Python checks and the serving build pass. CUDA, E4B and audio
 text-generation throughput are not qualified by these OCR runs.
+
+## Singleton-invariant Q4 cohort dispatch
+
+`TERMITE_METAL_Q4_0_BATCH_INVARIANT=1` adds an experimental Q4_0 float32
+projection policy for two through eight rows. Portfolio selection uses a copy of
+the descriptor with `rows=1`, retaining the singleton pipeline and reduction
+geometry. The dispatch still uses the actual cohort size in the kernel's row
+dimension. Generated/JIT and shape-dependent small-batch projection routes are
+bypassed for this contract. Fused gate/up activation similarly uses the
+singleton MMV pipeline across all cohort rows in one GPU dispatch.
+
+The complete operation family matters beyond ordinary matrix multiplication.
+The singleton FFN down projection fuses sum-of-squares, normalization and
+residual addition. This tail remains canonical per row; its optional float16
+projection policy is preserved. The attention output projection has an analogous
+fused tail. A dedicated checked device wrapper preserves that family per row,
+including offsets and prepared normalization slots. Both operate within the
+resident frame. The `cohort4w8invariant` sweep case also retains the actual
+singleton fused QKV family, PLE and final head processing.
+
+GPU checks compare framed singleton results bit for bit at two, three, four and
+eight rows, with distinct inputs/residuals, reverse-order fused-tail references,
+partial output tiles and the E2B model's 1,536-by-6,144 and 1,536-by-12,288 FFN
+shapes. Counters check one fused gate/up dispatch per cohort when singleton
+fusion is active. Sixty-four selected GPU, decoder, scheduler, MTP, QKV and HTTP
+checks pass without skips at runtime `874788fba0`; eight sweep checks pass.
+
+Operator equality alone does not qualify a complete decoder. The initial
+`893a21b056` experiment preserved linear/gate-up/FFN-down arithmetic, but two
+copies of the Attention page still stopped at 701 instead of 742 tokens in the
+second pass. Adding the canonical attention tail at `874788fba0` matches all eight
+repeated-page observations, at 2,968 completion tokens per pass. Those runs take
+38.731/39.219 seconds, against ordinary controls of 36.793–38.024 seconds. This
+case establishes no throughput gain. The first experiment's shortened outputs
+are excluded from speed comparisons. On the original eight-page corpus, two
+complete passes at both cohort sizes match all 4,057 tokens per pass. Two rows
+with a four-request window take 55.126/55.270 seconds; four rows with an
+eight-request window take 63.172/62.616 seconds. The four ordinary controls take
+53.212–58.282 seconds. Neither cohort qualifies a speedup. The sixteen-page text corpus matches all
+9,126 tokens at windows eight and sixteen (141.314/145.037 seconds), and again
+with reversed rows (129.669 seconds). These extended correctness checks have no
+new ordinary timing brackets. The allocation-instrumented condition also
+matches all transcripts/counts; its timing is excluded. In total, the final
+experimental path matches 104 native-cohort page observations and 58,668
+completion tokens. This is empirical transcript parity on the recorded corpus,
+not a claim of bitwise equality for every decoder operator or OCR accuracy on
+arbitrary PDFs. The experimental policy remains off by default.
+
+[The batch-invariant report](gemma4-ocr-batch-invariant.json) records frozen
+runtime/binary/harness identities, per-output transcript hashes, rejected gates
+and broader qualification. Its corpus fixtures were restored from the recorded
+public PDF sources after local PNGs disappeared; all three PDF hashes and all
+sixteen text-page raster hashes match the prior corpus. Rendering and startup
+remain outside recognition timings. Shared-machine activity can affect timing;
+repeatable complete-output gates remain mandatory. Canonical OCR cohorts remain
+the default, and matrix arithmetic still requires its separate explicit opt-in.
