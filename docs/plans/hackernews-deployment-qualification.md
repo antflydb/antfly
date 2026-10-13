@@ -713,3 +713,10 @@ Run the regional latency matrix only after budget admission is restored through
 reviewed reconciliation or a new explicit ceiling. Public DNS remains gated on
 managed deployment qualification. This follow-up does not create a release,
 promote the development catalog or deploy a tenant.
+
+The final count-normalization guard also rejects an exact count smaller than the
+returned window after earlier lower-bound pages. The final local regression run
+passes 155 core plus 246 API lake tests without skips/leaks; all thirteen composed
+regressions pass, and the qualification/budget/transport/recovery Python checks
+pass 47 tests and 25 subtests. These are engine/harness checks; the optimized HTTP
+matrix remains a separate evidence gate.

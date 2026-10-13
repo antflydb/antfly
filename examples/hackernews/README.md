@@ -1130,3 +1130,26 @@ At PR #1117, the large cold composed-query count contract rejected lower-bound
 leaf totals on both the baseline and that follow-up. SQL fixture seeding itself passes with the
 explicit response budget. See the qualification plan for retained raw samples,
 provenance, query bounds and this remaining limitation.
+
+### Composed lower-bound totals
+
+The composed executor now consumes a full requested ordered leaf page even when
+its total is `gte`. Catalog/schema/policy binding stays pinned independently of
+the count. It never sums changing page-local lower bounds. Exact terminal pages
+prove exhaustion; short unknown-count pages and contradictory exact counts fail
+closed. Explicit counts and replacement lookups retain exactness checks. Version
+3 continuations remain compatible with retained version 2 cursors.
+
+The regional qualifier can run the same union and saved-overlay timing matrix
+with `benchmark_composed: true` and `composed_current_rows: 1000`. Its acceptance
+gate requires both cold and warm measurements with the configured fixture size;
+missing evidence fails. Warm comparisons include table, ID and score provenance.
+The full archive profile must explicitly match the existing shared budget ledger.
+Dry-run admission reports remaining run slots and headroom; it does not refund or
+reset previous reservations. New cloud billing/preflight evidence remains local.
+
+Local regressions pass: 401 lake tests (155 core and 246 API) without skips or
+leaks, including the thirteen composed-query regressions. Runtime HTTP timings
+are a separate qualification gate, followed by an immutable release and actual
+Antfly Cloud tenant recovery/credential checks. The standalone storage scaffold
+and its retained disk are not prerequisites for the managed deployment.
