@@ -860,19 +860,33 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 assert all(hit["_score"] > 0 for hit in hits)
             hits = query(nested)
             filtered = call(
-                "POST", "/tables/fragmented/query",
-                {"full_text_search": nested, "fields": ["amount"], "limit": 10,
-                 "filter_query": {"range": {"path": "/amount", "gte": max(expected)}}},
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 10,
+                    "filter_query": {
+                        "range": {"path": "/amount", "gte": max(expected)}
+                    },
+                },
             )["hits"]["hits"]
             assert [hit["_source"]["amount"] for hit in filtered] == [max(expected)]
             highlighted = call(
-                "POST", "/tables/fragmented/query",
-                {"full_text_search": nested, "fields": ["amount"], "limit": 10,
-                 "highlight": {"fields": ["body"]}},
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 10,
+                    "highlight": {"fields": ["body"]},
+                },
             )["hits"]["hits"]
             assert {hit["_source"]["amount"] for hit in highlighted} == expected
-            assert all(hit["_highlights"]["body"] and "body" not in hit["_source"]
-                       for hit in highlighted)
+            assert all(
+                hit["_highlights"]["body"] and "body" not in hit["_source"]
+                for hit in highlighted
+            )
             top = call(
                 "POST",
                 "/tables/fragmented/query",
@@ -923,8 +937,10 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                         roots.append(document)
             assert roots
             root_document = roots[-1]
-            assert all(root_document.get(key) is None for key in (
-                "serving_inventory", "serving_routes", "segment_files"))
+            assert all(
+                root_document.get(key) is None
+                for key in ("serving_inventory", "serving_routes", "segment_files")
+            )
 
             def leaves(ref):
                 path, page = pages[bytes(ref["digest"])]
@@ -934,25 +950,36 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 for _ in range(count):
                     key_size, value_size = struct.unpack_from("<II", page, offset)
                     offset += 8
-                    key = page[offset:offset + key_size]
+                    key = page[offset : offset + key_size]
                     offset += key_size
-                    value = page[offset:offset + value_size]
+                    value = page[offset : offset + value_size]
                     offset += value_size
                     records.append((key, value))
                 if ref["height"]:
                     for _, value in records:
-                        yield from leaves({"digest": list(value[:32]), "height": value[36]})
+                        yield from leaves(
+                            {"digest": list(value[:32]), "height": value[36]}
+                        )
                 else:
                     yield path, records
 
             # A rare query must never read an unrelated routing leaf. Restart
             # clears in-memory admission and decoded page caches first.
-            required = {key[-32:] for _, records in leaves(root_document["term_directory"]["leaves"])
-                        for key, _ in records if b"quasar" in key}
+            required = {
+                key[-32:]
+                for _, records in leaves(root_document["term_directory"]["leaves"])
+                for key, _ in records
+                if b"quasar" in key
+            }
             assert len(required) == 3
-            unrelated = [path for path, records in leaves(root_document["directories"]["segments"])
-                         if all(key[:32] not in required for key, _ in records)]
-            assert unrelated, "Fixture must have a leaf outside the necessary segment set"
+            unrelated = [
+                path
+                for path, records in leaves(root_document["directories"]["segments"])
+                if all(key[:32] not in required for key, _ in records)
+            ]
+            assert unrelated, (
+                "Fixture must have a leaf outside the necessary segment set"
+            )
             server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
