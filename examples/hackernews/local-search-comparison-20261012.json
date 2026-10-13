@@ -1,0 +1,601 @@
+{
+  "kind": "local_native_bm25_comparison",
+  "engine_code_revision": "29785baec765b445bff5c4f66995835c982e3d15",
+  "build_input_provenance": {
+    "base_revision": "ac84069daef735d3490cc67dc2df01472de7af6b",
+    "working_tree_patch": "Opening/cohort implementation. Production source-body equivalence with engine_code_revision was verified; standard license comments were added after builds started.",
+    "proof_manifest_sha256": "5fee3faa32e5c467de7148b5455ddfacbccd3a1ba8367503c6b942925182f720"
+  },
+  "antfly_binary_sha256": "37aee33aa6ac2c2361d39c650341b4c290bc4e8481d56ad17d420c26dbc24e0e",
+  "linux_antfly_binary_sha256": "7c9f996a186d75a0561af7bd50c133c5d51f9044a71bc477d34222015ff20300",
+  "source_sha256": "e568043355dd35700f29e9a6c055f3e4dd541724e4c844db3436f409d38b5a52",
+  "rows": 142577,
+  "platform": "macOS ARM64 native execution; shared host",
+  "query": {
+    "match": "database",
+    "field": "body",
+    "limit": 5,
+    "projection": [
+      "hn_id",
+      "title",
+      "item_type",
+      "author",
+      "points",
+      "created_at"
+    ],
+    "highlights": false
+  },
+  "antfly": {
+    "parallelism": "default native server policy",
+    "cache_state": "fresh process; serving cache directory removed before restart; startup created one cache file; measured cold queries had zero disk-cache hits; OS cache uncontrolled",
+    "cycles": [
+      {
+        "cycle": 1,
+        "cold_ms": 129.7,
+        "warm_samples_ms": [
+          6.64,
+          6.73,
+          6.68,
+          6.19,
+          6.09,
+          6.75,
+          6.45,
+          6.25,
+          6.7,
+          6.35,
+          5.87,
+          6.33,
+          5.71,
+          6.65,
+          5.84,
+          7.02,
+          6.35,
+          6.71,
+          6.63,
+          6.7
+        ],
+        "warm_p95_ms": 6.75,
+        "restart_ms": 78.51,
+        "provider_reads": 295,
+        "provider_bytes": 43314381,
+        "cold_disk_cache_hits": 0,
+        "startup_cache_files_before_query": 1,
+        "concurrent_max_ms": 16.44,
+        "filter_p95_ms": {
+          "item_type": 11.7,
+          "author": 8.92,
+          "points": 16.07,
+          "created_at": 11.86,
+          "combined": 10.76
+        },
+        "workload_p95_ms": {
+          "database": 10.72,
+          "postgres": 7.35,
+          "sqlite": 6.38,
+          "AI": 9.8
+        },
+        "verified": [
+          "remote_bm25",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "raw_report_sha256": "960121126ddb5e4efc65fbd0fac7ca2241beb30f64e484d83c1da9e9d18a6801"
+      },
+      {
+        "cycle": 2,
+        "cold_ms": 104.8,
+        "warm_samples_ms": [
+          6.21,
+          6.03,
+          7.22,
+          6.13,
+          6.01,
+          5.43,
+          5.88,
+          6.32,
+          5.47,
+          6.54,
+          5.93,
+          6.46,
+          5.94,
+          6.36,
+          5.7,
+          6.1,
+          5.54,
+          6.29,
+          5.87,
+          5.97
+        ],
+        "warm_p95_ms": 6.54,
+        "restart_ms": 56.52,
+        "provider_reads": 297,
+        "provider_bytes": 43445453,
+        "cold_disk_cache_hits": 0,
+        "startup_cache_files_before_query": 1,
+        "concurrent_max_ms": 14.58,
+        "filter_p95_ms": {
+          "item_type": 10.86,
+          "author": 6.05,
+          "points": 10.13,
+          "created_at": 7.09,
+          "combined": 7.63
+        },
+        "workload_p95_ms": {
+          "database": 6.37,
+          "postgres": 6.2,
+          "sqlite": 5.93,
+          "AI": 9.73
+        },
+        "verified": [
+          "remote_bm25",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "raw_report_sha256": "ab7dbf36ad5fd57be7b0f5babff1e24d94fcabf6f85ba81ef9b1ffefddb9d1bb"
+      }
+    ]
+  },
+  "duckdb": {
+    "version": "1.5.6",
+    "threads": 4,
+    "build": {
+      "seconds": 2.821,
+      "rows": 142577
+    },
+    "cycles": [
+      {
+        "mode": "fts",
+        "duckdb_version": "1.5.6",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "architecture": "arm64",
+        "threads": 4,
+        "rows": 142577,
+        "workloads": {
+          "database": {
+            "first_ms": 30.54,
+            "warm_samples_ms": [
+              11.34,
+              10.31,
+              9.78,
+              9.99,
+              10.2,
+              10.08,
+              10.17,
+              10.17,
+              9.9,
+              9.6,
+              9.85,
+              9.91,
+              9.76,
+              9.61,
+              9.53,
+              9.63,
+              9.43,
+              9.58,
+              9.16,
+              9.51
+            ],
+            "warm_p95_ms": 10.31,
+            "top_hn_ids": [
+              42108980,
+              42053930,
+              42076462,
+              42031354,
+              42128520
+            ],
+            "scores": [
+              4.1032301034703025,
+              3.9795942202245773,
+              3.9173930098104495,
+              3.798647012583929,
+              3.798647012583929
+            ]
+          },
+          "postgres": {
+            "first_ms": 8.86,
+            "warm_samples_ms": [
+              9.23,
+              9.09,
+              9.17,
+              9.02,
+              9.2,
+              9.28,
+              9.19,
+              8.84,
+              9.01,
+              9.02,
+              11.5,
+              18.91,
+              19.78,
+              13.87,
+              14.28,
+              9.7,
+              9.32,
+              9.73,
+              9.69,
+              9.24
+            ],
+            "warm_p95_ms": 18.91,
+            "top_hn_ids": [
+              42079934,
+              42039667,
+              42022018,
+              42076042,
+              42108734
+            ],
+            "scores": [
+              4.288623429634285,
+              4.2398837174930595,
+              4.1983105160763285,
+              4.1983105160763285,
+              4.1983105160763285
+            ]
+          },
+          "sqlite": {
+            "first_ms": 9.34,
+            "warm_samples_ms": [
+              9.42,
+              9.05,
+              8.88,
+              9.05,
+              8.78,
+              8.68,
+              8.93,
+              9.08,
+              9.16,
+              8.82,
+              8.92,
+              8.8,
+              9.03,
+              8.97,
+              8.82,
+              9.17,
+              9.05,
+              8.58,
+              8.74,
+              8.68
+            ],
+            "warm_p95_ms": 9.17,
+            "top_hn_ids": [
+              42115222,
+              42084459,
+              42094663,
+              42025948,
+              42010323
+            ],
+            "scores": [
+              4.771790758516216,
+              4.703602222420168,
+              4.657482136208824,
+              4.637335048450647,
+              4.621785192587678
+            ]
+          },
+          "AI": {
+            "first_ms": 11.22,
+            "warm_samples_ms": [
+              11.26,
+              10.96,
+              11.2,
+              11.17,
+              11.11,
+              11.22,
+              11.29,
+              11.08,
+              11.05,
+              11.35,
+              11.11,
+              11.52,
+              11.12,
+              11.18,
+              11.11,
+              11.04,
+              11.27,
+              10.9,
+              10.86,
+              10.75
+            ],
+            "warm_p95_ms": 11.35,
+            "top_hn_ids": [
+              42110074,
+              42002781,
+              42070793,
+              42001358,
+              42020123
+            ],
+            "scores": [
+              2.9375309124177034,
+              2.80262110492544,
+              2.80262110492544,
+              2.7514135990836914,
+              2.732770151568483
+            ]
+          }
+        },
+        "cache_state": "fresh process; OS file cache uncontrolled; each term follows preceding terms",
+        "ranking": "BM25",
+        "highlights": false
+      },
+      {
+        "mode": "fts",
+        "duckdb_version": "1.5.6",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "architecture": "arm64",
+        "threads": 4,
+        "rows": 142577,
+        "workloads": {
+          "database": {
+            "first_ms": 26.15,
+            "warm_samples_ms": [
+              11.5,
+              10.11,
+              10.13,
+              9.73,
+              9.88,
+              10.1,
+              10.24,
+              9.7,
+              9.7,
+              9.89,
+              9.8,
+              9.5,
+              9.63,
+              9.82,
+              9.84,
+              9.77,
+              9.58,
+              9.64,
+              9.47,
+              9.47
+            ],
+            "warm_p95_ms": 10.24,
+            "top_hn_ids": [
+              42108980,
+              42053930,
+              42076462,
+              42031354,
+              42128520
+            ],
+            "scores": [
+              4.1032301034703025,
+              3.9795942202245773,
+              3.9173930098104495,
+              3.798647012583929,
+              3.798647012583929
+            ]
+          },
+          "postgres": {
+            "first_ms": 9.13,
+            "warm_samples_ms": [
+              8.94,
+              9.4,
+              9.39,
+              8.92,
+              8.81,
+              8.91,
+              8.94,
+              9.14,
+              8.94,
+              8.87,
+              8.76,
+              9.18,
+              9.12,
+              9.0,
+              9.56,
+              9.01,
+              9.17,
+              9.28,
+              8.69,
+              8.86
+            ],
+            "warm_p95_ms": 9.4,
+            "top_hn_ids": [
+              42079934,
+              42039667,
+              42022018,
+              42076042,
+              42108734
+            ],
+            "scores": [
+              4.288623429634285,
+              4.2398837174930595,
+              4.1983105160763285,
+              4.1983105160763285,
+              4.1983105160763285
+            ]
+          },
+          "sqlite": {
+            "first_ms": 8.61,
+            "warm_samples_ms": [
+              9.17,
+              8.79,
+              8.88,
+              9.21,
+              8.82,
+              9.23,
+              9.16,
+              9.1,
+              8.87,
+              8.9,
+              8.78,
+              9.28,
+              8.7,
+              8.89,
+              9.08,
+              8.7,
+              8.61,
+              9.12,
+              9.05,
+              8.81
+            ],
+            "warm_p95_ms": 9.23,
+            "top_hn_ids": [
+              42115222,
+              42084459,
+              42094663,
+              42025948,
+              42010323
+            ],
+            "scores": [
+              4.771790758516216,
+              4.703602222420168,
+              4.657482136208824,
+              4.637335048450647,
+              4.621785192587678
+            ]
+          },
+          "AI": {
+            "first_ms": 10.98,
+            "warm_samples_ms": [
+              11.59,
+              11.11,
+              11.28,
+              11.7,
+              11.39,
+              11.17,
+              11.15,
+              11.43,
+              10.87,
+              11.18,
+              11.13,
+              11.45,
+              10.97,
+              11.29,
+              11.15,
+              11.05,
+              10.64,
+              11.25,
+              11.04,
+              11.18
+            ],
+            "warm_p95_ms": 11.59,
+            "top_hn_ids": [
+              42110074,
+              42002781,
+              42070793,
+              42001358,
+              42020123
+            ],
+            "scores": [
+              2.9375309124177034,
+              2.80262110492544,
+              2.80262110492544,
+              2.7514135990836914,
+              2.732770151568483
+            ]
+          }
+        },
+        "cache_state": "fresh process; OS file cache uncontrolled; each term follows preceding terms",
+        "ranking": "BM25",
+        "highlights": false
+      }
+    ],
+    "raw_report_sha256": "54a097fd259709893ca7a9a307da24c96b2ef61e663e4256d7492b86ec59234b"
+  },
+  "matched_x86_provider_work": {
+    "conditions": "same source/projection/profile; fresh processes and reset serving caches; 4CPU4GiB containers",
+    "previous_engine_revision": "048692502a97f9fbb7cd62e0cb039efef1148aa2",
+    "previous_provider_reads": 397,
+    "current_provider_reads": 314,
+    "previous_provider_bytes": 53487307,
+    "current_provider_bytes": 46458677,
+    "reads_reduction_percent": 20.91,
+    "bytes_reduction_percent": 13.14,
+    "top_hn_ids_and_scores_identical": true,
+    "timing_used_for_acceptance": false,
+    "report_sha256": {
+      "previous": "ca90985bfd6e4fadfda202f0ecc24ad10fec882ac224b9a7d1bfa3e8ed5960af",
+      "current": "24b97ad747bceaf58a8dec499669639334cb8b9a9ea9e6fd8d591651c254a602"
+    }
+  },
+  "validation": {
+    "embedded_lake_tests_passed": 126,
+    "focused_api_tests_passed": 10,
+    "native_test_leaks": 0,
+    "public_native_filesystem_recovery_profiles_passed": [
+      "primary_lsm",
+      "vector_store"
+    ],
+    "python_tests_passed": 69,
+    "python_environment_skips": 16,
+    "python_subtests": 28,
+    "loopback_note": "Gateway wire test rerun with loopback networking after sandbox bind rejection.",
+    "logs_sha256": {
+      "embedded_suite_and_selection": "0da1b4fe5013f9ee85088eb9729d7884136a08c07055c82143dd1ad4438d31b8",
+      "focused_api": "168eceeab3ca486bb83f41bd06c2477887239bce7469aae7a4043156cbba6fd0",
+      "public_http": "4f4d582385c1233d7431e05842ec3c98dae541c6b1f226c723e484e0ee483d58",
+      "comparison_tests": "fb06be0765e83a121766a431badbf4b5e658484ef7d68ebf045206ac10377a05"
+    }
+  },
+  "limitations": [
+    "Shared-host timings may be affected by unrelated workloads; not a production latency guarantee.",
+    "OS file caches were not flushed; Antfly serving caches were reset.",
+    "DuckDB uses four threads; Antfly uses default server scheduling.",
+    "Analyzers, field-length encoding and scoring semantics differ; cross-engine order/scores are not an exact oracle.",
+    "Antfly includes HTTP transport; DuckDB query latency excludes connection and extension loading.",
+    "Remote substring scans are separate unranked baselines, not indexed BM25.",
+    "Current layout regional GCS and full-archive latency remain unqualified; earlier passing GCS evidence belongs to the preceding binary.",
+    "Cold native Antfly still reads about 43 MB for five hits; further reduction remains useful."
+  ],
+  "highlighted_search_and_composition": {
+    "cold_ms": 178.83,
+    "warm_p95_ms": 8.87,
+    "restart_ms": 18.53,
+    "cursor_hits": 4110,
+    "cursor_continuation_p95_ms": 38.85,
+    "cursor_restart_ms": 17.18,
+    "verified": [
+      "remote_bm25",
+      "projected_highlights",
+      "snapshot_pagination",
+      "restart_scores",
+      "restart_pagination",
+      "metadata_filters_match_residual",
+      "metadata_filters_after_restart",
+      "empty_date_filter_before_and_after_restart",
+      "concurrent_search",
+      "exact_filter"
+    ],
+    "composed_sources": {
+      "verified": [
+        "union_history",
+        "overlay_nonmatching_suppression",
+        "saved_current_visibility",
+        "mutable_composed_cursor_restart"
+      ],
+      "error": null
+    },
+    "raw_report_sha256": "4bf24f568a384eaf9fd68bbf210826a4ba27fffdeab6c231f8e56a252518f839"
+  },
+  "remote_scan_diagnostic": {
+    "engine": "DuckDB 1.5.6",
+    "client": "macOS ARM64 outside the object-storage region",
+    "query_kind": "unranked contains(lower(body), lower(term)); metadata projection; ORDER BY hn_id LIMIT 5",
+    "same_export_verified_by_local_crc_and_size": true,
+    "samples_per_term": 2,
+    "workloads": {
+      "database": {
+        "first_ms": 3577.93,
+        "repeat_ms": 236.49
+      },
+      "AI": {
+        "first_ms": 206.48,
+        "repeat_ms": 209.38
+      }
+    },
+    "raw_report_sha256": "33fbad693dac0c9a5bb82b0654bd019f8ed4b013e63b605306cdd6d24ee89de2",
+    "limitation": "Different geography and query semantics from regional Antfly BM25; not an engine speed ranking."
+  }
+}

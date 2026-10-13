@@ -1,0 +1,6 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+FROM python:3.12-slim
+RUN pip install --no-cache-dir duckdb==1.5.6
+RUN python -c "import duckdb; c=duckdb.connect(); c.execute('INSTALL fts'); c.execute('INSTALL httpfs')"
+ENTRYPOINT ["python", "/comparison.py"]

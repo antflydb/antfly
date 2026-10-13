@@ -347,6 +347,52 @@ equate lake commitment with synchronous indexing.
 
 ## Storage durability, deployment, and cold starts
 
+Native cursor capture publishes a durable discovery witness before the cursor
+descriptor. The supervised maintenance owner can therefore collect expired
+descriptors even when physical capture fails, the process restarts, or the table
+is dropped. Descriptor creation and generation upload do not sweep retained
+history inline; deletion availability and accumulated generations must not add
+work to a foreground search. Local cut admission still enforces capacity and
+protects active readers. Deployments must keep the background artifact collector
+enabled, or run explicit maintenance when they disable automatic collection.
+
+Filesystem object-store prefix listings descend only through the prefix's
+complete path components. The final partial component remains a string filter,
+and ordering, continuation tokens, delimiter grouping and symbolic-link behavior
+retain the bucket-listing contract. Listing a cursor namespace must not traverse
+unrelated archive artifacts.
+
+Cold-query qualification must distinguish local execution, process restart,
+empty Antfly serving caches, and fully remote reads. A restart with a retained
+filesystem cache does not establish object-store cold latency. Compare prebuilt
+BM25 indexes on the same corpus and machine before comparing remote Parquet
+scans; an unranked substring scan is a separate baseline. Exclude index creation
+and extension installation from query latency, preserve row-count/content
+provenance, and report tokenizer, projection, highlighting, thread limits and
+OS-cache differences. Do not benchmark during builds or compare translated x86
+execution with native ARM execution as an engine speed comparison.
+
+Seekable native text directory version 5 can carry a Snappy-compressed opening
+bundle. Decoded navigation is capped at 1 MiB, authenticated against each original
+range identity, and charged to the physical owner. Native bytes and page CRCs do
+not change. Metadata pieces retain original pack ranges so denied residency can
+fall back to required verified reads. Versions 1–4 remain readable; rebuilding
+creates the new layout, while unchanged-file reuse can preserve an older layout.
+Upgrade readers before publishing version-5 directories or cohort-bearing file
+manifests; older binaries are not forward-compatible with these new records.
+
+Per-file opening cohorts combine small directory and navigation objects while
+preserving every member's original content-addressed identity. A cohort decodes
+at most 4 MiB and contains at most 256 members; each member is checked against its
+own SHA-256 proof before admission into the existing scoped immutable cache.
+Cold physical admission warms only file groups with new segments, with a 16 MiB
+decoded-work ceiling per admission. Memory denial or that ceiling leaves normal
+required reads responsible for access. No credentials or query capabilities are
+retained. Reader cancellation and current context validity are checked before
+decoding and during admission. File manifests, incremental reuse validation and GC retain
+both cohorts and their original artifacts. These are transport hints, not a new
+commit authority, and do not require loading an archive-sized index locally.
+
 Durable data files, index artifacts, publication metadata, pending work, and
 accepted mutations must survive worker replacement. Stateful deployments can
 use their canonical replicated storage; serverless deployments use the durable

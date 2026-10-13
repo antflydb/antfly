@@ -19,6 +19,12 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const artifact_store = @import("store.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
+// Serialize journal initialization and deterministic staging across separate
+// in-process handles as well as external owners. Stripes keep unrelated
+// publications independent; interprocess file locks remain in place.
+var journal_mutexes: [64]std.Io.Mutex = @splat(.init);
+var content_mutexes: [64]std.Io.Mutex = @splat(.init);
+
 pub const FsStore = struct {
     const verified_file_cache_limit: usize = 4096;
 
@@ -131,6 +137,11 @@ pub const FsStore = struct {
         } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
 
+        var write_io = threadedIo();
+        defer write_io.deinit();
+        const content_mutex = &content_mutexes[std.hash.Wyhash.hash(0, artifact_id) % content_mutexes.len];
+        try content_mutex.lock(write_io.io());
+        defer content_mutex.unlock(write_io.io());
         const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
@@ -375,6 +386,9 @@ pub const FsStore = struct {
     fn uploadJournal(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken) !std.Io.File {
         const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
         defer self.alloc.free(path);
+        const journal_mutex = &journal_mutexes[std.hash.Wyhash.hash(0, path) % journal_mutexes.len];
+        try journal_mutex.lock(io);
+        defer journal_mutex.unlock(io);
         try self.durable_dirs.ensure(self.alloc, io, path);
         const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
         defer attempt.close(io);
@@ -1386,4 +1400,60 @@ test "external lake filesystem journal resumes across restart with linear record
     try std.testing.expectEqual(@as(usize, 73), total);
     try std.testing.expectEqual(total, reads);
     try std.testing.expectEqual(@as(usize, 11), passes);
+}
+
+test "external lake filesystem concurrent scoped uploads preserve journal and duplicate content" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "concurrent-scoped-uploads");
+    defer cleanupTmp(path);
+    var first = try FsStore.init(a, std.mem.span(path));
+    defer first.deinit();
+    var second = try FsStore.init(a, std.mem.span(path));
+    defer second.deinit();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(13), 1, std.testing.io);
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var failures: [64]?anyerror = @splat(null);
+    var group: std.Io.Group = .init;
+    const Worker = struct {
+        fn run(fs: *FsStore, upload_scope: artifact_store.UploadScope, n: usize, failure: *?anyerror) void {
+            execute(fs, upload_scope, n) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(fs: *FsStore, upload_scope: artifact_store.UploadScope, n: usize) !void {
+            var buffer: [32]u8 = undefined;
+            const payload = try std.fmt.bufPrint(&buffer, "payload-{d}", .{n % 32});
+            var store = fs.artifactStore();
+            var metadata = try store.putScoped(upload_scope, payload, .none);
+            defer metadata.deinit(fs.alloc);
+            const actual = try store.getAlloc(metadata.artifact_id);
+            defer fs.alloc.free(actual);
+            try std.testing.expectEqualSlices(u8, payload, actual);
+        }
+    };
+    for (0..64) |n| group.async(io_impl.io(), Worker.run, .{ if (n % 2 == 0) &first else &second, scope, n, &failures[n] });
+    try group.await(io_impl.io());
+    for (failures) |failure| if (failure) |err| return err;
+    const Visitor = struct {
+        store: *artifact_store.ArtifactStore,
+        seen: std.StringHashMapUnmanaged(void) = .empty,
+        fn visit(raw: *anyopaque, _: artifact_store.UploadScope, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try self.store.getAlloc(id);
+            defer a.free(bytes);
+            const entry = try self.seen.getOrPut(a, bytes);
+            if (!entry.found_existing) entry.key_ptr.* = try a.dupe(u8, bytes);
+        }
+    };
+    var store = second.artifactStore();
+    var visitor: Visitor = .{ .store = &store };
+    defer {
+        var keys = visitor.seen.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        visitor.seen.deinit(a);
+    }
+    try store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit }, .none);
+    try std.testing.expectEqual(@as(u32, 32), visitor.seen.count());
 }

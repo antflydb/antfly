@@ -26,6 +26,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // update amplification. Branch packing always makes progress with >=2 entries.
 pub const max_page_bytes = 1024 * 1024;
 pub const target_page_bytes = 32 * 1024;
+pub const bulk_target_page_bytes = 256 * 1024;
 // Leave room for an ordered u64 prefix without reducing the accepted document
 // identifier size in the document facts index.
 pub const max_key_bytes = 256 * 1024 + 8;
@@ -66,11 +67,16 @@ pub const Store = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, Ref) anyerror![]u8,
     put: *const fn (*anyopaque, Ref, []const u8) anyerror!void,
+    /// Persist the entire bounded batch before returning. On failure no root
+    /// escapes the private sorted builder; scoped orphans remain collectible.
+    put_many: ?*const fn (*anyopaque, []const Write) anyerror!void = null,
     check: *const fn (*anyopaque) anyerror!void,
     /// Pure bounded reduction, authenticated in the page and parent routing entry.
     /// Existing trees retain their original wire representation when absent.
     reduce: ?*const fn (Allocator, []const Entry, u8) anyerror![]u8 = null,
 };
+pub const Write = struct { ref: Ref, bytes: []const u8 };
+pub const max_write_batch = 8;
 
 /// Small operation-local immutable page cache. It is a capability wrapper, not
 /// mutable state installed on the shared artifact-store owner. Planning many
@@ -285,6 +291,17 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
 }
 
 fn save(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggregate_out: *[]u8) !Ref {
+    const page = try encode(alloc, store, entries, height, aggregate_out);
+    defer alloc.free(page.bytes);
+    errdefer {
+        alloc.free(aggregate_out.*);
+        aggregate_out.* = &.{};
+    }
+    try store.put(store.ptr, page.ref, page.bytes);
+    return page.ref;
+}
+
+fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggregate_out: *[]u8) !Write {
     try store.check(store.ptr);
     if (entries.len == 0 or height > max_height) return error.InvalidGraphPage;
     const aggregate = if (store.reduce) |reduce| try reduce(alloc, entries, height) else try alloc.alloc(u8, 0);
@@ -298,7 +315,7 @@ fn save(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggr
     }
     if (size > max_page_bytes) return error.GraphPageTooLarge;
     const bytes = try alloc.alloc(u8, size);
-    defer alloc.free(bytes);
+    errdefer alloc.free(bytes);
     @memcpy(bytes[0..8], magic);
     @memcpy(bytes[24..56], &store.domain);
     bytes[8] = height;
@@ -331,9 +348,8 @@ fn save(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggr
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     const ref: Ref = .{ .digest = digest, .attempt = store.attempt, .bytes = @intCast(size), .height = height, .records = records };
-    try store.put(store.ptr, ref, bytes);
     aggregate_out.* = aggregate;
-    return ref;
+    return .{ .ref = ref, .bytes = bytes };
 }
 
 /// Pack toward half-full pages, allowing one indivisible record above the
@@ -586,12 +602,24 @@ fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8
 }
 
 /// Construct an initial tree from a strictly ordered stream. Only one pending
-/// page per height is retained; leaf records and every level's routing entries
-/// are released as soon as their page is persisted. The source's borrowed
+/// page per height and at most max_write_batch encoded pages are retained.
+/// Leaf records and routing entries are released when their page is encoded;
+/// encoded pages are released after their whole durable batch completes. The source's borrowed
 /// record may be invalidated by its next call. Like incremental apply, callers
 /// must account for orphan uploads if source, allocation or storage fails.
 pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
-    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    return buildSortedWithOptions(alloc, store, source, .{});
+}
+
+pub const BuildOptions = struct {
+    target_bytes: usize = target_page_bytes,
+};
+
+/// Bulk publication may pack larger pages to reduce object-store requests.
+/// Decoders, record limits and the maximum durable batch remain unchanged.
+pub fn buildSortedWithOptions(alloc: Allocator, store: Store, source: anytype, options: BuildOptions) !?Ref {
+    if (options.target_bytes < header_bytes + 8 or options.target_bytes > max_page_bytes) return error.InvalidGraphPageSize;
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store, .target_bytes = options.target_bytes };
     defer builder.deinit();
     while (try source.next()) |record| try builder.add(record.key, record.value);
     return builder.finish();
@@ -600,7 +628,10 @@ pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
 pub const SortedBuilder = struct {
     alloc: Allocator,
     store: Store,
+    target_bytes: usize = target_page_bytes,
     previous: ?[]u8 = null,
+    pending: [max_write_batch]Write = undefined,
+    pending_count: usize = 0,
     // The extra slot holds the final root ref, never another persisted page.
     levels: [max_height + 2]Level = @splat(.{}),
 
@@ -637,7 +668,10 @@ pub const SortedBuilder = struct {
             if (height > 0 and level.entries.items.len == 1) {
                 var higher_pending = false;
                 for (self.levels[height + 1 ..]) |higher| higher_pending = higher_pending or higher.entries.items.len > 0;
-                if (!higher_pending) return level.entries.items[0].child.?;
+                if (!higher_pending) {
+                    try self.persist();
+                    return level.entries.items[0].child.?;
+                }
             }
             try self.flush(height);
         }
@@ -645,6 +679,7 @@ pub const SortedBuilder = struct {
     }
 
     pub fn deinit(self: *SortedBuilder) void {
+        for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
         if (self.previous) |previous| self.alloc.free(previous);
         for (&self.levels) |*level| {
             level.clear(self.alloc);
@@ -656,7 +691,7 @@ pub const SortedBuilder = struct {
         if (height >= self.levels.len) return error.GraphPageTreeTooDeep;
         const level = &self.levels[height];
         const minimum: usize = if (height == 0) 1 else 2;
-        if (level.entries.items.len >= minimum and level.bytes + entry.size() > target_page_bytes)
+        if (level.entries.items.len >= minimum and level.bytes + entry.size() > self.target_bytes)
             try self.flush(height);
         const key = try self.alloc.dupe(u8, entry.key);
         errdefer self.alloc.free(key);
@@ -671,11 +706,25 @@ pub const SortedBuilder = struct {
     fn flush(self: *SortedBuilder, height: usize) anyerror!void {
         if (height > max_height) return error.GraphPageTreeTooDeep;
         const level = &self.levels[height];
-        var aggregate: []u8 = undefined;
-        const ref = try save(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
+        var aggregate: []u8 = &.{};
         defer self.alloc.free(aggregate);
+        const ref = if (self.store.put_many != null) queued: {
+            const page = try encode(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
+            self.pending[self.pending_count] = page;
+            self.pending_count += 1;
+            if (self.pending_count == self.pending.len) try self.persist();
+            break :queued page.ref;
+        } else try save(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
         try self.append(height + 1, .{ .key = level.entries.items[0].key, .child = ref, .aggregate = aggregate });
         level.clear(self.alloc);
+    }
+
+    fn persist(self: *SortedBuilder) !void {
+        if (self.pending_count == 0) return;
+        try self.store.check(self.store.ptr);
+        try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
+        for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
+        self.pending_count = 0;
     }
 };
 
@@ -1135,6 +1184,131 @@ const TestStore = struct {
         try self.pages.put(self.alloc, ref.digest, owned);
     }
 };
+
+test "serverless graph bulk packing preserves bounded forward and reverse reads" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        position: u64 = 0,
+        key: [8]u8 = undefined,
+        value: [1024]u8 = @splat(42),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.position == 1000) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var small: TestStore = .{ .alloc = a };
+    defer small.deinit();
+    var large: TestStore = .{ .alloc = a };
+    defer large.deinit();
+    var first: Source = .{};
+    var second: Source = .{};
+    const small_root = try buildSorted(a, small.store(), &first);
+    const large_root = try buildSortedWithOptions(a, large.store(), &second, .{ .target_bytes = bulk_target_page_bytes });
+    try std.testing.expect(large.writes * 4 < small.writes);
+    for ([_][2]u64{ .{ 0, 1000 }, .{ 228, 700 }, .{ 999, 1000 }, .{ 500, 500 } }) |bounds| {
+        var lower: [8]u8 = undefined;
+        var upper: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lower, bounds[0], .big);
+        std.mem.writeInt(u64, &upper, bounds[1], .big);
+        for ([_]bool{ false, true }) |reverse| {
+            var original = if (reverse) try Cursor.initReverse(a, small.store(), small_root, &lower, &upper) else try Cursor.init(a, small.store(), small_root, &lower, &upper);
+            defer original.deinit();
+            var bulk_cursor = if (reverse) try Cursor.initReverse(a, large.store(), large_root, &lower, &upper) else try Cursor.init(a, large.store(), large_root, &lower, &upper);
+            defer bulk_cursor.deinit();
+            var count: u64 = 0;
+            while (try original.next()) |row| {
+                const actual = (try bulk_cursor.next()).?;
+                try std.testing.expectEqualSlices(u8, row.key, actual.key);
+                try std.testing.expectEqualSlices(u8, row.value, actual.value);
+                count += 1;
+            }
+            try std.testing.expectEqual(bounds[1] - bounds[0], count);
+            try std.testing.expect((try bulk_cursor.next()) == null);
+        }
+    }
+    var invalid: Source = .{};
+    const before = large.writes;
+    for ([_]usize{ 0, max_page_bytes + 1 }) |target| {
+        try std.testing.expectError(error.InvalidGraphPageSize, buildSortedWithOptions(a, large.store(), &invalid, .{ .target_bytes = target }));
+    }
+    try std.testing.expectEqual(@as(u64, 0), invalid.position);
+    try std.testing.expectEqual(before, large.writes);
+    var failed: TestStore = .{ .alloc = a, .fail_put = 2 };
+    defer failed.deinit();
+    var fresh: Source = .{};
+    try std.testing.expectError(error.InjectedUploadFailure, buildSortedWithOptions(a, failed.store(), &fresh, .{ .target_bytes = bulk_target_page_bytes }));
+}
+
+test "serverless graph sorted page batches preserve identities and fail before root publication" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        position: u64 = 0,
+        key: [8]u8 = undefined,
+        value: [1024]u8 = @splat(7),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.position == 1000) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    const Batch = struct {
+        backing: *TestStore,
+        calls: usize = 0,
+        largest: usize = 0,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try TestStore.check(self.backing);
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, ref: Ref) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return TestStore.get(self.backing, alloc, ref);
+        }
+        fn put(_: *anyopaque, _: Ref, _: []const u8) !void {
+            return error.UnexpectedSerialWrite;
+        }
+        fn many(ptr: *anyopaque, writes: []const Write) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.largest = @max(self.largest, writes.len);
+            if (writes.len > max_write_batch) return error.UnboundedPageWrites;
+            for (writes) |write| try TestStore.put(self.backing, write.ref, write.bytes);
+        }
+        fn store(self: *@This()) Store {
+            return .{ .ptr = self, .check = check, .get = get, .put = put, .put_many = many };
+        }
+    };
+    var serial: TestStore = .{ .alloc = a };
+    defer serial.deinit();
+    var first: Source = .{};
+    const original = (try buildSorted(a, serial.store(), &first)).?;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var batch: Batch = .{ .backing = &backing };
+    var source: Source = .{};
+    const root = (try buildSorted(a, batch.store(), &source)).?;
+    try std.testing.expect(Ref.eql(original, root));
+    try std.testing.expectEqual(serial.writes, backing.writes);
+    try std.testing.expect(batch.calls > 1);
+    try std.testing.expectEqual(max_write_batch, batch.largest);
+    var cursor = try Cursor.init(a, batch.store(), root, "", null);
+    defer cursor.deinit();
+    var rows: usize = 0;
+    while (try cursor.next()) |row| {
+        try std.testing.expectEqual(rows, std.mem.readInt(u64, row.key[0..8], .big));
+        rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), rows);
+    for ([_]usize{ 2, serial.writes - 1 }) |failure| {
+        var failed: TestStore = .{ .alloc = a, .fail_put = failure };
+        defer failed.deinit();
+        var failing: Batch = .{ .backing = &failed };
+        var fresh: Source = .{};
+        try std.testing.expectError(error.InjectedUploadFailure, buildSorted(a, failing.store(), &fresh));
+    }
+}
 
 test "serverless graph page tree rank cursors resume without reading earlier leaves" {
     const a = std.testing.allocator;
@@ -1669,6 +1843,9 @@ test "external lake text statistics page reductions reuse interior subtrees and 
             self.position += 1;
             return .{ .key = &self.key, .value = &self.value };
         }
+        fn many(raw: *anyopaque, writes: []const Write) !void {
+            for (writes) |write| try TestStore.put(raw, write.ref, write.bytes);
+        }
         fn reduce(alloc: Allocator, entries: []const Entry, height: u8) ![]u8 {
             var sum: u64 = 0;
             for (entries) |entry| {
@@ -1683,8 +1860,16 @@ test "external lake text statistics page reductions reuse interior subtrees and 
     };
     var store = memory.store();
     store.reduce = Source.reduce;
+    store.put_many = Source.many;
     var source: Source = .{};
     const root = try buildSorted(a, store, &source);
+    var failed: TestStore = .{ .alloc = a, .fail_put = 0 };
+    defer failed.deinit();
+    var failing_store = failed.store();
+    failing_store.reduce = Source.reduce;
+    failing_store.put_many = Source.many;
+    var failing_source: Source = .{};
+    try std.testing.expectError(error.InjectedUploadFailure, buildSorted(a, failing_store, &failing_source));
     var key: [8]u8 = undefined;
     var value: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 2000, .big);

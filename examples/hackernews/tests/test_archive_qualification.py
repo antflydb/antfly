@@ -20,9 +20,11 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location(
     "hn_archive", ROOT / "archive_qualification.py"
 )
@@ -91,6 +93,34 @@ class ArchiveQualificationTest(unittest.TestCase):
         self.regional["runs"]["indexed"][0]["concurrent_search_ms"] = [100]
         self.regional["runs"]["indexed"][0]["warm_samples_ms"] = [100]
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+
+    def test_stored_source_policy_must_match_the_configured_profile(self):
+        self.config["store_source"] = True
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["store_source"] = True
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
+
+    def test_deep_cursor_workload_cannot_silently_change(self):
+        self.config["cursor_term"] = "AI"
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["cursor_depth"]["term"] = "AI"
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
+
+    def test_composed_coverage_is_required_when_enabled(self):
+        self.config["qualify_composed_sources"] = True
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["composed_sources"] = {
+                "verified": [
+                    "union_history",
+                    "overlay_nonmatching_suppression",
+                    "saved_current_visibility",
+                    "mutable_composed_cursor_restart",
+                ]
+            }
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
 
     def test_registration_is_part_of_the_initial_publication_gate(self):
         self.regional["runs"]["indexed"][0]["registration_seconds"] = 3000

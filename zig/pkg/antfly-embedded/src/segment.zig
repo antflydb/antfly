@@ -982,8 +982,14 @@ pub const SegmentReader = struct {
             var reader = try load(alloc, input_source);
             errdefer reader.deinit();
             if (reader.doc_count != self.doc_count or reader.fields.len != self.fields.len) return error.InvalidSegment;
-            for (reader.fields, self.fields) |actual, expected| {
-                if (!std.mem.eql(u8, actual.name, expected.name) or !std.meta.eql(actual.inverted_stats, expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
+            // Routing directories are canonicalized by name; historical
+            // physical segments retain writer field order. Bind identities,
+            // not positions, while still verifying every admitted field.
+            for (self.fields) |expected| {
+                const actual = for (reader.fields) |field| {
+                    if (std.mem.eql(u8, field.name, expected.name)) break field;
+                } else return error.InvalidSegment;
+                if (!std.meta.eql(try reader.invertedFieldStats(expected.name), expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
                 for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
             }
             return reader;
@@ -1784,6 +1790,7 @@ pub const SegmentReader = struct {
     pub const V4StoredDocLocation = struct {
         id: []const u8,
         id_length: usize,
+        id_start: usize = 0,
         block_idx: u32,
         block_start: usize,
         block_end: usize,
@@ -1915,12 +1922,22 @@ pub const SegmentReader = struct {
         return .{
             .id = id,
             .id_length = id_len,
+            .id_start = @intCast(ids_start + id_offset),
             .block_idx = block,
             .block_start = @intCast(range.stored_offset + range.stored_metadata_length + start),
             .block_end = @intCast(range.stored_offset + range.stored_metadata_length + end),
             .doc_offset = std.mem.readInt(u32, entry[16..20], .little),
             .raw_len = std.mem.readInt(u32, entry[20..24], .little),
         };
+    }
+
+    pub fn prefetchStoredDoc(self: *const SegmentReader, doc: u32) !void {
+        if (self.native == null) return;
+        const backing_source = self.source();
+        if (backing_source != .ranges or backing_source.ranges.prefetch == null) return;
+        const location = (try self.storedLocationMetadata(doc)) orelse return error.StoredDocMissing;
+        backing_source.prefetch(location.id_start, location.id_length);
+        backing_source.prefetch(location.block_start, location.block_end - location.block_start);
     }
 
     fn storedBlockChecksum(self: *const SegmentReader, block: u32) !u32 {
@@ -12176,4 +12193,41 @@ test "external lake compact routing readers unwind allocation failures and prese
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "external lake lazy routing binds physical field order by identity" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("one", "{\"z_body\":\"alpha\"}");
+    var text = inverted.InvertedIndexBuilder.init(a, .{});
+    defer text.deinit();
+    try text.addDocument(0, &.{.{ .term = "alpha", .freq = 1, .positions = &.{0} }});
+    const section = try text.build();
+    defer a.free(section);
+    try writer.addSection(try writer.addField("z_body"), .inverted_text, section);
+    _ = try writer.addField("a_key");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const route = [_]SegmentReader.RoutingField{
+        .{ .name = "a_key", .stats = null },
+        .{ .name = "z_body", .stats = .{ .doc_count = 1, .total_field_len = 1 }, .section_mask = @as(u16, 1) << @backingInt(SectionType.inverted_text) },
+    };
+    var lazy = try SegmentReader.initRouting(a, 1, &route, SegmentReader.initSource);
+    defer lazy.deinit();
+    var bound = try lazy.bindSource(a, .{ .contiguous = bytes });
+    defer bound.deinit();
+    try std.testing.expectEqualStrings("one", (try bound.storedDoc(0)).?.id);
+    try std.testing.expect(bound.hasSection("z_body", .inverted_text));
+    // Order tolerance must not weaken the advertised stats/name contract.
+    var wrong_stats = route;
+    wrong_stats[1].stats.?.total_field_len = 2;
+    var corrupt = try SegmentReader.initRouting(a, 1, &wrong_stats, SegmentReader.initSource);
+    defer corrupt.deinit();
+    try std.testing.expectError(error.InvalidSegment, corrupt.bindSource(a, .{ .contiguous = bytes }));
+    var wrong_name = route;
+    wrong_name[0].name = "absent";
+    var missing = try SegmentReader.initRouting(a, 1, &wrong_name, SegmentReader.initSource);
+    defer missing.deinit();
+    try std.testing.expectError(error.InvalidSegment, missing.bindSource(a, .{ .contiguous = bytes }));
 }
