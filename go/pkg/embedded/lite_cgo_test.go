@@ -67,6 +67,9 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 		Unsupported,
 		Stalled,
 		Cancelled,
+		ReplacementFailed,
+		ReplacementPending,
+		ReplacementConfigurationMismatch,
 		Internal,
 		ErrorCode(127),
 	}

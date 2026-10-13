@@ -315,6 +315,9 @@ pub const ReadableLeaseHook = struct {
             .unsupported => return error.UnsupportedOperation,
             .stalled => return error.Stalled,
             .cancelled => return error.Canceled,
+            .replacement_failed => return error.IndexReplacementFailed,
+            .replacement_pending => return error.IndexReplacementPending,
+            .replacement_configuration_mismatch => return error.IndexReplacementConfigurationMismatch,
             .internal => return error.Internal,
         }
     }

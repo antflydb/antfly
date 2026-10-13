@@ -4598,6 +4598,9 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
             .applied_sequence = job.applied_sequence,
             .target_sequence = database.core.nextDerivedSequence(),
             .last_error = job.last_error,
+            .retry_count = job.retry_count,
+            .retry_after_ns = job.retry_after_ns,
+            .activation_attempts = job.activation_attempts,
         }, .{});
         try rows.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, status, .{}));
     }
@@ -7268,7 +7271,40 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
 }
 
-pub export fn antfly_db_add_index_json(
+/// Registration is atomic; optional waiting releases API/path admission
+/// between maintenance quanta so cancellation and writers remain available.
+pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice) capi.ErrorCode {
+    capi.clearLastError();
+    var request = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, config_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer request.deinit();
+    const result = addIndexJsonRegistered(handle_ptr, config_json);
+    if (result != .ok) return result;
+    if (request.value != .object) return .ok;
+    const wait = request.value.object.get("wait") orelse return .ok;
+    const timeout = wait.object.get("timeout_ms").?.integer;
+    const name = request.value.object.get("name").?.string;
+    const deadline = monotonicNowNs() +| @as(u64, @intCast(timeout)) *| std.time.ns_per_ms;
+    while (true) {
+        const pending = blk: {
+            const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
+            defer guard.leave();
+            if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+            const database = guard.handle.database();
+            const now = monotonicNowNs();
+            const quantum_ms = @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+            database.waitGraphReplacement(name, quantum_ms) catch |err| switch (err) {
+                error.Busy => break :blk true,
+                else => return capi.mapError(err),
+            };
+            break :blk false;
+        };
+        if (!pending) return .ok;
+        if (monotonicNowNs() >= deadline) return capi.mapError(error.Busy);
+        handleLockIo().sleep(.fromMilliseconds(1), .awake) catch |err| return capi.mapError(err);
+    }
+}
+
+fn addIndexJsonRegistered(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
@@ -7291,12 +7327,10 @@ pub export fn antfly_db_add_index_json(
     if (discriminator != .string) return capi.mapError(error.InvalidIndexType);
     const replacement = value.object.get("replaces");
     const wait = value.object.get("wait");
-    var wait_ms: ?u64 = null;
     if (wait) |request| {
         if (request != .object) return capi.mapError(error.InvalidArgument);
         const timeout = request.object.get("timeout_ms") orelse return capi.mapError(error.InvalidArgument);
         if (timeout != .integer or timeout.integer < 0) return capi.mapError(error.InvalidArgument);
-        wait_ms = @intCast(timeout.integer);
     }
     var index_value = value;
     _ = index_value.object.swapRemove("wait");
@@ -7344,10 +7378,9 @@ pub export fn antfly_db_add_index_json(
             const cfg = job.config orelse return capi.mapError(error.InvalidIndexConfig);
             const same = cfg.kind == kind and (@import("../storage/db/enrichment/config_validation.zig").producerJsonValuesEqual(handle.alloc, cfg.config_json, parsed.value.config_json) catch |err| return capi.mapError(err));
             if (!same or (replacement != null and !std.mem.eql(u8, replacement.?.string, job.old)))
-                return capi.mapErrorContext(error.InvalidArgument, "index name is reserved by a different pending replacement; cancel_replacement before changing it");
+                return capi.mapErrorContext(error.IndexReplacementConfigurationMismatch, "index name is reserved by a different pending replacement; cancel_replacement before changing it");
             if (job.phase == .failed)
-                return capi.mapErrorContext(error.InvalidArgument, "replacement failed; inspect pending_work_stats and cancel_replacement before retrying");
-            if (wait_ms) |timeout| handle.database().waitGraphReplacement(job.name, timeout) catch |err| return capi.mapError(err);
+                return capi.mapErrorContext(error.IndexReplacementFailed, "replacement failed; inspect pending_work_stats and cancel_replacement before retrying");
             return .ok;
         }
     }
@@ -7427,7 +7460,6 @@ pub export fn antfly_db_add_index_json(
     }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     @import("tables.zig").noteReaderVersion(handle) catch |err| return capi.mapError(err);
-    if (wait_ms) |timeout| handle.database().waitGraphReplacement(name.string, timeout) catch |err| return capi.mapError(err);
     return .ok;
 }
 

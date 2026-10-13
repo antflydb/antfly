@@ -1029,6 +1029,12 @@ an already-loaded model retains its immutable identity. Unattested providers
 conservatively re-embed. Runtime adapters without complete candidate revisions
 refetch candidates while still allowing an attested embedding identity to reuse
 mention vectors.
+Embedding cache identities include the provider endpoint, region/project,
+credential source and resolved API-key digest, secret-store generation, and all
+embedding settings in addition to model revision. Keys never contain plaintext
+credentials. Equivalent destinations can still share vectors; distinct tenants,
+endpoints, rotated secrets and embedding settings cannot.
+
 The distributed adapter currently takes this conservative path. Candidate cache
 dependencies use the effective blocking strategy: a resolver without a scorer
 uses exact-key lookup even if its declarative strategy is prefix or ANN.
@@ -1065,7 +1071,7 @@ hot document rebuild its latest projection once per round.
 Replay retention advances after each round; it does not pin the entire journal.
 Restart resumes the durable marker/checkpoints, without rebuilding completed
 pages. Background construction retains its private manager across rounds, shares
-a source snapshot across each page, and checkpoints once per bounded quantum.
+a source snapshot across each page, and checkpoints its resumable progress.
 Source pages collect at most 32 sources per turn, sharing their write plan,
 artifact transaction and graph apply. Collection yields after 100 ms, followed
 by the current bounded source batch. Resident managers are invalidated when the
@@ -1077,13 +1083,20 @@ unacknowledged work. Checkpoint fsync remains required before the durable cursor
 advances. The scan excludes unrelated metadata/journal keys, and replay begins
 strictly after the last consumed sequence.
 
-A failed job enters terminal `phase: "failed"`, exposes `last_error`, releases its
+Transient storage/resource/network failures retry four times with persisted
+50 ms, 200 ms, 800 ms and 3200 ms backoff. `retry_count`, `retry_after_ns` (Unix
+nanoseconds) and `last_error` are visible in replacement status. Backoff survives
+reopen, and waiting jobs yield to later replacements and ordinary maintenance.
+A permanent failure or exhausted retry budget enters terminal `phase: "failed"`,
+exposes `last_error`, releases its
 journal retention pin and retires any inline execution owned only by that shadow.
 It is excluded from scheduling: later replacements, artifact repair, drains and
 backups continue. Backups export serving state and exclude failed shadow outputs.
 Call `cancel_replacement(new_name)` to remove a running or failed reservation and
 schedule bounded artifact cleanup; the serving old index stays intact. Repeated
-cancellation is a no-op. Deleting either index name cancels dependent shadows.
+cancellation is a no-op. Deleting the pending new name cancels its reservation.
+Deleting the serving old name removes it and cancels its shadow in one catalog
+transaction; a rejected deletion preserves the reservation and old index.
 Cancel and drain cleanup before registering a fresh attempt after failure.
 Plain `add_index` with the identical pending config joins its shadow even without
 `replaces`; conflicting configs are rejected before changing catalogs or storage.
@@ -1091,11 +1104,35 @@ The final write fence consumes and durably checkpoints a bounded tail even when
 the gap exceeds 1024. An intra-entry source cursor also permits yielding within a
 large journal batch. Each pause advances completed sources rather than restarting
 the tail; its 100 ms work budget includes the current indivisible source, followed
-by the required durability checkpoint.
+by the required durability checkpoint. After eight yielding activation attempts,
+the background owner escalates to a fixed-target cutover barrier: primary writes
+queue while it drains the already-admitted finite journal tail and swaps. This
+prevents starvation even when producers continually outpace ordinary catch-up.
+The escalated pause lasts for the remaining tail work and durability IO; it does
+not have a 100 ms wall-clock bound. Explicit wait callers retain their deadline;
+the maintenance owner performs escalation. `activation_attempts` persists across
+reopen and is reported with replacement progress.
+Cutover coalesces complete journal windows by source key before rebuilding,
+including during escalation, so repeated writes to a hot document cost one
+reconstruction per window. Partial large entries retain a durable source ordinal.
+Tail rebuilds share a source snapshot and write plan across batches of 32
+sources. Graph owner cleanup also pins one coherent outgoing/reverse snapshot
+pair for each batch, instead of reopening both stores for every document/prefix. Full document rebuilds cover their owned artifacts, so those artifacts
+are excluded from the source scan and journal artifact pass. Resolution batches
+also deduplicate owning extraction artifacts, rendering canonical relation
+endpoints once after all mention resolutions are applied.
 
 Identical in-progress requests are no-ops. `replaces` and optional
 `"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
-Waiting cooperatively advances the same work; deadline Busy means registration
+Waiting cooperatively advances the same work, releasing handle/path locks between
+quanta so another caller can cancel or write. Cancellation returns `ANTFLY_CANCELLED`
+promptly, storage/admission errors propagate, and a manual runtime sleeps through
+its control IO rather than spinning. Replacement precondition errors have distinct
+codes in C, Python, Go and Rust: `ANTFLY_REPLACEMENT_FAILED`,
+`ANTFLY_REPLACEMENT_PENDING` and `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`.
+Plain graph replacement does not upgrade the minimum reader version; only actual
+authoritative resolver catalog features require version 2.
+Deadline Busy means registration
 was accepted and the shadow continues in the background. Without wait, Busy is
 limited to bounded registration admission. Drain with `run_until_idle` to await
 all replacements. When both names are absent, the command behaves like ordinary

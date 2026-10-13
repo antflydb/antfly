@@ -120,6 +120,9 @@ pub const GraphReplacementBuild = struct {
     applied_sequence: u64 = 0,
     tail_source_cursor: usize = 0,
     last_error: ?[]const u8 = null,
+    retry_count: u32 = 0,
+    retry_after_ns: u64 = 0,
+    activation_attempts: u32 = 0,
 };
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
@@ -11955,11 +11958,9 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(key, value);
-        // Resumable shadows are a real new storage feature; plain table DDL
-        // is not. Stamp their requirement with the reservation atomically.
-        try txn.put(resolver_catalog.minimum_reader_key, "2");
+        // Shadow metadata is unpublished and ignored by older readers. Only
+        // authoritative resolver catalog fields require a reader upgrade.
         try txn.commit();
-        self.minimum_reader_version.store(@max(@as(u32, 2), self.minimum_reader_version.load(.acquire)), .release);
         return stored;
     }
 
@@ -22302,15 +22303,40 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
-        const maybe_retiring = if (removed_config) |config|
+        var retiring_names: std.ArrayList([]const u8) = .empty;
+        defer retiring_names.deinit(self.alloc);
+        const primary_retiring = if (removed_config) |config|
             try self.inlineResolversRetiringWithConfig(self.alloc, excluded_name, config)
         else
             try self.inlineResolversRetiringWithIndex(self.alloc, excluded_name);
-        defer self.alloc.free(maybe_retiring);
+        defer self.alloc.free(primary_retiring);
+        try retiring_names.appendSlice(self.alloc, primary_retiring);
+        // Deleting a serving index also cancels its shadow atomically. No
+        // cancellation survives a rejected catalog mutation or failed commit.
+        for (jobs.value) |job| {
+            if (self.get(excluded_name) == null or self.get(job.name) != null or !std.mem.eql(u8, job.old, excluded_name)) continue;
+            var cleanup = try self.prepareGeneratedArtifactCleanupPlan(job.name, .graph, job.generation, null, null, &.{});
+            defer cleanup.deinit();
+            const marker = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, job.name });
+            defer self.alloc.free(marker);
+            try txn.put(cleanup.key.?, cleanup.value.?);
+            try txn.delete(marker);
+            if (job.config) |cfg| {
+                const extra = try self.inlineResolversRetiringWithConfig(self.alloc, excluded_name, cfg.config_json);
+                defer self.alloc.free(extra);
+                for (extra) |name| {
+                    const exists = for (retiring_names.items) |present| {
+                        if (std.mem.eql(u8, present, name)) break true;
+                    } else false;
+                    if (!exists) try retiring_names.append(self.alloc, name);
+                }
+            }
+        }
+        const maybe_retiring = retiring_names.items;
         var retire_count: usize = 0;
         for (maybe_retiring) |name| {
             const shared = for (jobs.value) |job| {
-                if (std.mem.eql(u8, job.name, excluded_name) or job.phase == .failed) continue;
+                if (std.mem.eql(u8, job.name, excluded_name) or std.mem.eql(u8, job.old, excluded_name) or job.phase == .failed) continue;
                 if (job.config) |cfg| if (try self.indexDeclaresResolver(cfg.config_json, name)) break true;
             } else false;
             if (!shared) {

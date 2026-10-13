@@ -44,38 +44,47 @@ const (
 	// Cancelled means the caller stopped the operation by returning false
 	// from its progress or streaming callback (see Inference.Pull and
 	// Inference.GenerateStream).
-	Cancelled ErrorCode = 10
-	Internal  ErrorCode = 255
+	Cancelled                        ErrorCode = 10
+	ReplacementFailed                ErrorCode = 11
+	ReplacementPending               ErrorCode = 12
+	ReplacementConfigurationMismatch ErrorCode = 13
+	Internal                         ErrorCode = 255
 )
 
 var errorCodeNames = map[ErrorCode]string{
-	OK:              "ANTFLY_OK",
-	InvalidArgument: "ANTFLY_INVALID_ARGUMENT",
-	NotFound:        "ANTFLY_NOT_FOUND",
-	VersionConflict: "ANTFLY_VERSION_CONFLICT",
-	IntentConflict:  "ANTFLY_INTENT_CONFLICT",
-	TxnNotFound:     "ANTFLY_TXN_NOT_FOUND",
-	Busy:            "ANTFLY_BUSY",
-	OutcomeUnknown:  "ANTFLY_OUTCOME_UNKNOWN",
-	Unsupported:     "ANTFLY_UNSUPPORTED",
-	Stalled:         "ANTFLY_STALLED",
-	Cancelled:       "ANTFLY_CANCELLED",
-	Internal:        "ANTFLY_INTERNAL",
+	OK:                               "ANTFLY_OK",
+	InvalidArgument:                  "ANTFLY_INVALID_ARGUMENT",
+	NotFound:                         "ANTFLY_NOT_FOUND",
+	VersionConflict:                  "ANTFLY_VERSION_CONFLICT",
+	IntentConflict:                   "ANTFLY_INTENT_CONFLICT",
+	TxnNotFound:                      "ANTFLY_TXN_NOT_FOUND",
+	Busy:                             "ANTFLY_BUSY",
+	OutcomeUnknown:                   "ANTFLY_OUTCOME_UNKNOWN",
+	Unsupported:                      "ANTFLY_UNSUPPORTED",
+	Stalled:                          "ANTFLY_STALLED",
+	Cancelled:                        "ANTFLY_CANCELLED",
+	ReplacementFailed:                "ANTFLY_REPLACEMENT_FAILED",
+	ReplacementPending:               "ANTFLY_REPLACEMENT_PENDING",
+	ReplacementConfigurationMismatch: "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
+	Internal:                         "ANTFLY_INTERNAL",
 }
 
 var errorCodeDescriptions = map[ErrorCode]string{
-	OK:              "operation completed successfully",
-	InvalidArgument: "an argument, request, path, or open mode is invalid",
-	NotFound:        "the requested database object was not found",
-	VersionConflict: "a version predicate did not match the current document version",
-	IntentConflict:  "a transaction intent conflicts with the requested operation",
-	TxnNotFound:     "the requested transaction was not found",
-	Busy:            "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-	OutcomeUnknown:  "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
-	Unsupported:     "the operation requires a capability that is not supported by this platform or filesystem",
-	Stalled:         "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
-	Cancelled:       "the caller cancelled the operation",
-	Internal:        "an internal error occurred",
+	OK:                               "operation completed successfully",
+	InvalidArgument:                  "an argument, request, path, or open mode is invalid",
+	NotFound:                         "the requested database object was not found",
+	VersionConflict:                  "a version predicate did not match the current document version",
+	IntentConflict:                   "a transaction intent conflicts with the requested operation",
+	TxnNotFound:                      "the requested transaction was not found",
+	Busy:                             "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
+	OutcomeUnknown:                   "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+	Unsupported:                      "the operation requires a capability that is not supported by this platform or filesystem",
+	Stalled:                          "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
+	Cancelled:                        "the caller cancelled the operation",
+	ReplacementFailed:                "replacement failed after its retry budget; inspect diagnostics and cancel before retrying",
+	ReplacementPending:               "index name is reserved by a pending replacement",
+	ReplacementConfigurationMismatch: "replacement configuration differs from the reserved request",
+	Internal:                         "an internal error occurred",
 }
 
 func (code ErrorCode) Error() string {

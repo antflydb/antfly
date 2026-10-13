@@ -1513,10 +1513,33 @@ pub const ManagedEmbedder = struct {
         const model = capabilities.model_revision orelse return null;
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        const endpoint = managedEmbeddingEndpointIdentity(entry);
+        const secret_store = if (endpoint.credentials.kind == .secret_ref) entry.secret_store else null;
+        if (secret_store) |store| _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        endpoint.updateHash(&hasher);
+        hashQueryCacheU64(&hasher, if (secret_store) |store| store.generationFast() else 0);
+        // Hash the effective secret too: environment variables and secret
+        // references can rotate without changing their configured locator.
+        if (entry.api_key) |secret| {
+            var resolved = try secret.resolveOwnedWithGeneration(a, entry.secret_store);
+            defer resolved.deinit(a);
+            hashQueryCacheField(&hasher, resolved.value);
+        }
+        var endpoint_digest: [32]u8 = undefined;
+        hasher.final(&endpoint_digest);
         return try @import("antfly_resolver").fingerprint(a, .{
-            model,                   entry.input_type,                                 entry.query_input_type, entry.document_input_type,
-            entry.query_instruction, entry.model_identity,                             entry.truncate,         @tagName(entry.bedrock_request_format),
-            entry.dimensions,        EmbeddingTaskType.retrieval_document.canonical(),
+            endpoint_digest,
+            model,
+            entry.input_type,
+            entry.query_input_type,
+            entry.document_input_type,
+            entry.query_instruction,
+            entry.model_identity,
+            entry.truncate,
+            @tagName(entry.bedrock_request_format),
+            entry.dimensions,
+            EmbeddingTaskType.retrieval_document.canonical(),
         });
     }
 
@@ -10266,6 +10289,17 @@ pub fn testSparseCacheRevision() !void {
         std.testing.allocator.free(@field(managed.entries[0], field));
         @field(managed.entries[0], field) = "";
     }
+    const original_url = managed.entries[0].base_url;
+    managed.entries[0].base_url = @constCast("https://other-endpoint.invalid");
+    const moved = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    try std.testing.expect(!std.mem.eql(u8, &initial, &moved));
+    managed.entries[0].base_url = original_url;
+    managed.entries[0].api_key = .{ .literal = @constCast("tenant-a") };
+    const tenant_a = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    managed.entries[0].api_key = .{ .literal = @constCast("tenant-b") };
+    const tenant_b = (try dense_port.cache_revision_fn.?(dense_port.ptr, std.testing.allocator, "semantic_idx")).?;
+    try std.testing.expect(!std.mem.eql(u8, &tenant_a, &tenant_b));
+    managed.entries[0].api_key = null;
     managed.entries[0].sparse = true;
     const sparse = managed.sparseInterface();
     const revision = (try sparse.cache_revision_fn.?(sparse.ptr, std.testing.allocator, "semantic_idx")).?;

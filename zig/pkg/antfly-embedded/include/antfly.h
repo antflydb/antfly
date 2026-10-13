@@ -44,6 +44,10 @@ typedef enum antfly_error_code {
     /* The caller cancelled the call by returning false from its progress or
      * stream callback. */
     ANTFLY_CANCELLED = 10,
+    /* Stable replacement precondition failures, distinct from malformed input. */
+    ANTFLY_REPLACEMENT_FAILED = 11,
+    ANTFLY_REPLACEMENT_PENDING = 12,
+    ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH = 13,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -489,7 +493,11 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * serves until background activation. Identical requests are idempotent.
  * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
  * waits for activation; deadline BUSY leaves the accepted shadow running.
- * pending_work_stats_json reports per-index progress and the last error. */
+ * Waiting releases admission between work quanta; cancellation returns
+ * ANTFLY_CANCELLED. Precondition failures are ANTFLY_REPLACEMENT_FAILED,
+ * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
+ * pending_work_stats_json reports progress, retry_count, retry_after_ns and
+ * last_error. Transient failures retry four times with persisted backoff. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 /* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);

@@ -511,6 +511,9 @@ class Database:
         index serves until activation. It also works when the old index is absent.
         Optional ``wait: {timeout_ms: N}`` waits for activation. A wait timeout
         leaves the accepted shadow running; inspect ``pending_work_stats()``.
+        Waits release native admission between quanta; cancellation raises
+        CancelledError. ReplacementFailedError, ReplacementPendingError and
+        ReplacementConfigurationMismatchError classify replacement preconditions.
         """
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 

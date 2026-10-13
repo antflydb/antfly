@@ -981,3 +981,7 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
 }
+
+pub const ANTFLY_REPLACEMENT_FAILED: antfly_error_code = 11;
+pub const ANTFLY_REPLACEMENT_PENDING: antfly_error_code = 12;
+pub const ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH: antfly_error_code = 13;

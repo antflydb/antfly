@@ -934,6 +934,10 @@ def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_pa
         db.create_table("plain_named", {})
         db.create_table("dropped_named", {})
         db.drop_table("dropped_named")
+        graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+        db.add_index(graph)
+        db.add_index(dict(graph, name="new", replaces="old"))
+        db.run_until_idle()
         assert db.capabilities()["minimum_reader_version"] == 1
     with _open_graph_test(identity, options) as db:
         config = _resolver_graph("knowledge", "concepts")
@@ -1091,28 +1095,48 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
 def test_replacement_recovers_after_process_exit(tmp_path, storage):
     path = tmp_path / ("crash-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "crash-shadow")
     script = r"""
-import os, sys
+import os, sys, time
 import antfly_embedded as af
 options = af.OpenOptions(storage=af.Storage(int(sys.argv[2])))
 opener = af.create_with_options if options.storage == af.Storage.LITE else af.open_with_options
 db = opener(sys.argv[1], options)
 db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
-db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(3000)}})
 db.run_until_idle()
 try:
     db.add_index({"name": "new", "type": "graph", "replaces": "old",
-                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 0}})
+                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
 except af.BusyError:
     pass
 else:
     raise AssertionError("expected the registered shadow to remain pending")
-os._exit(0)  # Deliberately bypass all handle close/flush hooks.
+progress = db.pending_work_stats()["replacements"]
+deadline = time.monotonic() + 10
+while len(progress) == 1 and progress[0]["scanned_keys"] == 0:
+    assert time.monotonic() < deadline, progress
+    try:
+        db.add_index({"name": "new", "type": "graph", "replaces": "old",
+                      "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
+    except af.BusyError:
+        pass
+    progress = db.pending_work_stats()["replacements"]
+assert len(progress) == 1 and progress[0]["scanned_keys"] > 0 and progress[0]["phase"] == "building", progress
+assert "old" in {i["name"] for i in db.list_indexes()}
+# Advance beyond the acknowledged cursor, then crash without close/flush.
+try:
+    db.add_index({"name": "new", "type": "graph", "replaces": "old",
+                  "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
+except af.BusyError:
+    pass
+else:
+    raise AssertionError("build should still be partial")
+os._exit(0)
 """
     subprocess.run([sys.executable, "-c", script, str(path), str(int(storage))], check=True, timeout=60)
     with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
         db.run_until_idle()
         assert "old" not in {i["name"] for i in db.list_indexes()}
-        for key in ("source:0000", "source:0299"):
+        for key in ("source:0000", "source:2999"):
             assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
 
 
@@ -1128,7 +1152,7 @@ def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage)
         with pytest.raises(antfly_embedded.BusyError):
             db.add_index(dict(config, replaces="old", wait={"timeout_ms": 0}))
         db.add_index(config)  # Codex's plain inline config replay joins the shadow.
-        with pytest.raises(antfly_embedded.InvalidArgumentError):
+        with pytest.raises(antfly_embedded.ReplacementConfigurationMismatchError):
             db.add_index(dict(config, edge_types=[{"name": "R", "field": "wrong"}]))
         assert db.cancel_replacement("new")
         assert not db.cancel_replacement("new")
@@ -1151,3 +1175,51 @@ def test_plain_table_lifecycle_preserves_reader_version_one(tmp_path, storage):
         assert db.capabilities()["minimum_reader_version"] == 1
     with _open_graph_test(path, options) as db:
         assert db.capabilities()["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_replacement_keeps_reader_version_one(tmp_path, storage):
+    path = tmp_path / ("plain-replace.aflite" if storage == antfly_embedded.Storage.LITE else "plain-replace")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+        db.run_until_idle()
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(
+                {
+                    "name": "new",
+                    "type": "graph",
+                    "replaces": "old",
+                    "edge_types": [{"name": "R", "field": "links"}],
+                    "wait": {"timeout_ms": 0},
+                }
+            )
+        assert db.capabilities()["minimum_reader_version"] == 1
+        db.run_until_idle()
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_wait_observes_cancellation(tmp_path, storage):
+    import concurrent.futures
+    import time
+
+    path = tmp_path / ("cancel-wait.aflite" if storage == antfly_embedded.Storage.LITE else "cancel-wait")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:05}": {"links": ["target"]} for i in range(3000)}})
+        db.run_until_idle()
+        config = {"name": "new", "type": "graph", "replaces": "old", "edge_types": [{"name": "R", "field": "links"}]}
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(config, wait={"timeout_ms": 0}))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            waiter = pool.submit(db.add_index, dict(config, wait={"timeout_ms": 60000}))
+            time.sleep(0.02)
+            assert db.cancel_replacement("new")
+            with pytest.raises(antfly_embedded.CancelledError):
+                waiter.result(timeout=10)
+        assert "old" in {i["name"] for i in db.list_indexes()}
