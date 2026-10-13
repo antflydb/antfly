@@ -655,6 +655,7 @@ pub const NativeGenerateCoordinator = struct {
         for (self.entries.items) |entry| {
             if (entry.id == lease.request_id or entry.phase != .decode) continue;
             if (self.findPendingDecodeByRequest(entry.id)) |pending_idx| {
+                if (self.policy.allow_mixed_sequence_lengths) return true;
                 if (decodeWorkCompatible(
                     self.pending_decode.items[pending_idx],
                     total_sequence_len,
@@ -669,6 +670,7 @@ pub const NativeGenerateCoordinator = struct {
             // can describe work that will never be enqueued again. The
             // explicit next-work position is advanced when a step completes
             // and cleared when that work is actually enqueued.
+            if (self.policy.allow_mixed_sequence_lengths and entry.next_decode_work_total_sequence_len != null) return true;
             if (entry.next_decode_work_total_sequence_len == total_sequence_len) return true;
         }
         return false;
@@ -2935,4 +2937,28 @@ test "rollout cap singleton turns rotate across stable request order" {
             );
         }
     }
+}
+
+test "mixed position decode coalesces a peer returning from its previous step" {
+    const a = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .allow_mixed_sequence_lengths = true, .max_decode_wait_us = 1000 });
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 16 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 16 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 8);
+    var first_work: u8 = 0;
+    var second_work: u8 = 0;
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 9, 9, 0, .{});
+    var claimed = std.ArrayListUnmanaged(StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &second, @ptrCast(&second_work), .decode, .{ .max_items = 1, .max_query_tokens = 1 }, &claimed));
+    coordinator.completeStep(&second, claimed.items);
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try std.testing.expectEqual(@as(u32, 1000), coordinator.decodeCoalesceDelayUs(first));
+    coordinator.policy.allow_mixed_sequence_lengths = false;
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
 }

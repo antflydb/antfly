@@ -39,6 +39,52 @@ import urllib.request
 import uuid
 
 
+def parse_lake_metrics(text):
+    """Retain aggregate query phases without arbitrary metric label values."""
+    phases = {"total", "publication", "search", "hydration", "delivery"}
+    phase_keys = {
+        f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
+        for phase in phases
+    }
+    result = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].startswith("antfly_lake_"):
+            continue
+        key = fields[0]
+        if "{" in key and key not in phase_keys:
+            continue
+        result[key] = int(fields[1])
+    return result
+
+
+def lake_metric_deltas(before, after):
+    return {
+        key: value - before.get(key, 0)
+        for key, value in after.items()
+        if key.split("{", 1)[0].endswith("_total")
+    }
+
+
+def lake_phase_profile(delta, elapsed_ms):
+    keys = {
+        phase: f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
+        for phase in ("total", "publication", "search", "hydration", "delivery")
+    }
+    if not all(key in delta for key in keys.values()):
+        return None
+    values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
+    return {
+        "total_ms": values["total"],
+        "pre_search_ms": values["publication"],
+        "search_ms": values["search"],
+        "post_search_ms": values["delivery"],
+        "hydration_ms": values["hydration"],
+        "outside_lake_ms": round(elapsed_ms - values["total"], 3),
+        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative.",
+    }
+
+
 def wait_for_index(
     read_status,
     deadline,
@@ -597,13 +643,7 @@ def main():
             f"http://127.0.0.1:{args.port + 1}/metrics", timeout=15
         ) as response:
             text = response.read().decode()
-        return {
-            fields[0]: int(fields[1])
-            for line in text.splitlines()
-            if line.startswith("antfly_lake_")
-            and len(fields := line.split()) == 2
-            and "{" not in fields[0]
-        }
+        return parse_lake_metrics(text)
 
     def timed_query(query, phase="search", path="/tables/hn_archive_poc/query"):
         serial_profile = phase in {
@@ -620,19 +660,21 @@ def main():
         after = resource_counters()
         metrics_after = lake_metrics() if serial_profile else None
         if before is not None or metrics_after is not None:
+            delta = (
+                lake_metric_deltas(metrics_before, metrics_after)
+                if metrics_after is not None
+                else None
+            )
             io_profiles.append(
                 {
                     "phase": phase,
                     "elapsed_ms": elapsed,
                     "took_ms": result.get("took"),
                     "filter": query.get("filter_query"),
-                    "lake_metrics_delta": (
-                        {
-                            key: value - metrics_before.get(key, 0)
-                            for key, value in metrics_after.items()
-                            if key.endswith("_total")
-                        }
-                        if metrics_after is not None
+                    "lake_metrics_delta": delta,
+                    "lake_phase_profile": (
+                        lake_phase_profile(delta, elapsed)
+                        if delta is not None
                         else None
                     ),
                     "lake_metrics_scope": "process; nested phases may overlap",
