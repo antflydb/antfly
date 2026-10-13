@@ -3120,3 +3120,40 @@ unsupported retention guarantee is enabled by these query-path refinements.
 WAL overlay admission also remains pending the shared global-statistics and
 physical-identity extension. Archive-scale latency and provider-request savings
 have not yet been qualified.
+
+
+#### Refinement qualification
+
+Source at `038ad3787c`, including main `e8666a5b75`, is qualified on macOS arm64
+with Zig 0.17.0. The final standalone Debug binary is copied into the worktree's
+ignored cache before running real-file fixtures, so rebuilds cannot replace it
+between restart assertions.
+
+- The final combined Debug command (`antfly lake-integration-test
+  lake-text-frontier-test antfly-api-public-table-http-test -j2`) completes
+  all 105 build steps. Its two integration roots pass 154 and 234 tests
+  (388 total), with no failures or leaks. The focused regressions overlap
+  integration coverage and are not additional unique tests.
+- Seven focused frontier/admission/scorer regressions pass in both Debug and
+  ReleaseFast, with no failures or leaks. The sort ownership regression forces
+  local observation to return cold-handle unavailability and local preflight to
+  return `IndexNotFound`; remote admission still succeeds, including with a
+  field-only active read schema, and rejects an invalid cursor.
+- All 33 typed public HTTP contract tests pass, including the exact 422
+  `decision_limit_exceeded` response. The filtered HTTP test root now imports
+  its handler fixtures unconditionally, fixing previously empty selections.
+- Runtime error identity checks pass in both Debug and ReleaseFast: 26 runtime
+  error ABI tests, five compiled-owner failure identity tests and the frozen
+  status-prefix compatibility check.
+- All six real Parquet/Iceberg E2Es pass against the final Debug binary: broad
+  ranked text across 67 independent files; PyIceberg snapshots/schema IDs/
+  partitions/deletes/restart; and four fragmented file/segment/format cases.
+  Differential broad-text coverage includes source-dependent transforms,
+  count-only behavior, full-match budget rejection and profiled filtered sorts.
+- Authored embedded production, Apache product and resolved C API/public-package
+  boundary checks pass. Changed Zig formatting, Python fixture formatting and
+  unresolved-name checks, and `git diff --check` pass.
+
+These are correctness and bounded-work checks. They do not qualify archive-scale
+latency, RSS or provider-request savings, and they do not complete the three
+pending storage/visibility migrations above.
