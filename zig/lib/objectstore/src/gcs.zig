@@ -416,9 +416,7 @@ pub const JsonApiClient = struct {
 
         var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
         defer metadata.deinit(alloc);
-        return .{
-            .etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null,
-        };
+        return putResultFromMetadata(alloc, metadata);
     }
 
     fn putObjectWithSha256Metadata(
@@ -489,7 +487,7 @@ pub const JsonApiClient = struct {
         var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
         defer metadata.deinit(alloc);
         completed = true;
-        return .{ .etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null };
+        return putResultFromMetadata(alloc, metadata);
     }
 
     fn putFile(
@@ -616,7 +614,7 @@ pub const JsonApiClient = struct {
         var metadata = try parseObjectMetadataResponse(alloc, bucket, response.body);
         defer metadata.deinit(alloc);
         completed = true;
-        return .{ .etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null };
+        return putResultFromMetadata(alloc, metadata);
     }
 
     fn cancelResumableUpload(
@@ -710,13 +708,16 @@ pub const JsonApiClient = struct {
             else => return mapUnexpectedStatus(response.status),
         }
 
+        if (response.generation) |actual| if (effective_generation) |expected| {
+            if (!std.mem.eql(u8, actual, expected)) return error.PreconditionFailed;
+        };
+        if (opts.version_id) |expected| if (meta.version_id) |actual| {
+            if (!std.mem.eql(u8, actual, expected)) return error.PreconditionFailed;
+        };
         meta.content_length = @intCast(response.body.len);
         if (opts.skip_metadata_probe) {
             if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
             if (response.generation) |value| {
-                if (opts.version_id) |expected| {
-                    if (!std.mem.eql(u8, value, expected)) return error.PreconditionFailed;
-                }
                 meta.version_id = try alloc.dupe(u8, value);
             } else if (opts.version_id) |value| {
                 // The generation-qualified URL selects exactly this immutable
@@ -924,11 +925,42 @@ pub const JsonApiClient = struct {
         );
     }
 
+    fn versionRetention(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, generation: []const u8, cancellation: ?types.CancellationToken) !?types.VersionRetention {
+        const number = std.fmt.parseUnsigned(u64, generation, 10) catch return null;
+        if (number == 0) return null;
+        const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, 64 * 1024, cancellation);
+        defer response.deinit(alloc);
+        if (response.status != 200) return null;
+        return parseVersionRetention(alloc, response.body, response.server_date, generation, key);
+    }
+    fn providerTime(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, cancellation: ?types.CancellationToken) !?u64 {
+        const escaped_bucket = try percentEncodeAlloc(alloc, bucket);
+        defer alloc.free(escaped_bucket);
+        const url = try std.fmt.allocPrint(alloc, "{s}/b/{s}?fields=id", .{ self.cfg.endpoint, escaped_bucket });
+        defer alloc.free(url);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, 64 * 1024, cancellation);
+        defer response.deinit(alloc);
+        if (response.status != 200) return null;
+        return @import("retention_time.zig").providerDateUpperBound(response.server_date orelse return null);
+    }
+    fn erasedVersionRetention(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, generation: []const u8, token: ?types.CancellationToken) !?types.VersionRetention {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return self.versionRetention(alloc, bucket, key, generation, token);
+    }
+    fn erasedProviderTime(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, token: ?types.CancellationToken) !?u64 {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return self.providerTime(alloc, bucket, token);
+    }
+
     const vtable: client_mod.Client.VTable = .{
         // Bucket/Object Retention protects generations, not live names.
         // Artifact references must pin generations before this provider can
         // supply immutable-name closure evidence (including after toggling
         // bucket versioning). Keep complete audits authoritative meanwhile.
+        .version_retention = erasedVersionRetention,
+        .provider_time = erasedProviderTime,
         .deinit = erasedDeinit,
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
@@ -1375,6 +1407,32 @@ fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, 
     return try std.fmt.allocPrint(alloc, "{s}/b/{s}/o?{s}", .{ cfg.endpoint, escaped_bucket, query.items });
 }
 
+fn putResultFromMetadata(alloc: Allocator, metadata: types.ObjectMetadata) !types.PutResult {
+    const etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (etag) |value| alloc.free(value);
+    return .{ .etag = etag, .version_id = if (metadata.version_id) |value| try alloc.dupe(u8, value) else null };
+}
+fn parseVersionRetention(alloc: Allocator, body: []const u8, date: ?[]const u8, generation: []const u8, key: []const u8) !?types.VersionRetention {
+    const time = @import("retention_time.zig");
+    const observed = time.providerDateUpperBound(date orelse return null) orelse return null;
+    const Parsed = struct {
+        name: []const u8,
+        generation: []const u8,
+        retention: ?struct { mode: []const u8, retainUntilTime: []const u8 } = null,
+    };
+    var parsed = std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.name, key) or !std.mem.eql(u8, parsed.value.generation, generation)) return null;
+    const retention = parsed.value.retention orelse return null;
+    if (!std.mem.eql(u8, retention.mode, "Locked")) return null;
+    const until = time.rfc3339(retention.retainUntilTime) orelse return null;
+    if (until <= observed) return null;
+    return .{ .observed_ms = observed, .until_ms = until };
+}
+
 fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []const u8) !types.ObjectMetadata {
     const Parsed = struct {
         bucket: ?[]const u8 = null,
@@ -1684,6 +1742,7 @@ test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     var result = try gcs_client.putFileWithThreshold(alloc, io, "bucket", "backup/segment", source_path, .{}, 0);
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("final-etag", result.etag.?);
+    try std.testing.expectEqualStrings("7", result.version_id.?);
     try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
@@ -2008,7 +2067,7 @@ test "json api client put object encodes upload url and returns etag" {
             try std.testing.expectEqualStrings("text/plain", content_type.?);
             return .{
                 .status = 200,
-                .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-2\",\"size\":\"5\",\"contentType\":\"text/plain\"}"),
+                .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-2\",\"generation\":\"123\",\"size\":\"5\",\"contentType\":\"text/plain\"}"),
             };
         }
     };
@@ -2026,6 +2085,7 @@ test "json api client put object encodes upload url and returns etag" {
     defer put.deinit(alloc);
 
     try std.testing.expectEqualStrings("etag-2", put.etag.?);
+    try std.testing.expectEqualStrings("123", put.version_id.?);
 }
 
 test "json api client persists informational caller SHA-256 metadata" {
@@ -2257,4 +2317,69 @@ test "gcs version retention never certifies live artifact names" {
     var client = provider.client();
     try std.testing.expect((try client.immutablePrefixUntil("bucket", "graph/a/", null)) == null);
     try std.testing.expect(!try client.validateImmutableUntil("bucket", std.math.maxInt(u64), null));
+}
+
+test "gcs exact generation retention requires locked mode identity and provider time" {
+    const a = std.testing.allocator;
+    const locked = "{\"name\":\"folder/key\",\"generation\":\"123\",\"retention\":{\"mode\":\"Locked\",\"retainUntilTime\":\"2026-10-12T12:34:56Z\"}}";
+    const date = "Sun, 11 Oct 2026 12:34:56 GMT";
+    const proof = (try parseVersionRetention(a, locked, date, "123", "folder/key")).?;
+    try std.testing.expect(proof.protectsThrough(proof.observed_ms));
+    try std.testing.expect((try parseVersionRetention(a, locked, null, "123", "folder/key")) == null);
+    try std.testing.expect((try parseVersionRetention(a, locked, date, "124", "folder/key")) == null);
+    try std.testing.expect((try parseVersionRetention(a, locked, date, "123", "other")) == null);
+    try std.testing.expect((try parseVersionRetention(a, locked, "Mon, 12 Oct 2026 12:34:56 GMT", "123", "folder/key")) == null);
+    try std.testing.expect((try parseVersionRetention(a, "{\"name\":\"folder/key\",\"generation\":\"123\",\"retention\":{\"mode\":\"Unlocked\",\"retainUntilTime\":\"2030-01-01T00:00:00Z\"}}", date, "123", "folder/key")) == null);
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expectEqual(@as(?usize, 64 * 1024), limit);
+            if (std.mem.endsWith(u8, url, "?fields=id")) return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .server_date = try alloc.dupe(u8, "Sun, 11 Oct 2026 12:34:56 GMT") };
+            try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fkey?generation=123", url);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"folder/key\",\"generation\":\"123\",\"retention\":{\"mode\":\"Locked\",\"retainUntilTime\":\"2026-10-12T12:34:56Z\"}}"), .server_date = try alloc.dupe(u8, "Sun, 11 Oct 2026 12:34:56 GMT") };
+        }
+    };
+    var state: State = .{};
+    var provider = JsonApiClient.initWithRequestFn(a, try jsonApiClientConfigAlloc(a), &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    try std.testing.expect((try client.versionRetention("bucket", "folder/key", "0", null)) == null);
+    try std.testing.expect((try client.versionRetention("bucket", "folder/key", "not-generation", null)) == null);
+    const remote = (try client.versionRetention("bucket", "folder/key", "123", null)).?;
+    try std.testing.expectEqual(proof.until_ms, remote.until_ms);
+    try std.testing.expect(remote.observed_ms > proof.observed_ms);
+    try std.testing.expect((try client.providerTime("bucket", null)).? > proof.observed_ms);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
+test "gcs upload generation ownership survives allocation failure" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var result = try putResultFromMetadata(a, .{ .bucket = @constCast("bucket"), .key = @constCast("key"), .etag = @constCast("etag"), .version_id = @constCast("123"), .content_length = 0 });
+            defer result.deinit(a);
+            try std.testing.expectEqualStrings("etag", result.etag.?);
+            try std.testing.expectEqualStrings("123", result.version_id.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "gcs exact reads reject contradictory response generations with and without metadata probes" {
+    const a = std.testing.allocator;
+    const State = struct {
+        fn request(_: ?*anyopaque, alloc: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            try std.testing.expect(std.mem.indexOf(u8, url, "generation=123") != null);
+            if (std.mem.indexOf(u8, url, "alt=media") == null) return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"key\",\"generation\":\"123\",\"size\":\"1\"}") };
+            const body = try alloc.dupe(u8, "x");
+            errdefer alloc.free(body);
+            return .{ .status = 200, .body = body, .generation = try alloc.dupe(u8, "124") };
+        }
+    };
+    var provider = JsonApiClient.initWithRequestFn(a, try jsonApiClientConfigAlloc(a), null, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    for ([_]bool{ false, true }) |skip| try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "key", .{ .version_id = "123", .skip_metadata_probe = skip, .max_response_bytes = 1 }));
 }

@@ -16,6 +16,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
+/// Charge the entire request round trip (rounded upward), conservatively
+/// covering the unknown point during that request when Date was sampled.
+fn providerTimeAfterTransfer(observed_ms: u64, started_ns: u64) ?u64 {
+    const finished = @import("antfly_platform").time.monotonicNs();
+    if (finished < started_ns) return null;
+    const elapsed_ms = (finished - started_ns) / std.time.ns_per_ms + 1;
+    return std.math.add(u64, observed_ms, elapsed_ms) catch null;
+}
+
 const file_transfer_chunk_bytes: u64 = 8 * 1024 * 1024;
 const fallback_upload_limit_bytes: u64 = 64 * 1024 * 1024;
 const max_list_page_keys: u32 = 10_000;
@@ -30,6 +39,9 @@ pub const Client = struct {
         /// deletion AND replacement. Version retention alone is insufficient.
         immutable_prefix_until: ?*const fn (*anyopaque, []const u8, []const u8, ?types.CancellationToken) anyerror!?u64 = null,
         validate_immutable_until: ?*const fn (*anyopaque, []const u8, u64, ?types.CancellationToken) anyerror!bool = null,
+        /// Exact generation retention, separate from current-name protection.
+        version_retention: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, ?types.CancellationToken) anyerror!?types.VersionRetention = null,
+        provider_time: ?*const fn (*anyopaque, Allocator, []const u8, ?types.CancellationToken) anyerror!?u64 = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
         make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
@@ -56,6 +68,27 @@ pub const Client = struct {
         if (token) |value| try value.check();
         const call = self.vtable.validate_immutable_until orelse return false;
         return call(self.ptr, bucket, until_ms, token);
+    }
+    pub fn versionRetention(self: *Client, bucket: []const u8, key: []const u8, version: []const u8, token: ?types.CancellationToken) !?types.VersionRetention {
+        if (token) |value| try value.check();
+        // S3's null version can be replaced when versioning is suspended.
+        if (version.len == 0 or version.len > 4096 or std.mem.eql(u8, version, "null")) return null;
+        const call = self.vtable.version_retention orelse return null;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const observed = try call(self.ptr, self.allocator, bucket, key, version, token);
+        if (token) |value| try value.check();
+        var result = observed orelse return null;
+        result.observed_ms = providerTimeAfterTransfer(result.observed_ms, started) orelse return null;
+        if (!result.protectsThrough(result.observed_ms)) return null;
+        return result;
+    }
+    pub fn providerTime(self: *Client, bucket: []const u8, token: ?types.CancellationToken) !?u64 {
+        if (token) |value| try value.check();
+        const call = self.vtable.provider_time orelse return null;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const result = try call(self.ptr, self.allocator, bucket, token);
+        if (token) |value| try value.check();
+        return providerTimeAfterTransfer(result orelse return null, started);
     }
     pub fn deinit(self: *Client) void {
         self.vtable.deinit(self.allocator, self.ptr);

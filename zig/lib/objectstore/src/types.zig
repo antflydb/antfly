@@ -125,6 +125,19 @@ pub const ObjectMetadata = struct {
     }
 };
 
+/// Evidence applies only to the exact non-null generation supplied to the
+/// request. It never proves immutability of the current name. Expiry comes from
+/// the provider. observed_ms bounds its Date upward for precision and transfer
+/// time; callers must refresh provider time before reusing persisted evidence
+/// and account for elapsed time and their operation deadline thereafter.
+pub const VersionRetention = struct {
+    observed_ms: u64,
+    until_ms: u64,
+    pub fn protectsThrough(self: @This(), deadline_ms: u64) bool {
+        return self.observed_ms < self.until_ms and deadline_ms < self.until_ms;
+    }
+};
+
 pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
