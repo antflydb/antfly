@@ -4277,3 +4277,54 @@ a borrowed snapshot from a stack-local owner. Public JSON capability/lowering,
 immutable literals and full restart/restore qualification are still guarded;
 these owner contracts do not complete original sql-0671 or change any of the
 898 original unresolved dispositions.
+
+### Typed preparation publishes null authority to row encoding
+
+The next integration adds a caller-owned typed expression entry point. Pinned
+DOM roots own stable headers but borrow the already parsed input payload;
+masked-out JSON is not walked or parsed. Roots and root-null provenance must
+share the expression invocation's work identity and retained-byte admission.
+Mismatched owners fail closed before evaluation.
+
+The public-schema preparation boundary authenticates root-null names against
+the pinned compiled property's type and the actual null datum, rejects duplicate
+or unknown markers, and lets each published default/generated JSON result
+replace the corresponding input semantics. Missing defaults leave supplied
+values untouched. Preparation returns individually owned marker names, not a
+snapshot borrowed from a retired local owner. The relational mapper retains
+that result in the parsed row region through extraction, ordinal encoding and
+logical hashing. Representation-only legacy typed helpers reject changed
+metadata instead of silently discarding it.
+
+Typed restore evaluates generated-value verification with those authenticated
+markers. It never fills defaults or repairs the stored generated result. A
+present JSON null cannot impersonate a generated SQL NULL even when their API
+JSON bytes are identical. Document-table SQL normalization uses the same
+preparation result and translates SQL NULL to absence while preserving explicit
+JSON null; it does not infer output semantics from the JSON DOM alone.
+Document schemas still reject defaults/generated declarations; this shared
+preparation machinery does not bypass that existing activation guard.
+
+Native regressions cover ordinal null bits, preserved unrelated JSON null,
+forged restore metadata, marker authentication, all observed preparation
+allocation failures, and document normalization/commit/typed projection.
+Full Debug qualification for this integration is recorded separately from the
+previous owner checkpoint. Public durable JSON functions/lowering, immutable
+literal identity, CHECK/index input reuse and complete restart/distributed
+activation remain unfinished. No original case receives new inventory credit;
+the original accounting remains 479 implemented / 136 rejected / 73 superseded
+/ 898 unresolved.
+
+Relational session normalization also derives its outgoing marker list from
+actual present typed cells, rather than merely filtering submitted names. This
+single cell-iterator pass handles newly derived or retired JSON-null datums
+without reparsing payloads or scanning absent columns in sparse rows.
+
+Qualification with origin/main 553e58317f included: full reviewed SQL Debug
+passed 798 main-owner and 226 linked tests (three existing skips, zero failures
+or leaks, 21/21 steps). Final native Debug including the staging adapter passed
+227 main-owner and one linked test (zero failures or leaks, 50/50 steps).
+Formatting, source-catalog freshness, license headers, the 2,053-file Apache
+boundary and unchanged original inventory integrity passed. Cache GC was
+previewed only; nothing was deleted. No OpenAPI contract changed, so this
+checkpoint does not require SDK regeneration or claim new public activation.

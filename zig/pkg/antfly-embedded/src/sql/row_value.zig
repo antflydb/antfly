@@ -145,6 +145,20 @@ pub const JsonRow = struct {
         return json;
     }
 
+    /// Pin one already parsed, size-admitted typed input without reparsing or
+    /// cloning its tree. Own the root header so root-map relocation/replacement
+    /// cannot invalidate it; payloads borrow the immutable input region.
+    pub fn pinValue(self: *JsonRow, value: std.json.Value) !*const Json {
+        try self.context.charge(1);
+        if (self.admission) |*admission| admission.begin();
+        defer if (self.admission) |*admission| admission.finish();
+        var work: json_order.Budget = .{ .shared = self.context };
+        json_order.validateTextDomain(value, &work, 0) catch |err| return self.failure(err);
+        const root = self.arena.allocator().create(Json) catch |err| return self.failure(err);
+        root.* = .{ .value = value };
+        return root;
+    }
+
     fn failure(self: *JsonRow, err: anyerror) anyerror {
         if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) return self.context.limit();
         return err;
@@ -290,6 +304,42 @@ pub const Value = union(enum) {
         };
     }
 };
+
+test "SQL JSON pinned DOM roots own headers without reparsing or cloning admitted input" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":[9007199254740993.2500,null]}", .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var context: Context = .{ .alloc = a };
+    var bytes: usize = 1024 * 1024;
+    var owner: JsonRow = undefined;
+    owner.init(a, bytes, &context);
+    defer owner.deinit();
+    try owner.bindAdmission(&bytes);
+    const input = parsed.value.object.get("a").?.array.items[0].number_string;
+    const pinned = try owner.pinValue(parsed.value);
+    parsed.value = .null;
+    const output = pinned.value.object.get("a").?.array.items[0].number_string;
+    try std.testing.expectEqualStrings("9007199254740993.2500", output);
+    try std.testing.expectEqual(@intFromPtr(input.ptr), @intFromPtr(output.ptr));
+    try std.testing.expectEqual(@as(usize, 0), owner.decodes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024) - bytes, owner.memory.footprint());
+    const retained = owner.memory.footprint();
+    try std.testing.expectError(error.SqlTypeMismatch, owner.pinValue(.{ .string = "\x00" }));
+    try std.testing.expectEqual(retained, owner.memory.footprint());
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, source: std.json.Value) !void {
+            var scope: Context = .{ .alloc = alloc };
+            var roots: JsonRow = undefined;
+            roots.init(alloc, 1024 * 1024, &scope);
+            defer roots.deinit();
+            const root = try roots.pinValue(source);
+            try std.testing.expectEqual(@as(usize, 2), root.value.object.get("a").?.array.items.len);
+        }
+    };
+    try Run.run(a, pinned.value);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{pinned.value});
+}
 
 test "SQL JSON owners share actual retained region admission without double charging or renewal" {
     const a = std.testing.allocator;

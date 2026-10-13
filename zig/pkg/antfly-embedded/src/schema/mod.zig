@@ -154,6 +154,16 @@ pub const CompiledTableValidator = struct {
         }
     }
 
+    pub fn prepareTypedValueWithNulls(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !impl.PreparedJsonNulls {
+        if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        const prepared = try impl.prepareTypedDocumentWithNulls(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        errdefer prepared.deinit(owned_alloc);
+        if (self.execution.expressions != null) {
+            if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        }
+        return prepared;
+    }
+
     fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         if (value.* != .object) return;
         for (self.uuid_columns) |name| {

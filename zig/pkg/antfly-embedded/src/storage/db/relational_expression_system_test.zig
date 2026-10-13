@@ -94,6 +94,133 @@ test "relational index system cold generated JSON verification preserves SQL nul
     }
 }
 
+test "relational index system typed document expression preparation retains authoritative root null provenance" {
+    const a = std.testing.allocator;
+    const expressions = @import("../../schema/relational_expression.zig");
+    const operands = @import("../../sql/row_value.zig");
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const set = validator.execution.expressions.?;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    var document = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"g\":null,\"payload\":null}", .{});
+    var bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(region.allocator(), &bytes);
+    var roots: operands.JsonRow = undefined;
+    roots.initRegion(region.allocator(), bytes, &execution.numeric);
+    defer roots.deinit();
+    try roots.bindAdmission(&bytes);
+    var nulls: operands.JsonNulls = undefined;
+    nulls.initRegion(region.allocator(), bytes, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&bytes);
+    // Both source markers are legitimate root JSON datums. The generated SQL
+    // NULL result replaces g's submitted semantics; unrelated payload survives.
+    try nulls.import(&.{ "g", "payload" });
+    try set.applyTypedJsonWithExecution(&execution, &document, &roots, &nulls);
+    try std.testing.expect(!try nulls.contains("g"));
+    try std.testing.expect(try nulls.contains("payload"));
+    try std.testing.expectEqual(@as(usize, 1), (try nulls.snapshot()).len);
+    try std.testing.expectEqual(std.json.Value.null, document.object.get("g").?);
+    try std.testing.expectEqual(@as(usize, 0), roots.memory.footprint());
+    try std.testing.expectEqual(@as(usize, 0), roots.decodes);
+    var other_bytes: usize = expressions.max_allocated_bytes;
+    var other = expressions.Execution.init(region.allocator(), &other_bytes);
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, set.applyTypedJsonWithExecution(&other, &document, &roots, &nulls));
+    try std.testing.expect(try nulls.contains("payload"));
+}
+
+test "relational index system typed preparation encodes derived null authority and rejects forged restore" {
+    const a = std.testing.allocator;
+    const schema_api = @import("../../schema/mod.zig");
+    const codec = @import("algebraic/relational_row_codec.zig");
+    var validator = try schema_api.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const table = try schema_api.deriveRuntimeTableSchema(a, validator.schema);
+    defer @import("../schema.zig").freeSchema(a, table);
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const Run = struct {
+        fn run(fault_alloc: std.mem.Allocator, compiled: schema_api.CompiledTableValidator, runtime: @import("../schema.zig").TableSchema, physical: *const codec.PhysicalLayout) !void {
+            var prepared = try mapper.PreparedRelationalWrite.initTyped(fault_alloc, fault_alloc, fault_alloc, false, "r", "{\"g\":null,\"payload\":null}", compiled, runtime, physical, &.{ "g", "payload" }, false);
+            defer prepared.deinit(fault_alloc);
+            try prepared.finalizeMetadata(0);
+            const row = try codec.ordinalRowView(prepared.packed_row, runtime, physical);
+            const g = (try row.findCell(@intCast(physical.ordinalForName(runtime.relational_columns, "g").?))).?;
+            const payload = (try row.findCell(@intCast(physical.ordinalForName(runtime.relational_columns, "payload").?))).?;
+            try std.testing.expect(g.is_null);
+            try std.testing.expect(!payload.is_null);
+            try std.testing.expectEqualStrings("null", payload.value.bytes_val);
+        }
+    };
+    try Run.run(a, validator, table, &layout);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ validator, table, &layout });
+    var restored = try mapper.PreparedRelationalWrite.initTyped(a, a, a, false, "r", "{\"g\":null,\"payload\":null}", validator, table, &layout, &.{"payload"}, true);
+    defer restored.deinit(a);
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, mapper.PreparedRelationalWrite.initTyped(a, a, a, false, "r", "{\"g\":null,\"payload\":null}", validator, table, &layout, &.{ "g", "payload" }, true));
+    for ([_][]const []const u8{ &.{ "payload", "payload" }, &.{"missing"} }) |names| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"g\":null,\"payload\":null}", .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, names, false));
+    }
+}
+
+test "relational index system document SQL null normalization shares typed schema preparation" {
+    const a = std.testing.allocator;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-generated-json-null");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"g":{},"payload":{}},"additionalProperties":false}}}}
+    );
+    const options: db_mod.types.ScanOptions = .{ .relational_query = .{ .fields = &.{ "g", "payload" }, .schema_version = 1 } };
+    const session = try db.openDocumentReadSession(a, "", "", options);
+    defer session.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const normalized = try session.normalizeRows(arena.allocator(), &.{.{ .key = "r", .value = "{\"g\":null,\"payload\":null}", .json_null_fields = &.{"payload"} }});
+    try std.testing.expectEqual(@as(usize, 1), normalized[0].json_null_fields.len);
+    try std.testing.expectEqualStrings("payload", normalized[0].json_null_fields[0]);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, normalized[0].value, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.contains("g"));
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("payload").?);
+    // Match sql_execution's document commit adapter: the JSON representation
+    // now owns null semantics, so relational-only transport markers are not
+    // forwarded to native document batch admission.
+    try db.batch(.{ .writes = &.{.{ .key = normalized[0].key, .value = normalized[0].value }} });
+    const reader = try db.openDocumentReadSession(a, "", "", options);
+    defer reader.deinit();
+    var page = try reader.next(a, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, page.rows[0].sql_nulls.?);
+}
+
+test "relational index system typed restore admits declared domains before generated verification" {
+    const a = std.testing.allocator;
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"column","column":"n"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"g":{"type":"integer","x-antfly-sql-type":"int16"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    for ([_][]const u8{ "{\"n\":32768,\"g\":32768}", "{\"n\":\"bad\",\"g\":0}" }) |input| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{}, true));
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":1,\"g\":1,\"j\":null}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{"j"}, true));
+    const valid = try validator.prepareTypedValueWithNulls(parsed.arena.allocator(), a, &parsed.value, &.{}, true);
+    defer valid.deinit(parsed.arena.allocator());
+}
+
 test "relational index system NUMERIC public scalar constraints survive LSM reopen and portable restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-public-scalar");

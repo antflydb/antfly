@@ -1147,29 +1147,112 @@ pub fn prepareDocumentValueWithPlan(
     return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
 }
 
-/// Typed null metadata is schema-checked by the row preparer before entering
-/// this boundary. Pointer identity scopes the exception to the exact root
-/// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
+/// Compatibility boundary for callers that cannot consume changed metadata.
+/// New row preparers retain the owned result from the typed boundary below.
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
+    const prepared = try prepareTypedDocumentWithNulls(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve);
+    defer prepared.deinit(owned_alloc);
+    // Legacy representation-only callers cannot silently drop changed datum
+    // semantics. Row preparation consumes the returned authority instead.
+    if (prepared.fields.len != json_null_fields.len) return error.InvalidBatchRequest;
+    for (prepared.fields) |name| {
+        const found = for (json_null_fields) |input| {
+            if (std.mem.eql(u8, name, input)) break true;
+        } else false;
+        if (!found) return error.InvalidBatchRequest;
+    }
+}
+
+/// Owned semantic metadata, never a borrowed snapshot of a retired row owner.
+pub const PreparedJsonNulls = struct {
+    fields: []const []const u8,
+
+    pub fn deinit(self: PreparedJsonNulls, alloc: std.mem.Allocator) void {
+        for (self.fields) |name| alloc.free(name);
+        alloc.free(self.fields);
+    }
+};
+
+pub fn prepareTypedDocumentWithNulls(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !PreparedJsonNulls {
     try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
     const expressions_module = @import("relational_expression.zig");
+    const operands = @import("../sql/row_value.zig");
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
+    var roots: operands.JsonRow = undefined;
+    roots.init(owned_alloc, budget, &execution.numeric);
+    defer roots.deinit();
+    try roots.bindAdmission(&budget);
+    var nulls: operands.JsonNulls = undefined;
+    nulls.init(owned_alloc, budget, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&budget);
+    const document_schema = try resolveDocumentSchema(schema, value.object);
+    // Authenticate at this shared boundary, including document-table callers.
+    // Property dispatch reuses the immutable compiled map for wide schemas.
+    for (json_null_fields) |name| {
+        try execution.charge(1 +| name.len);
+        const resolved = document_schema orelse return error.InvalidBatchRequest;
+        const property = compiled.findProperty(resolved.properties, name) orelse return error.InvalidBatchRequest;
+        const json_column = if (schema.storage_mode == .document)
+            @import("../sql/document_row.zig").propertyType(property) == .json
+        else if (property.field_type) |kind|
+            std.mem.eql(u8, kind, "json")
+        else
+            false;
+        if (!json_column) return error.InvalidBatchRequest;
+        const datum = value.object.get(name) orelse return error.InvalidBatchRequest;
+        if (datum != .null) return error.InvalidBatchRequest;
+    }
+    nulls.import(json_null_fields) catch |err| return switch (err) {
+        error.InvalidSqlProgram => error.InvalidBatchRequest,
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
     if (!preserve) {
         try compiled.normalizeSql(&execution, value, false, .base);
         if (compiled.expressions) |expressions| {
-            try expressions.applyJsonWithExecution(&execution, value);
+            try expressions.applyTypedJsonWithExecution(&execution, value, &roots, &nulls);
             try compiled.normalizeSql(&execution, value, false, .derived);
         }
     }
-    const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
+    const names = nulls.snapshot() catch |err| return switch (err) {
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
+    const pointer_bytes = std.math.mul(usize, names.len, @sizeOf(*const std.json.Value)) catch return execution.limit();
+    if (pointer_bytes > budget) return execution.limit();
+    budget -= pointer_bytes;
+    const pointers = try scratch.alloc(*const std.json.Value, names.len);
     defer scratch.free(pointers);
-    for (json_null_fields, pointers) |name, *pointer| {
+    for (names, pointers) |name, *pointer| {
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution);
+    // Typed restore checks the actual null provenance, never repairs it.
+    if (preserve) {
+        // Domain/canonical admission precedes evaluation, just as on ordinary
+        // restore. Verification must not run on unadmitted typed input.
+        try compiled.normalizeSql(&execution, value, true, .all);
+        if (compiled.expressions) |expressions|
+            try expressions.verifyTypedJsonWithExecution(&execution, value.*, names);
+    }
+    try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution);
+    var output_bytes = std.math.mul(usize, names.len, @sizeOf([]const u8)) catch return execution.limit();
+    for (names) |name| output_bytes = std.math.add(usize, output_bytes, name.len) catch return execution.limit();
+    if (output_bytes > budget) return execution.limit();
+    budget -= output_bytes;
+    const fields = try owned_alloc.alloc([]const u8, names.len);
+    errdefer owned_alloc.free(fields);
+    var copied: usize = 0;
+    errdefer for (fields[0..copied]) |name| owned_alloc.free(name);
+    for (names, fields) |name, *field| {
+        try execution.charge(1 +| name.len);
+        field.* = try owned_alloc.dupe(u8, name);
+        copied += 1;
+    }
+    return .{ .fields = fields };
 }
 
 fn validateDocumentValueInternal(

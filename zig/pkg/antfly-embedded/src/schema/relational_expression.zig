@@ -3524,7 +3524,26 @@ pub const Set = struct {
     }
 
     pub fn applyJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value) !void {
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(execution.bytes);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(execution.bytes);
+        try self.applyTypedJsonWithExecution(execution, document, &roots, &nulls);
+        // A representation-only caller cannot discard new typed provenance.
+        // Typed preparation must retain the supplied owner through encoding.
+        if (nulls.fields.count() != 0) return error.InvalidRelationalExpressionInput;
+    }
+
+    pub fn applyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls) !void {
         execution.numeric.charge(0) catch |err| return executionFailure(err);
+        if (roots.context != &execution.numeric or nulls.context != &execution.numeric or
+            roots.admission == null or nulls.admission == null or
+            roots.admission.?.remaining != execution.bytes or nulls.admission.?.remaining != execution.bytes)
+            return error.InvalidRelationalExpressionInput;
         if (document.* != .object) return error.InvalidBatchRequest;
         const alloc = execution.alloc;
         const count = self.table.relational_columns.len;
@@ -3536,7 +3555,7 @@ pub const Set = struct {
         const present = try alloc.alloc(bool, values.len);
         defer alloc.free(present);
         execution.bytes.* -= staging_bytes;
-        try self.readValues(execution, document.*, values, present, true);
+        try self.readValues(execution, document.*, values, present, true, roots, nulls);
         try self.applyValuesWithExecution(execution, values, present, .apply_to_absent, null);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
@@ -3555,6 +3574,8 @@ pub const Set = struct {
             const key = try allocateOutput(alloc, name.len, execution.bytes);
             @memcpy(key, name);
             try document.object.put(alloc, key, try boundedValueToJson(execution, value));
+            if (self.table.relational_columns[binding.ordinal].column_type == .json)
+                nulls.assign(name, value) catch |err| return executionFailure(err);
         }
     }
 
@@ -3567,14 +3588,18 @@ pub const Set = struct {
     }
 
     pub fn verifyJsonWithExecution(self: *const Set, execution: *Execution, document: std.json.Value) !void {
+        return self.verifyTypedJsonWithExecution(execution, document, &.{});
+    }
+
+    pub fn verifyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: std.json.Value, json_null_fields: []const []const u8) !void {
         try execution.charge(0);
         var scratch: ExecutionScratch = undefined;
         scratch.init(execution);
         defer scratch.deinit();
-        self.verifyJsonInner(execution, document) catch |err| return scratch.failure(err);
+        self.verifyJsonInner(execution, document, json_null_fields) catch |err| return scratch.failure(err);
     }
 
-    fn verifyJsonInner(self: *const Set, execution: *Execution, document: std.json.Value) !void {
+    fn verifyJsonInner(self: *const Set, execution: *Execution, document: std.json.Value, json_null_fields: []const []const u8) !void {
         const has_generated = for (self.bindings) |binding| {
             if (binding.generated) break true;
         } else false;
@@ -3583,7 +3608,16 @@ pub const Set = struct {
         try execution.charge(self.table.relational_columns.len);
         const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
         const present = try execution.alloc.alloc(bool, values.len);
-        try self.readValues(execution, document, values, present, false);
+        var roots: @import("../sql/row_value.zig").JsonRow = undefined;
+        roots.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer roots.deinit();
+        try roots.bindAdmission(execution.bytes);
+        var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;
+        nulls.initRegion(execution.alloc, execution.bytes.*, &execution.numeric);
+        defer nulls.deinit();
+        try nulls.bindAdmission(execution.bytes);
+        try nulls.import(json_null_fields);
+        try self.readValues(execution, document, values, present, false, &roots, &nulls);
         try self.verifyValues(execution, values, present);
     }
 
@@ -3703,7 +3737,7 @@ pub const Set = struct {
         };
     }
 
-    fn readValues(self: *const Set, execution: *Execution, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool) !void {
+    fn readValues(self: *const Set, execution: *Execution, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool, roots: *@import("../sql/row_value.zig").JsonRow, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
         for (self.table.relational_columns, values, present, 0..) |column, *value, *exists, ordinal| {
             const input = document.object.get(column.name);
             exists.* = input != null;
@@ -3715,6 +3749,14 @@ pub const Set = struct {
                 .numeric => value.* = try numericJson(execution, scalar),
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
+                .json => {
+                    const present_json_null = if (scalar == .null and nulls != null)
+                        nulls.?.contains(column.name) catch |err| return executionFailure(err)
+                    else
+                        false;
+                    if (scalar != .null or present_json_null)
+                        value.* = .{ .json = roots.pinValue(scalar) catch |err| return executionFailure(err) };
+                },
                 .string, .boolean, .datetime, .integer, .number => value.* = try scalarJson(execution.alloc, column.column_type, scalar, false),
                 else => {},
             };

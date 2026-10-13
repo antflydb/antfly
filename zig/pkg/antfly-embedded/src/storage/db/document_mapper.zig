@@ -507,11 +507,6 @@ pub const PreparedRelationalWrite = struct {
                 if (!column.is_json or column.json_kind != .any) return error.InvalidBatchRequest;
                 const datum = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
                 if (datum != .null or (try seen.getOrPut(scratch, name)).found_existing) return error.InvalidBatchRequest;
-                // Generated fields are output-only. Their expression result
-                // owns its null semantics, regardless of submitted metadata.
-                if (!preserve_logical_values) if (validator) |compiled| if (compiled.execution.expressions) |expressions| {
-                    if (expressions.generated_columns[ordinal]) continue;
-                };
                 try effective_json_null_fields.append(scratch, name);
             }
         }
@@ -520,12 +515,11 @@ pub const PreparedRelationalWrite = struct {
             // schema boundary as CHECKs, extraction, indexes and logical hash.
             // Durable intents have already crossed it and must never evaluate
             // the current expression plan again during replay.
-            if (effective_json_null_fields.items.len != 0)
-                try compiled.prepareTypedValue(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values)
-            else if (preserve_logical_values)
-                try compiled.validateValue(scratch, &parsed.value)
-            else
-                try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
+            const prepared = try compiled.prepareTypedValueWithNulls(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values);
+            // The result belongs to the parsed row region and remains alive
+            // through extraction, physical encoding and semantic hashing.
+            effective_json_null_fields.clearRetainingCapacity();
+            try effective_json_null_fields.appendSlice(scratch, prepared.fields);
         };
 
         var extracted = extractWriteFromParsedPrepared(
