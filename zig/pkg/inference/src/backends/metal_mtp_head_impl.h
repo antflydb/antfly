@@ -79,7 +79,9 @@ int termite_metal_decode_runtime_mtp_cluster_head(
     // Flush preserves the caller's frame by reopening an empty one. The
     // independent head command is ordered after that flush's wait; pending
     // work still requires a drain, but an empty frame is safe to preserve.
-    if (runtime->submitted_frame_cb != nil || (runtime->active_frame_cb != nil && !termite_metal_decode_runtime_active_frame_empty(runtime))) return -3;
+    const bool append_frame = runtime->active_frame_cb != nil &&
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"));
+    if (runtime->submitted_frame_cb != nil || (!append_frame && runtime->active_frame_cb != nil && !termite_metal_decode_runtime_active_frame_empty(runtime))) return -3;
     id<MTLBuffer> weights[2]; NSUInteger offsets[2] = {0, 0}; uint32_t types[2];
     size_t slots[2] = {lm_slot, centroid_slot}, rows[2] = {vocab, clusters};
     for (unsigned i = 0; i < 2; ++i) {
@@ -128,8 +130,12 @@ int termite_metal_decode_runtime_mtp_cluster_head(
             w->lm_offset = offsets[0]; w->centroid_offset = offsets[1]; w->ordering_offset = ordering_offset;
             runtime->mtp_head_workspace = w;
         }
-        id<MTLCommandBuffer> command = termite_metal_new_command_buffer(runtime->queue, __func__);
+        // Append before the scalar boundary: the hidden producer and head
+        // share one submission. Flush below preserves the caller's frame.
+        if (append_frame) termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        id<MTLCommandBuffer> command = append_frame ? runtime->active_frame_cb : termite_metal_new_command_buffer(runtime->queue, __func__);
         if (!command) return -8;
+        if (append_frame) { runtime->active_frame_blit_encoder_count += 1; runtime->active_frame_compute_encoder_count += 1; }
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder]; if (!blit) return -8;
         [blit copyFromBuffer:source sourceOffset:input_offset toBuffer:w->input destinationOffset:0 size:hidden * 4]; [blit endEncoding];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; if (!encoder) return -8;
@@ -175,7 +181,10 @@ int termite_metal_decode_runtime_mtp_cluster_head(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
         }
-        [encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+        [encoder endEncoding];
+        if (append_frame) {
+            if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -9;
+        } else { [command commit]; [command waitUntilCompleted]; }
         if (command.status != MTLCommandBufferStatusCompleted) return -9;
         *token = *(uint32_t *)w->result.contents;
         return 0;
@@ -227,9 +236,16 @@ int termite_metal_decode_runtime_mtp_cluster_head_test(termite_metal_decode_runt
         if (!termite_metal_decode_runtime_active_frame_empty(r) || r->active_frame_cb == nil) return -6;
         id<MTLBlitCommandEncoder> pending = [r->active_frame_cb blitCommandEncoder];
         if (pending == nil) return -6;
-        [pending copyFromBuffer:input sourceOffset:16 toBuffer:r->mtp_head_workspace->input destinationOffset:0 size:64 * sizeof(float)];
+        float pending_input[64] = {-1.0f};
+        id<MTLBuffer> producer = [r->device newBufferWithBytes:pending_input length:sizeof(pending_input) options:MTLResourceStorageModeShared];
+        if (producer == nil) return -6;
+        [pending copyFromBuffer:producer sourceOffset:0 toBuffer:input destinationOffset:16 size:sizeof(pending_input)];
         [pending endEncoding]; r->active_frame_blit_encoder_count += 1;
-        if (termite_metal_decode_runtime_mtp_cluster_head(r, 0, 1, (__bridge void *)input, 16, (__bridge void *)order, 16, 64, 32, 4, 2, &token) != -3) return -6;
+        const bool head_frame = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME"));
+        const uint64_t submits_before = r->frame_submit_count;
+        const int pending_rc = termite_metal_decode_runtime_mtp_cluster_head(r, 0, 1, (__bridge void *)input, 16, (__bridge void *)order, 16, 64, 32, 4, 2, &token);
+        if (pending_rc != (head_frame ? 0 : -3)) return -6;
+        if (head_frame && (token != 16 || !termite_metal_decode_runtime_active_frame_empty(r) || r->frame_submit_count != submits_before + 1)) return -6;
         if (termite_metal_decode_runtime_cancel_frame(r) != 0) return -6;
         r->submitted_frame_cb = [r->queue commandBuffer];
         if (r->submitted_frame_cb == nil) return -6;
