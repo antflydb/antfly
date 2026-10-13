@@ -572,3 +572,90 @@ union warm p95 60.25–65.18 ms and saved-overlay warm p95 67.54–73.56 ms. A m
 before/after diagnostic records the large reduction from removing foreground
 collection and bucket-wide enumeration. These shared-host sample measurements
 do not establish full-archive performance or a managed Cloud SLO.
+
+## Follow-up after #1081: publication traversal and cross-file serving runs
+
+Keep the canonical per-file native inventory as the incremental rebuild authority.
+An optional authenticated `compacted` root is the serving generation. It carries
+merged native runs, their own term-directory envelopes, and complete physical
+member spans referencing the original file manifests. It preserves producer IDs,
+global statistics, deleted row holes, typed filtering, highlights and public
+pagination. Source Parquet files are unchanged. Source replacement/removal retires
+the affected merged unit; unchanged units and copy-on-write directory paths are
+reused. Retained readers and GC protect both canonical and serving generations.
+
+The initial policy merges adjacent complete one-run files in groups of at most
+eight, with a 16 MiB input target, a 32 MiB output cap and a 64 MiB merge workspace.
+Larger/multi-run files retain their existing within-file policy. Workspace denial
+falls back to the original runs. Metadata version 11 and reader protocol 36 fence
+writers/readers that do not understand member mappings; historical v9/v10 roots
+remain decodable. Upgrade readers before publishing the new format.
+
+Publication-wide best-first traversal uses authenticated term-page reductions to
+prioritize promising segments. It skips only bounds strictly below the current
+competitive score, keeps equal bounds for ID ties, and reports a lower-bound total
+when pruning. Exact counts, backward/non-score ordering, unsupported query proofs,
+and exhausted optional planning retain the exact existing traversal. The initial
+query coordinator accepts single terms and single-token analyzed matches with
+explicit leading `_score DESC`; broader query shapes remain supported through
+that fallback. Frontier memory and object reads are bounded and cancellation is
+checked even on cache hits. Health counters distinguish completed best-first
+queries, admitted segments and pruned nodes from the profiling planner.
+
+The reported SQLSTATE 54000 for `ORDER BY created_at ... LIMIT 1000` was a response
+budget mismatch: HTTP SQL defaults to 128 rows unless its request `limit` is set.
+Local probes with `limit: 1000` return 1,000 rows in both directions, including body
+projection and `created_at IS NOT NULL`. The HN qualifier now seeds current rows
+through Antfly SQL for both filesystem and remote sources, sets its explicit row
+budget, and bounds that fixture to the supported 4,096-row response maximum. It
+no longer substitutes a local PyArrow projection for this SQL path.
+
+Development checks on the 142,577-row, 67-file sample produce a serving generation
+with **9 runs**, while retaining the 67-file canonical inventory. The debug runtime
+preserves the previously recorded top HN IDs/scores and passes exact filters,
+highlights, union/overlay composition, SQL seeding, pagination and restart checks.
+Debug timings are correctness evidence; optimized matched timings must be recorded
+separately before treating them as a performance comparison.
+
+
+### Optimized 1,024-file local comparison, October 13
+
+[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+compares the retained optimized #1081 executable with the follow-up implementation
+on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
+ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
+continuations. This preserves the canonical 1,024 runs and serves **128 compacted
+runs**, exercising publication-wide traversal above the 64-run threshold.
+
+| Measurement | Retained #1081 qualifier | Follow-up |
+|---|---:|---:|
+| First highlighted `database` search | 327–407 ms | 136–240 ms |
+| Warm highlighted search p95 | 77–92 ms | 51–55 ms |
+| First highlighted search after restart | 172–183 ms | 95–102 ms |
+| Provider object reads during first search | 1,461 | 405 |
+| Provider bytes during first search | 50.85 MB | 24.33 MB |
+
+Both follow-up cycles visit 58 serving segments and prune 70 term-directory nodes.
+Top-five public row IDs and exact floating-point scores match both baseline cycles;
+highlights, exact filter comparison, empty filters, cursor continuation and restart
+checks pass. Priority candidates are admitted in windows of up to eight, and
+highlight locations follow the admitted snapshot's canonical segment order.
+The full lake gate passes 155 local and 242 integration tests with no leaks; the
+final optimized runtime also passes seven native gateway tests and nine subtests.
+
+Cursor p95 and metadata-filter timings are mixed across cycles: cursor p95 is
+178–224 ms versus 213–218 ms on the baseline; some filter cases vary or regress.
+No general filter/cursor speedup is claimed. OS file caches were not flushed,
+readiness warming remains enabled, and other local builds shared the development
+host. These small normalized-data runs establish correctness and reduced query
+I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
+
+The 1,024-file **cold composed search still returns HTTP 422
+`query_candidate_budget_exceeded` on both executables**. The composed stream
+requires exact leaf totals, while large ranked pages can return lower-bound totals.
+This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
+1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
+fails. The smaller 67-file development composition check passes, but it does not
+qualify this larger cold composed workload. Fixing that leaf-count contract and
+full-archive/cloud qualification remain follow-ups. No cloud job or deployment was
+launched for this comparison.

@@ -48,6 +48,7 @@ const SegmentRecord = struct {
     interval: Interval,
     route: corpus.SegmentRouting,
     rows: []const corpus.physical.Block,
+    members: []const corpus.Member = &.{},
 };
 pub fn validateRef(ref: Chunk, domain: Id) !void {
     if (ref.byte_len == 0 or ref.byte_len > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
@@ -79,7 +80,7 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
         ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
-    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
+    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .members = group.members, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
     store: stores.ArtifactStore,
@@ -122,9 +123,16 @@ const Segments = struct {
         _ = try corpus.physical.validate(group.rows);
         return .{ .group = group, .manifest = manifest, .routes = try @import("lake_index_serving_inventory.zig").compactRoutes(a, group) };
     }
+    fn memberSlice(self: *Segments, lower: u32, upper: u32) ![]const corpus.Member {
+        if (self.group.members.len == 0) return &.{};
+        if (self.group.segments.len != 1 or lower != 0) return error.InvalidNativeLakeTextCorpus;
+        const last = self.group.members[self.group.members.len - 1];
+        if (upper != try std.math.add(u32, last.lower, last.count)) return error.InvalidNativeLakeTextCorpus;
+        return self.group.members;
+    }
     fn next(self: *Segments) !?SegmentRecord {
         if (self.ordinal == self.routes.len) {
-            if (self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
+            if (self.lower != (if (self.group.members.len != 0) try std.math.add(u32, self.group.members[self.group.members.len - 1].lower, self.group.members[self.group.members.len - 1].count) else try corpus.physical.validate(self.group.rows))) return error.InvalidNativeLakeTextCorpus;
             return null;
         }
         const route = self.routes[self.ordinal];
@@ -137,7 +145,8 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const result: SegmentRecord = .{ .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
+        const members = try self.memberSlice(self.lower, upper);
+        const result: SegmentRecord = .{ .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end], .members = members };
         self.lower = upper;
         self.ordinal += 1;
         return result;
@@ -480,6 +489,10 @@ fn validateRouting(record: SegmentRecord, domain: Id) !void {
     }
 }
 fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
+    if (record.members.len != 0) {
+        if (record.rows.len != 0) return error.InvalidNativeLakeTextCorpus;
+        return corpus.validateMembers(record.members, domain, record.interval.lower, record.interval.count);
+    }
     var covered = record.interval.lower;
     for (record.rows, 0..) |block, i| {
         var independent = block;
@@ -654,6 +667,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
         const routing = try a.alloc(corpus.SegmentRouting, selected.len);
         const intervals = try a.alloc(Interval, selected.len);
         var blocks: std.ArrayList(corpus.physical.Block) = .empty;
+        var members: std.ArrayList(corpus.Member) = .empty;
         for (selected, refs, summaries, routing, intervals, 0..) |record, *ref, *summary, *route, *interval, i| {
             if (i != 0 and (selected[i - 1].ordinal >= record.ordinal or @as(u64, intervals[i - 1].lower) + intervals[i - 1].count > record.interval.lower)) return error.InvalidNativeLakeTextCorpus;
             if (!std.mem.eql(u8, &selected[0].file.digest, &record.file.digest) or !std.mem.eql(u8, selected[0].manifest.artifact_id, record.manifest.artifact_id)) return error.InvalidNativeLakeTextCorpus;
@@ -663,12 +677,13 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
             summary.* = record.route.summary;
             route.* = record.route;
             interval.* = record.interval;
+            try members.appendSlice(a, record.members);
             for (record.rows) |block| {
                 if (blocks.items.len != 0 and blocks.items[blocks.items.len - 1].base == block.base) continue;
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .members = members.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);

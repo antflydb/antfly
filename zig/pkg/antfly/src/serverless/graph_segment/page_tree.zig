@@ -760,6 +760,111 @@ fn containsPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const 
     }
 }
 
+/// Best-first traversal of authenticated reductions. Missing reductions have
+/// an infinite bound and are visited exactly. Only strictly losing subtrees
+/// are pruned, so equal-bound records remain available for stable tie breaks.
+pub const BestFirst = struct {
+    pub const Bound = struct {
+        ptr: *anyopaque,
+        value: *const fn (*anyopaque, []const u8, ?u64) anyerror!f32,
+    };
+    const Node = struct {
+        score: f32,
+        first: ?[]const u8 = null,
+        end: ?[]const u8 = null,
+        ref: ?Ref = null,
+        value: ?[]const u8 = null,
+        fn compare(_: void, left: Node, right: Node) std.math.Order {
+            return std.math.order(right.score, left.score);
+        }
+        fn bytes(self: Node) usize {
+            return (if (self.first) |v| v.len else 0) + (if (self.end) |v| v.len else 0) + (if (self.value) |v| v.len else 0);
+        }
+        fn deinit(self: Node, a: Allocator) void {
+            if (self.first) |v| a.free(v);
+            if (self.end) |v| a.free(v);
+            if (self.value) |v| a.free(v);
+        }
+    };
+    alloc: Allocator,
+    store: Store,
+    bound: Bound,
+    lower: []const u8,
+    upper: ?[]const u8,
+    heap: std.PriorityQueue(Node, void, Node.compare) = .initContext({}),
+    retained: usize = 0,
+    returned: ?Node = null,
+    pruned: bool = false,
+    pruned_nodes: u64 = 0,
+    max_retained: usize = 4 * 1024 * 1024,
+    max_nodes: usize = 8192,
+
+    pub fn init(a: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8, bound: Bound) !BestFirst {
+        var self: BestFirst = .{ .alloc = a, .store = store, .lower = lower, .upper = upper, .bound = bound };
+        if (root) |ref| try self.heap.push(a, .{ .ref = ref, .score = std.math.inf(f32) });
+        return self;
+    }
+    pub fn deinit(self: *BestFirst) void {
+        if (self.returned) |node| node.deinit(self.alloc);
+        while (self.heap.pop()) |node| node.deinit(self.alloc);
+        self.heap.deinit(self.alloc);
+    }
+    fn add(self: *BestFirst, first: []const u8, end: ?[]const u8, ref: ?Ref, value: []const u8, score: f32) !void {
+        if (std.math.isNan(score) or score < 0) return error.InvalidGraphPage;
+        const bytes = first.len + (if (end) |v| v.len else 0) + (if (ref == null) value.len else 0);
+        if (self.heap.items.len >= self.max_nodes or bytes > self.max_retained -| self.retained) return error.BestFirstBudgetExceeded;
+        var node: Node = .{ .score = score, .ref = ref };
+        errdefer node.deinit(self.alloc);
+        node.first = try self.alloc.dupe(u8, first);
+        if (end) |v| node.end = try self.alloc.dupe(u8, v);
+        if (ref == null) node.value = try self.alloc.dupe(u8, value);
+        try self.heap.push(self.alloc, node);
+        self.retained += bytes;
+    }
+    /// The returned record borrows the cursor until next or deinit.
+    pub fn next(self: *BestFirst, minimum_score: ?f32) !?Cursor.Record {
+        try self.store.check(self.store.ptr);
+        if (minimum_score) |v| if (!std.math.isFinite(v) or v < 0) return error.InvalidGraphPage;
+        if (self.returned) |node| {
+            node.deinit(self.alloc);
+            self.returned = null;
+        }
+        while (self.heap.pop()) |node| {
+            self.retained -= node.bytes();
+            var transferred = false;
+            defer if (!transferred) node.deinit(self.alloc);
+            try self.store.check(self.store.ptr);
+            if (minimum_score) |cutoff| if (node.score < cutoff) {
+                self.pruned = true;
+                self.pruned_nodes +|= 1;
+                continue;
+            };
+            const ref = node.ref orelse {
+                self.returned = node;
+                transferred = true;
+                return .{ .key = node.first.?, .value = node.value.? };
+            };
+            var page = try load(self.alloc, self.store, ref);
+            defer page.deinit(self.alloc);
+            if (node.first) |first| if (!std.mem.eql(u8, page.entries[0].key, first)) return error.InvalidGraphPage;
+            if (node.end) |end| if (!less(page.entries[page.entries.len - 1].key, end)) return error.InvalidGraphPage;
+            for (page.entries, 0..) |entry, index| {
+                const end = if (index + 1 < page.entries.len) page.entries[index + 1].key else node.end;
+                if (self.upper) |upper| if (!less(entry.key, upper)) break;
+                if (entry.child) |child| {
+                    if (end) |last| if (!less(self.lower, last)) continue;
+                    const score = if (entry.aggregate.len == 0) std.math.inf(f32) else try self.bound.value(self.bound.ptr, entry.aggregate, child.records);
+                    try self.add(entry.key, end, child, "", score);
+                } else {
+                    if (less(entry.key, self.lower)) continue;
+                    try self.add(entry.key, null, null, entry.value, try self.bound.value(self.bound.ptr, entry.value, null));
+                }
+            }
+        }
+        return null;
+    }
+};
+
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
 pub const Cursor = struct {
@@ -1955,4 +2060,67 @@ test "external lake dynamic exact keys sorted range zipper skips absent prefixes
     try std.testing.expect(counted.pages < 100);
     var bounded: Ranges = .{ .limit = 1 };
     try std.testing.expect((try countSortedRanges(a, memory.store(), root, &bounded)) == null);
+}
+
+test "external lake best first traversal preserves ties prunes losing pages and checks cancellation" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Source = struct {
+        at: u64 = 0,
+        key: [8]u8 = undefined,
+        value: [128]u8 = @splat(0),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.at == 5000) return null;
+            std.mem.writeInt(u64, &self.key, self.at, .big);
+            const score: f32 = if (self.at >= 4998) 1000 else 1;
+            std.mem.writeInt(u32, self.value[0..4], @bitCast(score), .little);
+            self.at += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+        fn reduce(a_: Allocator, entries: []const Entry, height: u8) ![]u8 {
+            var score: f32 = 0;
+            for (entries) |entry| score = @max(score, @as(f32, @bitCast(std.mem.readInt(u32, (if (height == 0) entry.value else entry.aggregate)[0..4], .little))));
+            const out = try a_.alloc(u8, 4);
+            std.mem.writeInt(u32, out[0..4], @bitCast(score), .little);
+            return out;
+        }
+        fn bound(_: *anyopaque, bytes: []const u8, _: ?u64) !f32 {
+            if (bytes.len < 4) return error.InvalidGraphPage;
+            return @bitCast(std.mem.readInt(u32, bytes[0..4], .little));
+        }
+    };
+    var source: Source = .{};
+    var store = memory.store();
+    store.reduce = Source.reduce;
+    const root = try buildSorted(a, store, &source);
+    const all_pages = memory.pages.count();
+    memory.reads = 0;
+    var cursor = try BestFirst.init(a, store, root, "", null, .{ .ptr = &source, .value = Source.bound });
+    defer cursor.deinit();
+    const first = (try cursor.next(null)).?;
+    const first_id = std.mem.readInt(u64, first.key[0..8], .big);
+    try std.testing.expect(first_id >= 4998);
+    const second = (try cursor.next(1000)).?;
+    try std.testing.expect(std.mem.readInt(u64, second.key[0..8], .big) >= 4998);
+    try std.testing.expect(std.mem.readInt(u64, second.key[0..8], .big) != first_id);
+    try std.testing.expect((try cursor.next(1000)) == null);
+    try std.testing.expect(cursor.pruned);
+    try std.testing.expect(memory.reads < all_pages);
+    memory.canceled = true;
+    try std.testing.expectError(error.Canceled, cursor.next(1000));
+    memory.canceled = false;
+    // A bounded frontier declines optional planning instead of truncating it.
+    var limited = try BestFirst.init(a, store, root, "", null, .{ .ptr = &source, .value = Source.bound });
+    defer limited.deinit();
+    limited.max_nodes = 0;
+    try std.testing.expectError(error.BestFirstBudgetExceeded, limited.next(null));
+    // Missing reductions never authorize subtree pruning.
+    var old_source: Source = .{};
+    const old_root = try buildSorted(a, memory.store(), &old_source);
+    var old = try BestFirst.init(a, memory.store(), old_root, "", null, .{ .ptr = &source, .value = Source.bound });
+    defer old.deinit();
+    var found: usize = 0;
+    while (try old.next(1000)) |_| found += 1;
+    try std.testing.expectEqual(@as(usize, 2), found);
 }
