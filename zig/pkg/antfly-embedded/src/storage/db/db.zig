@@ -19404,6 +19404,17 @@ pub const DB = struct {
 
     /// A durable generation for cursor pages: no apply/read lease escapes
     /// capture, and resume never falls back to a fresh live generation.
+    fn admitQueryCut(self: *DB, io: std.Io, id: []const u8, cancellation: types.CancellationToken) !void {
+        const cut = @import("native_query_cut.zig");
+        var repository = self.backend_runtime.query_cut_repository;
+        const Confirm = struct {
+            fn durable(raw: *anyopaque, io_: std.Io, root: []const u8, manifest: cut.Manifest, token: types.CancellationToken) !bool {
+                const port: *@import("native_query_cut_repository.zig").Port = @ptrCast(@alignCast(raw));
+                return port.canEvict(io_, root, manifest.request, manifest.namespace, manifest.sequence, token);
+            }
+        };
+        return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
+    }
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
@@ -19427,7 +19438,7 @@ pub const DB = struct {
         };
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
-        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
@@ -19443,7 +19454,7 @@ pub const DB = struct {
                 else => err,
             };
         };
-        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             try repository.publish(io, root, request, self.core.identity_namespace, token);
         };
@@ -19558,10 +19569,10 @@ pub const DB = struct {
             // Legacy repositories may materialize missing generations, but
             // must not overwrite an invalid cache with active local readers.
             if (local_exists) return error.CatalogGenerationChanged;
-            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try self.admitQueryCut(io, cache_id, control.token());
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try self.admitQueryCut(io, cache_id, control.token());
             try cut.validate(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
         var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
@@ -20717,6 +20728,8 @@ pub const DB = struct {
             };
         };
         try cancellation.check();
+        if (purpose == .historical_table)
+            try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, cancellation);
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         // A table-local historical image cannot certify references owned by
@@ -75814,18 +75827,27 @@ test "graph relation endpoints canonicalize through injected resolutions" {
         try std.testing.expectEqualStrings("person/ada_lovelace", parsed.source_node.?);
     }
 
-    // A legacy inline endpoint object that matches no extraction entity keeps
-    // the owning document as the source (historical extraction_relation
-    // contract), with no owner split.
+    // An inline mention that matches no extraction entity has no canonical
+    // identity. It must not manufacture an edge from the owning document.
     {
         const legacy_raw =
             \\{"relations":[{"type":"mentions","source":{"id":"inline","label":"person","text":"Ada"},"target":"ext-node"}]}
         ;
         const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", legacy_raw, source, "application/json", null, null, 100);
         defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+    // An explicit document reference is already canonical and remains usable
+    // even when it is absent from the extraction entity list.
+    {
+        const explicit_raw =
+            \\{"relations":[{"type":"mentions","source":{"document_id":"person/ada"},"target":"ext-node"}]}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", explicit_raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
         try std.testing.expectEqual(@as(usize, 1), writes.len);
-        try std.testing.expectEqualStrings("doc:a", writes[0].source);
-        try std.testing.expectEqual(@as(usize, 0), writes[0].owner.len);
+        try std.testing.expectEqualStrings("person/ada", writes[0].source);
+        try std.testing.expectEqualStrings("doc:a", writes[0].owner);
     }
 }
 

@@ -627,6 +627,7 @@ const Entry = struct {
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
+        self.identities.segment_ids = self.statistics_identities;
         if (root.statistics_version >= 1) {
             const ordinals = try a.alloc(corpus.statistics.IdentityOrdinal, root.segments.len);
             var offset: u32 = 0;

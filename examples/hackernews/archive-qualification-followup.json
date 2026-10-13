@@ -56,5 +56,7 @@
   "cursor_pages": 40,
   "cursor_term": "AI",
   "qualify_composed_sources": true,
-  "store_source": true
+  "store_source": true,
+  "benchmark_composed": true,
+  "composed_current_rows": 1000
 }

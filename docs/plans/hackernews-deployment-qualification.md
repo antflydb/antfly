@@ -453,6 +453,25 @@ per-cut lease under the parent guard. Active local readers prevent that cleanup;
 the request fails its existing admission bound instead of deleting their files.
 Remote reader leases do not depend on the discarded local directory.
 
+The configured `max_native_cuts` and `max_native_retained_bytes` bound the hot
+local generation cache. When admission reaches either bound, it may evict an idle
+copy only after confirming its local publication receipt against the current
+repository's immutable manifest: incarnation/namespace, ID, expiry, sequence,
+chunk authority and retention horizons must match. The parent guard and exclusive
+per-cut lease protect against concurrent local readers. Admission preserves the
+requested generation, recomputes shared-extent accounting after each deletion,
+and honors cancellation before deleting. Missing durable authority, active
+readers and repository adapters without this capability retain the hard bound.
+Eviction deletes local cache files, never durable manifests or chunks; an old
+cursor resumes the same remote generation without recapturing live rows.
+
+Repeated first-page searches previously filled the 64-cut default even when they
+referred to unchanged native rows. Qualification must exceed a deliberately small
+local cache capacity and resume old cursors after mutation, eviction and restart.
+The native HTTP matrix uses a two-cut cache for this purpose, for both primary-LSM
+and vector-store tables with filesystem and local S3 artifact providers. GCS is
+an explicit separate opt-in qualification.
+
 The recovery regression primes the vector reader, restarts the live database,
 and then preserves the local directory while removing its manifest, corrupting
 its metadata or removing a sealed source-vector file. Each case must return the
@@ -572,3 +591,188 @@ union warm p95 60.25–65.18 ms and saved-overlay warm p95 67.54–73.56 ms. A m
 before/after diagnostic records the large reduction from removing foreground
 collection and bucket-wide enumeration. These shared-host sample measurements
 do not establish full-archive performance or a managed Cloud SLO.
+
+## Follow-up after #1081: publication traversal and cross-file serving runs
+
+Keep the canonical per-file native inventory as the incremental rebuild authority.
+An optional authenticated `compacted` root is the serving generation. It carries
+merged native runs, their own term-directory envelopes, and complete physical
+member spans referencing the original file manifests. It preserves producer IDs,
+global statistics, deleted row holes, typed filtering, highlights and public
+pagination. Source Parquet files are unchanged. Source replacement/removal retires
+the affected merged unit; unchanged units and copy-on-write directory paths are
+reused. Retained readers and GC protect both canonical and serving generations.
+
+The initial policy merges adjacent complete one-run files in groups of at most
+eight, with a 16 MiB input target, a 32 MiB output cap and a 64 MiB merge workspace.
+Larger/multi-run files retain their existing within-file policy. Workspace denial
+falls back to the original runs. Metadata version 11 and reader protocol 36 fence
+writers/readers that do not understand member mappings; historical v9/v10 roots
+remain decodable. Upgrade readers before publishing the new format.
+
+Publication-wide best-first traversal uses authenticated term-page reductions to
+prioritize promising segments. It skips only bounds strictly below the current
+competitive score, keeps equal bounds for ID ties, and reports a lower-bound total
+when pruning. Exact counts, backward/non-score ordering, unsupported query proofs,
+and exhausted optional planning retain the exact existing traversal. The initial
+query coordinator accepts single terms and single-token analyzed matches with
+explicit leading `_score DESC`; broader query shapes remain supported through
+that fallback. Frontier memory and object reads are bounded and cancellation is
+checked even on cache hits. Health counters distinguish completed best-first
+queries, admitted segments and pruned nodes from the profiling planner.
+
+The reported SQLSTATE 54000 for `ORDER BY created_at ... LIMIT 1000` was a response
+budget mismatch: HTTP SQL defaults to 128 rows unless its request `limit` is set.
+Local probes with `limit: 1000` return 1,000 rows in both directions, including body
+projection and `created_at IS NOT NULL`. The HN qualifier now seeds current rows
+through Antfly SQL for both filesystem and remote sources, sets its explicit row
+budget, and bounds that fixture to the supported 4,096-row response maximum. It
+no longer substitutes a local PyArrow projection for this SQL path.
+
+Development checks on the 142,577-row, 67-file sample produce a serving generation
+with **9 runs**, while retaining the 67-file canonical inventory. The debug runtime
+preserves the previously recorded top HN IDs/scores and passes exact filters,
+highlights, union/overlay composition, SQL seeding, pagination and restart checks.
+Debug timings are correctness evidence; optimized matched timings must be recorded
+separately before treating them as a performance comparison.
+
+
+### Optimized 1,024-file local comparison, October 13
+
+[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+compares the retained optimized #1081 executable with the follow-up implementation
+on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
+ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
+continuations. This preserves the canonical 1,024 runs and serves **128 compacted
+runs**, exercising publication-wide traversal above the 64-run threshold.
+
+| Measurement | Retained #1081 qualifier | Follow-up |
+|---|---:|---:|
+| First highlighted `database` search | 327–407 ms | 136–240 ms |
+| Warm highlighted search p95 | 77–92 ms | 51–55 ms |
+| First highlighted search after restart | 172–183 ms | 95–102 ms |
+| Provider object reads during first search | 1,461 | 405 |
+| Provider bytes during first search | 50.85 MB | 24.33 MB |
+
+Both follow-up cycles visit 58 serving segments and prune 70 term-directory nodes.
+Top-five public row IDs and exact floating-point scores match both baseline cycles;
+highlights, exact filter comparison, empty filters, cursor continuation and restart
+checks pass. Priority candidates are admitted in windows of up to eight, and
+highlight locations follow the admitted snapshot's canonical segment order.
+The full lake gate passes 155 local and 242 integration tests with no leaks; the
+final optimized runtime also passes seven native gateway tests and nine subtests.
+
+Cursor p95 and metadata-filter timings are mixed across cycles: cursor p95 is
+178–224 ms versus 213–218 ms on the baseline; some filter cases vary or regress.
+No general filter/cursor speedup is claimed. OS file caches were not flushed,
+readiness warming remains enabled, and other local builds shared the development
+host. These small normalized-data runs establish correctness and reduced query
+I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
+
+At PR #1117, the 1,024-file **cold composed search returned HTTP 422
+`query_candidate_budget_exceeded` on both executables**. The composed stream
+requires exact leaf totals, while large ranked pages can return lower-bound totals.
+This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
+1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
+fails. The smaller 67-file development composition check passes, but it does not
+qualify this larger cold composed workload. Fixing that leaf-count contract and
+full-archive/cloud qualification were the next follow-ups. No cloud job or deployment
+was launched for this comparison.
+
+### Composed cardinality and release handoff follow-up
+
+A bounded ordered page and an exact relation count are separate contracts. The
+composed executor now accepts a full requested ordered leaf window whose total
+relation is `gte`. It keeps the exact total unknown and returns a conservative
+visible-prefix lower bound. It does not add page-local lower bounds, because leaf
+adapters can report either full-relation or remaining-relation counts. A short
+window with an unknown lower-bound total still fails closed. An exact short or
+empty terminal window proves exhaustion; full and remaining exact counts are
+validated against the retained position. Explicit union `count: true` still
+requires exact leaf counts, while overlay counts stream through visibility.
+Replacement lookups retain their exact, bounded completeness requirement.
+
+Retained source continuations use version 3 and pin catalog/schema/policy identity
+independently of cardinality. Version 2 cursors remain readable: their existing
+exact total establishes that the identity was already bound. Refills reauthorize
+exhausted sources and verify immutable serving tokens. Unknown cardinality cannot
+allow a drop/recreate or schema/policy change to silently rebind a cursor. The
+merge loop checks exhaustion again after refill before indexing a possibly empty
+terminal batch.
+
+The regional runner now forwards `benchmark_composed` and
+`composed_current_rows`. The archive acceptance profile requires cold and warm
+measurements for both the historical/current union and the saved replacement
+overlay, in addition to existing suppression and retained-cursor checks. Results
+bind each public hit's table, ID and score, so equal IDs across sources do not hide
+ordering changes. The 1,000-row current fixture is bounded diagnostic coverage;
+it does not represent a year's worth of current HN data. Percentiles use nearest
+rank consistently. Missing measurements, a different fixture size or exceeded
+latency limits fail the gate.
+
+The full-archive follow-up profile must explicitly match the existing shared
+ledger before execution. A dry run reports remaining run slots, unreserved budget
+and whether another reservation can be admitted. Updating a profile cannot reset
+the retained ledger or create retry capacity. New billing and cloud-preflight
+records remain local; reconcile posted gross compute and retain unexported
+storage/network allowances before admitting another worker. Promotion credits do
+not reduce budget accounting.
+
+After local qualification, merge the fix and run the human-approved CI gate on
+its final revision. Publish an immutable native runtime release and verify the
+release/image digest includes this merge and #1117. Select that release in the
+Colony development catalog, preserving the existing rollback reference and
+leaving auto-upgrade disabled. The actual deploy uses an organization-owned
+Antfly Cloud instance, with its tenant identity and credential-refresh path; a
+standalone benchmark pod or retained 20 GiB claim does not qualify that path.
+Verify restricted object access, both HN tables and saved overlay, publication,
+cursor retention and replacement-owner recovery through the managed API. Reuse
+the pinned 334-object, 47,717,307-row export after verifying its live generations.
+Run the regional latency matrix only after budget admission is restored through
+reviewed reconciliation or a new explicit ceiling. Public DNS remains gated on
+managed deployment qualification. This follow-up does not create a release,
+promote the development catalog or deploy a tenant.
+
+The final count-normalization guard also rejects an exact count smaller than the
+returned window after earlier lower-bound pages. The final local regression run
+passes 157 core plus 247 API lake tests without skips/leaks; all thirteen composed
+regressions pass, and the qualification/budget/transport/recovery Python checks
+pass 47 tests and 25 subtests. These are engine/harness checks; the optimized HTTP
+matrix results follow below.
+
+### Rebuilt composed-query qualification, October 13
+
+[Recorded local evidence](../../examples/hackernews/composed-lake-qualification-20261013.json)
+binds production revision `37fa71b50d` and the optimized executable's digest to two
+complete cycles on the same 142,577-row, 1,024-file fixture with 128 serving runs.
+Both cycles pass filters, highlights, composition, retained pagination and
+restart correctness. Table/ID/score results match across all repeated composed
+queries and both cycles. A prior executable exhausted its default 64-cut native
+local cache during the second cycle; both rebuilt cycles complete after durable
+cache eviction was added.
+
+| Measurement | Cycle 1 | Cycle 2 |
+|---|---:|---:|
+| Cold historical/current union | 280 ms | 342 ms |
+| Union warm p95, 20 samples | 269 ms | 168 ms |
+| Cold saved replacement overlay | 345 ms | 299 ms |
+| Overlay warm p95, 20 samples | 199 ms | 162 ms |
+| Single-table first search after restart | 142 ms | 4,385 ms |
+| Retained cursor after restart | 2,583 ms | 768 ms |
+
+Finite `sqlite` pagination returns 167 union hits and 166 overlay hits over eleven
+pages each, without duplicate table/ID pairs. Both begin with lower-bound totals
+and end with exact totals matching independent explicit counts. The native HTTP
+matrix passes eleven tests and nine subtests with a two-cut cache, covering
+filesystem and local S3 repositories under both native vector-storage modes,
+mutation, restart, local-cache loss and missing/corrupt authority. Two real-GCS
+cases are excluded; these results do not qualify actual cloud providers.
+
+The 4,385 ms restart search exceeds the 2,000 ms target. Its measured ranking
+phase is 87 ms; the available phase counters do not explain the full delay, so
+its cause remains unproven. Five isolated restart probes return identical results
+in 237–774 ms. Keep the original search and cursor outliers in the evidence rather
+than replacing them with the diagnostic probes. Correctness and cache-pressure
+qualification pass; the two-cycle restart-latency criterion does not. OS caches
+are not flushed, readiness warming is enabled, and these normalized local data
+measurements do not establish full-archive or managed Cloud latency.

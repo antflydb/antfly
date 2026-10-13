@@ -18071,8 +18071,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), parsed.graph_metric_results.len);
             try std.testing.expectEqualStrings("central", parsed.graph_metric_results[0].name);
             try std.testing.expectEqual(@as(usize, 1), parsed.graph_results.len);
-            try std.testing.expectEqual(@as(usize, 2), parsed.graph_results[0].nodes[0].metrics.len);
-            try std.testing.expect(parsed.graph_results[0].nodes[0].metrics[1].score == null);
+            try std.testing.expectEqual(@as(usize, 2), parsed.graph_results[0].nodes[0].metricCount());
+            try std.testing.expect(parsed.graph_results[0].nodes[0].metricAt(1).score == null);
             const status = parsed.graph_results[0].metric_status[0];
             try std.testing.expectEqual(@as(u32, 2), status.metadata_version);
             try std.testing.expectEqual(std.math.maxInt(u64), status.config_fingerprint);

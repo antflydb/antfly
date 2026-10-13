@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import struct
 import json
+import math
 import shutil
 import statistics
 import sys
@@ -330,8 +331,8 @@ def main():
     )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
-    if not 2 <= args.composed_current_rows <= 10000:
-        parser.error("composed current rows must be between 2 and 10000")
+    if not 2 <= args.composed_current_rows <= 4096:
+        parser.error("composed current rows must be between 2 and 4096")
     if args.benchmark_composed and not args.qualify_composed_sources:
         parser.error("composed benchmarks require --qualify-composed-sources")
     if args.docker and not args.filesystem_source:
@@ -1082,35 +1083,18 @@ def main():
                 "points",
                 "created_at",
             ]
-            if args.filesystem_source:
-                import pyarrow.dataset as dataset
-
-                paths = sorted((args.filesystem_source / "archive").glob("*.parquet"))
-                if not paths:
-                    raise ValueError(
-                        "Local composed fixture needs original archive/*.parquet payloads"
-                    )
-                recent_rows = (
-                    dataset.dataset([str(path) for path in paths], format="parquet")
-                    .to_table(columns=columns)
-                    .sort_by([("created_at", "descending"), ("hn_id", "ascending")])
-                    .slice(0, args.composed_current_rows)
-                    .to_pylist()
-                )
-                recent = {
-                    "rows": [[row[name] for name in columns] for row in recent_rows]
-                }
-            else:
-                recent = call(
-                    "POST",
-                    "/sql",
-                    {
-                        "statement": "SELECT "
-                        + ", ".join(columns)
-                        + " FROM hn_archive_poc ORDER BY created_at DESC LIMIT "
-                        + str(args.composed_current_rows)
-                    },
-                )
+            recent = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(columns)
+                    + " FROM hn_archive_poc WHERE created_at IS NOT NULL ORDER BY created_at DESC LIMIT "
+                    + str(args.composed_current_rows),
+                    # HTTP SQL's row budget is separate from the statement LIMIT.
+                    "limit": args.composed_current_rows,
+                },
+            )
             assert len(recent["rows"]) == args.composed_current_rows
             documents = []
             for row in recent["rows"]:
@@ -1183,23 +1167,29 @@ def main():
                 start()
                 request = dict(query, source=source, source_ranking="rrf")
                 cold, cold_ms = timed_query(request, "composed_cold." + name, "/query")
-                expected = [(h["_id"], h["_score"]) for h in cold["hits"]["hits"]]
+                expected = [
+                    (h["_table"], h["_id"], h["_score"]) for h in cold["hits"]["hits"]
+                ]
                 samples = []
                 for _ in range(args.repeats):
                     result, elapsed = timed_query(
                         request, "composed_warm." + name, "/query"
                     )
                     assert [
-                        (h["_id"], h["_score"]) for h in result["hits"]["hits"]
+                        (h["_table"], h["_id"], h["_score"])
+                        for h in result["hits"]["hits"]
                     ] == expected
                     samples.append(elapsed)
                 composed_benchmarks[name] = {
                     "first_search_ms": cold_ms,
                     "warm_samples_ms": samples,
-                    "warm_p95_ms": sorted(samples)[
-                        min(len(samples) - 1, int(len(samples) * 0.95))
-                    ],
+                    "warm_p95_ms": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
                     "result_count": len(expected),
+                    "top_hits": [
+                        {"table": table, "id": identity, "score": score}
+                        for table, identity, score in expected
+                    ],
+                    "total": cold["hits"]["total"],
                     "current_fixture_rows": args.composed_current_rows,
                     "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale.",
                 }

@@ -1171,7 +1171,7 @@ test "online direct vector Raft retention captures exact artifacts and rejects u
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
         doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
-        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try doc_identity.writeNamespaceTxn(&txn, db.core.identity_namespace);
         _ = try retention.admitWithDirectVectors(&txn, namespace, 1, @splat(9), retention.default_limit, true);
         try txn.commit();
     }

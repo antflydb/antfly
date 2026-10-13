@@ -497,6 +497,7 @@ const ParallelScan = struct {
     workers: [8]Worker = undefined,
     worker_count: usize = 0,
     scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
+    ready: std.Io.Event = .unset,
     const Worker = struct {
         pipeline: *ParallelScan,
         index: usize,
@@ -554,6 +555,9 @@ const ParallelScan = struct {
             }
         }
         fn run(self: *Worker) anyerror!void {
+            // Nested expression jobs must not consume admission intended for
+            // sibling scan workers while the parent is still starting them.
+            try self.pipeline.ready.wait(self.pipeline.io);
             var index = self.index;
             while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
                 const lane = &self.pipeline.lanes[index];
@@ -686,6 +690,7 @@ const ParallelScan = struct {
                 return null;
             }
         }
+        self.ready.set(io);
         return self;
     }
     fn close(self: *ParallelScan) void {
@@ -2034,6 +2039,7 @@ test "SQL ordered block admission preserves offsets filtered progress and deferr
             count += page.output.rows.len;
             if (page.exhausted) break;
         }
+        if (case.failure != failure) std.debug.print("ordered block admission sql={s} splits={d} failure={?t}\n", .{ case.sql, fixture.splits, failure });
         try std.testing.expectEqual(case.failure, failure);
         try std.testing.expectEqual(case.count, count);
         try std.testing.expect(stream.visited <= case.scan_rows);

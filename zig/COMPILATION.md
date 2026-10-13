@@ -456,6 +456,23 @@ compiled runtime island.
   result lifetimes, request validation, and exact error/cancellation semantics.
   Measure with `storage_boundary_bench` (see
   [Boundary runtime cost](#boundary-runtime-cost)).
+- Replicated batches carry the deterministic owner-open descriptor, including
+  the full schema and index JSON, in every Raft entry
+  (`encodeWithStorageOwnerDescriptor` in `data/raft_batch.zig`). That was the
+  simplest replay-independent proof of deterministic opening, not the intended
+  wire format. Before default enablement, measure envelope/log amplification and
+  replace repeated contracts with a versioned descriptor reference, but only
+  once provisioning and Raft snapshots durably carry the referenced contract.
+  Do not trade deterministic replay for a leader-local or catalog-dependent
+  cache ([history](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md#open-items-recorded-in-the-log-later-resolution-not-recorded-here)).
+- Provider, secret, and remote-content capabilities needed by
+  production-generated enrichments must reach every resident and restore
+  candidate owner; the Phase 4h log entry recorded this as required
+  before the atomic source switch. Current code configures the inference
+  provider, secrets, and remote-content security on the process storage context
+  before any table owner opens, but `RestorePrepareRequest` carries no
+  capability handles, so candidate-owner coverage remains unverified
+  ([history](../docs/design/compilation/history/experiment-ledger-2026-08-to-10.md#open-items-recorded-in-the-log-later-resolution-not-recorded-here)).
 
 ### Operation granularity
 

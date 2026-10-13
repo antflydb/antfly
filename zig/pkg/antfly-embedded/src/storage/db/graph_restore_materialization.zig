@@ -203,7 +203,8 @@ pub fn appendRelationItem(
     // replay re-renders it. With no resolver configured no canonical key
     // will ever arrive, so the source keeps the owning document instead of
     // losing the edge (zig/GRAPH.md's V1 extractor-only graph). A source
-    // that matches no extraction entity keeps the legacy document source.
+    // that matches no extraction entity must provide an explicit document
+    // reference; an unbound inline mention cannot invent a document source.
     var source_table: ?[]const u8 = null;
     const source_doc = blk: {
         if (mapped_source) |value| break :blk value;
@@ -221,9 +222,7 @@ pub fn appendRelationItem(
             break :blk canonical;
         }
         // A plain-string source matching no extraction entity is an external
-        // node id; any other unresolvable shape (e.g. legacy inline endpoint
-        // objects) keeps the owning document as the source, the historical
-        // contract.
+        // node id. Inline objects must carry an explicit document reference.
         break :blk switch (source_value) {
             .string => |external| if (external.len > 0) external else doc_key,
             .object => |endpoint| if (jsonStringField(.{ .object = endpoint }, "document_id") orelse jsonStringField(.{ .object = endpoint }, "doc_key") orelse jsonStringField(.{ .object = endpoint }, "key")) |explicit| explicit else return,
