@@ -159,6 +159,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
+            "storage.db.query.document_authority.test.",
             "storage.db.query.graph_exec.test.",
             "storage.db.types.test.",
         },
