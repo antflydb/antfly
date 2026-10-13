@@ -2890,8 +2890,9 @@ Implemented frontier details:
 
 - The complete v2 term directory already carries conservative authenticated
   per-term subtree reductions. A metadata-only plan uses the native analyzer
-  and Boolean lowerer, collection lengths and exact publication-wide DF. The
-  same preparation lends analyzed tokens and global frequencies to native
+  and Boolean lowerer, collection lengths and exact publication-wide DF. Bounds
+  cover both constrained and unconstrained native lowering, including boosted
+  terms' f32 addition order, before physical masks are known. The same preparation lends analyzed tokens and global frequencies to native
   scoring windows. Negative/nonfinite boosts or bounds conservatively disable
   score pruning; baseline-only and unsupported query shapes use the existing
   complete planner.

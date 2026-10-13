@@ -3013,6 +3013,7 @@ pub const TextNavigationPlan = struct {
     arena: std.heap.ArenaAllocator,
     stats: StreamingBoolStats = undefined,
     root: *const LoweredText = undefined,
+    constrained_root: *const LoweredText = undefined,
     config: inverted.BM25Config,
 
     pub fn create(a: Allocator, query: SearchQuery, source: Statistics, config: inverted.BM25Config) !?*TextNavigationPlan {
@@ -3025,7 +3026,9 @@ pub const TextNavigationPlan = struct {
         try self.stats.collect(query);
         var lowerer: LoweredText.Lowerer = .{ .a = scratch, .stats = &self.stats, .constrained = false };
         self.root = try lowerer.lower(query);
-        if (!restricted(self.root)) {
+        lowerer.constrained = true;
+        self.constrained_root = try lowerer.lower(query);
+        if (!restricted(self.root) or !restricted(self.constrained_root)) {
             self.deinit();
             return null;
         }
@@ -3055,7 +3058,11 @@ pub const TextNavigationPlan = struct {
         return (try self.rangeBound(source)).upper;
     }
     pub fn rangeBound(self: *const TextNavigationPlan, source: Summaries) !RangeBound {
-        return self.nodeBound(self.root, source);
+        // Native membership can change boosted-term lowering and f32 addition
+        // order. Cover both canonical paths before the physical mask is known.
+        const plain = try self.nodeBound(self.root, source);
+        const constrained = try self.nodeBound(self.constrained_root, source);
+        return .{ .upper = @max(plain.upper, constrained.upper), .possible = plain.possible or constrained.possible };
     }
     fn nodeBound(self: *const TextNavigationPlan, node: *const LoweredText, source: Summaries) anyerror!RangeBound {
         var upper: f32 = 0;
@@ -10070,15 +10077,18 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         const plan = (try TextNavigationPlan.create(a, query, .{ .ptr = &source, .count = source.snapshot.scoringDocCount(), .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
         defer plan.deinit();
         const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
-        var result = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false });
-        defer result.deinit();
-        var prepared = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .text_navigation_plan = plan });
-        defer prepared.deinit();
-        try std.testing.expectEqual(result.hits.len, prepared.hits.len);
-        for (result.hits, prepared.hits) |hit, cached| {
-            try std.testing.expect(upper >= hit.score);
-            try std.testing.expectEqual(hit.doc_id, cached.doc_id);
-            try std.testing.expectEqual(hit.score, cached.score);
+        for ([_]bool{ false, true }) |constrained| {
+            const selected: []const u32 = if (constrained) &.{0} else &.{};
+            var result = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = constrained });
+            defer result.deinit();
+            var prepared = try execute(a, source.snapshot, .{ .query = query, .k = 10, .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = constrained, .text_navigation_plan = plan });
+            defer prepared.deinit();
+            try std.testing.expectEqual(result.hits.len, prepared.hits.len);
+            for (result.hits, prepared.hits) |hit, cached| {
+                try std.testing.expect(upper >= hit.score);
+                try std.testing.expectEqual(hit.doc_id, cached.doc_id);
+                try std.testing.expectEqual(hit.score, cached.score);
+            }
         }
         source.unknown = true;
         try std.testing.expect(std.math.isInf(try plan.bound(.{ .ptr = &source, .read = Source.summary })));
