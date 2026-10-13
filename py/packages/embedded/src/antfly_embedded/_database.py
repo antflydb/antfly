@@ -473,7 +473,11 @@ class Database:
         return self._json_read(self._lib.antfly_db_list_resolver_identities_json, raw=raw)
 
     def drop_resolver_identity(self, resolver: str) -> bool:
-        """Permanently discard a retired identity and its merges."""
+        """Discard a retired identity/merges; preserve artifacts and canonical rows.
+
+        Delete source documents to remove their artifacts, and explicitly delete
+        canonical rows after checking other users. BusyError is retryable.
+        """
         handle = self._acquire()
         try:
             name, keep_name = _ffi.make_slice(encode_text(resolver))
@@ -486,7 +490,7 @@ class Database:
             self._release()
 
     def set_resolver_namespace(self, resolver: str, request: JSONInput) -> None:
-        """Reset or explicitly migrate aliases/merges into a new table/template; drain afterward."""
+        """Reset/migrate identity rules; drain afterward. BusyError is retryable."""
         handle = self._acquire()
         try:
             name, keep_name = _ffi.make_slice(encode_text(resolver))
@@ -496,10 +500,14 @@ class Database:
             self._release()
 
     def add_index(self, config: JSONInput) -> None:
+        """Add or replace an index; retry the identical request on BusyError.
+
+        A graph's ``replaces`` command also works when the old index is absent.
+        """
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 
     def delete_index(self, name: str) -> bool:
-        """Delete an index by name, returning whether it existed."""
+        """Delete an index, returning whether it existed; BusyError is retryable."""
         handle = self._acquire()
         try:
             sl, _keep = _ffi.make_slice(encode_text(name))

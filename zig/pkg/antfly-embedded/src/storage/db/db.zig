@@ -24760,7 +24760,7 @@ pub const DB = struct {
     }
 
     pub fn reconcileArtifactAddIndex(self: *DB, cfg: types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !?u128 {
-        return self.addIndexForReconciliation(cfg, .managed, context, null);
+        return self.addIndexForReconciliation(cfg, .managed, context, null, null);
     }
     pub fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
         return self.deleteIndexForReconciliation(name, context);
@@ -26898,6 +26898,7 @@ pub const DB = struct {
     var test_index_delete_after_worker_paused: ?*const fn (*DB) anyerror!void = null;
     var test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
     var test_fail_index_activation_after_catalog_commit = false;
+    var test_graph_replacement_before_build: ?*const fn (*DB) anyerror!void = null;
     var test_block_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
     var test_generated_artifact_finalization_entered: std.atomic.Value(bool) = .init(false);
     var test_release_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
@@ -27053,7 +27054,7 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         admission_mode: IndexAdmissionMode,
     ) !InstalledIndex {
-        return self.installIndexForReconciliation(cfg, admission_mode, null, null);
+        return self.installIndexForReconciliation(cfg, admission_mode, null, null, null);
     }
 
     /// Field-derived edges are part of prepared document effects. Preserve
@@ -27065,7 +27066,7 @@ pub const DB = struct {
         if (try manager.hasSchemaLeases()) return error.SchemaInUse;
     }
 
-    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8) !InstalledIndex {
+    fn installIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !InstalledIndex {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         {
@@ -27117,7 +27118,8 @@ pub const DB = struct {
         // ordinary synchronous backfill. Source identity proves the former;
         // a streaming artifact-key probe proves the latter. Both start clean
         // at the current replay head.
-        var applied = if (replaces) |old| try self.core.replaceGraphIndex(old, cfg, admission_write) else switch (admission_mode) {
+        if (prepared) |candidate| try candidate.finish(self, cfg);
+        var applied = if (replaces) |old| try self.core.replaceGraphIndex(old, cfg, admission_write, if (prepared) |candidate| &candidate.entry else null) else switch (admission_mode) {
             .ordinary => try self.core.addIndex(cfg, admission_write),
             .managed => try self.core.addManagedIndex(cfg, admission_write),
         };
@@ -27363,10 +27365,10 @@ pub const DB = struct {
     }
 
     fn addIndexWithAdmission(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode) !?u128 {
-        return self.addIndexForReconciliation(cfg, admission_mode, null, null);
+        return self.addIndexForReconciliation(cfg, admission_mode, null, null, null);
     }
 
-    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8) !?u128 {
+    fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !?u128 {
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
         var row_policy_lease = self.local_execution.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
@@ -27401,7 +27403,11 @@ pub const DB = struct {
         defer if (paused_old) {
             if (replacement_committed) self.executor.removeWorker(replaces.?) else self.executor.resumeWorker(replaces.?);
         };
-        const installed = try self.installIndexForReconciliation(cfg, admission_mode, context, replaces);
+        const installed = install: {
+            var activity: ?ResolverCatalogActivity = if (replaces != null) try self.acquireResolverCatalogActivity(true) else null;
+            defer if (activity) |*lease| lease.deinit();
+            break :install try self.installIndexForReconciliation(cfg, admission_mode, context, replaces, prepared);
+        };
         replacement_committed = true;
         if (replaces != null) {
             self.scheduleGeneratedArtifactCleanup();
@@ -27422,10 +27428,89 @@ pub const DB = struct {
         return repair_id;
     }
 
+    const PreparedGraphReplacement = struct {
+        manager: *index_manager_mod.IndexManager,
+        checkpoint: []const u8,
+        source_guard: @import("artifact_source_gap.zig").Guard,
+        sequence: u64,
+        stable_source_floor: ?u64 = null,
+        entry: ?index_manager_mod.IndexManager.DetachedIndex = null,
+
+        fn finish(candidate: *@This(), db: *DB, cfg: types.IndexConfig) !void {
+            // Called only at final activation under DB apply and replay gates.
+            // Bound the remaining journal gap; expensive construction is done.
+            const target = db.core.nextDerivedSequence();
+            if (candidate.stable_source_floor) |floor| if (target != floor) return error.Busy;
+            if (target -| candidate.sequence > 1024) return error.Busy;
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try candidate.source_guard.requireCurrent(&read);
+            const result = db.catchUpShadowReplacementUntil(db.alloc, candidate.manager, candidate.checkpoint, .{ .name = cfg.name, .kind = .graph }, target, .{}, monotonicTimeNs() +| 100 * std.time.ns_per_ms, 1) catch |err| switch (err) {
+                error.CatchUpDeadlineExceeded, error.RepairActivationBudgetExhausted => return error.Busy,
+                else => return err,
+            };
+            if (result.applied_sequence < target) return error.Busy;
+            candidate.sequence = target;
+            candidate.entry = try candidate.manager.detachReplacementIndex(cfg.name);
+        }
+    };
+
     pub fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) !void {
-        var activity = try self.acquireResolverCatalogActivity(true);
-        defer activity.deinit();
-        _ = try self.addIndexForReconciliation(cfg, .ordinary, null, old);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var stored = reserve: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            self.core.repair_replay_mutex.lockUncancelable(self.core.index_manager.checkpointIo());
+            defer self.core.repair_replay_mutex.unlock(self.core.index_manager.checkpointIo());
+            break :reserve try self.core.index_manager.prepareGraphReplacementConfig(self.core.store, old, cfg);
+        };
+        defer stored.deinit(self.core.index_manager.alloc);
+        var published = false;
+        defer if (!published) {
+            self.core.index_manager.recoverGraphReplacementBuilds(self.core.store) catch |err| std.log.warn("replacement cleanup deferred: {s}", .{@errorName(err)});
+            self.scheduleGeneratedArtifactCleanup();
+        };
+        var private = try index_manager_mod.IndexManager.initWithOptions(self.core.index_manager.alloc, self.core.index_manager.base_path, self.index_backends);
+        defer private.deinit();
+        private.source_payload_store = self.core.index_manager.source_payload_store;
+        private.setIo(self.backend_runtime.io());
+        const checkpoint = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/replacement-applied", .{ self.core.index_manager.base_path, cfg.name });
+        defer self.alloc.free(checkpoint);
+        private.setAppliedSequenceCheckpointPath(checkpoint);
+        try private.registerReplacementIndex(self.core.store, stored);
+        var source_snapshot = try self.core.store.beginReadTxn();
+        var snapshot_open = true;
+        defer if (snapshot_open) source_snapshot.abort();
+        const source_guard = try @import("artifact_source_gap.zig").Guard.capture(&source_snapshot);
+        const floor = try self.core.store.lastReplaySequenceFromTxn(&source_snapshot, 0);
+        var ctx = AsyncContext{
+            .alloc = self.alloc,
+            .io = self.backend_runtime.io(),
+            .store = self.core.store,
+            .relational_base_rows = relationalColumns(self) != null,
+            .applied_sequence_checkpoint_path = checkpoint,
+            .index_manager = &private,
+            .apply_mutex = self.async_context.apply_mutex,
+            .dense_bulk_session_scope = .external,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
+            .repair_sequence = floor,
+            .snapshot_read_txn = &source_snapshot,
+        };
+        defer ctx.deinit(self.alloc);
+        if (builtin.is_test) if (test_graph_replacement_before_build) |hook| try hook(self);
+        const has_fields = try buildGraphReplacementSources(&ctx, cfg.name, &source_snapshot);
+        ctx.snapshot_read_txn = null;
+        _ = try applySplitGraphArtifactsForIndexStreamingContext(&ctx, cfg.name, graph_repair_rebuild_batch_size);
+        source_snapshot.abort();
+        snapshot_open = false;
+        const ref: index_manager_mod.ManagedIndexRef = .{ .name = cfg.name, .kind = .graph };
+        try self.saveShadowReplacementAppliedSequence(self.alloc, &private, checkpoint, ref, floor);
+        const caught = try self.catchUpShadowReplacementUntil(self.alloc, &private, checkpoint, ref, self.core.nextDerivedSequence(), .{}, null, 1);
+        var prepared: PreparedGraphReplacement = .{ .manager = &private, .checkpoint = checkpoint, .source_guard = source_guard, .sequence = caught.applied_sequence, .stable_source_floor = if (has_fields) floor else null };
+        defer if (prepared.entry) |*entry| private.destroyDetachedReplacementIndex(entry);
+        _ = try self.addIndexForReconciliation(stored, .ordinary, null, old, &prepared);
+        published = true;
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -53046,6 +53131,7 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.promotion_runtime) |runtime| {
         effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
+    effective = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, effective);
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
     try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
@@ -54356,6 +54442,55 @@ fn applySplitGraphArtifactsStreaming(
         ScanState.scanEntry,
     );
     try state.flush();
+}
+
+/// Reuse ordinary graph materialization for a renamed logical index, not the
+/// old index's already-materialized edge keys. This keeps changed source
+/// mappings, mention edges and relation endpoints on the public semantics.
+fn buildGraphReplacementSources(ctx: *AsyncContext, name: []const u8, snapshot: *docstore_mod.DocStore.Txn) !bool {
+    var plan = try ctx.index_manager.writePlanSnapshotAlloc(ctx.alloc);
+    defer plan.deinit();
+    var has_fields = false;
+    for (plan.graph_fields) |field_plan| if (field_plan.edges.len != 0) {
+        has_fields = true;
+    };
+    var cursor = try snapshot.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter("");
+    while (row) |kv| : (row = try cursor.next()) {
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (internal_keys.isAssetArtifactKey(kv.key) or internal_keys.isChunkArtifactRecordKey(kv.key) or internal_keys.isResolutionArtifactKey(kv.key)) {
+            // Snapshot enumerates complete source coverage; materialization reads
+            // each current source, then journal catch-up converges later changes.
+            const changed = try materializeGraphSourceArtifactsForIndex(a, ctx.store, ctx.index_manager, &.{kv.key}, name, .{ .require_resolution_contract = true, .repair_ctx = ctx, .sequence = ctx.repair_sequence });
+            _ = changed;
+        } else if (has_fields and internal_keys.isStoredDocumentRowKey(kv.key)) {
+            const key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(a, kv.key)).?;
+            const json = try ctx.index_manager.materializeStoredValueAlloc(a, kv.key, kv.value);
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+            var extracted = try mapper.extractWrite(a, key, json);
+            try local_mutation.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(plan, a, key, root, &extracted);
+            var direct: std.ArrayListUnmanaged(types.BatchWrite) = .empty;
+            var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+            var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+            var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+            var owned_values: std.ArrayListUnmanaged([]u8) = .empty;
+            var owned_deletes: std.ArrayListUnmanaged([]u8) = .empty;
+            const graph = ctx.index_manager.graphIndex(name).?;
+            for (extracted.graph_writes) |write| {
+                if (!std.mem.eql(u8, write.index_name, name)) continue;
+                const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(a, key, name, write.edge_type, write.target, write.source, write.edge_id);
+                const payload = try encodeGraphSourceEdgeArtifactWithTtlAlloc(a, ctx.store, artifact, graph.config.coverage_generation, graph.ttl_duration_ns, currentTimeNs(), write);
+                try direct.append(a, .{ .key = artifact, .value = payload });
+                try writes.append(a, .{ .key = artifact, .value = payload });
+            }
+            try local_mutation.appendMixedDirectGraphContenderMutations(a, ctx.store, ctx.index_manager, direct.items, &writes, &deletes, &owned_keys, &owned_values, &owned_deletes);
+            if (writes.items.len > 0 or deletes.items.len > 0) try ctx.store.putBatch(writes.items, deletes.items);
+        }
+    }
+    return has_fields;
 }
 
 fn applySplitGraphArtifactsForIndexStreamingContext(
@@ -134832,4 +134967,59 @@ test "db default text index preserves empty-only primary population after reopen
             }
         }
     }
+}
+
+test "capi resolver replacement builds while replay gates remain available" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-replacement-gates");
+    defer tmp.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false });
+    defer db.close();
+    const config = "{\"source\":{\"artifact\":\"kg\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"kg\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"},\"edge_types\":[{\"name\":\"mentions\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    try db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false });
+    var enrichment_config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+    try db.initOptionalEnrichmentRuntime(&enrichment_config);
+    try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}" }} });
+    try db.runUntilIdle();
+    {
+        const before = try db.core.index_manager.graphIndex("old").?.index.getEdges(alloc, "claim", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, before);
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+    }
+    const Check = struct {
+        var observed = false;
+        var fail_build = true;
+        fn call(database: *DB) anyerror!void {
+            observed = true;
+            try std.testing.expectEqual(@as(u64, 0), try database.core.index_manager.clampReplayForGraphReplacementBuilds(database.core.store, 99));
+            const resolution = database.resolution_runtime orelse return error.TestExpectedEqual;
+            try std.testing.expect(resolution.catch_up_mutex.tryLock());
+            resolution.catch_up_mutex.unlock();
+            if (database.promotion_runtime) |promotion| {
+                try std.testing.expect(promotion.catch_up_mutex.tryLock());
+                promotion.catch_up_mutex.unlock();
+            }
+            if (fail_build) return error.InjectedReplacementBuildFailure;
+        }
+    };
+    Check.observed = false;
+    DB.test_graph_replacement_before_build = Check.call;
+    defer DB.test_graph_replacement_before_build = null;
+    try std.testing.expectError(error.InjectedReplacementBuildFailure, db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config }));
+    try std.testing.expect(db.core.index_manager.get("old") != null);
+    try std.testing.expect(db.core.index_manager.get("new") == null);
+    try std.testing.expectEqual(@as(u64, 99), try db.core.index_manager.clampReplayForGraphReplacementBuilds(db.core.store, 99));
+    try db.runUntilIdle();
+    Check.fail_build = false;
+    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    try std.testing.expect(Check.observed);
+    try std.testing.expect(db.core.index_manager.get("old") == null);
+    const graph = &@constCast(db.core.graphIndex("new").?).index;
+    const edges = try graph.getEdges(alloc, "claim", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("entity/ada", edges[0].target);
 }

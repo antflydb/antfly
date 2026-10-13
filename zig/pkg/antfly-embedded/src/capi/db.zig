@@ -2302,6 +2302,10 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
         .embedded_path = try alloc.dupe(u8, path),
     };
     handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    @import("tables.zig").load(handle) catch |err| {
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
     return handle;
 }
 
@@ -2701,6 +2705,11 @@ pub fn openLiteHandleAllocWithRuntime(
         return err;
     };
     @import("entity_sink.zig").attach(handle, &handle.db);
+    @import("tables.zig").load(handle) catch |err| {
+        stopLiteEmbeddedInference(handle);
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
@@ -2759,6 +2768,10 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
         .embedded_open_options = options,
     };
     handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    @import("tables.zig").load(handle) catch |err| {
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
     return handle;
 }
 
@@ -2883,31 +2896,18 @@ pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
     return out;
 }
 
-fn databaseMinimumReaderVersion(handle: *Handle) !u32 {
+fn databaseMinimumReaderVersion(handle: *Handle) u32 {
     const root = handle.parent_handle orelse handle;
-    try @import("tables.zig").load(root);
-    var version: u32 = 1;
-    const Probe = struct {
-        fn inspect(db: *db_mod.DB, a: Allocator) !u32 {
-            const identities = try db.core.index_manager.listResolverIdentities(a);
-            defer {
-                for (identities) |*cfg| cfg.deinit(a);
-                a.free(identities);
-            }
-            for (identities) |cfg| if (cfg.merge_state_version != 0 or cfg.aliases.len > 0 or !cfg.promote or cfg.namespace_generation > 0) return 2;
-            return 1;
-        }
-    };
-    version = @max(version, try Probe.inspect(&root.db, handle.alloc));
+    var version = root.db.core.index_manager.minimum_reader_version.load(.acquire);
     var it = root.embedded_tables.valueIterator();
-    while (it.next()) |table| version = @max(version, try Probe.inspect(&table.*.db, handle.alloc));
+    while (it.next()) |table| version = @max(version, table.*.db.core.index_manager.minimum_reader_version.load(.acquire));
     return version;
 }
 
 pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -2917,7 +2917,7 @@ pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*ca
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
     var capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
-    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle) catch |err| return capi.mapError(err);
+    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle);
     out.* = stringifyJson(capabilities) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
@@ -2934,7 +2934,7 @@ pub const directory_storage_status: lite_backend.StorageStatus = .{
 pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -2955,7 +2955,7 @@ pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buf
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
     var capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
-    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle) catch |err| return capi.mapError(err);
+    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle);
     const status = lite_backend.Status(JsonDBStats){
         .storage = storage,
         .stats = jsonDBStatsProjection(stats, indexes),
@@ -3223,6 +3223,7 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
     }
     defer guard.leave();
     const handle = guard.handle;
+    @import("entity_sink.zig").collectEmbeddingCache(handle.parent_handle orelse handle, true) catch |err| return capi.mapError(err);
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
@@ -7118,8 +7119,6 @@ pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolv
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
 }
 
-/// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
-/// The resolver, identity state and replay cursors commit together.
 pub export fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
@@ -7153,6 +7152,8 @@ pub export fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: ca
     return .ok;
 }
 
+/// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
+/// The resolver, identity state and replay cursors commit together.
 pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice) capi.ErrorCode {
     capi.clearLastError();
     const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
@@ -7254,6 +7255,15 @@ pub export fn antfly_db_add_index_json(
         }
         break :blk .dense_vector;
     } else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse return capi.mapError(error.InvalidIndexType);
+    // Validate command targets before registering any inline producers/resolvers.
+    if (replacement) |old| {
+        if (old != .string or old.string.len == 0 or std.mem.eql(u8, old.string, name.string))
+            return capi.mapErrorContext(error.InvalidArgument, "replaces must name a different graph index");
+        if (kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
+        if (handle.database().core.index_manager.get(old.string)) |previous| {
+            if (previous.kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
+        }
+    }
     const parsed = .{ .value = .{ .name = name.string, .config_json = normalized_config } };
     // A native Lite handle also accepts the server's nested "enrichments"
     // shape on this index's own config (see `registerLiteIndexEnrichments`),
@@ -7320,25 +7330,23 @@ pub export fn antfly_db_add_index_json(
             return capi.mapError(err);
         };
     }
-    if (replacement) |old| {
-        if (old != .string or old.string.len == 0 or std.mem.eql(u8, old.string, parsed.value.name)) {
-            rollback.?.restore();
-            return capi.mapErrorContext(error.InvalidArgument, "replaces must name a different existing graph index");
-        }
-    }
     const index_cfg: db_mod.types.IndexConfig = .{ .name = parsed.value.name, .kind = kind, .config_json = stored_config_json };
-    if (!existing_index) (if (replacement) |old|
-        handle.database().replaceGraphIndex(old.string, index_cfg)
+    if (!existing_index) (if (replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null)
+        handle.database().replaceGraphIndex(replacement.?.string, index_cfg)
     else
         handle.database().addIndex(index_cfg)) catch |err| {
         if (rollback) |*undo| undo.restore();
         return capi.mapError(err);
     };
     if (existing_index and replacement != null) {
-        if (kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
-        if (handle.database().core.index_manager.get(replacement.?.string)) |old| {
-            if (old.kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
-            _ = handle.database().deleteIndex(replacement.?.string) catch |err| return capi.mapError(err);
+        if (handle.database().core.index_manager.get(replacement.?.string) != null) {
+            _ = handle.database().deleteIndex(replacement.?.string) catch |err| {
+                // A pre-publication failure must undo inline config changes.
+                // After publication the index is gone and its new identity state
+                // must remain consistent with the committed catalog.
+                if (handle.database().core.index_manager.get(replacement.?.string) != null) rollback.?.restore();
+                return capi.mapError(err);
+            };
         }
     }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);

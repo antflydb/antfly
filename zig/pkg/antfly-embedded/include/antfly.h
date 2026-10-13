@@ -457,22 +457,33 @@ antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resol
  * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
  * antfly_db_run_until_idle to re-resolve existing artifacts and replace mention edges.
  * Promotion-enabled resolvers also reconcile entity documents. Arbitrary application
- * references and manually supplied graph edges are not rewritten. */
+ * references and manually supplied graph edges are not rewritten.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
 
+/* Lists active and retired identities, including durable merges. */
+antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);
+/* Drops a retired identity and its merges; rejects an active identity.
+ * Existing resolution artifacts and promoted documents remain. Delete source
+ * documents to remove their artifacts; delete canonical rows explicitly only
+ * after checking other resolvers/application references.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+antfly_error_code antfly_db_drop_resolver_identity(antfly_db *db, antfly_slice resolver_name, bool *out_deleted);
 /** Set {table,key_template} and choose reset_merges:true (clears inline aliases too,
  * unless an explicit replacement aliases array is supplied) or
  * key_map:[{key,target},...] mapping every inline/durable alias endpoint.
  * A durable fence rejects stale inline namespaces/aliases even after reset.
  * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
- * Application-owned documents/references are not renamed. */
-/* Lists active and retired identities, including durable merges. */
-antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);
-/* Drops a retired identity and its merges; rejects an active identity. */
-antfly_error_code antfly_db_drop_resolver_identity(antfly_db *db, antfly_slice resolver_name, bool *out_deleted);
+ * Application-owned documents/references are not renamed.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
 
+/* Schema admission (add, replaces, delete, namespace changes and identity drop)
+ * may return ANTFLY_BUSY before mutation when replay/promotion is active for
+ * approximately 100 ms. Retry the identical request with bounded backoff.
+ * replaces is idempotent and acts as add when the old index is absent. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
+/* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_add_enrichment_json(antfly_db *db, antfly_slice config_json);

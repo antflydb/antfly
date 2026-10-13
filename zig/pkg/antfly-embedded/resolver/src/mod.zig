@@ -77,6 +77,29 @@ pub const ExtractedEntity = struct {
 /// mention; `label` gates `type_must_match`. When blocking finds a merged-away
 /// duplicate, `resolved_doc_ref` / `resolved_record` carry the canonical survivor
 /// to link/promote after scoring against the duplicate.
+/// Cache-only vector locator. Generated vectors reference their dense id;
+/// application vectors reference the primary document field instead.
+pub const VectorReference = struct {
+    field: []const u8,
+    table: []const u8,
+    index_name: []const u8,
+    key: []const u8,
+    vector_id: ?u64 = null,
+    index_revision: [32]u8,
+    dimensions: usize,
+};
+
+pub const EmbeddingCache = struct {
+    ptr: *anyopaque,
+    get: *const fn (*anyopaque, std.mem.Allocator, [32]u8) anyerror!?[]const f32,
+    put: *const fn (*anyopaque, [32]u8, []const f32) anyerror!void,
+};
+
+pub const VectorLoader = struct {
+    ptr: *anyopaque,
+    load: *const fn (*anyopaque, std.mem.Allocator, VectorReference) anyerror!?[]const f32,
+};
+
 pub const Candidate = struct {
     doc_ref: DocRef,
     label: []const u8,
@@ -85,6 +108,7 @@ pub const Candidate = struct {
     resolved_record: ?matcher.Record = null,
     /// Validated raw comparison features for this mention/candidate pair.
     features: ?[]const matcher.Feature = null,
+    vector_refs: []const VectorReference = &.{},
 };
 
 fn hasCrossTableRedirect(candidates: []const Candidate) bool {
@@ -1293,6 +1317,7 @@ pub const WorkCache = struct {
         embedding_input: [32]u8,
         embedding_dependency: ?[32]u8 = null,
         embedding: ?[]const f32 = null,
+        embedding_key: ?[32]u8 = null,
         candidate_dependency: ?[32]u8 = null,
         candidates: []const Use,
     };
@@ -1317,9 +1342,27 @@ pub const WorkCache = struct {
             for (entry.candidates, uses) |candidate, *use| {
                 var row = candidate;
                 row.features = null;
+                const fields = try a.dupe(matcher.Field, row.record.fields);
+                for (fields) |*field| {
+                    if (field.value != .vector) continue;
+                    var referenced = entry.candidate_dependency == null;
+                    for (row.vector_refs) |ref| if (std.mem.eql(u8, ref.field, field.name)) {
+                        referenced = true;
+                        break;
+                    };
+                    if (referenced) field.value = .none;
+                }
+                row.record = .{ .fields = fields };
+                if (row.resolved_record) |record| {
+                    const survivor_fields = try a.dupe(matcher.Field, record.fields);
+                    for (survivor_fields) |*field| if (field.value == .vector) {
+                        field.value = .none;
+                    };
+                    row.resolved_record = .{ .fields = survivor_fields };
+                }
                 const identity: RecordIdentity = .{
-                    .fields = @intFromPtr(row.record.fields.ptr),
-                    .len = row.record.fields.len,
+                    .fields = @intFromPtr(candidate.record.fields.ptr),
+                    .len = candidate.record.fields.len,
                     .survivor_fields = if (row.resolved_record) |record| @intFromPtr(record.fields.ptr) else 0,
                     .survivor_len = if (row.resolved_record) |record| record.fields.len else 0,
                     .endpoint = try fingerprint(a, .{ row.doc_ref, row.label, row.resolved_doc_ref }),
@@ -1333,7 +1376,7 @@ pub const WorkCache = struct {
                 }
                 use.* = .{ .candidate = slot.value_ptr.*, .features = candidate.features };
             }
-            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = entry.embedding, .candidate_dependency = entry.candidate_dependency, .candidates = uses };
+            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = if (entry.embedding_key == null) entry.embedding else null, .embedding_key = entry.embedding_key, .candidate_dependency = entry.candidate_dependency, .candidates = uses };
         }
         // Large canonical vectors are stored once per work unit, not once per
         // mention/candidate pair. Each pair retains just its comparison features.
@@ -1401,7 +1444,7 @@ pub const WorkCache = struct {
                 candidate.* = wire.candidates[use.candidate];
                 candidate.features = use.features;
             }
-            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = entry.embedding, .candidate_dependency = entry.candidate_dependency, .candidates = candidates };
+            mention.* = .{ .local_id = entry.local_id, .embedding_input = entry.embedding_input, .embedding_dependency = entry.embedding_dependency, .embedding = entry.embedding, .embedding_key = entry.embedding_key, .candidate_dependency = entry.candidate_dependency, .candidates = candidates };
         }
         return .{ .version = wire.version, .promotion_enabled = wire.promotion_enabled, .mentions = mentions };
     }
@@ -1412,6 +1455,7 @@ pub const MentionWork = struct {
     embedding_input: [32]u8,
     embedding_dependency: ?[32]u8 = null,
     embedding: ?[]const f32 = null,
+    embedding_key: ?[32]u8 = null,
     candidate_dependency: ?[32]u8 = null,
     candidates: []const Candidate = &.{},
 };
@@ -1472,6 +1516,8 @@ pub const ResolutionStage = struct {
     /// `embedding` gets one from its text before blocking/scoring, so `ann`
     /// candidate search and cosine comparisons have a query vector.
     embedder: ?MentionEmbedder = null,
+    embedding_cache: ?EmbeddingCache = null,
+    vector_loader: ?VectorLoader = null,
     /// Optional human-curation overrides: when set, a mention with a recorded
     /// review decision takes that decision/endpoint instead of the scorer's, so
     /// a curated link survives re-resolution (replay-stable curation).
@@ -1577,6 +1623,15 @@ pub const ResolutionStage = struct {
         if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
             for (parsed.entities, 0..) |*entity, i| {
                 if (alias_mask[i] or entity.embedding != null or entity.text.len == 0) continue;
+                const cache_key: ?[32]u8 = if (self.embedding_dependency) |dependency| try fingerprint(arena, .{ dependency, work[i].embedding_input }) else null;
+                if (self.embedding_cache) |cache| if (cache_key) |key| {
+                    if (cache.get(cache.ptr, arena, key) catch null) |vector| {
+                        entity.embedding = vector;
+                        work[i].embedding_key = key;
+                        if (self.stats) |stats| stats.reused_embeddings += 1;
+                        continue;
+                    }
+                };
                 if (prior[i]) |entry| {
                     if (sameDependency(entry.embedding_dependency, self.embedding_dependency) and std.mem.eql(u8, &entry.embedding_input, &work[i].embedding_input) and entry.embedding != null) {
                         entity.embedding = entry.embedding;
@@ -1586,6 +1641,10 @@ pub const ResolutionStage = struct {
                 }
                 if (self.stats) |stats| stats.embeddings += 1;
                 entity.embedding = embedder.embed(arena, entity.text) catch null;
+                if (self.retain_work and self.work_retention != .none) if (self.embedding_cache) |cache| if (cache_key) |key| if (entity.embedding) |vector| {
+                    cache.put(cache.ptr, key, vector) catch {};
+                    work[i].embedding_key = key;
+                };
             }
         }
 
@@ -1605,9 +1664,11 @@ pub const ResolutionStage = struct {
                 if (self.candidate_dependency) |dep| work[i].candidate_dependency = try fingerprint(a, .{ dep, entity });
                 if (prior[i]) |entry| {
                     if (sameDependency(entry.candidate_dependency, work[i].candidate_dependency) and !hasCrossTableRedirect(entry.candidates)) {
-                        lists[i] = entry.candidates;
-                        if (self.stats) |stats| stats.reused_candidate_mentions += 1;
-                        continue;
+                        if (try self.hydrateCachedCandidates(a, entry.candidates)) |hydrated| {
+                            lists[i] = hydrated;
+                            if (self.stats) |stats| stats.reused_candidate_mentions += 1;
+                            continue;
+                        }
                     }
                 }
                 if (self.stats) |stats| stats.candidate_mentions += 1;
@@ -1685,6 +1746,29 @@ pub const ResolutionStage = struct {
             resolution.work = .{ .mentions = work, .promotion_enabled = self.promotion_enabled };
         }
         return try resolution.toJson(gpa);
+    }
+
+    fn hydrateCachedCandidates(self: ResolutionStage, a: std.mem.Allocator, cached: []const Candidate) !?[]const Candidate {
+        const candidates = try a.dupe(Candidate, cached);
+        for (candidates) |*candidate| {
+            if (candidate.vector_refs.len == 0) continue;
+            const loader = self.vector_loader orelse return null;
+            const fields = try a.dupe(matcher.Field, candidate.record.fields);
+            for (candidate.vector_refs) |ref| {
+                const vector = loader.load(loader.ptr, a, ref) catch return null;
+                const values = vector orelse return null;
+                if (values.len != ref.dimensions) return null;
+                var found = false;
+                for (fields) |*field| if (std.mem.eql(u8, field.name, ref.field)) {
+                    field.value = .{ .vector = values };
+                    found = true;
+                    break;
+                };
+                if (!found) return null;
+            }
+            candidate.record = .{ .fields = fields };
+        }
+        return candidates;
     }
 
     /// `extraction_key` / `resolution_key` are the primary-store artifact keys

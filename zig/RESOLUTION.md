@@ -1012,16 +1012,18 @@ reusing their comparison features.
 Native Lite candidate revisions include the physical table binding, committed
 source/enrichment sequences, selected index configuration and its applied replay
 sequence. This covers canonical inserts/deletes, table recreation and vectors
-becoming visible after an ANN drain. Embedding revisions cover the destination's
-embedding configuration and the resolved loaded model's immutable revision,
-independently of table mutations. The local revision covers resolved weight,
-shard, ONNX external tensor, tokenizer and processor file generations (inode/size/mtime/ctime), captured
-and cross-checked during model construction. It identifies the loaded generation,
-not a model name or a fresh inspection of potentially replaced files. Providers
-without an attested revision conservatively re-embed; no loaded model means no
-embedding reuse yet. Runtime adapters that
-cannot provide a complete revision return null: candidate fetching and/or
-embedding generation then run again rather than trust incomplete dependencies.
+becoming visible after an ANN drain. Mention embedding keys combine the model
+identity, dimensions and a hash of the exact input string, independently of the
+source or destination table. Local capabilities expose identity before weights
+load: managed downloads hash sorted relative artifact paths and pinned receipt
+SHA-256 digests. Copying or restoring identical files preserves that identity.
+Models without complete receipts fall back to resolved weight, shard, ONNX
+external tensor, tokenizer and processor file generations (inode/size/mtime/ctime).
+Model construction cross-checks file generations to reject mid-load changes, and
+an already-loaded model retains its immutable identity. Unattested providers
+conservatively re-embed. Runtime adapters without complete candidate revisions
+refetch candidates while still allowing an attested embedding identity to reuse
+mention vectors.
 The distributed adapter currently takes this conservative path. Candidate cache
 dependencies use the effective blocking strategy: a resolver without a scorer
 uses exact-key lookup even if its declarative strategy is prefix or ANN.
@@ -1050,10 +1052,19 @@ including empty candidate sets, even if it ultimately changes no matches.
 Prefer `add_index({..., "replaces":"knowledge_v1"})` for graph index versioning.
 It privately constructs the replacement and commits the new index catalog,
 last-owner retirement, routing revisions and cleanup debt together. A construction
-or pre-commit failure leaves the old index serving. `replaces` is a command field,
+or pre-commit failure leaves the old index serving. Private snapshot construction
+and journal catch-up use the existing repair helpers while resolution/promotion
+workers continue. Only the final bounded catch-up and catalog swap take their
+gates. A durable unpublished-build marker temporarily retains replay; interrupted
+builds become the existing bounded cleanup debt on recovery. Field-backed
+replacement aborts with Busy if primary writes advance during its build, because
+the old logical index's field deltas cannot certify the new projection. The old
+index remains serving; retry after the source stabilizes.
+`replaces` is a command field,
 not stored declarative configuration. Retrying the same request is idempotent;
-reopening may reapply the identical new config without `replaces`. Currently
-atomic replacement supports graph-to-graph upgrades with distinct names.
+reopening may reapply the identical new config without `replaces`. When both names
+are absent, it behaves like ordinary add, so callers can always send the command.
+Currently atomic replacement supports graph-to-graph upgrades with distinct names.
 
 The separate-call recipe is add v2 first, then delete v1. When changing identity
 rules, migrate/reset the resolver namespace first and submit v2 with the new
@@ -1062,12 +1073,24 @@ upgrades are supported too: `list_resolver_identities` includes archived configs
 and durable merges, and `set_resolver_namespace` works on retired identities
 without reactivating them. Adding v2 then reactivates the migrated identity.
 `drop_resolver_identity` explicitly discards an archived identity and its merges;
-it rejects active identities. Index deletion only retires last-owner identities.
-The capabilities/status JSON reports `minimum_reader_version`, an on-disk feature
-epoch independent of the package release: 1 for the baseline format, 2 when durable
-merges, aliases, namespace fences or disabled promotion require identity-aware
-readers. Optional retirement/cache metadata does not advance this epoch. Durable identity rules still require a reader supporting
-their format; additive retirement cannot give older readers its execution semantics.
+it rejects active identities. It does not delete existing resolution artifacts,
+canonical rows, application references or their redirects. Delete the source
+documents to remove their artifacts, and drain index cleanup to remove retired
+graph contributions. Explicitly delete canonical rows only after checking other
+resolvers and application references; shared destination rows have no single
+resolver owner. Index deletion only retires last-owner identities.
+
+The capabilities/status JSON reports a durable `minimum_reader_version` feature
+epoch independent of package release: 1 for the baseline catalog, 2 whenever
+extended identity/ownership/cache-policy catalog fields are present, including
+`inline_managed` or `retired`. Catalog transactions stamp this monotonically,
+and opening checks the epoch before parsing resolver definitions. Older unstamped
+catalogs infer their epoch on load; the next mutation stamps it. Status polling
+uses cached epochs under a read guard, with table catalogs loaded during open,
+rather than opening every table under an exclusive polling guard. Portable
+exports retain the stamp; imports validate it against supported versions and
+catalog requirements before publication. CI checks a real pinned pre-PR reader
+against both a plain database and one containing inline ownership fields.
 
 ### Cache storage and mutation invariants
 
@@ -1075,12 +1098,21 @@ Inline resolver configs accept `retain_work: "none" | "embeddings" | "full"`
 (default `full`) and `max_work_bytes` (default 1 MiB, maximum 16 MiB). The latter
 bounds persisted private work per resolution artifact; oversize work is omitted
 entirely without dropping authoritative entity decisions. `embeddings` retains
-only per-mention embeddings and dependencies, never candidate records/features.
-Vectors are encoded losslessly as base64 little-endian IEEE754 f32, including
-hydrated candidate vectors; older JSON-array caches remain readable. Public
-artifact lookup and raw resolution lookup strip `_resolution_work`; the existing
-artifact deletion, replay transaction and backup lifetime own cache GC. Backups
-retain private work as an expendable optimization, not authoritative decisions.
+only per-mention embedding references and dependencies, never candidate records
+or comparison features. Embedded mention vectors live once per model/text key
+in a shared content-addressed side store. Generated ANN candidate vectors retain
+index name, vector id and index revision; application-provided vectors reference
+the primary document field instead, preserving their values. Reuse reloads and
+validates each reference. Missing ids, moved revisions or missing/corrupt cache
+entries trigger candidate fetching or inference, never an identity change based
+on an absent vector. Scorer inputs remain lossless f32.
+
+Public artifact lookup and raw resolution lookup strip `_resolution_work`.
+Artifact deletion/replay own the reference lifetime. The mention side store is
+strictly expendable, excluded from portable backups and swept periodically by
+embedded maintenance (also on drain/vacuum): mark live artifact references, then
+delete unmarked entries in bounded write batches. Losing it only costs inference.
+Portable artifacts may retain cache references; restore safely recomputes misses.
 
 Candidate epochs must advance on every visible destination insert, update,
 delete, TTL expiration and index publication. TTL uses ordinary guarded delete
@@ -1109,7 +1141,10 @@ A merge on source A does not modify source B's resolver mappings, even when both
 promote to the same destination; shared destination rows remain shared data.
 
 `ANTFLY_BUSY` means concurrent execution/configuration prevented establishing a
-consistent operation. Retry the entire read-only `resolve_query` request with
+consistent operation. The public schema calls `add_index` (including `replaces`),
+`delete_index`, `set_resolver_namespace`, `drop_resolver_identity` and key merging
+may also return Busy before mutation when replay/promotion exceeds their bounded
+admission wait. Retry the identical schema request. Retry `resolve_query` with
 bounded exponential backoff (for example 5 ms doubling to 100 ms, with jitter).
 Queries perform no writes and are safe to retry. Identical index config replay,
 namespace reset/mapping to the same desired state, and repeated key merges are

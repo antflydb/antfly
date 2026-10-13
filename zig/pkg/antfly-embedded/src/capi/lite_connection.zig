@@ -234,6 +234,7 @@ const Owner = struct {
                     self.maintenance_pending = (table.*.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 }
             }
+            @import("entity_sink.zig").collectEmbeddingCache(root, false) catch {};
             if (!self.stopping.load(.acquire)) {
                 const now = std.Io.Clock.awake.now(io).nanoseconds;
                 if (now >= self.next_ttl_ns) {

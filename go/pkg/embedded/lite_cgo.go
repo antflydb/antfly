@@ -732,7 +732,8 @@ func (db *DB) ResolverIdentitiesJSON() ([]byte, error) {
 	})
 }
 
-// DropResolverIdentity permanently deletes a retired identity and its merges.
+// DropResolverIdentity deletes retired identity metadata; artifacts and canonical rows remain.
+// Retry on Busy. Delete source documents for artifact cleanup; explicitly delete unused canonical rows.
 func (db *DB) DropResolverIdentity(name string) (bool, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -752,6 +753,7 @@ func (db *DB) DropResolverIdentity(name string) (bool, error) {
 }
 
 // SetResolverNamespaceJSON atomically resets or migrates resolver identities; drain afterward.
+// Retry the identical request on Busy.
 func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 	name, cleanup := makeCStringSlice([]byte(resolver))
 	defer cleanup()
@@ -760,7 +762,8 @@ func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 	})
 }
 
-// AddIndexJSON adds an index from its JSON configuration.
+// AddIndexJSON adds or replaces an index. Retry the identical request on Busy.
+// A graph replaces command also works when its old index is absent.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_db_add_index_json((*C.antfly_db)(handle), input)
@@ -768,6 +771,7 @@ func (db *DB) AddIndexJSON(config []byte) error {
 }
 
 // DeleteIndex deletes an index by name and reports whether it existed.
+// DeleteIndex retires an index; retry on Busy. Returns whether the index existed.
 func (db *DB) DeleteIndex(name string) (bool, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

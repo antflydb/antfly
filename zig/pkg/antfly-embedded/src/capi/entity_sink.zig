@@ -31,34 +31,196 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
 }
 
 fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     // Directory handles permit concurrent writes; without a pinned candidate
     // snapshot they must refetch. Native calls own the database path gate.
-    if (handle.lite_profile != .native) return .{};
     const database = try tables.get(handle, table);
     const physical = try boundTable(ptr, table);
     const index_config = database.core.index_manager.get(index);
     var schema = database.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
     const time_dependent = if (schema) |view| view.visibilityTtlDurationNs() != 0 else false;
-    var producer = try database.getEnrichment(a, .embedding, embedding);
-    defer if (producer) |*config| config.deinit(a);
     const hash = @import("antfly_resolver").fingerprint;
     const embedder = database.resolution_embedder orelse if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null;
     const model_revision: ?[32]u8 = if (embedder) |provider| blk: {
+        if (embedding.len == 0) break :blk null;
         const revision = provider.cache_revision_fn orelse break :blk null;
         break :blk try revision(provider.ptr, a, embedding);
     } else null;
     var applied = try database.core.loadAppliedSequence(a, index);
     if (database.executor.appliedSequence(index)) |live| applied = @max(applied, live);
     return .{
-        .candidates = if (time_dependent) null else try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
-        .embedding = if (model_revision) |revision| try hash(a, .{ physical, embedding, producer, index_config, revision }) else null,
+        .candidates = if (time_dependent or handle.lite_profile != .native) null else try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
+        .embedding = if (model_revision) |revision| try hash(a, .{revision}) else null,
     };
+}
+
+const embedding_cache_prefix = "\x00antfly/cache/mention_embeddings/v1/";
+const embedding_cache_sweep_key = "\x00antfly/cache/mention_embeddings/last_sweep_ns";
+
+fn embeddingCacheKey(a: std.mem.Allocator, digest: [32]u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}", .{ embedding_cache_prefix, std.fmt.bytesToHex(digest, .lower) });
+}
+
+fn embeddingCacheGet(ptr: *anyopaque, a: std.mem.Allocator, digest: [32]u8) anyerror!?[]const f32 {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    const key = try embeddingCacheKey(a, digest);
+    defer a.free(key);
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const raw = read.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len < 40 or !std.mem.eql(u8, raw[0..4], "ECF1")) return null;
+    const count = std.mem.readInt(u32, raw[4..8], .little);
+    if (count == 0 or count > 4 * 1024 * 1024 or raw.len != 40 + @as(usize, count) * 4) return null;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw[40..], &hash, .{});
+    if (!std.mem.eql(u8, &hash, raw[8..40])) return null;
+    const vector = try a.alloc(f32, count);
+    for (vector, 0..) |*value, i| {
+        value.* = @bitCast(std.mem.readInt(u32, raw[40 + i * 4 ..][0..4], .little));
+        if (!std.math.isFinite(value.*)) {
+            a.free(vector);
+            return null;
+        }
+    }
+    return vector;
+}
+
+fn embeddingCachePut(ptr: *anyopaque, digest: [32]u8, vector: []const f32) anyerror!void {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    if (!h.liteOpenModeCanWrite(root.open_mode) or vector.len == 0 or vector.len > 4 * 1024 * 1024) return;
+    const key = try embeddingCacheKey(root.alloc, digest);
+    defer root.alloc.free(key);
+    const raw = try root.alloc.alloc(u8, 40 + vector.len * 4);
+    defer root.alloc.free(raw);
+    @memcpy(raw[0..4], "ECF1");
+    std.mem.writeInt(u32, raw[4..8], @intCast(vector.len), .little);
+    for (vector, 0..) |value, i| {
+        if (!std.math.isFinite(value)) return;
+        std.mem.writeInt(u32, raw[40 + i * 4 ..][0..4], @bitCast(value), .little);
+    }
+    std.crypto.hash.sha2.Sha256.hash(raw[40..], raw[8..40], .{});
+    // Cache keys never enter the authoritative replay stream or portable exports.
+    try root.db.core.store.put(key, raw);
+}
+
+fn loadVector(ptr: *anyopaque, a: std.mem.Allocator, ref: @import("antfly_resolver").VectorReference) anyerror!?[]const f32 {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    const current = (try candidateRevisions(ptr, a, ref.table, ref.index_name, "")).candidates orelse return null;
+    if (!std.mem.eql(u8, &current, &ref.index_revision)) return null;
+    const database = try tables.get(root, ref.table);
+    if (ref.vector_id) |id| {
+        if ((try database.core.index_manager.lookupDenseVectorId(database.core.store, ref.index_name, ref.key)) != id) return null;
+        const dense = database.core.index_manager.denseIndex(ref.index_name) orelse return null;
+        var txn = try dense.index.beginReadTxn();
+        defer txn.abort();
+        const vector = try a.alloc(f32, ref.dimensions);
+        const loaded = dense.index.getVectorInto(&txn, id, vector) catch {
+            a.free(vector);
+            return null;
+        };
+        if (loaded.len != ref.dimensions) {
+            a.free(vector);
+            return null;
+        }
+        return vector;
+    }
+    const raw = try candidateGet(ptr, a, ref.table, ref.key) orelse return null;
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const field = parsed.value.object.get(ref.field) orelse return null;
+    if (field != .array or field.array.items.len != ref.dimensions) return null;
+    const vector = try a.alloc(f32, ref.dimensions);
+    for (field.array.items, vector) |value, *out| switch (value) {
+        .float => |n| out.* = @floatCast(n),
+        .integer => |n| out.* = @floatFromInt(n),
+        else => {
+            a.free(vector);
+            return null;
+        },
+    };
+    return vector;
+}
+
+/// Opportunistic periodic mark/sweep. Artifacts own references, never cache
+/// entries; races with an unfinished artifact only cause harmless recomputation.
+pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
+    if (!h.liteOpenModeCanWrite(root.open_mode)) return;
+    const now = std.math.cast(i64, std.Io.Clock.real.now(h.handleLockIo()).nanoseconds) orelse return;
+    if (!force) {
+        var read = try root.db.core.store.beginReadTxn();
+        defer read.abort();
+        const last = read.get(embedding_cache_sweep_key) catch |err| switch (err) {
+            error.NotFound => "0",
+            else => return err,
+        };
+        const timestamp = std.fmt.parseInt(i64, last, 10) catch 0;
+        if (now >= timestamp and now - timestamp < 15 * std.time.ns_per_min) return;
+    }
+    var live: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer live.deinit(root.alloc);
+    const Mark = struct {
+        fn table(a: std.mem.Allocator, database: *h.db_mod.DB, keys: *std.AutoHashMapUnmanaged([32]u8, void)) !void {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter("");
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!@import("../storage/internal_keys.zig").isResolutionArtifactKey(kv.key)) continue;
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), kv.value, .{}) catch continue;
+                if (parsed != .object) continue;
+                const work = parsed.object.get("_resolution_work") orelse continue;
+                if (work != .object) continue;
+                const mentions = work.object.get("mentions") orelse continue;
+                if (mentions != .array) continue;
+                for (mentions.array.items) |mention| {
+                    if (mention != .object) continue;
+                    const value = mention.object.get("embedding_key") orelse continue;
+                    const key = std.json.parseFromValueLeaky(?[32]u8, arena.allocator(), value, .{}) catch continue;
+                    if (key) |digest| try keys.put(a, digest, {});
+                }
+            }
+        }
+    };
+    try Mark.table(root.alloc, &root.db, &live);
+    var tables_it = root.embedded_tables.valueIterator();
+    while (tables_it.next()) |table| try Mark.table(root.alloc, &table.*.db, &live);
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var write = try root.db.core.store.beginWriteTxn();
+    errdefer write.abort();
+    var deleted: usize = 0;
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        var digest: [32]u8 = undefined;
+        const parsed = if (kv.key.len == embedding_cache_prefix.len + 64) std.fmt.hexToBytes(&digest, kv.key[embedding_cache_prefix.len..]) catch null else null;
+        if (parsed != null and live.contains(digest)) continue;
+        try write.delete(kv.key);
+        deleted += 1;
+        if (deleted % 1024 == 0) {
+            try write.commit();
+            write = try root.db.core.store.beginWriteTxn();
+        }
+    }
+    const stamp = try std.fmt.allocPrint(root.alloc, "{d}", .{now});
+    defer root.alloc.free(stamp);
+    try write.put(embedding_cache_sweep_key, stamp);
+    try write.commit();
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
@@ -129,6 +291,10 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    // Source-table workers share one destination coordinator. Serialize only
+    // canonical read/merge/commit, never extraction, embedding or candidate work.
+    handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());
+    defer handle.promotion_commit_mutex.unlock(h.handleLockIo());
     try @import("sql_commit.zig").recover(handle);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -178,7 +344,10 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
         try root.db.runUntilIdle();
         var iterator = root.embedded_tables.valueIterator();
         while (iterator.next()) |table| try table.*.db.runUntilIdle();
-        if (before == replaySequence(root)) return;
+        if (before == replaySequence(root)) {
+            collectEmbeddingCache(root, false) catch {};
+            return;
+        }
     }
     return error.RunUntilIdleDidNotConverge;
 }
@@ -257,7 +426,23 @@ fn candidateNearest(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, que
         };
         const hydrated = try hydrateCandidate(a, json, query.vector_fields, vector);
         defer if (hydrated) |bytes| a.free(bytes);
-        try consume(ctx, hit.id, hydrated orelse json);
+        const revision = if (query.cache_vectors) (try candidateRevisions(ptr, a, name, query.index_name, "")).candidates else null;
+        if (revision) |epoch| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, hydrated orelse json, .{});
+            defer parsed.deinit();
+            const arena = parsed.arena.allocator();
+            const original = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+            var refs: std.ArrayList(@import("antfly_resolver").VectorReference) = .empty;
+            for (query.vector_fields) |field| if (parsed.value.object.get(field)) |value| {
+                if (value != .array) continue;
+                try refs.append(arena, .{ .field = field, .table = name, .index_name = query.index_name, .key = hit.id, .vector_id = if (original.object.contains(field)) null else vector_id, .index_revision = epoch, .dimensions = value.array.items.len });
+            };
+            const wire = try std.json.Stringify.valueAlloc(arena, refs.items, .{});
+            try parsed.value.object.put(arena, "_resolution_vector_refs", try std.json.parseFromSliceLeaky(std.json.Value, arena, wire, .{}));
+            const referenced = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+            defer a.free(referenced);
+            try consume(ctx, hit.id, referenced);
+        } else try consume(ctx, hit.id, hydrated orelse json);
     };
 }
 
@@ -612,6 +797,46 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", edges[0].target);
     try std.testing.expect((try entities.lookup(a, "concept/laya_reviewer", .{})) == null);
+    const before_duplicate = embed_context.mention_calls;
+    try handle.db.batch(.{ .writes = &.{.{ .key = "claim:duplicate", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
+    const private_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:duplicate", "resolved");
+    defer a.free(private_key);
+    const private_bytes = try handle.db.core.store.get(a, private_key);
+    defer a.free(private_bytes);
+    var private_arena = std.heap.ArenaAllocator.init(a);
+    defer private_arena.deinit();
+    const private_json = try std.json.parseFromSliceLeaky(std.json.Value, private_arena.allocator(), private_bytes, .{});
+    const work_json = private_json.object.get("_resolution_work").?;
+    const mention = work_json.object.get("mentions").?.array.items[0];
+    try std.testing.expect(mention.object.get("embedding").? == .null);
+    const embedding_key = (try std.json.parseFromValueLeaky(?[32]u8, private_arena.allocator(), mention.object.get("embedding_key").?, .{})).?;
+    const wire_candidate = work_json.object.get("candidates").?.array.items[0];
+    const refs = try std.json.parseFromValueLeaky([]const @import("antfly_resolver").VectorReference, private_arena.allocator(), wire_candidate.object.get("vector_refs").?, .{});
+    try std.testing.expect(refs.len > 0 and refs[0].vector_id != null);
+    for (wire_candidate.object.get("record").?.object.get("fields").?.array.items) |field| {
+        if (std.mem.eql(u8, field.object.get("name").?.string, "canonical_embedding")) try std.testing.expect(field.object.get("value").?.object.contains("none"));
+    }
+    var current_ref = refs[0];
+    current_ref.index_revision = (try candidateRevisions(handle, a, "entities", "names", "")).candidates.?;
+    const loaded_vector = (try loadVector(handle, a, current_ref)).?;
+    defer a.free(loaded_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, loaded_vector);
+    var stale_ref = current_ref;
+    stale_ref.index_revision[0] ^= 1;
+    try std.testing.expect((try loadVector(handle, a, stale_ref)) == null);
+    stale_ref = current_ref;
+    stale_ref.vector_id = std.math.maxInt(u64);
+    try std.testing.expect((try loadVector(handle, a, stale_ref)) == null);
+    const orphan: [32]u8 = @splat(255);
+    try embeddingCachePut(handle, orphan, &.{ 1, 0, 0 });
+    try collectEmbeddingCache(handle, true);
+    try std.testing.expect((try embeddingCacheGet(handle, a, orphan)) == null);
+    const retained_embedding = (try embeddingCacheGet(handle, a, embedding_key)).?;
+    defer a.free(retained_embedding);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, retained_embedding);
+
     // Public query resolution uses the stored ANN index and custom scorer
     // vector field, but must not publish a query document or any derived work.
     const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
@@ -743,7 +968,12 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     defer a.free(restored_config);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(reopened_id, .fromSlice(restored_config)));
     try runUntilIdle(reopened);
-    try std.testing.expectEqual(before_reopen_replay, embed_context.mention_calls);
+    try std.testing.expect(embed_context.mention_calls > before_reopen_replay);
+    // Once the restored cache is populated, another new document reuses it.
+    const after_restore = embed_context.mention_calls;
+    try reopened.db.batch(.{ .writes = &.{.{ .key = "claim:restored-duplicate", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(reopened);
+    try std.testing.expectEqual(after_restore, embed_context.mention_calls);
 }
 
 test "capi Lite models_dir loads a real extractor for graph enrichment" {
@@ -1280,4 +1510,63 @@ test "capi inline resolver ownership migrates legacy declarations and preserves 
         defer api.antfly_buffer_free(&out);
         try std.testing.expectEqual(if (independent) h.capi.ErrorCode.ok else h.capi.ErrorCode.not_found, api.antfly_db_render_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Antfly\",\"label\":\"concept\"}"), &out));
     }
+}
+
+test "capi resolver reader version is checked before opening catalog" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("reader-epoch");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    try handle.db.core.store.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, "3");
+    api.antfly_db_close(id);
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null));
+}
+
+test "capi resolver sparse model revision uses sparse capability discovery" {
+    try h.managed_embedder.testSparseCacheRevision();
+}
+
+test "capi resolver concurrent source promotions preserve shared destination aliases" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("concurrent-promotion");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    try tables.create(root, "entities", "{}", false);
+    var ready = std.atomic.Value(u32).init(0);
+    const State = struct {
+        root: *h.Handle,
+        ready: *std.atomic.Value(u32),
+        json: []const u8,
+        failure: ?anyerror = null,
+        fn run(state: *@This()) void {
+            _ = state.ready.fetchAdd(1, .acq_rel);
+            while (state.ready.load(.acquire) < 2) std.atomic.spinLoopHint();
+            upsert(state.root, std.heap.c_allocator, "entities", "entity/ada", state.json) catch |err| {
+                state.failure = err;
+            };
+        }
+    };
+    var first: State = .{ .root = root, .ready = &ready, .json = "{\"entity_type\":\"person\",\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" };
+    var second: State = .{ .root = root, .ready = &ready, .json = "{\"entity_type\":\"person\",\"canonical_name\":\"ADA\",\"aliases\":[\"ADA\"]}" };
+    const one = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, State.run, .{&first});
+    const two = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, State.run, .{&second});
+    one.join();
+    two.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    const destination = try tables.get(root, "entities");
+    var row = (try destination.lookup(a, "entity/ada", .{})).?;
+    defer row.deinit(a);
+    var json = try std.json.parseFromSlice(std.json.Value, a, row.json, .{});
+    defer json.deinit();
+    try std.testing.expectEqual(@as(usize, 2), json.value.object.get("aliases").?.array.items.len);
+    const canonical = json.value.object.get("canonical_name").?.string;
+    try std.testing.expect(std.mem.eql(u8, canonical, "Ada") or std.mem.eql(u8, canonical, "ADA"));
 }

@@ -61,6 +61,39 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
     return out;
 }
 
+/// Monotonic feature epoch, published with catalog mutations and checked before parsing.
+pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
+pub const supported_reader_version: u32 = 2;
+
+pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidResolverConfig;
+    for (parsed.value.array.items) |entry| {
+        if (entry != .object) return error.InvalidResolverConfig;
+        for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
+            if (entry.object.contains(field)) return 2;
+        }
+    }
+    return 1;
+}
+
+pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
+    const raw = txn.get(minimum_reader_key) catch |err| switch (err) {
+        error.NotFound => return 1,
+        else => return err,
+    };
+    const version = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidResolverConfig;
+    if (version > supported) return error.UnsupportedDatabaseReaderVersion;
+    return version;
+}
+
+pub fn stampMinimumReaderVersion(a: Allocator, txn: anytype, catalog: []const u8) !u32 {
+    const version = @max(try readMinimumReaderVersion(txn, supported_reader_version), try catalogReaderVersion(a, catalog));
+    try txn.put(minimum_reader_key, if (version == 1) "1" else "2");
+    return version;
+}
+
 pub const ResolverSourceArtifactKind = enum {
     /// Root and unit-scoped asset artifacts. This is the legacy default.
     asset,
@@ -779,4 +812,26 @@ test "capi resolver source artifact scopes overlap symmetrically" {
             try std.testing.expectEqual(left.overlaps(right), right.overlaps(left));
         }
     }
+}
+
+test "capi resolver reader epochs fence older readers and remain monotonic" {
+    const Txn = struct {
+        value: ?[]const u8 = null,
+        pub fn get(self: *@This(), _: []const u8) anyerror![]const u8 {
+            return self.value orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), _: []const u8, value: []const u8) !void {
+            self.value = value;
+        }
+    };
+    const a = std.testing.allocator;
+    var txn: Txn = .{};
+    try std.testing.expectEqual(@as(u32, 1), try readMinimumReaderVersion(&txn, 1));
+    try std.testing.expectEqual(@as(u32, 1), try stampMinimumReaderVersion(a, &txn, "[]"));
+    try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[{\"inline_managed\":true}]"));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 1));
+    try std.testing.expectEqual(@as(u32, 2), try readMinimumReaderVersion(&txn, 2));
+    try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[]"));
+    txn.value = "3";
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 2));
 }

@@ -23,6 +23,9 @@ import os
 import random
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -834,3 +837,115 @@ def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
             assert b.list_resolver_identities()[0]["merges"] == []
         with db.open_table("entities" if shared else "entities_b") as entities:
             assert entities.lookup("entity/ada")["canonical_name"] == "Ada"
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    path = tmp_path / ("replace.aflite" if storage == antfly_embedded.Storage.LITE else "replace")
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+        config = _resolver_graph("knowledge_v2", "concepts")
+        config["resolvers"][0]["min_confidence"] = 0.2
+        config["resolvers"][0]["promote"] = True
+        config["replaces"] = "knowledge_v1"
+        db.add_index(config)
+        assert db.capabilities()["minimum_reader_version"] == 2
+        before = db.list_resolver_identities()
+        # The target exists, but the old index is the default full-text index.
+        bad = json.loads(json.dumps(config))
+        bad["replaces"] = next(i["name"] for i in db.list_indexes() if i["name"] != "knowledge_v2")
+        bad["resolvers"][0]["min_confidence"] = 0
+        with pytest.raises(antfly_embedded.InvalidArgumentError):
+            db.add_index(bad)
+        assert db.list_resolver_identities() == before
+        db.add_index(config)
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.list_resolver_identities() == before
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_database_reader_version_stays_one(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("plain.aflite" if storage == antfly_embedded.Storage.LITE else "plain")
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.status()["capabilities"]["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_concurrent_shared_destination_promotion_preserves_aliases(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    path = tmp_path / ("concurrent.aflite" if storage == antfly_embedded.Storage.LITE else "concurrent")
+    with _open_graph_test(path, options) as db:
+        db.create_table("entities", {})
+        for name in ["source_a", "source_b"]:
+            db.create_table(name, {})
+            with db.open_table(name) as source:
+                config = _resolver_graph("knowledge", "people", destination="entities")
+                config["resolvers"][0]["promote"] = True
+                source.add_index(config)
+        barrier = threading.Barrier(2)
+
+        def promote(name, text):
+            # Directory storage has one writer owner. Both source tables share
+            # that owner and its destination transaction coordinator.
+            with db.open_table(name) as source:
+                barrier.wait(timeout=30)
+                source.batch_json(
+                    {"inserts": {"claim": {"kg": {"entities": [{"id": "a", "text": text, "label": "person"}]}}}}
+                )
+                for attempt in range(20):
+                    try:
+                        db.run_until_idle()
+                        return
+                    except antfly_embedded.BusyError:
+                        if attempt == 19:
+                            raise
+                        time.sleep(0.01)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(promote, name, text) for name, text in [("source_a", "Ada"), ("source_b", "ADA")]
+            ]
+            for future in futures:
+                future.result(timeout=60)
+        db.run_until_idle()
+        with db.open_table("entities") as entities:
+            row = json.loads(entities.get_raw("entity/ada"))
+            assert row["canonical_name"] in ["Ada", "ADA"]
+            assert set(row["aliases"]) == {"Ada", "ADA"}
+
+
+def test_previous_reader_opens_plain_database_and_rejects_inline_identity(tmp_path):
+    previous = os.environ.get("ANTFLY_LITE_PREVIOUS_LIBRARY")
+    if not previous:
+        if os.environ.get("ANTFLY_LITE_REQUIRE_PREVIOUS_READER") == "1":
+            pytest.fail("ANTFLY_LITE_PREVIOUS_LIBRARY is required")
+        pytest.skip("set ANTFLY_LITE_PREVIOUS_LIBRARY to the pinned pre-PR reader")
+    options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.LITE)
+    plain = tmp_path / "previous-plain.aflite"
+    identity = tmp_path / "previous-identity.aflite"
+    with _open_graph_test(plain, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(identity, options) as db:
+        config = _resolver_graph("knowledge", "concepts")
+        config["resolvers"][0]["promote"] = True
+        db.add_index(config)
+        assert db.capabilities()["minimum_reader_version"] == 2
+    script = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_open.restype = ctypes.c_int
+lib.antfly_db_close.argtypes = [ctypes.c_void_p]
+for path, accepted in [(sys.argv[2], True), (sys.argv[3], False)]:
+    handle = ctypes.c_void_p()
+    code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
+    assert (code == 0) == accepted, (path, code)
+    if handle.value:
+        lib.antfly_db_close(handle)
+"""
+    subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity)], check=True, timeout=60)

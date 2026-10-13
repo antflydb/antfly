@@ -31,6 +31,7 @@ pub const CandidateSource = struct {
         /// Candidate record fields consumed by comparisons against the mention vector.
         /// Empty means ANN blocking only: return stored JSON without vector hydration.
         vector_fields: []const []const u8 = &.{},
+        cache_vectors: bool = false,
     };
     pub const ScanOptions = struct {
         limit: usize = 0,
@@ -59,6 +60,9 @@ pub const CandidateSource = struct {
         embedding: ?[32]u8 = null,
     };
     pub const VTable = struct {
+        embedding_cache_get: ?*const fn (*anyopaque, std.mem.Allocator, [32]u8) anyerror!?[]const f32 = null,
+        embedding_cache_put: ?*const fn (*anyopaque, [32]u8, []const f32) anyerror!void = null,
+        load_vector: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_resolver").VectorReference) anyerror!?[]const f32 = null,
         revisions: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!Revisions = null,
         /// Bulk point candidates. Missing keys are omitted. Values are borrowed
         /// during consume; this optional capability must preserve point-read semantics.

@@ -451,6 +451,7 @@ fn processChangedExtractionWithConfigOptions(
                     .mode = mode,
                     .ann_index_name = annIndexName(cfg),
                     .candidate_limit = candidateLimit(cfg),
+                    .cache_vectors = retain_work and cfg.retain_work == .full,
                 };
                 break :blk source_provider.provider();
             }
@@ -520,9 +521,11 @@ fn processChangedExtractionWithConfigOptions(
         .retain_work = retain_work,
         .work_retention = cfg.retain_work,
         .max_work_bytes = cfg.max_work_bytes,
-        .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding, cfg.name_embedding_dims }) else null,
+        .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding_dims }) else null,
         .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
         .embedder = stage_embedder,
+        .embedding_cache = if (batch_source) |source| if (source.vtable.embedding_cache_get != null and source.vtable.embedding_cache_put != null) .{ .ptr = source.ptr, .get = source.vtable.embedding_cache_get.?, .put = source.vtable.embedding_cache_put.? } else null else null,
+        .vector_loader = if (batch_source) |source| if (source.vtable.load_vector) |load| .{ .ptr = source.ptr, .load = load } else null else null,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,
         .doc_ref_binding = if (batch_source) |source| .{
@@ -995,6 +998,7 @@ fn appendEntityCandidateWithResolved(
             .key = try allocator.dupe(u8, rk),
         } else null,
         .resolved_record = resolved_record,
+        .vector_refs = if (parsed.value.object.get("_resolution_vector_refs")) |refs| try std.json.parseFromValueLeaky([]const resolver_lib.VectorReference, allocator, refs, .{ .allocate = .alloc_always }) else &.{},
     });
 }
 
@@ -1027,6 +1031,7 @@ const SourceCandidateProvider = struct {
     mode: CandidateMode,
     ann_index_name: []const u8,
     candidate_limit: usize,
+    cache_vectors: bool = false,
 
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1151,11 +1156,32 @@ const SourceCandidateProvider = struct {
                     try appendEntityCandidateWithResolved(alloc, self.table, candidate_key, raw, resolved_key, resolved_raw, &candidates);
                 }
             }
+            try self.referenceVectors(alloc, candidates.items);
             try prepared.put(a, key, candidates.items);
         }
         // Candidate records are immutable; repeated mentions share decoding and
         // allocation while the scorer still evaluates each mention separately.
         for (keys, lists) |key, *list| list.* = prepared.get(key).?;
+    }
+
+    fn referenceVectors(self: *SourceCandidateProvider, a: std.mem.Allocator, candidates: []resolver_lib.Candidate) !void {
+        if (!self.cache_vectors) return;
+        const revisions = self.source.vtable.revisions orelse return;
+        const revision = (try revisions(self.source.ptr, a, self.table, self.ann_index_name, "")).candidates orelse return;
+        for (candidates) |*candidate| {
+            var refs: std.ArrayListUnmanaged(resolver_lib.VectorReference) = .empty;
+            try refs.appendSlice(a, candidate.vector_refs);
+            for (candidate.record.fields) |field| {
+                if (field.value != .vector) continue;
+                var found = false;
+                for (refs.items) |ref| if (std.mem.eql(u8, ref.field, field.name)) {
+                    found = true;
+                    break;
+                };
+                if (!found) try refs.append(a, .{ .field = field.name, .table = candidate.doc_ref.table, .index_name = self.ann_index_name, .key = candidate.doc_ref.key, .index_revision = revision, .dimensions = field.value.vector.len });
+            }
+            candidate.vector_refs = refs.items;
+        }
     }
 
     const ScanCtx = struct {
@@ -1217,6 +1243,7 @@ const SourceCandidateProvider = struct {
                 var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
                 self.source.nearest(allocator, self.table, .{
                     .index_name = self.ann_index_name,
+                    .cache_vectors = self.cache_vectors,
                     .embedding = emb,
                     .k = self.candidate_limit,
                     .vector_fields = try self.resolver.candidateVectorFields(allocator),

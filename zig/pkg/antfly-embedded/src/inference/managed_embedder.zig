@@ -1258,7 +1258,7 @@ pub const ManagedEmbedder = struct {
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
-            .cache_revision_fn = cacheRevision,
+            .cache_revision_fn = sparseCacheRevision,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
@@ -1510,6 +1510,18 @@ pub const ManagedEmbedder = struct {
             error.OutOfMemory => return err,
             else => return null,
         };
+        return capabilities.model_revision;
+    }
+
+    fn sparseCacheRevision(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?[32]u8 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!entry.sparse) return error.UnsupportedEmbeddingProvider;
+        const local = entry.antfly_provider orelse return null;
+        const resolve = local.model_capabilities orelse return null;
+        const capabilities = try AntflyProviderBoundary.call("model_capabilities", local.boundary_dispatch, resolve, .{ local.ptr, a, entry.model, inference_work.Task.embed });
+        try capabilities.validate();
+        if (capabilities.task != .embed) return error.InvalidInferenceCapabilities;
         return capabilities.model_revision;
     }
 
@@ -10221,4 +10233,27 @@ test "managed embedder propagates requested dimensions and pins across HTTP text
     for (0..3) |_| try server.handleOne();
     try group.await(io);
     if (failure) |err| return err;
+}
+
+pub fn testSparseCacheRevision() !void {
+    const Local = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return a.alloc(db_embedder.SparseEmbedding, 0);
+        }
+        fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: inference_work.Task) anyerror!inference_work.InferenceCapabilities {
+            return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = @as([32]u8, @splat(7)) };
+        }
+    };
+    var context: u8 = 0;
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}", .{ .ptr = &context, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .model_capabilities = Local.capabilities });
+    defer managed.deinit();
+    managed.entries[0].sparse = true;
+    const sparse = managed.sparseInterface();
+    const revision = (try sparse.cache_revision_fn.?(sparse.ptr, std.testing.allocator, "semantic_idx")).?;
+    try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
+    const dense = managed.denseInterface();
+    try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
 }

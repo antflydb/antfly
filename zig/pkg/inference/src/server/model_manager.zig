@@ -2377,6 +2377,42 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
     return componentDependencySignature(io, paths.items);
 }
 
+/// Stable identity before loading weights. Managed receipts use relative paths
+/// and pinned content digests, so copying/restoring a model preserves reuse.
+pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
+    defer if (receipt) |*validated| validated.deinit();
+    if (receipt) |*validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var complete = true;
+        for (artifacts) |artifact| {
+            const digest = artifact.sha256 orelse {
+                complete = false;
+                break;
+            };
+            if (digest.len != 64) return error.InvalidManagedDownload;
+            var decoded: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        if (complete) {
+            var result: [32]u8 = undefined;
+            hash.final(&result);
+            return result;
+        }
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
 pub const LoadedModel = struct {
     resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
@@ -7437,6 +7473,10 @@ pub const ModelManager = struct {
         return self.waitForLoadFlight(flight_key, flight, control);
     }
 
+    pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+        return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
+    }
+
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
@@ -7485,7 +7525,8 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
-        const resolution_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -7718,7 +7759,7 @@ pub const ModelManager = struct {
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
-        if (!std.mem.eql(u8, &resolution_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
             .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
@@ -13767,4 +13808,37 @@ test "ONNX export tokenizer format takes precedence over root JSON" {
         defer a.free(ids);
         try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
     }
+}
+
+test "capi resolver model identity uses receipt digests before load and survives copying" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const body = "identical fake model weights";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .source = .{ .owner = "test", .name = "identity", .variant = "safetensors", .selected_format = "safetensors" }, .artifacts = &.{.{ .path = "model.safetensors", .size = body.len, .sha256 = &hex }} }, .{});
+    defer a.free(receipt);
+    for ([_]std.Io.Dir{ first.dir, second.dir }) |dir| {
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    const first_path = try first.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(second_path);
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    const original = try modelIdentity(a, io, first_path, manifest);
+    const copied = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &copied);
+    // Invalid weight bytes deliberately prove identity lookup does not load a model.
+    const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
+    defer a.free(changed);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = changed });
+    const new_identity = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expect(!std.mem.eql(u8, &original, &new_identity));
 }

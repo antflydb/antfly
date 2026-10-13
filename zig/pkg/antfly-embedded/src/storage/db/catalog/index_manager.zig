@@ -107,6 +107,8 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
+const graph_replacement_build_prefix = "\x00\x00__metadata__:graph_replacement_build_v1/";
+const GraphReplacementBuild = struct { name: []const u8, generation: u64 };
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic_v1 = "antfly-active-index-root-v1\n";
@@ -1317,6 +1319,7 @@ pub const IndexManager = struct {
     /// Stable-address lifetime admission shared by DB searches and background
     /// publishers. The high bit closes admission during structural changes.
     published_dense_admission: std.atomic.Value(u32) = .init(0),
+    minimum_reader_version: std.atomic.Value(u32) = .init(1),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -11549,6 +11552,7 @@ pub const IndexManager = struct {
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
+        if (!read_only) try self.recoverGraphReplacementBuilds(store);
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -11751,7 +11755,7 @@ pub const IndexManager = struct {
     }
 
     pub const AtomicCatalogMutation = union(enum) {
-        batch: struct { puts: []const docstore_mod.KVPair, delete: []const u8 },
+        batch: struct { puts: []const docstore_mod.KVPair, deletes: []const []const u8 },
         put: struct {
             key: []const u8,
             value: []const u8,
@@ -11873,7 +11877,7 @@ pub const IndexManager = struct {
     };
 
     pub fn add(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
-        try self.addWithOptions(store, cfg, true, null, null);
+        try self.addWithOptions(store, cfg, true, null, null, null);
     }
 
     pub fn addWithAtomicMutation(
@@ -11882,7 +11886,7 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         admission: ?AtomicCatalogMutation,
     ) !void {
-        try self.addWithOptions(store, cfg, true, admission, null);
+        try self.addWithOptions(store, cfg, true, admission, null, null);
     }
 
     /// Managed admission deliberately leaves corpus reconstruction to the
@@ -11895,13 +11899,85 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         admission: ?AtomicCatalogMutation,
     ) !void {
-        try self.addWithOptions(store, cfg, false, admission, null);
+        try self.addWithOptions(store, cfg, false, admission, null, null);
     }
 
     /// Construct the new graph privately, then publish ownership transfer,
     /// old retirement and cleanup debt in the same transaction as admission.
-    pub fn replaceGraphWithAtomicMutation(self: *IndexManager, store: anytype, old: []const u8, cfg: types.IndexConfig, admission: ?AtomicCatalogMutation) !void {
-        try self.addWithOptions(store, cfg, true, admission, old);
+    pub fn replaceGraphWithAtomicMutation(self: *IndexManager, store: anytype, old: []const u8, cfg: types.IndexConfig, admission: ?AtomicCatalogMutation, prepared: ?*?DetachedIndex) !void {
+        try self.addWithOptions(store, cfg, true, admission, old, prepared);
+    }
+
+    /// Reserve only the unpublished physical namespace. Corpus construction
+    /// happens in a separate manager while the serving replay workers continue.
+    pub fn prepareGraphReplacementConfig(self: *IndexManager, store: anytype, old: []const u8, cfg: types.IndexConfig) !types.IndexConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        const previous = self.get(old) orelse return error.NotFound;
+        if (previous.kind != .graph or cfg.kind != .graph) return error.UnsupportedOperation;
+        var stored = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
+        errdefer stored.deinit(self.alloc);
+        try self.prepareStorageForFreshCatalogEntry(store, stored);
+        try self.provisionConfiguredIndexDirDurable(stored);
+        const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
+        defer self.alloc.free(key);
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation }, .{});
+        defer self.alloc.free(value);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(key, value);
+        try txn.commit();
+        return stored;
+    }
+
+    /// The durable build marker precedes the source snapshot, so retaining the
+    /// journal while it exists closes the capture/truncation race. Normal replay
+    /// continues; activation or recovery removes this temporary retention pin.
+    pub fn clampReplayForGraphReplacementBuilds(self: *IndexManager, store: anytype, effective: u64) !u64 {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(graph_replacement_build_prefix)) |row| {
+            if (std.mem.startsWith(u8, row.key, graph_replacement_build_prefix)) return 0;
+        }
+        return effective;
+    }
+
+    /// Turn interrupted unpublished builds into the existing bounded cleanup
+    /// debt. Their outputs never become catalog authority or replace old graphs.
+    pub fn recoverGraphReplacementBuilds(self: *IndexManager, store: anytype) !void {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var builds: std.ArrayList(struct { key: []const u8, build: GraphReplacementBuild }) = .empty;
+        {
+            var txn = try runtime_store.store.beginRead();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
+                try builds.append(a, .{ .key = try a.dupe(u8, kv.key), .build = try std.json.parseFromSliceLeaky(GraphReplacementBuild, a, kv.value, .{ .allocate = .alloc_always }) });
+            }
+        }
+        for (builds.items) |item| {
+            var cleanup = try self.prepareGeneratedArtifactCleanupPlan(item.build.name, .graph, item.build.generation, null, null, &.{});
+            defer cleanup.deinit();
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            if (cleanup.key) |key| try txn.put(key, cleanup.value.?);
+            try txn.delete(item.key);
+            try txn.commit();
+        }
     }
 
     fn addWithOptions(
@@ -11911,6 +11987,7 @@ pub const IndexManager = struct {
         allow_backfill: bool,
         admission: ?AtomicCatalogMutation,
         replaces: ?[]const u8,
+        prepared: ?*?DetachedIndex,
     ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -11927,8 +12004,10 @@ pub const IndexManager = struct {
         // Catalog absence is the generation boundary. Reject any
         // crash-surviving artifact cleanup before the new config can bind the
         // same public artifact names, then discard name-scoped index state.
-        try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
-        try self.provisionConfiguredIndexDirDurable(stored_cfg);
+        if (prepared == null) {
+            try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
+            try self.provisionConfiguredIndexDirDurable(stored_cfg);
+        }
 
         const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
             self.freshDenseNativeV2Permitted(stored_cfg)
@@ -11954,13 +12033,20 @@ pub const IndexManager = struct {
         const has_generated_after_enrichments = if (enrichments_changed) try self.computeGeneratedEnrichmentTargetCache() else false;
         var admission_committed = false;
         errdefer if (!admission_committed and enrichment_catalog_committed) self.storeGeneratedEnrichmentTargetCache(has_generated_after_enrichments);
-        try self.openConfiguredIndexWithAuthorization(
-            store,
-            stored_cfg,
-            allow_backfill and fresh_native_generation == null,
-            false,
-            fresh_native_generation != null,
-        );
+        if (prepared) |entry| {
+            const opened = entry.* orelse return error.IndexNotFound;
+            if (std.meta.activeTag(opened) != .graph or types.indexConfigHash(opened.graph.config) != types.indexConfigHash(stored_cfg)) return error.IndexReplacementConfigurationMismatch;
+            try self.appendOpenedIndex(opened);
+            entry.* = null;
+        } else {
+            try self.openConfiguredIndexWithAuthorization(
+                store,
+                stored_cfg,
+                allow_backfill and fresh_native_generation == null,
+                false,
+                fresh_native_generation != null,
+            );
+        }
         errdefer {
             self.removeInMemory(stored_cfg.name);
         }
@@ -12003,7 +12089,9 @@ pub const IndexManager = struct {
             }
             const old_admission = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, old);
             defer self.alloc.free(old_admission);
-            try self.persistCatalogExcludingWithAtomicMutation(store, old, .{ .batch = .{ .puts = writes[0..write_count], .delete = old_admission } });
+            const build_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored_cfg.name });
+            defer self.alloc.free(build_key);
+            try self.persistCatalogExcludingWithAtomicMutation(store, old, .{ .batch = .{ .puts = writes[0..write_count], .deletes = &.{ old_admission, build_key } } });
             self.clearManagedAdmissionSnapshotForIndex(old);
             self.removeInMemory(old);
             self.clearAppliedSequenceAfterCatalogRemoval(store, old);
@@ -22022,7 +22110,7 @@ pub const IndexManager = struct {
         if (atomic_mutation) |mutation| switch (mutation) {
             .batch => |batch| {
                 for (batch.puts) |write| try txn.put(write.key, write.value);
-                txn.delete(batch.delete) catch |err| switch (err) {
+                for (batch.deletes) |key| txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
                 };
@@ -22137,6 +22225,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(resolver_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, resolver_data);
         try txn.put(resolver_catalog_key, resolver_data);
+        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, resolver_data);
         // Revisions and durable replay cursors publish with ownership removal.
         for (definitions) |cfg| {
             if (!cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
@@ -22149,7 +22238,7 @@ pub const IndexManager = struct {
         if (atomic_mutation) |mutation| switch (mutation) {
             .batch => |batch| {
                 for (batch.puts) |write| try txn.put(write.key, write.value);
-                txn.delete(batch.delete) catch |err| switch (err) {
+                for (batch.deletes) |key| txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
                 };
@@ -22168,6 +22257,7 @@ pub const IndexManager = struct {
             },
         };
         try txn.commit();
+        self.minimum_reader_version.store(reader_version, .release);
         for (definitions) |cfg| {
             if (cfg.retired) continue;
             for (self.resolvers.items) |*entry| if (std.mem.eql(u8, entry.name, cfg.name)) {
@@ -22267,12 +22357,14 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, enrichment_data);
         try txn.put(resolver_catalog_key, resolver_data);
+        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         try @import("../artifact_inventory.zig").refresh(&txn);
         try @import("../artifact_inventory.zig").invalidateOrdered(&txn);
         try txn.commit();
+        self.minimum_reader_version.store(reader_version, .release);
         self.invalidateWritePlanSnapshot();
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
@@ -22282,11 +22374,14 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
+        const stamped_version = try resolver_catalog.readMinimumReaderVersion(&txn, resolver_catalog.supported_reader_version);
+        self.minimum_reader_version.store(stamped_version, .release);
         const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
         };
 
+        self.minimum_reader_version.store(@max(stamped_version, try resolver_catalog.catalogReaderVersion(self.alloc, data)), .release);
         const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
         defer {
             for (configs) |*cfg| cfg.deinit(self.alloc);
@@ -22392,6 +22487,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
+        const reader_version = try resolver_catalog.stampMinimumReaderVersion(self.alloc, &txn, data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
@@ -22402,6 +22498,7 @@ pub const IndexManager = struct {
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         }
         try txn.commit();
+        self.minimum_reader_version.store(reader_version, .release);
         self.invalidateWritePlanSnapshot();
     }
 

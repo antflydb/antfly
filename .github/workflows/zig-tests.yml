@@ -680,8 +680,15 @@ jobs:
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
             -j1
-          cd ..
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir ../../.zig-cache --prefix ../../zig-out
+          cd ../../..
+          python3 scripts/ci/prepare_lite_previous_reader.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
           ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
@@ -1135,8 +1142,15 @@ jobs:
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
             -j1
-          cd ..
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir ../../.zig-cache --prefix ../../zig-out
+          cd ../../..
+          python3 scripts/ci/prepare_lite_previous_reader.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
           ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \

@@ -3081,12 +3081,14 @@ fn localModelCapabilitiesInScope(
         }
     }
     if (task == .embed) {
-        // Do not load weights just to inspect capabilities. Until an actual
-        // loaded generation exists, storage must conservatively re-embed.
+        // Identity inspection reads the receipt/manifest, never model weights.
+        // Prefer the immutable loaded generation if it already exists.
         if (node.model_manager.acquireLoadedModel(model_path)) |cached| {
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+        } else {
+            result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }
     }
     try result.validate();

@@ -823,9 +823,9 @@ pub const DBCore = struct {
         return applied;
     }
 
-    pub fn replaceGraphIndex(self: *DBCore, old: []const u8, cfg: types.IndexConfig, admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation) !u64 {
-        try self.index_manager.replaceGraphWithAtomicMutation(self.store, old, cfg, admission);
-        return if (try self.index_manager.requiresEnrichmentReplay(cfg.name)) 0 else self.nextDerivedSequence();
+    pub fn replaceGraphIndex(self: *DBCore, old: []const u8, cfg: types.IndexConfig, admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation, prepared: ?*?index_manager_mod.IndexManager.DetachedIndex) !u64 {
+        try self.index_manager.replaceGraphWithAtomicMutation(self.store, old, cfg, admission, prepared);
+        return if (prepared != null) self.nextDerivedSequence() else if (try self.index_manager.requiresEnrichmentReplay(cfg.name)) 0 else self.nextDerivedSequence();
     }
 
     pub fn addManagedIndex(

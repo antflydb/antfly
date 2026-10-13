@@ -888,7 +888,7 @@ pub fn decodeInlineDataUriAlloc(
 }
 
 pub const InferenceCapabilities = struct {
-    /// Immutable revision of the loaded weights and tokenizer generation.
+    /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
     task: Task,
     input_modalities: Modalities,
