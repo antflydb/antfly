@@ -122,6 +122,44 @@ class ArchiveQualificationTest(unittest.TestCase):
             }
         self.assertTrue(archive.assess(self.regional, self.config)["passed"])
 
+    def test_composed_benchmark_requires_both_sources_and_bounded_current_fixture(self):
+        self.config.update(benchmark_composed=True, composed_current_rows=1000)
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["composed_benchmarks"] = {
+                name: {
+                    "first_search_ms": 1000,
+                    "warm_samples_ms": [100] * 20,
+                    "result_count": 5,
+                    "current_fixture_rows": 1000,
+                }
+                for name in ("union", "saved_overlay")
+            }
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
+        for field, value in (
+            ("first_search_ms", 20000),
+            ("first_search_ms", float("nan")),
+            ("warm_samples_ms", [100]),
+            ("warm_samples_ms", [5000] * 20),
+            ("current_fixture_rows", 999),
+            ("result_count", 0),
+        ):
+            with self.subTest(field=field, value=value):
+                evidence = deepcopy(self.regional)
+                evidence["runs"]["indexed"][0]["composed_benchmarks"]["saved_overlay"][
+                    field
+                ] = value
+                self.assertFalse(archive.assess(evidence, self.config)["passed"])
+
+    def test_composed_plan_rejects_missing_correctness_or_unbounded_fixture(self):
+        self.config["benchmark_composed"] = True
+        with self.assertRaisesRegex(ValueError, "Composed benchmarks require"):
+            archive.plan(self.config, self.inventory)
+        self.config["qualify_composed_sources"] = True
+        self.config["composed_current_rows"] = 4097
+        with self.assertRaisesRegex(ValueError, "Composed benchmarks require"):
+            archive.plan(self.config, self.inventory)
+
     def test_registration_is_part_of_the_initial_publication_gate(self):
         self.regional["runs"]["indexed"][0]["registration_seconds"] = 3000
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
@@ -145,6 +183,17 @@ class ArchiveQualificationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Run limit exhausted"):
                 archive.reserve(ledger, self.config, "unapproved-retry")
             self.assertEqual(len(json.loads(ledger.read_text())["runs"]), 2)
+
+    def test_dry_run_reports_exhausted_admission_without_resetting_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            self.config["budget"]["max_runs"] = 1
+            archive.reserve(ledger, self.config, "failed")
+            before = ledger.read_bytes()
+            result = archive.plan(self.config, self.inventory, json.loads(before))
+            self.assertEqual(result["remaining_run_slots"], 0)
+            self.assertFalse(result["can_reserve_next_run"])
+            self.assertEqual(ledger.read_bytes(), before)
 
     def test_existing_ledger_cannot_silently_reset_prior_spend(self):
         with tempfile.TemporaryDirectory() as directory:
