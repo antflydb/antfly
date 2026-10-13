@@ -648,7 +648,7 @@ fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64)
         // The injected resolution map is keyed by mention local id. An
         // id-less extraction entity (GLiNER2.5's positional payloads) was
         // resolved under its decimal array position — the same identity
-        // lib/resolver's parseExtractionEntities assigns it.
+        // pkg/antfly-embedded/resolver's parseExtractionEntities assigns it.
         var buf: [20]u8 = undefined;
         const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
         const local_id = if (raw_entity) |entity|

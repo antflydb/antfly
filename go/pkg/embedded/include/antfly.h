@@ -442,6 +442,32 @@ antfly_error_code antfly_db_run_until_idle_json(antfly_db *db, antfly_buffer *ou
 antfly_error_code antfly_db_pending_work_stats_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_replay_generated_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_list_indexes_json(antfly_db *db, antfly_buffer *out);
+/** Render a durable resolver's key without writes. Mention JSON: {"text","label"}.
+ * Returns {"minted_key","key","table","config_generation"}; key follows configured aliases.
+ * Free output with antfly_buffer_free. ANN matching is not performed. */
+antfly_error_code antfly_db_render_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice mention_json, antfly_buffer *out_json);
+
+/* Resolve {"text":"..."} through the resolver's configured asset extractor, or
+ * {"extraction":{"entities":[...]}} through the same resolver. Includes aliases,
+ * mention embeddings, ANN candidates and scoring. Returns {extraction,resolution}
+ * with canonical doc_refs and decisions. Does not write documents or artifacts.
+ * Requires an asset-scoped resolver; text requires an extractor producer. */
+antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out_json);
+/** Merge fully rendered keys: {"key":"concept/old","target":"concept/new"}.
+ * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
+ * antfly_db_run_until_idle to re-resolve existing artifacts and replace mention edges.
+ * Promotion-enabled resolvers also reconcile entity documents. Arbitrary application
+ * references and manually supplied graph edges are not rewritten. */
+antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
+
+/** Set {table,key_template} and choose reset_merges:true (clears inline aliases too,
+ * unless an explicit replacement aliases array is supplied) or
+ * key_map:[{key,target},...] mapping every inline/durable alias endpoint.
+ * A durable fence rejects stale inline namespaces/aliases even after reset.
+ * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
+ * Application-owned documents/references are not renamed. */
+antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
+
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);

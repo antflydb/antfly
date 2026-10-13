@@ -27923,6 +27923,28 @@ components:
           type: string
         key_template:
           type: string
+        promote:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+          description: Materialize canonical entity documents. False resolves graph keys without promotion.
+        aliases:
+          type: array
+          description: Explicit redirects between fully rendered keys in this resolver's table; no entity
+            documents required. Changes trigger corpus re-resolution.
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - key
+              - target
+            properties:
+              key:
+                type: string
+                minLength: 1
+              target:
+                type: string
+                minLength: 1
         labels:
           type: array
           items:
