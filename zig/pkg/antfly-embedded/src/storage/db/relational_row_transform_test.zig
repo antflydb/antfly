@@ -19,6 +19,44 @@ const mapper = @import("document_mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 
+test "relational index system typed rewrite preserves JSON SQL null and blob operand identity" {
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"coalesce","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"eA=="}]}},{"column":"same","expression":{"op":"eq","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"AAE="}]}},{"column":"j","expression":{"op":"literal","type":"json","value":null}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"g":{"type":"blob"},"same":{"type":"boolean","nullable":true},"j":{"type":"json","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    ;
+    var program = try transform.Program.init(alloc, before, after, .{});
+    defer program.deinit();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, owner: *const transform.Program, packed_row: []const u8, expected_blob: []const u8, expected_same: ?bool) !void {
+            var result = try owner.transform(a, packed_row);
+            defer result.deinit(a);
+            const view = try codec.ordinalRowView(result.packed_row, owner.target.tableSchema().*, owner.target.physicalLayout());
+            const columns = owner.target.tableSchema().relational_columns;
+            const g = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "g").?)).?;
+            const same = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "same").?)).?;
+            const j = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "j").?)).?;
+            const payload = (try view.findCell(owner.target.physicalLayout().ordinalForName(columns, "payload").?)).?;
+            try std.testing.expectEqualStrings(expected_blob, g.value.bytes_val);
+            if (expected_same) |boolean| {
+                try std.testing.expect(!same.is_null);
+                try std.testing.expectEqual(boolean, same.value.bool_val);
+            } else try std.testing.expect(same.is_null);
+            try std.testing.expect(j.is_json and j.is_null);
+            try std.testing.expectEqualStrings("{\"scale\":1.20}", payload.value.bytes_val);
+            try std.testing.expectEqual(@as(usize, 1), result.expression_input_cells);
+        }
+    };
+    for ([_][]const u8{ "{\"b\":\"AAE=\",\"payload\":{\"scale\":1.20}}", "{\"b\":null,\"payload\":{\"scale\":1.20}}" }, [_][]const u8{ "AAE=", "eA==" }, [_]?bool{ true, null }) |json, expected, same| {
+        var source = try sourceRow(&program, alloc, json);
+        defer source.deinit(alloc);
+        try Run.run(alloc, &program, source.packed_row, expected, same);
+        var stable = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ &program, source.packed_row, expected, same });
+    }
+}
+
 test "SQL expression DDL rewrite computes stored generated columns and admitted defaults from base cells" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

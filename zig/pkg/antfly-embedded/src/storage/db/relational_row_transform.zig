@@ -186,6 +186,11 @@ pub const Program = struct {
         @memset(values, .null);
         @memset(present, false);
         const expression_set = self.target.validator().?.execution.expressions;
+        var expression_bytes: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena, &expression_bytes);
+        var input: expressions.PreparedInput = undefined;
+        try input.initBoundRow(&execution, row);
+        defer input.deinit();
         var expression_input_cells: usize = 0;
         for (to.relational_columns, self.source_ordinals, 0..) |column, old, ordinal| {
             const old_ordinal = old orelse continue;
@@ -197,15 +202,15 @@ pub const Program = struct {
             if (expression_set) |set| {
                 if (!set.read_columns[ordinal] or set.generated_columns[ordinal]) continue;
                 expression_input_cells += 1;
-                values[ordinal] = try scalarValue(column, cell);
+                values[ordinal] = try input.valueAt(&execution, old_ordinal);
             }
         }
         if (expression_set) |set| {
-            try set.applyValuesWithDefaultMask(arena, values, present, if (self.default_mask != null) .apply_to_absent else .preserve_absence, self.default_mask);
+            try set.applyValuesWithExecution(&execution, values, present, if (self.default_mask != null) .apply_to_absent else .preserve_absence, self.default_mask);
             for (set.bindings) |binding| {
                 if (!binding.generated and cells[binding.ordinal] != null) continue;
                 if (!present[binding.ordinal]) continue;
-                cells[binding.ordinal] = try scalarCell(to.relational_columns[binding.ordinal], @intCast(binding.ordinal), values[binding.ordinal]);
+                cells[binding.ordinal] = try scalarCell(&execution, to, to.relational_columns[binding.ordinal], @intCast(binding.ordinal), values[binding.ordinal]);
             }
         }
 
@@ -288,28 +293,12 @@ fn validateStored(alloc: Allocator, bytes: []const u8, view: registry.SchemaView
     }
 }
 
-fn scalarValue(column: schema.RelationalColumn, cell: codec.Cell) !expressions.Value {
-    if (cell.is_null) return .null;
-    return switch (column.column_type) {
-        .string => .{ .string = cell.value.bytes_val },
-        .blob => .{ .blob = cell.value.bytes_val },
-        .integer => .{ .integer = cell.value.i64_val },
-        .number => .{ .number = cell.value.f64_val },
-        .numeric => .{ .numeric = cell.value.bytes_val },
-        .sql_array => if (cell.sql_array_element_type == column.sql_element_type and column.sql_element_type != null)
-            .{ .sql_array = .{ .element_type = column.sql_element_type.?, .bytes = cell.value.bytes_val } }
-        else
-            error.InvalidRelationalExpressionInput,
-        .boolean => .{ .boolean = cell.value.bool_val },
-        .datetime => .{ .datetime = cell.value.u64_val },
-        else => error.InvalidRelationalExpressionInput,
-    };
-}
-
-fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.Value) !codec.Cell {
+fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, column: schema.RelationalColumn, ordinal: u32, value: expressions.Value) !codec.Cell {
+    try execution.charge(1);
+    if (value != .null and !std.mem.eql(u8, @tagName(value), @tagName(column.column_type))) return error.InvalidRelationalExpressionInput;
     if (value == .sql_array and (column.column_type != .sql_array or value.sql_array.element_type != column.sql_element_type)) return error.InvalidRelationalExpressionInput;
     const value_type: @import("../../section/typed_doc_values.zig").ValueType = switch (column.column_type) {
-        .string, .blob, .numeric, .sql_array => .bytes_val,
+        .string, .blob, .numeric, .sql_array, .json => .bytes_val,
         .integer => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
@@ -320,35 +309,99 @@ fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.
         .ordinal = ordinal,
         .path = column.path,
         .value_type = value_type,
+        .is_json = column.is_json,
         .is_numeric = column.column_type == .numeric,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
         .is_null = value == .null,
         .value = switch (value) {
             .null => .{ .bytes_val = "" },
-            .string, .blob, .numeric => |bytes| .{ .bytes_val = bytes },
+            .string, .numeric => |bytes| .{ .bytes_val = bytes },
+            .blob => |bytes| blk: {
+                const size = std.base64.standard.Encoder.calcSize(bytes.len);
+                try execution.charge(size);
+                if (size > execution.bytes.*) return execution.limit();
+                const encoded = try execution.alloc.alloc(u8, size);
+                execution.bytes.* -= size;
+                _ = std.base64.standard.Encoder.encode(encoded, bytes);
+                break :blk .{ .bytes_val = encoded };
+            },
             .integer => |integer| .{ .i64_val = integer },
             .number => |number| .{ .f64_val = number },
             .boolean => |boolean| .{ .bool_val = boolean },
             .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
             .sql_array => |array| .{ .bytes_val = array.bytes },
-            // JSON output requires its explicit SQL NULL provenance boundary.
-            .json => return error.InvalidRelationalExpressionInput,
+            .json => |json| blk: {
+                var memory: @import("../../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+                defer execution.bytes.* -|= memory.footprint();
+                var work: @import("../../sql/json_order.zig").Budget = .{ .shared = &execution.numeric };
+                try @import("../../sql/json_order.zig").validateTextDomain(json.value, &work, 0);
+                const encoded = (if (table.requires_jsonb_display)
+                    content.canonicalJsonStorageValueAlloc(memory.allocator(), json.value)
+                else
+                    content.canonicalJsonValueAlloc(memory.allocator(), json.value)) catch |err| {
+                    if (err == error.OutOfMemory and memory.isExhausted()) return execution.limit();
+                    return err;
+                };
+                try execution.charge(encoded.len);
+                break :blk .{ .bytes_val = encoded };
+            },
         },
     };
 }
 
-test "relational index system array rewrite operands retain canonical bytes and reject element reinterpretation" {
+test "relational index system typed rewrite output preserves JSON identity and shares admission" {
+    const Run = struct {
+        fn run(backing: Allocator) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const a = region.allocator();
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":1.20}", .{ .parse_numbers = false });
+            const json: @import("../../sql/row_value.zig").Json = .{ .value = parsed };
+            const column: schema.RelationalColumn = .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any };
+            var bytes: usize = expressions.max_allocated_bytes;
+            var execution = expressions.Execution.init(a, &bytes);
+            const cell = try scalarCell(&execution, .{ .requires_jsonb_display = true }, column, 0, .{ .json = &json });
+            try std.testing.expect(cell.is_json and !cell.is_null);
+            try std.testing.expectEqualStrings("{\"n\":1.20}", cell.value.bytes_val);
+            try std.testing.expect(bytes < expressions.max_allocated_bytes);
+            const present_null: @import("../../sql/row_value.zig").Json = .{ .value = .null };
+            const json_null = try scalarCell(&execution, .{}, column, 0, .{ .json = &present_null });
+            try std.testing.expect(json_null.is_json and !json_null.is_null);
+            try std.testing.expectEqualStrings("null", json_null.value.bytes_val);
+            const sql_null = try scalarCell(&execution, .{}, column, 0, .null);
+            try std.testing.expect(sql_null.is_json and sql_null.is_null);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(&execution, .{}, column, 0, .{ .string = "null" }));
+            bytes = 0;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, scalarCell(&execution, .{}, column, 0, .{ .json = &json }));
+            // Byte admission failure remains sticky even for a later NULL,
+            // which needs no output allocation of its own.
+            bytes = expressions.max_allocated_bytes;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, scalarCell(&execution, .{}, column, 0, .null));
+            var blob_bytes: usize = 3;
+            var blob_execution = expressions.Execution.init(a, &blob_bytes);
+            const blob_column: schema.RelationalColumn = .{ .name = "b", .path = "b", .column_type = .blob };
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, scalarCell(&blob_execution, .{}, blob_column, 0, .{ .blob = &.{ 0, 1 } }));
+            try std.testing.expectEqual(@as(usize, 3), blob_bytes);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "relational index system array rewrite results retain canonical bytes and reject element reinterpretation" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(region.allocator(), &bytes);
     const column: schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 };
     const value: expressions.Value = .{ .sql_array = .{ .element_type = .int64, .bytes = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } } };
-    const cell = try scalarCell(column, 0, value);
+    const cell = try scalarCell(&execution, .{}, column, 0, value);
     try std.testing.expectEqual(column.sql_element_type, cell.sql_array_element_type);
-    const borrowed = try scalarValue(column, cell);
-    try std.testing.expectEqual(value.sql_array.bytes.ptr, borrowed.sql_array.bytes.ptr);
-    try std.testing.expectEqual(value.sql_array.element_type, borrowed.sql_array.element_type);
+    try std.testing.expectEqual(value.sql_array.bytes.ptr, cell.value.bytes_val.ptr);
     var wrong = column;
     wrong.sql_element_type = .int32;
-    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(wrong, 0, value));
-    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarValue(wrong, cell));
-    const nullable = try scalarCell(column, 0, .null);
-    try std.testing.expectEqual(expressions.Value.null, try scalarValue(column, nullable));
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(&execution, .{}, wrong, 0, value));
+    const nullable = try scalarCell(&execution, .{}, column, 0, .null);
+    try std.testing.expect(nullable.is_null);
 }

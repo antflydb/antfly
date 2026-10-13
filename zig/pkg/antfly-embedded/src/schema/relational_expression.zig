@@ -97,6 +97,24 @@ pub const PreparedInput = struct {
         self.* = undefined;
     }
 
+    /// Read an already resolved physical ordinal from this pinned source.
+    /// Rewrite mappings need no repeated name lookup or secondary cell decoder.
+    pub fn valueAt(self: *PreparedInput, execution: *Execution, ordinal: u32) !Value {
+        try self.requireExecution(execution);
+        if (self.source != .bound_row) return error.InvalidRelationalExpressionInput;
+        const columns = self.source.bound_row.table_schema.relational_columns;
+        if (ordinal >= columns.len) return error.InvalidRelationalExpressionInput;
+        try execution.charge(1);
+        const column = columns[ordinal];
+        return Plan.readColumn(execution, .{ .prepared = self }, .{
+            .op = .column,
+            .kind = column.column_type,
+            .sql_type = column.sql_element_type,
+            .column_name = column.name,
+            .ordinal = ordinal,
+        });
+    }
+
     fn requireExecution(self: *const PreparedInput, execution: *Execution) !void {
         if (execution != self.execution or self.roots.context != &execution.numeric or self.roots.admission.?.remaining != execution.bytes) return error.InvalidRelationalExpressionInput;
         try execution.charge(0);
@@ -252,6 +270,17 @@ test "relational index system shared prepared input decodes cold JSON once and k
             try std.testing.expectEqualStrings("1.20", one.json.value.object.get("n").?.number_string);
             try std.testing.expectEqual(@as(usize, 1), input.roots.decodes);
             try std.testing.expectEqual(@as(usize, 1), input.preparations);
+            var bound: PreparedInput = undefined;
+            try bound.initBoundRow(&execution, source);
+            defer bound.deinit();
+            const resolved = try bound.valueAt(&execution, 0);
+            const before = execution.numeric.remaining;
+            const retained = remaining;
+            try std.testing.expectEqual(resolved.json, (try bound.valueAt(&execution, 0)).json);
+            try std.testing.expectEqual(@as(u64, 2), before - execution.numeric.remaining);
+            try std.testing.expectEqual(retained, remaining);
+            try std.testing.expectEqual(@as(usize, 1), bound.roots.decodes);
+            try std.testing.expectError(error.InvalidRelationalExpressionInput, bound.valueAt(&execution, 1));
             const Cancel = struct {
                 fn poll(_: ?*anyopaque) anyerror!void {
                     return error.Canceled;

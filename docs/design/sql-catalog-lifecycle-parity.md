@@ -4443,3 +4443,39 @@ source-catalog freshness, license headers, the 2,053-file Apache boundary and
 unchanged original inventory integrity passed. Original accounting remains
 479 implemented / 136 rejected / 73 superseded / 898 unresolved. Public durable
 JSON activation is still unfinished; this checkpoint does not claim otherwise.
+
+### Typed operands and results through native row rewrite
+
+Native schema rewrite now reads its already resolved source ordinals through
+the shared PreparedInput rather than maintaining a second scalar decoder.
+Selected blob operands are decoded from AROW base64 exactly once; ordinary
+scalars and encoded NUMERIC/array operands remain borrowed. Unselected JSON
+payloads retain their canonical bytes without decoding. Input preparation,
+generated/default evaluation and result encoding share one sticky execution
+work/cancellation identity and byte allowance. Resolved reads charge work even
+when the selected scalar needs no allocation.
+
+This fixes two existing rewrite errors: physical base64 was previously treated
+as logical blob bytes, and generated blob results were written as raw bytes.
+Generated JSON SQL NULL was also rejected by the scalar-only output adapter.
+Typed result encoding now preserves the JSON null bit independently of present
+JSON null, uses the schema-selected JSONB display policy, and base64-encodes
+logical blob results before physical row encoding. Retained JSON serializer
+capacity competes with the same allowance as other expression results.
+
+Focused Debug regressions cover generated blob coalescing and comparison for
+binary and SQL NULL inputs, generated JSON SQL NULL, unchanged JSONB display
+scale, selected-input counts, direct ordinal cache reuse, typed result fences,
+sticky byte-admission failure and all observed allocation failures. These are
+rewrite/kernel proofs, not public durable-JSON activation or original sql-0671
+completion. Compiler/literal identity, capability and public lowering/client
+activation, authenticated CHECK provenance and vector-batch adapters remain
+open. Original inventory accounting is unchanged.
+
+Reviewed-source qualification passed all 1,025 SQL Debug tests (three existing
+skips, zero failures/leaks, 21/21 steps) and all 239 native Debug tests (zero
+failures/leaks, 50/50 steps). The five focused ownership/rewrite tests passed
+with allocation sweeps. Formatting, source-catalog freshness, Apache boundary
+and license checks, and original inventory integrity passed. Cache GC was
+previewed while other builds were active; nothing was deleted. Origin/main
+e8666a5b75 was already contained in the branch. No public API changed.
