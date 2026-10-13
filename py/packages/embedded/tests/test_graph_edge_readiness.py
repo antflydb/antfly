@@ -1091,6 +1091,7 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGKILL and pipe-polling fixture")
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_replacement_recovers_after_process_exit(tmp_path, storage):
     import select
