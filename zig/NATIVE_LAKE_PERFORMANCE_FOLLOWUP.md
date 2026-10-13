@@ -3672,3 +3672,20 @@ exact generation selectors under the resulting root. Scripted providers now
 serialize their internal object/version maps while allowing remote-operation
 hooks to overlap. No live-provider throughput or archive-scale latency result is
 claimed by these operation-count and ownership regressions.
+
+Qualification on Zig 0.17.0/macOS ARM64 with main `832c9d6659` merged: the
+final Debug build passes all 95 steps, including the server, 432 lake integration
+executions (159 shared and 273 server), and 31 focused executions (two shared and
+29 server), without failures or leaks. The same 31 focused contracts pass in
+ReleaseFast (50/50 steps). All 15 selected real Parquet/Iceberg E2Es pass on the
+final server in 281.32 seconds, covering small and paged stored highlights,
+accepted text/dense/sparse/hybrid cuts, incremental refresh, transforms and
+restart. The reset-generation regression uses analyzed text search to verify
+that identical LSNs and row keys cannot reuse older accepted text. Object-store
+contracts pass 91 tests with two live-provider cases intentionally skipped.
+Apache boundaries (2,036 sources), license headers, changed-source formatting
+and Git whitespace checks pass. Required cache GC ran; an additional 24.5 GiB of
+unused old server/test artifacts was safely evicted from this worktree, preserving
+active outputs and restoring E2E disk headroom without overriding safeguards.
+Live-provider retention qualification and archive-scale benchmarking remain
+previously deferred; these checks establish correctness and bounded/reused work.
