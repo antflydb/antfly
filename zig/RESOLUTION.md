@@ -1091,7 +1091,10 @@ candidate revision until they can provide a pinned snapshot across tables;
 they refetch instead of reusing an unpinned candidate set. Aliases and merges are
 applied from current identity state on each resolution and override cached matches.
 Retiring a labeled resolver invalidates its source-sharing catch-all siblings and
-publishes durable backfill cursors in the retirement transaction.
+publishes durable backfill cursors in the retirement transaction. Routing dependencies
+use the same artifact-scope overlap rule as admission and query routing: `any`
+overlaps both `asset` and `chunk`, while `asset` and `chunk` remain disjoint.
+Activation and label changes use this rule too.
 
 ### Source-table identity and retries
 

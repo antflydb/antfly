@@ -700,14 +700,19 @@ def _stored_resolution(db, name):
 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
-def test_retirement_replays_catchall_routing(tmp_path, storage):
+@pytest.mark.parametrize("owner_kind,catchall_kind", [("asset", "asset"), ("any", "asset"), ("asset", "any")])
+def test_retirement_replays_catchall_routing(tmp_path, storage, owner_kind, catchall_kind):
     options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
     with _open_graph_test(
         tmp_path / ("routing.aflite" if storage == antfly_embedded.Storage.LITE else "routing"), options
     ) as db:
         # Catch-all initially skips the person mention claimed by its sibling.
-        db.add_index(_resolver_graph("people_index", "people", labels=["person"]))
-        db.add_index(_resolver_graph("catchall_index", "catchall"))
+        owner = _resolver_graph("people_index", "people", labels=["person"])
+        owner["resolvers"][0]["source_artifact_kind"] = owner_kind
+        catchall = _resolver_graph("catchall_index", "catchall")
+        catchall["resolvers"][0]["source_artifact_kind"] = catchall_kind
+        db.add_index(owner)
+        db.add_index(catchall)
         extraction = {"entities": [{"id": "a", "text": "Ada", "label": "person"}]}
         db.batch_json({"inserts": {"claim": {"kg": extraction}}})
         db.run_until_idle()
@@ -725,7 +730,8 @@ def test_retirement_replays_catchall_routing(tmp_path, storage):
         assert "_resolution_work" not in stored
         # Reactivation restores the label owner and retires the catch-all's
         # previous entity, without changing the catch-all's inline config.
-        db.add_index(_resolver_graph("people_index_v2", "people", labels=["person"]))
+        owner["name"] = "people_index_v2"
+        db.add_index(owner)
         db.run_until_idle()
         assert _stored_resolution(db, "resolved_catchall")["entities"] == []
 

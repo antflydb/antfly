@@ -12282,8 +12282,7 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.name, cfg.name)) continue;
             if (entry.labels.len == 0) continue;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) continue;
-            if (!entry.source_artifact_kind.matches(cfg.source_artifact_kind) and
-                !cfg.source_artifact_kind.matches(entry.source_artifact_kind)) continue;
+            if (!entry.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
             for (entry.labels) |claimed| {
                 if (cfg.resolvesLabel(claimed)) return true;
             }
@@ -22082,7 +22081,7 @@ pub const IndexManager = struct {
         if (cfg.labels.len != 0) return false;
         for (retiring) |name| {
             const removed = self.getResolver(name) orelse continue;
-            if (removed.labels.len > 0 and removed.source_artifact_kind == cfg.source_artifact_kind and
+            if (removed.labels.len > 0 and removed.source_artifact_kind.overlaps(cfg.source_artifact_kind) and
                 std.mem.eql(u8, removed.source_artifact, cfg.source_artifact)) return true;
         }
         return false;
@@ -22338,7 +22337,7 @@ pub const IndexManager = struct {
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(a);
         for (configs) |sibling| {
-            if (sibling.retired or std.mem.eql(u8, sibling.name, cfg.name) or sibling.source_artifact_kind != cfg.source_artifact_kind or
+            if (sibling.retired or std.mem.eql(u8, sibling.name, cfg.name) or !sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind) or
                 !std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
             try labels.appendSlice(a, sibling.labels);
         }
@@ -47325,4 +47324,41 @@ test "generator config ownership unwinds dense and sparse partial allocation" {
 fn appendOwnedString(alloc: Allocator, out: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
     try out.ensureUnusedCapacity(alloc, 1);
     out.appendAssumeCapacity(try alloc.dupe(u8, value));
+}
+
+test "capi resolver routing dependencies include overlapping artifact scopes" {
+    const alloc = std.testing.allocator;
+    const kinds = [_]resolver_catalog.ResolverSourceArtifactKind{ .asset, .chunk, .any };
+    for (kinds) |owner_kind| {
+        for (kinds) |catchall_kind| {
+            var manager = try IndexManager.init(alloc, ".");
+            defer manager.deinit();
+            const owner = ResolverConfig{
+                .name = "people",
+                .table = "default",
+                .source_artifact = "kg",
+                .source_artifact_kind = owner_kind,
+                .resolution_artifact = "people_resolved",
+                .key_template = "entity/{{ uslug _entity.text }}",
+                .labels = &.{"person"},
+            };
+            const catchall = ResolverConfig{
+                .name = "catchall",
+                .table = "default",
+                .source_artifact = "kg",
+                .source_artifact_kind = catchall_kind,
+                .resolution_artifact = "catchall_resolved",
+                .key_template = "entity/{{ uslug _entity.text }}",
+            };
+            try manager.resolvers.append(alloc, try ResolverConfig.clone(alloc, owner));
+            const expected = owner_kind == catchall_kind or owner_kind == .any or catchall_kind == .any;
+            try std.testing.expectEqual(expected, manager.routingChangedByRetirement(catchall, &.{"people"}));
+            const labels = try IndexManager.resolverRoutingLabelsAlloc(alloc, manager.resolvers.items, catchall);
+            defer alloc.free(labels);
+            try std.testing.expectEqualStrings(if (expected) "[\"person\"]" else "[]", labels);
+            var unrelated = catchall;
+            unrelated.source_artifact = "other";
+            try std.testing.expect(!manager.routingChangedByRetirement(unrelated, &.{"people"}));
+        }
+    }
 }

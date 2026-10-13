@@ -72,6 +72,11 @@ pub const ResolverSourceArtifactKind = enum {
     pub fn matches(self: ResolverSourceArtifactKind, actual: ResolverSourceArtifactKind) bool {
         return self == .any or self == actual;
     }
+
+    /// Whether two resolver scopes can consume the same artifact kind.
+    pub fn overlaps(self: ResolverSourceArtifactKind, other: ResolverSourceArtifactKind) bool {
+        return self.matches(other) or other.matches(self);
+    }
 };
 
 pub const ResolverConfig = struct {
@@ -763,4 +768,15 @@ test "capi retired resolver identities retain merges without entering execution 
     }
     try applyMergeState(a, restored, sidecar);
     try std.testing.expectEqualStrings("b", restored[0].merges[0].target);
+}
+
+test "capi resolver source artifact scopes overlap symmetrically" {
+    const kinds = [_]ResolverSourceArtifactKind{ .asset, .chunk, .any };
+    for (kinds) |left| {
+        for (kinds) |right| {
+            const expected = left == right or left == .any or right == .any;
+            try std.testing.expectEqual(expected, left.overlaps(right));
+            try std.testing.expectEqual(left.overlaps(right), right.overlaps(left));
+        }
+    }
 }

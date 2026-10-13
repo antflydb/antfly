@@ -139,8 +139,7 @@ pub fn siblingClaimedLabelsAlloc(
     for (resolvers) |*sibling| {
         if (sibling == cfg) continue;
         if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
-        if (!sibling.source_artifact_kind.matches(cfg.source_artifact_kind) and
-            !cfg.source_artifact_kind.matches(sibling.source_artifact_kind)) continue;
+        if (!sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
         for (sibling.labels) |label| try claimed.append(gpa, label);
     }
     return try claimed.toOwnedSlice(gpa);
