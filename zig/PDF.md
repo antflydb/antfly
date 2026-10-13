@@ -485,8 +485,9 @@ active compressor's peak share one bounded budget.
   document ranges, so shard range transfer cannot separate temporary results
   from their recovery metadata. They never participate in public artifact scans.
 - Planning and publication stay on the enrichment thread. Synchronous text
-  peers run first; bounded embedding jobs hold independent grants and drain
-  before owner inference. Optional next-window rendering may overlap the final
+  peers run first; bounded window jobs hold independent grants, and a
+  controlled owner may overlap peers within the same host concurrency ceiling.
+  Explicit admission denial drains the cohort before one serial retry. Optional next-window rendering may overlap the final
   admitted embedding cohort. Renderer workers never enter enrichment state or
   concurrently use another consumer's PDF session. There is no document-sized
   rendered-image cache.
@@ -878,6 +879,13 @@ The implementation follows these long-term rules:
   still-bounded stale capability lease. Capability-stale conflicts retry once
   within the owning single-flight; authoritative 4xx responses, invalid
   contracts, expired contexts, and canceled callers never publish stale data.
+  An upstream catalog 404, 405, or 501 is a negatively cached
+  `discovery unsupported` result, not an inference outage: explicitly
+  configured legacy endpoints continue with conservative singleton/serial
+  execution. The discovering owner still keeps its own cancellation or
+  deadline outcome; publishing the legacy cache entry for other callers never
+  turns a canceled operation into fallback work
+  ([history](../docs/design/pdf/history/review-and-migration-ledger-2026.md)).
 - Capability caches and concurrent I/O executors are runtime-owned services,
   not document-owned implementation details. Read and write enrichment borrow
   them for their invocation lifetimes; shutdown destroys them only after their

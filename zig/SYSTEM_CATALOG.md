@@ -91,11 +91,22 @@ fallback decoders.
   a per-service `std.Io` lane at a 250 ms cadence with at most one bounded
   intent per slice; tracking adoption remains explicit, and ambiguous admission
   re-observes durable state.
+- Replica-local publication preparation shares a fixed-capacity native pool:
+  eight evidence slots and at most two active owned scans per store. Each call
+  advances one bounded page outside the apply mutex; unrelated groups cannot
+  evict active scans, and completed evidence is reused only at the same
+  applied-log position, source epoch, ready state and root identity. Admission
+  is nonblocking and idle snapshots close after sixty seconds; service control
+  rounds use this pool instead of owning duplicate leader scans
+  ([history](../docs/design/relational/history/namespace-relation-ownership-log.md)).
 - Bulk catalog resolution accepts at most 256 combined lookups in one immutable
   transaction pinned to one published live root; missing or unpublished roots
   cannot attest absence. Name-sensitive replacements use a guarded wire tag
   (decoder capability 33) that rechecks the exact active owner, logical table
-  and incarnation in the replacing transaction.
+  and incarnation in the replacing transaction. Guarded writes must install and
+  observe capability 33 before user admission; durable activation cannot
+  decrease within an incarnation
+  ([history](../docs/design/relational/history/namespace-relation-ownership-log.md)).
 - Index DDL has its own relation kind: CREATE retains its owning table; DROP
   resolves names and definitions from one immutable relation cut, authorizes the
   logical owning table first and carries the exact owner into native guarded

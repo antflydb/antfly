@@ -225,7 +225,8 @@ test "pgwire client encoding remains UTF-8 across SET SHOW and RESET" {
 }
 
 test "pgwire RESET ALL is one complete connection setting command" {
-    // sql-0045: local syntax coverage; custom app.* catalog parity is pending.
+    // sql-0045: local syntax coverage; app.* catalog parity is covered by
+    // pgwire-original-session-commands.
     const alloc = std.testing.allocator;
     try std.testing.expect((try settingCommand(alloc, "RESET ALL;")).? == .reset_all);
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "RESET ALL; SELECT 1"));
@@ -233,8 +234,8 @@ test "pgwire RESET ALL is one complete connection setting command" {
 }
 
 test "pgwire DISCARD ALL requires one complete command" {
-    // sql-0047: syntax and connection ownership only; original catalog scope
-    // also includes custom settings and remains unresolved.
+    // sql-0047: syntax and connection ownership only; custom app.* settings
+    // are covered by pgwire-original-session-commands.
     const alloc = std.testing.allocator;
     try std.testing.expect((try settingCommand(alloc, "DISCARD ALL;")).? == .discard_all);
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "DISCARD ALL; SELECT 1"));
