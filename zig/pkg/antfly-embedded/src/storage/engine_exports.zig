@@ -52,7 +52,13 @@ fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, op
 }
 
 fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) engine.Outcome(SearchWithDenseProfileResult) {
-    return .{ .value = self.searchWithDenseProfile(alloc, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    var value = self.searchWithDenseProfile(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) };
+    // Captured requests retain caller-owned hooks, never the stack proxy.
+    value.request.native_key_predicate = req.native_key_predicate;
+    return .{ .value = value };
 }
 
 fn searchWithCapturedRequestAndExecutionContext(
@@ -61,11 +67,23 @@ fn searchWithCapturedRequestAndExecutionContext(
     req: types.SearchRequest,
     exec_ctx: types.ExecutionContext,
 ) engine.Outcome(SearchWithCapturedRequestResult) {
-    return .{ .value = self.searchWithCapturedRequestAndExecutionContext(alloc, req, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    var value = self.searchWithCapturedRequestAndExecutionContext(alloc, received, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) };
+    // Captured requests retain caller-owned hooks, never the stack proxy.
+    value.request.native_key_predicate = req.native_key_predicate;
+    return .{ .value = value };
 }
 
 fn searchLease(lease: DB.QueryReadLease, alloc: Allocator, req: types.SearchRequest) engine.Outcome(SearchWithDenseProfileResult) {
-    return .{ .value = lease.search(alloc, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    var value = lease.search(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) };
+    // Captured requests retain caller-owned hooks, never the stack proxy.
+    value.request.native_key_predicate = req.native_key_predicate;
+    return .{ .value = value };
 }
 
 fn sync(self: *DB, full: bool) engine.Outcome(void) {
@@ -202,12 +220,38 @@ fn relationalIndexBuildStatus(self: *DB, name: []const u8) engine.Outcome(DB.Rel
     return .{ .value = self.relationalIndexBuildStatus(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn reconfigureEnrichmentRuntime(self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) engine.Outcome(void) {
+    return .{ .value = self.reconfigureEnrichmentRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) engine.Outcome(void) {
+    return .{ .value = self.reconfigureEnrichmentRuntimePaused(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) engine.Outcome(void) {
+    return .{ .value = self.resumeEnrichmentRuntimeAfterReconfigure(operation, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn ensureTransactionRecoveryRuntime(self: *DB, cfg: @import("db/maintenance/transaction_runtime.zig").Config) engine.Outcome(void) {
+    return .{ .value = self.ensureTransactionRecoveryRuntime(cfg) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
+    return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 const descriptor: engine.Descriptor = .{
     .table_layout = engine.table_layout,
     .db_layout = engine.db_layout,
     .core_layout = engine.core_layout,
     .handle_layout = engine.handle_layout,
     .registry_layout = engine.registry_layout,
+    .backend_runtime_layout = engine.backend_runtime_layout,
+    .resource_manager_layout = engine.resource_manager_layout,
+    .backend_fields = engine.backend_fields.ptr,
+    .backend_field_count = engine.backend_fields.len,
+    .resource_fields = engine.resource_fields.ptr,
+    .resource_field_count = engine.resource_fields.len,
     .db_fields = engine.db_fields.ptr,
     .db_field_count = engine.db_fields.len,
     .core_fields = engine.core_fields.ptr,
@@ -224,11 +268,11 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v2", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v3", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v2", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v3", .visibility = .hidden });
 }

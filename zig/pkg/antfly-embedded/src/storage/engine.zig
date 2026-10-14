@@ -40,6 +40,11 @@ pub fn Outcome(comptime T: type) type {
     return struct { value: T = undefined, failure: Failure = .{} };
 }
 pub const VTable = struct {
+    reconfigureEnrichmentRuntime: *const fn (self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) Outcome(void),
+    reconfigureEnrichmentRuntimePaused: *const fn (self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) Outcome(void),
+    resumeEnrichmentRuntimeAfterReconfigure: *const fn (self: *DB, operation: []const u8, index_name: []const u8) Outcome(void),
+    ensureTransactionRecoveryRuntime: *const fn (self: *DB, cfg: @import("db/maintenance/transaction_runtime.zig").Config) Outcome(void),
+    activateResolverReplayRuntimes: *const fn (self: *DB) Outcome(void),
     get: *const fn (self: *DB, alloc: Allocator, key: []const u8) Outcome(?[]u8),
     getDocument: *const fn (self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) Outcome(?types.LookupResult),
     lookup: *const fn (self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) Outcome(?types.LookupResult),
@@ -95,12 +100,18 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 2,
+    version: u32 = 3,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
     handle_layout: native.TypeContract,
     registry_layout: native.TypeContract,
+    backend_runtime_layout: native.TypeContract,
+    resource_manager_layout: native.TypeContract,
+    backend_fields: [*]const FieldLayout,
+    backend_field_count: usize,
+    resource_fields: [*]const FieldLayout,
+    resource_field_count: usize,
     db_fields: [*]const FieldLayout,
     db_field_count: usize,
     core_fields: [*]const FieldLayout,
@@ -127,18 +138,26 @@ pub const registry_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("../capi/handles.zig").HandleRegistry);
 };
-extern fn antfly_storage_engine_get_descriptor_v2() callconv(.c) *const Descriptor;
+pub const backend_runtime_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("background_runtime.zig").BackendRuntime);
+};
+pub const resource_manager_layout = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
+};
+extern fn antfly_storage_engine_get_descriptor_v3() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v2();
+    const descriptor = antfly_storage_engine_get_descriptor_v3();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v2" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v3" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const outcome = try Boundary.call(name, descriptor.dispatch, method, args);
     if (outcome.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..outcome.failure.len]);
@@ -146,14 +165,19 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v2();
+    return antfly_storage_engine_get_descriptor_v3();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 2 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 3 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
-        !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout))
+        !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
+        !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
+        !descriptor.resource_manager_layout.matches(resource_manager_layout))
         return error.UnsupportedVersion;
 }
 
 pub const db_fields = fieldsFor(DB);
 pub const core_fields = fieldsFor(@typeInfo(@FieldType(DB, "core")).pointer.child);
+
+pub const backend_fields = fieldsFor(@import("background_runtime.zig").BackendRuntime);
+pub const resource_fields = fieldsFor(@import("resource_manager.zig").ResourceManager);

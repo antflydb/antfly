@@ -144,11 +144,15 @@ pub const ReplicationWriteGate = replication_contract.WriteGate;
 pub const DocumentArtifactChildRangeDispatcher = document_child_range_outbox.DocumentArtifactChildRangeDispatcher;
 
 pub const CommittedBatchEffectsObserver = struct {
+    const NativeCallbacks = struct { apply: @FieldType(CommittedBatchEffectsObserver, "apply") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     apply: *const fn (ptr: *anyopaque, replay_payload: []const u8) anyerror!void,
 
     pub fn observe(self: CommittedBatchEffectsObserver, replay_payload: []const u8) !void {
-        return try self.apply(self.ptr, replay_payload);
+        return try NativeBoundary.call("apply", self.callback_dispatch, self.apply, .{ self.ptr, replay_payload });
     }
 };
 

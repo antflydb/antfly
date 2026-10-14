@@ -1085,12 +1085,21 @@ borrowed native state. Conditional runtime implementations have authored names
 so independent compilation units calculate identical type identities. The
 existing error-domain dispatcher transports named failures without copying
 compiler-local numeric error codes. Both products access one handle registry
-and one C API TLS error state. Public lookup/raw/schema output buffers use the
+and one C API TLS error state. The private v3 descriptor additionally checks
+backend-runtime and resource-manager layouts. Named callback dispatch preserves
+project error identities for server-provided mutation, query, replication, TTL,
+repair/capacity and background-job hooks. Query proxies are synchronous and
+captured requests restore the caller-owned hook. Borrowed executors and
+filesystem storage retain stable I/O receivers, so their errors are interpreted
+in the originating compilation unit. Public lookup/raw/schema output buffers use the
 C allocator even when an internal handle has a custom allocator.
 
 Each operation has a hidden accessor, rather than one global pointer table, so
 final links can discard unused operations. Lookup, scan, statistics and relational
-constraint/index maintenance also route to the owner. Stateful relational readers
+constraint/index maintenance also route to the owner. Enrichment reconfiguration
+and recovery/resolver runtime construction belong to this same owner, preventing
+server-side construction from retaining a second prepared-mutation engine.
+Stateful relational readers
 retain their existing implementation until their full reader lifetime and callback
 contract can be moved together.
 
@@ -1156,7 +1165,13 @@ CPU/optimization/strip/backend settings above, and no thread sanitizer. It claim
 14 GiB for the adapter and 10 GiB for the engine; these exceed the rounded bounds
 plus a whole GiB and 25% margin. Remaining runtime claims use the conservative
 SDK 26.4 envelopes, also above this run's peaks. API and adapter can fit together
-within 28 GiB; final cold overlap qualification remains pending.
+within 28 GiB; a subsequent cold overlap qualification at `044fc332fd` succeeded in 1,402.07 s
+(23m22s, 46.77% shorter than the 43m54s baseline). Its observed aggregate compiler
+RSS peak was 10.32 GiB. Rounded MaxRSS was 9G API, 5G storage adapter, 4G engine,
+7G inference, 7G distributed, and 4G serverless; all claims retained at least 25%
+above a rounded upper bound. The executable was still 198,994,408 B and library
+68,375,216 B. These figures precede moving runtime construction and completing
+callback/I/O ownership, so they do not establish final size or performance.
 
 Four alternating isolated-process runs (1,200 x 64 rows, 64 warmup batches) of
 that initial revision measured medians 3.5341 -> 3.6658 s for document batches
@@ -1168,3 +1183,16 @@ Repeat on the final revision with a quiet host. Counts and read-backs passed.
 Final release and overlap measurements remain pending. SDK 27.0 results are
 separate from wolfspider's SDK 26.4 pair; earlier figures describe their frozen
 snapshots. Shared storage and measured memory remain opt-in.
+
+
+Native Debug probes now emit entry objects and use the same system Mach-O linker
+as the C API. Consumer import graphs omit C/ObjC inputs already bundled by the
+providers, without modifying shared provider modules. This avoids Zig's large
+Debug archive relocation overflow and duplicate native inputs. Both source-owner
+profiles pass actual caller-created runtime/I/O, runtime reconfiguration, and
+foreign observer/dense-predicate failure probes; `TestWindowFailed` retains its
+exact identity across both directions. Resource accounting passed 64/64 steps
+(92 accounting/cache tests plus selection audit), sparse passed 71 tests, and
+background/storage foundation passed 37 tests. The Linux ELF facade still exports
+exactly the 118 header functions. Linux thread-sanitized CLI fallback compiles.
+Final v3 release and throughput measurements remain pending.

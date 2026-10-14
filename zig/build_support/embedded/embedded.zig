@@ -316,12 +316,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         client_mod.addOptions("capi_build_options", capi_options);
         client_mod.addImport("antfly_storage_root", client_mod);
         const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
-        probe_mod.addImport("storage_client", client_mod);
+        probe_mod.addImport("storage_client", @import("shared_library.zig").storageConsumerModule(b, client_mod));
         probe_mod.linkLibrary(owner);
         probe_mod.linkLibrary(native_inference);
         probe_mod.linkLibrary(native_enrichment);
-        const probe = b.addExecutable(.{ .name = "storage-owner-linkage-probe", .root_module = probe_mod, .max_rss = 4 * 1024 * 1024 * 1024 });
-        const run = b.addRunArtifact(probe);
+        const run = @import("shared_library.zig").addStorageProbe(b, probe_mod, "storage-owner-linkage-probe");
         _ = run.addOutputDirectoryArg("storage-owner-linkage");
         run.has_side_effects = true;
         b.step("storage-owner-linkage-test", "Exercise actual shared storage calls, state ownership and incompatible ABI rejection").dependOn(&run.step);

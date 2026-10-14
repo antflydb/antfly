@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout" }) |field| {
+        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout" }) |field| {
             const actual = @field(descriptor, field);
             const expected = @field(engine, field);
             std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
@@ -44,12 +44,19 @@ pub fn main(init: std.process.Init) !void {
             if (actual.offset != expected.offset or actual.size != expected.size or !std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)))
                 std.debug.print("Core field {s}: owner offset={d} size={d} type={s}; client offset={d} size={d} type={s}\n", .{ std.mem.span(actual.name), actual.offset, actual.size, std.mem.span(actual.type_name), expected.offset, expected.size, std.mem.span(expected.type_name) });
         }
+        inline for (.{ "backend", "resource" }) |kind| {
+            for (@field(descriptor, kind ++ "_fields")[0..@field(descriptor, kind ++ "_field_count")], @field(engine, kind ++ "_fields")) |actual, expected| {
+                if (actual.offset != expected.offset or actual.size != expected.size or !std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)))
+                    std.debug.print("{s} field {s}: owner offset={d} size={d} type={s}; client offset={d} size={d} type={s}\n", .{ kind, std.mem.span(actual.name), actual.offset, actual.size, std.mem.span(actual.type_name), expected.offset, expected.size, std.mem.span(expected.type_name) });
+            }
+        }
         return err;
     };
     var incompatible = engine.descriptorForValidation().*;
     incompatible.db_layout.size += 1;
     engine.validateDescriptor(&incompatible) catch |err| {
         if (err != error.UnsupportedVersion) return err;
+        try exerciseBorrowedRuntime(alloc, root, init.io);
         return exercise(alloc, root, physical);
     };
     return error.AcceptedIncompatibleStorageLayout;
@@ -61,16 +68,19 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8) !v
     const value = (try db.get(alloc, "shared-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);
     if (!std.mem.eql(u8, value, "{\"n\":1}")) return error.SharedStorageReadBackFailed;
-    var looked_up = (try db.lookup(alloc, "shared-row", .{})) orelse return error.SharedStorageLookupFailed;
+    var looked_up = (try db.lookup(alloc, "shared-row", .{})) orelse return error.SharedStorageReadBackFailed;
     defer looked_up.deinit(alloc);
-    if (!std.mem.eql(u8, looked_up.json, value)) return error.SharedStorageLookupFailed;
+    if (!std.mem.eql(u8, looked_up.json, value)) return error.SharedStorageReadBackFailed;
     var scanned = try db.scan(alloc, "", "", .{ .include_documents = true });
     defer scanned.deinit(alloc);
-    if (scanned.documents.len != 1 or try db.primaryDocCount(alloc) != 1) return error.SharedStorageScanFailed;
+    if (scanned.documents.len != 1 or try db.primaryDocCount(alloc) != 1) return error.SharedStorageReadBackFailed;
     var result = try db.search(alloc, .{});
     defer result.deinit();
     if (result.hits.len != 1) return error.SharedStorageQueryFailed;
     try db.sync(true);
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try exerciseForeignPredicate(alloc, db);
+    try exerciseForeignHook(db);
     db.batch(.{ .row_policy_install_bundle = "reject-this-private-command" }) catch |err| {
         if (err != error.InvalidBatchRequest) return error.SharedStorageErrorIdentityLost;
         try exerciseServerHandle(alloc, root);
@@ -116,4 +126,51 @@ fn exerciseServerHandle(alloc: std.mem.Allocator, root: []const u8) !void {
         return error.SharedStorageServerHandleRejected;
     if (std.mem.indexOf(u8, out.ptr.?[0..out.len], "server") == null)
         return error.SharedStorageServerHandleReadFailed;
+}
+
+fn exerciseForeignHook(db: *db_mod.DB) !void {
+    const Callback = struct {
+        fn observe(ptr: *anyopaque, _: []const u8) anyerror!void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+            return error.TestWindowFailed;
+        }
+    };
+    var count: usize = 0;
+    db.batchInternal(.{ .writes = &.{.{ .key = "callback-row", .value = "{}" }}, .sync_level = .write }, null, .{ .committed_batch_effects_observer = .{ .ptr = &count, .apply = Callback.observe } }) catch |err| {
+        if (err != error.TestWindowFailed or count != 1) return error.SharedStorageErrorIdentityLost;
+        return;
+    };
+    return error.SharedStorageInvalidBatchAccepted;
+}
+
+fn exerciseBorrowedRuntime(alloc: std.mem.Allocator, root: []const u8, io: std.Io) !void {
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+    defer runtime.deinit();
+    const path = try std.fs.path.join(alloc, &.{ root, "borrowed-runtime" });
+    defer alloc.free(path);
+    const db = try db_mod.DB.openOwned(alloc, path, .{ .backend_runtime = runtime.ptr(), .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.closeOwned();
+    try db.batch(.{ .writes = &.{.{ .key = "borrowed-row", .value = "{}" }}, .sync_level = .write });
+    const value = (try db.get(alloc, "borrowed-row")) orelse return error.SharedStorageReadBackFailed;
+    defer alloc.free(value);
+}
+
+fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":2}" });
+    try db.batch(.{ .writes = &.{.{ .key = "vector-row", .value = "{\"v\":[0,0]}" }}, .sync_level = .full_index });
+    const Callback = struct {
+        fn allows(ptr: *anyopaque, _: []const u8) anyerror!bool {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+            return error.TestWindowFailed;
+        }
+    };
+    var count: usize = 0;
+    var result = db.search(alloc, .{ .dense = .{ .vector = &.{ 0, 0 }, .k = 1 }, .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } }) catch |err| {
+        if (err != error.TestWindowFailed or count == 0) return error.SharedStorageErrorIdentityLost;
+        return;
+    };
+    result.deinit();
+    return error.SharedStorageInvalidBatchAccepted;
 }

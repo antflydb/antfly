@@ -2977,7 +2977,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "resource manager replay skip snapshots clean up every allocation failure",
         "resource manager records and snapshots replay-document-not-visible skips per owner and index",
         "default tokenizer cache budget is aligned with its resource slice",
-        "default lake range cache queue budget is aligned with its terminal resource slice",
+        "default lake range cache queue budget keeps its stable resource identity",
         "identity allocation failure rolls back every memory ledger",
         "manager teardown retires live observer snapshots",
         "batch reservation is atomic across inference resource slices",

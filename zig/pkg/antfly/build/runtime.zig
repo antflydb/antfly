@@ -295,12 +295,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         client.addOptions("capi_build_options", capi_options);
         client.addImport("antfly_storage_root", client);
         const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
-        probe_mod.addImport("storage_client", client);
+        probe_mod.addImport("storage_client", @import("../../../build_support/embedded/shared_library.zig").storageConsumerModule(b, client));
         probe_mod.linkLibrary(owner);
         probe_mod.linkLibrary(options.native_inference);
         probe_mod.linkLibrary(options.native_enrichment);
-        const probe = b.addExecutable(.{ .name = "storage-server-owner-linkage-probe", .root_module = probe_mod, .max_rss = 4 * 1024 * 1024 * 1024 });
-        const run = b.addRunArtifact(probe);
+        const run = @import("../../../build_support/embedded/shared_library.zig").addStorageProbe(b, probe_mod, "storage-server-owner-linkage-probe");
         _ = run.addOutputDirectoryArg("storage-server-owner-linkage");
         run.has_side_effects = true;
         b.top_level_steps.get("storage-owner-linkage-test").?.step.dependOn(&run.step);

@@ -5400,6 +5400,7 @@ pub const DB = struct {
     };
 
     pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntime", .{ self, cfg });
         try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{});
     }
 
@@ -5409,6 +5410,7 @@ pub const DB = struct {
     /// admission is established. Starting here would make addIndex stop the
     /// new worker a second time and let corpus work delay control-plane DDL.
     pub fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntimePaused", .{ self, cfg });
         try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{ .start_replacement = false });
     }
 
@@ -5466,6 +5468,7 @@ pub const DB = struct {
     }
 
     pub fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resumeEnrichmentRuntimeAfterReconfigure", .{ self, operation, index_name });
         if (self.enrichment_runtime == null) return;
         try self.restartEnrichmentAfterStructuralMutation(operation, index_name);
     }
@@ -5755,6 +5758,7 @@ pub const DB = struct {
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("ensureTransactionRecoveryRuntime", .{ self, cfg });
         if (!cfg.enabled or self.transaction_runtime != null) return;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -5793,6 +5797,7 @@ pub const DB = struct {
 
     /// Activate only after the serving owner installs candidate/sink hooks.
     pub fn activateResolverReplayRuntimes(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("activateResolverReplayRuntimes", .{self});
         self.resolver_workers_enabled = true;
         if (self.local_execution.optional_runtime_workers_enabled) try self.startResolverReplayRuntimesIfConfigured();
     }

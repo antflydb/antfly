@@ -241,3 +241,59 @@ fn forcePublicSymbols(b: *std.Build, artifact: *std.Build.Step.Compile) void {
         } else index += 1;
     }
 }
+
+/// Native providers already bundle the C/ObjC inputs from this composition.
+/// A source consumer needs their declarations, but linking the same objects
+/// again confuses the Mach-O linker. Clone rather than mutating shared modules.
+pub fn storageConsumerModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module {
+    var copies: std.AutoHashMap(*std.Build.Module, *std.Build.Module) = .init(b.allocator);
+    return cloneStorageConsumer(b, original, &copies);
+}
+fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
+    if (copies.get(original)) |existing| return existing;
+    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
+    copy.init(original.owner, .{ .existing = original });
+    copy.import_table = .empty;
+    copy.link_objects = .empty;
+    copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
+    copies.put(original, copy) catch @panic("OOM");
+    for (original.link_objects.items) |input| switch (input) {
+        .c_source_file, .c_source_files, .assembly_file => {},
+        else => copy.link_objects.append(b.allocator, input) catch @panic("OOM"),
+    };
+    for (original.import_table.keys(), original.import_table.values()) |name, imported|
+        copy.addImport(name, cloneStorageConsumer(b, imported, copies));
+    @import("source_owner.zig").adopt(copy);
+    return copy;
+}
+
+/// Large Debug archive probes exceed the Zig Mach-O linker's relocation range.
+/// Emit an entry object and use the C API's system linker for the final image.
+pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u8) *std.Build.Step.Run {
+    const target = module.resolved_target.?.result;
+    if (target.os.tag != .macos) {
+        const executable = b.addExecutable(.{ .name = name, .root_module = module, .max_rss = 4 * 1024 * 1024 * 1024 });
+        return b.addRunArtifact(executable);
+    }
+    module.link_libc = true;
+    const object = b.addObject(.{ .name = name, .root_module = module, .use_llvm = true, .max_rss = 4 * 1024 * 1024 * 1024 });
+    object.entry = .enabled;
+    object.bundle_compiler_rt = false;
+    object.bundle_ubsan_rt = false;
+    const link = b.addSystemCommand(&.{"python3"});
+    link.addFileArg(b.path("tools/native_executable_link.py"));
+    const deployment = target.os.version_range.semver.min;
+    link.addArgs(&.{ "--arch", if (target.cpu.arch == .aarch64) "arm64" else "x86_64", "--deployment", b.fmt("{d}.{d}.{d}", .{ deployment.major, deployment.minor, deployment.patch }), "--sdk" });
+    link.addDirectoryArg(b.named_lazy_paths.get("antfly_macos_sdk_root").?);
+    link.addArg("--object");
+    link.addFileArg(object.getEmittedBin());
+    link.addArg("--output");
+    const binary = link.addOutputFileArg(name);
+    link.addArg("--");
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
+    addLinks(b, link, module, &modules, &libraries);
+    const run = std.Build.Step.Run.create(b, name);
+    run.addFileArg(binary);
+    return run;
+}

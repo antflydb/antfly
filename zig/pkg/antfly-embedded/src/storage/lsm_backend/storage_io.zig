@@ -985,10 +985,10 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
 /// caller's I/O implementation, including deterministic VOPR filesystems,
 /// instead of silently creating a native threaded storage lane.
 pub const IoStorage = struct {
-    io: std.Io,
+    receiver: @import("antfly_runtime_abi").io_abi.Receiver,
 
     pub fn init(io: std.Io) IoStorage {
-        return .{ .io = io };
+        return .{ .receiver = @import("antfly_runtime_abi").io_abi.Borrow.init(&io).receive() catch unreachable };
     }
 
     pub fn storage(self: *IoStorage) Storage {
@@ -1021,39 +1021,39 @@ pub const IoStorage = struct {
     }
 
     fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
-        try fs_paths.createDirPathPortable(context(ptr).io, path);
+        try fs_paths.createDirPathPortable(context(ptr).receiver.io(), path);
     }
 
     fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).io, path, allocator, .limited(max_bytes));
+        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).receiver.io(), path, allocator, .limited(max_bytes));
     }
 
     fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-        return try readFileRangeWithIo(context(ptr).io, allocator, path, offset, len);
+        return try readFileRangeWithIo(context(ptr).receiver.io(), allocator, path, offset, len);
     }
 
     fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
-        try readFileRangeWithIoInto(context(ptr).io, path, offset, out);
+        try readFileRangeWithIoInto(context(ptr).receiver.io(), path, offset, out);
     }
 
     fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
-        return try readFileRangeWithIoAtMostInto(context(ptr).io, path, offset, out);
+        return try readFileRangeWithIoAtMostInto(context(ptr).receiver.io(), path, offset, out);
     }
 
     fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
-        return try fileSizeWithIo(context(ptr).io, path);
+        return try fileSizeWithIo(context(ptr).receiver.io(), path);
     }
 
     fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-        return try readFileTrailerWithIo(context(ptr).io, allocator, path, len);
+        return try readFileTrailerWithIo(context(ptr).receiver.io(), allocator, path, len);
     }
 
     fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
-        try std.Io.Dir.cwd().writeFile(context(ptr).io, .{ .sub_path = path, .data = contents });
+        try std.Io.Dir.cwd().writeFile(context(ptr).receiver.io(), .{ .sub_path = path, .data = contents });
     }
 
     fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-        const io = context(ptr).io;
+        const io = context(ptr).receiver.io();
         var file = try fs_paths.createFilePortable(io, path, .{ .read = true, .truncate = false });
         defer file.close(io);
         const offset = try file.length(io);
@@ -1062,27 +1062,27 @@ pub const IoStorage = struct {
     }
 
     fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try syncFileContentsPathWithIo(context(ptr).io, path);
+        try syncFileContentsPathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try syncParentPathWithIo(context(ptr).io, path);
+        try syncParentPathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).io);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).receiver.io());
     }
 
     fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try deleteFilePathWithIo(context(ptr).io, path);
+        try deleteFilePathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
-        try std.Io.Dir.cwd().deleteTree(context(ptr).io, path);
+        try std.Io.Dir.cwd().deleteTree(context(ptr).receiver.io(), path);
     }
 
     fn nowNs(ptr: *anyopaque) u64 {
-        const value = std.Io.Clock.awake.now(context(ptr).io).toNanoseconds();
+        const value = std.Io.Clock.awake.now(context(ptr).receiver.io()).toNanoseconds();
         return if (value <= 0) 0 else @intCast(@min(value, std.math.maxInt(u64)));
     }
 
