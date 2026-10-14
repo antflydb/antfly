@@ -3753,3 +3753,25 @@ fixtures while forcing multiple serving windows after compaction. They assert th
 selected bounded plan, stored hidden-source highlights, metadata counts, ordered
 forward/backward pages and retained restart results. This supersedes the earlier
 67-source-file test's insufficient inference that file count guaranteed windowing.
+
+
+Qualification for the protocol-41 refinements on Zig 0.17.0/macOS ARM64, with
+latest main `77b50e6adb` merged and runtime code at `a180dcbd73`: all 95 Debug
+build steps pass, including the server, 434 lake integration executions (160
+shared and 274 server), and 33 focused executions (three shared and 30 server).
+All 33 focused executions also pass in ReleaseFast (50/50 steps). Both modes
+report no failures or leaks. All 15 selected real Parquet/Iceberg E2Es pass on
+the final server in 272.90 seconds (31 unrelated cases deselected), including
+bounded-window plan assertions after compaction, hidden stored highlights,
+metadata counts, ordered forward/backward pages, accepted text/vector/hybrid
+cuts and restart. Apache boundaries (2,036 sources), license headers, 69 changed
+Zig files, Python formatting/name checks and Git whitespace checks pass.
+
+Required cache GC preserved active worktrees and reached package-cache pruning;
+a 55-second watchdog stopped its existing uv cache-lock wait. Only unused,
+superseded outputs in this worktree were separately evicted to restore disk
+headroom; the E2E disk safeguard remained enabled. Live-provider retention
+qualification remains deferred and certificate enablement defaults off.
+Archive-scale latency/RSS measurements remain outstanding; these regressions
+establish correct results, bounded admission and reduced repeated work, not a
+measured speedup for a production archive.
