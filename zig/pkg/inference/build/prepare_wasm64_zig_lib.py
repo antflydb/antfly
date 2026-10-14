@@ -53,6 +53,16 @@ def clone_file(source: str, destination: str) -> str:
     return destination
 
 
+def make_directories_writable(directory: Path) -> None:
+    # Only directories are private copies. File inodes may still belong to the
+    # installed toolchain, so never chmod them, even when unwinding a failed copy.
+    directory.chmod(directory.stat().st_mode | stat.S_IRWXU)
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                make_directories_writable(Path(entry.path))
+
+
 def prepare(zig: str, destination: Path, comparison_source: Path) -> None:
     version = subprocess.check_output([zig, "version"], text=True).strip()
     if version != "0.17.0":
@@ -77,25 +87,26 @@ def prepare(zig: str, destination: Path, comparison_source: Path) -> None:
     if destination.exists() and any(destination.iterdir()):
         raise RuntimeError("the ABI overlay destination must be empty")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix="wasm64-lib-", dir=destination.parent
-    ) as staging:
-        staged = Path(staging) / "lib"
+    staging = Path(tempfile.mkdtemp(prefix="wasm64-lib-", dir=destination.parent))
+    try:
+        staged = staging / "lib"
         shutil.copytree(source, staged, copy_function=clone_file)
+        # Keep every copied directory writable for patching, publication, and
+        # later cache eviction. copytree preserved the installed directory modes.
+        make_directories_writable(staged)
         comparison = staged / "compiler_rt/comparef.zig"
-        # copytree preserves read-only Nix directory modes. Directories are
-        # cache-owned copies, so grant write access to the patch parent;
-        # chmod on a hard-linked file would alter the installed toolchain.
-        comparison.parent.chmod(comparison.parent.stat().st_mode | stat.S_IWUSR)
         # Break the hard link BEFORE writing: the installed library is immutable.
         comparison.unlink()
         comparison.write_text(corrected)
         if destination.exists():
             destination.rmdir()
-        # macOS also requires a writable directory when moving it between
-        # parents. This changes only the copied library root.
-        staged.chmod(staged.stat().st_mode | stat.S_IWUSR)
         staged.rename(destination)
+    finally:
+        # TemporaryDirectory's permission-repair cleanup can chmod hard-linked
+        # files. Normalize copied directories even after a partial copy, then
+        # remove the staging tree without any file-permission repair callback.
+        make_directories_writable(staging)
+        shutil.rmtree(staging)
 
 
 def main() -> None:

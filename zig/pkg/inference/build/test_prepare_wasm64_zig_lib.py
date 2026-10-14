@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import json
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 import unittest
@@ -34,6 +35,70 @@ from pkg.inference.build.prepare_wasm64_zig_lib import (
 
 
 class Wasm64ZigLibTest(unittest.TestCase):
+    def check_read_only_failure(self, partial_copy):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "installed"
+            runtime = source / "compiler_rt"
+            nested = source / "std"
+            runtime.mkdir(parents=True)
+            nested.mkdir()
+            comparison = runtime / "comparef.zig"
+            comparison.write_text(OLD)
+            neighbor = nested / "other.zig"
+            neighbor.write_text("unchanged")
+            modes = {
+                source: 0o555,
+                runtime: 0o555,
+                nested: 0o555,
+                comparison: 0o444,
+                neighbor: 0o444,
+            }
+            for path, mode in modes.items():
+                path.chmod(mode)
+            output = Path(root) / "cache/overlay"
+            real_copytree = shutil.copytree
+
+            def fail_after_partial_copy(src, dst, **options):
+                Path(dst).mkdir()
+                real_copytree(Path(src) / "std", Path(dst) / "std", **options)
+                raise OSError("injected copy failure")
+
+            try:
+                with patch(
+                    "subprocess.check_output",
+                    side_effect=[
+                        "0.17.0\n",
+                        f".lib_dir = {json.dumps(str(source))},\n",
+                    ],
+                ):
+                    if partial_copy:
+                        failure = patch(
+                            "shutil.copytree", side_effect=fail_after_partial_copy
+                        )
+                    else:
+                        failure = patch.object(
+                            Path,
+                            "write_text",
+                            side_effect=OSError("injected write failure"),
+                        )
+                    with failure, self.assertRaisesRegex(OSError, "injected"):
+                        prepare("zig", output, comparison)
+                self.assertEqual(comparison.read_text(), OLD)
+                self.assertEqual(neighbor.read_text(), "unchanged")
+                for path, mode in modes.items():
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                self.assertFalse(output.exists())
+                self.assertEqual(list(output.parent.iterdir()), [])
+            finally:
+                for path in (source, runtime, nested):
+                    path.chmod(0o755)
+
+    def test_failed_patch_preserves_read_only_toolchain(self):
+        self.check_read_only_failure(partial_copy=False)
+
+    def test_partial_copy_failure_preserves_read_only_toolchain(self):
+        self.check_read_only_failure(partial_copy=True)
+
     def test_read_only_toolchain_preserves_contents_and_permissions(self):
         for cross_volume in (False, True):
             with (
@@ -42,14 +107,17 @@ class Wasm64ZigLibTest(unittest.TestCase):
             ):
                 source = Path(root) / "installed"
                 runtime = source / "compiler_rt"
+                nested = source / "std"
                 runtime.mkdir(parents=True)
+                nested.mkdir()
                 comparison = runtime / "comparef.zig"
                 comparison.write_text(OLD)
-                neighbor = source / "std.zig"
+                neighbor = nested / "other.zig"
                 neighbor.write_text("unchanged")
                 comparison.chmod(0o444)
                 neighbor.chmod(0o444)
                 runtime.chmod(0o555)
+                nested.chmod(0o555)
                 source.chmod(0o555)
                 output = Path(root) / "cache/overlay"
                 try:
@@ -73,22 +141,28 @@ class Wasm64ZigLibTest(unittest.TestCase):
                     self.assertEqual(
                         (output / "compiler_rt/comparef.zig").read_text(), NEW
                     )
-                    self.assertEqual((output / "std.zig").read_text(), "unchanged")
-                    for path, mode in (
-                        (source, 0o555),
-                        (runtime, 0o555),
-                        (comparison, 0o444),
-                        (neighbor, 0o444),
-                    ):
-                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                    self.assertEqual(
+                        (output / "std/other.zig").read_text(), "unchanged"
+                    )
                     self.assertNotEqual(
                         comparison.stat().st_ino,
                         (output / "compiler_rt/comparef.zig").stat().st_ino,
                     )
+                    # Ordinary cache eviction must need no file-mode repair.
+                    shutil.rmtree(output)
+                    for path, mode in (
+                        (source, 0o555),
+                        (runtime, 0o555),
+                        (nested, 0o555),
+                        (comparison, 0o444),
+                        (neighbor, 0o444),
+                    ):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
                     self.assertEqual(list(output.parent.glob("wasm64-lib-*")), [])
                 finally:
                     source.chmod(0o755)
                     runtime.chmod(0o755)
+                    nested.chmod(0o755)
 
     def test_unknown_runtime_is_rejected(self):
         for source in ("different compiler runtime", OLD + OLD):
