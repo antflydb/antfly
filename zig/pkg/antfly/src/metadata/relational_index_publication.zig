@@ -29,6 +29,14 @@ const shape = @import("schema_publication_shape.zig");
 const lifecycle = @import("table_lifecycle_lock.zig");
 const Allocator = std.mem.Allocator;
 const native_control = local.storage_db_relational_index_owner_control;
+const readers = local.common_schema_readers;
+
+fn readerRequirements(before: records.TableRecord, after: records.TableRecord) !?readers.ReaderRequirements {
+    var joined: readers.ReaderFloor = .{};
+    if (before.schema_reader_requirements) |requirements| joined = try joined.include(requirements);
+    if (after.schema_reader_requirements) |requirements| joined = try joined.include(requirements);
+    return if (joined.active()) .{ .semantic_version = joined.semantic_version, .encoding_version = joined.encoding_version } else null;
+}
 pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
@@ -594,6 +602,7 @@ pub const Inputs = struct {
 
     fn requireHead(self: Inputs, head: progress.Head) !void {
         try head.validate();
+        if (!std.meta.eql(try readerRequirements(self.before, self.after), head.reader_requirements)) return error.InvalidCatalogRecord;
         if (self.format_version != 1 or !std.mem.eql(u8, &self.id, &head.plan_id) or
             !std.mem.eql(u8, &self.plan_digest, &head.plan_digest) or self.namespace_id == 0 or
             self.before.table_id != head.table_id or self.after.table_id != head.table_id or
@@ -794,6 +803,7 @@ pub const Plan = struct {
             try state.validate();
         }
         const head: progress.Head = .{
+            .reader_requirements = try readerRequirements(self.before, self.after),
             .plan_id = self.id,
             .plan_digest = plan_digest,
             .candidate_digest = digest(candidate.next.value),
@@ -994,7 +1004,8 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         !std.mem.eql(u8, &head.plan_id, &prepared.head.plan_id) or
         !std.mem.eql(u8, &head.plan_digest, &frame_digest) or !std.mem.eql(u8, &head.plan_digest, &prepared.head.plan_digest) or
         !std.mem.eql(u8, &head.candidate_digest, &prepared.head.candidate_digest) or
-        !std.mem.eql(u8, &head.reservation_digest, &prepared.head.reservation_digest) or head.owner_count != prepared.head.owner_count)
+        !std.mem.eql(u8, &head.reservation_digest, &prepared.head.reservation_digest) or head.owner_count != prepared.head.owner_count or
+        !std.meta.eql(head.reader_requirements, prepared.head.reader_requirements))
         return error.InvalidCatalogRecord;
     if (!std.mem.eql(u8, try txn.get(try inputsKey(&buf, group, table)), prepared.inputs)) return error.InvalidCatalogRecord;
     var counts: [7]u16 = @splat(0);
@@ -1512,6 +1523,17 @@ test "relational index publication dispatch omits schema sized inputs and immuta
     try std.testing.expectEqualSlices(u8, prepared.dispatch[0], replay.dispatch[0]);
 }
 
+test "relational index publication reader pair joins active and prospective physical axes" {
+    var before: records.TableRecord = .{ .table_id = 7, .name = "rows" };
+    var after = before;
+    try std.testing.expect(try readerRequirements(before, after) == null);
+    before.schema_reader_requirements = .{ .semantic_version = 30, .encoding_version = 17 };
+    after.schema_reader_requirements = .{ .semantic_version = 14, .encoding_version = 31 };
+    try std.testing.expectEqualDeep(@as(?readers.ReaderRequirements, .{ .semantic_version = 30, .encoding_version = 31 }), try readerRequirements(before, after));
+    after.schema_reader_requirements.?.semantic_version = 0;
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, readerRequirements(before, after));
+}
+
 test "relational index publication projected candidate rejects changed admitted fingerprints" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1532,6 +1554,10 @@ test "relational index publication projected candidate rejects changed admitted 
     changed = prepared.head;
     changed.plan_id[0] ^= 1;
     try std.testing.expectError(error.InvalidCatalogRecord, inputs.value.prepareCandidate(a, changed));
+    changed = prepared.head;
+    changed.reader_requirements = .{ .semantic_version = 30, .encoding_version = 17 };
+    try std.testing.expectError(error.InvalidCatalogRecord, inputs.value.prepareCandidate(a, changed));
+    try std.testing.expectError(error.InvalidCatalogRecord, inputs.value.prepareNativeManifest(a, changed));
 }
 
 test "relational index publication permission separates phase execution acknowledged retries and cancellation" {

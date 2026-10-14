@@ -77,7 +77,11 @@ const std = @import("std");
 /// Version 39 decodes definition-bound semantic/ASCH requirements in table
 /// records (storage extension v3), including nested FK/restore/catalog plans.
 /// This does not itself activate a floor or acknowledge an installed schema.
-pub const current_version: u16 = 39;
+/// Version 40 decodes AIPH v2 compact index-publication heads binding separate
+/// semantic/physical reader requirements to the admitted owner cohort.
+/// Admission and planless ACKs require durable activation of this decoder.
+pub const current_version: u16 = 40;
+pub const index_publication_head_version: u16 = 40;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

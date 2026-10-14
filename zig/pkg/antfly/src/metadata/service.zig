@@ -3422,6 +3422,10 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    // AIPH v2 also applies to unmarked plans. Classify it before the older
+    // table-definition profile can return a weaker decoder requirement.
+    if (command == .begin_relational_index_publication or command == .ack_relational_index_publication)
+        return metadata_topology_protocol.index_publication_head_version;
     const has_reader_requirements = switch (command) {
         .upsert_table => |table| table.schema_reader_requirements != null,
         .compare_and_replace_table => |cas| cas.expected.schema_reader_requirements != null or cas.replacement.schema_reader_requirements != null,
@@ -3450,8 +3454,6 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => {},
     }
-    if (command == .begin_relational_index_publication or command == .ack_relational_index_publication)
-        return metadata_topology_protocol.index_publication_admission_version;
     if (command == .apply_fk_generation_publication and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_generation_publication, fk_generation_publication.max_bytes))
         return metadata_topology_protocol.checks_catalog_identity_version;
     if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
@@ -3580,8 +3582,10 @@ test "system catalog schema reader publication requires the definition decoder a
         .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = "{\"table\":{\"schema_reader_requirements\":{}}}" } },
         .{ .begin_relational_index_publication = "{\"plan\":{\"table\":{\"schema_reader_requirements\":{}}}}" },
     };
-    for (commands) |command|
-        try std.testing.expectEqual(metadata_topology_protocol.schema_reader_publication_version, transitionRequiredCoordinatedDecoderVersion(command));
+    for (commands) |command| {
+        const required = if (command == .begin_relational_index_publication) metadata_topology_protocol.index_publication_head_version else metadata_topology_protocol.schema_reader_publication_version;
+        try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(command));
+    }
     try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = plain }));
     try std.testing.expect(metadata_topology_protocol.schema_reader_publication_version > metadata_topology_protocol.schema_reader_floor_version);
 }
@@ -3611,10 +3615,10 @@ test "catalog projection schema reader facts require their decoder profile at fi
 
 test "relational index publication admission requires its own coordinated decoder floor" {
     const command: metadata_storage.TransitionCommand = .{ .begin_relational_index_publication = "{}" };
-    try std.testing.expectEqual(metadata_topology_protocol.index_publication_admission_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, transitionRequiredCoordinatedDecoderVersion(command));
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(command) > metadata_topology_protocol.checks_catalog_identity_version);
     const ack: metadata_storage.TransitionCommand = .{ .ack_relational_index_publication = "{}" };
-    try std.testing.expectEqual(metadata_topology_protocol.index_publication_admission_version, transitionRequiredCoordinatedDecoderVersion(ack));
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, transitionRequiredCoordinatedDecoderVersion(ack));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
@@ -3749,6 +3753,17 @@ test "system catalog schema reader publication durable activation guards ordinar
     const admitted = try prepareCoordinatedDecoderAdmission(&service, &.{ ordinary, ordinary });
     try std.testing.expectEqual(@as(u16, 39), admitted.readiness.?.required_version);
     try validateRelationSourceDecoderFloor(&service, admitted);
+    service.source.activation.?.version = metadata_topology_protocol.index_publication_head_version;
+    service.members = &.{ 40, 39, 40 };
+    try std.testing.expect(!service.source.floor.active());
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, ordinary, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, prepareCoordinatedDecoderAdmission(&service, &.{ordinary}));
+    service.members = &.{ 40, 40, 40 };
+    // Matching membership alone cannot upgrade an admission's decoder proof.
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&service, admitted));
+    const head_admitted = try prepareCoordinatedDecoderAdmission(&service, &.{ ordinary, ordinary });
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, head_admitted.readiness.?.required_version);
+    try validateRelationSourceDecoderFloor(&service, head_admitted);
     service.source.incarnation = null;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
     service.source.incarnation = "1123456789abcdef0123456789abcdef".*;

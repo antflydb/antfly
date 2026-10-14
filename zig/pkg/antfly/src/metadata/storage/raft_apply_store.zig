@@ -4264,6 +4264,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             defer arena.deinit();
             var plan = try index_publication.testing.plan(arena.allocator());
             var owners = [_]index_publication.Owner{plan.owners[0]};
+            plan.after.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, plan.after.schema_json, plan.after.read_schema_json);
             owners[0].receipt_authority = authority;
             plan.owners = &owners;
             var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
@@ -4273,7 +4274,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = plan.before.table_id, .shard_id = 301, .range_id = 301 }),
                 .sequence = if (authority == .native) 10 else 0,
             };
-            const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
+            const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .schema_reader = .current, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
             const placement: raft_reconciler.PlacementIntent = .{ .record = .{ .group_id = owners[0].range.group_id, .replica_id = 5, .local_node_id = 2 }, .store_id = 3, .peer_node_ids = &.{2} };
             var ack: index_publication.Ack = undefined;
             {
@@ -4287,7 +4288,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
                 try store.applyStandaloneCommand(group, .{ .register_store = current });
                 if (authority == .raft) try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
-                const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_admission_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+                const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_head_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
                 defer a.free(activation);
                 try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
                 try adoptRelationWriterForTest(&store, a, group);
@@ -4379,7 +4380,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     defer status.deinit();
                     try std.testing.expect(!try status.value.isAcknowledged(ack));
                 }
-                const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle, native_binding_missing, native_binding_changed };
+                const Fault = enum { reporter, root_identity, root_generation, reader_role, reader_unknown, reader_semantic, reader_encoding, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle, native_binding_missing, native_binding_changed };
                 inline for (std.meta.tags(Fault)) |fault| {
                     // Each fault has its own aborted storage cut. No simulated
                     // verification boolean can substitute for real durable reads.
@@ -4394,6 +4395,10 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         .reporter => changed.reporter_incarnation += 1,
                         .root_identity => changed.replica_root_incarnation += 1,
                         .root_generation => changed_runtime[0].lsm_root_generation += 1,
+                        .reader_role => changed.role = "metadata",
+                        .reader_unknown => changed.schema_reader = .{},
+                        .reader_semantic => changed.schema_reader.semantic_ceiling = 11,
+                        .reader_encoding => changed.schema_reader.encoding_ceiling = 11,
                         .placement_replica => changed_placement.record.replica_id += 1,
                         .placement_store => changed_placement.store_id += 1,
                         .placement_state => changed_placement.serving_state = .planned,
@@ -4459,6 +4464,43 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     }
                     try std.testing.expectEqualSlices(u8, &try prepared.head.encode(), try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
                     try std.testing.expectEqualSlices(u8, &try prepared.owners[0].encode(), try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+                }
+                {
+                    // Losing reader capability must prevent install progress,
+                    // but not authenticated cleanup of an unpublished build.
+                    var txn = try store.store.beginWriteTxn();
+                    defer txn.abort();
+                    var buf: [192]u8 = undefined;
+                    var downgraded = current;
+                    downgraded.role = "metadata";
+                    downgraded.schema_reader = .{};
+                    _ = try store.updateListingStoreTxn(&txn, group, current.store_id, downgraded);
+                    var canceled_head = try prepared.head.cancel(prepared.head.revision, .requested);
+                    try txn.put(try index_publication.headKey(&buf, group, ack.table_id), &try canceled_head.encode());
+                    var cleanup = ack;
+                    cleanup.expected_revision = canceled_head.revision;
+                    cleanup.signed.receipt.action = .canceled;
+                    cleanup.signed.proof = try cleanup.signed.proof.sign(root, try cleanup.signed.receipt.digest());
+                    const cancel_bytes = try std.json.Stringify.valueAlloc(a, cleanup, .{});
+                    defer a.free(cancel_bytes);
+                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, cancel_bytes);
+                    try store.ackRelationalIndexPublicationTxn(&txn, group, cancel_bytes);
+                    canceled_head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
+                    try std.testing.expectEqual(.cancel_releasing, canceled_head.phase);
+                    try std.testing.expectEqualDeep(prepared.head.reader_requirements, canceled_head.reader_requirements);
+                    cleanup.expected_revision = canceled_head.revision;
+                    cleanup.signed.receipt.action = .cancel_released;
+                    switch (cleanup.signed.receipt.position) {
+                        .raft => |*position| position.index += 1,
+                        .native => |*position| position.sequence += 1,
+                    }
+                    cleanup.signed.proof = try cleanup.signed.proof.sign(root, try cleanup.signed.receipt.digest());
+                    const release_bytes = try std.json.Stringify.valueAlloc(a, cleanup, .{});
+                    defer a.free(release_bytes);
+                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, release_bytes);
+                    try store.ackRelationalIndexPublicationTxn(&txn, group, release_bytes);
+                    canceled_head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
+                    try std.testing.expectEqual(.canceled, canceled_head.phase);
                 }
                 const source = blk: {
                     var read = try store.store.beginReadTxn();
@@ -4589,7 +4631,13 @@ test "relational index publication admission reserves names atomically and survi
             try std.testing.expectError(error.NotFound, read.get(try index_publication.headKey(&buf, group, plan.before.table_id)));
             try std.testing.expectEqual(null, try @import("../table_lifecycle_lock.zig").read(&read, group, plan.before.table_id));
         }
-        const reader_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.schema_reader_publication_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+        const definition_decoder = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.schema_reader_publication_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+        defer a.free(definition_decoder);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = definition_decoder });
+        const revision_at_definition_decoder = try store.standaloneRevision();
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = marked_begin }));
+        try std.testing.expectEqual(revision_at_definition_decoder, try store.standaloneRevision());
+        const reader_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_head_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
         defer a.free(reader_activation);
         try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = reader_activation });
         plan = marked;
@@ -4690,7 +4738,7 @@ test "relational index publication admission reserves names atomically and survi
             defer metadata_table_manager.freeTable(a, current);
             try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(current, plan.before));
         }
-        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory, extra_range, aliased_range, stale_plan_incarnation, foreign_plan_namespace, rebound_table, rebound_namespace, rebound_database, inputs_missing, inputs_corrupt, dispatch_missing, dispatch_corrupt, extra_inputs, extra_dispatch };
+        const Fault = enum { head_missing, reader_requirements_changed, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory, extra_range, aliased_range, stale_plan_incarnation, foreign_plan_namespace, rebound_table, rebound_namespace, rebound_database, inputs_missing, inputs_corrupt, dispatch_missing, dispatch_corrupt, extra_inputs, extra_dispatch };
         inline for (std.meta.tags(Fault)) |fault| {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -4703,6 +4751,13 @@ test "relational index publication admission reserves names atomically and survi
                 .extra_inputs => try txn.put(try index_publication.inputsKey(&buf, group, 999), "orphan"),
                 .extra_dispatch => try txn.put(try index_publication.dispatchKey(&buf, group, plan.before.table_id, 1), "orphan"),
                 .head_missing => try txn.delete(try index_publication.headKey(&buf, group, plan.before.table_id)),
+                .reader_requirements_changed => {
+                    const key = try index_publication.headKey(&buf, group, plan.before.table_id);
+                    var head = try index_progress.Head.decode(try txn.get(key));
+                    // Valid pair and checksum, but not the admitted plan's pair.
+                    head.reader_requirements = .{ .semantic_version = 11, .encoding_version = 17 };
+                    try txn.put(key, &try head.encode());
+                },
                 .owner_missing => try txn.delete(try index_publication.ownerKey(&buf, group, plan.before.table_id, 0)),
                 .active_missing => try txn.delete(try index_publication.activeKey(&buf, group, plan.before.table_id)),
                 .active_substituted => try txn.put(try index_publication.activeKey(&buf, group, plan.before.table_id), &@as([16]u8, @splat(9))),
@@ -15889,8 +15944,7 @@ pub const RaftApplyStore = struct {
     fn prepareRelationalIndexOwnerAckTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !IndexOwnerAck {
         const progress = @import("antfly_local_sources").storage_db_relational_index_publication_progress;
         if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.InvalidGenerationPublication;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_admission_version);
-        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
         var parsed = try std.json.parseFromSlice(index_publication.Ack, self.alloc, bytes, .{});
         defer parsed.deinit();
         const ack = parsed.value;
@@ -15909,10 +15963,11 @@ pub const RaftApplyStore = struct {
         const head_bytes = (try stagingGet(txn, try index_publication.headKey(&buf, group_id, ack.table_id))) orelse return error.InvalidCatalogRecord;
         if (head_bytes.len != progress.Head.encoded_len) return error.InvalidCatalogRecord;
         const owned_head = head_bytes[0..progress.Head.encoded_len].*;
-        try index_publication.requireActivePointer(txn, group_id, try progress.Head.decode(&owned_head));
+        const head = try progress.Head.decode(&owned_head);
+        try index_publication.requireActivePointer(txn, group_id, head);
         const owner_bytes = (try stagingGet(txn, try index_publication.ownerKey(&buf, group_id, ack.table_id, ordinal))) orelse return error.InvalidCatalogRecord;
         const update = try progress.PreparedAck.prepare(&owned_head, owner_bytes, ack.expected_revision, ack.signed.receipt);
-        try self.requireIndexOwnerRootReceiptTxn(txn, group_id, ack.signed);
+        try self.requireIndexOwnerRootReceiptTxn(txn, group_id, ack.signed, head.reader_requirements);
         return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update };
     }
 
@@ -15929,7 +15984,7 @@ pub const RaftApplyStore = struct {
         try prepared.update.stage(txn, try index_publication.headKey(&head_buf, group_id, prepared.table_id), try index_publication.ownerKey(&owner_buf, group_id, prepared.table_id, prepared.ordinal));
     }
 
-    fn requireIndexOwnerRootReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedReceipt) !void {
+    fn requireIndexOwnerRootReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedReceipt, requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements) !void {
         const proof = signed.proof;
         self.requireStoreRootEnrollmentTxn(txn, group_id, proof.identity) catch |err| switch (err) {
             error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged => return error.IndexOwnerReceiptChanged,
@@ -15944,6 +15999,13 @@ pub const RaftApplyStore = struct {
         const cluster = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.IndexOwnerReceiptChanged;
         if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(cluster)).incarnation, &proof.identity.metadata_incarnation)) return error.IndexOwnerReceiptChanged;
         const owner = signed.receipt.owner;
+        // Use the current enrolled reporter, never a capability in the ACK.
+        // Pre-install cancellation must remain possible after capability loss;
+        // its cleanup proves that no candidate became public.
+        if (signed.receipt.action != .canceled and signed.receipt.action != .cancel_released) {
+            if (!metadata_table_manager.storeServesTableData(current.role)) return error.IndexOwnerReceiptChanged;
+            if (requirements) |required| if (!current.schema_reader.supports(required)) return error.IndexOwnerReceiptChanged;
+        }
         const range_bytes = (try stagingGet(txn, try rangeKeyForGroup(&buf, group_id, owner.group_id))) orelse return error.IndexOwnerReceiptChanged;
         const range = try decodeRangeRecord(self.alloc, range_bytes);
         defer metadata_table_manager.freeRange(self.alloc, range);
@@ -16003,8 +16065,7 @@ pub const RaftApplyStore = struct {
         try request.validate();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        const activation = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_admission_version);
-        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
         var buf: [192]u8 = undefined;
         const head = index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group_id, request.table_id)) catch |err| switch (err) {
             error.NotFound => return error.GenerationPublicationNotFound,
@@ -16050,8 +16111,7 @@ pub const RaftApplyStore = struct {
         try request.validate();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        const activation = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_admission_version);
-        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
         var buf: [192]u8 = undefined;
         const head = index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group_id, request.table_id)) catch |err| switch (err) {
             error.NotFound => return error.GenerationPublicationNotFound,
@@ -16099,8 +16159,7 @@ pub const RaftApplyStore = struct {
 
     fn beginRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_admission_version);
-        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
         var parsed = try std.json.parseFromSlice(index_publication.Begin, self.alloc, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         const plan = parsed.value.plan;
@@ -32570,32 +32629,37 @@ fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows
         try fk_generation_publication.initialPrefixForGroup(&plan_buffers[2], group_id),
         try restore_staging.jobPrefix(&plan_buffers[3], group_id),
     };
-    var publication_required = false;
-    records: for (rows) |row| {
+    var head_prefix_buf: [160]u8 = undefined;
+    const heads_prefix = try index_publication.headPrefix(&head_prefix_buf, group_id);
+    var required_version: u16 = 0;
+    for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        if (std.mem.startsWith(u8, row.key, tables_prefix)) {
+        if (std.mem.startsWith(u8, row.key, heads_prefix)) {
+            _ = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.Head.decode(row.value);
+            required_version = topology_protocol.index_publication_head_version;
+            break; // Highest profile currently emitted by these records.
+        } else if (std.mem.startsWith(u8, row.key, tables_prefix)) {
             if ((try borrowTableProjection(row.value, .identity)).schema_reader_requirements != null) {
-                publication_required = true;
-                break;
+                required_version = @max(required_version, topology_protocol.schema_reader_publication_version);
             }
         } else {
             for (plan_prefixes) |prefix| {
                 if (std.mem.startsWith(u8, row.key, prefix) and @import("../schema_reader_wire.zig").requiresPublication(row.value)) {
-                    publication_required = true;
-                    break :records;
+                    required_version = @max(required_version, topology_protocol.schema_reader_publication_version);
+                    break;
                 }
             }
         }
     }
     const encoded = values.get(try metadataIncarnationKeyForGroup(&buf, group_id)) orelse {
-        if (publication_required) return error.InvalidMetadataSnapshot;
+        if (required_version != 0) return error.InvalidMetadataSnapshot;
         return;
     };
     const incarnation = try decodeMetadataIncarnationRecord(encoded);
     const floor = incarnation.schema_reader_floor;
-    if (!floor.active() and !publication_required) return;
+    if (!floor.active() and required_version == 0) return;
     const activation = values.get(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id)) orelse return error.InvalidMetadataSnapshot;
-    const required = if (publication_required) topology_protocol.schema_reader_publication_version else topology_protocol.schema_reader_floor_version;
+    const required = @max(required_version, if (floor.active()) topology_protocol.schema_reader_floor_version else @as(u16, 0));
     if (!try schemaReaderDecoderActivationValidAt(alloc, activation, incarnation.incarnation, required)) return error.InvalidMetadataSnapshot;
     if (!floor.active()) return;
     var prefix_buf: [128]u8 = undefined;
@@ -32675,6 +32739,24 @@ test "system catalog schema reader table snapshot protects marked definitions be
         rows[1].value = current;
         try Check.project(a, &rows);
     }
+    // A later compact head needs v40 even when a preceding marked table has
+    // already established v39. The reader pair may also be absent in a head.
+    const progress = @import("antfly_local_sources").storage_db_relational_index_publication_progress;
+    const head_bytes = try (progress.Head{ .plan_id = @splat(1), .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .table_id = 7, .owner_count = 1 }).encode();
+    var head_key_buf: [160]u8 = undefined;
+    const head_key = try index_publication.headKey(&head_key_buf, group, 7);
+    rows[2] = .{ .key = @constCast(table_key), .value = encoded };
+    var with_head = [_]docstore.OwnedKVPair{ rows[0], rows[1], rows[2], .{ .key = @constCast(head_key), .value = @constCast(&head_bytes) } };
+    try std.testing.expectError(error.InvalidMetadataSnapshot, Check.project(a, &with_head));
+    activation.version = topology_protocol.index_publication_head_version;
+    const newest = try std.json.Stringify.valueAlloc(a, activation, .{});
+    defer a.free(newest);
+    with_head[1].value = newest;
+    try Check.project(a, &with_head);
+    rows[2] = with_head[3];
+    try std.testing.expectError(error.InvalidMetadataSnapshot, Check.project(a, &rows));
+    rows[1].value = newest;
+    try Check.project(a, &rows);
     // Opaque restore pointers are not JSON plans and require no new decoder.
     rows[2] = .{ .key = @constCast(try restore_staging.activeKey(&plan_buf, group, @splat(7))), .value = @constCast(&@as([16]u8, @splat(7))) };
     rows[1].value = old;

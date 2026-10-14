@@ -6130,7 +6130,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const index_publication_progress_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/relational_index_publication_progress.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/src/relational_index_publication_progress_test_root.zig"),
             .target = target,
             .optimize = optimize,
         }),

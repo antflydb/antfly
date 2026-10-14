@@ -386,7 +386,7 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_admission_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_head_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -440,7 +440,7 @@ test "relational index publication ACK submission fences capabilities releases m
             }
         };
         pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
-            try std.testing.expectEqual(protocol.index_publication_admission_version, version);
+            try std.testing.expectEqual(protocol.index_publication_head_version, version);
             return version;
         }
         pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}

@@ -114,7 +114,8 @@ pub const Receipt = struct {
 
 /// Fixed-size head: ACK application does not rewrite/reparse a 4,096-owner plan.
 pub const Head = struct {
-    pub const encoded_len = 184;
+    pub const encoded_len = 192;
+    reader_requirements: ?@import("../../common/schema_readers.zig").ReaderRequirements = null,
     plan_id: Id,
     plan_digest: Digest,
     candidate_digest: Digest,
@@ -127,6 +128,7 @@ pub const Head = struct {
     counts: [7]u16 = @splat(0),
 
     pub fn validate(self: Head) !void {
+        if (self.reader_requirements) |requirements| if (!requirements.valid()) return error.InvalidGenerationPublication;
         if (!nonzero(&self.plan_id) or !nonzero(&self.plan_digest) or !nonzero(&self.candidate_digest) or
             !nonzero(&self.reservation_digest) or equal(self.candidate_digest, self.reservation_digest) or
             self.table_id == 0 or self.revision == 0 or self.owner_count == 0 or self.owner_count > max_owners)
@@ -199,7 +201,7 @@ pub const Head = struct {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPH");
-        bytes[4] = 1;
+        bytes[4] = 2;
         bytes[5] = @backingInt(self.phase);
         bytes[6] = @backingInt(self.failure);
         @memcpy(bytes[8..24], &self.plan_id);
@@ -210,13 +212,17 @@ pub const Head = struct {
         std.mem.writeInt(u64, bytes[128..136], self.revision, .little);
         std.mem.writeInt(u16, bytes[136..138], self.owner_count, .little);
         for (self.counts, 0..) |count, i| std.mem.writeInt(u16, bytes[138 + i * 2 ..][0..2], count, .little);
-        @memcpy(bytes[152..184], &checksum(bytes[0..152]));
+        if (self.reader_requirements) |requirements| {
+            std.mem.writeInt(u32, bytes[152..156], requirements.semantic_version, .little);
+            std.mem.writeInt(u32, bytes[156..160], requirements.encoding_version, .little);
+        }
+        @memcpy(bytes[160..192], &checksum(bytes[0..160]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !Head {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPH") or bytes[4] != 1 or bytes[7] != 0 or
-            !std.mem.eql(u8, &checksum(bytes[0..152]), bytes[152..184])) return error.InvalidGenerationPublication;
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPH") or bytes[4] != 2 or bytes[7] != 0 or
+            !std.mem.eql(u8, &checksum(bytes[0..160]), bytes[160..192])) return error.InvalidGenerationPublication;
         var result: Head = .{
             .plan_id = bytes[8..24].*,
             .plan_digest = bytes[24..56].*,
@@ -228,6 +234,9 @@ pub const Head = struct {
             .phase = std.enums.fromInt(Phase, bytes[5]) orelse return error.InvalidGenerationPublication,
             .failure = std.enums.fromInt(Failure, bytes[6]) orelse return error.InvalidGenerationPublication,
         };
+        const semantic = std.mem.readInt(u32, bytes[152..156], .little);
+        const encoding = std.mem.readInt(u32, bytes[156..160], .little);
+        if (semantic != 0 or encoding != 0) result.reader_requirements = .{ .semantic_version = semantic, .encoding_version = encoding };
         for (&result.counts, 0..) |*count, i| count.* = std.mem.readInt(u16, bytes[138 + i * 2 ..][0..2], .little);
         try result.validate();
         return result;
@@ -680,8 +689,29 @@ test "index progress codecs reject every byte corruption and invalid checksummed
     }
     var impossible = head_bytes;
     impossible[5] = @backingInt(Phase.published);
-    @memcpy(impossible[152..184], &checksum(impossible[0..152]));
+    @memcpy(impossible[160..192], &checksum(impossible[0..160]));
     try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&impossible));
+}
+
+test "index publication reader requirements survive ACKs and reject partial checksummed pairs" {
+    var head = testHead(1);
+    head.reader_requirements = .{ .semantic_version = 30, .encoding_version = 17 };
+    var owner = testOwner(0);
+    try testAck(&head, &owner, .fenced);
+    try std.testing.expectEqualDeep(@as(?@import("../../common/schema_readers.zig").ReaderRequirements, .{ .semantic_version = 30, .encoding_version = 17 }), head.reader_requirements);
+    const canonical = try head.encode();
+    try std.testing.expectEqualDeep(head, try Head.decode(&canonical));
+    for ([_][2]u32{ .{ 0, 17 }, .{ 30, 0 }, .{ 32, 17 }, .{ 30, 32 } }) |pair| {
+        var invalid = canonical;
+        std.mem.writeInt(u32, invalid[152..156], pair[0], .little);
+        std.mem.writeInt(u32, invalid[156..160], pair[1], .little);
+        @memcpy(invalid[160..192], &checksum(invalid[0..160]));
+        try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&invalid));
+    }
+    var old_format = canonical;
+    old_format[4] = 1;
+    @memcpy(old_format[160..192], &checksum(old_format[0..160]));
+    try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&old_format));
 }
 
 test "index progress stays fixed size at maximum owner count and fails closed on revision exhaustion" {
@@ -692,7 +722,7 @@ test "index progress stays fixed size at maximum owner count and fails closed on
         try testAck(&head, &owner, .fenced);
     }
     try std.testing.expectEqual(Phase.reserving, head.phase);
-    try std.testing.expectEqual(@as(usize, 184), (try head.encode()).len);
+    try std.testing.expectEqual(@as(usize, 192), (try head.encode()).len);
     head.revision = std.math.maxInt(u64);
     try std.testing.expectError(error.GenerationPublicationChanged, head.cancel(head.revision, .requested));
     head = testHead(1);

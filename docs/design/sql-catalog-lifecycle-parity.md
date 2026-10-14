@@ -5841,3 +5841,57 @@ table in a compound publication before any catalog effects; publish that one
 monotonic native-floor update in the same transaction as the admitted table set.
 Then qualify the original ALTER TABLE and CREATE INDEX cohorts through the public
 endpoint, including restart/root replacement and rejected-write poststates.
+
+### Reader-bound compact heads and installed-root acknowledgment admission
+
+The private index-publication head is now AIPH v2: 192 fixed bytes, including
+independent u32 semantic/encoding requirements and a checksum covering both.
+The head joins requirements from the admitted before/after table images; an
+unmarked plan retains an absent pair, not an assumed current capability. Its
+plan digest binds those images, projected candidate/native-manifest preparation
+rechecks the pair, and checkpoint verification independently recomputes it.
+This replaces the unreleased v1 head rather than adding a compatibility path.
+
+Metadata decoder v40 is required for admission, owner decision/status reads and
+planless ACKs, including unmarked plans. The service classifier selects it before
+the older v39 definition-marker profile. Catalog preflight and native apply use
+the same version. Snapshot cuts require v40 for a compact head even when a marked
+table earlier in row order needed only v39; an inactive data floor is no bypass.
+Ordinary appends already honor the durable activation's actual version.
+
+ACK admission reuses the existing signed receipt, current enrolled reporter,
+physical root, live range/placement and ordered source-position checks. The
+head's pair is checked against capabilities in the store header already loaded
+for those checks, not a request claim or schema-sized plan decode. Cancellation
+and cancel-release can still clean an unpublished build after capability loss;
+they retain all root/authentication/position checks and cannot publish a schema.
+Non-cancellation progress also requires a current table-serving role; changing
+the store to metadata-only cannot bypass the floor's table-owner scope.
+
+Debug regressions cover independently joined axes, partial or unsupported
+checksummed pairs, changed candidate/head requirements, v39-vs-v40 admission,
+snapshot row ordering, missing/insufficient capabilities on both native and Raft
+owners, and complete cancel/release progress after capability loss. Recovery
+also substitutes a valid pair with a fresh checksum to verify immutable plan
+binding. Maximum-owner pure progress stays allocation-free and fixed-size;
+no throughput/latency benchmark improvement is claimed. The focused gates passed
+102/102 steps; the pure gate passed 16/16 tests. The final combined Debug
+metadata/service/reader/catalog/initial-FK/restore/index-publication/ACK/progress
+gate passed 179/179 steps and 278/278 standard-protocol tests. Linked runners
+passed 244 metadata-store, 318 control, 226 runtime, 139 service, 28 replication,
+19 initial-FK, 25 restore and 32 index-publication tests, plus eight table-reader,
+seven service-reader, two data-reader and four HTTP ACK contracts. Two optional
+live PostgreSQL CDC tests skipped their prerequisites. No failures or leaks
+remained; overlapping suite counts are not original SQL-case totals. Formatting,
+inventory integrity, Apache boundary, licensing and control-catalog freshness
+checks passed. The license checker initially stalled in macOS timezone startup;
+sampling identified that block and its read-only rerun passed. GC was preview-only.
+No original SQL disposition changes, full SQL release pass, public activation
+or push is claimed.
+
+This is ACK admission, not complete publication authority. Owner progress still
+stores logical receipt digests, not the accepted physical root attestation.
+Publication must retain/revalidate physical evidence and support owner-root
+replacement/re-attestation instead of treating an old phase counter as proof
+of a newly installed root. That work and the same-transaction joined reader
+floor/catalog decision remain prerequisites for enabling public producers.
