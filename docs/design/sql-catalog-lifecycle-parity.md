@@ -6231,3 +6231,66 @@ Static inventory, Apache-boundary, licensing and control-catalog checks passed.
 No original-case credit, public activation,
 throughput improvement, release pass or push is claimed; dispositions remain
 483 implemented / 862 unresolved.
+
+### Bounded canonical source partitions and target admission headroom
+
+Source preparation now accounts for a single row's actual target inventory
+charge before emitting it, including repeated parent-table/key fields and
+claim/inventory overhead. A row that fits a physical ordered key but cannot fit
+one target request becomes a durable key-too-large build failure, not an
+undrainable ready batch or an endlessly retried transport-size failure. The
+failure emits no member rows or private forward keys and survives reopen at the
+same native cut. Temporary allocation/resource/cancellation errors still do not
+poison a generation. Source bodies require strictly increasing primary keys,
+rejecting duplicate/noncanonical members before they can inflate coverage.
+
+An owned immutable cohort validates complete, disjoint range coverage, exact
+plan/table identity, unique groups and consecutive owner ordinals. It preserves
+ordinal identity after range sorting, bounds retained bytes, and routes each
+logical tuple hash with binary search. Preparing a page uses fixed 128-entry
+scratch rather than a row-by-owner scan or allocation per destination. It checks
+the exact header/scope/canonical body and request cancellation outside apply
+exclusion, then partitions by destination and actual target-byte charge.
+Different partitions for one owner are allowed when their combined target
+inventory charge exceeds 1 MiB even though the source body fits 1 MiB.
+
+Each partition has a source-row mask and deterministic descriptor commitment.
+Complete coverage rejects omissions, duplicates, overlapping masks and unknown
+partitions independently of response order. Structural target checks pin the
+owner, shared manifest, predecessor schema, candidate/reservation commitments
+and successor schema version. A borrowed internal request constructor preserves
+those exact selected claim bytes without choosing a physical allocation.
+These are data preparation/coverage commitments, not authorization booleans,
+remote-durability proofs, publication receipts or source-consumption permission.
+
+Native integration reads a real checkpoint-verified source batch, partitions
+four rows including a NULL-distinct witness, applies those exact target claims
+and retries at the same creation cut. Its nine source batches remain pending:
+successful target writes alone cannot retire source debt. The additional wide
+row regression proves durable target-size failure before source member emission.
+
+Qualification caught two local-name compilation errors and a test-discovery
+gap. Routing tests now live in an explicit server test leaf; production routing
+stays Apache-only. The registered 87-step Debug run passed with 35 publication
+tests rather than the previous 32, plus eight native page tests, six C-ABI tests,
+14 private-candidate prerequisites and 46 runtime contracts. The router tests
+cover allocation failures, gaps/overlap/duplicate groups, owned input lifetime,
+all 4,096 owner boundaries within 13 comparisons per lookup, splitting at actual
+target bytes, exact masks, body substitution, cancellation/deadlines and failed
+source rejection. Counts overlap and are not original SQL cases.
+
+Final shared-manifest/predecessor-schema hardening passed 87/87 Debug steps,
+including all 35 publication/router tests, eight native page tests, six C-ABI
+tests, 14 private-candidate prerequisites and 46 runtime contracts, with no
+failures or leaks. The final log is
+`/private/tmp/antfly-claim-delivery-partitions-scope-debug.log`.
+Inventory, Apache-boundary, licensing and control-catalog checks passed; original
+dispositions remain 483 implemented / 862 unresolved. No throughput improvement,
+public activation, full release pass or push is claimed.
+
+Still required: authenticated source-subset production, fresh target authority
+verification and durable complete-delivery ACKs, source/target EOF inventory
+seals, provenance-backed root repair and data-Raft execution, native validated/
+installed/released evidence and atomic current-proof/reader-floor/catalog/schema
+publication. Do not open the source-consumption or public activation guards on
+the strength of these structural coverage tests.

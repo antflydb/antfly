@@ -282,6 +282,18 @@ pub const ClaimRequest = struct {
     id: [16]u8,
     claims: @FieldType(native.ClaimCommand, "claims"),
 
+    /// Borrowed request for one deterministic source partition. This does not
+    /// replace the receiver's fresh permission and physical binding checks.
+    pub fn fromDelivery(plan: *const jobs.private_claims.delivery.Plan, cohort: *const jobs.private_claims.delivery.Cohort, group_index: usize) !ClaimRequest {
+        if (!std.mem.eql(u8, &plan.cohort_digest, &cohort.digest)) return error.PrivateIndexOwnerJobChanged;
+        try cohort.requireBinding(plan.source);
+        const values = try plan.groupClaims(group_index);
+        const owner = cohort.targets[plan.groups[group_index].target_index].owner;
+        const result: ClaimRequest = .{ .table_id = owner.namespace.table_id, .group_id = owner.group_id, .id = owner.plan_id, .claims = values };
+        try result.validate(result.group_id);
+        return result;
+    }
+
     pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ClaimRequest {
         const wire = try std.json.innerParse(struct { table_id: u64, group_id: u64, id: [16]u8, claims: native.ClaimCommand.BoundedClaims }, alloc, source, options);
         return .{ .table_id = wire.table_id, .group_id = wire.group_id, .id = wire.id, .claims = wire.claims.items };
@@ -1109,6 +1121,26 @@ test "relational index publication claim receiver binds fresh build permission w
         .id = plan.id,
         .claims = &.{.{ .tuple = "receiver\x00\xff", .parent_table = plan.before.name, .parent_key = "row", .schema_version = 2 }},
     };
+    {
+        const delivery = jobs.private_claims.delivery;
+        const Source = jobs.private_claims.SourceStream;
+        var cohort = try delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner }});
+        defer cohort.deinit();
+        const scope: Source.Scope = .{ .table_name = plan.before.name, .generation = @splat(1), .schema_version = 2, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false };
+        const rows = [_]Source.Row{.{ .key = request.claims[0].parent_key, .tuple = request.claims[0].tuple }};
+        var source = try Source.PreparedSource.init(alloc, binding.?, scope, @splat(9), .ready, &rows);
+        defer source.deinit();
+        var source_header = source.header;
+        std.mem.writeInt(u64, source_header[104..112], 1, .little);
+        @memcpy(source_header[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.?.fence.namespace, .sequence = 4 } }).encode());
+        std.crypto.hash.Blake3.hash(source_header[0..288], source_header[288..320], .{});
+        const prepared_delivery = try delivery.Plan.prepare(&cohort, binding.?, .{ .header = try Source.Header.decode(&source_header, binding.?, 1), .scope = scope, .rows = &rows });
+        const generated = try ClaimRequest.fromDelivery(&prepared_delivery, &cohort, 0);
+        try std.testing.expectEqual(request.table_id, generated.table_id);
+        try std.testing.expectEqual(request.group_id, generated.group_id);
+        try std.testing.expectEqual(request.id, generated.id);
+        try std.testing.expectEqual(try (native.ClaimCommand{ .binding = binding.?, .claims = request.claims }).digest(), try (native.ClaimCommand{ .binding = binding.?, .claims = generated.claims }).digest());
+    }
     {
         const first = request.claims[0];
         var second = first;

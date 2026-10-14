@@ -26,6 +26,7 @@ pub const registration_prefix = jobs.key ++ ":claim-registration:";
 const authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
 pub const max_claims = 128;
+pub const delivery = @import("relational_index_claim_delivery.zig");
 
 /// Durable source pages, independent of mirror transport acknowledgments.
 /// Headers stay compact for recovery; payloads are fetched only for delivery.
@@ -40,6 +41,16 @@ pub const SourceStream = struct {
     pub const Key = [batch_prefix.len + 25]u8;
     pub const State = enum(u8) { building, ready, failed };
     pub const Row = struct { key: []const u8, tuple: []const u8 };
+    /// Exact target inventory charge, not merely source-body framing. Check
+    /// before persisting a row that no destination request could ever admit.
+    pub fn targetBytes(table_bytes: usize, key_bytes: usize, tuple_bytes: usize) !usize {
+        if (table_bytes == 0 or key_bytes == 0 or tuple_bytes == 0) return error.InvalidPrivateIndexClaimInventory;
+        var result: usize = claim_entry_overhead;
+        for ([_]usize{ table_bytes, key_bytes, tuple_bytes }) |size|
+            result = std.math.add(usize, result, size) catch return error.RelationalIndexKeyTooLarge;
+        if (result > max_bytes) return error.RelationalIndexKeyTooLarge;
+        return result;
+    }
     pub const Scope = struct {
         table_name: []const u8,
         generation: integrity.Generation,
@@ -186,9 +197,15 @@ pub const SourceStream = struct {
             try source.validate();
             if (rows.len > max_claims or source.schema_version != binding.physical_candidate.schema_version or std.mem.allEqual(u8, &progress_digest, 0)) return error.InvalidPrivateIndexClaimInventory;
             var size: usize = source.table_name.len;
+            var previous: ?[]const u8 = null;
             for (rows) |row| {
+                if (previous) |prior| if (std.mem.order(u8, prior, row.key) != .lt) return error.InvalidPrivateIndexClaimInventory;
+                previous = row.key;
                 if (row.key.len == 0 or row.key.len > @import("relational_index_limits.zig").max_cursor_key_bytes or row.tuple.len == 0) return error.InvalidPrivateIndexClaimInventory;
-                size = std.math.add(usize, size, 8 + row.key.len + row.tuple.len) catch return error.TransactionTooLarge;
+                _ = try targetBytes(source.table_name.len, row.key.len, row.tuple.len);
+                const fields = std.math.add(usize, row.key.len, row.tuple.len) catch return error.TransactionTooLarge;
+                const framed = std.math.add(usize, fields, 8) catch return error.TransactionTooLarge;
+                size = std.math.add(usize, size, framed) catch return error.TransactionTooLarge;
                 if (size > max_payload_bytes) return error.TransactionTooLarge;
             }
             const payload = try alloc.alloc(u8, size);
@@ -365,6 +382,7 @@ pub const SourceStream = struct {
         try txn.delete(head_key);
     }
 };
+
 pub const max_bytes = 1024 * 1024;
 const key_len = prefix.len + 16 + 32 + 32;
 // AFC1 fixed fields/checksum, both paired keys, and the provenance value.

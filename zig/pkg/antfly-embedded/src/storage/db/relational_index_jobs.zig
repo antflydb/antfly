@@ -508,6 +508,7 @@ pub const Page = struct {
             if (scratch.projected == null) scratch.projected = try scratch.projection.tuple.projectSource(alloc, typed.table_schema, typed.layout);
             scratch.encoded.clearRetainingCapacity();
             try scratch.projected.?.appendUnique(alloc, &scratch.encoded, typed, scratch.projection.scope.nulls_not_distinct, document);
+            _ = try @import("relational_index_private_claims.zig").SourceStream.targetBytes(scratch.projection.scope.table_name.len, document.len, scratch.encoded.items.len);
             scratch.value = try payload_alloc.dupe(u8, scratch.encoded.items);
         }
         return if (index.cover) |cover| try cover.encodeSource(payload_alloc, typed, &projected_cover.*.?) else "";
