@@ -141,6 +141,10 @@ const Table = struct {
         return true;
     }
 };
+/// Borrowed payload valid only during its callback. Copy it for retention.
+/// Continuation PES records retain has_timestamp=false; no clocks are invented.
+pub const Pes = struct { bytes: []const u8, packet: Packet, ordinal: usize };
+pub const Consumer = struct { context: *anyopaque, accept: *const fn (*anyopaque, Pes) anyerror!void };
 const Parser = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -154,6 +158,9 @@ const Parser = struct {
     pes_started: bool = false,
     output: std.ArrayList(u8) = .empty,
     packets: std.ArrayList(Packet) = .empty,
+    consumer: ?Consumer = null,
+    published_packets: usize = 0,
+    published_bytes: usize = 0,
     fn section(self: *Parser, bytes: []const u8, pat: bool) !void {
         try self.control.check();
         if (bytes.len < 12 or bytes[5] & 0xc0 != 0xc0) return error.MalformedTransportStream;
@@ -244,9 +251,18 @@ const Parser = struct {
             pts = std.math.add(i64, dts, delta(pts_raw, dts_raw)) catch return error.ResourceLimitExceeded;
         }
         if (header == end) return error.MalformedTransportPes;
-        if (self.packets.items.len >= self.limits.max_packets or end - header > self.limits.max_bytes -| self.output.items.len) return error.ResourceLimitExceeded;
-        try self.packets.append(self.allocator, .{ .offset = self.output.items.len, .size = end - header, .dts = dts, .pts = pts, .has_timestamp = timed });
-        try self.output.appendSlice(self.allocator, bytes[header..end]);
+        const count = if (self.consumer != null) self.published_packets else self.packets.items.len;
+        const offset = if (self.consumer != null) self.published_bytes else self.output.items.len;
+        if (count >= self.limits.max_packets or end - header > self.limits.max_bytes -| offset) return error.ResourceLimitExceeded;
+        const packet_info = Packet{ .offset = offset, .size = end - header, .dts = dts, .pts = pts, .has_timestamp = timed };
+        if (self.consumer) |consumer| {
+            try consumer.accept(consumer.context, .{ .bytes = bytes[header..end], .packet = packet_info, .ordinal = count });
+            self.published_packets += 1;
+            self.published_bytes += end - header;
+        } else {
+            try self.packets.append(self.allocator, packet_info);
+            try self.output.appendSlice(self.allocator, bytes[header..end]);
+        }
         if (timed) self.state.last_dts = dts;
         self.pes.clearRetainingCapacity();
         self.pes_started = false;
@@ -294,6 +310,105 @@ const Parser = struct {
         try self.pes.appendSlice(self.allocator, payload);
     }
 };
+
+/// Native 188-byte packet framing with bounded active-PES storage. One consumer,
+/// synchronous callback backpressure, and no implicit retry. Entered failures
+/// are terminal and release all admitted workspace. Accepted payloads may have
+/// escaped; reconstruct from the original State and reconcile them on retry.
+/// A successful finish returns the transactional state for the next resource.
+pub const Stream = struct {
+    parser: Parser,
+    workspace: admission.TrackedAllocator,
+    fixed: admission.Token = .{},
+    carry: [188]u8 = undefined,
+    carry_len: usize = 0,
+    input_bytes: usize = 0,
+    largest_pes_capacity: usize = 0,
+    ended: bool = false,
+    active: bool = false,
+    pub fn init(a: std.mem.Allocator, state: State, limits: Limits, control: source.Control, pool: ?*admission.Pool, consumer: Consumer) !Stream {
+        try control.check();
+        if ((state.pmt_pid != null and state.program == null) or (state.video_pid != null and state.pmt_pid == null)) return error.InvalidTransportState;
+        if (limits.max_bytes == 0 or limits.max_packets == 0 or limits.max_pes_bytes == 0) return error.ResourceLimitExceeded;
+        var fixed = if (pool) |p| try p.acquire(.{ .host_bytes = @sizeOf(Stream) }) else admission.Token{};
+        errdefer fixed.deinit();
+        var token = if (pool) |p| try p.acquire(.{}) else admission.Token{};
+        errdefer token.deinit();
+        // ArrayList may temporarily own old/new moving-growth buffers. Charges
+        // follow actual allocations, rather than reserving the PES ceiling.
+        const bound = std.math.add(usize, std.math.mul(usize, limits.max_pes_bytes, 3) catch return error.ResourceLimitExceeded, 4096) catch return error.ResourceLimitExceeded;
+        return .{ .parser = .{ .allocator = a, .limits = limits, .control = control, .state = state, .consumer = consumer }, .workspace = .{ .backing = a, .limit = bound, .reservation = token }, .fixed = fixed };
+    }
+    pub fn deinit(self: *Stream) void {
+        const a = self.workspace.allocator();
+        self.parser.pes.deinit(a);
+        self.parser.pes = .empty;
+        self.parser.output.deinit(a);
+        self.parser.output = .empty;
+        self.parser.packets.deinit(a);
+        self.parser.packets = .empty;
+        std.debug.assert(self.workspace.live == 0);
+        self.workspace.reservation.deinit();
+        self.fixed.deinit();
+        self.ended = true;
+    }
+    fn failure(self: *Stream, err: anyerror) anyerror {
+        const result = if (err == error.OutOfMemory and self.workspace.denied != null) self.workspace.denied.? else err;
+        self.deinit();
+        return result;
+    }
+    pub fn push(self: *Stream, bytes: []const u8) !void {
+        if (self.ended or self.active) return error.InvalidTransportState;
+        self.active = true;
+        defer self.active = false;
+        self.parser.allocator = self.workspace.allocator();
+        self.pushEntered(bytes) catch |err| return self.failure(err);
+    }
+    fn pushEntered(self: *Stream, bytes: []const u8) !void {
+        try self.parser.control.check();
+        if (bytes.len > self.parser.limits.max_bytes -| self.input_bytes) return error.ResourceLimitExceeded;
+        self.input_bytes += bytes.len;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            try self.parser.control.check();
+            if (self.carry_len == 0 and bytes.len - offset >= 188) {
+                try self.parser.packet(bytes[offset..][0..188]);
+                self.largest_pes_capacity = @max(self.largest_pes_capacity, self.parser.pes.capacity);
+                offset += 188;
+                continue;
+            }
+            const count = @min(self.carry.len - self.carry_len, bytes.len - offset);
+            @memcpy(self.carry[self.carry_len..][0..count], bytes[offset..][0..count]);
+            self.carry_len += count;
+            offset += count;
+            if (self.carry_len != self.carry.len) continue;
+            try self.parser.packet(&self.carry);
+            self.largest_pes_capacity = @max(self.largest_pes_capacity, self.parser.pes.capacity);
+            self.carry_len = 0;
+        }
+    }
+    pub fn finish(self: *Stream) !State {
+        if (self.ended or self.active) return error.InvalidTransportState;
+        self.active = true;
+        defer self.active = false;
+        self.parser.allocator = self.workspace.allocator();
+        const state = self.finishEntered() catch |err| return self.failure(err);
+        self.deinit();
+        return state;
+    }
+    fn finishEntered(self: *Stream) !State {
+        try self.parser.control.check();
+        if (self.input_bytes == 0 or self.carry_len != 0) return error.MalformedTransportStream;
+        if (self.parser.pat.length != 0 or self.parser.pmt.length != 0) return error.TruncatedTransportSection;
+        try self.parser.finishPes();
+        if (!self.parser.pat_table.complete() or !self.parser.pmt_table.complete()) return error.MissingTransportTables;
+        if (self.parser.state.video_pid == null) return error.UnsupportedVideoCodec;
+        if (self.parser.published_packets == 0) return error.EmptyVideo;
+        try self.parser.control.check();
+        return self.parser.state;
+    }
+};
+
 fn timestamp(bytes: []const u8, prefix: u8) !u64 {
     if (bytes.len != 5 or bytes[0] >> 4 != prefix or bytes[0] & 1 == 0 or bytes[2] & 1 == 0 or bytes[4] & 1 == 0) return error.MalformedTransportPes;
     return (@as(u64, (bytes[0] >> 1) & 7) << 30) | (@as(u64, bytes[1]) << 22) | (@as(u64, bytes[2] >> 1) << 15) | (@as(u64, bytes[3]) << 7) | (bytes[4] >> 1);
@@ -510,4 +625,150 @@ test "transport untimed continuation PES preserve original payload and timestamp
         try std.testing.expectEqual(original.packets.len, clock);
         try std.testing.expectEqual(original.next_state.last_dts, split.next_state.last_dts);
     }
+}
+
+test "incremental transport PES byte clocks and transactional state match buffered independent fixtures at every packet boundary" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        expected: *Demux,
+        count: usize = 0,
+        before_eof: usize = 0,
+        finishing: bool = false,
+        fn accept(raw: *anyopaque, pes: Pes) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const packet = self.expected.packets[self.count];
+            try std.testing.expectEqual(self.count, pes.ordinal);
+            try std.testing.expectEqualDeep(packet, pes.packet);
+            try std.testing.expectEqualSlices(u8, self.expected.bytes[packet.offset..][0..packet.size], pes.bytes);
+            if (!self.finishing) self.before_eof += 1;
+            self.count += 1;
+        }
+    };
+    inline for (.{ "closed", "bframes", "closed-split", "bframes-split" }) |name| {
+        const bytes = @embedFile("../testdata/transport/" ++ name ++ ".ts");
+        var expected = try demux(a, bytes, .{}, .{}, .{}, null);
+        defer expected.deinit();
+        for ([_]usize{ 1, 187, 188, 189, 8192, bytes.len }) |chunk| {
+            var pool = admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+            var capture = Capture{ .expected = &expected };
+            var stream = try Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &capture, .accept = Capture.accept });
+            defer stream.deinit();
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const end = @min(bytes.len, offset + chunk);
+                try stream.push(bytes[offset..end]);
+                offset = end;
+            }
+            try std.testing.expect(capture.before_eof > 0);
+            try std.testing.expectEqual(@as(usize, 0), stream.parser.output.capacity);
+            try std.testing.expectEqual(@as(usize, 0), stream.parser.packets.capacity);
+            try std.testing.expect(stream.largest_pes_capacity < bytes.len);
+            capture.finishing = true;
+            const state = try stream.finish();
+            try std.testing.expectEqualDeep(expected.next_state, state);
+            try std.testing.expectEqual(expected.packets.len, capture.count);
+            try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+            try std.testing.expectError(error.InvalidTransportState, stream.push(""));
+        }
+    }
+}
+fn streamingAllocations(backing: std.mem.Allocator) !void {
+    // Keep moving-growth failure counts deterministic across heap placement.
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    const Discard = struct {
+        fn accept(_: *anyopaque, _: Pes) !void {}
+    };
+    var dummy: u8 = 0;
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), admission.Resources{}));
+    var stream = try Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &dummy, .accept = Discard.accept });
+    defer stream.deinit();
+    const bytes = @embedFile("../testdata/transport/closed-split.ts");
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(bytes.len, offset + 189);
+        try stream.push(bytes[offset..end]);
+        offset = end;
+    }
+    _ = try stream.finish();
+}
+test "incremental transport allocation failure drains actual PES growth and fixed admission" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, streamingAllocations, .{});
+}
+test "incremental transport cancellation consumer failure truncated packets and limits release owners and prohibit reentry" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/transport/closed.ts");
+    const Gate = struct {
+        cancel: bool = false,
+        fail: bool = false,
+        count: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            if (@as(*const @This(), @ptrCast(@alignCast(raw.?))).cancel) return error.Cancelled;
+        }
+        fn accept(raw: *anyopaque, _: Pes) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.ConsumerFailure;
+            self.count += 1;
+        }
+    };
+    var gate = Gate{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    var stream = try Stream.init(a, .{}, .{}, .{ .context = &gate, .check_fn = Gate.check }, &pool, .{ .context = &gate, .accept = Gate.accept });
+    defer stream.deinit();
+    try stream.push(bytes[0..188]);
+    gate.cancel = true;
+    try std.testing.expectError(error.Cancelled, stream.push(bytes[188..]));
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    gate.cancel = false;
+    gate.fail = true;
+    stream = try Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &gate, .accept = Gate.accept });
+    try std.testing.expectError(error.ConsumerFailure, stream.push(bytes));
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    gate.fail = false;
+    stream = try Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &gate, .accept = Gate.accept });
+    try stream.push(bytes[0 .. bytes.len - 1]);
+    try std.testing.expectError(error.MalformedTransportStream, stream.finish());
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    stream = try Stream.init(a, .{}, .{ .max_packets = 1 }, .{}, &pool, .{ .context = &gate, .accept = Gate.accept });
+    try std.testing.expectError(error.ResourceLimitExceeded, stream.push(bytes));
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    try std.testing.expectError(error.InvalidTransportState, stream.finish());
+    var denied = admission.Pool{ .limits = .{ .host_bytes = @sizeOf(Stream) - 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, Stream.init(a, .{}, .{}, .{}, &denied, .{ .context = &gate, .accept = Gate.accept }));
+    try std.testing.expectEqual(admission.Resources{}, denied.snapshot());
+}
+
+test "incremental transport CRC continuity and dynamic growth denial fail before corrupt payload delivery" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/transport/closed.ts");
+    const Discard = struct {
+        count: usize = 0,
+        fn accept(raw: *anyopaque, _: Pes) !void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).count += 1;
+        }
+    };
+    var capture = Discard{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    const damaged = try a.dupe(u8, bytes);
+    defer a.free(damaged);
+    var offset: usize = 0;
+    while (offset < damaged.len) : (offset += 188) {
+        if (damaged[offset + 1] & 31 == 0 and damaged[offset + 2] == 0) {
+            const payload = 4 + (if (damaged[offset + 3] & 0x20 != 0) @as(usize, damaged[offset + 4]) + 1 else 0);
+            damaged[offset + payload + 5] ^= 1;
+            break;
+        }
+    }
+    var stream = try Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &capture, .accept = Discard.accept });
+    defer stream.deinit();
+    try std.testing.expectError(error.InvalidTransportCrc, stream.push(damaged));
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    // Permit the fixed parser, but deny even the first dynamic PES allocation.
+    var constrained = admission.Pool{ .limits = .{ .host_bytes = @sizeOf(Stream) } };
+    stream = try Stream.init(a, .{}, .{}, .{}, &constrained, .{ .context = &capture, .accept = Discard.accept });
+    try std.testing.expectError(error.SharedAdmissionExceeded, stream.push(bytes));
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(admission.Resources{}, constrained.snapshot());
 }

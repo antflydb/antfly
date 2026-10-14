@@ -2982,3 +2982,36 @@ and actual Linux ARM64 each preserve all six vectors exactly; 214 media and 17
 HTTP checks pass on both platforms, plus 42 model checks with four optional skips. See
 [LL-HLS streaming qualification](../media/testdata/ll-stream/README.md) for terminal results
 and source/binary/checkpoint scope. Incremental normalized TS remains open.
+
+
+### Native incremental MPEG-TS PES extraction
+
+`transport_stream.Stream` accepts arbitrary byte pieces, frames 188-byte TS
+packets and publishes complete borrowed PES payloads with native PTS/DTS,
+continuation timing flags and elementary-stream offsets. It reuses the buffered
+parser's PSI sections, CRC, program selection, continuity and rollover rules.
+The consumer runs synchronously for backpressure; it must copy payloads it keeps.
+Untimed continuation records remain untimed, without invented picture clocks.
+
+Only the active PES buffer is retained, with an incomplete TS packet and fixed
+PSI/continuity workspace. Shared admission charges actual buffer allocations and
+moving-growth overlap; its configured PES limit is not a reservation. Aligned
+packets are parsed directly from input slices. Entered parsing, consumer,
+allocation, cancellation and resource failures terminalize the stream and free
+all workspace. A successful EOF validates sections/PES and returns the state for
+the next resource. There is no implicit retry or per-PES continuity checkpoint.
+
+The gate compares four independent ordinary/B-frame/split-PES fixtures at chunk
+sizes 1, 187, 188, 189, 8192 and full-body input. Payload bytes, packet clocks,
+continuation flags, ordinals, offsets and final state match buffered extraction.
+It checks early delivery, bounded retained capacity, no whole-body output array,
+all allocation failures, CRC errors, cancellation, consumer errors, truncated
+packets, limits and fixed/dynamic admission denial. A real authenticated chunked
+server withholds its tail until a native PES callback runs.
+
+This is the extraction stage of incremental TS ingestion. AVC access-unit
+normalization with decode-duration lookahead, acknowledged Reader replay/cursors
+and direct model coordinator delivery remain to be connected. The existing TS
+Reader/model route remains buffered. See [PES extraction qualification](../media/testdata/ts-stream/README.md)
+for source/binary scope: 218 media and 18 authenticated HTTP tests pass on
+macOS and actual Linux ARM64.

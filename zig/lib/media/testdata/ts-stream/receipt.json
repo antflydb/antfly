@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "date": "2026-10-14",
+  "basis_commit": "72cc37d934af33b96901ac6582893b7dd604f602",
+  "status": "pass",
+  "compiler": "Zig 0.17.0",
+  "optimization": "Debug",
+  "scope": "Incremental PES extraction, not incremental TS model integration",
+  "results": {
+    "macos_arm64": {
+      "media_passed": 218,
+      "http_passed": 18
+    },
+    "linux_arm64": {
+      "media_passed": 218,
+      "http_passed": 18,
+      "runtime": "native ARM64 Linux VM",
+      "image_id": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+      "network": "none; authenticated loopback only"
+    }
+  },
+  "source_sha256": {
+    "zig/lib/media/src/transport_stream.zig": "4b4cae80694990b2d6bda79067ce66f269d738b959dc761fc2d7b6ff73f22bd7",
+    "zig/lib/media/http_live_test_root.zig": "0326746be3aa0c5f0b6bb1b00eb20c518f73b08ff0f4dbc9515d0deb74384294"
+  },
+  "binary_sha256": {
+    "zig/zig-out/bin/ts-stream-media-macos": "363a82ebb74a9b11148f4b8dbeb2699d58569eeca93a810de2192930a01cd9ed",
+    "zig/zig-out/bin/ts-stream-media-linux": "04a2412378b664a29f0ca75b51b8c0b787c8ca33e083bc1ce31eaa30aaaf4d24",
+    "zig/zig-out/bin/media-http-tests": "9852f22169762fe75988c82e04399da51c0cb4d6763074fa843c5f2892db084b",
+    "zig/.zig-cache/o/75241ff665fb344f9bc4da02a27d3bf0/test": "79fd3a56a06bd03f1cdfcf28584f974aa722e5bf272cfd7f2be9647b89e9c76c"
+  },
+  "fixtures": {
+    "closed": {
+      "sha256": "00f54b524dc404758c1b0044fd6d3c86af9874be7836025f79764f28977bb185",
+      "reference": "Existing independent FFprobe PES/decoded-picture fixture receipts"
+    },
+    "bframes": {
+      "sha256": "bdc83e969c31c267bc019d4730d47ee8cc196504e89496861a46b28982f1e941",
+      "reference": "Existing independent FFprobe PES/decoded-picture fixture receipts"
+    },
+    "closed-split": {
+      "sha256": "a1266e77a9946650ffae422bf69d3baec84f5dfc2f3a2eb5a723ca5f6f22a20c",
+      "reference": "Existing independent FFprobe PES/decoded-picture fixture receipts"
+    },
+    "bframes-split": {
+      "sha256": "b9670802482f244f5b74d9c718f936c4b4ee5c7a1c1b2359bece10bfc69d3487",
+      "reference": "Existing independent FFprobe PES/decoded-picture fixture receipts"
+    }
+  },
+  "chunk_sizes": [
+    1,
+    187,
+    188,
+    189,
+    8192,
+    "full body"
+  ],
+  "contracts": [
+    "Complete borrowed PES payloads and native clocks/offsets agree with buffered extraction",
+    "No synthesized clocks for untimed continuation PES",
+    "No whole-resource output/index arrays retained",
+    "State returned only after validated EOF",
+    "Entered failures terminalize and release fixed/dynamic admission",
+    "All allocation failures and moving buffer growth checked",
+    "Authenticated HTTP tail unavailable until first PES callback"
+  ],
+  "log_sha256": {
+    "http-linux-build.log": "5f84a5be883ec45f520ecdff6bfb0a2ca91b353c1fafcda7b25dd5be9a93102d",
+    "http-macos.log": "cfb6582ce90c5cda1b113ff205e41c78d15328b2f0ed442767284e678ca30e93",
+    "media-linux-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "media-linux.log": "ed6f59c07043bf2673b7c897b46d2521e2c4122a61d4c80a97f08441306a3e98",
+    "media-macos.log": "ed6f59c07043bf2673b7c897b46d2521e2c4122a61d4c80a97f08441306a3e98",
+    "http-linux.log": "a19d89a1f80383f5c6496aee019eeac244603751f0fd46d7e233fb07ff8f1319"
+  },
+  "commands": {
+    "media": "zig test zig/lib/media/media_test_root.zig -O Debug",
+    "linux_media_build": "zig test zig/lib/media/media_test_root.zig -O Debug -target aarch64-linux-musl --test-no-exec",
+    "http": "zig build test-media-http -Doptimize=Debug --summary all (from zig/lib/media)",
+    "linux_http_build": "zig build install-media-http-tests -Dtarget=aarch64-linux-musl -Doptimize=Debug --prefix ../../zig-out --summary all (from zig/lib/media)",
+    "linux_run": "docker run --rm --network=none --read-only --workdir=/tmp --tmpfs /tmp:size=64m -v <recorded binary>:/qualify/test:ro --entrypoint /qualify/test <pinned image>"
+  },
+  "remaining": [
+    "Incremental AVC normalization and duration lookahead",
+    "Acknowledged Reader replay/cursor integration",
+    "Direct TS model coordinator delivery and pretrained preservation gate"
+  ]
+}

@@ -2287,3 +2287,12 @@ LL-HLS streaming qualification passes 214 media and 17 authenticated HTTP tests
 on macOS and actual Linux ARM64, plus 42 model unit checks (four optional skips).
 Configured CPU, Metal and Linux checkpoint gates preserve all six buffered
 full-clip vectors exactly across parent repackaging and retained-output retry.
+
+
+Native incremental TS extraction now publishes bounded borrowed PES payloads
+from arbitrary byte pieces, preserving native clocks and transactional EOF state.
+Actual-allocation admission, callback backpressure and terminal cleanup are
+qualified independently of the buffered oracle, including a real withheld-tail
+HTTP gate. AVC normalization/lookahead, acknowledged Reader replay and model
+coordinator integration remain open; the current TS model path stays buffered.
+Qualification: `zig/lib/media/testdata/ts-stream/README.md`.

@@ -1057,3 +1057,104 @@ test "production LL HLS streamed parent verifies repackaged sample prefix before
         }
     }
 }
+
+test "production HTTP incremental TS publishes native PES before authenticated response tail" {
+    const bytes = @embedFile("testdata/transport/closed.ts");
+    const Capture = struct {
+        expected: *media.transport_stream.Demux,
+        release: std.Io.Event = .unset,
+        tail: std.atomic.Value(bool) = .init(false),
+        count: usize = 0,
+        fn accept(raw: *anyopaque, pes: media.transport_stream.Pes) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const expected = self.expected.packets[self.count];
+            try std.testing.expectEqualDeep(expected, pes.packet);
+            try std.testing.expectEqual(self.count, pes.ordinal);
+            try std.testing.expectEqualSlices(u8, self.expected.bytes[expected.offset..][0..expected.size], pes.bytes);
+            if (self.count == 0) {
+                try std.testing.expect(!self.tail.load(.acquire));
+                self.release.set(std.testing.io);
+            }
+            self.count += 1;
+        }
+        fn serve(self: *@This(), listener: *http.TcpListener) !void {
+            const accepted = try listener.accept();
+            var socket = accepted.socket;
+            defer socket.close();
+            try socket.setRecvTimeout(5000);
+            try socket.setSendTimeout(5000);
+            var request: [4096]u8 = undefined;
+            var used: usize = 0;
+            while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                if (used == request.len) return error.TestUnexpectedResult;
+                const n = try socket.recv(request[used..]);
+                if (n == 0) return error.UnexpectedEof;
+                used += n;
+            }
+            try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+            try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+            var starts: usize = 0;
+            var boundary: usize = 0;
+            // Two AVC PES starts delimit the first complete PES. Only the
+            // header namespace is inspected here; demux checks PAT/PMT/CRC.
+            var offset: usize = 0;
+            while (offset < bytes.len) : (offset += 188) {
+                const pid = (@as(u16, bytes[offset + 1] & 31) << 8) | bytes[offset + 2];
+                if (pid == self.expected.next_state.video_pid.? and bytes[offset + 1] & 0x40 != 0) {
+                    starts += 1;
+                    if (starts == 2) {
+                        boundary = offset + 188;
+                        break;
+                    }
+                }
+            }
+            try std.testing.expect(boundary > 0 and boundary < bytes.len);
+            try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            try chunk(&socket, bytes[0..boundary]);
+            try self.release.wait(std.testing.io);
+            self.tail.store(true, .release);
+            try chunk(&socket, bytes[boundary..]);
+            try socket.sendAll("0\r\n\r\n");
+        }
+        fn chunk(socket: *http.Socket, body: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{body.len}));
+            try socket.sendAll(body);
+            try socket.sendAll("\r\n");
+        }
+    };
+    const Sink = struct {
+        stream: *media.transport_stream.Stream,
+        started: bool = false,
+        pub fn startResponse(self: *@This(), response: anytype) !void {
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            self.started = true;
+        }
+        pub fn writeAll(self: *@This(), input: []const u8) !void {
+            if (!self.started) return error.UnexpectedHttpStatus;
+            try self.stream.push(input);
+        }
+    };
+    var expected = try media.transport_stream.demux(a, bytes, .{}, .{}, .{}, null);
+    defer expected.deinit();
+    var capture = Capture{ .expected = &expected };
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    var stream = try media.transport_stream.Stream.init(a, .{}, .{}, .{}, &pool, .{ .context = &capture, .accept = Capture.accept });
+    defer stream.deinit();
+    var sink = Sink{ .stream = &stream };
+    var listener = try http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/stream.ts", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var serving = try std.testing.io.concurrent(Capture.serve, .{ &capture, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    var response = try client.getToWriter(url, .{ .headers = &.{.{ "Accept-Encoding", "identity" }}, .max_response_size = bytes.len, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .timeout_ms = 5000 }, &sink, null, null);
+    defer response.deinit();
+    const state = try stream.finish();
+    try serving.await(std.testing.io);
+    try std.testing.expectEqualDeep(expected.next_state, state);
+    try std.testing.expectEqual(expected.packets.len, capture.count);
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
