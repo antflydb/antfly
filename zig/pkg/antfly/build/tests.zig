@@ -1157,7 +1157,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata.runtime_status_protocol.test.runtime status exposes only released compatibility profiles",
         "metadata.table_topology_mutations.test.restore preserves implicit source document identity across a new physical incarnation",
 
-        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "embedding provider request helpers",
         "restore job store is idempotent and fenced",
@@ -1887,7 +1886,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client preserves group doc identity conflicts",
         "typed internal group reads preserve retryable resident storage failures",
         "typed routed batch preserves forwarding cancellation and identity conflicts",
-        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "db graph search filters result nodes and hidden traversal intermediates",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",

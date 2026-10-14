@@ -331,9 +331,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "issue1015",
         .skip = &.{
             // C ABI regressions borrow the implementation; storage owns its tests.
-            "storage.db.db.test.",
-            "storage.db.derived.catch_up_policy.test.",
-            "storage.db.derived.io_threaded_runtime.test.",
+            "storage.",
         },
     },
     .{
