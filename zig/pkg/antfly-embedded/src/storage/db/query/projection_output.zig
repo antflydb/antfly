@@ -37,7 +37,7 @@ pub const Source = union(enum) {
     }
     fn field(self: Source, name: []const u8) !?Source {
         return switch (self) {
-            .span => |s| if (try s.view.field(s.node, name)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
+            .span => |s| if (try s.view.fieldSparse(s.node, name)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
             .logical => |v| if (v.* == .object) (if (v.object.getPtr(name)) |value| .{ .logical = value } else null) else null,
         };
     }
@@ -47,12 +47,6 @@ pub const Source = union(enum) {
             .logical => |v| if (v.* == .array and index < v.array.items.len) .{ .logical = &v.array.items[index] } else null,
         };
     }
-    fn arrayLen(self: Source) !usize {
-        return switch (self) {
-            .span => |s| (try s.view.children(s.node)).len,
-            .logical => |v| v.array.items.len,
-        };
-    }
 };
 
 pub const Output = union(enum) {
@@ -60,6 +54,8 @@ pub const Output = union(enum) {
     object: Object,
     overlay: *Overlay,
     array: std.ArrayListUnmanaged(Output),
+    fanout: *const Fanout,
+    const Fanout = struct { source: Source, path: []const []const u8 };
     pub const Object = std.StringArrayHashMapUnmanaged(Output);
     // Keep this behind a pointer: ordinary fanout entries must not pay for a
     // base source plus an override map when no copy-on-write is needed.
@@ -110,7 +106,7 @@ pub const Output = union(enum) {
     }
 
     /// Apply includes in caller order. Object selections merge; every array
-    /// selection builds a fresh compact array, preserving legacy replacement.
+    /// selection produces a fresh compact array, preserving legacy replacement.
     pub fn include(a: Allocator, dst: *Object, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
         return includeWithBase(a, .{ .map = dst }, name, source, path);
     }
@@ -142,14 +138,17 @@ pub const Output = union(enum) {
                         if (object.count() != 0) try result.append(a, .{ .object = object });
                     }
                 } else {
-                    const len = try source.arrayLen();
-                    for (0..len) |i| {
-                        const item = (try source.element(i)).?;
-                        if (item.kind() != '{') continue;
-                        var object: Object = .empty;
-                        try includeObjectPath(a, &object, item, path);
-                        if (object.count() != 0) try result.append(a, .{ .object = object });
+                    // Establish whether this selector replaces the previous
+                    // array, then retain only its immutable source and path.
+                    // A selector with no surviving items must leave it alone.
+                    const fanout = try a.create(Fanout);
+                    fanout.* = .{ .source = source, .path = path };
+                    var rows = FanoutRows.init(a, fanout.*);
+                    defer rows.deinit();
+                    if (try rows.next() != null) {
+                        try put(a, dst, name, .{ .fanout = fanout });
                     }
+                    return;
                 }
                 if (result.items.len != 0) try put(a, dst, name, .{ .array = result });
             },
@@ -194,55 +193,69 @@ pub const Output = union(enum) {
     pub fn serialize(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
         var writer = std.Io.Writer.Allocating.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
         defer writer.deinit();
-        self.write(scratch, &writer.writer) catch |err| switch (err) {
+        var context = StreamContext.init(scratch);
+        defer context.deinit();
+        self.write(&context, &writer.writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
             else => return err,
         };
         return output.dupe(u8, writer.written());
     }
-    fn write(self: Output, scratch: Allocator, writer: *std.Io.Writer) anyerror!void {
+    fn write(self: Output, context: *StreamContext, writer: *std.Io.Writer) anyerror!void {
         switch (self) {
             .borrowed => |source| switch (source) {
-                .span => |s| try writeSpan(scratch, writer, s.node.raw, s.view.parse_numbers),
+                .span => |s| try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
             },
-            .overlay => |overlay| try writeOverlay(scratch, writer, overlay),
+            .overlay => |overlay| try writeOverlay(context, writer, overlay),
             .object => |object| {
                 try writer.writeByte('{');
                 for (object.keys(), object.values(), 0..) |name, child, i| {
                     if (i != 0) try writer.writeByte(',');
                     try std.json.Stringify.value(name, .{}, writer);
                     try writer.writeByte(':');
-                    try child.write(scratch, writer);
+                    try child.write(context, writer);
                 }
                 try writer.writeByte('}');
+            },
+            .fanout => |fanout| {
+                var rows = FanoutRows.init(context.work, fanout.*);
+                defer rows.deinit();
+                try writer.writeByte('[');
+                var count: usize = 0;
+                while (try rows.next()) |object| {
+                    if (count != 0) try writer.writeByte(',');
+                    try (Output{ .object = object }).write(context, writer);
+                    count += 1;
+                }
+                try writer.writeByte(']');
             },
             .array => |array| {
                 try writer.writeByte('[');
                 for (array.items, 0..) |child, i| {
                     if (i != 0) try writer.writeByte(',');
-                    try child.write(scratch, writer);
+                    try child.write(context, writer);
                 }
                 try writer.writeByte(']');
             },
         }
     }
 
-    fn writeMember(scratch: Allocator, writer: *std.Io.Writer, count: *usize, name: []const u8, value: Output) !void {
+    fn writeMember(context: *StreamContext, writer: *std.Io.Writer, count: *usize, name: []const u8, value: Output) !void {
         if (count.* != 0) try writer.writeByte(',');
         try std.json.Stringify.value(name, .{}, writer);
         try writer.writeByte(':');
-        try value.write(scratch, writer);
+        try value.write(context, writer);
         count.* += 1;
     }
-    fn writeBaseMember(scratch: Allocator, writer: *std.Io.Writer, overlay: *const Overlay, emitted: []bool, count: *usize, name: []const u8, source: Source) !void {
+    fn writeBaseMember(context: *StreamContext, writer: *std.Io.Writer, overlay: *const Overlay, emitted: []bool, count: *usize, name: []const u8, source: Source) !void {
         if (overlay.changed.getIndex(name)) |index| {
-            try writeMember(scratch, writer, count, name, overlay.changed.values()[index]);
+            try writeMember(context, writer, count, name, overlay.changed.values()[index]);
             emitted[index] = true;
-        } else try writeMember(scratch, writer, count, name, .{ .borrowed = source });
+        } else try writeMember(context, writer, count, name, .{ .borrowed = source });
     }
-    fn writeOverlay(scratch: Allocator, writer: *std.Io.Writer, overlay: *const Overlay) anyerror!void {
-        const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
+    fn writeOverlay(context: *StreamContext, writer: *std.Io.Writer, overlay: *const Overlay) anyerror!void {
+        const work = context.work;
         const emitted = try work.alloc(bool, overlay.changed.count());
         defer work.free(emitted);
         @memset(emitted, false);
@@ -250,7 +263,7 @@ pub const Output = union(enum) {
         try writer.writeByte('{');
         switch (overlay.base) {
             .logical => |value| for (value.object.keys(), value.object.values()) |name, *child| {
-                try writeBaseMember(scratch, writer, overlay, emitted, &count, name, .{ .logical = child });
+                try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
             },
             .span => |span| {
                 var scanner = std.json.Scanner.initCompleteInput(work, span.node.raw);
@@ -274,19 +287,26 @@ pub const Output = union(enum) {
                         .object_end, .array_end, .end_of_document => return error.SyntaxError,
                         else => {},
                     }
-                    const start = scanner.cursor;
-                    try scanner.skipValue();
-                    // This temporary node is consumed synchronously by write;
-                    // none of its navigation can enter a retained native view.
-                    var node: View.Node = .{ .raw = span.node.raw[start..scanner.cursor] };
-                    try writeBaseMember(scratch, writer, overlay, emitted, &count, name, .{ .span = .{ .view = span.view, .node = &node } });
+                    if (overlay.changed.getIndex(name)) |index| {
+                        // Discarded bytes still need syntax validation. An
+                        // unchanged value is consumed and emitted in one pass.
+                        try scanner.skipValue();
+                        try writeMember(context, writer, &count, name, overlay.changed.values()[index]);
+                        emitted[index] = true;
+                    } else {
+                        if (count != 0) try writer.writeByte(',');
+                        try std.json.Stringify.value(name, .{}, writer);
+                        try writer.writeByte(':');
+                        try context.writeValue(writer, &scanner, span.node.raw.len, span.view.parse_numbers);
+                        count += 1;
+                    }
                 }
                 _ = try scanner.next();
                 if (try scanner.next() != .end_of_document) return error.SyntaxError;
             },
         }
         for (overlay.changed.keys(), overlay.changed.values(), emitted) |name, child, seen| {
-            if (!seen) try writeMember(scratch, writer, &count, name, child);
+            if (!seen) try writeMember(context, writer, &count, name, child);
         }
         try writer.writeByte('}');
     }
@@ -300,84 +320,181 @@ fn resetScratch(arena: *std.heap.ArenaAllocator) Allocator.Error!void {
     } else if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
 }
 
-/// Transcode a validated terminal without constructing its DOM. Decode one
-/// string/number at a time; container state scales only with nesting depth.
-fn writeSpan(scratch: Allocator, writer: *std.Io.Writer, raw: []const u8, parse_numbers: bool) !void {
-    const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
-    var scanner = std.json.Scanner.initCompleteInput(work, raw);
-    defer scanner.deinit();
-    var token_arena = std.heap.ArenaAllocator.init(work);
-    defer token_arena.deinit();
+/// One bounded pool for all terminals in a response. No borrowed token or
+/// duplicate-key entry survives its container; completed depths are reusable.
+const StreamContext = struct {
+    work: Allocator,
+    tokens: std.heap.ArenaAllocator,
+    scanners: std.heap.ArenaAllocator,
+    frames: std.ArrayListUnmanaged(Frame) = .empty,
     const Frame = struct { object: bool, key: bool = true, count: usize = 0, arena: std.heap.ArenaAllocator, names: std.StringHashMapUnmanaged(void) = .empty };
-    var stack: std.ArrayListUnmanaged(Frame) = .empty;
-    defer {
-        for (stack.items) |*frame| frame.arena.deinit();
-        stack.deinit(work);
+    fn init(scratch: Allocator) StreamContext {
+        const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
+        return .{ .work = work, .tokens = .init(work), .scanners = .init(work) };
     }
-    var root_seen = false;
-    // Reuse arenas across siblings, but keep each live ancestor's duplicate
-    // keys until its object ends. Retention is capped at every reuse.
-    var depth: usize = 0;
-    while (true) {
-        try resetScratch(&token_arena);
-        const token = try scanner.nextAllocMax(token_arena.allocator(), .alloc_if_needed, raw.len);
-        if (token == .end_of_document) {
-            if (!root_seen or depth != 0) return error.SyntaxError;
-            break;
-        }
-        if (token == .object_end or token == .array_end) {
-            try writer.writeByte(if (token == .object_end) '}' else ']');
-            if (depth == 0) return error.SyntaxError;
-            depth -= 1;
-            const closed = &stack.items[depth];
-            try resetScratch(&closed.arena);
-            closed.names = .empty;
-            continue;
-        }
-        if (depth == 0) {
-            if (root_seen) return error.SyntaxError;
-            root_seen = true;
-        }
-        if (depth != 0) {
-            const frame = &stack.items[depth - 1];
-            if (frame.object and frame.key) {
-                const name = switch (token) {
-                    .string, .allocated_string => |s| s,
-                    else => return error.SyntaxError,
-                };
-                const key = if (token == .allocated_string) try frame.arena.allocator().dupe(u8, name) else name;
-                if ((try frame.names.getOrPut(frame.arena.allocator(), key)).found_existing) return error.DuplicateField;
-                if (frame.count != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(name, .{}, writer);
-                try writer.writeByte(':');
-                frame.count += 1;
-                frame.key = false;
+    fn deinit(self: *StreamContext) void {
+        for (self.frames.items) |*frame| frame.arena.deinit();
+        self.frames.deinit(self.work);
+        self.tokens.deinit();
+        self.scanners.deinit();
+    }
+    fn writeSpan(self: *StreamContext, writer: *std.Io.Writer, raw: []const u8, parse_numbers: bool) !void {
+        try resetScratch(&self.scanners);
+        var scanner = std.json.Scanner.initCompleteInput(self.scanners.allocator(), raw);
+        defer scanner.deinit();
+        try self.writeValue(writer, &scanner, raw.len, parse_numbers);
+        if (try scanner.next() != .end_of_document) return error.SyntaxError;
+    }
+    fn writeValue(self: *StreamContext, writer: *std.Io.Writer, scanner: *std.json.Scanner, max_len: usize, parse_numbers: bool) !void {
+        var root_seen = false;
+        // Reuse arenas across siblings, but keep each live ancestor's duplicate
+        // keys until its object ends. Retention is capped at every reuse.
+        var depth: usize = 0;
+        while (!root_seen or depth != 0) {
+            try resetScratch(&self.tokens);
+            const token = try scanner.nextAllocMax(self.tokens.allocator(), .alloc_if_needed, max_len);
+            if (token == .end_of_document) {
+                if (!root_seen or depth != 0) return error.SyntaxError;
+                break;
+            }
+            if (token == .object_end or token == .array_end) {
+                try writer.writeByte(if (token == .object_end) '}' else ']');
+                if (depth == 0) return error.SyntaxError;
+                depth -= 1;
+                const closed = &self.frames.items[depth];
+                try resetScratch(&closed.arena);
+                closed.names = .empty;
                 continue;
             }
-            if (frame.object) {
-                frame.key = true;
-            } else {
-                if (frame.count != 0) try writer.writeByte(',');
-                frame.count += 1;
+            if (depth == 0) {
+                if (root_seen) return error.SyntaxError;
+                root_seen = true;
+            }
+            if (depth != 0) {
+                const frame = &self.frames.items[depth - 1];
+                if (frame.object and frame.key) {
+                    const name = switch (token) {
+                        .string, .allocated_string => |s| s,
+                        else => return error.SyntaxError,
+                    };
+                    const key = if (token == .allocated_string) try frame.arena.allocator().dupe(u8, name) else name;
+                    if ((try frame.names.getOrPut(frame.arena.allocator(), key)).found_existing) return error.DuplicateField;
+                    if (frame.count != 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(name, .{}, writer);
+                    try writer.writeByte(':');
+                    frame.count += 1;
+                    frame.key = false;
+                    continue;
+                }
+                if (frame.object) {
+                    frame.key = true;
+                } else {
+                    if (frame.count != 0) try writer.writeByte(',');
+                    frame.count += 1;
+                }
+            }
+            switch (token) {
+                .object_begin, .array_begin => {
+                    try writer.writeByte(if (token == .object_begin) '{' else '[');
+                    if (depth == self.frames.items.len) try self.frames.append(self.work, .{ .object = token == .object_begin, .arena = .init(self.work) });
+                    const frame = &self.frames.items[depth];
+                    frame.* = .{ .object = token == .object_begin, .arena = frame.arena };
+                    depth += 1;
+                },
+                .string, .allocated_string => |s| try std.json.Stringify.value(s, .{}, writer),
+                .number, .allocated_number => |s| try std.json.Stringify.value(if (parse_numbers) Value.parseFromNumberSlice(s) else Value{ .number_string = s }, .{}, writer),
+                .true => try writer.writeAll("true"),
+                .false => try writer.writeAll("false"),
+                .null => try writer.writeAll("null"),
+                else => return error.SyntaxError,
             }
         }
-        switch (token) {
-            .object_begin, .array_begin => {
-                try writer.writeByte(if (token == .object_begin) '{' else '[');
-                if (depth == stack.items.len) try stack.append(work, .{ .object = token == .object_begin, .arena = .init(work) });
-                const frame = &stack.items[depth];
-                frame.* = .{ .object = token == .object_begin, .arena = frame.arena };
-                depth += 1;
-            },
-            .string, .allocated_string => |s| try std.json.Stringify.value(s, .{}, writer),
-            .number, .allocated_number => |s| try std.json.Stringify.value(if (parse_numbers) Value.parseFromNumberSlice(s) else Value{ .number_string = s }, .{}, writer),
-            .true => try writer.writeAll("true"),
-            .false => try writer.writeAll("false"),
-            .null => try writer.writeAll("null"),
-            else => return error.SyntaxError,
+    }
+};
+
+/// Each returned object borrows this iterator's row arena and view until next.
+/// In particular, navigation never enters a retained native column-page view.
+const FanoutRows = struct {
+    source: Source,
+    path: []const []const u8,
+    arena: std.heap.ArenaAllocator,
+    scanner: ?std.json.Scanner = null,
+    started: bool = false,
+    index: usize = 0,
+    view: View = undefined,
+    fn init(a: Allocator, fanout: Output.Fanout) FanoutRows {
+        const work = @import("antfly_platform").allocator.reclaimingScratch(a);
+        return .{ .source = fanout.source, .path = fanout.path, .arena = .init(work), .scanner = switch (fanout.source) {
+            .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
+            .logical => null,
+        } };
+    }
+    fn deinit(self: *FanoutRows) void {
+        if (self.scanner) |*scanner| scanner.deinit();
+        self.arena.deinit();
+    }
+    fn next(self: *FanoutRows) anyerror!?Output.Object {
+        while (true) {
+            try resetScratch(&self.arena);
+            const a = self.arena.allocator();
+            const item: Source = switch (self.source) {
+                .logical => |value| blk: {
+                    if (self.index == value.array.items.len) return null;
+                    const item = &value.array.items[self.index];
+                    self.index += 1;
+                    break :blk .{ .logical = item };
+                },
+                .span => |span| blk: {
+                    const scanner = &self.scanner.?;
+                    if (!self.started) {
+                        if (try scanner.next() != .array_begin) return error.SyntaxError;
+                        self.started = true;
+                    }
+                    const token = try scanner.peekNextTokenType();
+                    if (token == .array_end) {
+                        _ = try scanner.next();
+                        if (try scanner.next() != .end_of_document) return error.SyntaxError;
+                        return null;
+                    }
+                    if (token == .object_end or token == .end_of_document) return error.SyntaxError;
+                    const start = scanner.cursor;
+                    if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
+                        // Discover the selected root member while advancing
+                        // the array scanner, avoiding a second scan per item.
+                        _ = try scanner.next();
+                        var names: std.StringHashMapUnmanaged(void) = .empty;
+                        var selected: ?[]const u8 = null;
+                        while (try scanner.peekNextTokenType() != .object_end) {
+                            const key = switch (try scanner.nextAllocMax(a, .alloc_if_needed, span.node.raw.len)) {
+                                .string, .allocated_string => |key| key,
+                                else => return error.SyntaxError,
+                            };
+                            if (!span.node.state.fanout_keys_validated) if ((try names.getOrPut(a, key)).found_existing) return error.DuplicateField;
+                            switch (try scanner.peekNextTokenType()) {
+                                .object_end, .array_end, .end_of_document => return error.SyntaxError,
+                                else => {},
+                            }
+                            const value_start = scanner.cursor;
+                            try scanner.skipValue();
+                            if (std.mem.eql(u8, key, self.path[0])) selected = span.node.raw[value_start..scanner.cursor];
+                        }
+                        _ = try scanner.next();
+                        self.view = try View.initProjectedObject(a, span.node.raw[start..scanner.cursor], self.path[0], selected);
+                    } else {
+                        try scanner.skipValue();
+                        self.view = .init(a, span.node.raw[start..scanner.cursor]);
+                    }
+                    self.view.parse_numbers = span.view.parse_numbers;
+                    break :blk .{ .span = .{ .view = &self.view, .node = &self.view.root } };
+                },
+            };
+            if (item.kind() != '{') continue;
+            var object: Output.Object = .empty;
+            try Output.includeObjectPath(a, &object, item, self.path);
+            if (object.count() != 0) return object;
         }
     }
-}
+};
 
 fn differentialScenario(a: Allocator) !void {
     const query = @import("../document_query.zig");
@@ -577,4 +694,104 @@ test "public graph metric borrowed wire streaming scratch retires oversized buff
     try resetScratch(&arena);
     _ = try arena.allocator().alloc(u8, 128);
     try std.testing.expectEqual(small_allocated, budget.alloc_calls);
+}
+
+fn fanoutOrderingScenario(a: Allocator) !void {
+    const query = @import("../document_query.zig");
+    const raw = "{\"items\":[{\"x\":{\"m\":1.00,\"n\":2},\"nested\":[{\"z\":3},{\"q\":4}]},null,{\"x\":{},\"nested\":[]},{\"other\":5},{\"x\":[{\"m\":6}]}],\"empty\":[]}";
+    const selections = [_][]const []const u8{
+        &.{"items.x"},
+        &.{ "items", "items.missing" },
+        &.{ "items.x.m", "items.missing" },
+        &.{ "items.x", "items.0.x.n" },
+        &.{ "items.0.x.n", "items.x" },
+        &.{ "items.nested.z", "items.x" },
+        &.{ "items.x", "items.nested.z" },
+        &.{ "items.x.m", "items", "items.nested.missing" },
+        &.{ "items.nested.z", "empty.x" },
+    };
+    for (selections) |fields| {
+        const opts: @import("../types.zig").LookupOptions = .{ .fields = fields, .include_all_fields = false };
+        var expected = try query.lookupJson(a, raw, opts);
+        defer expected.deinit(a);
+        var actual = try query.lookupJsonWithOutput(a, a, raw, opts);
+        defer actual.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, actual.json);
+    }
+    // Loaded logical fields use the same lazy fanout and replacement contract.
+    var parsed = try std.json.parseFromSlice(Value, a, raw, .{});
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var object: Output.Object = .empty;
+    try Output.include(arena.allocator(), &object, "items", .{ .logical = parsed.value.object.getPtr("items").? }, &.{ "nested", "z" });
+    const result = try (Output{ .object = object }).serialize(arena.allocator(), a);
+    defer a.free(result);
+    var expected = try query.lookupJson(a, raw, .{ .fields = &.{"items.nested.z"}, .include_all_fields = false });
+    defer expected.deinit(a);
+    try std.testing.expectEqualStrings(expected.json, result);
+}
+
+test "public graph metric borrowed wire streaming fanout preserves ordered arrays and allocation failure ownership" {
+    try fanoutOrderingScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, fanoutOrderingScenario, .{});
+}
+
+test "public graph metric borrowed wire streaming fanout bounds navigation maps and terminal scanner scratch" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..8000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":{\"m\":1,\"n\":2}}");
+    }
+    try input.writer.writeAll("]}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{"items.x"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 1024 * 1024 };
+    var result = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings(input.written(), result.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.alloc_calls < 128);
+    std.debug.print("STREAMING_FANOUT count=8000 allocations={d} peak={d}\n", .{ budget.alloc_calls, budget.peak });
+}
+
+test "public graph metric borrowed wire streaming fused overlay consumes exactly one value including escaped keys" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var view = View.init(arena.allocator(), "{\"a\\u0062\":{\"s\":\"\\n\\u0061\",\"n\":1e2},\"arr\":[1,true,null,{\"z\":2}],\"last\":false}");
+    var replacement: Value = .{ .object = .empty };
+    try replacement.object.put(arena.allocator(), "last", .{ .bool = true });
+    var object: Output.Object = .empty;
+    try Output.include(arena.allocator(), &object, "v", .{ .span = .{ .view = &view, .node = &view.root } }, &.{});
+    try Output.include(arena.allocator(), &object, "v", .{ .logical = &replacement }, &.{"last"});
+    const bytes = try (Output{ .object = object }).serialize(arena.allocator(), a);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"v\":{\"ab\":{\"s\":\"\\na\",\"n\":1e2},\"arr\":[1,true,null,{\"z\":2}],\"last\":true}}", bytes);
+    // The transcode context is reused across object members, but never shares
+    // duplicate-name sets between distinct objects or overlooks trailing data.
+    for ([_][]const u8{ "{\"x\":1,\"x\":2}", "{\"x\":1} true", "[1,]" }) |raw| {
+        view = View.init(arena.allocator(), raw);
+        const invalid: Output = .{ .borrowed = .{ .span = .{ .view = &view, .node = &view.root } } };
+        if (invalid.serialize(arena.allocator(), a)) |result| {
+            a.free(result);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+test "public graph metric borrowed wire streaming fanout validates unprepared sibling keys before reusing proof" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var view = View.init(arena.allocator(), "[{\"x\":1},{\"x\":2,\"\\u0078\":3}]");
+    var object: Output.Object = .empty;
+    try Output.include(arena.allocator(), &object, "items", .{ .span = .{ .view = &view, .node = &view.root } }, &.{"x"});
+    try std.testing.expectError(error.DuplicateField, (Output{ .object = object }).serialize(arena.allocator(), a));
 }

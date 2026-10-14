@@ -116,7 +116,7 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     const JsonView = @import("query/json_view.zig").View;
     var view = JsonView.init(a, raw);
     view.parse_numbers = true;
-    try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
+    try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .defer_fanout = true, .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
     const overlays = try a.alloc(JsonView.RootSource, sources.len);
     for (sources, overlays) |source, *overlay| overlay.* = .{ .name = source.name, .value = source.value };
     view.root_sources = overlays;

@@ -146,13 +146,19 @@ pub const View = struct {
             number_string: *[]const u8,
             container: *Value,
         } = .empty,
-        object_complete: bool = false,
+        state: packed struct(u8) {
+            object_complete: bool = false,
+            // Every object item has had its decoded sibling keys checked.
+            // This proof avoids repeating key-table work during lazy emission.
+            fanout_keys_validated: bool = false,
+            reserved: u6 = 0,
+        } = .{},
 
         fn objectComplete(self: Node) bool {
-            return self.object_complete;
+            return self.state.object_complete;
         }
         fn markObjectComplete(self: *Node, complete: bool) void {
-            self.object_complete = complete;
+            self.state.object_complete = complete;
         }
 
         pub fn kind(self: Node) u8 {
@@ -164,6 +170,21 @@ pub const View = struct {
 
     pub fn init(alloc: Allocator, raw: []const u8) View {
         return .{ .alloc = alloc, .root = .{ .raw = raw } };
+    }
+
+    /// Seed one member discovered by a streaming object scan. Both the name
+    /// and navigation belong to the item view, independent of selector lifetime.
+    pub fn initProjectedObject(alloc: Allocator, raw: []const u8, name: []const u8, selected: ?[]const u8) !View {
+        var view = View.init(alloc, raw);
+        const entries = try alloc.alloc(ObjectIndex.Entry, 1);
+        entries[0] = .{ .name = try alloc.dupe(u8, name), .index = if (selected != null) 0 else std.math.maxInt(usize) };
+        view.root.object_index = .{ .storage = .{ .compact = entries } };
+        if (selected) |value| {
+            const slots = try alloc.alloc(Child, 1);
+            slots[0] = .{ .node = .{ .raw = value } };
+            view.root.children = slots;
+        }
+        return view;
     }
 
     pub fn children(self: *View, node: *Node) ![]Child {
@@ -220,6 +241,51 @@ pub const View = struct {
         return &entries[i].node;
     }
 
+    /// Output-only lookup: retain the requested member rather than indexing
+    /// every sibling of a streaming fanout item. Scan all sibling keys to keep
+    /// duplicate and syntax validation identical to ordinary lazy navigation.
+    pub fn fieldSparse(self: *View, node: *Node, name: []const u8) !?*Node {
+        if (node.kind() != '{') return null;
+        if (node.object_index.get(name)) |i| {
+            if (i == std.math.maxInt(usize)) return null;
+            if (node.children) |entries| if (i < entries.len) return &entries[i].node;
+        }
+        if (node.objectComplete()) return null;
+        var scanner = std.json.Scanner.initCompleteInput(self.alloc, node.raw);
+        defer scanner.deinit();
+        _ = try scanner.next();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        var selected: ?[]const u8 = null;
+        while (try scanner.peekNextTokenType() != .object_end) {
+            const key = switch (try scanner.nextAllocMax(self.alloc, .alloc_if_needed, node.raw.len)) {
+                .string, .allocated_string => |key| key,
+                else => return error.SyntaxError,
+            };
+            if ((try names.getOrPut(self.alloc, key)).found_existing) return error.DuplicateField;
+            switch (try scanner.peekNextTokenType()) {
+                .object_end, .array_end, .end_of_document => return error.SyntaxError,
+                else => {},
+            }
+            const start = scanner.cursor;
+            try scanner.skipValue();
+            if (std.mem.eql(u8, key, name)) selected = node.raw[start..scanner.cursor];
+        }
+        _ = try scanner.next();
+        if (try scanner.next() != .end_of_document) return error.SyntaxError;
+        const owned_name = node.object_index.canonicalName(name) orelse try self.alloc.dupe(u8, name);
+        if (selected) |raw| {
+            const old = node.children orelse &.{};
+            const entries = try self.alloc.alloc(Child, old.len + 1);
+            @memcpy(entries[0..old.len], old);
+            entries[old.len] = .{ .node = .{ .raw = raw } };
+            try node.object_index.put(self.alloc, owned_name, old.len);
+            node.children = entries;
+            return &entries[old.len].node;
+        }
+        try node.object_index.put(self.alloc, owned_name, std.math.maxInt(usize));
+        return null;
+    }
+
     pub fn element(self: *View, node: *Node, index: usize) !?*Node {
         if (node.children) |entries| return if (index < entries.len) &entries[index].node else null;
         // A cached null is a requested index proven absent by validation.
@@ -269,6 +335,9 @@ pub const View = struct {
     }
     pub const PreparationOptions = struct {
         retain_root_fields: bool = false,
+        // Streaming output retains requested numeric slots, but validates
+        // fanout items without caching navigation for the whole array.
+        defer_fanout: bool = false,
         root_excluded: []const []const u8 = &.{},
     };
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
@@ -294,6 +363,7 @@ pub const View = struct {
             name: []const u8 = "",
             retain: bool = false,
             retain_all: bool = false,
+            defer_items: bool = false,
             omitted: bool = false,
             excluded: []const []const u8 = &.{},
             ordinal: usize = 0,
@@ -305,7 +375,7 @@ pub const View = struct {
             pending_selector: ?*const Selector = null,
 
             fn wants(self: *@This(), name: []const u8) bool {
-                if (self.node == null) return false;
+                if (self.selected == null) return false;
                 for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
                 return self.retain_all or self.selected.?.fields.contains(name);
             }
@@ -319,6 +389,7 @@ pub const View = struct {
                     node.markObjectComplete(false);
                     return;
                 }
+                node.state.fanout_keys_validated = false;
                 const selected = self.selected orelse return;
                 var indices = selected.indices.iterator();
                 while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
@@ -327,20 +398,19 @@ pub const View = struct {
                 self.start = start;
                 self.pending_node = null;
                 self.pending_selector = null;
-                if (self.node == null) return;
-                const selected = self.selected.?;
+                const selected = self.selected orelse return;
                 if (self.object) {
                     if (!self.retain) return;
                     if (selected.fields.get(self.name)) |child| {
                         if (child.fields.count() != 0) {
                             self.pending_selector = child;
-                            self.pending_node = self.pending_storage;
+                            if (self.node != null) self.pending_node = self.pending_storage;
                         }
                     }
                 } else {
                     const item = selected.array_items.get(self.ordinal);
                     if (item == null and selected.fanout == null) return;
-                    self.pending_node = self.pending_storage;
+                    if (self.node != null and (!self.defer_items or item != null)) self.pending_node = self.pending_storage;
                     if (object_value) {
                         const child = item orelse selected.fanout.?;
                         if (child.fields.count() != 0) self.pending_selector = child;
@@ -365,7 +435,7 @@ pub const View = struct {
                         if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
                         try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
                     } else if (self.pending_node) |node| {
-                        if (self.selected.?.fanout != null) try self.children.append(a, .{ .node = node.* }) else {
+                        if (self.selected.?.fanout != null and !self.defer_items) try self.children.append(a, .{ .node = node.* }) else {
                             const owned = try a.create(View.Node);
                             owned.* = node.*;
                             try parent.array_index.put(a, self.ordinal, owned);
@@ -376,7 +446,8 @@ pub const View = struct {
             }
             fn finishContainer(self: *@This(), a: Allocator) !void {
                 if (self.node) |node| {
-                    if (self.object or self.selected.?.fanout != null) node.children = try self.children.toOwnedSlice(a);
+                    if (!self.object and self.selected.?.fanout != null) node.state.fanout_keys_validated = true;
+                    if (self.object or (self.selected.?.fanout != null and !self.defer_items)) node.children = try self.children.toOwnedSlice(a);
                     if (self.object) {
                         node.markObjectComplete(!self.omitted);
                         if (!node.objectComplete()) {
@@ -417,7 +488,7 @@ pub const View = struct {
                     continue;
                 }
                 if (frame.object and frame.key) {
-                    if (policy == .visited and frame.node == null) {
+                    if (policy == .visited and frame.selected == null) {
                         // Unvisited native keys need syntax checks, not decoded
                         // names or duplicate-key tables. Keep them allocation-free.
                         if (token != .string) return error.SyntaxError;
@@ -429,9 +500,9 @@ pub const View = struct {
                         .string, .allocated_string => |key_name| key_name,
                         else => return error.SyntaxError,
                     };
-                    if (policy == .all or frame.node != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                    if (policy == .all or frame.selected != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
                     frame.retain = frame.wants(name);
-                    frame.name = if (frame.retain) (frame.node.?.object_index.canonicalName(name) orelse try alloc.dupe(u8, name)) else name;
+                    frame.name = if (frame.retain and frame.node != null) (frame.node.?.object_index.canonicalName(name) orelse try alloc.dupe(u8, name)) else name;
                     frame.key = false;
                     continue;
                 }
@@ -441,7 +512,7 @@ pub const View = struct {
             root_seen = true;
             if (token == .object_begin or token == .array_begin) {
                 const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].pending_selector != null) frames.items[depth - 1].pending_node else null;
-                const selected_plan = if (depth == 0) selector else frames.items[depth - 1].pending_selector;
+                const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].pending_selector;
                 _ = try scanner.next();
                 if (depth == frames.items.len) {
                     try frames.ensureUnusedCapacity(scratch, 1);
@@ -450,7 +521,7 @@ pub const View = struct {
                 const frame = &frames.items[depth];
                 var key_arena = frame.arena;
                 _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
-                frame.* = .{ .pending_storage = frame.pending_storage, .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
+                frame.* = .{ .pending_storage = frame.pending_storage, .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
                 try frame.plan(alloc);
                 depth += 1;
             } else {
@@ -853,4 +924,16 @@ test "public graph metric borrowed wire streaming preparation recovers after eve
         if (!induced) break;
     }
     try std.testing.expect(failed != 0);
+}
+
+test "public graph metric borrowed wire streaming deferred fanout preserves object only root validation policy" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const selector = try plan_mod.compile(arena.allocator(), &.{.{ .parts = &.{"x"} }});
+    var ignored = View.init(arena.allocator(), "[{\"x\":1,\"x\":2}]");
+    try ignored.prepareProjectionWithOptions(selector, .visited, .object_only, .{ .defer_fanout = true });
+    try std.testing.expect(ignored.root.children == null);
+    var strict = View.init(arena.allocator(), ignored.root.raw);
+    try std.testing.expectError(error.DuplicateField, strict.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true }));
 }

@@ -128,7 +128,7 @@ pub const Plan = struct {
         } else {
             if (self.selectors) |selectors| for (source.keys(), source.values()) |name, value| {
                 if (value == .json) if (selectors.fields.get(name)) |selected| {
-                    if (selected.fields.count() != 0) try value.json.prepareProjection(selected, .visited, .any_container);
+                    if (selected.fields.count() != 0) try value.json.prepareProjectionWithOptions(selected, .visited, .any_container, .{ .defer_fanout = true });
                 };
             };
             for (self.paths) |parts| {
@@ -267,4 +267,52 @@ test "public graph metric borrowed wire native JSON copy on write keeps output n
     var values: std.ArrayListUnmanaged(std.json.Value) = .empty;
     try view.collect(&.{ "a", "y" }, false, &values);
     try std.testing.expectEqual(@as(i64, 2), values.items[0].integer);
+}
+
+test "public graph metric borrowed wire streaming native fanout leaves page navigation bounded" {
+    const a = std.testing.allocator;
+    const counters = @import("../../lite/test_allocator.zig");
+    const columns = [_]schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{"payload.items.x"});
+    defer plan.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..8000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":{\"m\":1e2,\"n\":2}}");
+    }
+    try input.writer.writeAll("]}");
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 1024 * 1024 };
+    {
+        var owner = std.heap.ArenaAllocator.init(budget.allocator());
+        defer owner.deinit();
+        var view = JsonView.init(owner.allocator(), input.written());
+        for (0..2) |_| {
+            var row = std.heap.ArenaAllocator.init(budget.allocator());
+            defer row.deinit();
+            var source: Plan.Sources = .empty;
+            try source.put(row.allocator(), "payload", .{ .json = &view });
+            const bytes = try plan.projectSources(a, row.allocator(), source);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("{\"payload\":", bytes[0..11]);
+            try std.testing.expectEqualStrings(input.written(), bytes[11 .. bytes.len - 1]);
+            const items = (try view.field(&view.root, "items")).?;
+            try std.testing.expect(items.children == null);
+            try std.testing.expectEqual(@as(usize, 0), items.array_index.count());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.alloc_calls < 256);
+    std.debug.print("STREAMING_NATIVE_FANOUT count=8000 iterations=2 allocations={d} peak={d}\n", .{ budget.alloc_calls, budget.peak });
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    var view = JsonView.init(owner.allocator(), "{\"items\":[{\"x\":1},{\"x\":2,\"x\":3}]}");
+    var source: Plan.Sources = .empty;
+    try source.put(owner.allocator(), "payload", .{ .json = &view });
+    try std.testing.expectError(error.DuplicateField, plan.projectSources(a, owner.allocator(), source));
 }
