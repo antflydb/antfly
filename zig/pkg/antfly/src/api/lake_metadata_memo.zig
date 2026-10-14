@@ -25,11 +25,52 @@ pub fn Memo(comptime Value: type) type {
         mutex: std.atomic.Mutex = .unlocked,
         entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
         max_entries: usize = 128,
+        // Fixed-size construction admission: saturation bypasses coalescing,
+        // never blocks unrelated metadata or retains request capabilities.
+        flights: [32]?[32]u8 = @splat(null),
+        coalesced: u64 = 0,
         clock: u64 = 0,
         hits: u64 = 0,
         puts: u64 = 0,
         budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 32 * 1024 * 1024 },
         managed: ?local.storage_resource_manager.BudgetedAllocator = null,
+        pub const Flight = struct {
+            memo: *Self,
+            slot: usize,
+            pub fn deinit(self: Flight) void {
+                self.memo.lock();
+                defer self.memo.mutex.unlock();
+                std.debug.assert(self.memo.flights[self.slot] != null);
+                self.memo.flights[self.slot] = null;
+            }
+        };
+        /// Claim construction, then recheck the memo. Failed/canceled leaders
+        /// release their slot; waiters retry using their own authority and TTL.
+        pub fn claim(self: *Self, key: [32]u8, io: std.Io, token: @import("antfly_cancellation").CancellationToken) !?Flight {
+            while (true) {
+                try token.check();
+                self.lock();
+                var empty: ?usize = null;
+                var waiting = false;
+                for (self.flights, 0..) |flight, i| {
+                    if (flight) |active| {
+                        if (std.mem.eql(u8, &active, &key)) waiting = true;
+                    } else if (empty == null) empty = i;
+                }
+                if (!waiting) {
+                    if (empty) |slot| {
+                        self.flights[slot] = key;
+                        self.mutex.unlock();
+                        return .{ .memo = self, .slot = slot };
+                    }
+                    self.mutex.unlock();
+                    return null;
+                }
+                self.coalesced +|= 1;
+                self.mutex.unlock();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
         fn lock(self: *Self) void {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
         }
@@ -42,6 +83,7 @@ pub fn Memo(comptime Value: type) type {
             self.budget.backing = self.managed.?.allocator();
         }
         pub fn deinit(self: *Self) void {
+            for (self.flights) |flight| std.debug.assert(flight == null);
             const a = self.budget.allocator();
             var it = self.entries.valueIterator();
             while (it.next()) |entry| a.free(entry.bytes);
@@ -115,4 +157,62 @@ test "external lake bounded WAL metadata memos own hits across eviction and enfo
     try std.testing.expectEqualStrings("first", hit.name);
     memo.put(@splat(2), .{ .name = "stale" }, 99);
     try std.testing.expectEqualStrings("second", (try memo.get(arena.allocator(), @splat(2), 100)).?.name);
+}
+
+test "external lake bounded WAL publication flights independently cancel waiters and recover failed leaders" {
+    const io = std.testing.io;
+    const M = Memo(u64);
+    var memo: M = .{ .budget = .{ .backing = std.testing.allocator, .limit = 64 * 1024 } };
+    defer memo.deinit();
+    var leader: ?M.Flight = (try memo.claim(@splat(1), io, .none)).?;
+    defer if (leader) |flight| flight.deinit();
+    const Worker = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).cancel.load(.acquire);
+        }
+        fn run(self: *@This(), shared: *M) anyerror!void {
+            const flight = (try shared.claim(@splat(1), std.testing.io, .{ .ptr = self, .is_cancelled_fn = canceled })).?;
+            defer flight.deinit();
+        }
+    };
+    var worker: Worker = .{};
+    var waiter = try io.concurrent(Worker.run, .{ &worker, &memo });
+    var joined = false;
+    defer if (!joined) {
+        worker.cancel.store(true, .release);
+        waiter.cancel(io) catch {};
+    };
+    while (true) {
+        memo.lock();
+        const ready = memo.coalesced != 0;
+        memo.mutex.unlock();
+        if (ready) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    worker.cancel.store(true, .release);
+    joined = true;
+    try std.testing.expectError(error.Canceled, waiter.await(io));
+    // Cancellation of a waiter does not discard a leader's eventual payload.
+    memo.put(@splat(1), 42, 100);
+    leader.?.deinit();
+    leader = null;
+    const recovered = (try memo.claim(@splat(1), io, .none)).?;
+    defer recovered.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(u64, 42), (try memo.get(arena.allocator(), @splat(1), 99)).?);
+    // No successful value is needed for a released flight to be retried.
+    const failed = (try memo.claim(@splat(2), io, .none)).?;
+    failed.deinit();
+    const retry = (try memo.claim(@splat(2), io, .none)).?;
+    retry.deinit();
+    var slots: [31]M.Flight = undefined;
+    var claimed: usize = 0;
+    defer for (slots[0..claimed]) |flight| flight.deinit();
+    for (&slots, 0..) |*slot, i| {
+        slot.* = (try memo.claim(@splat(@as(u8, @intCast(i + 2))), io, .none)).?;
+        claimed += 1;
+    }
+    try std.testing.expect(try memo.claim(@splat(99), io, .none) == null);
 }

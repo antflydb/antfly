@@ -806,6 +806,9 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                         "format": source_format,
                         "uri": root.as_uri(),
                     },
+                    "relational_indexes": [
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                    ],
                 },
                 "indexes": {"body_text": {"type": "full_text", "field": "body"}},
             },
@@ -824,6 +827,40 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 "/tables/fragmented/query",
                 {"full_text_search": text, "fields": ["amount"], "limit": 10},
             )["hits"]["hits"]
+
+        def metadata_query(amount):
+            result = call(
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": {"term": "common", "field": "body"},
+                    "filter_query": {
+                        "conjuncts": [
+                            {"term": {"path": "/amount", "value": amount}},
+                            # An OR is residual membership, never an admission
+                            # proof; the surrounding required equality is safe.
+                            {
+                                "disjuncts": [
+                                    {"term": {"path": "/amount", "value": amount}},
+                                    {"term": {"path": "/amount", "value": -1}},
+                                ]
+                            },
+                        ]
+                    },
+                    "fields": ["amount"],
+                    "limit": 20,
+                    "profile": True,
+                    "highlight": {"fields": ["body"]},
+                },
+            )
+            assert result["profile"]["sort"]["selection_reason"] == (
+                "indexed_predicate_text_admission"
+            ), result
+            hits = result["hits"]["hits"]
+            assert [hit["_source"]["amount"] for hit in hits] == [amount]
+            assert hits[0]["_highlights"]["body"]
+            assert "body" not in hits[0]["_source"]
+            return hits
 
         rare = {"term": "quasar", "field": "body"}
         nested = {
@@ -852,10 +889,13 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
             },
         )["hits"]["hits"]
         assert large == query(rare)
+        metadata_baseline = {amount: metadata_query(amount) for amount in expected}
         baseline = None
         for restart in (False, False, True):
             if restart:
                 server.restart()
+            for amount in expected:
+                assert metadata_query(amount) == metadata_baseline[amount]
             for text in (nested, phrase):
                 hits = query(text)
                 assert {hit["_source"]["amount"] for hit in hits} == expected
@@ -952,7 +992,8 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     if document.get("inventory_version") == 3:
                         roots[artifact_id] = document
             canonical = [
-                document for document in roots.values()
+                document
+                for document in roots.values()
                 if document["file_count"] == parts
                 and (document.get("serving") or document.get("compacted"))
             ]
@@ -1019,6 +1060,10 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     path.unlink()
                 server.resume()
                 assert query(nested) == baseline
+                # A common text term with a one-row metadata filter must never
+                # admit the deleted unrelated packs, even when K is unfilled.
+                for amount in expected:
+                    assert metadata_query(amount) == metadata_baseline[amount]
             finally:
                 server.pause()
                 for path, payload in originals:

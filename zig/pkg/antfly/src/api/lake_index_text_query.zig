@@ -26,6 +26,22 @@ const Context = local.serverless_query_lake_read_context.Context;
 const Store = @import("lake_index_store.zig").Store;
 const A = std.mem.Allocator;
 const overlay_api = @import("lake_search_overlay.zig");
+fn retainedCancellation(context: *const Context) @import("antfly_cancellation").CancellationToken {
+    const Check = struct {
+        fn check(raw: *const anyopaque) !void {
+            const self: *const Context = @ptrCast(@alignCast(raw));
+            try self.ensureActive();
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+    };
+    // Artifact checkpoints preserve the precise deadline error; cloud
+    // transports also need the boolean adapter during an in-flight request.
+    return .{ .ptr = context, .check_fn = Check.check, .is_cancelled_fn = Check.canceled };
+}
+
 pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext) !?local.api_query.QueryResponse {
     return executeWithDelivery(a, server, table, req, request, null);
 }
@@ -55,13 +71,19 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const ra = retained_arena.allocator();
     var table = current_table;
     var retained: ?retained_api.Descriptor = null;
-    const retained_cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = request.cancellation.ptr, .is_cancelled_fn = request.cancellation.is_cancelled_fn };
+    var retained_pin: ?retained_api.Pinned = null;
+    defer if (retained_pin) |pin| pin.deinit();
+    const normalized = try request.platformDeadline();
+    var retained_context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    const retained_cancellation = retainedCancellation(&retained_context);
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
         var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
-        retained = try retained_api.load(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation);
+        try server.prepareLakeCache();
+        retained_pin = try retained_api.loadCached(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+        retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     };
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
@@ -72,7 +94,6 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     // reject them before selecting a publication rather than dropping clauses.
     if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
     if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
-    const normalized = try request.platformDeadline();
     var context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
@@ -106,7 +127,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (retained) |cut| {
         if (cut.published_only != published_only) return error.CatalogGenerationChanged;
         retained_pending = cut.pending;
-        if (cut.pending.count() != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
+        overlay = retained_pin.?.overlay;
     }
     if (published_only or retained != null) try pinPublishedSource(&source_schema.binding, publication.base_source);
     // The configured queue supports durable standalone filesystem fallback as
@@ -1298,6 +1319,26 @@ const Execution = struct {
     // highlights and text components of hybrid/composed retrieval share the same
     // bounded coordinator. The composed owner retains fusion and source leases;
     // source-dependent transforms run once on the global candidate pool.
+    fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8) !?[]const [32]u8 {
+        if (root.source_routes_version != 1) return null;
+        var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 16 * 1024 * 1024 };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        var candidates = (try resolver.selectiveCandidates(a, json, 4096)) orelse return null;
+        defer candidates.deinit();
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        var store = self.store.artifactStore();
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = &store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+        defer cache.deinit();
+        const selected = try @import("lake_index_source_routes.zig").select(a, cache.store(), root, store, cached, token, &candidates, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        return try self.arena.dupe([32]u8, selected);
+    }
+
     fn pagedText(self: *Execution, a: A, input: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
         var req = input;
         // Public limit=0 requests also ask for an exact count. Do not turn a
@@ -1357,7 +1398,17 @@ const Execution = struct {
             corpus.source_spans.planningBytes(root.serving_bytes, bytes)
         else
             std.math.maxInt(u64);
-        if (root.segment_count == 0 or (root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
+        // Selective indexed metadata leads admission even for a common text
+        // term. A one-row filter must not open every archive pack just because
+        // its result count is smaller than K. Recent WAL rows remain separate.
+        const predicate_selection = if (req.filter_query_json.len != 0)
+            self.predicatePacks(root, cached, cancellation, req.filter_query_json) catch |err| switch (err) {
+                error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
+                else => return err,
+            }
+        else
+            null;
+        if (root.segment_count == 0 or (predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
         var ordering: ?local.storage_db_query_search_exec.SearchHitOrder = if (req.order_by.len != 0 or req.search_after.len != 0 or req.search_before.len != 0)
             try .init(a, req, runtime)
         else
@@ -1407,7 +1458,7 @@ const Execution = struct {
         }
         const frontier_mod = @import("lake_index_text_frontier.zig");
         var frontier: ?*frontier_mod = null;
-        if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) {
+        if (predicate_selection == null and scoreFrontierEligible(req, if (ordering) |*order| order else null)) {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
@@ -1449,10 +1500,10 @@ const Execution = struct {
             defer selection_scratch.deinit();
             var planning = self.*;
             planning.arena = selection_scratch.allocator();
-            const subset = if (self.overlay != null) null else planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
+            const subset = predicate_selection orelse (if (self.overlay != null) null else planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
                 error.OutOfMemory => null,
                 else => return err,
-            };
+            });
             if (subset) |selected_ids| {
                 const owned_ids = try self.arena.dupe([32]u8, selected_ids);
                 selected_reader = try @import("lake_index_text_directory.zig").SelectedCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, owned_ids);
@@ -1584,7 +1635,7 @@ const Execution = struct {
             result.sort_profile_storage = profiled.sort_profile_storage;
             profiled.sort_profile = null;
             profiled.sort_profile_storage = null;
-            result.sort_profile.?.selection_reason = if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
+            result.sort_profile.?.selection_reason = if (predicate_selection != null) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
             result.sort_profile.?.selected_count = result.hits.len;
             result.sort_profile.?.window_capacity = winners.limit;
             result.sort_profile.?.collector_heap_peak = winners.peak;
@@ -3434,4 +3485,15 @@ test "external lake bounded WAL unit hydration chooses exact recent partition" {
     const two = try execution.unitPayload(a, second_key);
     defer a.free(two);
     try std.testing.expect(std.mem.indexOf(u8, two, "second") != null);
+}
+
+test "external lake bounded WAL retained publication cancellation reaches cloud transports" {
+    const live: Context = .{};
+    const active = retainedCancellation(&live);
+    try active.check();
+    try std.testing.expect(!local.storage_object_storage.CancellationToken.fromCallback(active.ptr, active.is_cancelled_fn).?.isCancelled());
+    const expired: Context = .{ .deadline_ns = 1 };
+    const token = retainedCancellation(&expired);
+    try std.testing.expectError(error.DeadlineExceeded, token.check());
+    try std.testing.expect(local.storage_object_storage.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn).?.isCancelled());
 }

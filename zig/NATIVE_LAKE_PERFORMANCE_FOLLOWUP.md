@@ -4028,3 +4028,61 @@ completed its Zig/Rust/Go phases before uv pruning reached the 55-second
 watchdog. Obsolete test/server/library output in this worktree was pruned to
 restore the E2E suite's production disk-admission headroom. No other worktree's
 active outputs were changed.
+
+
+### Retention horizons, decoded cursor reuse and predicate-led admission
+
+The next refinement retains protocol 44's immutable wire format. State memo
+expiry now inherits the minimum retention scope of its row groups. A new cursor
+that exceeds an unchanged group's lifetime renews that group and the root.
+Concurrent root and row-group construction shares bounded (32-slot) in-process
+flights; waiters recheck their own requested expiry after joining. Failure and
+cancellation release construction admission. Saturation bypasses coalescing.
+Every fresh cut capture continues to issue its own small envelope.
+
+Pinned cursor pagination uses the existing resource-accounted decoded-cache
+singleflight and leases, sharing decoded state and the accepted overlay map.
+Its key includes store, table incarnation and the exact provider-qualified state
+reference. Each page still reads its own envelope and validates permissions,
+recipe, expiry, transitive retention scopes and current reader/source authority.
+No request pointer, provider client or reader lease is cached. Legacy row identity
+encoding stays unchanged. Cold misses retain four-way bounded group reads.
+
+A selective required metadata conjunct can now drive pack admission before text
+ranking, including when a common text term cannot fill K after filtering. The
+optional planner tries native compound and column predicates, bounds candidate
+cardinality to 4,096 physical rows, and seeks paged inverse source/rank routes.
+It neither scans Parquet to plan admission nor expands broad predicates into
+scalar IDs. Full predicate membership, global BM25, accepted-WAL masking,
+residual OR/NOT, result delivery and cursor behavior remain authoritative.
+Profiles identify this path as `indexed_predicate_text_admission`.
+
+Regressions cover earlier retained groups followed by a longer cursor, cached
+transitive-expiry rejection, warm sharing across independent reader envelopes,
+deadline and expiration fencing, residency pressure, eight concurrent first-cut
+publications, canceled waiters, failed-leader retry and flight saturation. The
+real Parquet/Iceberg fragmented fixture now checks metadata-driven admission,
+including restart and successful common-term queries with unrelated serving
+descriptors physically removed.
+
+Qualification on `origin/main` at `4838edd96171b020eb865e62f16e027551d02a79`:
+
+- Final Debug server and lake suites: 95/95 build steps; all 444 integration
+  and 46 focused test executions passed, without failures or leaks.
+- ReleaseFast focused and object-store suites: 54/54 build steps; all 46
+  focused executions and 92 object-store tests passed, with two live-provider
+  skips.
+- Real Parquet/Iceberg selection: 15 passed, 31 deselected in 329.00 seconds.
+  The final-binary selective-admission and accepted-hybrid checks both passed
+  again (two passed, nine deselected in 34.13 seconds).
+- The merged checkpoint fixture uses matching declaration/artifact names and
+  real distinct scoped artifact IDs. Its targeted native rerun passed.
+- Apache dependency boundary verified 2,037 sources. License headers, formatting
+  of all 74 changed Zig files and both Python files, Python name checks and Git
+  whitespace passed.
+- Final fetch confirmed the same main revision is included.
+
+The repository cache collector ran with its bounded watchdog. Obsolete binary
+variants were reclaimed only in this worktree; two stale object-store cache
+manifests were invalidated and the optimized suite then passed. Other active
+worktrees were preserved. Provider retention qualification remains deferred.

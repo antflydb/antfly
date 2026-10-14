@@ -712,6 +712,53 @@ fn PredicateResolver(comptime Set: type) type {
             return result;
         }
 
+        /// Optional admission proof. A required native conjunct may bound
+        /// serving packs even when the complete predicate needs a residual.
+        /// Broad/unsupported filters never trigger a scan in this planner.
+        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+            if (Set != PhysicalSet) @compileError("physical admission requires physical coordinates");
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, sa, json, .{});
+            const compiled = try Graph.compilePatternFilter(sa, parsed);
+            var conditions: std.ArrayList(Condition) = .empty;
+            try requiredConditions(sa, compiled, &conditions, 0);
+            if (conditions.items.len == 0 or conditions.items.len > 64) return null;
+            var best: ?rows.Predicate = null;
+            defer if (best) |*predicate| predicate.deinit();
+            // Try a compound index first, then independent column indexes.
+            // All these predicates are necessary; full membership is still
+            // evaluated in the selected text windows, including OR/NOT.
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            var condition_index: usize = 0;
+            while (condition_index <= conditions.items.len) : (condition_index += 1) {
+                try self.context.ensureActive();
+                try self.read_context.ensureActive();
+                var subset: std.ArrayList(Condition) = .empty;
+                const selected = if (condition_index == 0) conditions.items else column_conditions: {
+                    const name = conditions.items[condition_index - 1].column;
+                    if ((try names.getOrPut(sa, name)).found_existing) continue;
+                    for (conditions.items) |condition| if (std.mem.eql(u8, name, condition.column)) try subset.append(sa, condition);
+                    break :column_conditions subset.items;
+                };
+                if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, selected, self.context, self.source, self.pinned)) |candidate| {
+                    var predicate = candidate;
+                    if (predicate.estimatedRows() <= limit and (best == null or predicate.estimatedRows() < best.?.estimatedRows())) {
+                        if (best) |*previous| previous.deinit();
+                        best = predicate;
+                    } else predicate.deinit();
+                }
+            }
+            if (best == null) return null;
+            var result = try self.consume(a, &best.?);
+            if (result.boundedCardinality(limit) == null) {
+                result.deinit();
+                return null;
+            }
+            return result;
+        }
+
         pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();

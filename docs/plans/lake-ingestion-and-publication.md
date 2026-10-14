@@ -372,6 +372,31 @@ Restart loads exact provider-qualified state and row objects, using the shared
 I/O scheduler with four concurrent reads and a bounded inline fallback. Combined
 encoded state remains limited to 40 MiB and 65,536 changes.
 
+The reusable state's retention horizon is the minimum across its own scope and
+all referenced row groups. Extending a cursor renews aging groups and publishes
+a new state; it cannot extend immutable objects by changing memo metadata.
+Bounded in-process construction flights coalesce concurrent state and group
+uploads. Waiters preserve their own cancellation, deadline and requested expiry;
+a failed leader releases admission for another request to retry. Every fresh cut capture
+still writes its own small lease envelope.
+
+Pinned pagination shares decoded state and overlay maps through the existing
+resource-accounted decoded cache. Keys include store, table incarnation and the
+exact state reference, including provider generation and length. Each request
+reads and validates its envelope, checks every transitive scope against its own
+expiry, and independently acquires source and index reader leases. Cached data
+holds no provider client or request capability. Cold restart retains the durable
+four-read path; cache saturation preserves bounded query-owned leases.
+
+Selective required metadata conjuncts can lead text serving-pack admission.
+The planner consults native compound or column indexes, retains a physical
+selection only up to 4,096 rows, and maps it through paged source/rank routes.
+The complete predicate (including disjunctions and exclusions) remains a ranking
+membership check. Recent accepted rows are evaluated separately. Broad or
+unsupported predicates keep compressed membership and bounded text windows;
+planning never scans Parquet merely to attempt this optimization. Global term
+statistics, score order, highlight delivery and cursor semantics stay unchanged.
+
 Archive file maps depend on publication and schema rather than the WAL head.
 Recent vector planning borrows immutable prefix views and memoizes ready job
 metadata only through its proved retention interval. Bounded, resource-accounted

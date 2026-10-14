@@ -110,7 +110,11 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
     if (descriptor.expires_ms <= now or descriptor.expires_ms > now +| max_ttl_ms) return error.DeadlineExceeded;
     const key = stateKey(descriptor, store_identity);
     const state_ref = (if (cache) |memo| try memo.get(a, key, descriptor.expires_ms) else null) orelse built: {
+        const flight = if (cache) |memo| try memo.claim(key, io, cancellation) else null;
+        defer if (flight) |held| held.deinit();
+        if (cache) |memo| if (try memo.get(a, key, descriptor.expires_ms)) |ref| break :built ref;
         const expiry = @max(now +| payload_ttl_ms, descriptor.expires_ms +| 1);
+        var horizon = expiry;
         const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), expiry, io);
         var parts: std.ArrayList(StateRef) = .empty;
         var pending = descriptor.pending;
@@ -147,6 +151,9 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
                 hash.final(&fingerprint);
                 const part_key = @import("lake_wal_image.zig").digest(.{ .format = "retained-row-group-v1", .domain = scope.domain, .keys = pending.key_fields, .key_identity = pending.key_identity, .prefix = index, .content = fingerprint });
                 const part = (if (cache) |memo| try memo.get(a, part_key, descriptor.expires_ms) else null) orelse new: {
+                    const part_flight = if (cache) |memo| try memo.claim(part_key, io, cancellation) else null;
+                    defer if (part_flight) |held| held.deinit();
+                    if (cache) |memo| if (try memo.get(a, part_key, descriptor.expires_ms)) |ref| break :new ref;
                     if (pending.change_blocks.len == 256 and pending.block_digests.len == 256 and pending.changes.len == 0) {
                         for (pending.change_blocks[index * 16 ..][0..16]) |block| try groups[index].appendSlice(a, block);
                     }
@@ -154,6 +161,10 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
                     if (cache) |memo| memo.put(part_key, ref, expiry);
                     break :new ref;
                 };
+                try validateStateRef(part, scope.domain, descriptor.expires_ms);
+                // Root reuse must never extend the lifetime of a transitive
+                // immutable row group. Later cursors renew only aging groups.
+                horizon = @min(horizon, (try stores.uploadScopeFromArtifactId(part.id)).?.fencingToken());
                 retained_bytes = std.math.add(usize, retained_bytes, part.bytes) catch return error.QueryCandidateBudgetExceeded;
                 if (retained_bytes > max_bytes) return error.QueryCandidateBudgetExceeded;
                 try parts.append(a, part);
@@ -165,10 +176,11 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
         const state: State = .{ .publication = descriptor.publication, .pending = pending, .change_parts = parts.items, .catalog_metadata = descriptor.catalog_metadata, .published_only = descriptor.published_only, .recent = descriptor.recent, .recent_cloud = descriptor.recent_cloud, .recent_runs = descriptor.recent_runs };
         const ref = try upload(a, store, scope, state, cancellation);
         if (ref.bytes > max_bytes -| retained_bytes) return error.QueryCandidateBudgetExceeded;
-        if (cache) |memo| memo.put(key, ref, expiry);
+        if (cache) |memo| memo.put(key, ref, horizon);
         break :built ref;
     };
     try cancellation.check();
+    try validateStateRef(state_ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
     const envelope: LeaseEnvelope = .{ .expires_ms = descriptor.expires_ms, .table_id = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .reader_token = descriptor.reader_token, .state = state_ref };
     const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), descriptor.expires_ms, io);
     return upload(a, store, scope, envelope, cancellation);
@@ -235,7 +247,59 @@ fn readRetained(store: *stores.ArtifactStore, ref: StateRef, cancellation: Token
         else => err,
     };
 }
+/// A query pins decoded data, never provider clients, request authority or
+/// reader leases. Eviction leaves outstanding query pins independently valid.
+pub const Pinned = struct {
+    descriptor: Descriptor,
+    overlay: ?@import("lake_search_overlay.zig").Overlay = null,
+    lease: ?local.serverless_query_lake_decoded_cache.Lease = null,
+    pub fn deinit(self: Pinned) void {
+        if (self.lease) |held| held.release();
+    }
+};
+const Decoded = struct { state: State, overlay: ?@import("lake_search_overlay.zig").Overlay };
+const StateLoader = struct {
+    store: stores.ArtifactStore,
+    ref: StateRef,
+    domain: [32]u8,
+    expiry: u64,
+    cancellation: Token,
+    fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const a = item.arena.allocator();
+        const value = try a.create(Decoded);
+        value.* = try decodeState(a, &self.store, self.ref, self.domain, self.expiry, self.cancellation);
+        item.payload = .{ .extension = value };
+    }
+};
+fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domain: [32]u8, expiry: u64, cancellation: Token) !Decoded {
+    const body = try readRetained(store, ref, cancellation);
+    defer store.allocator.free(body);
+    var state = try std.json.parseFromSliceLeaky(State, a, body, .{ .allocate = .alloc_always });
+    if (state.version != 1) return error.InvalidQueryRequest;
+    var retained_bytes: usize = body.len;
+    for (state.change_parts) |part| {
+        retained_bytes = std.math.add(usize, retained_bytes, part.bytes) catch return error.QueryCandidateBudgetExceeded;
+        if (retained_bytes > max_bytes) return error.QueryCandidateBudgetExceeded;
+    }
+    try readParts(a, store, &state, expected_domain, expiry, cancellation, if (store.providerStore()) |object| object.cloud_io else null);
+    const overlay = if (state.pending.count() != 0) try @import("lake_search_overlay.zig").Overlay.init(a, state.pending) else null;
+    return .{ .state = state, .overlay = overlay };
+}
 pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token) !Descriptor {
+    const pin = try loadImpl(a, store, store_identity, token, table, now, cancellation, null, .{});
+    defer pin.deinit();
+    return pin.descriptor;
+}
+pub fn loadCached(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
+    return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context);
+}
+fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: ?*local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
+    var held: ?local.serverless_query_lake_decoded_cache.Lease = null;
+    errdefer if (held) |lease| lease.release();
+    var overlay: ?@import("lake_search_overlay.zig").Overlay = null;
+    try context.ensureActive();
+    try cancellation.check();
     if (!std.mem.startsWith(u8, token, prefix)) return error.InvalidQueryRequest;
     const envelope = try generations.decode(a, prefix, token, max_bytes);
     defer if (envelope.generation) |value| a.free(value);
@@ -251,21 +315,38 @@ pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
         const lease = try std.json.parseFromSliceLeaky(LeaseEnvelope, a, bytes, .{ .allocate = .alloc_always });
         if (lease.expires_ms <= now or lease.expires_ms > now +| max_ttl_ms or lease.expires_ms != scope.fencingToken() or lease.table_id != table.table_id or lease.object_generation != table.object_storage_generation or !std.mem.eql(u8, &lease.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
         try validateStateRef(lease.state, expected_domain, lease.expires_ms);
-        const body = try readRetained(store, lease.state, cancellation);
-        defer store.allocator.free(body);
-        var state = try std.json.parseFromSliceLeaky(State, a, body, .{ .allocate = .alloc_always });
-        if (state.version != 1) return error.InvalidQueryRequest;
-        var retained_bytes: usize = body.len;
-        for (state.change_parts) |part| {
-            retained_bytes = std.math.add(usize, retained_bytes, part.bytes) catch return error.QueryCandidateBudgetExceeded;
-            if (retained_bytes > max_bytes) return error.QueryCandidateBudgetExceeded;
-        }
-        try readParts(a, store, &state, expected_domain, lease.expires_ms, cancellation, if (store.providerStore()) |object| object.cloud_io else null);
+        const decoded: Decoded = if (cache) |memo| shared: {
+            const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = store_identity, .table = table.table_id, .incarnation = table.object_storage_generation, .ref = lease.state });
+            var loader: StateLoader = .{ .store = store.*, .ref = lease.state, .domain = expected_domain, .expiry = lease.expires_ms, .cancellation = cancellation };
+            const Check = struct {
+                token: Token,
+                parent: local.serverless_query_lake_read_context.Context,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.token.check();
+                    try self.parent.ensureActive();
+                }
+            };
+            var check: Check = .{ .token = cancellation, .parent = context };
+            var checked = context;
+            checked.checkpoint = .{ .ptr = &check, .check = Check.check };
+            held = try memo.acquire(key, 64 * 1024 * 1024, checked, .{ .ptr = &loader, .load = StateLoader.decode });
+            const value: *const Decoded = @ptrCast(@alignCast(held.?.item.payload.extension));
+            break :shared value.*;
+        } else try decodeState(a, store, lease.state, expected_domain, lease.expires_ms, cancellation);
+        const state = decoded.state;
+        // A shared decode is data only: the current envelope still proves
+        // every transitive scope covers this reader's independent lifetime.
+        for (state.change_parts) |part| try validateStateRef(part, expected_domain, lease.expires_ms);
+        overlay = decoded.overlay;
         break :modern .{ .expires_ms = lease.expires_ms, .table_id = lease.table_id, .object_generation = lease.object_generation, .desired = lease.desired, .reader_token = lease.reader_token, .publication = state.publication, .pending = state.pending, .catalog_metadata = state.catalog_metadata, .published_only = state.published_only, .recent = state.recent, .recent_cloud = state.recent_cloud, .recent_runs = state.recent_runs };
     } else return error.InvalidQueryRequest;
     if (result.expires_ms != scope.fencingToken() or result.expires_ms <= now or result.expires_ms > now +| max_ttl_ms or result.table_id != table.table_id or result.object_generation != table.object_storage_generation or !std.mem.eql(u8, &result.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
     try result.publication.validate();
-    return result;
+    try context.ensureActive();
+    try cancellation.check();
+    if (version == 1 and result.pending.count() != 0) overlay = try @import("lake_search_overlay.zig").Overlay.init(a, result.pending);
+    return .{ .descriptor = result, .overlay = overlay, .lease = held };
 }
 /// Bounded discovery over a dedicated domain; archive generations use a
 /// different domain and cannot be collected by this path.
@@ -336,6 +417,8 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     var config = try local.common_config.Config.parseFromSlice(a, json);
     defer config.deinit();
     var store = try @import("lake_index_store.zig").Store.open(a, &config, null, false);
+    var store_open = true;
+    defer if (store_open) store.deinit();
     const identity = store.identity;
     var artifacts = store.artifactStore();
     const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{}" };
@@ -371,6 +454,70 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     const old_state = try Read.state(sa, &artifacts, old_envelope.state);
     try std.testing.expectEqual(@as(usize, 2), old_state.change_parts.len);
     try std.testing.expectEqual(@as(u64, 3), cache.puts);
+    {
+        // Model unchanged row groups retained from an earlier day's cut.
+        // They still cover the current five-minute query, but not a later
+        // twenty-minute query. A new root must inherit that earlier horizon.
+        var aging: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        defer aging.deinit();
+        const root_key = stateKey(descriptor, identity);
+        var entries = cache.entries.iterator();
+        while (entries.next()) |entry| {
+            if (std.mem.eql(u8, &entry.key_ptr.*, &root_key)) continue;
+            const original = try std.json.parseFromSliceLeaky(StateRef, sa, entry.value_ptr.bytes, .{});
+            const body = try readRetained(&artifacts, original, .none);
+            defer artifacts.allocator.free(body);
+            var earlier = try artifacts.putScoped(try stores.UploadScope.forPublication(domain(4, identity), now + 600_000, std.testing.io), body, .none);
+            defer earlier.deinit(artifacts.allocator);
+            aging.put(entry.key_ptr.*, .{ .id = earlier.artifact_id, .bytes = @intCast(earlier.byte_len), .generation = earlier.provider_version }, now + 600_000);
+        }
+        const short = try saveCached(sa, &artifacts, identity, std.testing.io, descriptor, .none, &aging);
+        _ = try load(sa, &artifacts, identity, short, table, now + 1, .none);
+        var decoded: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer decoded.deinit();
+        const short_pin = try loadCached(sa, &artifacts, identity, short, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        defer short_pin.deinit();
+        var forged = try Read.envelope(sa, &artifacts, short);
+        forged.expires_ms = now + 1_200_000;
+        const forged_ref = try upload(sa, &artifacts, try stores.UploadScope.forPublication(domain(4, identity), forged.expires_ms, std.testing.io), forged, .none);
+        const forged_token = try generations.encode(sa, prefix, .{ .artifact_id = @constCast(forged_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(forged_ref.id)), .byte_len = forged_ref.bytes, .provider_version = forged_ref.generation });
+        try std.testing.expectError(error.CatalogGenerationChanged, loadCached(sa, &artifacts, identity, forged_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io }));
+        try std.testing.expect(decoded.hits != 0);
+        var longer = descriptor;
+        longer.expires_ms = now + 1_200_000;
+        const long = try saveCached(sa, &artifacts, identity, std.testing.io, longer, .none, &aging);
+        // Every successfully issued fresh token must remain replayable.
+        _ = try load(sa, &artifacts, identity, long, table, now + 1, .none);
+        const short_envelope = try Read.envelope(sa, &artifacts, short);
+        const long_envelope = try Read.envelope(sa, &artifacts, long);
+        try std.testing.expect(!std.mem.eql(u8, short_envelope.state.id, long_envelope.state.id));
+        const long_state = try Read.state(sa, &artifacts, long_envelope.state);
+        for (long_state.change_parts) |part| try std.testing.expect((try stores.uploadScopeFromArtifactId(part.id)).?.fencingToken() > longer.expires_ms);
+    }
+    {
+        const Worker = struct {
+            fn run(backend: *stores.ArtifactStore, id: [32]u8, value: Descriptor, memo: *Cache) anyerror![]const u8 {
+                return saveCached(std.heap.page_allocator, backend, id, std.testing.io, value, .none, memo);
+            }
+        };
+        var concurrent: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        defer concurrent.deinit();
+        var jobs: [8]?std.Io.Future(anyerror![]const u8) = @splat(null);
+        defer for (&jobs) |*job| if (job.*) |*running| {
+            if (running.cancel(std.testing.io)) |value| std.heap.page_allocator.free(value) else |_| {}
+        };
+        for (&jobs) |*job| job.* = try std.testing.io.concurrent(Worker.run, .{ &artifacts, identity, descriptor, &concurrent });
+        var published: ?[]const u8 = null;
+        for (&jobs) |*job| {
+            var running = job.*.?;
+            job.* = null;
+            const value = try running.await(std.testing.io);
+            defer std.heap.page_allocator.free(value);
+            const envelope = try Read.envelope(sa, &artifacts, value);
+            if (published) |prior| try std.testing.expectEqualStrings(prior, envelope.state.id) else published = envelope.state.id;
+        }
+        try std.testing.expectEqual(@as(u64, 3), concurrent.puts);
+    }
     descriptor.expires_ms += 60_000;
     descriptor.reader_token = @splat(6);
     const fresh = try saveCached(a, &artifacts, identity, std.testing.io, descriptor, .none, &cache);
@@ -380,6 +527,27 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     try std.testing.expectEqual(descriptor.expires_ms, fresh_envelope.expires_ms);
     try std.testing.expectEqual(descriptor.reader_token, fresh_envelope.reader_token);
     try std.testing.expectEqual(@as(u64, 3), cache.puts);
+    {
+        var decoded: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer decoded.deinit();
+        const cold = try loadCached(sa, &artifacts, identity, token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        defer cold.deinit();
+        const warm = try loadCached(sa, &artifacts, identity, fresh, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        defer warm.deinit();
+        try std.testing.expect(cold.lease.?.item == warm.lease.?.item);
+        try std.testing.expect(cold.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first, .canonical)).?.value_ptr == warm.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first, .canonical)).?.value_ptr);
+        try std.testing.expectEqual(descriptor.reader_token, warm.descriptor.reader_token);
+        try std.testing.expectEqual(descriptor.expires_ms, warm.descriptor.expires_ms);
+        try std.testing.expectError(error.DeadlineExceeded, loadCached(sa, &artifacts, identity, fresh, table, now + 1, .none, &decoded, .{ .deadline_ns = 1 }));
+        try std.testing.expectError(error.CatalogGenerationChanged, loadCached(sa, &artifacts, identity, token, table, now + ttl_ms, .none, &decoded, .{}));
+        decoded.max_entries = 1;
+        const pressure = try decoded.create(1024);
+        defer pressure.release();
+        decoded.publish(@splat(99), pressure);
+        try std.testing.expect(!pressure.item.cached);
+        // Pinned data stays valid when residency admission is saturated.
+        try std.testing.expectEqual(@as(usize, 2), warm.overlay.?.rows.count());
+    }
     const changed_row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1000,\"body\":\"changed\"}", .{});
     const next = try images.Image.update(a, image, .{ .lsn = 9, .key_fields = image.key_fields, .changes = &.{.{ .op = .upsert, .row = changed_row }} });
     defer next.release();
@@ -401,6 +569,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     const legacy_ref = try upload(sa, &artifacts, try stores.UploadScope.forPublication(domain(4, identity), legacy.expires_ms, std.testing.io), legacy, .none);
     const legacy_token = try generations.encode(sa, prefix, .{ .artifact_id = @constCast(legacy_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(legacy_ref.id)), .byte_len = legacy_ref.bytes, .provider_version = legacy_ref.generation });
     store.deinit();
+    store_open = false;
     var reopened = try @import("lake_index_store.zig").Store.open(a, &config, null, false);
     defer reopened.deinit();
     reopened.implementation.cloud_io = std.testing.io;

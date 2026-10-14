@@ -443,9 +443,22 @@ test "external lake native publication builds scoped text artifacts and fences e
         try std.testing.expectEqual(@as(usize, 1), progress.declarations.items.len);
         var batch: [16]local.serverless_segment_sidecar_manifest.DeclaredArtifact = undefined;
         var names: [16][32]u8 = undefined;
+        var batch_objects: [16]?stores.ArtifactMetadata = @splat(null);
+        defer for (&batch_objects) |*object| if (object.*) |*value| value.deinit(a);
+        const original = parsed.value.published.?.declarations[0].artifact;
+        const payload = try artifact_store.getVerifiedAllocWithCancellation(original.artifact_id, original.byte_len, original.checksum, .none);
+        defer a.free(payload);
         for (&batch, &names, 0..) |*declaration, *name, index| {
             declaration.* = parsed.value.published.?.declarations[0];
             declaration.name = try std.fmt.bufPrint(name, "batch-{d}", .{index});
+            declaration.artifact.name = declaration.name;
+            // Distinct completed indexes require distinct scoped identities;
+            // reusing one artifact ID under different names is forbidden.
+            const scope = checkpoint_store.upload_scope.?;
+            batch_objects[index] = try checkpoint_store.putScoped(try stores.UploadScope.forPublication(scope.domain, scope.fencingToken(), std.testing.io), payload, .none);
+            declaration.artifact.artifact_id = batch_objects[index].?.artifact_id;
+            declaration.artifact.checksum = batch_objects[index].?.checksum;
+            declaration.artifact.byte_len = batch_objects[index].?.byte_len;
         }
         // One completed set has one durable checkpoint containing every
         // declaration, alongside the earlier resumable declaration.
