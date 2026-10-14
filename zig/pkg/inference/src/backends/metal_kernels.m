@@ -114,7 +114,10 @@ static void termite_metal_notify_managed_write(id<MTLBuffer> buffer, NSRange ran
 #define TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY TERMITE_METAL_LINEAR_SLOT_CAPACITY
 #define TERMITE_METAL_DENSE_QKV_PACK_CACHE_DEFAULT_MAX_MB 256u
 #define TERMITE_METAL_DEBERTA_MPS_ATTENTION_DEFAULT_MAX_MB 64u
-#define TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY 16
+// Training graphs use one GEMM shape per linear, direction and batch layout,
+// well over 16; a smaller cache rebuilds MPS kernels on every step.
+#define TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY 128
+#define TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY 128
 #define TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY 8
 #define TERMITE_METAL_A4B_RESIDENCY_ALLOCATION_CAPACITY \
     (TERMITE_METAL_LINEAR_SLOT_CAPACITY + TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY + 1u)
@@ -1576,6 +1579,9 @@ typedef struct termite_metal_decode_runtime {
     size_t dot_general_mps_k[TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY];
     uint8_t dot_general_mps_rhs_contract_axis[TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY];
     size_t dot_general_mps_next_slot;
+    MPSMatrixMultiplication *gemm_mps_mm[TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY];
+    size_t gemm_mps_key[TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY][5];
+    size_t gemm_mps_next_slot;
     id<MTLBuffer> dense_qkv_packed_weight_buffers[TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY];
     id<MTLBuffer> dense_qkv_packed_bias_buffers[TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY];
     MPSMatrixMultiplication *dense_qkv_packed_mps_mm[TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY];
@@ -16905,6 +16911,49 @@ static MPSMatrixMultiplication *termite_metal_decode_runtime_cached_dot_general_
     runtime->dot_general_mps_n[slot] = n;
     runtime->dot_general_mps_k[slot] = k;
     runtime->dot_general_mps_rhs_contract_axis[slot] = (uint8_t)rhs_contract_axis;
+    return mm;
+}
+
+static MPSMatrixMultiplication *termite_metal_decode_runtime_cached_gemm_mps_mm(
+    termite_metal_decode_runtime *runtime,
+    size_t m,
+    size_t n,
+    size_t k,
+    uint32_t transpose_left,
+    uint32_t transpose_right,
+    float alpha,
+    float beta
+) {
+    if (runtime == NULL || m == 0 || n == 0 || k == 0) return nil;
+    uint32_t alpha_bits = 0;
+    uint32_t beta_bits = 0;
+    memcpy(&alpha_bits, &alpha, sizeof(alpha_bits));
+    memcpy(&beta_bits, &beta, sizeof(beta_bits));
+    const size_t key[5] = {
+        m,
+        n,
+        k,
+        ((size_t)(transpose_left != 0u) << 1u) | (size_t)(transpose_right != 0u),
+        ((size_t)alpha_bits << 32u) | (size_t)beta_bits,
+    };
+    for (size_t i = 0; i < TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY; ++i) {
+        if (runtime->gemm_mps_mm[i] != nil && memcmp(runtime->gemm_mps_key[i], key, sizeof(key)) == 0) {
+            return runtime->gemm_mps_mm[i];
+        }
+    }
+    MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:runtime->device
+                                                                    transposeLeft:transpose_left != 0u
+                                                                   transposeRight:transpose_right != 0u
+                                                                       resultRows:m
+                                                                    resultColumns:n
+                                                                  interiorColumns:k
+                                                                            alpha:alpha
+                                                                             beta:beta];
+    if (mm == nil) return nil;
+    const size_t slot = runtime->gemm_mps_next_slot % TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY;
+    runtime->gemm_mps_next_slot = (slot + 1u) % TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY;
+    runtime->gemm_mps_mm[slot] = mm;
+    memcpy(runtime->gemm_mps_key[slot], key, sizeof(key));
     return mm;
 }
 
@@ -49382,6 +49431,92 @@ int termite_metal_decode_runtime_transpose_f32_device(
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
+    }
+}
+
+// output[b] = alpha * op(lhs[b]) * op(rhs[b]) + beta * output[b] for each of
+// `batch` row-major f32 matrices, through MPS. op(lhs) is m x k (stored k x m
+// when transpose_left), op(rhs) is k x n (stored n x k when transpose_right).
+int termite_metal_decode_runtime_gemm_f32_device(
+    termite_metal_decode_runtime *runtime,
+    const void *lhs_handle,
+    size_t lhs_offset,
+    const void *rhs_handle,
+    size_t rhs_offset,
+    void *output_handle,
+    size_t output_offset,
+    size_t batch,
+    size_t m,
+    size_t n,
+    size_t k,
+    uint32_t transpose_left,
+    uint32_t transpose_right,
+    float alpha,
+    float beta
+) {
+    if (runtime == NULL || lhs_handle == NULL || rhs_handle == NULL || output_handle == NULL) return -1;
+    if (batch == 0 || m == 0 || n == 0 || k == 0 || m > UINT32_MAX || n > UINT32_MAX || k > UINT32_MAX) return -3;
+    if (m > SIZE_MAX / k || m > SIZE_MAX / n || n > SIZE_MAX / k) return -4;
+    const size_t lhs_matrix = m * k * sizeof(float);
+    const size_t rhs_matrix = n * k * sizeof(float);
+    const size_t output_matrix = m * n * sizeof(float);
+    if (batch > SIZE_MAX / lhs_matrix || batch > SIZE_MAX / rhs_matrix || batch > SIZE_MAX / output_matrix) return -4;
+    @autoreleasepool {
+        id<MTLBuffer> lhs_buffer = (__bridge id<MTLBuffer>)lhs_handle;
+        id<MTLBuffer> rhs_buffer = (__bridge id<MTLBuffer>)rhs_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        if (lhs_offset > lhs_buffer.length || batch * lhs_matrix > lhs_buffer.length - lhs_offset ||
+            rhs_offset > rhs_buffer.length || batch * rhs_matrix > rhs_buffer.length - rhs_offset ||
+            output_offset > output_buffer.length || batch * output_matrix > output_buffer.length - output_offset)
+            return -6;
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -7;
+        termite_metal_planned_encoder_range accesses[3];
+        if (termite_metal_planned_range_make(lhs_buffer, lhs_offset, batch * lhs_matrix, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -8) != 0 ||
+            termite_metal_planned_range_make(rhs_buffer, rhs_offset, batch * rhs_matrix, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -8) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, batch * output_matrix,
+                TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -8) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -8) != 0)
+        {
+            return -8;
+        }
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        const size_t lhs_rows = transpose_left != 0u ? k : m;
+        const size_t lhs_cols = transpose_left != 0u ? m : k;
+        const size_t rhs_rows = transpose_right != 0u ? n : k;
+        const size_t rhs_cols = transpose_right != 0u ? k : n;
+        MPSMatrixDescriptor *left_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:lhs_rows
+                                                                               columns:lhs_cols
+                                                                              matrices:batch
+                                                                              rowBytes:lhs_cols * sizeof(float)
+                                                                           matrixBytes:lhs_matrix
+                                                                              dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *right_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:rhs_rows
+                                                                                columns:rhs_cols
+                                                                               matrices:batch
+                                                                               rowBytes:rhs_cols * sizeof(float)
+                                                                            matrixBytes:rhs_matrix
+                                                                               dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *result_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                                 columns:n
+                                                                                matrices:batch
+                                                                                rowBytes:n * sizeof(float)
+                                                                             matrixBytes:output_matrix
+                                                                                dataType:MPSDataTypeFloat32];
+        MPSMatrix *left = [[MPSMatrix alloc] initWithBuffer:lhs_buffer offset:lhs_offset descriptor:left_desc];
+        MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:rhs_buffer offset:rhs_offset descriptor:right_desc];
+        MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffer offset:output_offset descriptor:result_desc];
+        MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_gemm_mps_mm(
+            runtime, m, n, k, transpose_left, transpose_right, alpha, beta);
+        if (left == nil || right == nil || result == nil || mm == nil) {
+            if (frame_owned) [command_buffer commit];
+            return -9;
+        }
+        mm.batchStart = 0;
+        mm.batchSize = batch;
+        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
 }
 
