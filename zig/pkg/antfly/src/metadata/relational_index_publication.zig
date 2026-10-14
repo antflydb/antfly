@@ -42,6 +42,34 @@ pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+/// Provenance for one actual canonical source batch. This is not a source ACK,
+/// complete-stream seal, or current placement/enrollment authority.
+pub const SignedSourceBatch = struct {
+    binding: local.storage_db_relational_index_owner_job.Binding,
+    header: local.storage_db_relational_index_owner_job.private_claims.SourceStream.Header,
+    proof: RootProof,
+
+    pub fn verifyFor(self: SignedSourceBatch, read: *const native_control.SourceRead) !void {
+        _ = try self.verifiedDigest(read);
+    }
+
+    /// Retain the authenticated digest across current-authority reads so an
+    /// accepting transaction need not hash the complete body a second time.
+    pub fn verifiedDigest(self: SignedSourceBatch, read: *const native_control.SourceRead) !Digest {
+        const batch = if (read.batch) |*value| value else return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority != .native or !std.mem.eql(u8, &try self.binding.encode(), &try read.binding.encode()) or
+            !std.mem.eql(u8, &self.header.bytes, &batch.header.bytes)) return error.InvalidPrivateIndexClaimReceipt;
+        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        const logical_digest = try read.digest();
+        self.proof.verify(logical_digest) catch return error.InvalidPrivateIndexClaimReceipt;
+        return logical_digest;
+    }
+
+    pub fn commitment(self: SignedSourceBatch, read: *const native_control.SourceRead) !Digest {
+        return self.proof.commitment(try self.verifiedDigest(read));
+    }
+};
+
 /// Exact durable target delivery, not a source ACK or publication receipt.
 /// Verification must additionally read current enrollment, placement, root and
 /// observed cut in the transaction that will accept the delivery.

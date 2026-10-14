@@ -352,6 +352,13 @@ test "relational index build pages native owner control preserves committed cuts
             primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
             const outcome = try primary.applyPreparedNativeIndexOwnerBuild(&build, null);
             try std.testing.expectEqual(page_count == 1, outcome.replication_pending);
+            if (page_count == 1) {
+                const source_identity = try @import("relational_index_owner_control.zig").BuildRequest.init(.{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id }, build.command.binding, .{});
+                var blocked_source = try primary.readNativeIndexClaimSource(alloc, source_identity.identity, .{});
+                defer blocked_source.deinit();
+                try std.testing.expect(blocked_source.replication_pending and blocked_source.batch == null);
+                try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, blocked_source.digest());
+            }
             try outcome.validateFor(build.command);
             try std.testing.expect(!@hasField(@TypeOf(outcome), "receipt"));
             const payload = try build.finalizePayload(outcome.position);
@@ -893,6 +900,15 @@ test "relational index build pages identity dispatch caches immutable candidates
     try std.testing.expectEqual(@as(u64, 10), db.native_index_build_cache.hits);
     try std.testing.expect(manager.snapshot().slices[slice].used_bytes > 0);
     var delivered_position: ?@import("receipt_position.zig").Native = null;
+    {
+        var source_read = try db.readNativeIndexClaimSource(alloc, identity, .{});
+        defer source_read.deinit();
+        try source_read.requireIdentity(identity);
+        try std.testing.expectEqual(@as(usize, 4), source_read.batch.?.rows().len);
+        _ = try source_read.digest();
+        try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
+        try std.testing.expectEqual(@as(u64, 10), db.native_index_build_cache.hits);
+    }
     // Eviction cannot destroy a candidate still pinned by a page preparer.
     {
         var lease = try db.native_index_build_cache.acquire(std.testing.io, alloc, &manager, db.core, request, binding, .{});

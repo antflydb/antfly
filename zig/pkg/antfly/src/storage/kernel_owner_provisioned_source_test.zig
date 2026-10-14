@@ -300,6 +300,33 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const build_permission = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, reserved_receipt);
         metadata.value.head = build_permission.head;
         metadata.value.owner = build_permission.owner;
+        const source_request: execution.Request = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .operation = .source };
+        {
+            var absent = try execution.step(alloc, &owners, &metadata, plan.before.name, source_request, .{});
+            defer absent.deinit();
+            try std.testing.expect(absent == .source and absent.source.outcome.batch == null);
+            try std.testing.expect(!absent.needsSigning());
+        }
+        // Test startup establishes the root key before reading/signing. Serving
+        // code only loads the existing key and never creates one after a read.
+        const signing_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, root);
+        const native_root: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = metadata.value.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = signing_root.root_incarnation };
+        metadata.value.native_signing = .{ .identity = .{ .metadata_incarnation = native_root.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = signing_root.root_incarnation, .public_key = signing_root.public_key }, .reporter_incarnation = 4, .binding_digest = try native_root.digest() };
+        var build_request = source_request;
+        build_request.operation = .build;
+        var built = try execution.step(alloc, &owners, &metadata, plan.before.name, build_request, .{});
+        defer built.deinit();
+        try std.testing.expect(built == .building and built.building.outcome.value == .advanced);
+        var source_result = try execution.step(alloc, &owners, &metadata, plan.before.name, source_request, .{});
+        defer source_result.deinit();
+        try std.testing.expect(source_result.needsSigning());
+        try source_result.signNative(signing_root, 2, 3, 4);
+        const source_response = (try source_result.response()).source;
+        var source_read = try source_response.decodeSigned(alloc, source_request);
+        defer source_read.deinit();
+        try std.testing.expectEqual(root_generation, source_response.signed_source.?.root_generation);
+        try std.testing.expectEqual(@as(usize, 0), source_read.batch.?.rows().len);
+        try std.testing.expectEqual(built.building.outcome.value.advanced.position, try source_read.batch.?.header.position());
         const delivery: execution.ClaimRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .claims = claim_command.claims };
         var received = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, delivery, .{});
         defer received.deinit();
@@ -378,6 +405,8 @@ test "native index owner adapter executes fresh permission stages and recovers r
         // recovered receipt as belonging to the replacement physical root.
         root_generation += 1;
         try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
+        try std.testing.expectEqual(@as(u64, 7), source_result.rootGeneration().?);
+        try std.testing.expectEqual(@as(u64, 7), source_response.signed_source.?.root_generation);
     }
 }
 

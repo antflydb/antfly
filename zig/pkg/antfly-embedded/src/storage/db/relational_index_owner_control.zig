@@ -60,6 +60,97 @@ pub const Identity = struct {
     }
 };
 
+/// Read-only canonical source observation. Absence and pending mirrors are
+/// information only; neither can produce a source-batch signature or ACK.
+pub const SourceRead = struct {
+    binding: jobs.Binding,
+    batch: ?private_claims.SourceStream.OwnedBatch = null,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn deinit(self: *SourceRead) void {
+        if (self.batch) |*batch| batch.deinit();
+        self.* = undefined;
+    }
+
+    pub fn requireIdentity(self: *const SourceRead, identity: Identity) !void {
+        try identity.validate();
+        _ = try self.binding.encode();
+        const b = self.binding;
+        if (b.phase != .reserved or b.authority != .native or b.ordinal != identity.ordinal or
+            b.fence.owner_group_id != identity.owner_group_id or !b.fence.namespace.eql(identity.namespace) or
+            !std.mem.eql(u8, &b.id, &identity.id) or !std.mem.eql(u8, &b.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &b.owner_digest, &identity.owner_digest) or self.replication_pending != (self.error_name != null) or
+            (self.replication_pending and self.batch != null)) return error.InvalidPrivateIndexClaimInventory;
+    }
+
+    pub fn digest(self: *const SourceRead) !integrity.Digest {
+        const batch = if (self.batch) |*value| value else return error.InvalidPrivateIndexClaimReceipt;
+        if (self.replication_pending or self.error_name != null or batch.header.bytes[184] == @backingInt(private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexClaimReceipt;
+        try private_claims.delivery.View.fromBatch(batch).validate(self.binding);
+        return sourceHeaderCommitment(self.binding, batch.header);
+    }
+};
+
+/// Compact binary body in a bounded JSON control envelope. No per-row JSON or
+/// Unicode conversion enters the logical tuple representation.
+pub const SourceWire = struct {
+    pub const max_payload_b64 = std.base64.standard.Encoder.calcSize(private_claims.SourceStream.max_payload_bytes);
+    pub const max_wire_bytes = max_payload_b64 + 32 * 1024;
+    binding: jobs.Binding,
+    header: ?private_claims.SourceStream.Header = null,
+    payload_b64: ?[]const u8 = null,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    /// Envelope checks alone do not validate the decoded source body. Remote
+    /// consumers must decode before using rows or accepting source provenance.
+    pub fn requireIdentity(self: SourceWire, identity: Identity) !void {
+        if (self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexClaimInventory;
+        if (self.error_name) |name| if (!std.mem.eql(u8, name, "ReplicationOutboxPending")) return error.InvalidPrivateIndexClaimInventory;
+        try (SourceRead{ .binding = self.binding, .replication_pending = self.replication_pending, .error_name = self.error_name }).requireIdentity(identity);
+        if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
+        if (self.header) |header| _ = try private_claims.SourceStream.Header.decode(&header.bytes, self.binding, std.mem.readInt(u64, header.bytes[104..112], .little));
+        if (self.payload_b64) |encoded| if (encoded.len > max_payload_b64) return error.InvalidPrivateIndexClaimInventory;
+    }
+
+    pub fn headerCommitment(self: SourceWire) !integrity.Digest {
+        if (self.replication_pending or self.error_name != null or self.payload_b64 == null) return error.InvalidPrivateIndexClaimReceipt;
+        return sourceHeaderCommitment(self.binding, self.header orelse return error.InvalidPrivateIndexClaimReceipt);
+    }
+
+    pub fn decode(self: SourceWire, alloc: Allocator, identity: Identity) !SourceRead {
+        try self.requireIdentity(identity);
+        // The parsed wire arena may be released immediately after decoding.
+        var result: SourceRead = .{ .binding = self.binding, .replication_pending = self.replication_pending, .error_name = if (self.replication_pending) "ReplicationOutboxPending" else null };
+        try result.requireIdentity(identity);
+        if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
+        if (self.payload_b64) |encoded| {
+            if (encoded.len > max_payload_b64) return error.InvalidPrivateIndexClaimInventory;
+            const decoder = std.base64.standard.Decoder;
+            const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidPrivateIndexClaimInventory;
+            if (size > private_claims.SourceStream.max_payload_bytes) return error.InvalidPrivateIndexClaimInventory;
+            const body = try alloc.alloc(u8, size);
+            errdefer alloc.free(body);
+            decoder.decode(body, encoded) catch return error.InvalidPrivateIndexClaimInventory;
+            result.batch = try private_claims.SourceStream.OwnedBatch.takePayload(alloc, self.binding, self.header.?, body);
+        }
+        return result;
+    }
+};
+
+fn sourceHeaderCommitment(binding: jobs.Binding, header: private_claims.SourceStream.Header) !integrity.Digest {
+    _ = try private_claims.SourceStream.Header.decode(&header.bytes, binding, std.mem.readInt(u64, header.bytes[104..112], .little));
+    if (binding.phase != .reserved or binding.authority != .native or header.bytes[184] == @backingInt(private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexClaimReceipt;
+    var state = std.crypto.hash.Blake3.init(.{});
+    state.update("antfly/private-unique-source-batch/v1");
+    state.update(&try binding.encode());
+    state.update(&header.digest());
+    var result: integrity.Digest = undefined;
+    state.final(&result);
+    return result;
+}
+
 pub const Command = struct {
     effect: jobs.NativeEffect,
     binding: jobs.Binding,

@@ -4016,6 +4016,39 @@ pub fn storageOwnerNativeIndexControlJson(
     // Headers/bindings contain only fixed-size identities. Large schema inputs
     // remain raw borrowed bytes rather than another JSON/base64 representation.
     if (request.request_json.len == 0 or request.request_json.ptr == null or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.operation == .source) {
+        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        var parsed = std.json.parseFromSlice(native.Identity, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const resources = @import("antfly_local_sources").storage_resource_manager;
+        var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+        var result = handle.db.readNativeIndexClaimSource(alloc, parsed.value, context) catch |err| {
+            if (budget) |value| if (value.denied()) return storageOwnerStatusFromError(error.ResourceBudgetExceeded);
+            return storageOwnerStatusFromError(err);
+        };
+        defer result.deinit();
+        const encoded = if (result.batch) |batch| alloc.alloc(u8, std.base64.standard.Encoder.calcSize(batch.payload.len)) catch |err| {
+            if (budget) |value| if (value.denied()) return storageOwnerStatusFromError(error.ResourceBudgetExceeded);
+            return storageOwnerStatusFromError(err);
+        } else null;
+        defer if (encoded) |bytes| alloc.free(bytes);
+        if (encoded) |bytes| _ = std.base64.standard.Encoder.encode(bytes, result.batch.?.payload);
+        const wire: native.SourceWire = .{ .binding = result.binding, .header = if (result.batch) |batch| batch.header else null, .payload_b64 = encoded, .replication_pending = result.replication_pending, .error_name = result.error_name };
+        context.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+        const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, wire, .{}) catch |err| return storageOwnerStatusFromError(err);
+        if (response.len > native.SourceWire.max_wire_bytes) {
+            std.heap.c_allocator.free(response);
+            return .invalid_argument;
+        }
+        out_response.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
     if (request.operation == .build) {
         if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;

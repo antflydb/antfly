@@ -38,7 +38,7 @@ pub const Request = struct {
     table_id: u64,
     group_id: u64,
     id: [16]u8,
-    operation: enum { fence, reserve, build },
+    operation: enum { fence, reserve, build, source },
     build_budget: ?local.storage_db_relational_index_jobs.Budget = null,
 
     pub fn validate(self: Request, group_id: u64) !void {
@@ -56,7 +56,7 @@ pub const Request = struct {
             .operation = switch (self.operation) {
                 .fence => .fence,
                 .reserve => .reserve,
-                .build => .build,
+                .build, .source => .build,
             },
             .projection = projection,
         };
@@ -81,6 +81,7 @@ pub const Result = union(enum) {
     applied: std.json.Parsed(native.Outcome),
     controlled: struct { root_generation: u64, outcome: std.json.Parsed(native.Outcome), signing: SigningState = .{} },
     building: struct { root_generation: u64, outcome: std.json.Parsed(native.BuildResponse) },
+    source: SourceResult,
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
@@ -89,6 +90,7 @@ pub const Result = union(enum) {
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
             .building => |value| value.outcome.deinit(),
+            .source => |*value| value.deinit(),
         }
         self.* = undefined;
     }
@@ -96,7 +98,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .building => null,
+            .acknowledged, .building, .source => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -110,6 +112,7 @@ pub const Result = union(enum) {
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
+            .source => |value| value.root_generation,
             .acknowledged, .applied => null,
         };
     }
@@ -118,11 +121,12 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .applied, .building => null,
+            .acknowledged, .applied, .building, .source => null,
         };
     }
 
     pub fn needsSigning(self: *Result) bool {
+        if (self.* == .source) return self.source.needsSigning();
         const state = self.signingState() orelse return false;
         const value = self.outcome() orelse return false;
         return state.context != null and state.ack == null and value.receipt != null;
@@ -131,6 +135,7 @@ pub const Result = union(enum) {
     /// Signing is post-commit decoration, never another physical effect. The
     /// caller must preserve the outcome if the local identity is unavailable.
     pub fn signNative(self: *Result, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (self.* == .source) return self.source.signNative(root, node_id, store_id, reporter_incarnation);
         const state = self.signingState() orelse return error.NativeIndexSigningUnavailable;
         const context = state.context orelse return error.NativeIndexSigningUnavailable;
         const value = self.outcome() orelse return error.NativeIndexSigningUnavailable;
@@ -153,6 +158,11 @@ pub const Result = union(enum) {
     }
 
     pub fn signingFailed(self: *Result, failure: SigningFailure) void {
+        if (self.* == .source) {
+            self.source.signed_source = null;
+            self.source.signing_failure = failure;
+            return;
+        }
         const state = self.signingState() orelse return;
         if (state.ack == null) state.failure = failure;
     }
@@ -165,6 +175,7 @@ pub const Result = union(enum) {
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .building => |value| .{ .building = .{ .root_generation = value.root_generation, .outcome = value.outcome.value } },
+            .source => |*value| .{ .source = value.response() },
         };
     }
 };
@@ -180,6 +191,7 @@ pub const ControlResponse = union(enum) {
     controlled: RootedOutcome,
     recovered: RootedOutcome,
     building: struct { root_generation: u64, outcome: native.BuildResponse },
+    source: SourceResponse,
 
     pub const RootedOutcome = struct {
         root_generation: u64,
@@ -192,6 +204,7 @@ pub const ControlResponse = union(enum) {
         try request.validate(request.group_id);
         const outcome: native.Outcome = switch (self) {
             .acknowledged => return,
+            .source => |value| return value.validate(request),
             .building => |value| {
                 if (request.operation != .build or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
                 const binding = switch (value.outcome) {
@@ -228,10 +241,79 @@ pub const ControlResponse = union(enum) {
             .effect = switch (request.operation) {
                 .fence => .fenced,
                 .reserve => .reserved,
-                .build => return error.InvalidPrivateIndexNativeReceipt,
+                .build, .source => return error.InvalidPrivateIndexNativeReceipt,
             },
         });
         if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+/// Read-only signed source transport. Envelope validation is not body
+/// validation: callers must use decodeSigned before consuming logical rows.
+/// A valid signature is not current enrollment/placement authority. Durable
+/// source ACK acceptance must independently revalidate that metadata cut.
+pub const SourceResponse = struct {
+    root_generation: u64,
+    observation: native.SourceWire,
+    signed_source: ?publication.RootProof = null,
+    signing_failure: ?SigningFailure = null,
+
+    fn identity(self: SourceResponse, request: Request) native.Identity {
+        const b = self.observation.binding;
+        return .{ .id = request.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = request.group_id };
+    }
+
+    pub fn validate(self: SourceResponse, request: Request) !void {
+        try request.validate(request.group_id);
+        if (request.operation != .source or self.root_generation == 0 or self.observation.binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexClaimReceipt;
+        try self.observation.requireIdentity(self.identity(request));
+        if (self.signed_source) |proof| {
+            if (self.signing_failure != null or proof.root_generation != self.root_generation or proof.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
+            (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+            proof.verify(try self.observation.headerCommitment()) catch return error.InvalidPrivateIndexClaimReceipt;
+        }
+    }
+
+    pub fn decodeSigned(self: SourceResponse, alloc: std.mem.Allocator, request: Request) !native.SourceRead {
+        try self.validate(request);
+        _ = self.signed_source orelse return error.InvalidPrivateIndexClaimReceipt;
+        // validate authenticated the header commitment. Decode checks the
+        // canonical body against that exact header; no second signature/hash
+        // pass over reconstructed logical rows is necessary.
+        return self.observation.decode(alloc, self.identity(request));
+    }
+};
+
+pub const SourceResult = struct {
+    root_generation: u64,
+    outcome: native.SourceRead,
+    wire: std.json.Parsed(native.SourceWire),
+    signing: ?struct { view: publication.NativeSigningView, digest: ?[32]u8, root_generation: u64 } = null,
+    signed_source: ?publication.RootProof = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn deinit(self: *SourceResult) void {
+        self.outcome.deinit();
+        self.wire.deinit();
+        self.* = undefined;
+    }
+
+    pub fn needsSigning(self: *const SourceResult) bool {
+        return self.signing != null and self.signing.?.digest != null and self.signed_source == null;
+    }
+
+    pub fn signNative(self: *SourceResult, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        const pinned = self.signing orelse return error.NativeIndexSigningUnavailable;
+        const digest = try self.outcome.digest();
+        try pinned.view.validate(pinned.view.identity.metadata_incarnation);
+        if (pinned.digest == null or node_id != pinned.view.identity.node_id or store_id != pinned.view.identity.store_id or reporter_incarnation != pinned.view.reporter_incarnation or
+            self.root_generation != pinned.root_generation or !std.mem.eql(u8, &digest, &pinned.digest.?) or !std.mem.eql(u8, &digest, &try self.wire.value.headerCommitment())) return error.IndexOwnerReceiptChanged;
+        self.signed_source = try (publication.RootProof{ .identity = pinned.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = pinned.view.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, digest);
+        self.signing_failure = null;
+    }
+
+    pub fn response(self: *const SourceResult) SourceResponse {
+        return .{ .root_generation = self.root_generation, .observation = self.wire.value, .signed_source = self.signed_source, .signing_failure = self.signing_failure };
     }
 };
 
@@ -629,7 +711,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build => return error.InvalidGenerationPublication,
+            .build, .source => return error.InvalidGenerationPublication,
         } };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
         errdefer recovered.deinit();
@@ -645,6 +727,16 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     const identity = try permission.value.nativeExecutionIdentity(hot_request);
     try requireTable(permission.value, table_name);
     const signing: SigningState = .{ .context = if (permission.value.native_signing) |view| .{ .view = view, .expected_revision = permission.value.head.revision, .request = request } else null };
+    if (request.operation == .source) {
+        var rooted = try source.readNativeIndexClaimSourceAtRoot(alloc, request.group_id, table_name, identity, context);
+        errdefer rooted.deinit();
+        try rooted.outcome.requireIdentity(identity);
+        _ = try permission.value.nativeBuild(hot_request, rooted.outcome.binding, .{});
+        if (rooted.root_generation == 0) return error.InvalidPrivateIndexClaimReceipt;
+        const attestable = !rooted.outcome.replication_pending and rooted.outcome.batch != null and rooted.outcome.batch.?.header.bytes[184] != @backingInt(jobs.private_claims.SourceStream.State.failed);
+        if (rooted.outcome.batch) |batch| if (!std.mem.eql(u8, table_name, batch.scope.table_name)) return error.PrivateIndexOwnerJobChanged;
+        return .{ .source = .{ .root_generation = rooted.root_generation, .outcome = rooted.outcome, .wire = rooted.wire, .signing = if (permission.value.native_signing) |view| .{ .view = view, .digest = if (attestable) try rooted.outcome.digest() else null, .root_generation = rooted.root_generation } else null } };
+    }
     var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
     defer state.deinit();
     if (request.operation == .build) {
@@ -659,7 +751,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build => return error.InvalidGenerationPublication,
+            .build, .source => return error.InvalidGenerationPublication,
         };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {
@@ -717,6 +809,7 @@ const TestDriver = struct {
     produce_receipt: bool = false,
     pending: bool = false,
     build_pages: usize = 0,
+    source_reads: usize = 0,
     cancel_after_commit: ?*std.atomic.Value(bool) = null,
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
@@ -784,6 +877,25 @@ const TestDriver = struct {
         self.build_pages += 1;
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .advanced = .{ .binding = binding, .page_digest = @splat(9), .position = .{ .namespace = binding.fence.namespace, .sequence = 4 }, .duplicate = false, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null } }) };
+    }
+
+    pub fn readNativeIndexClaimSourceAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, table_name: []const u8, identity: native.Identity, context: operation.RequestContext) !SourceResult {
+        try context.ensureActive();
+        const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
+        self.source_reads += 1;
+        const Source = jobs.private_claims.SourceStream;
+        var prepared = try Source.PreparedSource.init(alloc, binding, .{ .table_name = table_name, .generation = @splat(1), .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), .ready, &.{.{ .key = "row", .tuple = "logical\x00\xff\x80" }});
+        defer prepared.deinit();
+        var header = prepared.header;
+        std.mem.writeInt(u64, header[104..112], 1, .little);
+        @memcpy(header[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 4 } }).encode());
+        std.crypto.hash.Blake3.hash(header[0..288], header[288..320], .{});
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(prepared.payload.len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, prepared.payload);
+        var wire = try parsed(native.SourceWire, alloc, .{ .binding = binding, .header = if (self.pending) null else try Source.Header.decode(&header, binding, 1), .payload_b64 = if (self.pending) null else encoded, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null });
+        errdefer wire.deinit();
+        return .{ .root_generation = self.root_generation, .outcome = try wire.value.decode(alloc, identity), .wire = wire };
     }
 
     pub fn admitNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, header: native.Admission, manifest: []const u8, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -1318,6 +1430,53 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expect(signal.load(.acquire));
     try std.testing.expect(pending_build.building.outcome.value.advanced.replication_pending);
     try (try pending_build.response()).validate(build_control);
+    {
+        const source_request: Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .source };
+        signal.store(false, .release);
+        driver = .{ .value = permission, .binding = binding };
+        var source_result = try step(alloc, &driver, &driver, plan.before.name, source_request, .{});
+        defer source_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), driver.permission_reads);
+        try std.testing.expectEqual(@as(usize, 0), driver.inspections);
+        try std.testing.expectEqual(@as(usize, 0), driver.admission_reads);
+        try std.testing.expect(source_result.needsSigning());
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, source_result.signNative(root, 2, 3, 5));
+        source_result.source.root_generation += 1;
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, source_result.signNative(root, 2, 3, 4));
+        source_result.source.root_generation -= 1;
+        try source_result.signNative(root, 2, 3, 4);
+        const response = (try source_result.response()).source;
+        const encoded_response = try std.json.Stringify.valueAlloc(alloc, try source_result.response(), .{});
+        defer alloc.free(encoded_response);
+        var roundtrip = try std.json.parseFromSlice(ControlResponse, alloc, encoded_response, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        defer roundtrip.deinit();
+        var decoded = try roundtrip.value.source.decodeSigned(alloc, source_request);
+        defer decoded.deinit();
+        try std.testing.expectEqualStrings("logical\x00\xff\x80", decoded.batch.?.rows()[0].tuple);
+        try std.testing.expectEqual(@as(u64, 9), response.signed_source.?.root_generation);
+        var bad_source = response;
+        bad_source.signed_source.?.signature[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, bad_source.decodeSigned(alloc, source_request));
+        bad_source = response;
+        bad_source.signed_source = signed.signed_delivery;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, bad_source.decodeSigned(alloc, source_request));
+        bad_source = response;
+        bad_source.signed_source.?.authority.native[0] ^= 1;
+        bad_source.signed_source = try bad_source.signed_source.?.sign(root, try response.observation.headerCommitment());
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, bad_source.decodeSigned(alloc, source_request));
+        bad_source = response;
+        const bad_payload = try alloc.dupe(u8, bad_source.observation.payload_b64.?);
+        defer alloc.free(bad_payload);
+        bad_payload[0] = if (bad_payload[0] == 'A') 'B' else 'A';
+        bad_source.observation.payload_b64 = bad_payload;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, bad_source.decodeSigned(alloc, source_request));
+        driver.pending = true;
+        var pending_source = try step(alloc, &driver, &driver, plan.before.name, source_request, .{});
+        defer pending_source.deinit();
+        try std.testing.expect(!pending_source.needsSigning());
+        try std.testing.expect(pending_source.source.outcome.batch == null);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (try pending_source.response()).source.decodeSigned(alloc, source_request));
+    }
 }
 
 test "relational index publication native receiver signs pinned authority and preserves progress on signing failure" {

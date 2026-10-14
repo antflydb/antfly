@@ -332,6 +332,36 @@ pub const SourceStream = struct {
             self.alloc.free(self.payload);
             self.* = undefined;
         }
+
+        /// Transfer one owned canonical body on success only. Reused by the
+        /// storage snapshot and compiled-owner wire decoder; no row JSON parse.
+        pub fn takePayload(alloc: Allocator, binding: jobs.Binding, header: Header, payload: []u8) !OwnedBatch {
+            _ = try Header.decode(&header.bytes, binding, std.mem.readInt(u64, header.bytes[104..112], .little));
+            if (payload.len != header.payloadLen() or !std.mem.eql(u8, header.bytes[224..256], &hash(payload))) return error.InvalidPrivateIndexClaimInventory;
+            const name_len = std.mem.readInt(u32, header.bytes[92..96], .little);
+            const scope_value: Scope = .{ .table_name = payload[0..name_len], .generation = header.bytes[72..88].*, .schema_version = std.mem.readInt(u32, header.bytes[88..92], .little), .tuple_fingerprint = header.bytes[192..224].*, .nulls_not_distinct = header.bytes[185] != 0 };
+            if (!std.mem.eql(u8, &try scope_value.digest(), header.bytes[40..72])) return error.InvalidPrivateIndexClaimInventory;
+            var result: OwnedBatch = .{ .alloc = alloc, .payload = payload, .header = header, .scope = scope_value, .entries = undefined, .count = std.mem.readInt(u32, header.bytes[96..100], .little) };
+            var offset: usize = name_len;
+            var previous: ?[]const u8 = null;
+            for (result.entries[0..result.count]) |*entry| {
+                if (payload.len - offset < 8) return error.InvalidPrivateIndexClaimInventory;
+                const row_key_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
+                const tuple_len = std.mem.readInt(u32, payload[offset + 4 ..][0..4], .little);
+                offset += 8;
+                if (row_key_len == 0 or row_key_len > @import("relational_index_limits.zig").max_cursor_key_bytes or row_key_len > payload.len - offset) return error.InvalidPrivateIndexClaimInventory;
+                entry.key = payload[offset..][0..row_key_len];
+                offset += row_key_len;
+                if (tuple_len == 0 or tuple_len > payload.len - offset) return error.InvalidPrivateIndexClaimInventory;
+                entry.tuple = payload[offset..][0..tuple_len];
+                offset += tuple_len;
+                _ = try targetBytes(name_len, row_key_len, tuple_len);
+                if (previous) |prior| if (std.mem.order(u8, prior, entry.key) != .lt) return error.InvalidPrivateIndexClaimInventory;
+                previous = entry.key;
+            }
+            if (offset != payload.len) return error.InvalidPrivateIndexClaimInventory;
+            return result;
+        }
     };
 
     /// Read one immutable bounded batch. A mirror ACK cannot retire it; a
@@ -346,28 +376,10 @@ pub const SourceStream = struct {
         const allocation = try requireRegistered(txn, binding);
         if (!std.mem.eql(u8, header.bytes[40..72], &head.scope_digest) or !std.mem.eql(u8, header.bytes[72..88], &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
         const raw = (try optional(txn, &key(binding.id, ordinal, true))) orelse return error.PrivateIndexRootRecoveryRequired;
-        if (raw.len != header.payloadLen() or !std.mem.eql(u8, header.bytes[224..256], &hash(raw))) return error.InvalidPrivateIndexClaimInventory;
+        if (raw.len != header.payloadLen()) return error.InvalidPrivateIndexClaimInventory;
         const payload = try alloc.dupe(u8, raw);
         errdefer alloc.free(payload);
-        const name_len = std.mem.readInt(u32, header.bytes[92..96], .little);
-        const scope_value: Scope = .{ .table_name = payload[0..name_len], .generation = header.bytes[72..88].*, .schema_version = std.mem.readInt(u32, header.bytes[88..92], .little), .tuple_fingerprint = header.bytes[192..224].*, .nulls_not_distinct = header.bytes[185] != 0 };
-        if (!std.mem.eql(u8, &try scope_value.digest(), &head.scope_digest)) return error.InvalidPrivateIndexClaimInventory;
-        var result: OwnedBatch = .{ .alloc = alloc, .payload = payload, .header = header, .scope = scope_value, .entries = undefined, .count = std.mem.readInt(u32, header.bytes[96..100], .little) };
-        var offset: usize = name_len;
-        for (result.entries[0..result.count]) |*entry| {
-            if (payload.len - offset < 8) return error.InvalidPrivateIndexClaimInventory;
-            const row_key_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
-            const tuple_len = std.mem.readInt(u32, payload[offset + 4 ..][0..4], .little);
-            offset += 8;
-            if (row_key_len == 0 or row_key_len > @import("relational_index_limits.zig").max_cursor_key_bytes or row_key_len > payload.len - offset) return error.InvalidPrivateIndexClaimInventory;
-            entry.key = payload[offset..][0..row_key_len];
-            offset += row_key_len;
-            if (tuple_len == 0 or tuple_len > payload.len - offset) return error.InvalidPrivateIndexClaimInventory;
-            entry.tuple = payload[offset..][0..tuple_len];
-            offset += tuple_len;
-        }
-        if (offset != payload.len) return error.InvalidPrivateIndexClaimInventory;
-        return result;
+        return try OwnedBatch.takePayload(alloc, binding, header, payload);
     }
 
     /// Cancellation owns these exact bounded ordinal keys. Do not fetch large

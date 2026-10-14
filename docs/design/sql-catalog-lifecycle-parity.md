@@ -6352,3 +6352,65 @@ data-Raft execution, terminal native publication evidence and atomic schema/
 catalog publication. Source-consumption and public activation guards remain
 closed; a signature or successful read-only verification is not permission to
 discard source batches.
+
+### Authenticated native source observations and current source authority
+
+The existing private owner-control route now supports a `source` read operation
+under fresh build permission. The request contains only table/group/job identity:
+no caller-selected allocation, source position, body, schema or verification
+flag. One pinned compiled owner reads the actual reserved job, mirror debt,
+physical checkpoint and bounded source-header chain in one storage snapshot,
+then fetches at most one 1 MiB body. It does not compile a candidate, take the
+global apply lock, create a commit position or consume a batch. Pending outbox
+debt schedules recovery and returns no body to sign. Absence, pending mirrors
+and failed batches cannot become successful source proofs; an authenticated
+empty batch remains distinct from absence and from a complete-stream seal.
+
+Native control ABI 79 adds the read selector and borrowed deadline/cancellation
+controls. The persisted mutation envelope remains version 23: this observation
+does not add a replay mutation. Binary payloads cross the control boundary as
+bounded base64, preserving arbitrary tuple/key bytes without per-row JSON or
+Unicode conversion. Shared payload decoding checks header/scope/body integrity,
+framing, exact lengths, row bounds, strictly increasing primary keys and target
+admission size. The leased adapter retains both the decoded owned body and the
+already encoded wire arena, so network serialization does not re-encode it.
+The HTTP client applies the source-specific response cap during transport, not
+only after downloading, while retaining the small cap for other controls.
+
+The serving receiver signs only the canonical batch observed from that actual
+lease, capturing its digest and root generation before releasing storage. It
+uses the existing enrolled root-key loader and never creates a key after the
+read. Source, target-delivery and publication signature domains are distinct.
+The remote consumer verifies the signature once, then checks the canonical body
+against that signed header during decoding. Bad native-binding assertions are
+invalid peer receipts, not evidence that the metadata catalog is corrupt.
+
+Metadata source preflight now shares the exact current job/catalog/range
+verifier and physical-root verifier with target deliveries. It independently
+checks the source's physical table name, enrollment, reporter, generation,
+native binding, reader capabilities, namespace and observed cut in the caller's
+transaction. The authenticated body digest is retained across these reads,
+avoiding another complete-body hash. These methods remain read-only; a durable
+ACK must repeat them in its accepting transaction. No boolean or signature by
+itself grants source-consumption authority.
+
+Qualification: the optional-result coercion and a local-name shadowing compile
+error were fixed without changing test expectations. The 87-step Debug run in
+`/private/tmp/antfly-native-source-proof-debug-v2.log` passed all native page,
+C-ABI, publication, candidate and runtime-contract gates. Actual leased-owner
+coverage then passed 94/94 steps, including cold absence, a checkpoint-backed
+signed source read, JSON/body decoding, and retention of the original generation
+after a routing/root switch. The final current-authority/receipt-classification
+run is `/private/tmp/antfly-native-source-proof-receipt-errors-debug.log`:
+94/94 steps, 35 publication tests, three leased-owner/adapter tests and the
+decoder barrier, with no failures or leaks. Real-store faults cover source and
+target cancellation, job/range/root replacement, capability loss and cut lag.
+Native regressions verify no candidate-cache compile/hit changes from source
+reads and no body/signature during pending mirror debt. Counts overlap; no
+wall-clock throughput improvement or original SQL case completion is claimed.
+
+Original dispositions remain 483 implemented / 862 unresolved. Still required:
+durable all-partition source ACKs, source/target EOF inventory seals, provenance-
+backed missing-root repair, real data-Raft execution, terminal native publication
+evidence and atomic schema/catalog activation. Source consumption and public
+activation guards remain closed. No push or full release pass is claimed.

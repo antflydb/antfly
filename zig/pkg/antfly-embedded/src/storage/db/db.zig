@@ -8034,6 +8034,30 @@ pub const DB = struct {
 
     pub const NativeIndexOwnerCancellationState = @import("relational_index_owner_job.zig").CancellationState;
 
+    /// One checkpoint-verified source batch in the same snapshot as the actual
+    /// native job and mirror-debt check. Never compile a candidate or mint cuts.
+    pub fn readNativeIndexClaimSource(self: *DB, alloc: Allocator, identity: NativeIndexOwnerIdentity, context: @import("../../api/operation.zig").RequestContext) !native_index_control.SourceRead {
+        try context.ensureActive();
+        try identity.validate();
+        if (!identity.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try self.enforceReplicationWriteGate();
+        var needs_recovery = false;
+        defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const binding = (try @import("relational_index_owner_job.zig").inspectNative(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
+        if (try durable_outbox_store.hasPendingTxn(&read)) {
+            self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+            needs_recovery = true;
+            return .{ .binding = binding, .replication_pending = true, .error_name = "ReplicationOutboxPending" };
+        }
+        var result: native_index_control.SourceRead = .{ .binding = binding, .batch = try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
+        errdefer result.deinit();
+        try context.ensureActive();
+        return result;
+    }
+
     pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
         try expected.validate();
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;

@@ -967,9 +967,13 @@ pub const ApiHttpClient = struct {
         var budget_buffer: [20]u8 = undefined;
         const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{remaining_ms});
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
-        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .headers = &.{.{ .name = if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header, .value = budget }} });
+        const max_response_bytes = if (claims) 32 * 1024 else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .max_response_bytes = max_response_bytes, .headers = &.{.{ .name = if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header, .value = budget }} }) catch |err| switch (err) {
+            error.ResponseTooLarge => return invalid_receipt,
+            else => return err,
+        };
         defer response.deinit(self.alloc);
-        if (response.body.len > 32 * 1024) return invalid_receipt;
+        if (response.body.len > max_response_bytes) return invalid_receipt;
         if (execution.claimHttpFailure(response.status, response.body)) |err| return err;
         switch (response.status) {
             200 => {},

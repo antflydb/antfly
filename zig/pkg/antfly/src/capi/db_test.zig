@@ -1501,6 +1501,26 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
         try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
     }
+    {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        const encoded = try std.json.Stringify.valueAlloc(a, identity, .{});
+        defer a.free(encoded);
+        var source_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .source, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded), .control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 } };
+        var source_response: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &source_request, &source_response));
+        try std.testing.expect(source_response.ptr == null);
+        source_request.control = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &source_request, &source_response));
+        defer freeRawBuffer(source_response.ptr, source_response.len);
+        var wire = try std.json.parseFromSlice(native.SourceWire, a, source_response.slice(), .{});
+        defer wire.deinit();
+        var source_read = try wire.value.decode(a, identity);
+        defer source_read.deinit();
+        try std.testing.expectEqual(@as(usize, 0), source_read.batch.?.rows().len);
+        try std.testing.expectEqual(build_position, try source_read.batch.?.header.position());
+        try std.testing.expectEqual(try source_read.digest(), try wire.value.headerCommitment());
+        try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+    }
     request.operation = .cancel_intent;
     request.request_json = .fromSlice(json);
     // Cancellation has a fixed identity header, never replacement inputs.

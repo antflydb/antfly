@@ -84,6 +84,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
     inline for (.{ cancelled, expired }) |context| {
         const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.readNativeIndexClaimSourceAtRoot(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
@@ -3640,6 +3641,38 @@ pub const ProvisionedKernelOwnerSource = struct {
         root_generation: u64,
         outcome: std.json.Parsed(native_index_control.BuildResponse),
     };
+
+    pub const RootedNativeIndexClaimSource = struct {
+        root_generation: u64,
+        outcome: native_index_control.SourceRead,
+        wire: std.json.Parsed(native_index_control.SourceWire),
+        pub fn deinit(self: *RootedNativeIndexClaimSource) void {
+            self.outcome.deinit();
+            self.wire.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Source bytes and root generation come from one pinned compiled owner.
+    /// No route/status reread, schema compiler or caller-selected cut is used.
+    pub fn readNativeIndexClaimSourceAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, identity: native_index_control.Identity, context: request_operation.RequestContext) !RootedNativeIndexClaimSource {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = native_context.cancellation;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexClaimSourceJson(table_name, encoded, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        if (response.bytes().len > native_index_control.SourceWire.max_wire_bytes) return error.InvalidPrivateIndexClaimInventory;
+        var parsed = try std.json.parseFromSlice(native_index_control.SourceWire, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .max_value_len = native_index_control.SourceWire.max_payload_b64 });
+        errdefer parsed.deinit();
+        var result = try parsed.value.decode(alloc, identity);
+        errdefer result.deinit();
+        try context.ensureActive();
+        return .{ .root_generation = lease.entry.generation, .outcome = result, .wire = parsed };
+    }
 
     pub fn stepNativeIndexOwnerBuildAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: request_operation.RequestContext) !RootedNativeIndexOwnerBuild {
         try context.ensureActive();
