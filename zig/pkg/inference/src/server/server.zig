@@ -24951,6 +24951,13 @@ fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
 }
 
 fn admittedInferenceHandler(node: *Node, handler: httpx.Handler, ctx: *httpx.Context) anyerror!httpx.Response {
+    const now = platform.time.monotonicNs();
+    ctx.application_deadline_ns = @import("inference_deadline.zig").establish(ctx.application_deadline_ns, ctx.request.headers.iterator(), now) catch {
+        ctx.application_deadline_invalid = true;
+        return ctx.status(400).json(.{ .@"error" = "INVALID_INFERENCE_TIMEOUT", .message = "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000", .retryable = false });
+    };
+    if (ctx.application_deadline_invalid) return ctx.status(400).json(.{ .@"error" = "INVALID_INFERENCE_TIMEOUT", .retryable = false });
+    if (ctx.application_deadline_ns) |deadline| if (deadline <= now) return inferenceFailureResponse(ctx, error.Timeout);
     if (!node.tryAcquireRequestSlot()) {
         return try transientCapacityFailureResponse(
             ctx,

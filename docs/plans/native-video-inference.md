@@ -1997,3 +1997,29 @@ Portable CPU performance, deadline/overload recovery and broader sustained
 qualification remain concrete gaps. GPU private-memory/transfer telemetry and
 all broader non-CUDA requirements remain active. See
 [receipts](../../zig/lib/video/testdata/concurrent-model-validation/README.md).
+
+### Declared inference budgets and video deadline recovery
+
+Standalone inference POST requests can declare one
+`X-Antfly-Inference-Timeout-Ms` header (1–3,600,000 decimal milliseconds). Route
+dispatch rejects malformed/duplicate values before admission and narrows any
+existing application deadline. The budget reaches existing decode/preparation,
+model loading/execution and cancellation controls. Python qualification requests
+send their remaining per-attempt allowance, preserving one capacity-retry budget.
+
+Fresh CPU, Metal and actual Linux ARM64 probes reject invalid metadata, return
+one-second known-clip timeouts in about 1.05/1.01/1.20 seconds after resource
+cleanup, then preserve the pretrained full-clip vector and model identity on a
+correct retry. Forty Python contracts and two parser checks on each host pass.
+These functional retries use explicit 600-second budgets; the earlier 180-second
+native retry failure is retained. A cold Metal hard-deadline exit86/restart is
+also retained as a failed initial probe. The existing unsafe-driver hard watchdog
+is unchanged and can close a connection; full hard-stop retry and exact GPU-stage
+cancellation remain unqualified. Counters are worker-generation scoped.
+
+Stack sampling identifies active vision SDPA/portable sequential GEMM as a CPU
+profiling target. Retry timings are shared-host diagnostics, with final CPU/Linux
+runs overlapping. Application/transport timeouts are distinct; the previous
+Linux concurrent-load failure remains failed. CPU SIMD/performance, overloaded
+scheduling, broader codec/display/fuzz and the full non-CUDA scope stay active.
+See [qualification receipts](../../zig/lib/video/testdata/deadline-model-validation/README.md).

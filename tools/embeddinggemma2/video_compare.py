@@ -575,13 +575,18 @@ def post_capacity_retry(url, body, timeout=30, max_attempts=16):
             ) from error
 
 
-def embedding_metrics(url, timeout=5):
+def embedding_metrics(url, timeout=5, include_outcomes=False):
     names = {
         "active": "antfly_inference_embedding_groups_active",
         "cancelled": "antfly_inference_embedding_groups_cancelled_total",
         "completed": "antfly_inference_embedding_groups_completed_total",
         "admitted": "antfly_admission_inference_in_flight_requests",
     }
+    if include_outcomes:
+        names.update(
+            timed_out="antfly_inference_embedding_groups_timed_out_total",
+            failed="antfly_inference_embedding_groups_failed_total",
+        )
     with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
         data = response.read(4 * 1024 * 1024 + 1)
     if len(data) > 4 * 1024 * 1024:

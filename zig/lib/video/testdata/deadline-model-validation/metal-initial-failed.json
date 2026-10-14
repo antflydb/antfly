@@ -1,0 +1,78 @@
+{
+  "status": "failed",
+  "backend": "metal",
+  "binary_sha256": "aaa110c623acb5f2a16b808ccceb1df20bea1bbc4943a12dc9f2c58d3b13a27a",
+  "tool_sha256": "856315d99ba47ba9d375aa0e9e4f36f59a62a24b9f77fccaca429a6db9522e97",
+  "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+  "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+  "retry_timeout_seconds": 600.0,
+  "warm_query": {
+    "cosine": 0.9999999999998519,
+    "max_abs": 7.450580596923828e-08,
+    "actual_norm": 0.9999999809944004
+  },
+  "invalid_requests": [
+    {
+      "budget": "0",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "bad",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "3600001",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "1,1",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "1",
+      "duplicate": true,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    }
+  ],
+  "failure": {
+    "type": "RemoteDisconnected",
+    "message": "Remote end closed connection without response"
+  },
+  "server_memory": {
+    "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+    "samples": 46,
+    "peak_bytes": 1705377792,
+    "first_bytes": 6340608,
+    "last_bytes": 1548500992,
+    "errors": []
+  }
+}

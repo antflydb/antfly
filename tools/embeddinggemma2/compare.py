@@ -335,8 +335,15 @@ def media_parts(suite, name):
 
 
 def post(url, endpoint, body, timeout=600):
+    if not math.isfinite(timeout) or not 0 < timeout <= 3600:
+        raise ValueError("request timeout must be positive and at most one hour")
     request = urllib.request.Request(
-        url + endpoint, json.dumps(body).encode(), {"Content-Type": "application/json"}
+        url + endpoint,
+        json.dumps(body).encode(),
+        {
+            "Content-Type": "application/json",
+            "X-Antfly-Inference-Timeout-Ms": str(max(1, math.floor(timeout * 1000))),
+        },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read(16 * 1024 * 1024))

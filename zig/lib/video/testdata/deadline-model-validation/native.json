@@ -1,0 +1,115 @@
+{
+  "status": "pass",
+  "backend": "native",
+  "binary_sha256": "aaa110c623acb5f2a16b808ccceb1df20bea1bbc4943a12dc9f2c58d3b13a27a",
+  "tool_sha256": "4e3b078e528e789ac0adaf21bf1062fba39c5be8ea462120d8c9c2253199fe3e",
+  "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+  "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+  "retry_timeout_seconds": 600.0,
+  "warm_query": {
+    "cosine": 0.9999999999998397,
+    "max_abs": 1.1920928955078125e-07,
+    "actual_norm": 1.00000019692896
+  },
+  "invalid_requests": [
+    {
+      "budget": "0",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "bad",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "3600001",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "1,1",
+      "duplicate": false,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    },
+    {
+      "budget": "1",
+      "duplicate": true,
+      "status": 400,
+      "response": {
+        "error": "INVALID_INFERENCE_TIMEOUT",
+        "message": "X-Antfly-Inference-Timeout-Ms must appear once and contain decimal milliseconds between 1 and 3600000",
+        "retryable": false
+      }
+    }
+  ],
+  "deadline_response": {
+    "status": 504,
+    "response": {
+      "error": "INFERENCE_TIMEOUT",
+      "message": "the inference deadline expired",
+      "retryable": true
+    },
+    "seconds": 1.052874667046126,
+    "replacement_generation": null,
+    "outcome": "http_timeout"
+  },
+  "metrics_before": {
+    "active": 0,
+    "cancelled": 0,
+    "completed": 0,
+    "admitted": 0,
+    "timed_out": 0,
+    "failed": 0
+  },
+  "metrics_after_deadline": {
+    "active": 0,
+    "cancelled": 0,
+    "completed": 0,
+    "admitted": 0,
+    "timed_out": 1,
+    "failed": 0
+  },
+  "retry_seconds": 62.29072454199195,
+  "retry_agreement": {
+    "cosine": 0.9999999999860274,
+    "max_abs": 6.980262696743011e-07,
+    "actual_norm": 0.9999999975832803
+  },
+  "metrics_after_retry": {
+    "active": 0,
+    "cancelled": 0,
+    "completed": 1,
+    "admitted": 0,
+    "timed_out": 1,
+    "failed": 0
+  },
+  "server_memory": {
+    "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+    "samples": 512,
+    "peak_bytes": 1972502528,
+    "first_bytes": 5439488,
+    "last_bytes": 1972502528,
+    "errors": []
+  }
+}

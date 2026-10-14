@@ -1,0 +1,84 @@
+{
+  "goal_status": "active",
+  "status": "caller deadline propagation and known-clip timeout cleanup/retry pass on CPU Metal Linux; broader performance and hard-stop recovery qualification remain active",
+  "base_commit": "fdb420da774c86f08dc7580427396d282cb5c8ca",
+  "macos_binary_sha256": "aaa110c623acb5f2a16b808ccceb1df20bea1bbc4943a12dc9f2c58d3b13a27a",
+  "linux_binary_sha256": "e1005071e6346827054cbf9eed7ac157e2c3b86ae1707a50ae0b3cf8f323d72a",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "source_sha256": {
+    "zig/pkg/inference/src/server/server.zig": "76aff00011283a05745ab6a7a6cbcb8f4f470d65ab5af019e096165aa8677c64",
+    "zig/pkg/inference/src/server/inference_deadline.zig": "d78aca649faeaabd3f3949660b74cf5f5fd2e198b170ab450abdecdcbf4a3a78",
+    "zig/pkg/inference/src/hard_cancellation_watchdog.zig": "1c94f9a4322fe705cf9bc313c668303dfa16f0eab61be376dc1adc54ec8b393c",
+    "tools/embeddinggemma2/compare.py": "a88ff65d38baa53957832f6d9fc474b2fed06786feff6e018054a34e12cfa9a1",
+    "tools/embeddinggemma2/video_compare.py": "d0547268643ae18bc83a353a3dceaf63a18fc70dda656f0b559e4be261006124",
+    "tools/embeddinggemma2/test_compare.py": "f80176cc65be9ea53f245d3522772552dbf0b7a0f81c64219d753f93576db348",
+    "tools/embeddinggemma2/video_deadline_qualification.py": "4e3b078e528e789ac0adaf21bf1062fba39c5be8ea462120d8c9c2253199fe3e"
+  },
+  "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+  "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+  "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+  "python_contract_tests_pass": 40,
+  "deadline_parser_macos_pass": 2,
+  "deadline_parser_linux_arm64_pass": 2,
+  "results": {
+    "native": {
+      "status": "pass",
+      "deadline_seconds": 1.052874667046126,
+      "retry_seconds": 62.29072454199195,
+      "retry_budget_seconds": 600.0,
+      "max_coordinate_error": 6.980262696743011e-07
+    },
+    "metal": {
+      "status": "pass",
+      "deadline_seconds": 1.010588374978397,
+      "retry_seconds": 12.185776291007642,
+      "retry_budget_seconds": 600.0,
+      "max_coordinate_error": 1.1939555406570435e-06
+    },
+    "linux": {
+      "status": "pass",
+      "deadline_seconds": 1.1979845000023488,
+      "retry_seconds": 99.02853550399595,
+      "retry_budget_seconds": 600.0,
+      "max_coordinate_error": 1.4450633898377419e-06
+    }
+  },
+  "historical_failures": {
+    "native": "180-second client retry timed out under overlapping compiler work; preserved as failed. Diagnostic retry and final retries use explicit 600-second budgets.",
+    "metal": "Cold unsafe driver guard was hard-deadline terminated (supervisor exit86); initial probe stopped before verifying replacement retry. Final run used cooperative timeout; the watchdog remains unchanged."
+  },
+  "limitations": [
+    "One real-footage H.264 derivative; no arbitrary stream or GPU-stage cancellation qualification.",
+    "Final native/Linux probes overlapped; retry timings are diagnostics, not comparable performance measurements.",
+    "No rerun or passing claim for prior Linux concurrency-two 180-second load gate.",
+    "No fresh Linux PyTorch execution or Linux x86_64 runtime.",
+    "Supervisor restart verification exists in the probe but the final three passing runs used structured cooperative timeout; full hard-stop retry remains unqualified."
+  ],
+  "artifacts_sha256": {
+    "native-initial-failed.server.log": "df691ce13e13c942cc13becb797636b7895f0f0a20478df6ebb9c0cbd2fac389",
+    "metal.json": "1821654b563b63fcfcf379ee36e611ee939e059aeace7d268f40e50b2d781ac0",
+    "linux.server.log": "447f150613d5d996bd0e28c59eb50deab3ba07c0cef7da1c95056af9f092da85",
+    "contracts.log": "b3b555bb9ab773b8374a086dfd1d9b61e9a58a4c52cf81694e0a2d5caa422ae0",
+    "native-initial-failed.log": "9add8c1b817e880dc25dd1eeddc383b287eb41e513dfa5328b0a3a2555d6dcaa",
+    "linux.json": "aaf2bfa928a7cf8de169d0b1dc1ade084a664d935c7444a99c4cd98abd2eac2a",
+    "native.server.log": "9565ee495a92a7f04f10964e9c2246ab0d51d05142e9efb7c94d3e810ea4590f",
+    "native-diagnostic-pass.server.log": "0c9383751c44f0dafa204e35beb168a0eeaeb285cf4a2087cbafdabe7e269ffc",
+    "parser-macos.log": "ec3f1fd84a415dc34384ac7d99b2ddd95c8ba83031cf4501bf70dca12c3b021e",
+    "metal-initial-failed.log": "e2838c69c0b1219b69daff99df801c1d9e61c2ab182ea11da57c72a71a2b3516",
+    "native-worker-sample.txt": "fb8d88132743db21d3a189368fb1f2b65a00a0977710a808da024eea1447b262",
+    "native.json": "0576d63f2adaf0dc9464893af71e63a78e4cca25d90838e636ce51a4af04c957",
+    "native-diagnostic-pass.json": "3b13ed4818a5a55a8ca13d41d3ec620d86cbffcf0b2979bd3df385fe7a6c5bd1",
+    "native.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "macos-build.log": "12acb1b4303a931c81429a10f61aad8179401b95d2e2a5efceb1e8990f13d5a5",
+    "parser-linux.log": "ec3f1fd84a415dc34384ac7d99b2ddd95c8ba83031cf4501bf70dca12c3b021e",
+    "linux.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "native-initial-failed.json": "6d30345d17d745554d093f06cb60167b1b0b6694f1480b9f71bcdc0ba570ac59",
+    "metal.server.log": "78119474c1a98dbb8a9cb1db54b475ce80bd99255253760f75d7768982b53c3c",
+    "native-parent-sample.txt": "a3325946f3625c5cc94f05f0d902400fb4feb90542012104327c29990c5a7355",
+    "linux-build.log": "ecf144a11ebaddb754d7d21aeeeeebea6f50920a6c7dfa0350825025fd5229f8",
+    "metal-initial-failed.json": "be8b0161165938046b608f40de099e5fa9522c5770dca56ead20924a6d8435ef",
+    "metal-initial-failed.server.log": "6df8b4b5fc5cb0abbb3df12490c31c59419bcc856e20c63fa2c57bd346776229",
+    "metal.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "native-diagnostic-pass.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
