@@ -4024,6 +4024,33 @@ pub fn storageOwnerNativeIndexControlJson(
     // Headers/bindings contain only fixed-size identities. Large schema inputs
     // remain raw borrowed bytes rather than another JSON/base64 representation.
     if (request.request_json.len == 0 or request.request_json.ptr == null or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.operation == .consume) {
+        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        const resources = @import("antfly_local_sources").storage_resource_manager;
+        var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+        context.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+        var parsed = std.json.parseFromSlice(native.ConsumeCommand, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| {
+            if (budget) |value| if (value.denied()) return storageOwnerStatusFromError(error.ResourceBudgetExceeded);
+            return storageOwnerStatusFromError(err);
+        };
+        defer parsed.deinit();
+        if (parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var prepared = handle.db.prepareNativeIndexSourceConsumptionControlled(alloc, parsed.value, context) catch |err| {
+            if (budget) |value| if (value.denied()) return storageOwnerStatusFromError(error.ResourceBudgetExceeded);
+            return storageOwnerStatusFromError(err);
+        };
+        defer prepared.deinit();
+        const status = applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+        // Mirrored payload preparation also uses this working-set allocator.
+        // Never relabel a successfully committed response as an admission error.
+        if (status != .ok) if (budget) |value| if (value.denied()) return storageOwnerStatusFromError(error.ResourceBudgetExceeded);
+        return status;
+    }
     if (request.operation == .source) {
         if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
@@ -4236,6 +4263,8 @@ fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_resp
         handle.db.applyPreparedNativeIndexOwnerCancellation(prepared, null)
     else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerClaims)
         handle.db.applyPreparedNativeIndexOwnerClaims(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexSourceConsumption)
+        handle.db.applyPreparedNativeIndexSourceConsumption(prepared, null)
     else
         handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
         return storageOwnerStatusFromError(err);

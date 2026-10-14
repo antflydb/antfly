@@ -6682,3 +6682,56 @@ real data-Raft execution and terminal schema/catalog activation also remain
 unfinished. Public UNIQUE activation stays guarded. Original dispositions are
 unchanged at 483 implemented / 862 unresolved; no SQL completion, full release
 pass, throughput improvement or push is claimed.
+
+### Receiving-server consumption and applying-root attestation
+
+The existing private claims receiver now also accepts a consume operation. Its
+wire input contains immutable owner identity and expected source ordinal/header
+digest only, never accepted metadata, a physical binding or a caller-selected
+cut. The receiver obtains fresh build permission and independently queries its
+configured metadata transport for durable source acceptance. Missing acceptance,
+metadata mirror debt, query/epoch mismatch and changed batch identity fail before
+apply. The source binding and original header come from the actual leased owner;
+an exact retry after deletion instead validates its retained consumption record.
+Current permission remains separate from the historical accepted decision.
+
+Compiled-owner ABI v82 adds a controlled consume selector. Preparation uses the
+relational working-set resource budget, with cancellation/deadline checks before
+and after preparation and again inside serialized staging after lock admission.
+The applying lease supplies root generation. Commit/pending outcomes survive
+post-dispatch ingress cancellation; no second effect is issued to resolve an
+uncertain result. Native apply, durable outbox and standby replay remain shared
+with the other private index effects.
+
+Only a committed, non-pending retained record can be signed. The signer binds its
+consumption-prefix digest to the pinned metadata identity, reporter and actual
+applying root generation, using the existing root key loader. A generation change
+between source read and apply prevents attestation. The response exposes the
+same signed consumption statement the metadata journal already requires for the
+next accepted batch. This is not an EOF seal or permission to activate UNIQUE.
+
+The leased-owner fixture uses real canonical source bytes, compiled dispatch and
+native commits; its metadata acceptance remains explicitly synthetic. It covers
+missing/pending acceptance, changed batch, exact retry after body deletion,
+unsigned and mirror-pending results, changed root generation and a tampered
+signed cut. Storage fixtures additionally cover cancellation before preparation,
+after preparation and at serialized staging. These are component qualifications,
+not original SQL or complete cross-service fault evidence.
+
+Still required: bounded producer retry/orchestration, EOF/inventory seals,
+provenance-backed missing-root repair, actual data-Raft execution, terminal
+schema/catalog activation and end-to-end distributed faults. Public UNIQUE
+activation remains guarded; original SQL dispositions remain unchanged.
+
+Final qualification in
+`/private/tmp/antfly-consumption-receiver-full-debug-v2.log` passed 129/129
+Debug steps: 41 publication, four service/ACK, eight native page, six C-ABI,
+three leased-owner, 14 candidate-prerequisite and 46 runtime-contract tests,
+plus the decoder barrier. Counts overlap; no failures or leaks were reported.
+The final run includes the mirrored-payload budget-error mapping correction;
+successful committed responses are preserved. Wire-test fixtures were corrected
+to reach the intended mixed-operation rejection without weakening assertions.
+Boundary, license, inventory, control-catalog, formatting and diff checks passed.
+GC was preview-only and deleted nothing. Original SQL dispositions remain
+483 implemented / 862 unresolved. No throughput improvement, full SQL release
+qualification or push is claimed.

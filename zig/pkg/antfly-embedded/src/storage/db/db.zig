@@ -8255,9 +8255,13 @@ pub const DB = struct {
     /// Private execution only. The server independently observes durable
     /// metadata acceptance; no ordinary mutation/API body selects this effect.
     pub fn prepareNativeIndexSourceConsumption(self: *DB, command: native_index_control.ConsumeCommand) !PreparedNativeIndexSourceConsumption {
+        return self.prepareNativeIndexSourceConsumptionControlled(self.alloc, command, .{});
+    }
+    pub fn prepareNativeIndexSourceConsumptionControlled(self: *DB, alloc: Allocator, command: native_index_control.ConsumeCommand, context: @import("../../api/operation.zig").RequestContext) !PreparedNativeIndexSourceConsumption {
+        try context.ensureActive();
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        return PreparedNativeIndexSourceConsumption.init(self.alloc, &read, command);
+        return PreparedNativeIndexSourceConsumption.initControlled(alloc, &read, command, context);
     }
     pub fn applyPreparedNativeIndexSourceConsumption(self: *DB, prepared: *PreparedNativeIndexSourceConsumption, replay: ?NativeIndexReplay) !NativeIndexSourceConsumptionOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);

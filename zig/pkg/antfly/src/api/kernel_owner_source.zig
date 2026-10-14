@@ -92,6 +92,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControlAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaims(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaimsAtRoot(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.consumeNativeIndexSourceAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
@@ -3637,6 +3638,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
+    pub const RootedNativeIndexSourceConsumption = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native_index_control.ConsumeOutcome),
+        pub fn deinit(self: *RootedNativeIndexSourceConsumption) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
     pub const RootedNativeIndexOwnerBuild = struct {
         root_generation: u64,
         outcome: std.json.Parsed(native_index_control.BuildResponse),
@@ -3722,6 +3732,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         var parsed = try std.json.parseFromSlice(native_index_control.ClaimOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer parsed.deinit();
         try parsed.value.validateFor(command);
+        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+    }
+
+    /// Uses the generation of the actual applying lease, not a later lookup.
+    /// The receiver must independently authenticate metadata acceptance first.
+    pub fn consumeNativeIndexSourceAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, command: native_index_control.ConsumeCommand, context: request_operation.RequestContext) !RootedNativeIndexSourceConsumption {
+        try context.ensureActive();
+        try command.validate();
+        const binding = command.binding;
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = binding.id,
+            .plan_digest = binding.plan_digest,
+            .owner_digest = binding.owner_digest,
+            .ordinal = binding.ordinal,
+            .namespace = binding.fence.namespace,
+            .owner_group_id = binding.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > 32 * 1024) return error.TransactionTooLarge;
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = native_context.cancellation;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexSourceConsumptionJson(table_name, encoded, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        if (response.bytes().len > 32 * 1024) return error.InvalidPrivateIndexNativeReceipt;
+        var parsed = try std.json.parseFromSlice(native_index_control.ConsumeOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(command);
+        // Preserve committed/pending results even if ingress was canceled.
         return .{ .root_generation = lease.entry.generation, .outcome = parsed };
     }
 

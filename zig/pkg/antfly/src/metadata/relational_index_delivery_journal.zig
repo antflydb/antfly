@@ -100,6 +100,11 @@ pub const Consumed = struct {
     position: positions.Native,
     proof: publication.RootProof,
 
+    pub fn fromRecord(record: Source.Consumption, proof: publication.RootProof) Consumed {
+        const consumed_prefix = record.prefix();
+        return .{ .metadata_incarnation = consumed_prefix.metadata_incarnation, .binding_digest = consumed_prefix.binding_digest, .ordinal = consumed_prefix.ordinal, .batch_digest = consumed_prefix.batch_digest, .decision_digest = consumed_prefix.decision_digest, .rows = consumed_prefix.rows, .position = consumed_prefix.position, .proof = proof };
+    }
+
     pub fn digest(self: Consumed) !Digest {
         if (self.ordinal == 0 or self.proof.authority != .native or
             !nonzero(&self.metadata_incarnation) or !nonzero(&self.binding_digest) or

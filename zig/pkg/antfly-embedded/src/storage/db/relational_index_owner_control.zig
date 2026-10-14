@@ -531,10 +531,18 @@ pub const PreparedConsumption = struct {
     prepared: private_claims.SourceStream.PreparedConsumption,
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
+    context: RequestContext = .{},
     pub fn init(alloc: Allocator, txn: anytype, command: ConsumeCommand) !PreparedConsumption {
+        return initControlled(alloc, txn, command, .{});
+    }
+    pub fn initControlled(alloc: Allocator, txn: anytype, command: ConsumeCommand, context: RequestContext) !PreparedConsumption {
+        try context.ensureActive();
         try command.validate();
         try PreparedBuild.verifyRecovery(txn, command.binding);
-        return .{ .alloc = alloc, .command = command, .prepared = try private_claims.SourceStream.PreparedConsumption.init(alloc, txn, command.binding, command.accepted) };
+        var result: PreparedConsumption = .{ .alloc = alloc, .command = command, .context = context, .prepared = try private_claims.SourceStream.PreparedConsumption.init(alloc, txn, command.binding, command.accepted) };
+        errdefer result.deinit();
+        try context.ensureActive();
+        return result;
     }
     pub fn deinit(self: *PreparedConsumption) void {
         if (self.payload) |bytes| self.alloc.free(bytes);
@@ -542,6 +550,7 @@ pub const PreparedConsumption = struct {
         self.* = undefined;
     }
     pub fn validate(self: *const PreparedConsumption) !void {
+        try self.context.ensureActive();
         try self.command.validate();
     }
     pub fn namespace(self: *const PreparedConsumption) @FieldType(Native, "namespace") {
@@ -554,7 +563,10 @@ pub const PreparedConsumption = struct {
         return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = null, .position = position, .duplicate = true };
     }
     pub fn stage(self: *PreparedConsumption, _: anytype, txn: anytype, replay: ?Native) !ConsumeOutcome {
+        // The serialized apply lock may have waited past ingress cancellation.
+        try self.context.ensureActive();
         try PreparedBuild.verifyRecovery(txn, self.command.binding);
+        try self.context.ensureActive();
         const result = try self.prepared.stage(txn, replay);
         return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = result.record, .position = result.record.position, .duplicate = result.duplicate };
     }

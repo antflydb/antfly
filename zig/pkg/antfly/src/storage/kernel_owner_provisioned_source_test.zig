@@ -152,8 +152,15 @@ test "native index owner adapter executes fresh permission stages and recovers r
     const Metadata = struct {
         value: publication.OwnerDecision,
         admission_reads: usize = 0,
+        acceptance: ?@import("../metadata/relational_index_delivery_journal.zig").Head = null,
+        acceptance_pending: bool = false,
+        acceptance_reads: usize = 0,
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
+            if (call == .relational_index_source_accept_status) {
+                self.acceptance_reads += 1;
+                return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending }, .{});
+            }
             var value = self.value;
             if (call.relational_index_owner_decision.claim_groups) |groups| {
                 if (groups.items.len != 0) return error.UnexpectedFixtureDestination;
@@ -347,6 +354,102 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(received.applied.outcome.value.duplicate);
         try std.testing.expectEqual(claimed.position, received.applied.outcome.value.position);
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owners.applyNativeIndexOwnerClaims(alloc, group + 1, plan.before.name, claim_command, .{}));
+        // Synthetic metadata decision, actual source bytes and compiled apply.
+        // This qualifies the private ABI, not independent metadata acceptance.
+        const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const header = source_read.batch.?.header;
+        var binding_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&try source_read.binding.encode(), &binding_digest, .{});
+        var accepted: Source.Accepted = .{
+            .metadata_incarnation = metadata.value.metadata_incarnation,
+            .binding_digest = binding_digest,
+            .scope_digest = header.bytes[40..72].*,
+            .ordinal = 1,
+            .rows = 0,
+            .batch_rows = 0,
+            .source_sequence = (try header.position()).sequence,
+            .batch_digest = header.digest(),
+            .logical_digest = try complete_source.closed.owned.data.logicalDigest(),
+            .previous_decision = @splat(0),
+            .decision_digest = @splat(0),
+            .state = @fromBackingInt(@intCast(header.bytes[184])),
+        };
+        accepted.decision_digest = accepted.computedDigest();
+        const consume_command: native.ConsumeCommand = .{ .binding = source_read.binding, .accepted = accepted };
+        const consume_request: execution.ClaimRequest = .{ .table_id = plan.before.table_id, .group_id = group, .id = plan.id, .consume = .{ .ordinal = 1, .batch_digest = header.digest() } };
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
+        var accepted_head: @import("../metadata/relational_index_delivery_journal.zig").Head = .{
+            .metadata_incarnation = accepted.metadata_incarnation,
+            .binding_digest = accepted.binding_digest,
+            .scope_digest = accepted.scope_digest,
+            .ordinal = accepted.ordinal,
+            .rows = accepted.rows,
+            .batch_rows = accepted.batch_rows,
+            .source_sequence = accepted.source_sequence,
+            .batch_digest = accepted.batch_digest,
+            .logical_digest = accepted.logical_digest,
+            .previous_decision = accepted.previous_decision,
+            .decision_digest = accepted.decision_digest,
+            .accepted_root = @splat(8),
+            .provenance = @splat(0),
+            .previous_rows = 0,
+            .previous_provenance = @splat(0),
+            .state = accepted.state,
+        };
+        var provenance = std.crypto.hash.Blake3.init(.{});
+        provenance.update("antfly/private-unique-accepted-provenance/v1");
+        provenance.update(&accepted_head.previous_provenance);
+        provenance.update(&accepted_head.decision_digest);
+        provenance.update(&accepted_head.accepted_root);
+        provenance.final(&accepted_head.provenance);
+        metadata.acceptance = accepted_head;
+        metadata.acceptance_pending = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
+        metadata.acceptance_pending = false;
+        var wrong_batch = consume_request;
+        wrong_batch.consume.?.batch_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, wrong_batch, .{}));
+        var consumed_result = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{});
+        defer consumed_result.deinit();
+        try std.testing.expect(consumed_result == .consumed and consumed_result.needsSigning());
+        const consumed = consumed_result.consumed;
+        try std.testing.expectEqual(root_generation, consumed.root_generation);
+        try std.testing.expect(!consumed.outcome.value.duplicate and !consumed.outcome.value.replication_pending);
+        try std.testing.expect(consumed.outcome.value.position.sequence > accepted.source_sequence);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, consumed_result.response().requireSignedConsumption(consume_request));
+        consumed_result.consumed.outcome.value.replication_pending = true;
+        consumed_result.consumed.outcome.value.error_name = "ReplicationOutboxPending";
+        try std.testing.expect(!consumed_result.needsSigning());
+        try std.testing.expectError(error.NativeIndexSigningUnavailable, consumed_result.signNative(signing_root, 2, 3, 4));
+        consumed_result.consumed.outcome.value.replication_pending = false;
+        consumed_result.consumed.outcome.value.error_name = null;
+        consumed_result.consumed.pinned_root_generation += 1;
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, consumed_result.signNative(signing_root, 2, 3, 4));
+        consumed_result.consumed.pinned_root_generation -= 1;
+        try consumed_result.signNative(signing_root, 2, 3, 4);
+        const signed_consumption = try consumed_result.response().requireSignedConsumption(consume_request);
+        try std.testing.expectEqual(accepted.decision_digest, signed_consumption.decision_digest);
+        var forged_consumption = signed_consumption;
+        forged_consumption.position.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, forged_consumption.verify());
+        metadata.acceptance = null;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
+        metadata.acceptance = accepted_head;
+        var receive_retry = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{});
+        defer receive_retry.deinit();
+        try std.testing.expect(receive_retry.consumed.outcome.value.duplicate);
+        try receive_retry.signNative(signing_root, 2, 3, 4);
+        _ = try receive_retry.response().requireSignedConsumption(consume_request);
+        try std.testing.expect(metadata.acceptance_reads >= 6);
+        var retried = try owners.consumeNativeIndexSourceAtRoot(alloc, group, plan.before.name, consume_command, .{});
+        defer retried.deinit();
+        try std.testing.expect(retried.outcome.value.duplicate);
+        try std.testing.expectEqual(consumed.outcome.value.position, retried.outcome.value.position);
+        var drained = try owners.readNativeIndexClaimSourceAtRoot(alloc, group, plan.before.name, .{ .id = consume_command.binding.id, .plan_digest = consume_command.binding.plan_digest, .owner_digest = consume_command.binding.owner_digest, .ordinal = consume_command.binding.ordinal, .namespace = consume_command.binding.fence.namespace, .owner_group_id = group }, .{});
+        defer drained.deinit();
+        try std.testing.expect(drained.outcome.batch == null);
+        try std.testing.expectEqual(accepted.decision_digest, drained.outcome.consumed.?.accepted.decision_digest);
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owners.consumeNativeIndexSourceAtRoot(alloc, group + 1, plan.before.name, consume_command, .{}));
         // Control commands carry the admitted preimage, even when inspection
         // recovered the durable reserved postimage. Never relax that guard.
         canceled_binding.phase = .fencing;

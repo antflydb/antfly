@@ -1205,6 +1205,20 @@ test "relational index build pages identity dispatch caches immutable candidates
                 logical_digest = try delivered_command.digest();
             }
             const accepted = try sourceDecision(binding, header, previous, logical_digest);
+            if (i == 0) {
+                const command: native.ConsumeCommand = .{ .binding = binding, .accepted = accepted };
+                var consume_canceled = std.atomic.Value(bool).init(true);
+                try std.testing.expectError(error.Canceled, db.prepareNativeIndexSourceConsumptionControlled(alloc, command, .{ .cancellation = .fromAtomic(&consume_canceled) }));
+                try std.testing.expectError(error.DeadlineExceeded, db.prepareNativeIndexSourceConsumptionControlled(alloc, command, .{ .deadline_ns = 0 }));
+                consume_canceled.store(false, .release);
+                var controlled = try db.prepareNativeIndexSourceConsumptionControlled(alloc, command, .{ .cancellation = .fromAtomic(&consume_canceled) });
+                defer controlled.deinit();
+                consume_canceled.store(true, .release);
+                try std.testing.expectError(error.Canceled, db.applyPreparedNativeIndexSourceConsumption(&controlled, null));
+                var aborted = try db.core.store.beginWriteTxn();
+                defer aborted.abort();
+                try std.testing.expectError(error.Canceled, controlled.stage(db.core, &aborted, null));
+            }
             var prepared = try db.prepareNativeIndexSourceConsumption(.{ .binding = binding, .accepted = accepted });
             defer prepared.deinit();
             {

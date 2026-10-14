@@ -565,6 +565,18 @@ pub const Owner = struct {
         return response;
     }
 
+    /// Trusted server command after independent durable metadata acceptance.
+    pub fn nativeIndexSourceConsumptionJson(self: *Owner, table_name: []const u8, command_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .consume,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
