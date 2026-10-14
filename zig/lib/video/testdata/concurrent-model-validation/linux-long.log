@@ -1,0 +1,13 @@
+native q0 [7.305366129003232]
+native q1 [0.3120946250128327]
+native q2 [0.16488250100519508]
+native q3 [0.15405875000578817]
+native sintel-52s [137.6739736879972]
+Traceback (most recent call last):
+  File "/workspace/tools/embeddinggemma2/video_compare.py", line 1213, in <module>
+    main()
+  File "/workspace/tools/embeddinggemma2/video_compare.py", line 1184, in main
+    (native if args.backend in ("native", "metal") else pytorch)(args, data, result)
+  File "/workspace/tools/embeddinggemma2/video_compare.py", line 963, in native
+    raise ValueError(
+ValueError: sustained workload did not complete every request and cleanup

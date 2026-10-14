@@ -453,5 +453,104 @@ class AdmissionRetryAndCleanupTests(unittest.TestCase):
         self.assertGreaterEqual(now[0], 0.1)
 
 
+class SustainedContracts(unittest.TestCase):
+    def run_load(self, responses, metrics_after=None):
+        import threading
+
+        lock = threading.Lock()
+        state = {"active": 0, "admitted": 0, "cancelled": 0, "completed": 0}
+
+        def metrics(url):
+            with lock:
+                if metrics_after is not None and state["completed"] == len(responses):
+                    return dict(state, **metrics_after)
+                return dict(state)
+
+        def post(url, body, timeout):
+            response = responses[body["index"]]
+            if isinstance(response, Exception):
+                raise response
+            with lock:
+                state["completed"] += 1
+            return response, [{"http_status": 503, "retry_delay_seconds": 1.0}] if body[
+                "index"
+            ] == 0 else []
+
+        bodies = {str(i): {"index": i} for i in range(len(responses))}
+        vectors = {name: [1.0, 0.0] for name in bodies}
+        with (
+            mock.patch.object(video, "embedding_metrics", side_effect=metrics),
+            mock.patch.object(video, "post_capacity_retry", side_effect=post),
+        ):
+            return video.sustained_requests(
+                "http://127.0.0.1", bodies, vectors, "stable", list(bodies), 2
+            )
+
+    @staticmethod
+    def response(vector=None, identity="stable"):
+        return {
+            "model_identity": identity,
+            "data": [{"embedding": vector or [1.0, 0.0]}],
+        }
+
+    def test_load_requires_all_vectors_and_records_declared_retry_and_timing(self):
+        report = self.run_load([self.response(), self.response()])
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["capacity_denials"], 1)
+        self.assertEqual(report["request_timing"]["count"], 2)
+        self.assertTrue(report["cleanup_pass"])
+        for row in report["requests"]:
+            self.assertGreaterEqual(row["total_seconds"], row["request_seconds"])
+            self.assertGreaterEqual(row["queue_seconds"], 0)
+
+    def test_failed_request_does_not_discard_other_outcomes_or_pass_load(self):
+        report = self.run_load([ValueError("invalid denial"), self.response()])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual([r["status"] for r in report["requests"]], ["failed", "pass"])
+        self.assertIn("invalid denial", report["requests"][0]["failure"]["message"])
+
+    def test_vector_or_identity_drift_fails_load(self):
+        for response in (self.response([0.0, 1.0]), self.response(identity="changed")):
+            with self.subTest(response=response):
+                self.assertEqual(self.run_load([response])["status"], "failed")
+
+    def test_leaked_admission_or_unexpected_cancellation_fails_load(self):
+        for metrics in (
+            {"admitted": 1},
+            {"active": 1},
+            {"cancelled": 1},
+        ):
+            with self.subTest(metrics=metrics):
+                report = self.run_load([self.response()], metrics_after=metrics)
+                self.assertEqual(report["status"], "failed")
+                self.assertFalse(report["cleanup_pass"])
+
+    def test_late_completions_and_failed_retries_do_not_imply_leaked_admission(self):
+        before = {"active": 0, "admitted": 0, "cancelled": 1, "completed": 3}
+        after = dict(before, completed=6)
+        denial = {"http_status": 503, "retry_delay_seconds": 1.0}
+        rows = [
+            {"status": "failed", "failure": {"attempts": [{"type": "TimeoutError"}]}},
+            {"status": "failed", "failure": {"attempts": [{"type": "TimeoutError"}]}},
+            {"status": "failed", "failure": {"attempts": [denial] * 16}},
+            {"status": "pass", "capacity_denials": [denial] * 12},
+        ]
+        evidence = video.sustained_evidence(rows, before, after)
+        self.assertEqual(evidence["capacity_denials"], 28)
+        self.assertTrue(evidence["cleanup_pass"])
+        self.assertFalse(evidence["completion_accounting_pass"])
+        self.assertEqual(evidence["unacknowledged_server_completions"], 2)
+        self.assertEqual(
+            self.run_load([self.response()], {"completed": 9})["status"], "failed"
+        )
+
+    def test_idle_owned_server_is_required(self):
+        with mock.patch.object(
+            video, "embedding_metrics", return_value={"active": 1, "admitted": 1}
+        ):
+            with self.assertRaisesRegex(ValueError, "idle owned server"):
+                video.sustained_requests("http://127.0.0.1", {}, {}, "stable", ["x"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -620,7 +620,7 @@ def wait_embedding_cleanup(url, before, outcome, timeout=30, expected_completion
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
 
-def disconnect_and_retry(url, body, expected):
+def disconnect_and_retry(url, body, expected, request_timeout=30):
     before = embedding_metrics(url)
     if before["active"] or before["admitted"]:
         raise ValueError("disconnect qualification requires an idle owned server")
@@ -661,7 +661,7 @@ def disconnect_and_retry(url, body, expected):
     finally:
         connection.close()
     start = time.perf_counter()
-    retry, attempts = post_capacity_retry(url, body)
+    retry, attempts = post_capacity_retry(url, body, timeout=request_timeout)
     compare.assert_agreement(retry["data"][0]["embedding"], expected)
     after = wait_embedding_cleanup(url, before, "cancelled", expected_completions=1)
     return dict(
@@ -676,11 +676,11 @@ def disconnect_and_retry(url, body, expected):
     )
 
 
-def half_close_and_read(url, body, expected):
+def half_close_and_read(url, body, expected, request_timeout=60):
     before = embedding_metrics(url)
     endpoint = urllib.parse.urlsplit(url)
     connection = http.client.HTTPConnection(
-        endpoint.hostname, endpoint.port, timeout=60
+        endpoint.hostname, endpoint.port, timeout=request_timeout
     )
     try:
         connection.request(
@@ -772,6 +772,132 @@ def server(args):
                 process.wait(timeout=10)
 
 
+def sustained_evidence(completed, before, after):
+    """Separate released admission from unacknowledged server completions."""
+    acknowledged = sum(
+        row.get("http_status") == 200 or row["status"] == "pass" for row in completed
+    )
+    server_completions = after["completed"] - before["completed"]
+    denials = 0
+    for row in completed:
+        attempts = row.get(
+            "capacity_denials", row.get("failure", {}).get("attempts", [])
+        )
+        denials += sum(
+            attempt.get("http_status") in (429, 503)
+            and "retry_delay_seconds" in attempt
+            for attempt in attempts
+        )
+    quiescent = after["active"] == 0 and after["admitted"] == 0
+    cancellation_stable = after["cancelled"] == before["cancelled"]
+    return {
+        "capacity_denials": denials,
+        "quiescent": quiescent,
+        "cancellation_stable": cancellation_stable,
+        "cleanup_pass": quiescent and cancellation_stable,
+        "acknowledged_responses": acknowledged,
+        "server_completions": server_completions,
+        "unacknowledged_server_completions": server_completions - acknowledged,
+        "completion_accounting_pass": server_completions == acknowledged,
+    }
+
+
+def sustained_requests(url, bodies, vectors, identity, jobs, concurrency, timeout=60):
+    """Require completed vectors, explicit bounded capacity retries and cleanup.
+
+    Executor queue delay is separate from the request/retry deadline. Retain
+    every request outcome even when one fails; a denial alone is not success.
+    """
+    if not jobs or not 1 <= concurrency <= 32 or not 0 < timeout <= 3600:
+        raise ValueError("invalid sustained workload bounds")
+    before = embedding_metrics(url)
+    if before["active"] or before["admitted"]:
+        raise ValueError("sustained qualification requires an idle owned server")
+    stop = threading.Event()
+    samples, sample_errors = [], []
+
+    def monitor():
+        while not stop.is_set():
+            try:
+                samples.append(embedding_metrics(url))
+            except Exception as error:
+                sample_errors.append(failure_details(error))
+            stop.wait(0.05)
+
+    def request(index, name, submitted):
+        started = time.perf_counter()
+        row = {"index": index, "case": name, "queue_seconds": started - submitted}
+        try:
+            response, denials = post_capacity_retry(url, bodies[name], timeout=timeout)
+            row["capacity_denials"] = denials
+            row["http_status"] = 200
+            if response["model_identity"] != identity:
+                raise ValueError("model identity changed under concurrent load")
+            row["agreement"] = compare.assert_agreement(
+                response["data"][0]["embedding"], vectors[name]
+            )
+            row["status"] = "pass"
+        except Exception as error:
+            row["status"] = "failed"
+            row["failure"] = failure_details(error)
+        row["request_seconds"] = time.perf_counter() - started
+        row["total_seconds"] = time.perf_counter() - submitted
+        return row
+
+    observer = threading.Thread(target=monitor, daemon=True)
+    observer.start()
+    started = time.perf_counter()
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [
+                pool.submit(request, index, name, time.perf_counter())
+                for index, name in enumerate(jobs)
+            ]
+            completed = [future.result() for future in futures]
+        elapsed = time.perf_counter() - started
+        after = embedding_metrics(url)
+    finally:
+        stop.set()
+        observer.join(timeout=6)
+    evidence = sustained_evidence(completed, before, after)
+    successful = [row for row in completed if row["status"] == "pass"]
+    return {
+        "status": "pass"
+        if len(successful) == len(jobs)
+        and evidence["cleanup_pass"]
+        and evidence["completion_accounting_pass"]
+        and not sample_errors
+        else "failed",
+        "concurrency": concurrency,
+        "request_timeout_seconds": timeout,
+        "requests": completed,
+        "wall_seconds": elapsed,
+        "completed_per_second": len(successful) / elapsed,
+        "request_timing": compare.timing([row["request_seconds"] for row in successful])
+        if successful
+        else None,
+        "total_timing": compare.timing([row["total_seconds"] for row in successful])
+        if successful
+        else None,
+        **evidence,
+        "metrics_before": before,
+        "metrics_after": after,
+        "observed_peak_active": max(
+            [before["active"], after["active"], *(row["active"] for row in samples)]
+        ),
+        "observed_peak_admitted": max(
+            [
+                before["admitted"],
+                after["admitted"],
+                *(row["admitted"] for row in samples),
+            ]
+        ),
+        "metrics_samples": len(samples),
+        "metrics_errors": sample_errors,
+        "scope": "HTTP completion including bounded retry; total timing includes executor queue; 50ms lifecycle sampling can miss short peaks",
+    }
+
+
 def native(args, data, result):
     reference.verify_checkpoint(args.model_dir)
     with server(args) as url:
@@ -812,7 +938,9 @@ def native(args, data, result):
                 if identity:
                     body["model_identity"] = identity
                 start = time.perf_counter()
-                response = compare.post(url + "/ai/v1", "/embed", body)
+                response = compare.post(
+                    url + "/ai/v1", "/embed", body, timeout=args.request_timeout
+                )
                 elapsed = time.perf_counter() - start
                 if identity and identity != response["model_identity"]:
                     raise ValueError("model identity changed")
@@ -835,47 +963,31 @@ def native(args, data, result):
         compare.publish(args.output, result)
         first = data["documents"][0]["id"]
         result["disconnect_retry"] = disconnect_and_retry(
-            url, bodies[first], result["cases"][first]["vector"]
+            url,
+            bodies[first],
+            result["cases"][first]["vector"],
+            request_timeout=args.request_timeout,
         )
         result["half_close"] = half_close_and_read(
-            url, bodies[first], result["cases"][first]["vector"]
+            url,
+            bodies[first],
+            result["cases"][first]["vector"],
+            request_timeout=args.request_timeout,
         )
-        jobs = [row["id"] for row in data["documents"]] * args.sustained_rounds
-
-        def request(name):
-            start = time.perf_counter()
-            try:
-                response = compare.post(url + "/ai/v1", "/embed", bodies[name])
-                if response["model_identity"] != identity:
-                    raise ValueError("model identity changed under concurrent load")
-                compare.assert_agreement(
-                    response["data"][0]["embedding"], result["cases"][name]["vector"]
-                )
-                return {
-                    "case": name,
-                    "status": 200,
-                    "seconds": time.perf_counter() - start,
-                }
-            except urllib.error.HTTPError as error:
-                if error.code not in (429, 503):
-                    raise
-                return {
-                    "case": name,
-                    "status": error.code,
-                    "seconds": time.perf_counter() - start,
-                }
-
-        start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            completed = list(pool.map(request, jobs))
-        elapsed = time.perf_counter() - start
-        result["sustained"] = {
-            "concurrency": args.concurrency,
-            "requests": completed,
-            "wall_seconds": elapsed,
-            "completed_per_second": sum(r["status"] == 200 for r in completed)
-            / elapsed,
-        }
+        result["sustained"] = sustained_requests(
+            url,
+            bodies,
+            {name: case["vector"] for name, case in result["cases"].items()},
+            identity,
+            [row["id"] for row in data["documents"]] * args.sustained_rounds,
+            args.concurrency,
+            getattr(args, "sustained_request_timeout", 60),
+        )
+        compare.publish(args.output, result)
+        if result["sustained"]["status"] != "pass":
+            raise ValueError(
+                "sustained workload did not complete every request and cleanup"
+            )
 
 
 def pytorch(args, data, result):
@@ -1035,6 +1147,8 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--sustained-rounds", type=int, default=2)
+    parser.add_argument("--sustained-request-timeout", type=float, default=60)
+    parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--score-tolerance", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, nargs="+", default=[1, 5, 10])
     args = parser.parse_args()
@@ -1043,6 +1157,8 @@ def main():
         and 1 <= args.iterations <= 100
         and 1 <= args.concurrency <= 32
         and 1 <= args.sustained_rounds <= 100
+        and 0 < args.sustained_request_timeout <= 3600
+        and 0 < args.request_timeout <= 3600
         and 1 <= args.threads <= 64
         and 0 < args.score_tolerance <= 0.01
         and all(k > 0 for k in args.top_k)
@@ -1074,6 +1190,8 @@ def main():
                 "threads",
                 "concurrency",
                 "sustained_rounds",
+                "sustained_request_timeout",
+                "request_timeout",
                 "score_tolerance",
                 "top_k",
                 "process_memory_budget_mb",

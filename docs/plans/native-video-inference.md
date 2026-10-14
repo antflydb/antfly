@@ -1969,3 +1969,31 @@ ARM64 and 100,879 bounded fuzz runs. [Receipts](../../zig/lib/media/testdata/hls
 bind sources/results and describe supported timestamp/protocol limits.
 The broader non-CUDA plan remains active; this phase adds no model parity or
 production-throughput claim.
+
+### Strict completed load qualification on a full real clip
+
+The maintained video harness now requires correct completion of every concurrent
+request, declared bounded capacity retry, stable model identity, released
+admission and completion accounting. It retains individual failures and denial
+attempts, records executor queue versus request time and samples lifecycle
+counters. An explicit normal-request deadline also covers reset retries and
+half-close. Failed retries are included in denial totals; quiescence is separate
+from server completions that clients did not acknowledge.
+
+Thirty-seven Python contract checks pass. A fresh 52-second Sintel campaign
+preserves completed baseline vectors/scores on native CPU, Metal, pinned PyTorch
+CPU/MPS and actual Linux ARM64. Mac CPU/Metal pass all four concurrent requests,
+reset cleanup/retry and legal half-close. Diagnostic clip times are about
+66.12/14.64/14.55/10.89/137.67 seconds respectively; these are single measurements
+with different HTTP/threading scopes, not normalized speed or production claims.
+
+Linux's concurrency-two workload remains failed: two 180-second client timeouts,
+one 16-attempt exhaustion and one correct result, with 28 declared denials.
+Two server completions outlive client deadlines; final admission is zero. The
+numerical baseline/lifecycle pass does not qualify this load. No memory/admission
+or vector gate was raised. The retained measured harness predates an accounting-
+only correction; raw results and current reanalysis are separately bound.
+Portable CPU performance, deadline/overload recovery and broader sustained
+qualification remain concrete gaps. GPU private-memory/transfer telemetry and
+all broader non-CUDA requirements remain active. See
+[receipts](../../zig/lib/video/testdata/concurrent-model-validation/README.md).

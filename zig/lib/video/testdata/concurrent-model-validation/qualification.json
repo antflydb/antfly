@@ -1,0 +1,123 @@
+{
+  "goal_status": "active",
+  "status": "stricter qualification delivered; CPU Metal reference preservation and bounded load pass; Linux baseline/lifecycle pass but concurrent workload fails",
+  "base_commit": "19bde086784349790a1608e79cbd7b83295450cb",
+  "binary_model_source_commit": "73cbd3152438ffbf5db387ac00615ad57e66b080",
+  "macos_binary_sha256": "9956dd41c68f14357f1706684d0eeabb69424400832ee68747d36f1b36f00f11",
+  "linux_binary_sha256": "2a8d84ba32c31d97b03cd0ef91348a02af09cce5604fd2dabf6ec153d92a154d",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+  "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+  "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+  "source_sha256": {
+    "tools/embeddinggemma2/video_compare.py": "94503a6b96d233ec5885ae23450987b5a7db8754b6be9fd93f21c56098981b55",
+    "tools/embeddinggemma2/test_video_compare.py": "954907059d782536be0932865c9054743ad0323a5287ca01b35b1387d8ce5802",
+    "tools/embeddinggemma2/compare.py": "82f19e4d2fe67937dfed00b1a0683e3bff890e99d933a50bdfdd9d5ab200e2b8",
+    "tools/embeddinggemma2/reference.py": "c8088f2238be041a525ef42bb775a80cc3e9e79202d983bd0400159023bb08e6"
+  },
+  "measured_tool_sha256": "b5dfbb34f93329680d4ca5d8270828dafe6a014addf9cf8aa17c78582b9e8387",
+  "measurements": {
+    "native-long": {
+      "status": "pass",
+      "video_seconds": 66.1248367499793,
+      "max_coordinate_error": 6.980262696743011e-07,
+      "request_memory": {
+        "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+        "samples": 2757,
+        "peak_bytes": 1976942592,
+        "first_bytes": 4947968,
+        "last_bytes": 1704230912,
+        "errors": []
+      },
+      "peak_self_rss_bytes": null,
+      "mps_end_driver_bytes": null,
+      "load_status": "pass",
+      "load_wall_seconds": 142.43380066601094
+    },
+    "metal-long": {
+      "status": "pass",
+      "video_seconds": 14.642579375009518,
+      "max_coordinate_error": 1.1939555406570435e-06,
+      "request_memory": {
+        "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+        "samples": 822,
+        "peak_bytes": 2334720000,
+        "first_bytes": 4947968,
+        "last_bytes": 810582016,
+        "errors": []
+      },
+      "peak_self_rss_bytes": null,
+      "mps_end_driver_bytes": null,
+      "load_status": "pass",
+      "load_wall_seconds": 62.40600416698726
+    },
+    "linux-long": {
+      "status": "failed",
+      "video_seconds": 137.6739736879972,
+      "max_coordinate_error": 1.4450633898377419e-06,
+      "request_memory": {
+        "scope": "sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+        "samples": 7713,
+        "peak_bytes": 1615765504,
+        "first_bytes": 12288,
+        "last_bytes": 1168580608,
+        "errors": []
+      },
+      "peak_self_rss_bytes": null,
+      "mps_end_driver_bytes": null,
+      "load_status": "failed",
+      "load_wall_seconds": 333.10182590300974
+    },
+    "pytorch-cpu-long": {
+      "status": "pass",
+      "video_seconds": 14.553780167014338,
+      "max_coordinate_error": 0.0,
+      "request_memory": null,
+      "peak_self_rss_bytes": 4216045568,
+      "mps_end_driver_bytes": null,
+      "load_status": null,
+      "load_wall_seconds": null
+    },
+    "pytorch-mps-long": {
+      "status": "pass",
+      "video_seconds": 10.88635487499414,
+      "max_coordinate_error": 4.731919034384191e-07,
+      "request_memory": null,
+      "peak_self_rss_bytes": 4835934208,
+      "mps_end_driver_bytes": 14934900736,
+      "load_status": null,
+      "load_wall_seconds": null
+    }
+  },
+  "contract_tests_pass": 37,
+  "artifacts_sha256": {
+    "metal-long.log": "6073bd387cfcb20ab1f6e1adc2e4164febabdda16f22f5e790e1d0372a585a36",
+    "metal-long.json": "dbc985021787016d3cf68bf9b8692c77c70b65e46a4b99fb229ee226cc255e27",
+    "native-long-initial-failed.json": "d243fc48bde31b68e9cd1433d45f45bb0860b9b0f2f87fefa0a3300284bb02d9",
+    "native-long-initial-failed.log": "ea251d8acc10120cf966ea6df29da21ee4da5c5b3066bc0c2eabc1e65517c949",
+    "linux-long.server.log": "566bbabb84845831a75a3b43ca047f743abdcef1c2345b785a51042a6de900ff",
+    "contracts.log": "be61b0a62389c5955b0a8d605b4f44841392bb04a744d4d7ef801442012277ab",
+    "native-long-initial-failed.server.log": "b4017a2c7c899445e692f7840dd6aa74049a3c7c2ff4b0d83042d3db5dacfac4",
+    "pytorch-mps-long.json": "05d2688e307362700cb288b7226adb2db76e8450afddaff25a2ebc5701d44022",
+    "pytorch-mps-long.log": "7f8e9be69f2e481946d11299e42174e6200f286c1924fa70cfaf2542496c204c",
+    "native-long.server.log": "ecf1fee67e2fb8f61837836bb73c66784704ab9b2dd2e009545a260d1211a35b",
+    "accounting.json": "163a26f3b8c43380f6690a1efffa9ccd2801466512cb2ffde3e1bce06295c018",
+    "measured_video_compare.py": "b5dfbb34f93329680d4ca5d8270828dafe6a014addf9cf8aa17c78582b9e8387",
+    "native-long.log": "58dad4427253bf4ebda1fa7130842a0d027f8812ba44a297ab15bf3527d69860",
+    "native-long.json": "c01c9538f47dae6dd92a30b3f3de8d6fc7918242eee4a28edb385249b8338e14",
+    "pytorch-cpu-long.json": "dda0e73c78a9768aaeca677ec421963e3b5de6181acd27b6aadf3b47d2644dbb",
+    "metal-long.server.log": "5bc6848861ddb3c83b802098a54ada87c01f917757e27143bac8e02865550e96",
+    "linux-long.json": "d1f78744b844b275ab1b6132942b18cafd5b75898716781f5ef33e0c2f9c1562",
+    "linux-long.log": "1ddd7111d1f03b4f009718202cba54152d4e1389722b383fe352e32eda3a4422",
+    "pytorch-cpu-long.log": "25fce7daf4f816ebccf0297b87ffc1a0c5e66e615a7e69a8f1fc947b477a9248"
+  },
+  "limitations": [
+    "One 52-second real-footage derivative and four queries; single-document rankings are trivial.",
+    "One measured resident-model video request per backend, four concurrent requests on owned servers; no production throughput claim.",
+    "Native HTTP and reference non-HTTP timings differ; CPU reference uses four threads, native uses its automatic runtime policy.",
+    "Sampled native process-tree RSS excludes unmapped GPU private memory; reference self RSS has a different scope.",
+    "Measured tool snapshot precedes the final accounting-only correction. Raw reports are retained unchanged; accounting.json uses the current summarizer.",
+    "Linux uses the pinned macOS PyTorch reference; no fresh Linux PyTorch or x86_64 execution.",
+    "Per-stage GPU transfer telemetry, portable CPU optimization, server deadline propagation and broader sustained-load qualification remain open."
+  ]
+}
