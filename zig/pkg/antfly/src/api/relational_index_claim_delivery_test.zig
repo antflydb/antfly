@@ -231,3 +231,49 @@ test "relational index publication routing bounds preserve all fixed-key prefix 
         }
     }
 }
+
+/// Serialization-only upper bound, deliberately not an authenticated delivery.
+/// Maximize fixed-width values (including invalid ordinals/masks) so this bound
+/// covers every valid statement without relaxing a single producer validation.
+fn widestJson(comptime T: type, value: T) T {
+    switch (@typeInfo(T)) {
+        .int => return std.math.maxInt(T),
+        .bool => return false,
+        .array => |info| {
+            var result: T = undefined;
+            for (&result) |*item| item.* = widestJson(info.child, std.mem.zeroes(info.child));
+            return result;
+        },
+        .@"struct" => |info| {
+            var result = value;
+            inline for (info.field_names) |name| @field(result, name) = widestJson(@FieldType(T, name), @field(value, name));
+            return result;
+        },
+        .optional => |info| return if (@typeInfo(info.child) == .@"struct") widestJson(info.child, value orelse std.mem.zeroes(info.child)) else value,
+        .@"union" => |info| {
+            if (info.tag_type == null) return value;
+            inline for (info.field_names) |name| if (std.mem.eql(u8, @tagName(std.meta.activeTag(value)), name)) return @unionInit(T, name, widestJson(@FieldType(T, name), @field(value, name)));
+            unreachable;
+        },
+        else => return value,
+    }
+}
+
+test "relational index publication maximum typed delivery footprint fits its transport cap" {
+    const complete = @import("../metadata/relational_index_source_delivery.zig");
+    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const binding = testBinding(testOwner(0, 1));
+    const proof: publication.RootProof = .{ .identity = .{ .metadata_incarnation = @splat(1), .node_id = 1, .store_id = 1, .root_incarnation = 1, .public_key = @splat(1) }, .reporter_incarnation = 1, .authority = .{ .native = @splat(1) }, .root_generation = 1, .signature = @splat(1) };
+    var parts: [complete.max_parts]complete.Part = undefined;
+    for (&parts) |*part| part.* = widestJson(complete.Part, .{ .index = 0, .rows = 1, .row_mask = @splat(0), .inventory_xor = @splat(1), .target = .{ .outcome = .{ .binding = binding, .claims_digest = @splat(1), .position = .{ .namespace = binding.fence.namespace, .sequence = 1 }, .duplicate = false, .claims_added = 1 }, .proof = proof } });
+    const signed = widestJson(complete.Signed, .{ .data = .{ .source = binding, .header = .{ .bytes = @splat(0) }, .routes_digest = @splat(1), .parts = .{ .items = &parts } }, .proof = proof });
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, signed, .{});
+    defer std.testing.allocator.free(bytes);
+    const command: journal.Request = .{ .signed = signed, .consumed = widestJson(journal.Consumed, .{ .metadata_incarnation = @splat(1), .binding_digest = @splat(1), .ordinal = 1, .batch_digest = @splat(1), .decision_digest = @splat(1), .rows = 1, .position = .{ .namespace = binding.fence.namespace, .sequence = 1 }, .proof = proof }) };
+    const command_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, command, .{});
+    defer std.testing.allocator.free(command_bytes);
+    std.debug.print("typed delivery upper bound: {d} bytes; acceptance {d} bytes\n", .{ bytes.len, command_bytes.len });
+    try std.testing.expect(bytes.len <= complete.max_wire_bytes);
+    try std.testing.expect(command_bytes.len <= journal.max_command_bytes);
+}

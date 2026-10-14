@@ -25,6 +25,8 @@ const Source = jobs.private_claims.SourceStream;
 const publication = @import("relational_index_publication.zig");
 const Digest = [32]u8;
 pub const max_parts = jobs.private_claims.max_claims;
+// The complete 128-destination typed statement fits even at maximum integer
+// and byte-array widths. The wire-footprint test guards this transport bound.
 pub const max_wire_bytes = 512 * 1024;
 
 pub const Delivered = struct { index: u16, signed: publication.SignedClaimDelivery };
@@ -128,6 +130,7 @@ pub const Data = struct {
             std.mem.allEqual(u8, &self.routes_digest, 0) or self.parts.items.len > max_parts) return error.InvalidPrivateIndexClaimReceipt;
         const rows = std.mem.readInt(u32, self.header.bytes[96..100], .little);
         var mask: u128 = 0;
+        var destinations: [local.storage_db_relational_index_publication_progress.max_owners]bool = @splat(false);
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly/private-unique-source-delivery/v1");
         state.update(&try self.source.encode());
@@ -144,6 +147,8 @@ pub const Data = struct {
                 target.physical_candidate.schema_version != self.source.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimReceipt;
             mask |= bits;
             try part.target.validateRecordedShape(part.rows);
+            if (destinations[target.ordinal]) return error.InvalidPrivateIndexClaimReceipt;
+            destinations[target.ordinal] = true;
             var counts: [4]u8 = undefined;
             std.mem.writeInt(u16, counts[0..2], part.index, .little);
             std.mem.writeInt(u16, counts[2..4], part.rows, .little);

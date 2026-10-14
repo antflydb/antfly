@@ -1146,6 +1146,32 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn acceptRelationalIndexSource(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (remaining_ms == 0) return error.Timeout;
+        try request.signed.verify();
+        const bytes = try self.forwardSystemCatalog(base_uri, .{ .relational_index_source_accept = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
+    pub fn relationalIndexSourceAcceptanceStatus(self: *MetadataHttpClient, base_uri: []const u8, query: @import("relational_index_delivery_journal.zig").Query, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (remaining_ms == 0) return error.Timeout;
+        try query.validate();
+        const bytes = try self.readSystemCatalog(base_uri, .{ .relational_index_source_accept_status = query }, remaining_ms, cancellation);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var parsed = try std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        if (!std.meta.eql(parsed.value.query, query)) return error.InvalidGenerationPublication;
+        if (parsed.value.head) |head| _ = try head.encode();
+        return parsed.value;
+    }
+
     pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
         const publication = @import("relational_index_publication.zig");
         try request.validate();

@@ -2589,6 +2589,32 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexOwnerAckStatusJson(alloc, group_ids.main_metadata_group_id, request);
             },
+            .relational_index_source_accept_status => |query| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexSourceAcceptanceStatusJson(alloc, group_ids.main_metadata_group_id, query);
+            },
+            .relational_index_source_accept => |request| {
+                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > journal.max_command_bytes) return error.CatalogCommandTooLarge;
+                try store.validateRelationalIndexSourceAcceptance(group_ids.main_metadata_group_id, bytes);
+                try context.ensureActive();
+                const prior_revision = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .accept_relational_index_delivery = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                const observed_revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (prior_revision != 0 and prior_revision != std.math.maxInt(u64) and observed_revision == prior_revision + 1) {
+                    self.epoch = observed_revision;
+                    self.durable_revision = observed_revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.relationalIndexSourceAcceptanceStatusJson(alloc, group_ids.main_metadata_group_id, journal.Query.from(request)) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
             .relational_index_owner_ack => |request| {
                 const publication = @import("../metadata/relational_index_publication.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;

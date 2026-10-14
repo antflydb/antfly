@@ -82,8 +82,12 @@ const std = @import("std");
 /// AIPO v3 retains accepted physical-proof commitments; bounded signed proof
 /// records and latest-stage re-attestation share this unreleased decoder gate.
 /// Admission and planless ACKs require durable activation of this decoder.
-pub const current_version: u16 = 40;
-pub const index_publication_head_version: u16 = 40;
+/// Version 41 binds source-delivery and expected-inventory records to AIPO v4
+/// owner directories, persists compact complete-delivery provenance, and
+/// decodes ordered delivery acceptance. This does not enable native consumption.
+pub const current_version: u16 = 41;
+pub const index_publication_head_version: u16 = 41;
+pub const index_delivery_version: u16 = 41;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

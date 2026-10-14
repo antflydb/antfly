@@ -15,9 +15,8 @@
 
 //! Ordered complete-delivery acceptance postimages. One source head and one
 //! inventory per touched target, not a historical row/body log. This module
-//! neither commits transactions nor enables source deletion. Production command
-//! activation additionally needs snapshot/reader barriers and native journal
-//! consumption; no public or Raft command currently stages these records.
+//! never commits transactions or enables source deletion. Metadata acceptance
+//! and native consumption are separate durable decisions.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const jobs = local.storage_db_relational_index_owner_job;
@@ -25,8 +24,41 @@ const Source = jobs.private_claims.SourceStream;
 const positions = local.storage_db_receipt_position;
 const delivery = @import("relational_index_source_delivery.zig");
 const publication = @import("relational_index_publication.zig");
+const progress = local.storage_db_relational_index_publication_progress;
 const Digest = [32]u8;
 const prefix = "\x00\x00__metadata__:relational_index_delivery:v1:";
+pub const max_command_bytes = delivery.max_wire_bytes + 16 * 1024;
+pub fn allGroupsPrefix() []const u8 {
+    return prefix;
+}
+pub fn sourcesPrefix(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}source:{d}:", .{ prefix, group });
+}
+pub fn targetsPrefix(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}target:{d}:", .{ prefix, group });
+}
+pub const Key = struct {
+    kind: enum { source, target },
+    group: u64,
+    table: u64,
+    ordinal: u16,
+    pub fn parse(bytes: []const u8) !?Key {
+        if (!std.mem.startsWith(u8, bytes, prefix)) return null;
+        var parts = std.mem.splitScalar(u8, bytes[prefix.len..], ':');
+        const kind = parts.next() orelse return error.InvalidCatalogRecord;
+        const result: Key = .{
+            .kind = if (std.mem.eql(u8, kind, "source")) .source else if (std.mem.eql(u8, kind, "target")) .target else return error.InvalidCatalogRecord,
+            .group = std.fmt.parseInt(u64, parts.next() orelse return error.InvalidCatalogRecord, 10) catch return error.InvalidCatalogRecord,
+            .table = std.fmt.parseInt(u64, parts.next() orelse return error.InvalidCatalogRecord, 16) catch return error.InvalidCatalogRecord,
+            .ordinal = std.fmt.parseInt(u16, parts.next() orelse return error.InvalidCatalogRecord, 16) catch return error.InvalidCatalogRecord,
+        };
+        if (parts.next() != null or result.group == 0 or result.table == 0 or result.ordinal >= progress.max_owners) return error.InvalidCatalogRecord;
+        var buf: [192]u8 = undefined;
+        const canonical = if (result.kind == .source) try sourceKey(&buf, result.group, result.table, result.ordinal) else try targetKey(&buf, result.group, result.table, result.ordinal);
+        if (!std.mem.eql(u8, canonical, bytes)) return error.InvalidCatalogRecord;
+        return result;
+    }
+};
 
 fn hash(bytes: []const u8) Digest {
     var result: Digest = undefined;
@@ -203,8 +235,91 @@ pub const Inventory = struct {
     }
 };
 
+pub const SourceRecord = struct {
+    head: Head,
+    signed: std.json.Parsed(delivery.Signed),
+    pub fn deinit(self: *SourceRecord) void {
+        self.signed.deinit();
+        self.* = undefined;
+    }
+    fn requireHead(head: Head, signed: delivery.Signed) !void {
+        const data = signed.data;
+        const raw = &data.header.bytes;
+        if (!equal(head.metadata_incarnation, signed.proof.identity.metadata_incarnation) or !equal(head.binding_digest, try bindingDigest(data.source)) or
+            !equal(head.scope_digest, raw[40..72].*) or head.ordinal != std.mem.readInt(u64, raw[104..112], .little) or
+            head.batch_rows != std.mem.readInt(u32, raw[96..100], .little) or head.source_sequence != (try data.header.position()).sequence or
+            @backingInt(head.state) != raw[184] or !equal(head.batch_digest, data.header.digest()) or !equal(head.logical_digest, try data.logicalDigest()) or
+            !equal(head.accepted_root, try signed.proof.commitment(try data.digest()))) return error.InvalidCatalogRecord;
+    }
+    pub fn encode(alloc: std.mem.Allocator, head: Head, signed: delivery.Signed) ![]u8 {
+        try requireHead(head, signed);
+        const json = try std.json.Stringify.valueAlloc(alloc, signed, .{});
+        defer alloc.free(json);
+        if (json.len == 0 or json.len > delivery.max_wire_bytes) return error.InvalidCatalogRecord;
+        return std.mem.concat(alloc, u8, &.{ &try head.encode(), json });
+    }
+    pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !SourceRecord {
+        if (bytes.len <= Head.encoded_len or bytes.len > Head.encoded_len + delivery.max_wire_bytes) return error.InvalidCatalogRecord;
+        const head = try Head.decode(bytes[0..Head.encoded_len]);
+        var signed = try std.json.parseFromSlice(delivery.Signed, alloc, bytes[Head.encoded_len..], .{ .allocate = .alloc_always, .max_value_len = 128 });
+        errdefer signed.deinit();
+        try signed.value.verify();
+        for (signed.value.data.parts.items) |part| try part.target.verifyRecorded(part.rows);
+        try requireHead(head, signed.value);
+        const canonical = try std.json.Stringify.valueAlloc(alloc, signed.value, .{});
+        defer alloc.free(canonical);
+        if (!std.mem.eql(u8, canonical, bytes[Head.encoded_len..])) return error.InvalidCatalogRecord;
+        return .{ .head = head, .signed = signed };
+    }
+};
+
+pub const TargetRecord = struct {
+    pub const encoded_len = jobs.Binding.encoded_len + Inventory.encoded_len;
+    binding: jobs.Binding,
+    inventory: Inventory,
+    pub fn encode(self: TargetRecord) ![encoded_len]u8 {
+        if (!equal(try bindingDigest(self.binding), self.inventory.binding_digest) or self.binding.authority != .native or self.binding.phase != .reserved) return error.InvalidCatalogRecord;
+        var bytes: [encoded_len]u8 = undefined;
+        @memcpy(bytes[0..jobs.Binding.encoded_len], &try self.binding.encode());
+        @memcpy(bytes[jobs.Binding.encoded_len..], &try self.inventory.encode());
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !TargetRecord {
+        if (bytes.len != encoded_len) return error.InvalidCatalogRecord;
+        const result: TargetRecord = .{ .binding = try jobs.Binding.decode(bytes[0..jobs.Binding.encoded_len]), .inventory = try Inventory.decode(bytes[jobs.Binding.encoded_len..]) };
+        _ = try result.encode();
+        return result;
+    }
+};
+
+pub const Query = struct {
+    table_id: u64,
+    group_id: u64,
+    id: [16]u8,
+    pub fn from(request: Request) Query {
+        const binding = request.signed.data.source;
+        return .{ .table_id = binding.fence.namespace.table_id, .group_id = binding.fence.owner_group_id, .id = binding.id };
+    }
+    pub fn validate(self: Query) !void {
+        if (self.table_id == 0 or self.group_id == 0 or !nonzero(&self.id)) return error.InvalidGenerationPublication;
+    }
+};
+pub const Status = struct {
+    query: Query,
+    head: ?Head,
+    replication_pending: bool = false,
+    pub fn isAccepted(self: Status, request: Request) !bool {
+        if (!std.meta.eql(self.query, Query.from(request))) return error.InvalidGenerationPublication;
+        if (self.replication_pending) return false;
+        const head = self.head orelse return false;
+        _ = try head.encode();
+        return equal(head.metadata_incarnation, request.signed.proof.identity.metadata_incarnation) and equal(head.binding_digest, try bindingDigest(request.signed.data.source)) and
+            equal(head.batch_digest, request.signed.data.header.digest()) and equal(head.logical_digest, try request.signed.data.logicalDigest());
+    }
+};
 pub const Request = struct { signed: delivery.Signed, consumed: ?Consumed = null };
-const TargetUpdate = struct { ordinal: u16, bytes: [Inventory.encoded_len]u8 };
+const TargetUpdate = struct { ordinal: u16, bytes: [TargetRecord.encoded_len]u8 };
+const OwnerUpdate = struct { ordinal: u16, bytes: [progress.OwnerState.encoded_len]u8 };
 pub const Prepared = struct {
     alloc: std.mem.Allocator,
     table_id: u64,
@@ -212,9 +327,13 @@ pub const Prepared = struct {
     head: Head,
     head_bytes: [Head.encoded_len]u8,
     targets: []TargetUpdate,
+    source_bytes: ?[]u8 = null,
+    owners: []OwnerUpdate = &.{},
     changed: bool,
     pub fn deinit(self: *Prepared) void {
         self.alloc.free(self.targets);
+        if (self.source_bytes) |bytes| self.alloc.free(bytes);
+        self.alloc.free(self.owners);
         self.* = undefined;
     }
     /// The outer transaction MUST abort on any failure, including the last put.
@@ -223,7 +342,11 @@ pub const Prepared = struct {
         if (!self.changed) return;
         var buf: [192]u8 = undefined;
         for (self.targets) |target| try txn.put(try targetKey(&buf, group, self.table_id, target.ordinal), &target.bytes);
-        try txn.put(try sourceKey(&buf, group, self.table_id, self.ordinal), &self.head_bytes);
+        try txn.put(try sourceKey(&buf, group, self.table_id, self.ordinal), self.source_bytes orelse &self.head_bytes);
+        for (self.owners, 0..) |owner, i| {
+            if (owner.ordinal == self.ordinal and i + 1 != self.owners.len) continue;
+            try txn.put(try publication.ownerKey(&buf, group, self.table_id, owner.ordinal), &owner.bytes);
+        }
     }
 };
 
@@ -239,8 +362,15 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
     const ordinal = std.mem.readInt(u64, raw[104..112], .little);
     const sequence = (try data.header.position()).sequence;
     var buf: [192]u8 = undefined;
-    // Decode borrowed native buffers before the next read.
-    const previous = if (try optional(txn, try sourceKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal))) |bytes| try Head.decode(bytes) else null;
+    var source_owner = try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal)));
+    // Decode/hash borrowed native buffers before the next read.
+    const previous = if (try optional(txn, try sourceKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal))) |bytes| blk: {
+        if (bytes.len <= Head.encoded_len or bytes.len > Head.encoded_len + delivery.max_wire_bytes or !equal(hash(bytes), source_owner.source_delivery)) return error.InvalidCatalogRecord;
+        break :blk try Head.decode(bytes[0..Head.encoded_len]);
+    } else blk: {
+        if (nonzero(&source_owner.source_delivery)) return error.InvalidCatalogRecord;
+        break :blk null;
+    };
     if (previous) |head| {
         if (!equal(head.metadata_incarnation, incarnation) or !equal(head.binding_digest, binding_digest) or !equal(head.scope_digest, raw[40..72].*)) return error.PrivateIndexOwnerJobChanged;
         if (ordinal == head.ordinal) {
@@ -279,15 +409,27 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
     head.decision_digest = head.decision();
     head.provenance = head.prefixDigest();
     const head_bytes = try head.encode();
+    const source_bytes = try SourceRecord.encode(alloc, head, request.signed);
+    errdefer alloc.free(source_bytes);
+    source_owner.source_delivery = hash(source_bytes);
     const targets = try alloc.alloc(TargetUpdate, data.parts.items.len);
     errdefer alloc.free(targets);
+    const owners = try alloc.alloc(OwnerUpdate, data.parts.items.len + 1);
+    errdefer alloc.free(owners);
     var seen: [local.storage_db_relational_index_publication_progress.max_owners]bool = @splat(false);
     for (data.parts.items, targets) |part, *target| {
         const binding = part.target.outcome.binding;
         if (seen[binding.ordinal]) return error.InvalidPrivateIndexClaimReceipt;
         seen[binding.ordinal] = true;
         const target_digest = try bindingDigest(binding);
-        var inventory: Inventory = if (try optional(txn, try targetKey(&buf, group, data.source.fence.namespace.table_id, binding.ordinal))) |bytes| try Inventory.decode(bytes) else .{ .metadata_incarnation = incarnation, .binding_digest = target_digest, .rows = 0, .batches = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
+        var owner = if (binding.ordinal == data.source.ordinal) source_owner else try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, data.source.fence.namespace.table_id, binding.ordinal)));
+        var inventory: Inventory = if (try optional(txn, try targetKey(&buf, group, data.source.fence.namespace.table_id, binding.ordinal))) |bytes| blk: {
+            if (!equal(hash(bytes), owner.target_inventory)) return error.InvalidCatalogRecord;
+            break :blk (try TargetRecord.decode(bytes)).inventory;
+        } else blk: {
+            if (nonzero(&owner.target_inventory)) return error.InvalidCatalogRecord;
+            break :blk .{ .metadata_incarnation = incarnation, .binding_digest = target_digest, .rows = 0, .batches = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
+        };
         if (!equal(inventory.metadata_incarnation, incarnation) or !equal(inventory.binding_digest, target_digest)) return error.PrivateIndexOwnerJobChanged;
         inventory.rows = std.math.add(u64, inventory.rows, part.rows) catch return error.InvalidPrivateIndexClaimInventory;
         inventory.batches = std.math.add(u64, inventory.batches, 1) catch return error.InvalidPrivateIndexClaimInventory;
@@ -300,9 +442,73 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
         state.update(&part.row_mask);
         state.update(&part.inventory_xor);
         state.final(&inventory.provenance);
-        target.* = .{ .ordinal = binding.ordinal, .bytes = try inventory.encode() };
+        target.* = .{ .ordinal = binding.ordinal, .bytes = try (TargetRecord{ .binding = binding, .inventory = inventory }).encode() };
+        owner.target_inventory = hash(&target.bytes);
+        if (binding.ordinal == data.source.ordinal) source_owner = owner;
+        owners[part.index] = .{ .ordinal = binding.ordinal, .bytes = try owner.encode() };
     }
-    return .{ .alloc = alloc, .table_id = data.source.fence.namespace.table_id, .ordinal = data.source.ordinal, .head = head, .head_bytes = head_bytes, .targets = targets, .changed = true };
+    owners[data.parts.items.len] = .{ .ordinal = data.source.ordinal, .bytes = try source_owner.encode() };
+    return .{ .alloc = alloc, .table_id = data.source.fence.namespace.table_id, .ordinal = data.source.ordinal, .head = head, .head_bytes = head_bytes, .source_bytes = source_bytes, .targets = targets, .owners = owners, .changed = true };
+}
+
+fn anchored(reader: anytype, key: []const u8, expected: Digest) !?[]const u8 {
+    const bytes = try optional(reader, key);
+    if (bytes) |value| {
+        if (!equal(hash(value), expected)) return error.InvalidCatalogRecord;
+    } else if (nonzero(&expected)) return error.InvalidCatalogRecord;
+    return bytes;
+}
+fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, binding: jobs.Binding) !void {
+    if (binding.ordinal >= head.owner_count or binding.phase != .reserved or !std.mem.eql(u8, &binding.id, &head.plan_id) or !equal(binding.plan_digest, head.plan_digest)) return error.InvalidCatalogRecord;
+    var buf: [192]u8 = undefined;
+    const owner = try progress.OwnerState.decode(try reader.get(try publication.ownerKey(&buf, group, head.table_id, binding.ordinal)));
+    if (owner.owner.namespace.table_id != head.table_id) return error.InvalidCatalogRecord;
+    var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
+    defer dispatch.deinit();
+    try (publication.OwnerDecision{ .metadata_group_id = group, .metadata_incarnation = @splat(0), .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value }).requireRetainedNativeBinding(binding);
+}
+fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proof: publication.RootProof, incarnation: Digest) !void {
+    const enrollment = @import("store_root_enrollment.zig");
+    if (!equal(proof.identity.metadata_incarnation, incarnation)) return error.InvalidCatalogRecord;
+    var buf: [192]u8 = undefined;
+    const bytes = try reader.get(try enrollment.key(&buf, group, proof.identity.store_id, proof.identity.root_incarnation));
+    if (bytes.len > 1024) return error.InvalidCatalogRecord;
+    var identity = try std.json.parseFromSlice(enrollment.Identity, alloc, bytes, .{});
+    defer identity.deinit();
+    if (!std.meta.eql(identity.value, proof.identity)) return error.InvalidCatalogRecord;
+}
+pub const Counts = struct { sources: usize = 0, targets: usize = 0, source_rows: u64 = 0, target_rows: u64 = 0 };
+/// Complete forward checkpoint verification; online acceptance never scans the
+/// owner cohort. Exact owner anchors also protect zero-row source decisions.
+pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !Counts {
+    var result: Counts = .{};
+    var buf: [192]u8 = undefined;
+    if (try anchored(reader, try sourceKey(&buf, group, head.table_id, owner.owner.ordinal), owner.source_delivery)) |bytes| {
+        var record = try SourceRecord.decode(alloc, bytes);
+        defer record.deinit();
+        if (!equal(record.head.metadata_incarnation, incarnation) or record.signed.value.data.source.ordinal != owner.owner.ordinal) return error.InvalidCatalogRecord;
+        try requireRetainedBinding(alloc, reader, group, head, record.signed.value.data.source);
+        try requireEnrollment(alloc, reader, group, record.signed.value.proof, incarnation);
+        for (record.signed.value.data.parts.items) |part| {
+            try requireRetainedBinding(alloc, reader, group, head, part.target.outcome.binding);
+            try requireEnrollment(alloc, reader, group, part.target.proof, incarnation);
+        }
+        result.sources = 1;
+        result.source_rows = record.head.rows;
+    }
+    if (try anchored(reader, try targetKey(&buf, group, head.table_id, owner.owner.ordinal), owner.target_inventory)) |bytes| {
+        const record = try TargetRecord.decode(bytes);
+        if (!equal(record.inventory.metadata_incarnation, incarnation) or record.binding.ordinal != owner.owner.ordinal) return error.InvalidCatalogRecord;
+        try requireRetainedBinding(alloc, reader, group, head, record.binding);
+        result.targets = 1;
+        result.target_rows = record.inventory.rows;
+    }
+    return result;
+}
+pub fn deleteOwner(txn: anytype, group: u64, table: u64, owner: progress.OwnerState) !void {
+    var buf: [192]u8 = undefined;
+    if (try anchored(txn, try sourceKey(&buf, group, table, owner.owner.ordinal), owner.source_delivery) != null) try txn.delete(try sourceKey(&buf, group, table, owner.owner.ordinal));
+    if (try anchored(txn, try targetKey(&buf, group, table, owner.owner.ordinal), owner.target_inventory) != null) try txn.delete(try targetKey(&buf, group, table, owner.owner.ordinal));
 }
 
 test "relational index publication source acceptance propagates every staged write failure and skips duplicate writes" {

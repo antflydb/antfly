@@ -244,7 +244,7 @@ pub const Head = struct {
 };
 
 pub const OwnerState = struct {
-    pub const encoded_len = 648;
+    pub const encoded_len = 712;
     owner: Owner,
     flags: u8 = 0,
     position: ?positions.Position = null,
@@ -252,6 +252,9 @@ pub const OwnerState = struct {
     /// Physical commitments are installed by the authenticated metadata
     /// adapter. The pure logical progress machine does not invent root proof.
     attestations: [7]Digest = @splat(@splat(0)),
+    /// Metadata-owned record commitments; never native publication evidence.
+    source_delivery: Digest = @splat(0),
+    target_inventory: Digest = @splat(0),
 
     fn has(self: OwnerState, action: Action) bool {
         return self.flags & bit(action) != 0;
@@ -284,13 +287,14 @@ pub const OwnerState = struct {
             (self.has(.installed) and (!self.has(.validated) or self.has(.canceled))) or
             (self.has(.released) and !self.has(.installed)) or (self.has(.canceled) and !self.has(.reserved)) or
             (self.has(.cancel_released) and !self.has(.canceled))) return error.InvalidGenerationPublication;
+        if ((nonzero(&self.source_delivery) or nonzero(&self.target_inventory)) and (self.owner.authority != .native or !self.has(.reserved))) return error.InvalidGenerationPublication;
     }
 
     pub fn encode(self: OwnerState) ![encoded_len]u8 {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPO");
-        bytes[4] = 3;
+        bytes[4] = 4;
         bytes[5] = self.flags;
         bytes[6] = @backingInt(self.owner.authority);
         @memcpy(bytes[8..24], &self.owner.plan_id);
@@ -304,15 +308,17 @@ pub const OwnerState = struct {
         if (self.position) |position| @memcpy(bytes[128..161], &try position.encode());
         for (self.receipts, 0..) |digest, i| @memcpy(bytes[168 + i * 32 ..][0..32], &digest);
         for (self.attestations, 0..) |digest, i| @memcpy(bytes[392 + i * 32 ..][0..32], &digest);
-        @memcpy(bytes[616..648], &checksum(bytes[0..616]));
+        @memcpy(bytes[616..648], &self.source_delivery);
+        @memcpy(bytes[648..680], &self.target_inventory);
+        @memcpy(bytes[680..712], &checksum(bytes[0..680]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !OwnerState {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 3 or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 4 or
             bytes[7] != 0 or !std.mem.allEqual(u8, bytes[58..64], 0) or
             !std.mem.allEqual(u8, bytes[161..168], 0) or
-            !std.mem.eql(u8, &checksum(bytes[0..616]), bytes[616..648])) return error.InvalidGenerationPublication;
+            !std.mem.eql(u8, &checksum(bytes[0..680]), bytes[680..712])) return error.InvalidGenerationPublication;
         var result: OwnerState = .{
             .owner = .{
                 .plan_id = bytes[8..24].*,
@@ -328,6 +334,8 @@ pub const OwnerState = struct {
                 .fence_digest = bytes[96..128].*,
             },
             .flags = bytes[5],
+            .source_delivery = bytes[616..648].*,
+            .target_inventory = bytes[648..680].*,
             .position = if (std.mem.allEqual(u8, bytes[128..161], 0)) null else positions.Position.decode(bytes[128..161]) catch return error.InvalidGenerationPublication,
         };
         for (&result.receipts, 0..) |*digest, i| digest.* = bytes[168 + i * 32 ..][0..32].*;
@@ -622,16 +630,16 @@ test "index owner codec rejects legacy layout and checksummed position padding" 
     const bytes = try owner.encode();
     var malformed = bytes;
     malformed[4] = 1;
-    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
+    @memcpy(malformed[680..712], &checksum(malformed[0..680]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
     malformed = bytes;
     malformed[161] = 1;
-    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
+    @memcpy(malformed[680..712], &checksum(malformed[0..680]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
     malformed = bytes;
     const position: positions.Position = .{ .native = .{ .namespace = owner.owner.namespace, .sequence = 1 } };
     @memcpy(malformed[128..161], &try position.encode());
-    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
+    @memcpy(malformed[680..712], &checksum(malformed[0..680]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
 }
 

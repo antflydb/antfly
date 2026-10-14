@@ -6536,3 +6536,82 @@ catalog and original-inventory checks passed. GC preview deleted nothing.
 Do not infer original SQL completion from these component gates. Original
 dispositions remain 483 implemented / 862 unresolved. No activation, source
 deletion, throughput improvement, full release pass or push is claimed.
+
+### Durable ordered acceptance and recoverable owner anchors
+
+Ordered complete-delivery acceptance now has a metadata transition and private
+proposal/status path, rather than a preparation-only helper. Preflight and
+ordered apply independently repeat current catalog/lifecycle/range, enrollment,
+reporter, capability, root-generation and observed-cut checks. Apply stages the
+source record, all touched target records and their owner-directory commitments
+in one transaction. Staging errors are never swallowed. Stale authority detected
+before staging produces no acceptance; a linearizable status observation resolves
+uncertain proposal outcomes without treating transport success as a decision.
+
+AIPO v4 adds separate source-delivery and target-inventory commitments to each
+owner, preserved by ordinary progress ACKs. This avoids a global acceptance CAS
+and makes optional records independently checkable, including zero-row sources.
+The v41 coordinated decoder barrier covers admission, owner ACKs and acceptance;
+the compiled-owner ABI is v80. No compatibility format was added for the private
+development layouts. These gates do not enable native source consumption.
+
+Each source retains its fixed 416-byte accepted head and one canonical compact
+complete-delivery statement, not row bodies or an unbounded batch history. Each
+target retains its reserved binding and 184-byte expected inventory. The source
+statement retains the actual source signature and independently signed target
+deliveries for checkpoint verification. Exact logical retries, including new
+physical re-attestation, preserve the original durable decision and inventory
+contributions. One owner write merges source and target anchors when a source
+also owns its own destination, avoiding duplicate owner writes.
+
+Snapshot/recovery forward verification checks anchor presence and hashes,
+canonical source bytes, source/target signatures and enrollment, immutable owner
+and schema bindings, cumulative count bounds, and source/target row accounting.
+Reverse enumeration rejects extra/orphan journal records. Native-owner binding
+is included in snapshots, with the decoder requirement protected. Terminal DROP
+and predecessor replacement remove the old records through the existing bounded
+owner cleanup. Expected inventory and its XOR remain diagnostic/provenance
+accounting, not an EOF seal or a substitute for actual physical target validation.
+
+The snapshot/reopen test exposed a shared receipt-preflight bug: metadata
+snapshots materialize store reports, but point receipt verification expects
+rebuilt report directories. Both owner-ACK and source-acceptance preflight now
+enter the existing shared indexed-report read path, which performs the existing
+one-time derived-index initialization. Ordered apply already initializes those
+same derived indexes in its transaction. No per-receipt fallback store scan or
+separate relational restore system was added, and root checks were not relaxed.
+
+Acceptance status also reports actual metadata standby-outbox debt. A locally
+committed acceptance is not reported as durable while that debt exists. This is
+separate from the already enforced source/target native mirror debt. A retained
+historical acceptance remains a durable fact, not current build/consume
+permission; native consumption must independently obtain current permission.
+
+A serialization-only upper-bound test maximizes every fixed integer/byte-array
+field across 128 destinations, without claiming valid delivery or SQL execution.
+The statement is at most 517,306 bytes and acceptance 519,084 bytes under that
+conservative fixture. This evidence allowed keeping the existing 512 KiB proof
+transport limit and its separately bounded acceptance wrapper. No throughput
+benchmark or performance gain is inferred from serialized sizes.
+
+The focused Debug run in
+`/private/tmp/antfly-source-acceptance-durable-debug-v6.log` passed 69/69 steps:
+40 publication tests, four service/ACK tests and the coordinated decoder barrier,
+with no failures or leaks. The actual metadata fixture uses committed Raft
+application, exact batch replay, logical duplicate acceptance, standby-pending
+status, snapshot exclusion/orphan faults and reopen recovery. Its physical claim
+values are synthetic metadata-verifier inputs, not original SQL qualification.
+Broader native/C-ABI and leased-owner qualification is recorded separately in
+`/private/tmp/antfly-source-acceptance-durable-full-debug.log`: 120/120 Debug
+steps passed, including 40 publication, four service/ACK, eight native page,
+six C-ABI, three leased-owner, 14 candidate-prerequisite and 46 runtime-contract
+tests, plus the decoder barrier. Counts overlap; no failures or leaks were
+reported. Formatting, boundary, license, control-catalog and original-inventory
+checks passed. GC was preview-only and deleted nothing.
+
+Native consumption/deletion/outbox replay is still absent: the native source
+head rejects a nonzero consumed prefix. Source/target EOF seals, provenance-
+backed missing-root repair, actual data-Raft execution, terminal native evidence
+and atomic schema/catalog activation remain unfinished. Public UNIQUE activation
+is still guarded. Original dispositions remain 483 implemented / 862 unresolved;
+component tests do not change them. No full release pass or push is claimed.

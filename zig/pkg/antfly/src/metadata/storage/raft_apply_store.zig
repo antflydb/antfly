@@ -59,6 +59,7 @@ const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
 const fk_generation_publication = @import("../fk_generation_publication.zig");
 const index_publication = @import("../relational_index_publication.zig");
+const index_delivery = @import("../relational_index_delivery_journal.zig");
 const index_progress = @import("antfly_local_sources").storage_db_relational_index_publication_progress;
 const fk_initial_retirement = @import("../fk_initial_retirement.zig");
 const fk_initial_retirement_ack = @import("../fk_initial_retirement_ack.zig");
@@ -4421,6 +4422,21 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const control = local.storage_db_relational_index_owner_control;
         const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
         const binding = signed.data.source;
+        // Make the fixture's reserved metadata cut independently checkpointable:
+        // logical flags alone are not retained authenticated owner evidence.
+        var proof_buf: [192]u8 = undefined;
+        var retained_owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&proof_buf, group, binding.fence.namespace.table_id, binding.ordinal)));
+        for ([_]index_progress.Action{ .fenced, .reserved }, 0..) |action, i| {
+            const receipt: index_progress.Receipt = .{ .owner = retained_owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 5 + i } }, .candidate_digest = binding.integrity_candidate, .reservation_digest = binding.integrity_reserved, .evidence_digest = @splat(8) };
+            const retained: index_publication.SignedReceipt = .{ .receipt = receipt, .proof = try proof.sign(root, try receipt.digest()) };
+            try std.testing.expectEqual(retained_owner.receipts[@backingInt(action)], try receipt.digest());
+            retained_owner.attestations[@backingInt(action)] = try retained.commitment();
+            try txn.put(try index_publication.proofKey(&proof_buf, group, binding.fence.namespace.table_id, binding.ordinal, action), &try retained.encode());
+        }
+        try txn.put(try index_publication.ownerKey(&proof_buf, group, binding.fence.namespace.table_id, binding.ordinal), &try retained_owner.encode());
+        const initial_snapshot = try store.buildMetadataSnapshotTxn(store.alloc, txn, group, null);
+        defer store.alloc.free(initial_snapshot);
+        try testDurableSourceAcceptance(store.alloc, group, initial_snapshot, .{ .signed = signed });
         var key_buf: [192]u8 = undefined;
         const physical_key = try journal.sourceKey(&key_buf, group, binding.fence.namespace.table_id, binding.ordinal);
         try std.testing.expectError(error.NotFound, txn.get(physical_key));
@@ -4538,7 +4554,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try std.testing.expectEqual(first.head.decision_digest, second.head.previous_decision);
         try second.stage(txn, group);
         var buf: [192]u8 = undefined;
-        const inventory = try journal.Inventory.decode(try txn.get(try journal.targetKey(&buf, group, binding.fence.namespace.table_id, binding.ordinal)));
+        const inventory = (try journal.TargetRecord.decode(try txn.get(try journal.targetKey(&buf, group, binding.fence.namespace.table_id, binding.ordinal)))).inventory;
         try std.testing.expectEqual(@as(u64, 2), inventory.rows);
         try std.testing.expectEqual(@as(u64, 2), inventory.batches);
         var final_retry = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed });
@@ -4552,8 +4568,95 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         after_ready.proof = try proof.sign(root, try after_ready.data.digest());
         try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = after_ready, .consumed = consumed }));
         try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = signed }));
-        // These postimages exist only in the test's aborted transaction. A
-        // production command must first register snapshot/capability support.
+        // The component postimages remain confined to this aborted transaction;
+        // the separate clone above exercises committed acceptance and reopen.
+    }
+
+    fn testDurableSourceAcceptance(alloc: std.mem.Allocator, group: u64, initial: []const u8, request: index_delivery.Request) !void {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/delivery-journal", .{tmp.sub_path});
+        defer alloc.free(path);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(bytes);
+        const command: TransitionCommand = .{ .accept_relational_index_delivery = bytes };
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        var decoded = (try decodeTransitionCommand(alloc, encoded)) orelse return error.InvalidMetadataTransitionEncoding;
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, bytes, decoded.accept_relational_index_delivery);
+        const query = index_delivery.Query.from(request);
+        var expected: index_delivery.Head = undefined;
+        {
+            var clone = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+            defer clone.deinit();
+            try std.testing.expect(try clone.snapshotBuilder().installSnapshot(alloc, group, 100, initial));
+            try clone.validateRelationalIndexSourceAcceptance(group, bytes);
+            const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 101, .entry_type = .normal, .data = encoded }});
+            defer alloc.free(entries);
+            try clone.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 101, .entries_bytes = entries });
+            const reply = try clone.relationalIndexSourceAcceptanceStatusJson(alloc, group, query);
+            defer alloc.free(reply);
+            var status = try std.json.parseFromSlice(index_delivery.Status, alloc, reply, .{});
+            defer status.deinit();
+            try std.testing.expect(try status.value.isAccepted(request));
+            expected = status.value.head.?;
+            try clone.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-test-effect");
+            const pending_reply = try clone.relationalIndexSourceAcceptanceStatusJson(alloc, group, query);
+            defer alloc.free(pending_reply);
+            var pending = try std.json.parseFromSlice(index_delivery.Status, alloc, pending_reply, .{});
+            defer pending.deinit();
+            try std.testing.expect(pending.value.replication_pending);
+            try std.testing.expect(!try pending.value.isAccepted(request));
+            try clone.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key);
+            const baseline = try clone.snapshotBuilder().buildSnapshot(alloc, group);
+            defer alloc.free(baseline);
+            // Exact replay retains records and target counts, not merely SQL
+            // result status. The state-machine marker additionally skips the
+            // same committed batch after an uncertain response.
+            try clone.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 101, .entries_bytes = entries });
+            try clone.applyStandaloneCommand(group, command);
+            const after_retry = try clone.snapshotBuilder().buildSnapshot(alloc, group);
+            defer alloc.free(after_retry);
+            var read = try clone.store.beginReadTxn();
+            defer read.abort();
+            var buf: [192]u8 = undefined;
+            const owner = try index_progress.OwnerState.decode(try read.get(try index_publication.ownerKey(&buf, group, query.table_id, request.signed.data.source.ordinal)));
+            const counts = try index_delivery.verifyOwner(alloc, &read, group, try index_progress.Head.decode(try read.get(try index_publication.headKey(&buf, group, query.table_id))), owner, expected.metadata_incarnation);
+            try std.testing.expectEqual(@as(u64, 1), counts.source_rows);
+            try std.testing.expectEqual(@as(u64, 1), counts.target_rows);
+            const rows = try decodeMetadataSnapshotAlloc(alloc, after_retry);
+            defer freeMetadataSnapshotRows(alloc, rows);
+            // Dropping either anchored family is rejected before install.
+            for (0..2) |kind| {
+                var key_buf: [192]u8 = undefined;
+                const key = if (kind == 0) try index_delivery.sourceKey(&key_buf, group, query.table_id, request.signed.data.source.ordinal) else try index_delivery.targetKey(&key_buf, group, query.table_id, request.signed.data.source.ordinal);
+                var missing: std.ArrayList(docstore.OwnedKVPair) = .empty;
+                defer missing.deinit(alloc);
+                for (rows) |row| if (!std.mem.eql(u8, row.key, key)) try missing.append(alloc, row);
+                try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(alloc, group, missing.items));
+            }
+            var extra: std.ArrayList(docstore.OwnedKVPair) = .empty;
+            defer extra.deinit(alloc);
+            try extra.appendSlice(alloc, rows);
+            var orphan_buf: [192]u8 = undefined;
+            const orphan = try index_delivery.targetKey(&orphan_buf, group, query.table_id + 1, 0);
+            var target_buf: [192]u8 = undefined;
+            const target_key = try index_delivery.targetKey(&target_buf, group, query.table_id, request.signed.data.source.ordinal);
+            for (rows) |row| if (std.mem.eql(u8, row.key, target_key)) try extra.append(alloc, .{ .key = @constCast(orphan), .value = row.value });
+            try std.testing.expectEqual(rows.len + 1, extra.items.len);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(alloc, group, extra.items));
+        }
+        {
+            var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+            defer reopened.deinit();
+            const reply = try reopened.relationalIndexSourceAcceptanceStatusJson(alloc, group, query);
+            defer alloc.free(reply);
+            var status = try std.json.parseFromSlice(index_delivery.Status, alloc, reply, .{});
+            defer status.deinit();
+            try std.testing.expect(try status.value.isAccepted(request));
+            try std.testing.expectEqualDeep(expected, status.value.head.?);
+        }
     }
 
     pub fn run(comptime Driver: type) !void {
@@ -8002,6 +8105,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 }
 
 pub const TransitionCommand = union(enum) {
+    accept_relational_index_delivery: []const u8,
     begin_relational_index_publication: []const u8,
     ack_relational_index_publication: []const u8,
     apply_relation_reconciliation: []const u8,
@@ -8170,7 +8274,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .accept_relational_index_delivery, .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -8317,6 +8421,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .begin_relational_index_publication => |bytes| if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication,
         .ack_relational_index_publication => |bytes| if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.InvalidGenerationPublication,
+        .accept_relational_index_delivery => |bytes| if (bytes.len == 0 or bytes.len > index_delivery.max_command_bytes) return error.InvalidGenerationPublication,
         .apply_fk_initial_create => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.InvalidStoreRootEnrollment,
         .upsert_store, .upsert_store_heartbeat, .register_store => |record| {
@@ -13747,7 +13852,7 @@ pub const RaftApplyStore = struct {
         // These exact commands cannot change visible table/schema/name state.
         // All other and future commands conservatively invalidate projection.
         try advanceStandaloneRevisionWithProjection(&txn, switch (command) {
-            .ack_relational_index_publication, .apply_store_root_enrollment => false,
+            .accept_relational_index_delivery, .ack_relational_index_publication, .apply_store_root_enrollment => false,
             else => true,
         });
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
@@ -16433,7 +16538,8 @@ pub const RaftApplyStore = struct {
     /// A preflight is only a hint. Committed apply repeats every check against
     /// its own transaction before staging either progress record.
     pub fn validateRelationalIndexOwnerAck(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
-        var txn = try self.store.beginReadTxn();
+        if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.InvalidGenerationPublication;
+        var txn = try self.beginIndexedReportRead(group_id);
         defer txn.abort();
         _ = try self.prepareRelationalIndexOwnerAckTxn(&txn, group_id, bytes);
     }
@@ -16691,11 +16797,58 @@ pub const RaftApplyStore = struct {
         }
     };
 
-    /// Read-only ordered acceptance preparation. No production command stages
-    /// these postimages until the decoder/snapshot and native-consumer barriers
-    /// are implemented. Source delivery success alone still permits no deletion.
+    /// Read-only preparation; the accepting command additionally enforces its
+    /// coordinated decoder floor. Native consumption remains a separate effect.
     fn prepareRelationalIndexSourceAcceptanceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: @import("../relational_index_delivery_journal.zig").Request) !@import("../relational_index_delivery_journal.zig").Prepared {
         return @import("../relational_index_delivery_journal.zig").prepare(self.alloc, txn, group, request, SourceDeliveryAuthority{ .store = self });
+    }
+
+    pub fn validateRelationalIndexSourceAcceptance(self: *RaftApplyStore, group: u64, bytes: []const u8) !void {
+        if (bytes.len == 0 or bytes.len > index_delivery.max_command_bytes) return error.InvalidGenerationPublication;
+        var txn = try self.beginIndexedReportRead(group);
+        defer txn.abort();
+        var prepared = try self.parseRelationalIndexSourceAcceptanceTxn(&txn, group, bytes);
+        defer prepared.deinit();
+    }
+    fn parseRelationalIndexSourceAcceptanceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !index_delivery.Prepared {
+        if (bytes.len == 0 or bytes.len > index_delivery.max_command_bytes) return error.InvalidGenerationPublication;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.index_delivery_version);
+        var request = try std.json.parseFromSlice(index_delivery.Request, self.alloc, bytes, .{ .max_value_len = 128 });
+        defer request.deinit();
+        return self.prepareRelationalIndexSourceAcceptanceTxn(txn, group, request.value);
+    }
+    fn acceptRelationalIndexDeliveryTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
+        var prepared = self.parseRelationalIndexSourceAcceptanceTxn(txn, group, bytes) catch |err| switch (err) {
+            // Preflight may lose current authority before ordered apply. These
+            // paths have staged no writes; status resolves ambiguous outcomes.
+            error.GenerationPublicationChanged, error.IndexOwnerReceiptChanged, error.PrivateIndexOwnerJobChanged => return,
+            else => return err,
+        };
+        defer prepared.deinit();
+        try prepared.stage(txn, group);
+    }
+    pub fn relationalIndexSourceAcceptanceStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, query: index_delivery.Query) ![]u8 {
+        try query.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.index_delivery_version);
+        var buf: [192]u8 = undefined;
+        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, query.table_id)));
+        if (!std.mem.eql(u8, &head.plan_id, &query.id)) return error.GenerationPublicationChanged;
+        const ordinal = try index_publication.ownerOrdinal(&txn, group, query.table_id, query.group_id);
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, query.table_id, ordinal)));
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group)))).incarnation;
+        const raw = try stagingGet(&txn, try index_delivery.sourceKey(&buf, group, query.table_id, ordinal));
+        var accepted: ?index_delivery.Head = null;
+        if (raw) |bytes| {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(bytes, &hash, .{});
+            if (!std.mem.eql(u8, &hash, &owner.source_delivery) or bytes.len <= index_delivery.Head.encoded_len) return error.InvalidCatalogRecord;
+            accepted = try index_delivery.Head.decode(bytes[0..index_delivery.Head.encoded_len]);
+            if (!std.mem.eql(u8, &accepted.?.metadata_incarnation, &incarnation)) return error.GenerationPublicationChanged;
+        } else if (!std.mem.allEqual(u8, &owner.source_delivery, 0)) return error.InvalidCatalogRecord;
+        const pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null;
+        return std.json.Stringify.valueAlloc(alloc, index_delivery.Status{ .query = query, .head = accepted, .replication_pending = pending }, .{});
     }
 
     /// Shared fixed-directory/catalog/range checks, not a caller-supplied
@@ -20806,6 +20959,9 @@ pub const RaftApplyStore = struct {
         reallocation_request_pending,
         catalog_revision,
         index_publication_proof,
+        index_delivery_source,
+        index_delivery_target,
+        standalone_native_owner,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -20862,6 +21018,9 @@ pub const RaftApplyStore = struct {
         .{ .projection = .index_publication_inputs, .key = .{ .prefix = index_publication.inputsPrefix } },
         .{ .projection = .index_publication_dispatch, .key = .{ .prefix = index_publication.dispatchPrefix } },
         .{ .projection = .index_publication_proof, .key = .{ .prefix = index_publication.proofsPrefix } },
+        .{ .projection = .index_delivery_source, .key = .{ .prefix = index_delivery.sourcesPrefix } },
+        .{ .projection = .index_delivery_target, .key = .{ .prefix = index_delivery.targetsPrefix } },
+        .{ .projection = .standalone_native_owner, .key = .{ .point = standalone_native_owner.key } },
         .{ .projection = .fk_generation_work, .key = .{ .prefix = fk_generation_publication.workPrefixForGroup } },
         .{ .projection = .fk_generation_table_lock, .key = .{ .prefix = fk_generation_publication.tableLockPrefix } },
         .{ .projection = .fk_initial_create, .key = .{ .prefix = fk_generation_publication.initialPrefixForGroup } },
@@ -20893,6 +21052,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .accept_relational_index_delivery => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
             .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
@@ -20967,7 +21127,8 @@ pub const RaftApplyStore = struct {
         };
         // Table publication and DROP update lifecycle roots in the same cut.
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
-            mask | metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
+            mask | metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) |
+                metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
         else
@@ -23370,6 +23531,7 @@ pub const RaftApplyStore = struct {
             .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
             .begin_relational_index_publication => |bytes| try self.beginRelationalIndexPublicationTxn(txn, group_id, bytes),
             .ack_relational_index_publication => |bytes| try self.ackRelationalIndexPublicationTxn(txn, group_id, bytes),
+            .accept_relational_index_delivery => |bytes| try self.acceptRelationalIndexDeliveryTxn(txn, group_id, bytes),
             .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
             .apply_store_root_enrollment => |bytes| self.applyStoreRootEnrollmentTxn(txn, group_id, bytes) catch |err| switch (err) {
                 error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.UnknownStore => {},
@@ -28752,6 +28914,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    accept_relational_index_delivery = 80,
     ack_relational_index_publication = 79,
     begin_relational_index_publication = 78,
     apply_relation_reconciliation = 76,
@@ -28930,6 +29093,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .ack_relational_index_publication => |bytes| {
             if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.ack_relational_index_publication));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .accept_relational_index_delivery => |bytes| {
+            if (bytes.len == 0 or bytes.len > index_delivery.max_command_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.accept_relational_index_delivery));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_fk_initial_create => |bytes| {
@@ -29365,6 +29533,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .ack_relational_index_publication => blk: {
             if (encoded.len > index_publication.max_ack_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .ack_relational_index_publication = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .accept_relational_index_delivery => blk: {
+            if (encoded.len > index_delivery.max_command_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .accept_relational_index_delivery = try readRequiredString(alloc, encoded, &pos) };
         },
         .apply_fk_initial_create => blk: {
             if (encoded.len > fk_generation_publication.max_bytes + 16) return error.CatalogCommandTooLarge;
@@ -33345,13 +33517,18 @@ fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows
     };
     var head_prefix_buf: [160]u8 = undefined;
     const heads_prefix = try index_publication.headPrefix(&head_prefix_buf, group_id);
+    var native_key_buf: [192]u8 = undefined;
+    const native_key = try standalone_native_owner.key(&native_key_buf, group_id);
     var required_version: u16 = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        if (std.mem.startsWith(u8, row.key, heads_prefix)) {
+        if (std.mem.eql(u8, row.key, native_key)) {
+            _ = try standalone_native_owner.decode(row.value);
+            required_version = @max(required_version, topology_protocol.index_delivery_version);
+        } else if (std.mem.startsWith(u8, row.key, heads_prefix)) {
             _ = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.Head.decode(row.value);
             required_version = topology_protocol.index_publication_head_version;
-            break; // Highest profile currently emitted by these records.
+            break; // Heads and their acceptance directory share decoder v41.
         } else if (std.mem.startsWith(u8, row.key, tables_prefix)) {
             if ((try borrowTableProjection(row.value, .identity)).schema_reader_requirements != null) {
                 required_version = @max(required_version, topology_protocol.schema_reader_publication_version);
@@ -33662,8 +33839,8 @@ fn verifyRelationClaims(registry: anytype, claims: []const relation_names.Claim)
 /// Shared only by verification of the new private index-job record classes.
 /// Snapshots without these records/index-build locks keep their existing path.
 const IndexPublicationVerification = struct {
-    expected: [8]usize = @splat(0),
-    received: [8]usize = @splat(0),
+    expected: [10]usize = @splat(0),
+    received: [10]usize = @splat(0),
     has_records: bool = false,
 
     /// Reverse cohort proof: each current range of a live job must resolve to
@@ -33723,13 +33900,14 @@ const IndexPublicationVerification = struct {
     }
 
     fn verifyTableCut(a: std.mem.Allocator, reader: anytype, group: u64, id: u64) !index_progress.Head {
-        return verifyTableCutWithReceiptCount(a, reader, group, id, null);
+        return verifyTableCutWithReceiptCount(a, reader, group, id, null, null);
     }
 
-    fn verifyTableCutWithReceiptCount(a: std.mem.Allocator, reader: anytype, group: u64, id: u64, receipt_count: ?*usize) !index_progress.Head {
+    fn verifyTableCutWithReceiptCount(a: std.mem.Allocator, reader: anytype, group: u64, id: u64, receipt_count: ?*usize, delivery_counts: ?*[2]usize) !index_progress.Head {
         var proof = try index_publication.verifyOwned(a, reader, group, id);
         defer proof.deinit();
         if (receipt_count) |count| count.* = proof.receipt_count;
+        if (delivery_counts) |count| count.* = proof.delivery_counts;
         var buf: [160]u8 = undefined;
         const current = decodeTableRecord(a, try reader.get(try tableKeyForGroup(&buf, group, id))) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -33757,13 +33935,20 @@ const IndexPublicationVerification = struct {
 
     fn feed(self: *@This(), a: std.mem.Allocator, reader: anytype, group: u64, key: []const u8, value: []const u8) !void {
         var buf: [160]u8 = undefined;
-        if (std.mem.startsWith(u8, key, index_publication.allGroupsPrefix())) {
+        if (try index_delivery.Key.parse(key)) |delivery_key| {
+            if (delivery_key.group != group) return error.InvalidCatalogRecord;
+            self.has_records = true;
+            self.received[if (delivery_key.kind == .source) @as(usize, 8) else 9] += 1;
+        } else if (std.mem.startsWith(u8, key, index_publication.allGroupsPrefix())) {
             if (try index_publication.groupFromKey(key) != group) return error.InvalidCatalogRecord;
             self.has_records = true;
             if (try index_publication.sourceKey(key, group)) |source| switch (source) {
                 .plan => |id| {
                     var receipt_count: usize = 0;
-                    const head = try verifyTableCutWithReceiptCount(a, reader, group, id, &receipt_count);
+                    var delivery_counts: [2]usize = undefined;
+                    const head = try verifyTableCutWithReceiptCount(a, reader, group, id, &receipt_count, &delivery_counts);
+                    self.expected[8] = std.math.add(usize, self.expected[8], delivery_counts[0]) catch return error.InvalidCatalogRecord;
+                    self.expected[9] = std.math.add(usize, self.expected[9], delivery_counts[1]) catch return error.InvalidCatalogRecord;
                     self.expected[7] = std.math.add(usize, self.expected[7], receipt_count) catch return error.InvalidCatalogRecord;
                     self.expected[0] += 1;
                     self.expected[1] += switch (head.phase) {
@@ -33804,7 +33989,7 @@ fn verifyIndexPublicationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocSt
     // Forward verification point-reads every required row. Equal reverse counts
     // then exclude extras/orphans without retaining all jobs in a hash table.
     var verification: IndexPublicationVerification = .{};
-    const fns = .{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix, index_publication.ownerGroupsPrefix, index_publication.inputsPrefix, index_publication.dispatchPrefix, index_publication.proofsPrefix, fk_generation_publication.tableLockPrefix };
+    const fns = .{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix, index_publication.ownerGroupsPrefix, index_publication.inputsPrefix, index_publication.dispatchPrefix, index_publication.proofsPrefix, index_delivery.sourcesPrefix, index_delivery.targetsPrefix, fk_generation_publication.tableLockPrefix };
     inline for (fns) |prefix_fn| {
         const owned = try prefix_fn(&buf, group_id);
         var row = try cursor.seekAtOrAfter(owned);

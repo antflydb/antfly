@@ -336,5 +336,7 @@ pub const CatalogProjectionRequest = union(enum) {
     standalone_revision_state: void,
     relational_index_owner_ack_status: @import("../relational_index_publication.zig").Ack,
     relational_index_owner_ack_preflight: []const u8,
+    relational_index_source_accept_status: @import("../relational_index_delivery_journal.zig").Query,
+    relational_index_source_accept_preflight: []const u8,
     validate_store_root_enrollment_protocol: void,
 };

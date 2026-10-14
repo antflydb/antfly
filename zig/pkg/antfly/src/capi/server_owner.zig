@@ -1957,6 +1957,14 @@ pub fn metadataApplyStoreProjection(
                     handle.store.validateRelationalIndexOwnerAck(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
                 },
+                .relational_index_source_accept_status => |input| {
+                    const value = handle.store.relationalIndexSourceAcceptanceStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relational_index_source_accept_preflight => |input| {
+                    handle.store.validateRelationalIndexSourceAcceptance(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
                 .fk_initial_create_prepare => |input| {
                     const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

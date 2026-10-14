@@ -506,12 +506,19 @@ pub const OwnerDecision = struct {
     }
 
     fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {
-        const identity = try self.nativeExecutionIdentity(request);
+        _ = try self.nativeExecutionIdentity(request);
+        try self.requireRetainedNativeBinding(observed);
+    }
+
+    /// Immutable identity only, not live execution permission. Checkpoints use
+    /// this for retained acceptance after cancellation or publication as well.
+    pub fn requireRetainedNativeBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding) !void {
+        const identity = self.owner.owner;
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         _ = try observed.encode();
-        if (observed.authority != .native or !std.mem.eql(u8, &observed.id, &identity.id) or
+        if (observed.authority != .native or !std.mem.eql(u8, &observed.id, &identity.plan_id) or
             !std.mem.eql(u8, &observed.plan_digest, &identity.plan_digest) or
-            !std.mem.eql(u8, &observed.owner_digest, &identity.owner_digest) or observed.ordinal != identity.ordinal or
+            !std.mem.eql(u8, &observed.owner_digest, &identity.fence_digest) or observed.ordinal != identity.ordinal or
             !observed.fence.eql(try privateIndexFence(dispatch.id, dispatch.owner)) or
             !std.mem.eql(u8, &observed.integrity_candidate, &self.head.candidate_digest) or
             !std.mem.eql(u8, &observed.integrity_reserved, &self.head.reservation_digest) or
@@ -1244,6 +1251,7 @@ fn optionalGet(txn: anytype, key: []const u8) !?[]const u8 {
 /// DROP removes the one retained terminal attempt, not an unbounded history.
 /// Active jobs must finish their owner cleanup before ordinary table deletion.
 fn deleteProofs(txn: anytype, group: u64, table: u64, owner: progress.OwnerState) !void {
+    try @import("relational_index_delivery_journal.zig").deleteOwner(txn, group, table, owner);
     var buf: [160]u8 = undefined;
     for (owner.attestations, 0..) |commitment, action| {
         if (!std.mem.allEqual(u8, &commitment, 0)) try txn.delete(try proofKey(&buf, group, table, owner.owner.ordinal, @fromBackingInt(@intCast(action))));
@@ -1283,6 +1291,7 @@ pub const Verified = struct {
     prepared: Prepared,
     head: progress.Head,
     receipt_count: usize,
+    delivery_counts: [2]usize,
 
     pub fn deinit(self: *Verified) void {
         self.prepared.deinit();
@@ -1319,12 +1328,19 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
     if (!std.mem.eql(u8, try txn.get(try inputsKey(&buf, group, table)), prepared.inputs)) return error.InvalidCatalogRecord;
     var counts: [7]u16 = @splat(0);
     var receipt_count: usize = 0;
+    var delivery_counts: [2]usize = @splat(0);
+    var delivery_rows: [2]u64 = @splat(0);
     var cached_enrollment: ?root_enrollment.Identity = null;
     for (prepared.owners, 0..) |expected, i| {
         const owner = progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i)))) catch return error.InvalidCatalogRecord;
         if (!std.meta.eql(owner.owner, expected.owner)) return error.InvalidCatalogRecord;
         if (try ownerOrdinal(txn, group, table, owner.owner.group_id) != i) return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, try txn.get(try dispatchKey(&buf, group, table, @intCast(i))), prepared.dispatch[i])) return error.InvalidCatalogRecord;
+        const accepted = try @import("relational_index_delivery_journal.zig").verifyOwner(a, txn, group, head, owner, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower));
+        delivery_counts[0] += accepted.sources;
+        delivery_counts[1] += accepted.targets;
+        delivery_rows[0] = std.math.add(u64, delivery_rows[0], accepted.source_rows) catch return error.InvalidCatalogRecord;
+        delivery_rows[1] = std.math.add(u64, delivery_rows[1], accepted.target_rows) catch return error.InvalidCatalogRecord;
         for (owner.receipts, 0..) |logical, action_index| {
             const action: progress.Action = @fromBackingInt(@intCast(action_index));
             if (std.mem.allEqual(u8, &logical, 0)) {
@@ -1355,6 +1371,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         };
     }
     if (!std.meta.eql(counts, head.counts)) return error.InvalidCatalogRecord;
+    if (delivery_rows[0] != delivery_rows[1]) return error.InvalidCatalogRecord;
     const pending = switch (head.phase) {
         .installing, .releasing, .published, .canceled => false,
         else => true,
@@ -1370,7 +1387,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         // A terminal attempt may coexist with a newer, unrelated lifecycle job.
         if (held.kind == .index_build) return error.InvalidCatalogRecord;
     }
-    return .{ .plan = parsed, .prepared = prepared, .head = head, .receipt_count = receipt_count };
+    return .{ .plan = parsed, .prepared = prepared, .head = head, .receipt_count = receipt_count, .delivery_counts = delivery_counts };
 }
 
 test "relational index publication durable keys are canonical group scoped and exclude owner progress from namespace sources" {
