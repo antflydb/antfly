@@ -31,6 +31,7 @@ const decide_qualification = @import("../models/gliner_decide_qualification.zig"
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
+const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -518,6 +519,24 @@ pub const ModelRegistry = struct {
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
     /// on the calling thread.
     pub fn pullWithProgress(
+        self: *ModelRegistry,
+        io: std.Io,
+        ref_str: []const u8,
+        hub_config: download.HubConfig,
+        tasks_csv: ?[]const u8,
+        capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
+        caller_sink: download.ProgressSink,
+    ) !void {
+        // Both CLIs and the linked engine use this path. Preserve the cause
+        // and report it here before a caller reduces it to a startup error.
+        return self.pullWithProgressImpl(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, caller_sink) catch |err| {
+            pull_diagnostics.report(ref_str, err);
+            return err;
+        };
+    }
+
+    fn pullWithProgressImpl(
         self: *ModelRegistry,
         io: std.Io,
         ref_str: []const u8,
@@ -2881,4 +2900,51 @@ test "native Moondream2 manifests declare image input for reader and generator r
         for (inputs.items) |item| has_image = has_image or std.mem.eql(u8, item, "image");
         try std.testing.expect(has_image);
     }
+}
+
+test "gliner boundary Transformers wrapper pull manifest qualifies the unchanged real weights" {
+    const source = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "encoder_config");
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    // Copy into the fixture so read-only caches, separate filesystems, and
+    // sandboxed test runs need only read access to the source model.
+    inline for (.{ "model.safetensors", "encoder_config/config.json", "tokenizer.json", "tokenizer_config.json" }) |name| {
+        const from = try std.fs.path.join(a, &.{ source, name });
+        defer a.free(from);
+        try Dir.cwd().copyFile(from, tmp.dir, name, io, .{ .permissions = std.Io.File.Permissions.default_file });
+    }
+    const config = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "models/base/config_transformers.json");
+    defer a.free(config);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    const manifest_json = try synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(manifest_json);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"extract\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"qualified_limits\"") != null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = manifest_json });
+    var manifest = try manifest_mod.loadFromDir(a, directory);
+    defer manifest.deinit();
+    const identity = boundaryIdentity(a, &manifest) orelse return error.TestExpectedQualifiedIdentity;
+    try std.testing.expect(gliner_qualification.hasQualifiedIdentity(identity));
+    try std.testing.expectEqual(gliner_qualification.fastino_gliner25_base_v1_transformers.fingerprint(), identity.fingerprint());
+    // A valid but unreviewed config must not gain extraction advertisement.
+    const changed = try std.mem.replaceOwned(u8, a, config, "\"transformers_version\": \"5.8.0\"", "\"transformers_version\": \"5.8.1\"");
+    defer a.free(changed);
+    // The replacement also changes the inline encoder declaration, so keep
+    // its sidecar consistent while still producing an unreviewed identity.
+    const encoder_path = try std.fs.path.join(a, &.{ source, "encoder_config/config.json" });
+    defer a.free(encoder_path);
+    const original_encoder = try c_file.readFile(a, encoder_path);
+    defer a.free(original_encoder);
+    const changed_encoder = try std.mem.replaceOwned(u8, a, original_encoder, "5.8.0", "5.8.1");
+    defer a.free(changed_encoder);
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = changed_encoder });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = changed });
+    const unreviewed = try synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(unreviewed);
+    try std.testing.expect(std.mem.indexOf(u8, unreviewed, "\"tasks\":[\"extract\"]") == null);
 }
