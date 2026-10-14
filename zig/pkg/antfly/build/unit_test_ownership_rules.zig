@@ -161,6 +161,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "metadata.storage.raft_apply_store.test.",
             "storage.db.query.document_authority.test.",
             "storage.db.query.graph_exec.test.",
+            "storage.db.query.search_exec.test.public graph metric borrowed wire",
             "storage.db.types.test.",
         },
     },

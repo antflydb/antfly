@@ -5067,6 +5067,26 @@ pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8
     return try parseRemoteSearchResult(alloc, body);
 }
 
+/// Decode private sources only for an admitted internal request. Both HTTP
+/// workers and compiled storage owners serialize the same authority envelope.
+pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
+    if (mode == .none) return;
+    if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
+    for (result.hits) |*hit| {
+        if (hit.document_authority != null) return error.InvalidRemoteResponse;
+        const bytes = hit.stored_data orelse return error.InvalidRemoteResponse;
+        const envelope = (try db_mod.types.document_authority.parse(scratch, bytes)) orelse return error.InvalidRemoteResponse;
+        if (envelope.authority.group != group_id or (mode == .hydrate and envelope.document == null)) return error.InvalidRemoteResponse;
+        const proof = try alloc.create(db_mod.types.document_authority.Authority);
+        proof.* = envelope.authority;
+        errdefer alloc.destroy(proof);
+        const document = if (envelope.document) |raw| try alloc.dupe(u8, raw) else null;
+        alloc.free(bytes);
+        hit.stored_data = document;
+        hit.document_authority = proof;
+    }
+}
+
 pub fn parseRemoteHierarchyMatchesAlloc(
     alloc: std.mem.Allocator,
     hierarchy: ?metadata_openapi.QueryHitHierarchy,

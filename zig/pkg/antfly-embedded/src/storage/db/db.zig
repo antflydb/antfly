@@ -130333,12 +130333,7 @@ test "source vector migration namespace reassignment preserves terminal receipts
             try std.testing.expectError(error.VectorMigrationActive, db.reassignIdentityNamespaceForInternalTransition(target));
             try std.testing.expect((try doc_identity.loadNamespaceFromStore(db.core.store)).?.eql(original));
             if (complete) {
-                for (0..256) |_| {
-                    var job = (try vector_migration.load(alloc, db.core.store)).?;
-                    defer job.deinit();
-                    if (job.value.phase == .complete) break;
-                    if (job.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
-                } else return error.VectorMigrationDidNotFinish;
+                try completeVectorMigrationForTest(&db, request.job_id);
             } else {
                 try db.cancelVectorMigration(request.job_id);
                 for (0..256) |_| {
