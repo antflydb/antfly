@@ -4246,6 +4246,114 @@ test "relational index publication standalone projection revision rejects corrup
 /// dispatch; enrollment, observed cuts, fault rejection and reopen verification
 /// remain identical to the storage contract. No production authority bypass.
 pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
+    fn testNativeClaimDelivery(store: *RaftApplyStore, group: u64, head: index_progress.Head, owner: index_progress.OwnerState, current: metadata.StoreRecord, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, proof: index_publication.RootProof) !void {
+        const local = @import("antfly_local_sources");
+        const control = local.storage_db_relational_index_owner_control;
+        var dispatch = blk: {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            break :blk try index_publication.readDispatch(store.alloc, &txn, group, owner.owner);
+        };
+        defer dispatch.deinit();
+        var inputs = blk: {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            break :blk try index_publication.readInputs(store.alloc, &txn, group, head);
+        };
+        defer inputs.deinit();
+        const decision: index_publication.OwnerDecision = .{ .metadata_group_id = group, .metadata_incarnation = proof.identity.metadata_incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value, .inputs = inputs.value };
+        const admission = try decision.nativeAdmission();
+        // Synthetic physical values test only the metadata verifier. They do
+        // not replace the native producer/reopen integration qualification.
+        const binding: local.storage_db_relational_index_owner_job.Binding = .{
+            .id = admission.id,
+            .plan_digest = admission.plan_digest,
+            .owner_digest = admission.owner_digest,
+            .ordinal = admission.ordinal,
+            .authority = .native,
+            .phase = .reserved,
+            .fence = admission.fence,
+            .integrity_before = admission.fence.catalog_digest,
+            .integrity_reserved = admission.reservation_digest,
+            .integrity_candidate = admission.candidate_digest,
+            .schema_before = @splat(3),
+            .physical_before = null,
+            .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(4) },
+            .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(5) },
+            .index = .{ .generation = 2, .slot = 0 },
+            .inputs_digest = @splat(6),
+        };
+        const command: control.ClaimCommand = .{ .binding = binding, .claims = &.{.{ .tuple = "logical-tuple", .parent_table = dispatch.value.table_name, .parent_key = "row", .schema_version = 2 }} };
+        const outcome: control.ClaimOutcome = .{ .binding = binding, .claims_digest = try command.digest(), .position = .{ .namespace = binding.fence.namespace, .sequence = 7 }, .duplicate = false, .claims_added = 1 };
+        const signed: index_publication.SignedClaimDelivery = .{ .outcome = outcome, .proof = try proof.sign(root, try outcome.deliveryDigest()) };
+        var receipt: index_progress.Receipt = .{ .owner = owner.owner, .action = .fenced, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 5 } }, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(8) };
+        const fenced = try index_progress.acknowledge(head, owner, head.revision, receipt);
+        receipt.action = .reserved;
+        receipt.position.native.sequence += 1;
+        const reserved = try index_progress.acknowledge(fenced.head, fenced.owner, fenced.head.revision, receipt);
+        const Fault = enum { none, signature, claims, binding, candidate, canceled, active_job, lifecycle, range, reporter, root_identity, root_generation, reader_role, reader_unknown, source_mode, source_namespace, source_cut, source_unknown, native_binding };
+        inline for (std.meta.tags(Fault)) |fault| {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var buf: [192]u8 = undefined;
+            try txn.put(try index_publication.headKey(&buf, group, head.table_id), &try reserved.head.encode());
+            try txn.put(try index_publication.ownerKey(&buf, group, head.table_id, owner.owner.ordinal), &try reserved.owner.encode());
+            var changed = signed;
+            var changed_command = command;
+            var changed_current = current;
+            var runtimes = [_]metadata.RuntimeGroupStatusReport{current.runtime_statuses[0]};
+            switch (fault) {
+                .none => {},
+                .signature => changed.proof.signature[0] ^= 1,
+                .claims => changed_command.claims = &.{.{ .tuple = "different", .parent_table = dispatch.value.table_name, .parent_key = "row", .schema_version = 2 }},
+                .binding => {
+                    changed_command.binding.owner_digest[0] ^= 1;
+                    changed.outcome.binding = changed_command.binding;
+                    changed.outcome.claims_digest = try changed_command.digest();
+                    changed.proof = try changed.proof.sign(root, try changed.outcome.deliveryDigest());
+                },
+                .candidate => {
+                    changed_command.binding.integrity_candidate[0] ^= 1;
+                    changed.outcome.binding = changed_command.binding;
+                    changed.outcome.claims_digest = try changed_command.digest();
+                    changed.proof = try changed.proof.sign(root, try changed.outcome.deliveryDigest());
+                },
+                .canceled => try txn.put(try index_publication.headKey(&buf, group, head.table_id), &try (try reserved.head.cancel(reserved.head.revision, .requested)).encode()),
+                .active_job => try txn.put(try index_publication.activeKey(&buf, group, head.table_id), &@as([16]u8, @splat(9))),
+                .lifecycle => try txn.delete(try @import("../table_lifecycle_lock.zig").key(&buf, group, head.table_id)),
+                .range => {
+                    var range = dispatch.value.owner.range;
+                    range.doc_identity_shard_id += 1;
+                    const bytes = try encodeRangeRecord(store.alloc, range);
+                    defer store.alloc.free(bytes);
+                    try txn.put(try rangeKeyForGroup(&buf, group, owner.owner.group_id), bytes);
+                },
+                .reporter => changed_current.reporter_incarnation += 1,
+                .root_identity => changed_current.replica_root_incarnation += 1,
+                .root_generation => runtimes[0].lsm_root_generation += 1,
+                .reader_role => changed_current.role = "metadata",
+                .reader_unknown => changed_current.schema_reader = .{},
+                .source_mode => {
+                    runtimes[0].source_authority.?.kind = .raft;
+                    runtimes[0].source_authority.?.sequence = 0;
+                },
+                .source_namespace => runtimes[0].source_authority.?.namespace[0] ^= 1,
+                .source_cut => runtimes[0].source_authority.?.sequence = 6,
+                .source_unknown => runtimes[0].source_authority = null,
+                .native_binding => try txn.delete(try standalone_native_owner.key(&buf, group)),
+            }
+            changed_current.runtime_statuses = &runtimes;
+            _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed_current);
+            switch (fault) {
+                .none => try std.testing.expectEqual(try signed.commitment(), try store.verifyRelationalIndexClaimDeliveryTxn(&txn, group, changed, changed_command)),
+                .signature, .claims => try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.verifyRelationalIndexClaimDeliveryTxn(&txn, group, changed, changed_command)),
+                .binding, .candidate => try std.testing.expectError(error.PrivateIndexOwnerJobChanged, store.verifyRelationalIndexClaimDeliveryTxn(&txn, group, changed, changed_command)),
+                .canceled, .active_job, .lifecycle, .range => try std.testing.expectError(error.GenerationPublicationChanged, store.verifyRelationalIndexClaimDeliveryTxn(&txn, group, changed, changed_command)),
+                else => try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifyRelationalIndexClaimDeliveryTxn(&txn, group, changed, changed_command)),
+            }
+        }
+    }
+
     pub fn run(comptime Driver: type) !void {
         const a = std.testing.allocator;
         const group = group_ids.main_metadata_group_id;
@@ -4350,6 +4458,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try std.testing.expectEqual(before_enrollment.revision + 1, after_enrollment.revision);
                 try std.testing.expectEqual(before_enrollment.projection_revision, after_enrollment.projection_revision);
                 try store.validateRelationalIndexOwnerAck(group, bytes);
+                if (authority == .native) try testNativeClaimDelivery(&store, group, prepared.head, prepared.owners[0], current, root, ack.signed.proof);
                 {
                     const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
                     defer a.free(reply);
@@ -16215,7 +16324,18 @@ pub const RaftApplyStore = struct {
     }
 
     fn requireIndexOwnerRootReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedReceipt, requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements) !void {
-        const proof = signed.proof;
+        return self.requireIndexOwnerRootProofTxn(txn, group_id, signed.receipt.owner, signed.receipt.position, signed.proof, requirements, signed.receipt.action == .canceled or signed.receipt.action == .cancel_released);
+    }
+
+    /// Shared physical authority checks. Callers verify the domain-specific
+    /// signature first; this never interprets a delivery as a publication ACK.
+    fn requireIndexOwnerRootProofTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, owner: index_progress.Owner, cut: @import("antfly_local_sources").storage_db_receipt_position.Position, proof: index_publication.RootProof, requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements, cleanup: bool) !void {
+        try owner.validate();
+        try cut.requireNamespace(owner.namespace);
+        if (owner.authority != switch (proof.authority) {
+            .native => index_progress.Authority.native,
+            .raft => index_progress.Authority.raft,
+        } or (owner.authority == .native) != (cut == .native)) return error.IndexOwnerReceiptChanged;
         self.requireStoreRootEnrollmentTxn(txn, group_id, proof.identity) catch |err| switch (err) {
             error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged => return error.IndexOwnerReceiptChanged,
             else => return err,
@@ -16228,11 +16348,10 @@ pub const RaftApplyStore = struct {
         var buf: [256]u8 = undefined;
         const cluster = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.IndexOwnerReceiptChanged;
         if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(cluster)).incarnation, &proof.identity.metadata_incarnation)) return error.IndexOwnerReceiptChanged;
-        const owner = signed.receipt.owner;
         // Use the current enrolled reporter, never a capability in the ACK.
         // Pre-install cancellation must remain possible after capability loss;
         // its cleanup proves that no candidate became public.
-        if (signed.receipt.action != .canceled and signed.receipt.action != .cancel_released) {
+        if (!cleanup) {
             if (!metadata_table_manager.storeServesTableData(current.role)) return error.IndexOwnerReceiptChanged;
             if (requirements) |required| if (!current.schema_reader.supports(required)) return error.IndexOwnerReceiptChanged;
         }
@@ -16270,7 +16389,7 @@ pub const RaftApplyStore = struct {
             runtime.lsm_root_generation != proof.root_generation or runtime.lsm_root_generation == 0) return error.IndexOwnerReceiptChanged;
         // Raft cuts require the owner observation to have caught up; a native
         // commit sequence is deliberately never compared to a Raft index.
-        switch (signed.receipt.position) {
+        switch (cut) {
             .raft => |position| {
                 if (runtime.source_authority) |state| {
                     if (state.kind != .raft or !std.mem.eql(u8, &state.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(owner.namespace)))
@@ -16287,6 +16406,42 @@ pub const RaftApplyStore = struct {
                     return error.IndexOwnerReceiptChanged;
             },
         }
+    }
+
+    /// Verify one exact target partition against a single current metadata
+    /// cut. Read-only: this is neither source provenance nor source consumption.
+    /// A future durable ACK must repeat these reads in its accepting transaction.
+    pub fn verifyRelationalIndexClaimDeliveryTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedClaimDelivery, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand) ![32]u8 {
+        try signed.verifyFor(command);
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
+        const binding = command.binding;
+        const table_id = binding.fence.namespace.table_id;
+        const owner_group = binding.fence.owner_group_id;
+        var buf: [192]u8 = undefined;
+        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group_id, table_id)));
+        try index_publication.requireActivePointer(txn, group_id, head);
+        const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group_id, table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &binding.id)) return error.GenerationPublicationChanged;
+        const ordinal = try index_publication.ownerOrdinal(txn, group_id, table_id, owner_group);
+        if (ordinal != binding.ordinal) return error.PrivateIndexOwnerJobChanged;
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, table_id, ordinal)));
+        var dispatch = try index_publication.readDispatch(self.alloc, txn, group_id, owner.owner);
+        defer dispatch.deinit();
+        const d = dispatch.value;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        const decision: index_publication.OwnerDecision = .{ .metadata_group_id = group_id, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = d };
+        _ = try decision.nativeClaims(.{ .table_id = table_id, .group_id = owner_group, .id = binding.id, .operation = .build }, binding, command.claims);
+        const range = try decodeRangeRecord(self.alloc, try txn.get(try rangeKeyForGroup(&buf, group_id, owner_group)));
+        defer metadata_table_manager.freeRange(self.alloc, range);
+        if (!metadata_table_manager.rangeRecordsEqual(range, d.owner.range)) return error.GenerationPublicationChanged;
+        try IndexPublicationVerification.verifyAuthority(self.alloc, txn, group_id, d, .{ .table_id = table_id, .name = d.table_name });
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
+        if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+        const claim = (try live.getClaim(.{ .namespace_id = d.namespace_id, .name = d.table_guard.logical_table })) orelse return error.GenerationPublicationChanged;
+        if (claim.kind != .table or claim.phase != .active or claim.table_id != table_id or
+            claim.schema_version != d.table_guard.owner.schema_version or !std.mem.eql(u8, &claim.schema_digest, &d.table_guard.owner.schema_digest)) return error.GenerationPublicationChanged;
+        try self.requireIndexOwnerRootProofTxn(txn, group_id, owner.owner, .{ .native = signed.outcome.position }, signed.proof, head.reader_requirements, false);
+        return signed.commitment();
     }
 
     /// Bounded hot dispatch: point directory/head/owner/projection/catalog/range

@@ -123,6 +123,28 @@ test "relational index publication claim delivery splits actual target bytes and
     try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, plan.coverage(&.{ 0, 0 }));
     try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, plan.coverage(&.{ 0, 2 }));
     try plan.requireTarget(&cohort, 0, binding);
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const control = local.storage_db_relational_index_owner_control;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    const native_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    for (0..plan.group_count) |i| {
+        const command: control.ClaimCommand = .{ .binding = binding, .claims = try plan.groupClaims(i) };
+        const outcome: control.ClaimOutcome = .{ .binding = binding, .claims_digest = try command.digest(), .position = .{ .namespace = binding.fence.namespace, .sequence = 8 + i }, .duplicate = false, .claims_added = 1 };
+        const signed: publication.SignedClaimDelivery = .{ .outcome = outcome, .proof = try (publication.RootProof{
+            .identity = .{ .metadata_incarnation = native_binding.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
+            .reporter_incarnation = 4,
+            .authority = .{ .native = try native_binding.digest() },
+            .root_generation = 9,
+            .signature = undefined,
+        }).sign(root, try outcome.deliveryDigest()) };
+        try signed.verifyPartition(&plan, &cohort, i);
+        // Both byte-split partitions have the same target. One target's valid
+        // signature cannot acknowledge a different subset from that target.
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, signed.verifyPartition(&plan, &cohort, 1 - i));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, signed.verifyPartition(&plan, &cohort, plan.group_count));
+    }
     var wrong = binding;
     wrong.integrity_reserved[0] ^= 1;
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, plan.requireTarget(&cohort, 0, wrong));

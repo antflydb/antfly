@@ -317,6 +317,19 @@ pub const ClaimResponse = union(enum) {
         signing_failure: ?SigningFailure = null,
     },
 
+    /// Transport success or an acknowledged phase is insufficient to retire
+    /// source debt. Return only exact committed, signed target evidence; the
+    /// consumer must still verify current metadata authority independently.
+    pub fn requireSignedDelivery(self: ClaimResponse, request: ClaimRequest) !publication.SignedClaimDelivery {
+        try self.validate(request);
+        if (self != .applied) return error.InvalidPrivateIndexClaimReceipt;
+        const value = self.applied;
+        return .{
+            .outcome = value.outcome,
+            .proof = value.signed_delivery orelse return error.InvalidPrivateIndexClaimReceipt,
+        };
+    }
+
     pub fn validate(self: ClaimResponse, request: ClaimRequest) !void {
         try request.validate(request.group_id);
         switch (self) {
@@ -326,13 +339,11 @@ pub const ClaimResponse = union(enum) {
                 if (value.root_generation == 0 or !std.mem.eql(u8, &binding.id, &request.id) or
                     binding.fence.owner_group_id != request.group_id or binding.fence.namespace.table_id != request.table_id)
                     return error.InvalidPrivateIndexClaimReceipt;
-                try value.outcome.validateFor(.{ .binding = binding, .claims = request.claims });
                 if (value.signed_delivery) |proof| {
                     if (value.signing_failure != null or proof.root_generation != value.root_generation or proof.authority != .native)
                         return error.InvalidPrivateIndexClaimReceipt;
-                    (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
-                    proof.verify(try value.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
-                }
+                    try (publication.SignedClaimDelivery{ .outcome = value.outcome, .proof = proof }).verifyFor(.{ .binding = binding, .claims = request.claims });
+                } else try value.outcome.validateFor(.{ .binding = binding, .claims = request.claims });
             },
         }
     }
@@ -1195,6 +1206,12 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expect(!result.needsSigning());
     try result.response().validate(request);
     const signed = result.response().applied;
+    const delivery = try result.response().requireSignedDelivery(request);
+    try std.testing.expectEqual(try signed.outcome.deliveryDigest(), try delivery.outcome.deliveryDigest());
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, @as(ClaimResponse, .acknowledged).requireSignedDelivery(request));
+    var unsigned = signed;
+    unsigned.signed_delivery = null;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = unsigned }).requireSignedDelivery(request));
     const not_a_publication: publication.SignedReceipt = .{
         .receipt = .{
             .owner = permission.owner.owner,
@@ -1258,6 +1275,7 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expectEqualStrings("ReplicationOutboxPending", pending.applied.outcome.value.error_name.?);
     try std.testing.expect(!pending.needsSigning());
     try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, pending.signNative(root, 2, 3, 4));
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, pending.response().requireSignedDelivery(request));
 
     const build_control: Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build, .build_budget = .{ .records = 7 } };
     driver = .{ .value = permission, .binding = binding };

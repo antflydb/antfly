@@ -6294,3 +6294,61 @@ seals, provenance-backed root repair and data-Raft execution, native validated/
 installed/released evidence and atomic current-proof/reader-floor/catalog/schema
 publication. Do not open the source-consumption or public activation guards on
 the strength of these structural coverage tests.
+
+### Current-authority verification for signed target deliveries
+
+Target deliveries now have an explicit signed evidence type, distinct from a
+publication receipt or source ACK. It checks the exact logical claim set,
+committed native position, signature domain and native signing identity. Its
+partition verifier also checks the shared manifest/schema commitments and exact
+selected source rows. A valid signature for one byte-split partition cannot
+acknowledge another partition sent to the same target. The wire response can
+extract this evidence only from signed, fully mirrored successful delivery;
+unsigned responses, phase acknowledgments and pending mirrors do not qualify.
+Response validation hashes the requested claim set and verifies its signature
+once, rather than repeating both operations when extracting signed evidence.
+
+A read-only metadata transaction verifier independently checks current job
+permission, active pointer, lifecycle lock, admitted owner/range dispatch,
+catalog authority and live table claim, then checks enrolled current physical
+authority. Physical checks are shared with publication receipts: current
+reporter/root identity, root generation, native binding, reader capabilities,
+observed namespace and native cut. Delivery cannot borrow the capability-loss
+exception reserved for authenticated cleanup of an unpublished candidate. No
+full-table scan or schema-sized plan projection is introduced on this path.
+The returned commitment is data, not a lease or source-consumption capability;
+an accepting durable transaction must repeat the authority reads.
+
+Real-store fault checks reject signature/claim substitution, a genuinely signed
+foreign owner/candidate binding, cancellation, active-job/lifecycle/range
+replacement, reporter/root/generation changes, reader-role/capability loss,
+wrong/missing source authority, insufficient observed native cut and removed
+native binding. These fixtures use synthetic physical claim values to qualify
+metadata verification, not to replace actual native production/reopen evidence.
+The existing native/C-ABI suites remain required separately.
+
+The initial union-tag test typing error was corrected. The 87-step Debug run in
+`/private/tmp/antfly-claim-current-authority-final-debug.log` passed with 35
+publication/router tests, eight native page tests, six C-ABI tests, 14 private
+candidate prerequisites, 46 runtime contracts and the decoder barrier, without
+failures or leaks. The subsequent single-pass response-validation refinement
+passed the publication, decoder-barrier, runtime-contract, C-ABI and candidate
+gates in `/private/tmp/antfly-claim-current-authority-single-pass-debug.log`.
+That run ended at 84/87 steps: its last native test hit FileNotFound and the
+runner could not create a cache output path. The entire worktree `.zig-cache`
+was subsequently confirmed absent, with roughly 150 GiB newly free. Our cache
+operation was preview-only and deleted nothing. The unchanged native target
+was rebuilt and rerun in the normal worktree cache; all 53/53 steps passed,
+including all eight native page tests and 14 candidate prerequisites, with no
+failures or leaks. Its log is
+`/private/tmp/antfly-claim-current-authority-native-after-cache-loss-debug.log`.
+Inventory, licensing, Apache-boundary and control-catalog checks passed.
+Original dispositions remain 483 implemented /
+862 unresolved; no new original SQL case or throughput improvement is claimed.
+
+Still required: actual pinned-root source-subset signing, durable all-partition
+source ACKs, source/target EOF inventory seals, provenance-backed root repair,
+data-Raft execution, terminal native publication evidence and atomic schema/
+catalog publication. Source-consumption and public activation guards remain
+closed; a signature or successful read-only verification is not permission to
+discard source batches.

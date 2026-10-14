@@ -42,6 +42,31 @@ pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+/// Exact durable target delivery, not a source ACK or publication receipt.
+/// Verification must additionally read current enrollment, placement, root and
+/// observed cut in the transaction that will accept the delivery.
+pub const SignedClaimDelivery = struct {
+    outcome: native_control.ClaimOutcome,
+    proof: RootProof,
+
+    pub fn verifyFor(self: SignedClaimDelivery, command: native_control.ClaimCommand) !void {
+        try self.outcome.validateFor(command);
+        if (self.proof.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
+        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch
+            return error.InvalidPrivateIndexClaimReceipt;
+        self.proof.verify(try self.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
+    }
+
+    pub fn verifyPartition(self: SignedClaimDelivery, plan: *const local.storage_db_relational_index_owner_job.private_claims.delivery.Plan, cohort: *const local.storage_db_relational_index_owner_job.private_claims.delivery.Cohort, group_index: usize) !void {
+        try plan.requireTarget(cohort, group_index, self.outcome.binding);
+        try self.verifyFor(.{ .binding = self.outcome.binding, .claims = try plan.groupClaims(group_index) });
+    }
+
+    pub fn commitment(self: SignedClaimDelivery) !Digest {
+        return self.proof.commitment(try self.outcome.deliveryDigest());
+    }
+};
+
 /// Signature verification alone is not authority. The metadata apply adapter
 /// must also check the enrolled current root/reporter and exact live placement
 /// in the SAME transaction as its progress CAS. Never accept a service ACK or
