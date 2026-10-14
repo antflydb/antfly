@@ -21018,6 +21018,7 @@ pub const DB = struct {
     /// The artifact digest is verified by the private restore RPC before this
     /// filesystem operation; it is then bound into the target owner's Scope.
     pub fn openVerifiedRestoreSource(staged_generation: *const generation_lifecycle.StagedGeneration, alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, expected_namespace: doc_identity.Namespace) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openVerifiedRestoreSource", .{ staged_generation, alloc, snapshot_root, path, opts, expected_namespace });
         return openVerifiedRestoreSourceWithCancellation(staged_generation, alloc, snapshot_root, path, opts, expected_namespace, .none);
     }
 
@@ -21096,6 +21097,7 @@ pub const DB = struct {
         identity: RestoreIdentity,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, snapshot_root, path, opts, identity, cancellation });
         try staged_generation.validatePath(path);
         var native_generation = try native_backup.validateAndMaterializeWithCancellation(
             alloc,
@@ -21134,6 +21136,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, primary_snapshot_root, path, opts, identity, native_generation, cancellation });
         // Tree-materialized callers may already contain every projection.
         // Remove statically incompatible physical codecs before opening the
         // staged catalog; the manifest-first remote planner calls the primary
@@ -21176,6 +21179,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation", .{ staged_generation, alloc, io, primary_snapshot_root, path, opts, identity, native_generation, cancellation });
         try staged_generation.validatePath(path);
         try classifyIncompatibleNativeProjections(native_generation, opts);
         try restoreSnapshotStoreTo(
@@ -21209,6 +21213,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         complete_runtime_repair: bool,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishMaterializedNativeGenerationWithIo", .{ staged_generation, alloc, io, path, opts, native_generation, complete_runtime_repair });
         try validateInstalledNativeBackupGeneration(
             staged_generation,
             alloc,
@@ -21251,6 +21256,7 @@ pub const DB = struct {
         opts: OpenOptions,
         cancellation: types.CancellationToken,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, snapshot_root, path, opts, cancellation });
         try staged_generation.validatePath(path);
         var native_generation = try native_backup.validateAndMaterializeWithCancellation(
             alloc,
@@ -21687,6 +21693,7 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markRestorePrimaryRestoredForPathWithArtifactWithIo", .{ alloc, io, path, backup_id, location, artifact_sha256, snapshot_path, group_id });
         return try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, io, path, .{
             .backup_id = backup_id,
             .location = location,

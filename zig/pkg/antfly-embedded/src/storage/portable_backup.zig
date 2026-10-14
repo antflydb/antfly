@@ -417,6 +417,7 @@ fn portableBlobIndex(blobs: []const PortableBlob, digest: [std.crypto.hash.sha2.
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExport", .{ alloc, store, out });
     var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, out);
     defer out.* = allocating.toArrayList();
     try exportPortableToWriter(alloc, store, &allocating.writer);

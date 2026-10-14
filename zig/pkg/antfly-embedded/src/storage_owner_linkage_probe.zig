@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout" }) |field| {
+        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout", "staged_generation_layout", "generation_manager_layout", "native_manifest_layout" }) |field| {
             const actual = @field(descriptor, field);
             const expected = @field(engine, field);
             std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
@@ -108,6 +108,10 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io
     if (!std.mem.eql(u8, committed, "{\"n\":3}")) return error.SharedStorageReadBackFailed;
     try exercisePreparedWorker(alloc, db);
     try exerciseFactoryAggregationBackup(alloc, db, root, physical, io);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+    try engine.call("portableExport", .{ alloc, db.core.store, &portable });
+    if (portable.items.len == 0) return error.SharedStorageReadBackFailed;
     try exerciseForeignPredicate(alloc, db);
     try exerciseForeignHook(db);
     db.batch(.{ .row_policy_install_bundle = "reject-this-private-command" }) catch |err| {
@@ -242,6 +246,25 @@ fn exerciseBorrowedRuntime(alloc: std.mem.Allocator, root: []const u8, io: std.I
     if (pinned.materializeWithSink(alloc, io, destination, .none, .{ .ptr = &receipt, .record_fn = Receipt.record })) |_| {
         return error.SharedStorageErrorIdentityLost;
     } else |err| if (err != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
+    _ = try pinned.materializeWithSink(alloc, io, destination, .none, null);
+    const Function = @typeInfo(@FieldType(engine.VTable, "restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation")).pointer.child;
+    const Stage = @typeInfo(@typeInfo(Function).@"fn".param_types[0].?).pointer.child;
+    const Manager = @typeInfo(@FieldType(Stage, "manager")).pointer.child;
+    var manager = Manager.init(alloc);
+    defer manager.deinit();
+    const restore_path = try std.fs.path.join(alloc, &.{ root, "native-restore" });
+    defer alloc.free(restore_path);
+    var transition = try manager.beginExclusive(restore_path);
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const restore_options: db_mod.OpenOptions = .{ .backend_runtime = runtime.ptr(), .staged_generation = &staged, .start_optional_runtimes = false, .start_index_workers = false };
+    _ = try db_mod.DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(&staged, alloc, io, destination, staged.path(), restore_options, .none);
+    var restored = try db_mod.DB.open(alloc, staged.path(), restore_options);
+    defer restored.close();
+    const restored_value = (try restored.get(alloc, "borrowed-row")) orelse return error.SharedStorageReadBackFailed;
+    defer alloc.free(restored_value);
+    if (!std.mem.eql(u8, restored_value, "{}")) return error.SharedStorageReadBackFailed;
 }
 
 fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {

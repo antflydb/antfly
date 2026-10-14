@@ -35,6 +35,14 @@ pub const ReplayCallbacks = struct { progress: db.ReplayProgressHook };
 pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallbacks);
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
 pub const VTable = struct {
+    openVerifiedRestoreSource: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) Outcome(DB),
+    restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) Outcome(void),
+    restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) Outcome(void),
+    restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) Outcome(void),
+    finishMaterializedNativeGenerationWithIo: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, native_generation: *@import("db/native_backup.zig").LoadedManifest, complete_runtime_repair: bool) Outcome(void),
+    restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, cancellation: types.CancellationToken) Outcome(bool),
+    markRestorePrimaryRestoredForPathWithArtifactWithIo: *const fn (alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, backup_id: []const u8, location: []const u8, artifact_sha256: []const u8, snapshot_path: []const u8, group_id: u64) Outcome(void),
+    portableExport: *const fn (std.mem.Allocator, *@import("docstore.zig").DocStore, *std.ArrayList(u8)) Outcome(void),
     resolutionDeinit: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionStart: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionStop: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
@@ -484,7 +492,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 17,
+    version: u32 = 19,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -512,6 +520,9 @@ pub const Descriptor = extern struct {
     resolution_runtime_layout: native.TypeContract,
     promotion_runtime_layout: native.TypeContract,
     pinned_snapshot_layout: native.TypeContract,
+    native_manifest_layout: native.TypeContract,
+    generation_manager_layout: native.TypeContract,
+    staged_generation_layout: native.TypeContract,
     table_fields: [*]const FieldLayout,
     table_field_count: usize,
     backend_fields: [*]const FieldLayout,
@@ -552,18 +563,18 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v17() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v19() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v17();
+    const descriptor = antfly_storage_engine_get_descriptor_v19();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v17" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v19" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -589,10 +600,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v17();
+    return antfly_storage_engine_get_descriptor_v19();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 17 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 19 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
@@ -613,7 +624,7 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
         !descriptor.backup_snapshot_layout.matches(backup_snapshot_layout) or
         !descriptor.resolution_runtime_layout.matches(resolution_runtime_layout) or
         !descriptor.promotion_runtime_layout.matches(promotion_runtime_layout) or
-        !descriptor.pinned_snapshot_layout.matches(pinned_snapshot_layout))
+        !descriptor.staged_generation_layout.matches(staged_generation_layout) or !descriptor.generation_manager_layout.matches(generation_manager_layout) or !descriptor.native_manifest_layout.matches(native_manifest_layout) or !descriptor.pinned_snapshot_layout.matches(pinned_snapshot_layout))
         return error.UnsupportedVersion;
 }
 
@@ -692,4 +703,19 @@ pub const promotion_runtime_layout = blk: {
 pub const pinned_snapshot_layout = blk: {
     @setEvalBranchQuota(1_000_000);
     break :blk native.TypeContract.of(@import("db/core.zig").PinnedStoreSnapshot);
+};
+
+pub const staged_generation_layout = blk: {
+    @setEvalBranchQuota(1_000_000);
+    break :blk native.TypeContract.of(@import("db/generation_lifecycle.zig").StagedGeneration);
+};
+
+pub const generation_manager_layout = blk: {
+    @setEvalBranchQuota(1_000_000);
+    break :blk native.TypeContract.of(@typeInfo(@FieldType(@import("db/generation_lifecycle.zig").StagedGeneration, "manager")).pointer.child);
+};
+
+pub const native_manifest_layout = blk: {
+    @setEvalBranchQuota(1_000_000);
+    break :blk native.TypeContract.of(@import("db/native_backup.zig").LoadedManifest);
 };

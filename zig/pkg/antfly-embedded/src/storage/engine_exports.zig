@@ -17,6 +17,9 @@ const engine = @import("engine.zig");
 const std = @import("std");
 const native = @import("antfly_runtime_abi").native_abi;
 const Exports = @This();
+fn portableExport(alloc: std.mem.Allocator, store: *@import("docstore.zig").DocStore, out: *std.ArrayList(u8)) engine.Outcome(void) {
+    return .{ .value = @import("portable_backup.zig").exportPortable(alloc, store, out) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 const db = @import("db/db.zig");
 const DB = db.DB;
 const Allocator = std.mem.Allocator;
@@ -1897,6 +1900,46 @@ fn sourcePinReconcileReleasedWithBudget(database: *DB, budget: @import("db/sourc
     return .{ .value = @import("db/source_pin.zig").reconcileReleasedWithBudget(database, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn openVerifiedRestoreSource(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) engine.Outcome(DB) {
+    return .{ .value = DB.openVerifiedRestoreSource(staged_generation, alloc, snapshot_root, path, opts, expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(staged_generation, alloc, received_io, snapshot_root, path, opts, identity, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(staged_generation, alloc, received_io, primary_snapshot_root, path, opts, identity, native_generation, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(staged_generation, alloc, received_io, primary_snapshot_root, path, opts, identity, native_generation, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn finishMaterializedNativeGenerationWithIo(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, native_generation: *@import("db/native_backup.zig").LoadedManifest, complete_runtime_repair: bool) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.finishMaterializedNativeGenerationWithIo(staged_generation, alloc, received_io, path, opts, native_generation, complete_runtime_repair) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, cancellation: types.CancellationToken) engine.Outcome(bool) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(staged_generation, alloc, received_io, snapshot_root, path, opts, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn markRestorePrimaryRestoredForPathWithArtifactWithIo(alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8, backup_id: []const u8, location: []const u8, artifact_sha256: []const u8, snapshot_path: []const u8, group_id: u64) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    const received_io = receiver.io();
+    return .{ .value = DB.markRestorePrimaryRestoredForPathWithArtifactWithIo(alloc, received_io, path, backup_id, location, artifact_sha256, snapshot_path, group_id) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 const descriptor: engine.Descriptor = .{
     .table_layout = engine.table_layout,
     .db_layout = engine.db_layout,
@@ -1925,6 +1968,9 @@ const descriptor: engine.Descriptor = .{
     .resolution_runtime_layout = engine.resolution_runtime_layout,
     .promotion_runtime_layout = engine.promotion_runtime_layout,
     .pinned_snapshot_layout = engine.pinned_snapshot_layout,
+    .native_manifest_layout = engine.native_manifest_layout,
+    .generation_manager_layout = engine.generation_manager_layout,
+    .staged_generation_layout = engine.staged_generation_layout,
     .table_fields = engine.table_fields.ptr,
     .table_field_count = engine.table_fields.len,
     .backend_fields = engine.backend_fields.ptr,
@@ -1958,12 +2004,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v17", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v19", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v17", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v19", .visibility = .hidden });
 }
