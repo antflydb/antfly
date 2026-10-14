@@ -329,97 +329,24 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 31;
+pub const storage_format_version: u32 = @import("../common/schema_readers.zig").current_encoding_version;
 
 /// A reader's two independent ceilings. Zero/zero is an unknown legacy
 /// observation, never evidence that a schema may be installed or restored.
 /// This describes implementation support, not a schema identity or owner ACK.
-pub const ReaderCapabilities = struct {
-    semantic_ceiling: u32 = 0,
-    encoding_ceiling: u32 = 0,
-
-    pub const current: ReaderCapabilities = .{
-        .semantic_ceiling = storage_format_version,
-        .encoding_ceiling = storage_format_version,
-    };
-
-    pub fn known(self: ReaderCapabilities) bool {
-        return self.semantic_ceiling != 0 or self.encoding_ceiling != 0;
-    }
-
-    /// Reported support must be an understood profile and belong to a live
-    /// process incarnation. The two ceilings need not be equal.
-    pub fn validForReporter(self: ReaderCapabilities, incarnation: u64) bool {
-        if (!self.known()) return true;
-        return incarnation != 0 and self.validProfile();
-    }
-
-    fn validProfile(self: ReaderCapabilities) bool {
-        return self.semantic_ceiling >= 11 and self.semantic_ceiling <= current.semantic_ceiling and
-            self.encoding_ceiling >= 11 and self.encoding_ceiling <= current.encoding_ceiling;
-    }
-
-    pub fn supports(self: ReaderCapabilities, requirements: ReaderRequirements) bool {
-        return self.validProfile() and
-            requirements.canDecodeFrame(self.encoding_ceiling, self.semantic_ceiling);
-    }
-};
+pub const ReaderCapabilities = @import("../common/schema_readers.zig").ReaderCapabilities;
 
 /// A monotonic cluster floor over all admitted schema identities, including
 /// historical layouts. Zero/zero means inactive, not a schema requirement.
-pub const ReaderFloor = struct {
-    semantic_version: u32 = 0,
-    encoding_version: u32 = 0,
-
-    pub fn active(self: ReaderFloor) bool {
-        return self.semantic_version != 0 or self.encoding_version != 0;
-    }
-
-    pub fn valid(self: ReaderFloor) bool {
-        if (!self.active()) return true;
-        return self.semantic_version >= 11 and self.semantic_version <= storage_format_version and
-            self.encoding_version != 0 and self.encoding_version <= storage_format_version;
-    }
-
-    pub fn include(self: ReaderFloor, requirement: ReaderRequirements) !ReaderFloor {
-        const incoming: ReaderFloor = .{ .semantic_version = requirement.semantic_version, .encoding_version = requirement.encoding_version };
-        if (!self.valid() or !incoming.active() or !incoming.valid()) return error.InvalidSchemaReaderRequirements;
-        return .{
-            .semantic_version = @max(self.semantic_version, incoming.semantic_version),
-            .encoding_version = @max(self.encoding_version, incoming.encoding_version),
-        };
-    }
-
-    pub fn covers(self: ReaderFloor, requirement: ReaderRequirements) bool {
-        const incoming: ReaderFloor = .{ .semantic_version = requirement.semantic_version, .encoding_version = requirement.encoding_version };
-        return self.valid() and incoming.active() and incoming.valid() and
-            self.semantic_version >= requirement.semantic_version and self.encoding_version >= requirement.encoding_version;
-    }
-
-    pub fn admits(self: ReaderFloor, reader: ReaderCapabilities, reporter_incarnation: u64) bool {
-        if (!self.valid() or !reader.validForReporter(reporter_incarnation)) return false;
-        return !self.active() or reader.supports(.{ .semantic_version = self.semantic_version, .encoding_version = self.encoding_version });
-    }
-};
+pub const ReaderFloor = @import("../common/schema_readers.zig").ReaderFloor;
 
 /// Requirements attached to one immutable schema identity. Semantic feature
 /// support and physical frame decoding are separate admission decisions.
-pub const ReaderRequirements = struct {
-    semantic_version: u32,
-    encoding_version: u32,
+pub const ReaderRequirements = @import("../common/schema_readers.zig").ReaderRequirements;
 
-    pub fn fromSchema(schema: TableSchema) ReaderRequirements {
-        return .{ .semantic_version = requiredReaderVersion(schema), .encoding_version = schema.decoded_format_version };
-    }
-
-    pub fn canInterpret(self: ReaderRequirements, capability_ceiling: u32) bool {
-        return self.semantic_version >= 11 and self.semantic_version <= capability_ceiling;
-    }
-
-    pub fn canDecodeFrame(self: ReaderRequirements, decoder_ceiling: u32, capability_ceiling: u32) bool {
-        return self.encoding_version != 0 and self.encoding_version <= decoder_ceiling and self.canInterpret(capability_ceiling);
-    }
-};
+pub fn readerRequirementsForSchema(schema: TableSchema) ReaderRequirements {
+    return .{ .semantic_version = requiredReaderVersion(schema), .encoding_version = schema.decoded_format_version };
+}
 
 test "relational index system schema reader floor joins independent dimensions without regression" {
     const inactive: ReaderFloor = .{};
@@ -620,10 +547,10 @@ test "relational index system schema reader requirements preserve precise column
         defer freeSchema(a, current);
         try std.testing.expectEqual(expected.version, requiredReaderVersion(current));
         try std.testing.expectEqual(storage_format_version, current.decoded_format_version);
-        const original_requirements = ReaderRequirements.fromSchema(restored);
+        const original_requirements = readerRequirementsForSchema(restored);
         try std.testing.expect(original_requirements.canDecodeFrame(expected.version, expected.version));
         try std.testing.expect(!original_requirements.canInterpret(expected.version - 1));
-        const current_requirements = ReaderRequirements.fromSchema(current);
+        const current_requirements = readerRequirementsForSchema(current);
         try std.testing.expect(current_requirements.canInterpret(expected.version));
         try std.testing.expect(current_requirements.canDecodeFrame(storage_format_version, expected.version));
         if (expected.version < storage_format_version) try std.testing.expect(!current_requirements.canDecodeFrame(expected.version, expected.version));

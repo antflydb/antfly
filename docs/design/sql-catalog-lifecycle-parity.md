@@ -5386,3 +5386,37 @@ Five focused reader/original contracts and all eight independent PostgreSQL
 generated-expression tests passed. Formatting, Apache boundary/license checks,
 control-catalog freshness and original inventory integrity passed. No original
 disposition changed, and no rollout barrier is claimed by these results.
+
+### Storage-independent reader admission contract
+
+ReaderCapabilities, ReaderRequirements and ReaderFloor now share the pure
+common/schema_readers contract. Metadata no longer imports physical schema
+implementation to name its capability/floor types. Native schema feature
+derivation remains in readerRequirementsForSchema; immutable epochs cache its
+result exactly as before. The physical ASCH writer version is sourced from the
+shared encoding ceiling so transport and durable encoding cannot drift. The
+semantic ceiling is independently named rather than inferred from encoding.
+
+The contract validates required dimensions before joining or covering a floor,
+retains zero/zero only as an inactive floor or unknown implementation claim,
+and requires an actual reporter incarnation for a known claim. Its standalone
+Debug test exercises asymmetric ceilings, monotonic joins, unknown/zero,
+partial and future-version rejection. This is a prerequisite for typed durable
+table/manifest requirements, not their activation: server-derived publication
+requirements and exact same-root owner installation ACKs remain unfinished.
+
+Main was merged at 8e962ee4e2. Its error-ABI conflict retained every one of main's
+647 Detail entries at the original numeric position, placing branch additions
+after them; all 27 Debug error transport tests passed. The initial merged data
+gate encountered sandbox EPERM on localhost bind and then a teardown panic.
+The same compiled distributed UNIQUE/FK merge/split/restart regression passed
+without skips or leaks when rerun with socket access. This does not qualify the
+entire initial gate; the complete Debug gates are being rerun with that access.
+
+The final reader-admission gate including the pure CI test passed 64/64 build
+steps: one standalone contract test and both two-test metadata/data owners,
+without skips or leaks. Apache boundary (2,056 sources), license headers,
+control-catalog generation/freshness, Zig formatting and original inventory
+checks passed. The broader integrated and native Debug runs remain in flight;
+their pending results are not counted as passes. Cache GC was previewed only
+(DRY_RUN=1); no caches were deleted.

@@ -25,8 +25,8 @@ const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
 const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
 const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
-pub const SchemaReaderCapabilities = @import("antfly_local_sources").storage_schema.ReaderCapabilities;
-pub const SchemaReaderFloor = @import("antfly_local_sources").storage_schema.ReaderFloor;
+pub const SchemaReaderCapabilities = @import("antfly_local_sources").common_schema_readers.ReaderCapabilities;
+pub const SchemaReaderFloor = @import("antfly_local_sources").common_schema_readers.ReaderFloor;
 
 pub fn requireSchemaReaderAtFloor(floor: SchemaReaderFloor, incoming: StoreRecord) !void {
     if (!floor.valid()) return error.InvalidSchemaReaderRequirements;

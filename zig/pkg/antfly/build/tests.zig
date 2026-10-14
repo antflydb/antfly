@@ -2834,6 +2834,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = data_tests_addTests_result.run_lib_data_runtime_tests;
     const run_lib_data_storage_tests = data_tests_addTests_result.run_lib_data_storage_tests;
     const reader_admission_step = b.step("antfly-store-reader-admission-test", "Verify durable decoder readiness and incarnation-bound schema reader advertisement");
+    const reader_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/common/schema_readers.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const reader_contract_run = b.addRunArtifact(reader_contract_tests);
+    reader_admission_step.dependOn(&reader_contract_run.step);
+    unit_test_step.dependOn(&reader_contract_run.step);
     for ([_]struct { module: *std.Build.Module, filters: []const []const u8 }{
         .{ .module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog schema reader readiness"} },
         .{ .module = data_consumer_module, .filters = &.{"data runtime schema reader"} },

@@ -79,6 +79,7 @@ pub const common_process_memory_budget = @import("common/process_memory_budget.z
 pub const common_prometheus = @import("common/prometheus.zig");
 pub const common_provider_limits = @import("common/provider_limits.zig");
 pub const common_provider_registry = @import("common/provider_registry.zig");
+pub const common_schema_readers = @import("common/schema_readers.zig");
 pub const common_secret_contract = @import("common/secret_contract.zig");
 pub const common_secret_record = @import("common/secret_record.zig");
 pub const common_secrets = @import("common/secrets.zig");

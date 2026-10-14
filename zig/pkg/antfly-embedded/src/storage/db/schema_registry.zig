@@ -54,7 +54,7 @@ pub const Epoch = struct {
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
         errdefer physical_layout.deinit();
         const epoch = try alloc.create(Epoch);
-        epoch.* = .{ .alloc = alloc, .schema = owned_schema, .reader_requirements = .fromSchema(owned_schema), .physical_layout = physical_layout };
+        epoch.* = .{ .alloc = alloc, .schema = owned_schema, .reader_requirements = schema_mod.readerRequirementsForSchema(owned_schema), .physical_layout = physical_layout };
         return epoch;
     }
 
@@ -90,7 +90,7 @@ pub const Epoch = struct {
         epoch.* = .{
             .alloc = alloc,
             .schema = owned_schema,
-            .reader_requirements = .fromSchema(owned_schema),
+            .reader_requirements = schema_mod.readerRequirementsForSchema(owned_schema),
             .physical_layout = physical_layout,
             .validator = owned_validator,
         };
