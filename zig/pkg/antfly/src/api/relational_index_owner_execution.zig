@@ -247,7 +247,7 @@ pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
         408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
-        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation }) |err| {
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
         else => {},
@@ -517,7 +517,25 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     if (table_name.len == 0) return error.InvalidGenerationPublication;
     var permission = try decision(alloc, metadata, hot_request, context);
     defer permission.deinit();
-    if (permission.value.disposition == .acknowledged) return .acknowledged;
+    if (permission.value.disposition == .acknowledged) {
+        const grant = permission.value.attestation orelse return .acknowledged;
+        if (!std.mem.eql(u8, grant.table_name, table_name)) return error.GenerationPublicationChanged;
+        try context.ensureActive();
+        const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
+            .fence => .fenced,
+            .reserve => .reserved,
+        } };
+        var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
+        errdefer recovered.deinit();
+        const outcome = recovered.outcome.value orelse return error.PrivateIndexRootRecoveryRequired;
+        try outcome.validateRecovery(receipt_request);
+        const receipt = outcome.receipt orelse return error.PrivateIndexRootRecoveryRequired;
+        if (!std.meta.eql(receipt.owner, permission.value.owner.owner) or
+            !std.mem.eql(u8, &receipt.candidate_digest, &permission.value.head.candidate_digest) or
+            !std.mem.eql(u8, &receipt.reservation_digest, &permission.value.head.reservation_digest) or
+            !std.mem.eql(u8, &try receipt.digest(), &permission.value.owner.receipts[@backingInt(receipt.action)])) return error.PrivateIndexRootRecoveryRequired;
+        return .{ .recovered = .{ .root_generation = recovered.root_generation, .outcome = recovered.outcome, .signing = .{ .context = .{ .view = grant.signing, .expected_revision = permission.value.head.revision, .request = request } } } };
+    }
     const identity = try permission.value.nativeExecutionIdentity(hot_request);
     try requireTable(permission.value, table_name);
     const signing: SigningState = .{ .context = if (permission.value.native_signing) |view| .{ .view = view, .expected_revision = permission.value.head.revision, .request = request } else null };
@@ -1096,6 +1114,52 @@ test "relational index publication native receiver signs pinned authority and pr
     try recovered_response.validate(request);
     try std.testing.expectEqual(@as(u64, 10), recovered_response.recovered.signed_ack.?.signed.proof.root_generation);
     try std.testing.expectEqual(@as(usize, 1), driver.controls);
+    {
+        const progress = local.storage_db_relational_index_publication_progress;
+        const accepted = try progress.acknowledge(permission.head, permission.owner, permission.head.revision, unsigned.receipt.?);
+        var owner = accepted.owner;
+        owner.attestations[0] = try ack.signed.commitment();
+        const readonly: publication.OwnerDecision = .{
+            .metadata_group_id = permission.metadata_group_id,
+            .metadata_incarnation = permission.metadata_incarnation,
+            .head = accepted.head,
+            .owner = owner,
+            .disposition = .acknowledged,
+            .attestation = .{ .table_name = plan.before.name, .identity = try dispatch.value.nativeIdentity(owner.owner), .signing = view },
+        };
+        try readonly.requireRequest(request.lookup(.permission));
+        try std.testing.expectError(error.InvalidGenerationPublication, readonly.nativeExecutionIdentity(request.lookup(.permission)));
+        try std.testing.expectError(error.InvalidGenerationPublication, readonly.nativeControl(request.lookup(.permission), unsigned.binding));
+        var attest_driver: TestDriver = .{ .value = readonly, .receipt_result = unsigned, .root_generation = 27 };
+        var renewed = try step(alloc, &attest_driver, &attest_driver, plan.before.name, request, .{});
+        defer renewed.deinit();
+        try std.testing.expect(renewed == .recovered and renewed.needsSigning());
+        try std.testing.expectEqual(@as(usize, 1), attest_driver.recoveries);
+        try std.testing.expectEqual(@as(usize, 0), attest_driver.inspections);
+        try std.testing.expectEqual(@as(usize, 0), attest_driver.admissions);
+        try std.testing.expectEqual(@as(usize, 0), attest_driver.controls);
+        attest_driver.root_generation = 28;
+        try renewed.signNative(root, 2, 3, 4);
+        const refreshed_response = try renewed.response();
+        try refreshed_response.validate(request);
+        try std.testing.expectEqual(@as(u64, 27), refreshed_response.recovered.signed_ack.?.signed.proof.root_generation);
+        try std.testing.expectEqual(accepted.head.revision, refreshed_response.recovered.signed_ack.?.expected_revision);
+        try std.testing.expectEqualDeep(unsigned, renewed.outcome().?);
+        const reads = attest_driver.recoveries;
+        try std.testing.expectError(error.GenerationPublicationChanged, step(alloc, &attest_driver, &attest_driver, "wrong table", request, .{}));
+        try std.testing.expectEqual(reads, attest_driver.recoveries);
+        attest_driver.receipt_result = null;
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, step(alloc, &attest_driver, &attest_driver, plan.before.name, request, .{}));
+        var different_cut = unsigned;
+        different_cut.position.sequence += 1;
+        different_cut.receipt.?.position.native.sequence += 1;
+        try different_cut.validateRecovery(.{ .identity = readonly.attestation.?.identity, .effect = .fenced });
+        attest_driver.receipt_result = different_cut;
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, step(alloc, &attest_driver, &attest_driver, plan.before.name, request, .{}));
+        try std.testing.expectEqual(@as(usize, 0), attest_driver.admissions);
+        try std.testing.expectEqual(@as(usize, 0), attest_driver.controls);
+        try std.testing.expectEqual(error.PrivateIndexRootRecoveryRequired, claimHttpFailure(503, "PrivateIndexRootRecoveryRequired").?);
+    }
     driver.receipt_result.?.receipt = null;
     driver.receipt_result.?.replication_pending = true;
     driver.receipt_result.?.error_name = "ReplicationOutboxPending";

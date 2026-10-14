@@ -255,6 +255,11 @@ pub const NativeSigningView = struct {
 };
 
 pub const OwnerDecision = struct {
+    pub const Attestation = struct {
+        table_name: []const u8,
+        identity: native_control.Identity,
+        signing: NativeSigningView,
+    };
     metadata_group_id: u64,
     metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
     head: progress.Head,
@@ -263,6 +268,9 @@ pub const OwnerDecision = struct {
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
     native_signing: ?NativeSigningView = null,
+    /// Read-only recovery of an already accepted latest stage. This is never
+    /// execution permission, schema input, or an index allocation request.
+    attestation: ?Attestation = null,
 
     pub fn requireRequest(self: OwnerDecision, request: OwnerRequest) !void {
         try request.validate();
@@ -273,6 +281,24 @@ pub const OwnerDecision = struct {
         if (self.native_signing) |view| {
             if (self.disposition != .execute or self.owner.owner.authority != .native) return error.InvalidCatalogRecord;
             try view.validate(self.metadata_incarnation);
+        }
+        if (self.attestation) |grant| {
+            if (self.disposition != .acknowledged or self.owner.owner.authority != .native or
+                self.dispatch != null or self.inputs != null or self.native_signing != null or grant.table_name.len == 0)
+                return error.InvalidCatalogRecord;
+            const action: progress.Action = switch (request.operation) {
+                .fence => .fenced,
+                .reserve => .reserved,
+                else => return error.InvalidCatalogRecord,
+            };
+            if ((try self.owner.latestReceiptAction()) != action or std.mem.allEqual(u8, &self.owner.attestations[@backingInt(action)], 0)) return error.InvalidCatalogRecord;
+            try grant.identity.validate();
+            if (!std.mem.eql(u8, &grant.identity.id, &self.head.plan_id) or
+                !std.mem.eql(u8, &grant.identity.plan_digest, &self.head.plan_digest) or
+                !std.mem.eql(u8, &grant.identity.owner_digest, &self.owner.owner.fence_digest) or
+                grant.identity.ordinal != self.owner.owner.ordinal or grant.identity.owner_group_id != request.group_id or
+                !grant.identity.namespace.eql(self.owner.owner.namespace)) return error.InvalidCatalogRecord;
+            try grant.signing.validate(self.metadata_incarnation);
         }
     }
 

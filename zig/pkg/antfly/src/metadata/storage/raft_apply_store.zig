@@ -4687,6 +4687,27 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 var renewed = current;
                 renewed.runtime_statuses = &new_runtimes;
                 try store.applyStandaloneCommand(group, .{ .upsert_store = renewed });
+                if (authority == .native) {
+                    const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
+                    defer a.free(reply);
+                    var read_only = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
+                    defer read_only.deinit();
+                    try read_only.value.requireRequest(owner_request);
+                    try std.testing.expectEqual(.acknowledged, read_only.value.disposition);
+                    try std.testing.expect(read_only.value.attestation != null);
+                    try std.testing.expect(read_only.value.dispatch == null and read_only.value.inputs == null and read_only.value.native_signing == null);
+                    try std.testing.expectEqualStrings(plan.before.name, read_only.value.attestation.?.table_name);
+                    try std.testing.expectEqual(@as(u64, 2), read_only.value.head.revision);
+                    try std.testing.expectError(error.InvalidGenerationPublication, read_only.value.nativeExecutionIdentity(owner_request));
+                    var substituted = read_only.value;
+                    substituted.attestation.?.identity.namespace.range_id += 1;
+                    try std.testing.expectError(error.InvalidCatalogRecord, substituted.requireRequest(owner_request));
+                    substituted = read_only.value;
+                    substituted.attestation.?.signing.binding_digest[0] ^= 1;
+                    try std.testing.expectError(error.InvalidCatalogRecord, substituted.requireRequest(owner_request));
+                } else {
+                    try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(a, group, owner_request));
+                }
                 var refreshed = ack;
                 refreshed.signed.proof.root_generation = new_runtimes[0].lsm_root_generation;
                 refreshed.signed.proof = try refreshed.signed.proof.sign(root, try refreshed.signed.receipt.digest());
@@ -4714,6 +4735,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 }
                 ack = refreshed;
                 ack.expected_revision = 3;
+                {
+                    const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
+                    defer a.free(reply);
+                    var current_decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
+                    defer current_decision.deinit();
+                    try std.testing.expectEqual(.acknowledged, current_decision.value.disposition);
+                    try std.testing.expect(current_decision.value.attestation == null and current_decision.value.dispatch == null and current_decision.value.inputs == null);
+                }
                 try verifyRelationRecoveryForTest(&store, a, group);
             }
             {
@@ -16329,7 +16358,31 @@ pub const RaftApplyStore = struct {
         try index_publication.requireActivePointer(&txn, group_id, head);
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         var decision: index_publication.OwnerDecision = .{ .metadata_group_id = group_id, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = permission };
-        if (permission == .acknowledged) return std.json.Stringify.valueAlloc(alloc, decision, .{});
+        var attest = false;
+        if (permission == .acknowledged) {
+            const action: ?index_progress.Action = switch (request.operation) {
+                .fence => .fenced,
+                .reserve => .reserved,
+                .validate => .validated,
+                .install => .installed,
+                .release => .released,
+                .cancel => .canceled,
+                .cancel_release => .cancel_released,
+                .build => null,
+            };
+            if (head.phase != .published and head.phase != .canceled and action != null and (try owner.latestReceiptAction()) == action) {
+                const retained = try stagingGet(&txn, try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, action.?)) orelse return error.InvalidCatalogRecord;
+                const accepted = try index_publication.storedReceipt(retained, head, owner, action.?);
+                self.requireIndexOwnerRootReceiptTxn(&txn, group_id, accepted, head.reader_requirements) catch |err| switch (err) {
+                    error.IndexOwnerReceiptChanged => attest = true,
+                    else => return err,
+                };
+            }
+            if (!attest) return std.json.Stringify.valueAlloc(alloc, decision, .{});
+            // Later native phases need their own durable receipt recovery;
+            // never report an old root's proof as a fresh acknowledgment.
+            if (owner.owner.authority != .native or (request.operation != .fence and request.operation != .reserve)) return error.IndexOwnerReceiptChanged;
+        }
         const lock = (try @import("../table_lifecycle_lock.zig").read(&txn, group_id, request.table_id)) orelse return error.GenerationPublicationChanged;
         if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &head.plan_id)) return error.GenerationPublicationChanged;
         var dispatch = try index_publication.readDispatch(self.alloc, &txn, group_id, owner.owner);
@@ -16347,6 +16400,16 @@ pub const RaftApplyStore = struct {
         const schema_digest = if (after) d.successor_schema_digest else d.table_guard.owner.schema_digest;
         if (claim.kind != .table or claim.phase != .active or claim.table_id != request.table_id or
             claim.schema_version != schema_version or !std.mem.eql(u8, &claim.schema_digest, &schema_digest)) return error.GenerationPublicationChanged;
+        if (attest) {
+            const signing = (try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation)) orelse return error.IndexOwnerReceiptChanged;
+            const current = (try self.loadStoreHeaderTxn(&txn, group_id, signing.identity.store_id)) orelse return error.IndexOwnerReceiptChanged;
+            defer metadata_table_manager.freeStore(self.alloc, current);
+            if (!metadata_table_manager.storeServesTableData(current.role)) return error.IndexOwnerReceiptChanged;
+            if (head.reader_requirements) |requirements| if (!current.schema_reader.supports(requirements)) return error.IndexOwnerReceiptChanged;
+            decision.attestation = .{ .table_name = d.table_name, .identity = try d.nativeIdentity(owner.owner), .signing = signing };
+            try decision.requireRequest(request);
+            return std.json.Stringify.valueAlloc(alloc, decision, .{});
+        }
         decision.dispatch = d;
         if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
         var inputs: ?std.json.Parsed(index_publication.Inputs) = null;

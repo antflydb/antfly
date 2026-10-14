@@ -5955,3 +5955,47 @@ replacement root lacks durable stage data. Publication must revalidate the
 accepted physical evidence against the current owner cut and commit the joined
 reader floor, catalog and schema decision together. Public producers remain off
 until those boundaries and their distributed recovery faults are qualified.
+
+### Read-only native receipt re-attestation
+
+Metadata now distinguishes a logically acknowledged live stage whose accepted
+physical proof no longer matches its current root. For the existing native
+fenced/reserved receipt stages, it issues a compact read-only attestation grant
+after repeating the live table/range/name/lifecycle cut and validating current
+signer enrollment, role and reader capabilities. The grant contains only the
+native identity, table name and signing view: no schema inputs, allocation or
+mutation permission. It disappears once the current proof is accepted.
+
+The native control receiver recovers the existing durable receipt under its
+physical-root lease and verifies its exact logical digest against metadata.
+Signing preserves that lease's root generation and the granted head revision;
+a later routing/signing lookup cannot relabel the read. Missing or different
+local state returns `PrivateIndexRootRecoveryRequired`, a classified 503, with
+zero admissions or controls. Historical stages do not get this grant; stale
+data-Raft and unsupported later-native proofs fail closed instead of being
+reported as fresh native acknowledgments.
+
+Debug tests exercise automatic grant issuance/retirement, swapped namespace or
+signing view, zero-write recovery, immutable recovered outcomes, root-generation
+pinning, mutation-method rejection, wrong table, missing local receipts and a
+different but internally valid native cut. The focused publication/ACK gates
+passed 69/69 steps with linked 32 publication, four HTTP and one decoder tests.
+An earlier test-local shadowing error was corrected; that failed build is not
+qualification evidence. The final combined Debug metadata/service/reader/catalog/
+initial-FK/restore/publication/ACK/progress gate passed 179/179 steps and 278/278
+standard-protocol tests. Linked runners passed 244 metadata-store, 318 control,
+226 runtime, 139 service, 28 replication, 19 initial-FK, 25 restore and 32
+publication tests plus reader and HTTP checks. Two optional live PostgreSQL CDC
+tests skipped prerequisites; no failures or leaks remained. Counts overlap and
+are not original SQL-case totals. Formatting, inventory integrity, licensing,
+Apache boundary and control-catalog freshness checks passed. The latter needed
+a read-only rerun after sampling confirmed macOS timezone startup was blocking
+Python before repository code. GC was preview-only. No original SQL disposition
+changes, full SQL release pass, public activation or push is claimed.
+
+Repair is still a separate prerequisite: a missing private stage cannot be
+reconstructed by trusting a phase counter or minting a new position. Use
+provenance-checked native root/journal recovery before re-driving control work,
+and add the remaining post-reservation native receipt production. Then revalidate
+current physical evidence in the atomic reader-floor/catalog/schema decision
+before enabling the original public index/ALTER cohorts.
