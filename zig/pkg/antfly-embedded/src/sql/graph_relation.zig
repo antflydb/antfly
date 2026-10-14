@@ -53,7 +53,9 @@ fn expressionType(binding: Binding, expr: *const cypher.ast.Expr) ast.ColumnType
             const match = binding.definition.query.clauses[0].operation.match;
             for (match.paths) |path| {
                 for (path.edges) |edge| if (edge.alias) |alias| if (std.mem.eql(u8, alias, variable)) {
-                    break :blk if (std.mem.eql(u8, property.name, "weight")) .number else .json;
+                    // Cypher properties, including weight, can have arbitrary data
+                    // types. No relationship property schema is declared here.
+                    break :blk .json;
                 };
                 for (path.nodes) |node| if (node.alias) |alias| if (std.mem.eql(u8, alias, variable)) {
                     var kind: ?ast.ColumnType = null;
@@ -77,13 +79,14 @@ fn expressionType(binding: Binding, expr: *const cypher.ast.Expr) ast.ColumnType
             }
             break :blk .json;
         },
-        .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "count") or std.ascii.eqlIgnoreCase(call.name, "size") or std.ascii.eqlIgnoreCase(call.name, "length") or std.ascii.eqlIgnoreCase(call.name, "toInteger")) .integer else if (std.ascii.eqlIgnoreCase(call.name, "elementId") or std.ascii.eqlIgnoreCase(call.name, "antfly.documentKey") or std.ascii.eqlIgnoreCase(call.name, "toString") or std.ascii.eqlIgnoreCase(call.name, "toLower") or std.ascii.eqlIgnoreCase(call.name, "toUpper")) .string else if (std.ascii.eqlIgnoreCase(call.name, "toFloat") or std.ascii.eqlIgnoreCase(call.name, "avg")) .number else .json,
+        .call => |call| callType(binding, call),
         .binary => |binary| switch (binary.op) {
             .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or", .xor, .in, .starts_with, .ends_with, .contains, .regex => .boolean,
             else => blk: {
                 const left = expressionType(binding, binary.left);
                 const right = expressionType(binding, binary.right);
-                if (left == .integer and right == .integer) break :blk .integer;
+                if (binary.op == .add and left == .string and right == .string) break :blk .string;
+                if (left == .integer and right == .integer and binary.op != .power) break :blk .integer;
                 if ((left == .integer or left == .number) and (right == .integer or right == .number)) break :blk .number;
                 break :blk .json;
             },
@@ -95,6 +98,30 @@ fn expressionType(binding: Binding, expr: *const cypher.ast.Expr) ast.ColumnType
         .comparison, .list_predicate, .exists => .boolean,
         else => .json,
     };
+}
+fn callType(binding: Binding, call: cypher.ast.Function) ast.ColumnType {
+    const name = call.name;
+    for ([_][]const u8{ "count", "size", "length", "toInteger" }) |function| if (std.ascii.eqlIgnoreCase(name, function)) return .integer;
+    for ([_][]const u8{ "elementId", "antfly.documentKey", "toString", "toLower", "toUpper", "trim", "ltrim", "rtrim", "substring", "type" }) |function| if (std.ascii.eqlIgnoreCase(name, function)) return .string;
+    if (std.ascii.eqlIgnoreCase(name, "toBoolean")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "toFloat") or std.ascii.eqlIgnoreCase(name, "avg")) return .number;
+    if (call.args.len == 1) {
+        const input = expressionType(binding, call.args[0]);
+        if (std.ascii.eqlIgnoreCase(name, "min") or std.ascii.eqlIgnoreCase(name, "max")) return input;
+        if (std.ascii.eqlIgnoreCase(name, "reverse") and input == .string) return .string;
+        if (std.ascii.eqlIgnoreCase(name, "abs") or std.ascii.eqlIgnoreCase(name, "sum")) return if (input == .integer or input == .number) input else .json;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) {
+        var common: ?ast.ColumnType = null;
+        for (call.args) |arg| {
+            if (arg.value == .literal and arg.value.literal == .null) continue;
+            const kind = expressionType(binding, arg);
+            if (common) |previous| if (kind != previous) return .json;
+            common = kind;
+        }
+        return common orelse .json;
+    }
+    return .json;
 }
 /// Graph entities retain their wire envelope at SQL's JSON boundary; ordinary
 /// user maps remain ordinary maps, including keys named type or value.

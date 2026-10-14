@@ -388,6 +388,23 @@ pub const Value = union(enum) {
         }
     }
 };
+/// Entity properties accept finite data, including nested Antfly maps/lists,
+/// but never graph handles. Validate before any mutation or JSON normalization:
+/// assigning a handle to itself would otherwise introduce a serialization cycle.
+pub fn validatePropertyValue(value: Value) error{ CypherInvalidPropertyValue, CypherValueDepthExceeded }!void {
+    try validatePropertyDepth(value, 0);
+}
+fn validatePropertyDepth(value: Value, depth: usize) error{ CypherInvalidPropertyValue, CypherValueDepthExceeded }!void {
+    if (depth > 64) return error.CypherValueDepthExceeded;
+    switch (value) {
+        .node, .relationship, .path => return error.CypherInvalidPropertyValue,
+        .number => |number| if (!std.math.isFinite(number)) return error.CypherInvalidPropertyValue,
+        .map => |entries| for (entries) |entry| try validatePropertyDepth(entry.value, depth + 1),
+        .list => |items| for (items) |item| try validatePropertyDepth(item, depth + 1),
+        else => {},
+    }
+}
+
 /// An entity cannot have a null-valued property in Cypher. SQL NULL and
 /// document JSON null both appear as absence at the entity boundary; nulls
 /// inside a user map or list remain data and are preserved.

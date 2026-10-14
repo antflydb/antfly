@@ -258,6 +258,7 @@ pub const Overlay = struct {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return error.CypherTransactionRequired;
+        try mutation.validateProperties();
         switch (mutation) {
             .create_node => |node| {
                 if (self.findNode(node.identity) != null) return error.CypherDuplicateIdentity;

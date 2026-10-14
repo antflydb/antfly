@@ -32,6 +32,15 @@ pub const Mutation = union(enum) {
     remove_properties: struct { target: v.EntityIdentity, names: []const []const u8 },
     delete_node: struct { identity: v.Identity, detach: bool },
     delete_relationship: v.RelationshipIdentity,
+    pub fn validateProperties(self: Mutation) !void {
+        const entries = switch (self) {
+            .create_node => |node| node.properties,
+            .create_relationship => |relationship| relationship.properties,
+            .set_properties => |update| update.properties,
+            else => return,
+        };
+        try v.validatePropertyValue(.{ .map = entries });
+    }
 };
 /// All returned values are allocated in the supplied execution allocator and
 /// remain valid through execution. Read callbacks enforce row/field policies

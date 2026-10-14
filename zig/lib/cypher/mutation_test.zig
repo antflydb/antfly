@@ -518,3 +518,55 @@ test "invalid property access and decimal overflow abort all writes" {
     try std.testing.expectEqual(@as(usize, 0), fixture.commits);
     try std.testing.expectEqual(@as(usize, 2), fixture.rollbacks);
 }
+
+test "entity property validation precedes mutations and rejects nested handles" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "CREATE (a:Person) CREATE (b:Person {payload:a}) RETURN b",
+        "CREATE (a:Person) SET a.payload=a RETURN a",
+        "CREATE (a:Person) SET a.payload={nested:[a]} RETURN a",
+        "CREATE p=(a:Person)-[r:KNOWS]->(b:Person) SET a.payload=p RETURN a",
+        "CREATE (a:Person)-[r:KNOWS]->(b:Person) SET r.payload=r RETURN r",
+    }) |text| {
+        try std.testing.expectError(error.CypherInvalidPropertyValue, fixture.run(text));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+}
+
+test "relationship and path creation aliases reject prebound declarations on empty inputs" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "MATCH (a:Person)-[r:KNOWS]->(b) CREATE (a)-[r:KNOWS]->(b) RETURN r",
+        "EXPLAIN MATCH (a:Person)-[r:KNOWS]->(b) MERGE (a)-[r:KNOWS]->(b) RETURN r",
+        "CREATE (a:Person)-[r:KNOWS]->(b:Person)-[r:KNOWS]->(c:Person) RETURN r",
+        "MATCH p=(a:Person)-[:KNOWS]->(b) CREATE p=(a)-[:KNOWS]->(b) RETURN p",
+    }) |text| {
+        try std.testing.expectError(error.CypherVariableConflict, fixture.run(text));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rollbacks);
+    }
+}
+
+test "self-loop traversal validates the endpoint label selected by orientation" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seed = try fixture.run("CREATE (a:Person {s:false,t:true})-[:KNOWS]->(a), (b:Person {s:true,t:true})-[:KNOWS]->(b), (c:Person {s:true,t:false})-[:KNOWS]->(c)");
+    seed.deinit();
+    const filtered: root.catalog.Graph = .{ .name = "filtered", .incarnation = 1, .revision = 1, .labels = &.{
+        .{ .name = "Person", .table = "people" },
+        .{ .name = "Source", .table = "people", .predicate = &.{.{ .name = "s", .value = .{ .boolean = true } }} },
+        .{ .name = "Target", .table = "people", .predicate = &.{.{ .name = "t", .value = .{ .boolean = true } }} },
+    }, .relationships = &.{.{ .name = "KNOWS", .index = "links", .source_label = "Source", .target_label = "Target", .stored_type = "knows" }} };
+    for ([_][]const u8{ "MATCH (n:Target)<-[r:KNOWS]-(m) RETURN count(r)", "MATCH (n)-[r:KNOWS]-(m) RETURN count(r)", "MATCH (n:Source)-[r:KNOWS]->(m) RETURN count(r)" }) |text| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, fixture.backend(), filtered, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+    }
+}

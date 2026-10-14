@@ -37,19 +37,10 @@ fn plan(plans: []Plan, table: []const u8) !*Plan {
     for (plans) |*entry| if (std.mem.eql(u8, entry.table, table)) return entry;
     return error.UndefinedGraphTable;
 }
-fn data(value: v.Value) anyerror!void {
-    switch (value) {
-        .node, .relationship, .path => return error.CypherInvalidPropertyValue,
-        .number => |number| if (!std.math.isFinite(number)) return error.CypherInvalidPropertyValue,
-        .map => |entries| for (entries) |entry| try data(entry.value),
-        .list => |items| for (items) |item| try data(item),
-        else => {},
-    }
-}
 pub fn document(a: A, node: *const v.Node) ![]const u8 {
     var properties: std.ArrayList(v.Entry) = .empty;
     for (node.properties) |entry| {
-        try data(entry.value);
+        try v.validatePropertyValue(entry.value);
         if (entry.value != .null) try properties.append(a, entry);
     }
     return std.json.Stringify.valueAlloc(a, v.Value{ .map = properties.items }, .{});
@@ -122,7 +113,7 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *const root.transaction.O
                 } else false;
                 if (!present) return error.CypherDeletedEntity;
             }
-            try data(.{ .map = relationship.properties });
+            try v.validatePropertyValue(.{ .map = relationship.properties });
             edge.metadata_json = try std.json.Stringify.valueAlloc(a, .{ .source_table = relationship.source.table, .target_table = relationship.target.table, .antfly_cypher = .{ .version = @as(u8, 1), .properties = root.wire.Value{ .value = .{ .map = relationship.properties } } } }, .{});
             try entry.edges.append(a, edge);
         }

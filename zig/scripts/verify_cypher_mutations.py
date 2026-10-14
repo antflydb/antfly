@@ -174,7 +174,67 @@ def main():
         assert query("MATCH (a:Document {id:'a'})-[r:LINK]->(b) RETURN r.weight") == [
             [{"type": "number", "value": 1}]
         ]
-        print("18 authenticated Cypher mutation semantics checks passed")
+        for statement in (
+            "CREATE (n:Document {id:'invalid-handle'}) SET n.payload=n RETURN n",
+            "CREATE (n:Document {id:'invalid-handle'}) SET n.payload={nested:[n]} RETURN n",
+            "CREATE (a:Document {id:'invalid-handle'}),(b:Document {id:'invalid-handle',payload:a}) RETURN b",
+            "CREATE p=(a:Document {id:'invalid-handle'})-[r:LINK]->(b:Document {id:'invalid-handle'}) SET r.payload=p RETURN r",
+            "MATCH (a:Document {id:'a'}) SET a.payload=a RETURN a.id",
+        ):
+            invalid = call(f"/graphs/{graph}/query", {"query": statement}, status=400)
+            assert invalid["code"] == "CypherInvalidPropertyValue", invalid
+        assert query("MATCH (n:Document {id:'invalid-handle'}) RETURN count(n)") == [
+            [{"type": "integer", "value": "0"}]
+        ]
+        for prefix in ("", "EXPLAIN "):
+            for verb in ("CREATE", "MERGE"):
+                conflict = call(
+                    f"/graphs/{graph}/query",
+                    {
+                        "query": f"{prefix}MATCH (a:Document {{id:'missing'}})-[r:LINK]->(b) {verb} (a)-[r:LINK]->(b) RETURN r"
+                    },
+                    status=400,
+                )
+                assert conflict["code"] == "CypherVariableConflict", conflict
+        filtered = graph + "_filtered"
+        call(
+            f"/graphs/{filtered}",
+            {
+                "labels": [
+                    {"name": "Document", "table": table},
+                    {"name": "Source", "table": table, "where": {"s": True}},
+                    {"name": "Target", "table": table, "where": {"t": True}},
+                ],
+                "relationships": [
+                    {
+                        "name": "LINK",
+                        "index": "links",
+                        "source_label": "Source",
+                        "target_label": "Target",
+                        "stored_type": "link",
+                    }
+                ],
+            },
+        )
+        try:
+            query(
+                "CREATE (a:Document {id:'target-loop',s:false,t:true})-[:LINK]->(a), (b:Document {id:'both-loop',s:true,t:true})-[:LINK]->(b)"
+            )
+            for pattern in (
+                "(n:Target)<-[r:LINK]-(m)",
+                "(n)-[r:LINK]-(m)",
+                "(n:Source)-[r:LINK]->(m)",
+            ):
+                result = call(
+                    f"/graphs/{filtered}/query",
+                    {"query": f"MATCH {pattern} RETURN n.id"},
+                )
+                assert result["rows"] == [[{"type": "string", "value": "both-loop"}]], (
+                    result
+                )
+        finally:
+            call(f"/graphs/{filtered}", method="DELETE")
+        print("32 authenticated Cypher mutation semantics checks passed")
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")

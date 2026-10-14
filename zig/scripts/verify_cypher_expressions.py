@@ -263,6 +263,32 @@ def main():
         )
         assert sql["rows"] == [["9007199254740993", "1.0"]], sql
         checks += 1
+        for prefix in ("", "EXPLAIN "):
+            empty = query(f"{prefix}MATCH (n:Document) WHERE false RETURN *")
+            assert empty["columns"] == ["n"] and empty["rows"] == [], empty
+            checks += 1
+        for expression, expected in (
+            ("trim(' a ')", "a!"),
+            ("substring('abc',1,1)", "b!"),
+            ("reverse('ab')", "ba!"),
+            ("coalesce(null,'a')", "a!"),
+        ):
+            sql = call(
+                "/sql",
+                {
+                    "statement": f"SELECT g.x || '!' FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS({expression} AS x)) g"
+                },
+            )
+            assert sql["rows"] == [[expected]], sql
+            checks += 1
+        sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT g.x + 1 FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS(abs(-2) AS x,toBoolean('true') AS ok)) g WHERE g.ok"
+            },
+        )
+        assert sql["rows"] == [["3"]], sql
+        checks += 1
         print(f"{checks} native Cypher/SQL expression checks passed")
     finally:
         if created_graph:

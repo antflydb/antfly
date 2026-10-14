@@ -485,3 +485,35 @@ test "numeric scalars and aggregation preserve Cypher precision and spelling" {
     try check("UNWIND [null,1,2.0] AS x RETURN avg(x)", "[[1.5]]");
     try check("UNWIND [] AS x RETURN avg(x)", "[[null]]");
 }
+
+test "bound result schemas survive empty wildcard projections and align trail cells" {
+    for ([_][]const u8{
+        "MATCH (n:Document) WHERE false RETURN *",
+        "MATCH (n:Document) WHERE false RETURN * UNION ALL MATCH (n:Document) WHERE false RETURN *",
+        "CALL { MATCH (n:Document) WHERE false RETURN * } RETURN *",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+        try std.testing.expectEqualStrings("n", result.columns[0]);
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH p=(a:Document {id:'a'})-[r:CITES]->(b)-[s:CITES]->(c) RETURN *", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expect(result.rows.len > 0);
+    for (result.rows) |row| for (result.columns, row) |name, cell| {
+        if (std.mem.eql(u8, name, "r") or std.mem.eql(u8, name, "s")) {
+            try std.testing.expect(cell == .relationship);
+        } else if (std.mem.eql(u8, name, "p")) {
+            try std.testing.expect(cell == .path);
+        } else try std.testing.expect(cell == .node);
+    };
+}

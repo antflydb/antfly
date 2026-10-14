@@ -110,7 +110,6 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         engine.stats.scanned_anchors = initial.scanned_anchors;
         engine.stats.explored_edges = initial.explored_edges;
     };
-    if (compiled.query.explain) engine.columns = try @import("binder.zig").columns(engine.a, graph, compiled.query);
     const rows = try engine.run(compiled.query.clauses, &.{&.{}}, compiled.query.explain, false);
     var combined: std.ArrayList(Row) = .empty;
     try combined.appendSlice(engine.a, rows);
@@ -123,10 +122,13 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         }
         if (!arm.all) combined = try engine.distinct(combined.items);
     }
+    // Result shape is bound independently of row production. In particular,
+    // RETURN * must retain its columns when every branch produces zero rows.
+    engine.columns = try @import("binder.zig").columns(engine.a, graph, compiled.query);
     const output = try engine.a.alloc([]const v.Value, combined.items.len);
     for (combined.items, output) |row, *out| {
-        const cells = try engine.a.alloc(v.Value, row.len);
-        for (row, cells) |entry, *cell| cell.* = try (try engine.readValue(entry.value)).clone(engine.a);
+        const cells = try engine.a.alloc(v.Value, engine.columns.len);
+        for (engine.columns, cells) |name, *cell| cell.* = try (try engine.readValue(lookup(row, name) orelse return error.UnboundCypherVariable)).clone(engine.a);
         out.* = cells;
     }
     const columns = try engine.a.alloc([]const u8, engine.columns.len);
@@ -569,9 +571,10 @@ const Engine = struct {
                     };
                     if (used) continue;
                     if (!std.mem.eql(u8, relationship.index, mapping.index) or !std.mem.eql(u8, relationship.type, mapping.name)) return error.CypherInvalidBackendRelationship;
-                    const target = if (outgoing and relationship.source.eql(current.identity)) relationship.target else if (incoming and relationship.target.eql(current.identity)) relationship.source else continue;
+                    const traversing_out = outgoing and relationship.source.eql(current.identity);
+                    const target = if (traversing_out) relationship.target else if (incoming and relationship.target.eql(current.identity)) relationship.source else continue;
                     const reached = (try self.backend.vtable.get(self.backend.ptr, self.a, target)) orelse continue;
-                    const target_label = if (relationship.source.eql(current.identity)) mapping.target_label else mapping.source_label;
+                    const target_label = if (traversing_out) mapping.target_label else mapping.source_label;
                     if (!self.graph.admits(reached, target_label)) continue;
                     if (mode == .node_simple) {
                         var revisited = false;
@@ -1379,6 +1382,7 @@ const Engine = struct {
     fn mutate(self: *Engine, mutation: backend_mod.Mutation) !void {
         try self.checkpoint();
         const mutate_fn = self.backend.vtable.mutate orelse return error.CypherMutationsUnavailable;
+        try mutation.validateProperties();
         try mutate_fn(self.backend.ptr, self.a, mutation);
         const deletion: ?v.EntityIdentity = switch (mutation) {
             .delete_node => |node| .{ .node = node.identity },

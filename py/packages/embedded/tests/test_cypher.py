@@ -421,3 +421,137 @@ def test_scalar_errors_roll_back_and_numbers_preserve_cypher_semantics(require_n
         )["rows"] == [["9007199254740993", "1.0"]]
     with af.open_hosted(aflite_path) as database:
         assert database.sql("SELECT name FROM docs")["rows"] == [["1.0"]]
+
+
+def test_entity_properties_and_rebound_relationships_reject_before_writes(require_native, aflite_path):
+    definition = {
+        "labels": [{"name": "D", "table": "docs"}],
+        "relationships": [
+            {"name": "LINK", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+        ],
+    }
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT,payload JSONB)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        database.graph_catalog_json({"action": "put", "name": "g", "definition": definition})
+        for query in (
+            "CREATE (a:D) CREATE (b:D {payload:a}) RETURN b",
+            "CREATE (n:D) SET n.payload=n RETURN n",
+            "CREATE (n:D) SET n.payload={nested:[n]} RETURN n",
+            "CREATE p=(a:D)-[r:LINK]->(b:D) SET a.payload=p RETURN a",
+            "CREATE (a:D)-[r:LINK]->(b:D) SET r.payload=r RETURN r",
+            "CREATE (a:D)-[r:LINK {payload:a}]->(b:D) RETURN r",
+        ):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json("g", {"query": query})
+            assert invalid.value.graph_code == "CypherInvalidPropertyValue"
+            assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]
+        for prefix in ("", "EXPLAIN "):
+            for verb in ("CREATE", "MERGE"):
+                with pytest.raises(af.GraphError) as conflict:
+                    database.cypher_json(
+                        "g", {"query": f"{prefix}MATCH (a:D)-[r:LINK]->(b) {verb} (a)-[r:LINK]->(b) RETURN r"}
+                    )
+                assert conflict.value.graph_code == "CypherVariableConflict"
+        database.cypher_json("g", {"query": "CREATE (a:D {name:'a'})-[r:LINK {x:1,weight:'heavy'}]->(b:D {name:'b'})"})
+        for query, code in (
+            ("MATCH (n:D {name:'a'}) SET n.payload=n RETURN n.name", "CypherInvalidPropertyValue"),
+            (
+                "MATCH (a:D)-[r:LINK]->(b) MERGE (a)-[r:LINK]->(b) ON MATCH SET r.x=2 RETURN r.x",
+                "CypherVariableConflict",
+            ),
+        ):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json("g", {"query": query})
+            assert invalid.value.graph_code == code
+    with af.open_hosted(aflite_path) as database:
+        assert database.sql("SELECT name,payload FROM docs ORDER BY name")["rows"] == [["a", None], ["b", None]]
+        weight = database.sql(
+            "SELECT g.weight FROM GRAPH_TABLE(g MATCH ()-[r IS LINK]->() COLUMNS(r.weight AS weight)) g"
+        )
+        assert weight["columns"] == [{"name": "weight", "type": "json"}]
+        assert weight["rows"] == [["heavy"]]
+        assert database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r.x"})["rows"] == [
+            [{"type": "integer", "value": "1"}]
+        ]
+
+
+def test_filtered_self_loops_follow_declared_endpoint_predicates(require_native, aflite_path):
+    labels = [
+        {"name": "D", "table": "docs"},
+        {"name": "Source", "table": "docs", "where": {"s": True}},
+        {"name": "Target", "table": "docs", "where": {"t": True}},
+    ]
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT,s BOOLEAN,t BOOLEAN)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        for graph, source, target in (("all", "D", "D"), ("filtered", "Source", "Target")):
+            database.graph_catalog_json(
+                {
+                    "action": "put",
+                    "name": graph,
+                    "definition": {
+                        "labels": labels,
+                        "relationships": [
+                            {
+                                "name": "LINK",
+                                "index": "links",
+                                "source_label": source,
+                                "target_label": target,
+                                "stored_type": "link",
+                            }
+                        ],
+                    },
+                }
+            )
+        database.cypher_json(
+            "all",
+            {
+                "query": "CREATE (a:D {name:'target',s:false,t:true})-[:LINK]->(a), (b:D {name:'both',s:true,t:true})-[:LINK]->(b), (c:D {name:'source',s:true,t:false})-[:LINK]->(c)"
+            },
+        )
+    with af.open_hosted(aflite_path) as database:
+        for pattern in ("(n:Target)<-[r:LINK]-(m)", "(n)-[r:LINK]-(m)", "(n:Source)-[r:LINK]->(m)"):
+            assert database.cypher_json("filtered", {"query": f"MATCH {pattern} RETURN n.name"})["rows"] == [
+                [{"type": "string", "value": "both"}]
+            ]
+        assert database.sql(
+            "SELECT g.name FROM GRAPH_TABLE(filtered MATCH (n)<-[r IS LINK]-(m) COLUMNS(n.name AS name)) g"
+        )["rows"] == [["both"]]
+
+
+def test_graph_table_scalar_types_and_empty_wildcard_schema(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT,amount BIGINT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        for prefix in ("", "EXPLAIN "):
+            result = database.cypher_json("g", {"query": f"{prefix}MATCH (n:D) RETURN *"})
+            assert result["columns"] == ["n"] and result["rows"] == []
+        database.sql("INSERT INTO docs (name,amount) VALUES (' a ',-1),('b',2)")
+        for expression, expected in (
+            ("trim(n.name)", ["a", "b"]),
+            ("ltrim(n.name)", ["a ", "b"]),
+            ("rtrim(n.name)", [" a", "b"]),
+            ("substring(n.name,1,1)", ["a", ""]),
+            ("reverse(n.name)", [" a ", "b"]),
+            ("coalesce(null,trim(n.name))", ["a", "b"]),
+        ):
+            result = database.sql(
+                f"SELECT g.x || '!' FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS({expression} AS x,n.amount AS amount)) g ORDER BY g.amount"
+            )
+            assert result["rows"] == [[value + "!"] for value in expected]
+        result = database.sql(
+            "SELECT g.name FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(toBoolean('true') AS ok,n.name AS name)) g WHERE g.ok ORDER BY g.name"
+        )
+        assert result["rows"] == [[" a "], ["b"]]
+        result = database.sql("SELECT sum(g.x) FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(abs(n.amount) AS x)) g")
+        assert result["rows"] == [["3"]]
+        for function in ("sum", "min", "max"):
+            result = database.sql(
+                f"SELECT g.x + 1 FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS({function}(n.amount) AS x)) g"
+            )
+            assert result["rows"] == [[{"sum": "2", "min": "0", "max": "3"}[function]]]

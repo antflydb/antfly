@@ -18,6 +18,7 @@ const std = @import("std");
 const cypher = @import("cypher");
 const A = std.mem.Allocator;
 pub fn normalize(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const cypher.value.Node, apply_defaults: bool) !*const cypher.value.Node {
+    try cypher.value.validatePropertyValue(.{ .map = node.properties });
     var document = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, cypher.value.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
     var schema_view = self.core.acquireSchemaView();
     defer if (schema_view) |*view| view.release();

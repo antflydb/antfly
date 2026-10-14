@@ -192,6 +192,16 @@ running floating-point mean to avoid intermediate integer or float sum overflow.
 `toString(float)` retains fractional digits and Java 21/Cypher notation thresholds,
 including negative zero and subnormal values.
 
+Property values are validated before overlay changes or normalization: graph
+handles, even inside maps/lists, raise `CypherInvalidPropertyValue` and roll back.
+Self-loop endpoint predicates follow the selected traversal orientation. CREATE
+and MERGE reject already-bound relationship or path declarations before storage
+admission, including EXPLAIN and empty inputs. Final wildcard column schemas are
+bound independently of row production, and cells follow that bound column order.
+SQL GRAPH_TABLE preserves the scalar types of string/boolean/numeric functions;
+relationship properties remain JSONB until explicitly converted because their
+Cypher values have no declared SQL property schema.
+
 ## Product direction
 
 Build **Antfly Graph**, a Cypher-compatible graph language with Antfly search

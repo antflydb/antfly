@@ -82,8 +82,14 @@ const Binder = struct {
         for (path.edges) |edge| {
             for (edge.types) |name| if (self.graph.relationship(name) == null) return error.UnknownGraphRelationship;
             if (create and (edge.variable_length or edge.types.len != 1 or edge.direction == .both)) return error.CypherInvalidCreateRelationship;
+            if (create) if (edge.alias) |alias| {
+                if (find(scope.*, alias) != null) return error.CypherVariableConflict;
+            };
             try self.declare(scope, edge.alias, if (edge.variable_length) .list else .relationship);
         }
+        if (create) if (path.alias) |alias| {
+            if (find(scope.*, alias) != null) return error.CypherVariableConflict;
+        };
         try self.declare(scope, path.alias, .path);
         for (path.nodes) |node| for (node.properties) |property| try self.expression(scope.*, property.value, false);
         for (path.edges) |edge| for (edge.properties) |property| try self.expression(scope.*, property.value, false);
