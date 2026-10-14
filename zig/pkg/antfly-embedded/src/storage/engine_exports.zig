@@ -240,6 +240,9 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {
+    return .{ .value = self.batchInternalPrepared(req, profile, opts, memo, allocator) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 const descriptor: engine.Descriptor = .{
     .table_layout = engine.table_layout,
     .db_layout = engine.db_layout,
@@ -248,6 +251,9 @@ const descriptor: engine.Descriptor = .{
     .registry_layout = engine.registry_layout,
     .backend_runtime_layout = engine.backend_runtime_layout,
     .resource_manager_layout = engine.resource_manager_layout,
+    .prepared_owner_layout = engine.prepared_owner_layout,
+    .prepared_allocator_layout = engine.prepared_allocator_layout,
+    .embedding_memo_layout = engine.embedding_memo_layout,
     .backend_fields = engine.backend_fields.ptr,
     .backend_field_count = engine.backend_fields.len,
     .resource_fields = engine.resource_fields.ptr,
@@ -268,11 +274,11 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v3", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v4", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v3", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v4", .visibility = .hidden });
 }

@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout" }) |field| {
+        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout" }) |field| {
             const actual = @field(descriptor, field);
             const expected = @field(engine, field);
             std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
@@ -79,6 +79,7 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8) !v
     if (result.hits.len != 1) return error.SharedStorageQueryFailed;
     try db.sync(true);
     try db.reconfigureEnrichmentRuntimePaused(.{});
+    try exercisePreparedWorker(alloc, db);
     try exerciseForeignPredicate(alloc, db);
     try exerciseForeignHook(db);
     db.batch(.{ .row_policy_install_bundle = "reject-this-private-command" }) catch |err| {
@@ -173,4 +174,17 @@ fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
     };
     result.deinit();
     return error.SharedStorageInvalidBatchAccepted;
+}
+
+fn exercisePreparedWorker(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    const Function = @typeInfo(@FieldType(engine.VTable, "batchPrepared")).pointer.child;
+    const Args = std.meta.ArgsTuple(Function);
+    const Memo = @typeInfo(@FieldType(Args, "4")).pointer.child;
+    const Guard = @typeInfo(@FieldType(Args, "5")).pointer.child;
+    var memo = Memo.init(alloc);
+    defer memo.deinit();
+    var guard: Guard = .{ .child = alloc, .io = db.backend_runtime.io().? };
+    try db.batchInternalPrepared(.{ .writes = &.{.{ .key = "prepared-row", .value = "{}" }}, .sync_level = .write }, null, .{}, &memo, &guard);
+    const value = (try db.get(alloc, "prepared-row")) orelse return error.SharedStorageReadBackFailed;
+    defer alloc.free(value);
 }

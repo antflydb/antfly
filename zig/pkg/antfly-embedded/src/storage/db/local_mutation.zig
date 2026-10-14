@@ -753,6 +753,8 @@ pub fn ImplementationFor(comptime D: type) type {
         // Live field borrows keep mutexes, caches and recovery scratch with their
         // actual owner. The synchronous worker never copies owned descriptors.
         pub const PreparedBatchOwner = struct {
+            const NativeBoundary = @import("../named_callback.zig").Boundary(struct { get_fn: @FieldType(PreparedBatchOwner, "get_fn"), wait_fn: @FieldType(PreparedBatchOwner, "wait_fn"), resolved_wait_fn: @FieldType(PreparedBatchOwner, "resolved_wait_fn") });
+            callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
             recovery: bool,
             context: *anyopaque,
             get_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[]u8,
@@ -876,6 +878,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 };
                 var view: PreparedBatchOwner = undefined;
                 inline for (@typeInfo(Execution).@"struct".field_names) |field| @field(view, field) = &@field(receiver, field);
+                view.callback_dispatch = NativeBoundary.local_dispatch;
                 view.recovery = Receiver == *Execution;
                 view.context = @ptrCast(receiver);
                 view.get_fn = if (Receiver == *Execution) null else &Callbacks.get;
@@ -887,7 +890,7 @@ pub fn ImplementationFor(comptime D: type) type {
             }
             pub fn get(self: *PreparedBatchOwner, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
                 const callback = self.get_fn orelse return error.PreparedReadSetChanged;
-                return callback(self.context, alloc, key);
+                return NativeBoundary.call("get_fn", self.callback_dispatch, callback, .{ self.context, alloc, key });
             }
             pub fn bulkSessionActive(self: *PreparedBatchOwner) bool {
                 return self.bulk_fn(self.context);
@@ -896,10 +899,10 @@ pub fn ImplementationFor(comptime D: type) type {
                 self.schedule_fn(self.context);
             }
             pub fn waitForSyncLevelWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool) anyerror!void {
-                return self.wait_fn(self.context, level, version, targets, cancellation, explicit);
+                return NativeBoundary.call("wait_fn", self.callback_dispatch, self.wait_fn, .{ self.context, level, version, targets, cancellation, explicit });
             }
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, cancellation: types.CancellationToken) anyerror!void {
-                return self.resolved_wait_fn(self.context, level, version, cancellation);
+                return NativeBoundary.call("resolved_wait_fn", self.callback_dispatch, self.resolved_wait_fn, .{ self.context, level, version, cancellation });
             }
         };
         pub inline fn ownerField(receiver: anytype, comptime field: []const u8) if (@TypeOf(receiver) == *PreparedBatchOwner or @TypeOf(receiver) == *const PreparedBatchOwner) @TypeOf(@field(receiver, field)) else @TypeOf(&@field(receiver, field)) {

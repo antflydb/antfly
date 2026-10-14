@@ -1085,7 +1085,7 @@ borrowed native state. Conditional runtime implementations have authored names
 so independent compilation units calculate identical type identities. The
 existing error-domain dispatcher transports named failures without copying
 compiler-local numeric error codes. Both products access one handle registry
-and one C API TLS error state. The private v3 descriptor additionally checks
+and one C API TLS error state. The private v4 descriptor additionally checks
 backend-runtime and resource-manager layouts. Named callback dispatch preserves
 project error identities for server-provided mutation, query, replication, TTL,
 repair/capacity and background-job hooks. Query proxies are synchronous and
@@ -1196,3 +1196,15 @@ exact identity across both directions. Resource accounting passed 64/64 steps
 background/storage foundation passed 37 tests. The Linux ELF facade still exports
 exactly the 118 header functions. Linux thread-sanitized CLI fallback compiles.
 Final v3 release and throughput measurements remain pending.
+
+
+The concrete prepared-mutation entry also crosses this owner boundary. Resident
+and recovery contexts borrow the same pointer-based prepared-owner view, memo
+and allocator; their layouts are checked before the owner runs the one compiled
+worker. The view's read/visibility callbacks use named-error dispatch, and the
+allocator retains its originating I/O receiver without copying its mutex. A real
+client-created prepared-worker invocation passes through both native source-owner
+profiles, with read-back verified. Combined replay/SQL/native/C API validation
+passed 103/103 steps, and the final direct-worker/C API run passed 80/80 steps.
+Expanded Debug probe compilation measured 4.47 decimal GB; its 6 GiB reservation
+retains more than 25% margin.

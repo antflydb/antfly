@@ -8382,6 +8382,7 @@ pub const DB = struct {
 
     pub const batchInternalWithPreparationAllocator = local_mutation.batchInternalWithPreparationAllocator;
 
+    pub const PreparedBatchOwner = local_mutation.PreparedBatchOwner;
     pub const batchInternalPrepared = local_mutation.batchInternalPrepared;
 
     /// Exact source replays may omit derived journal work while each existing

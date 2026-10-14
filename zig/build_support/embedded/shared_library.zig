@@ -276,7 +276,8 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
         return b.addRunArtifact(executable);
     }
     module.link_libc = true;
-    const object = b.addObject(.{ .name = name, .root_module = module, .use_llvm = true, .max_rss = 4 * 1024 * 1024 * 1024 });
+    // Expanded Debug native-state probes measured 4.47 decimal GB.
+    const object = b.addObject(.{ .name = name, .root_module = module, .use_llvm = true, .max_rss = @as(u64, if (module.optimize == .debug) 6 else 4) * 1024 * 1024 * 1024 });
     object.entry = .enabled;
     object.bundle_compiler_rt = false;
     object.bundle_ubsan_rt = false;
