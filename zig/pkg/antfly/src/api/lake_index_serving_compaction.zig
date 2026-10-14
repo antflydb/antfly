@@ -38,6 +38,7 @@ const Builder = struct {
     pages: *pages_mod.PageStore,
     terms: *corpus.term_directory.Builder,
     ownership: *corpus.text_directory.Mutations,
+    source_routes: *corpus.text_directory.Mutations,
     open_packs: std.ArrayList(Chunk) = .empty,
     added: std.ArrayList(Chunk) = .empty,
     removed: std.ArrayList(Chunk) = .empty,
@@ -59,6 +60,7 @@ const Builder = struct {
         for (group.summaries, group.segments) |summary, segment| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), sign);
     }
     fn owner(self: *@This(), group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
+        try @import("lake_index_source_routes.zig").mutate(self.a, self.source_routes, group, deleting);
         const a = self.pending_arena[0].child_allocator;
         const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
         defer a.free(bytes);
@@ -249,7 +251,9 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     terms.enableDurable(pages.store());
     var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
     defer ownership.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .pending_arena = .{ .init(a), .init(a) } };
+    var source_routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer source_routes.deinit();
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .pending_arena = .{ .init(a), .init(a) } };
     defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
@@ -258,6 +262,13 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     if (prior) |old| {
+        if (old.source_routes_version == 0) {
+            for (try corpus.text_directory.fileRecords(ca, old, store.*, null, token)) |record| {
+                _ = scratch.reset(.free_all);
+                const group = try corpus.loadFileManifest(scratch.allocator(), store.*, record.manifest, old.domain, token, null);
+                try @import("lake_index_source_routes.zig").mutate(a, &source_routes, group, false);
+            }
+        }
         builder.pack_count = old.segment_count;
         builder.serving_bytes = old.serving_bytes;
         // Paged ownership lookup touches only changed/removed source prefixes.
@@ -317,6 +328,8 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     root.serving = null;
     root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
     root.term_directory = try terms.finish(pages.store(), if (prior) |old| old.term_directory else .{});
+    root.source_routes_version = 1;
+    root.source_routes = try source_routes.finish(if (prior) |old| old.source_routes else null);
     root.pack_ownership = try ownership.finish(if (prior) |old| old.pack_ownership else null);
     root.open_packs = builder.open_packs.items;
     root.file_count = builder.pack_count;
@@ -378,11 +391,21 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             var cache = local.serverless_query_lake_serving_cache.Cache.init(a_);
             defer cache.deinit();
             const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+            var route_store = store_;
+            var route_reads: u64 = 16 * 1024 * 1024;
+            var route_writes: u64 = 0;
+            var route_pages: pages_mod.PageStore = .{ .domain = root_.domain, .artifacts = &route_store, .remaining_read_bytes = &route_reads, .remaining_write_bytes = &route_writes };
+            var route_cache: tree.Cache = .{ .alloc = a_, .underlying = route_pages.store() };
+            defer route_cache.deinit();
             var physical: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
             defer physical.deinit(a_);
             for (0..expected) |i| {
                 const row = try identities.physicalRow(a_, &physical, store_, cached, @intCast(i), "source", "snapshot");
                 try std.testing.expect(row.external.row_ordinal == 10 or row.external.row_ordinal == 11);
+                const route = (try @import("lake_index_source_routes.zig").lookup(a_, route_cache.store(), root_, store_, cached, .none, &physical, row)).?;
+                var ordinal: usize = 0;
+                while (identities.offsets[ordinal + 1] <= i) ordinal += 1;
+                try std.testing.expectEqual(corpus.term_directory.identity(root_.file_groups[ordinal].segments[0].artifact_id), route);
                 try std.testing.expectEqual(@as(?u32, @intCast(i)), try identities.ordinal(a_, &physical, store_, cached, row));
             }
             var actual = try local.search_search.execute(a_, snapshot, .{ .query = .{ .term = .{ .field = "body", .term = "quasar" } }, .k = 3, .include_stored = false, .tie_rank = identities.tie_rank });

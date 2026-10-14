@@ -4572,9 +4572,23 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
 
 
 def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
-    tmp_path, inference_reranker
+    tmp_path, inference_reranker, monkeypatch
 ):
     """Packed runs from 67 independent Parquet files match the full corpus exactly."""
+    import conftest
+
+    original_config = conftest._write_remote_content_e2e_config
+
+    def configured(root, **kwargs):
+        path = original_config(root, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("lake_indexes", {}).setdefault("text_cache", {})[
+            "admission_window_segments"
+        ] = 1
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(conftest, "_write_remote_content_e2e_config", configured)
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "lake"
@@ -4686,9 +4700,11 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
         # separately from the named-component fusion profile below.
         profile_definition = json.loads(json.dumps(definition))
         profile_definition["schema"]["base_source"]["table_id"] = "profile-text"
-        profile_definition["schema"]["relational_indexes"] = []
+        profile_definition["schema"]["relational_indexes"][0]["name"] = (
+            "profile_amount_idx"
+        )
         profile_definition["indexes"] = {
-            "body_text": {"type": "full_text", "field": "body"}
+            "body_text": {"type": "full_text", "store_source": True}
         }
         call("POST", "/tables/profile_text", profile_definition)
         deadline = time.monotonic() + 120
@@ -4767,6 +4783,60 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 (h["_score"], h["_source"]["amount"]) for h in profiled["hits"]["hits"]
             ] == [(score, amount) for _, score, amount in expected[61:80]]
             assert profiled["profile"]["sort"]["plan"] == "score_top_k", profiled
+            assert profiled["profile"]["sort"]["selection_reason"] == (
+                "bounded_global_text_frontier"
+            ), profiled
+            highlighted = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(direct, highlight={"fields": ["body"]}),
+            )
+            assert highlighted["profile"]["sort"]["selection_reason"] == (
+                "bounded_global_text_frontier"
+            ), highlighted
+            assert all(h["_highlights"]["body"] for h in highlighted["hits"]["hits"])
+            metadata_count = call(
+                "POST", "/tables/profile_text/query", dict(direct, limit=0, offset=0)
+            )
+            assert metadata_count["hits"]["total"] == {
+                "value": 201,
+                "relation": "exact",
+            }
+            assert metadata_count["profile"]["sort"]["selection_reason"] == (
+                "native_text_metadata_count"
+            ), metadata_count
+            ordered_query = dict(
+                direct, limit=7, offset=0, order_by=[{"field": "amount", "desc": True}]
+            )
+            ordered = call("POST", "/tables/profile_text/query", ordered_query)
+            assert ordered["profile"]["sort"]["selection_reason"] == (
+                "bounded_ordered_lake_index"
+            ), ordered
+            assert [h["_source"]["amount"] for h in ordered["hits"]["hits"]] == list(
+                range(200, 193, -1)
+            )
+            forward = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(
+                    ordered_query,
+                    search_after=ordered["hits"]["hits"][-1]["_sort"],
+                    remote_snapshot=ordered["remote_snapshot"],
+                ),
+            )
+            assert [h["_source"]["amount"] for h in forward["hits"]["hits"]] == list(
+                range(193, 186, -1)
+            )
+            backward = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(
+                    ordered_query,
+                    search_before=forward["hits"]["hits"][0]["_sort"],
+                    remote_snapshot=forward["remote_snapshot"],
+                ),
+            )
+            assert backward["hits"]["hits"] == ordered["hits"]["hits"]
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
             assert total["value"] <= 201

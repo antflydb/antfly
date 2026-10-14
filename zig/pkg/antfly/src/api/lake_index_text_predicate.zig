@@ -436,6 +436,15 @@ pub const Identities = struct {
             if (self.partial_inventory) return null;
             return error.ExternalLakeSnapshotMismatch;
         };
+        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, row)) orelse return null);
+    }
+    pub fn sourceOrdinal(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, row: local.storage_rowsource_types.RowRef) !?u32 {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        return sourceRank(a, cache, store, cached, span, row);
+    }
+    fn sourceRank(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: Span, row: local.storage_rowsource_types.RowRef) !?u32 {
+        if (row != .external) return error.InvalidNativeLakeRowIndex;
+        const ref = row.external;
         const blocks = try span.blocks(cache, store, cached, ref.file_id);
         const index = corpus.physical.find(blocks, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
         const block = blocks[index];
@@ -449,7 +458,7 @@ pub const Identities = struct {
             if (low < block.lower or low - block.lower >= block.count) return null;
             break :blk low - block.lower;
         };
-        return span.localOrdinal(try std.math.add(u32, block.base, rank));
+        return try std.math.add(u32, block.base, rank);
     }
     /// Binary searches keep native-to-physical lookup logarithmic in files and
     /// physical blocks. Delete holes use the same authenticated rank directory.

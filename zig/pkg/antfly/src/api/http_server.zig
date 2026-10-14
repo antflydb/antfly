@@ -3985,6 +3985,7 @@ pub const ApiHttpServer = struct {
     lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
     lake_recent_text: @import("lake_recent_text_cache.zig").Cache = .{},
+    lake_wal_cuts: @import("lake_wal_cut_cache.zig").Cache = .{},
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
     lake_text_corpora: @import("lake_index_native_text_cache.zig").Cache = .{},
@@ -4748,6 +4749,7 @@ pub const ApiHttpServer = struct {
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
         self.lake_recent_text.deinit();
+        self.lake_wal_cuts.deinit();
         self.lake_native_runtimes.deinit();
         self.lake_text_corpora.deinit();
         if (self.native_query_gc_after) |value| self.alloc.free(value);
@@ -12961,6 +12963,7 @@ pub const ApiHttpServer = struct {
     /// All aliases and public transports share this server-owned cache.
     pub fn prepareLakeCache(self: *ApiHttpServer) !void {
         self.lake_recent_text.attach(self.shared_resource_manager orelse &self.local_resource_manager);
+        self.lake_wal_cuts.attach(self.shared_resource_manager orelse &self.local_resource_manager);
         self.lake_native_runtimes.attach(self.shared_resource_manager orelse &self.local_resource_manager);
         self.lake_text_corpora.attachResourceManager(self.shared_resource_manager orelse &self.local_resource_manager);
         const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};

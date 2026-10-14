@@ -206,15 +206,26 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
     const base = try prefix(a, opened.prefix, binding, options);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
     const suffix = try store.range(a, cut);
+    return normalizePending(a, cut, suffix.lsn, suffix.records);
+}
+pub fn normalizePending(a: A, cut: u64, lsn: u64, records: []const wal.Record) !Pending {
+    return normalizePendingWithBase(a, cut, lsn, null, records);
+}
+/// Final images may borrow an immutable prior cut. Its owner must outlive this
+/// result; new records are parsed only once and replace earlier key images.
+pub fn normalizePendingWithBase(a: A, cut: u64, lsn: u64, base: ?Pending, records: []const wal.Record) !Pending {
     var changes: std.ArrayList(Batch.Change) = .empty;
     var latest: std.StringHashMapUnmanaged(usize) = .empty;
-    var keys: []const []const u8 = &.{};
-    for (suffix.records) |record| {
+    var keys: []const []const u8 = if (base) |previous| previous.key_fields else &.{};
+    if (base) |previous| for (previous.changes) |change| {
+        const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
+        try latest.put(a, identity, changes.items.len);
+        try changes.append(a, change);
+    };
+    for (records) |record| {
         const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
         if (keys.len == 0) keys = batch.key_fields else if (!keyFieldsEqual(keys, batch.key_fields)) return error.LakeSourceConflict;
         for (batch.changes) |change| {
-            var values: std.ArrayList(V) = .empty;
-            for (keys) |field| try values.append(a, change.row.object.get(field) orelse return error.InvalidWal);
             const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
             const entry = try latest.getOrPut(a, identity);
             if (entry.found_existing) changes.items[entry.value_ptr.*] = change else {
@@ -224,7 +235,7 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
             }
         }
     }
-    return .{ .base_lsn = cut, .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
+    return .{ .base_lsn = cut, .lsn = lsn, .key_fields = keys, .changes = changes.items };
 }
 
 test "external lake filesystem maintenance reads ingestion artifacts in the same namespace" {

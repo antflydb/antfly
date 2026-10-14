@@ -25,6 +25,7 @@ pub const Provider = struct {
     now_ms: u64 = 100,
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
+    gets: usize = 0,
     put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     pub fn init(a: A) Provider {
@@ -86,6 +87,7 @@ pub const Provider = struct {
         const self = owner(raw);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        self.gets += 1;
         var c = self.memory.client();
         c.allocator = a;
         const version = options.version_id orelse self.versions.get(name);

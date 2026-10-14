@@ -19305,40 +19305,61 @@ pub fn attachHighlightsWithIndexQueries(
     hits: []types.SearchHit,
     sources: ?[]const ?[]u8,
 ) !void {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
-    for (indexed_queries, 0..) |indexed, index| {
-        const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
-        const start = entries.items.len;
-        try collectHighlightMatchers(arena, lowered, indexed, &entries);
-        for (entries.items[start..]) |*entry| entry.query_index = index;
-    }
-    if (entries.items.len == 0) return;
-
-    const fragment_size = @max(options.fragment_size, 1);
-    const max_fragments = @max(options.max_fragments, 1);
-
-    // Parsed documents live only as long as their own hit so peak memory is
-    // one document, not the whole page.
-    var hit_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer hit_arena_state.deinit();
-
-    for (hits, 0..) |*hit, hit_index| {
-        if (hit.highlights.len > 0) continue;
-        _ = hit_arena_state.reset(.retain_capacity);
-        const hit_arena = hit_arena_state.allocator();
-        const parsed = parsed: {
-            if (sources) |items| if (items[hit_index]) |source|
-                break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, source, .{}) catch continue;
+    var prepared = try PreparedHighlights.init(alloc, options, indexed_queries);
+    defer prepared.deinit();
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    for (hits, 0..) |*hit, index| {
+        if (hit.highlights.len != 0) continue;
+        _ = scratch.reset(.retain_capacity);
+        const a = scratch.allocator();
+        const value = parsed: {
+            if (sources) |items| if (items[index]) |source|
+                break :parsed std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}) catch continue;
             if (hit.source_value) |value| break :parsed value;
-            if (hit.column_source) |source| break :parsed try source.value(&hit_arena_state);
-            const stored = hit.stored_data orelse continue;
-            break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
+            if (hit.column_source) |source| break :parsed try source.value(&scratch);
+            break :parsed std.json.parseFromSliceLeaky(std.json.Value, a, hit.stored_data orelse continue, .{}) catch continue;
         };
+        try prepared.attachValue(alloc, a, hit, value);
+    }
+}
 
+/// Query-owned matchers, shared by batched and streaming source consumers.
+/// Index analysis/schema are borrowed until deinit; output owns every fragment.
+pub const PreparedHighlights = struct {
+    arena: *std.heap.ArenaAllocator,
+    entries: []const HighlightMatcherEntry,
+    indexed_queries: []const HighlightQuery,
+    options: types.HighlightRequest,
+    pub fn init(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery) !PreparedHighlights {
+        const owner = try alloc.create(std.heap.ArenaAllocator);
+        owner.* = .init(alloc);
+        errdefer {
+            owner.deinit();
+            alloc.destroy(owner);
+        }
+        const arena = owner.allocator();
+        var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
+        for (indexed_queries, 0..) |indexed, index| {
+            const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
+            const start = entries.items.len;
+            try collectHighlightMatchers(arena, lowered, indexed, &entries);
+            for (entries.items[start..]) |*entry| entry.query_index = index;
+        }
+        return .{ .arena = owner, .entries = entries.items, .indexed_queries = indexed_queries, .options = options };
+    }
+    pub fn deinit(self: *PreparedHighlights) void {
+        const a = self.arena.child_allocator;
+        self.arena.deinit();
+        a.destroy(self.arena);
+    }
+    /// Parsed source and scratch are borrowed only for this call.
+    pub fn attachValue(self: *const PreparedHighlights, alloc: Allocator, hit_arena: Allocator, hit: *types.SearchHit, parsed: std.json.Value) !void {
+        if (self.entries.len == 0 or hit.highlights.len != 0) return;
+        const indexed_queries = self.indexed_queries;
+        const options = self.options;
+        const fragment_size = @max(options.fragment_size, 1);
+        const max_fragments = @max(options.max_fragments, 1);
         const text_fields = try hit_arena.alloc([]const mapper_mod.HighlightTextField, indexed_queries.len);
         var fields = std.ArrayListUnmanaged([]const u8).empty;
         if (options.fields.len > 0) try fields.appendSlice(hit_arena, options.fields);
@@ -19346,7 +19367,7 @@ pub fn attachHighlightsWithIndexQueries(
             text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValueWithSelectedField(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field);
             if (options.fields.len > 0) continue;
             for (text_fields[query_index]) |contribution| {
-                const referenced = for (entries.items) |entry| {
+                const referenced = for (self.entries) |entry| {
                     if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, contribution.indexed_field)) break true;
                 } else false;
                 if (!referenced) continue;
@@ -19384,7 +19405,7 @@ pub fn attachHighlightsWithIndexQueries(
             }
             for (indexed_queries, 0..) |indexed, query_index| {
                 var processed = std.ArrayListUnmanaged([]const u8).empty;
-                for (entries.items) |entry| {
+                for (self.entries) |entry| {
                     if (entry.query_index != query_index) continue;
                     const matches_field = for (text_fields[query_index]) |contribution| {
                         if (std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) and
@@ -19402,7 +19423,7 @@ pub fn attachHighlightsWithIndexQueries(
                     try processed.append(hit_arena, entry.indexed_field);
 
                     var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
-                    for (entries.items) |candidate| {
+                    for (self.entries) |candidate| {
                         if (candidate.query_index == query_index and
                             std.mem.eql(u8, candidate.indexed_field, entry.indexed_field))
                         {
@@ -19442,11 +19463,11 @@ pub fn attachHighlightsWithIndexQueries(
         }
         if (highlighted.items.len == 0) {
             highlighted.deinit(alloc);
-            continue;
+            return;
         }
         hit.highlights = try highlighted.toOwnedSlice(alloc);
     }
-}
+};
 
 test "attachHighlights marks analyzed, prefix, and substring matches on stored source" {
     const alloc = std.testing.allocator;
@@ -33020,4 +33041,23 @@ test "public graph metric borrowed wire composed search hydrates only fused winn
     try Harness.run(a);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
     std.debug.print("COMPOSED_HYDRATION components=2 candidates=6 component_bodies=0 winner_bodies=2 hydration_batches=1\n", .{});
+}
+
+test "external lake metadata navigation prepared highlights own lazy regex allocators and borrow parsed sources" {
+    const a = std.testing.allocator;
+    const indexed = [_]HighlightQuery{.{ .query = .{ .regexp = .{ .field = "body", .pattern = "qu[a-z]+" } }, .text_analysis = .{}, .runtime_schema = null }};
+    var prepared = try PreparedHighlights.init(a, .{ .fields = &.{"body"} }, &indexed);
+    defer prepared.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var hits = [_]types.SearchHit{ .{ .id = try a.dupe(u8, "one") }, .{ .id = try a.dupe(u8, "two") } };
+    defer for (&hits) |*hit| hit.deinit(a);
+    for (&hits) |*hit| {
+        _ = scratch.reset(.retain_capacity);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), "{\"body\":\"quasar quartz\"}", .{});
+        try prepared.attachValue(a, scratch.allocator(), hit, value);
+        try std.testing.expectEqual(@as(usize, 1), hit.highlights.len);
+    }
+    _ = scratch.reset(.free_all);
+    try std.testing.expectEqualDeep(hits[0].highlights, hits[1].highlights);
 }

@@ -214,6 +214,8 @@ pub const Root = struct {
     checkpoint_removed_count: u32 = 0,
     serving_bytes: u64 = 0,
     pack_ownership: ?statistics.Ref = null,
+    source_routes_version: u8 = 0,
+    source_routes: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
     seekable: bool = false,
     /// Stored JSON contains exactly the binding projection, never an implicit
@@ -282,6 +284,8 @@ pub const Root = struct {
         if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
         if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
+        if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
+        if (self.source_routes) |ref| try ref.validate();
         if (self.open_packs.len > 14) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
@@ -743,7 +747,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.source_routes_version == 1 and root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
@@ -1071,6 +1075,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
         const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
+        root.source_routes_version = 1;
         root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
@@ -1272,6 +1277,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     try validator.pages(root.checkpoint_files);
     try validator.pages(root.checkpoint_removed_files);
     try validator.pages(root.pack_ownership);
+    try validator.pages(root.source_routes);
     try validator.pages(root.term_statistics);
     for (root.statistics_deltas) |run| try validator.pages(run.page);
     try validator.pages(root.term_directory.leaves);

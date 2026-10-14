@@ -1091,6 +1091,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         config = json.loads(path.read_text())
         config["deployment_mode"] = "standalone"
         config["storage"] = {"engine": "local", "local": {"base_dir": str(root)}}
+        config.setdefault("lake_indexes", {}).setdefault("text_cache", {})[
+            "admission_window_segments"
+        ] = 1
         path.write_text(json.dumps(config))
         return path
 
@@ -1272,6 +1275,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         first = call("POST", "/tables/wal_windows/query", query)
         hits = first["hits"]["hits"]
         assert first["profile"]["sort"]["plan"] == "score_top_k", first
+        assert first["profile"]["sort"]["selection_reason"] == (
+            "bounded_global_text_frontier"
+        ), first
         assert len(hits) == 201, first
         rows = {h["_source"]["id"]: h["_source"]["body"] for h in hits}
         assert 1 not in rows and rows[0] == "quasar replacement"

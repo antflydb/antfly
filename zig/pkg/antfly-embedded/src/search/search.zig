@@ -3116,6 +3116,24 @@ pub const TextNavigationPlan = struct {
         }
     }
     pub const RangeBound = struct { upper: f32, possible: bool };
+    /// Exact membership counts for a single positive term (including one-token
+    /// analyzed matches and equivalent wrappers). The caller proves that no
+    /// private visibility mask, residual predicate, or accepted overlay applies.
+    pub fn exactMetadataCount(self: *const TextNavigationPlan) ?u32 {
+        var node = self.root;
+        while (true) switch (node.kind) {
+            .none => return 0,
+            .term => {
+                const term = node.term.?;
+                return (self.stats.fields.get(term.field) orelse return null).frequencies.get(term.term).?.value;
+            },
+            .boolean => {
+                if (node.must_not.len != 0) return null;
+                if (node.must.len == 1 and node.should.len == 0 and node.minimum == 0) node = node.must[0] else if (node.must.len == 0 and node.should.len == 1 and node.minimum == 1) node = node.should[0] else return null;
+            },
+            else => return null,
+        };
+    }
     pub fn bound(self: *const TextNavigationPlan, source: Summaries) !f32 {
         return (try self.rangeBound(source)).upper;
     }
@@ -10181,6 +10199,7 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         defer plan.deinit();
         const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
         try std.testing.expectEqual(try countMatches(a, source.snapshot, query), try countMatchesPrepared(a, source.snapshot, query, plan));
+        if (plan.exactMetadataCount()) |count| try std.testing.expectEqual(try countMatches(a, source.snapshot, query), count);
         // Physical membership wrapping must borrow the analyzed child without
         // bypassing the new required branch.
         const wrapped: SearchQuery = .{ .bool_query = .{ .must = &.{ query, .{ .match_none = {} } } } };

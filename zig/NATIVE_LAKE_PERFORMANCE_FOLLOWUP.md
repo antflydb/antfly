@@ -3689,3 +3689,64 @@ unused old server/test artifacts was safely evicted from this worktree, preservi
 active outputs and restoring E2E disk headroom without overriding safeguards.
 Live-provider retention qualification and archive-scale benchmarking remain
 previously deferred; these checks establish correctness and bounded/reused work.
+
+## Immutable accepted cuts and ordered source routing (protocol 41)
+
+Accepted search reads now pin and validate the WAL floor and immutable tail before
+looking up server-owned normalized cut state. Four descriptor lanes share a
+256 MiB process-accounted budget; each cut has a 128 MiB construction/retention
+bound. Cache keys bind the backend identity, table/object generation, publication,
+schema, queue namespace, base coverage and immutable tail record. Hits perform
+only the floor/tail reads. A later tail extends the nearest cached cut only after
+checking its immutable parent record, reading and parsing the new suffix. Cuts
+retain immutable earlier images through reference-counted owners, with a maximum
+of eight extensions before a full rebuild. Eviction cannot invalidate active
+readers. Pressure uses a bounded private build; no partial cut becomes visible.
+
+The same owner single-flights a publication-specific compressed physical
+replacement mask. It retains data, never a request context, reader lease or
+provider client. Every waiter checks its own deadline; errors discard partial
+mask allocations. Both text and vector execution borrow the mask while their
+cut pin remains live. Retained descriptors still persist their normalized images
+and remain usable after restart, independently of this optional process cache.
+
+Native text v11 serving roots now carry a COW inverse source-route tree under
+reader protocol 41. A key contains the source-file identity and original live
+row rank; its value authenticates the serving segment and physical-hole manifest.
+Ordered row consumers seek a predecessor after translating physical coordinates
+through that manifest. This avoids enumerating all serving packs for a large
+source file. Incremental compaction updates only affected spans. A one-time
+metadata bootstrap upgrades older packed roots. GC, closure auditing and bounded
+startup navigation warming include the new tree; older retained cuts remain
+readable.
+
+Eligible ordered text queries stream bounded batches from an index with proven
+complete tuple/public-ID ordering. Each batch admits only the serving packs
+containing its rows and lowers those rows into native ordinal constraints under
+the same pinned statistics and source authority. A full top-K proves early stop.
+Backward pages use the reverse tuple order. Incomplete ordering or an unproductive
+bounded prefix returns to bounded text windows. A small requested page does not
+require full text-corpus admission. Accepted overlays and full-match evaluation
+retain complete window traversal. Early-stopped totals are explicit lower bounds.
+
+Published-only count requests whose lowered membership is exactly one positive
+term (including a one-token analyzed match) use authenticated global document
+frequency. Exclusions, metadata/authorization filters, private masks, accepted
+rows, distributed statistics and cursor/ordering requests retain normal exact
+membership execution. Profiles identify the shortcut as
+`native_text_metadata_count`; these queries admit no posting readers.
+
+Stored highlights prepare query matchers once per page and consume one borrowed
+parsed source at a time. Stored-block batching remains independent of public hit
+order. Regex matchers retain a stable allocator owner for lazy DFA construction;
+only final snippets transfer to the result allocator.
+
+Operators can tune `lake_indexes.text_cache.admission_window_segments` (1–64,
+default 64) and `admission_window_bytes` (1–32 MiB, default 32 MiB) downward to
+reduce admission granularity. A single immutable serving segment is indivisible.
+These settings control execution windows, not result or candidate limits. Real
+Parquet and Iceberg E2Es set the segment window to one, preserving small independent
+fixtures while forcing multiple serving windows after compaction. They assert the
+selected bounded plan, stored hidden-source highlights, metadata counts, ordered
+forward/backward pages and retained restart results. This supersedes the earlier
+67-source-file test's insufficient inference that file count guaranteed windowing.

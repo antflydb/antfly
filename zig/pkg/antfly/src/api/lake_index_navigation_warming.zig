@@ -222,13 +222,13 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         defer arena.deinit();
         const sa = arena.allocator();
         var domain: [32]u8 = undefined;
-        var selected: [8]?tree.Ref = @splat(null);
+        var selected: [9]?tree.Ref = @splat(null);
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
             const metadata = try @import("lake_index_decoded_metadata.zig").acquire(@import("lake_index_native_text.zig").Directory, cached, store.artifactStore(), declaration.artifact, token, @import("lake_index_native_text.zig").loadDirectory);
             defer metadata.release();
             const root = metadata.value.root;
             domain = root.domain;
-            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files };
+            selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes };
         } else if (declaration.artifact.kind == .ordered_row_index) {
             const root = try @import("lake_index_ordered_rows.zig").loadRoot(sa, store.artifactStore(), declaration.artifact, token, cached);
             domain = root.domain;
