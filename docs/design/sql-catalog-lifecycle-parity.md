@@ -22,6 +22,16 @@ are unresolved family pools, not promises that one implementation closes them.
 
 ## First delivery: catalog and index lifecycle
 
+Within the 308-case DDL/catalog/session pool, the largest unresolved statement
+groups currently include 38 ALTER TABLE, 27 CREATE FUNCTION, 26 CREATE INDEX /
+CREATE UNIQUE INDEX, 19 CREATE TABLE, and 12 COPY cases. These are statement
+counts, not implementation estimates: CREATE FUNCTION needs a separate routine
+execution architecture, while ALTER TABLE and index/table DDL share the current
+publication boundary. Finish and qualify that shared boundary as coherent public
+case batches before expanding into another infrastructure-only subproject.
+Original-case closure remains the progress metric; passing additional component
+tests alone does not reduce the unresolved count.
+
 Public index resolution already exists in `api/sql_catalog.zig`. Preserve its
 bounded single-cut search-path lookup, logical-table authorization, immutable
 owner identity and metadata-owner mutation guard. Do not replace it with a
@@ -5781,3 +5791,53 @@ not original SQL-case totals. No leaks or failures remained in the final run.
 Formatting, licensing, Apache boundary, control-catalog freshness and original
 inventory checks passed. GC was preview-only. No original SQL case credit or
 push is claimed at this checkpoint.
+
+### Admit marked private definitions only behind the durable decoder barrier
+
+Schema-only index/FK publication shape checks now permit the reader marker to
+change with its definition and verify the logical requirements of active and
+retained layouts. A marked predecessor cannot become unmarked. The prospective
+frame must match the current compiler's encoding; an existing frame's encoding
+is not inferred from JSON or silently rewritten. Unrelated table settings remain
+immutable, and allocation failures release compiled layouts.
+
+The native admission boundary requires the durable definition-decoder activation
+before retaining marked index, FK-initial-create, FK-generation or restore plans,
+or writing a marked table frame. Discovery includes predecessor/support tables,
+replaced restore targets and external FK parents. This is decoder admission,
+not proof of installed data-owner roots or a native reader-floor publication.
+
+Snapshot validation now also requires that barrier for marked definitions and
+retained plans even while the native floor remains inactive. Table projections
+borrow schema bytes; the regression projects a 64 KiB definition using 4 KiB of
+scratch. JSON scanning is confined to actual plan/job keys: opaque restore
+active pointers are not parsed as JSON. The index admission regression rejects
+an older activation without advancing standby revision or installing locks,
+then exercises marked replay/reopen and snapshot validation. The restore
+regression round-trips the actual command and checks rejection leaves no job or
+physical-name reservations before retrying after activation.
+
+The focused Debug restore gate passed 51/51 steps and 25/25 restore tests.
+The final combined Debug metadata/service/reader/catalog/initial-FK/restore/index
+publication gate passed 167/167 steps and 278/278 standard-protocol tests. Linked
+runners passed 244 metadata-store, 318 metadata/control, 226 runtime, 139 service,
+28 replication, 19 initial-FK, 25 restore and 31 index-publication tests, plus
+eight table-reader, seven service-reader and two data-reader checks. Two optional
+live PostgreSQL CDC tests skipped their prerequisites; no failures or leaks
+remained. These overlapping suite counts are not original SQL-case totals. An
+earlier broad run overlapped source edits and is not qualification evidence.
+Formatting, licensing, Apache boundary, inventory integrity and control-catalog
+freshness checks passed. Cache GC was preview-only. No full SQL release pass or
+push is claimed. Original SQL dispositions are unchanged; public producers
+remain gated on the same-transaction native floor join and exact installed-root
+owner acknowledgments.
+
+The next integration should reuse the existing signed index-owner receipts and
+enrollment/live-root checks, not add a parallel service-ACK authority. Bind the
+required reader pair into a versioned compact publication head and its candidate
+identity so owner acknowledgment can validate the current enrolled reporter
+without decoding schema-sized plans. Prepare the joined requirement for every
+table in a compound publication before any catalog effects; publish that one
+monotonic native-floor update in the same transaction as the admitted table set.
+Then qualify the original ALTER TABLE and CREATE INDEX cohorts through the public
+endpoint, including restart/root replacement and rejected-write poststates.

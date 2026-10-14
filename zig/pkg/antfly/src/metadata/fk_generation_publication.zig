@@ -270,9 +270,21 @@ pub const Parent = struct {
     /// with the hidden child reservation. `table` remains the exact prior
     /// descriptor until the post-migration owner cut is sealed.
     support_after: ?records.TableRecord = null,
+
+    fn readerPublicationRequired(self: Parent) bool {
+        return self.table.schema_reader_requirements != null or
+            (if (self.support_before) |table| table.schema_reader_requirements != null else false) or
+            (if (self.support_after) |table| table.schema_reader_requirements != null else false);
+    }
 };
 
 pub const Plan = struct {
+    pub fn readerPublicationRequired(self: Plan) bool {
+        if (self.child_before.schema_reader_requirements != null or self.child_after.schema_reader_requirements != null) return true;
+        for (self.parents) |parent| if (parent.readerPublicationRequired()) return true;
+        return false;
+    }
+
     id: Id,
     child_before: records.TableRecord,
     child_after: records.TableRecord,
@@ -581,6 +593,12 @@ fn supportIndexIncarnation(alloc: std.mem.Allocator, before: records.TableRecord
 /// zero-write fence, and publishes only after every parent accepts the new
 /// generation. It deliberately does not invent an old schema/source receipt.
 pub const InitialCreatePlan = struct {
+    pub fn readerPublicationRequired(self: InitialCreatePlan) bool {
+        if (self.child.schema_reader_requirements != null) return true;
+        for (self.parents) |parent| if (parent.readerPublicationRequired()) return true;
+        return false;
+    }
+
     id: Id,
     retirement_scope: InitialRetirementScope,
     catalog_id: u64,
@@ -1689,6 +1707,30 @@ pub const SourceDecision = struct {
         try writeCoverageFields(self, writer);
     }
 };
+
+test "system catalog schema reader table FK discovery includes child and all parent support images" {
+    const table: records.TableRecord = .{ .table_id = 1, .name = "rows" };
+    var marked = table;
+    marked.schema_reader_requirements = .{ .semantic_version = 14, .encoding_version = 31 };
+    var parents = [_]Parent{.{ .table = table, .ranges = &.{}, .fences = &.{}, .transitions = &.{} }};
+    var plan: Plan = .{ .id = @splat(1), .child_before = table, .child_after = table, .child_catalog_before_b64 = "", .child_ranges = &.{}, .child_fences = &.{}, .parents = &parents };
+    var initial: InitialCreatePlan = .{ .id = @splat(1), .retirement_scope = .local_owner, .catalog_id = 1, .expected_catalog_revision = 0, .child = table, .child_ranges = &.{}, .parents = &parents, .logical_name = "rows", .namespace_id = 1 };
+    try std.testing.expect(!plan.readerPublicationRequired());
+    try std.testing.expect(!initial.readerPublicationRequired());
+    plan.child_after = marked;
+    initial.child = marked;
+    try std.testing.expect(plan.readerPublicationRequired());
+    try std.testing.expect(initial.readerPublicationRequired());
+    plan.child_after = table;
+    initial.child = table;
+    inline for (.{ "table", "support_before", "support_after" }) |field| {
+        const prior = parents[0];
+        @field(parents[0], field) = marked;
+        try std.testing.expect(plan.readerPublicationRequired());
+        try std.testing.expect(initial.readerPublicationRequired());
+        parents[0] = prior;
+    }
+}
 
 test "FK generation publication rejects an unbound or empty plan" {
     try std.testing.expect(try schemaHasForeignKeys(std.testing.allocator, "{\"foreign_keys\":[{}]}"));

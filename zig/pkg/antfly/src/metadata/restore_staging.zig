@@ -383,6 +383,15 @@ pub fn prepareEmptyGenerationHandoffMappingsAlloc(alloc: std.mem.Allocator, targ
 }
 
 pub const Plan = struct {
+    pub fn readerPublicationRequired(self: Plan) bool {
+        for (self.targets) |target| {
+            if (target.table.schema_reader_requirements != null) return true;
+            if (target.replace) |old| if (old.table.schema_reader_requirements != null) return true;
+        }
+        for (self.external_fk_parents) |parent| if (parent.table.schema_reader_requirements != null) return true;
+        return false;
+    }
+
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         // Preserve the canonical digest of in-flight plans created before
         // external parents became an optional part of the envelope.
@@ -1378,6 +1387,10 @@ pub fn jobKey(buf: []u8, metadata_group_id: u64, id: Id) ![]const u8 {
 
 pub fn prefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:", .{metadata_group_id});
+}
+
+pub fn jobPrefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:job:", .{metadata_group_id});
 }
 
 pub fn activePrefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
