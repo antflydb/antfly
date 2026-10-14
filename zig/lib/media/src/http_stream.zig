@@ -19,6 +19,18 @@ const std = @import("std");
 const source = @import("source.zig");
 const admission = @import("admission.zig");
 const hls = @import("hls.zig");
+const live = @import("live_mp4.zig");
+/// Callback-scoped owner. Take transfers an independent immutable snapshot;
+/// otherwise it is destroyed when the callback returns, including on failure.
+pub const FragmentDelivery = struct {
+    segment: ?live.Segment,
+    pub fn take(self: *FragmentDelivery) !live.Segment {
+        const result = self.segment orelse return error.FragmentAlreadyTaken;
+        self.segment = null;
+        return result;
+    }
+};
+pub const StreamStats = struct { bytes: usize = 0, fragments: usize = 0, largest_pending_capacity: usize = 0 };
 pub const Limits = struct {
     max_resource_bytes: usize = 32 * 1024 * 1024,
     max_transferred_bytes: u64 = 1024 * 1024 * 1024,
@@ -166,6 +178,107 @@ pub fn Adapter(comptime http: type) type {
             try reservation.resize(.{ .host_bytes = owned.len });
             self.charged_bytes -= cap - owned.len;
             return .{ .allocator = self.allocator, .bytes = owned, .reservation = reservation };
+        }
+        /// Feed HTTP body pieces directly to the automatic fMP4 framer. Complete
+        /// fragments reach the callback before response completion, with caller
+        /// backpressure. No automatic retry can duplicate published fragments.
+        /// Transport-entry failures make the borrowed ingest terminal; recreate it for an
+        /// explicit restart. Already taken snapshots remain independently owned.
+        pub fn streamFmp4(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, ingest: *live.Ingest, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !StreamStats {
+            try self.control.check();
+            if (ingest.ended or ingest.pending.items.len != 0) return error.InvalidMediaStreamState;
+            if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
+            const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            var cap = @min(resource_limit, self.limits.max_resource_bytes);
+            if (range) |requested| {
+                if (requested.length == 0 or requested.length > cap) return error.ResourceLimitExceeded;
+                _ = std.math.add(u64, requested.offset, requested.length) catch return error.InvalidRemoteRange;
+                cap = @intCast(requested.length);
+            }
+            if (cap == 0 or cap > self.limits.max_transferred_bytes -| self.charged_bytes) return error.ResourceLimitExceeded;
+            // Preserve the existing conservative transport envelope, including
+            // httpx's buffered HTTP/2 fallback. Framer/snapshot owners separately
+            // charge their actual allocations through their admission pool.
+            var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(u64, cap, 2) }) else admission.Token{};
+            defer reservation.deinit();
+            var headers: [2][2][]const u8 = undefined;
+            headers[0] = .{ "Accept-Encoding", "identity" };
+            var range_buffer: [96]u8 = undefined;
+            if (range) |requested| headers[1] = .{ "Range", try std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{ requested.offset, requested.offset + requested.length - 1 }) };
+            const Sink = struct {
+                adapter: *Self,
+                ingest: *live.Ingest,
+                context: *anyopaque,
+                accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void,
+                range: ?hls.Range,
+                cap: usize,
+                started: bool = false,
+                stats: StreamStats = .{},
+                pub fn startResponse(sink: *@This(), response: anytype) !void {
+                    try sink.adapter.control.check();
+                    if (sink.started) return error.InvalidMediaStreamState;
+                    if (sink.range) |requested| {
+                        if (response.status.code != 206) return error.InvalidRemoteRange;
+                        try validateRange(response.header("Content-Range") orelse return error.InvalidRemoteRange, requested);
+                    } else if (response.status.code != 200) return error.UnexpectedHttpStatus;
+                    if (response.header("Content-Encoding")) |encoding| if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.UnsupportedMediaEncoding;
+                    sink.started = true;
+                }
+                fn publish(sink: *@This(), segment: live.Segment) !void {
+                    var delivery = FragmentDelivery{ .segment = segment };
+                    defer if (delivery.segment) |*owner| owner.deinit();
+                    try sink.adapter.control.check();
+                    sink.stats.fragments += 1;
+                    try sink.accept(sink.context, &delivery);
+                }
+                pub fn writeAll(sink: *@This(), bytes: []const u8) !void {
+                    if (!sink.started) return error.InvalidMediaStreamState;
+                    try sink.adapter.control.check();
+                    if (bytes.len > sink.cap -| sink.stats.bytes) return error.ResourceLimitExceeded;
+                    sink.stats.bytes += bytes.len;
+                    sink.adapter.transferred_bytes += bytes.len;
+                    // Bound pending work to one network piece plus one framing
+                    // boundary; draining does not retain the complete HTTP body.
+                    var offset: usize = 0;
+                    while (offset < bytes.len) {
+                        try sink.adapter.control.check();
+                        const end = @min(bytes.len, offset + 8192);
+                        try sink.ingest.push(bytes[offset..end]);
+                        sink.stats.largest_pending_capacity = @max(sink.stats.largest_pending_capacity, sink.ingest.pending.capacity);
+                        offset = end;
+                        while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment);
+                    }
+                }
+            };
+            var sink = Sink{ .adapter = self, .ingest = ingest, .context = context, .accept = accept, .range = range, .cap = cap };
+            const cancel = Cancel{ .control = self.control };
+            self.requests += 1;
+            self.charged_bytes += cap;
+            errdefer {
+                ingest.ended = true;
+                ingest.discardSegment();
+            }
+            var response = self.client.getToWriter(url, .{
+                .headers = headers[0..@as(usize, if (range != null) 2 else 1)],
+                .max_response_size = cap,
+                .max_retries = 0,
+                .follow_redirects = false,
+                .cookies_enabled = false,
+                .timeout_ms = self.limits.timeout_ms,
+                .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
+            }, &sink, null, null) catch |err| {
+                try self.control.check();
+                return err;
+            };
+            defer response.deinit();
+            try self.control.check();
+            if (!sink.started) return error.UnexpectedHttpStatus;
+            if (sink.stats.bytes == 0) return error.EmptyMediaResource;
+            if (range) |requested| if (sink.stats.bytes != requested.length) return error.InvalidRemoteRange;
+            if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment());
+            self.charged_bytes -= cap - sink.stats.bytes;
+            return sink.stats;
         }
     };
 }

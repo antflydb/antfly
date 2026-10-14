@@ -1,0 +1,32 @@
+{
+  "base_commit": "9825446c73bfaddd6c6fd3ed471ca8a8d7e5a0ce",
+  "source_sha256": {
+    "zig/lib/media/src/http_stream.zig": "ec2322b24529a67bcaf1dd373833ad33d0c8b80959b77cde21b8dd91e92a699e",
+    "zig/lib/media/src/http_fragment_test.zig": "c6fbee227a650ece85be30fabebb22668d66a95584ccb7fa7b1e9331a15f9888",
+    "zig/lib/media/src/live_mp4.zig": "df75a1a41e8779af848a0d25f2de997e8a06a3867b2eaa349f535e4deabab4e1",
+    "zig/lib/media/src/mod.zig": "c97d6215aa538d946d72d0a2904f39c9ce06b955c9b77da87db88f70d8074d19",
+    "zig/lib/media/http_live_test_root.zig": "91f767db0daae65420b67805ed6f82a8ac3415a26a61c8f52fa46b333819ece7",
+    "zig/lib/httpx/src/client/client.zig": "9ba234056c4a9ff18a44ca4c44009da6e443e8072aa3b76739db8a1aa02a6937",
+    "zig/lib/media/testdata/fragmented.mp4": "8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be"
+  },
+  "status": "passed",
+  "streaming_scope": "HTTP/1 direct body delivery; httpx buffered HTTP/2 fallback remains",
+  "failure_policy": "pre-entry rejection preserves ingest; post-entry errors terminalize ingest; no implicit retries; taken snapshots remain caller-owned",
+  "admission_policy": "existing cap-times-two transport envelope plus actual separate framer/snapshot reservations",
+  "remaining": "DASH availabilityTimeComplete=false, resumable per-resource cursors/ledgers and model coordinator integration remain",
+  "macos_media_tests_pass": 168,
+  "macos_production_http_tests_pass": 12,
+  "one_byte_fragment": {
+    "input_bytes": 10409,
+    "allocations": 15,
+    "allocated_bytes": 32767,
+    "retained_capacity": 16384
+  },
+  "linux_media_binary_sha256": "de4a16f6c4eb4c863025380f0b0e322958dd432b37fd9a21a5412cf2321b815f",
+  "macos_http_binary_sha256": "7223ab2db283bdfbe30960c7c038eaaef8cba91931641a9cff8e01e44a85ae36",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "linux_arm64_media_tests_pass": 168,
+  "linux_http_binary_sha256": "9a7a3b24ae970d21ab1971962b5b2497a245f6791e5f2dac7f51b2f1e60e15f3",
+  "linux_http_status": "passed",
+  "linux_arm64_production_http_tests_pass": 12
+}

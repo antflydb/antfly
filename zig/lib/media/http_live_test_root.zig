@@ -30,6 +30,80 @@ const Verify = struct {
         for (0..count) |_| try server.handleOne();
     }
 };
+test "production HTTP fragments publish before response EOF under authenticated chunked backpressure" {
+    const bytes = @embedFile("testdata/fragmented.mp4");
+    const State = struct {
+        release: std.Io.Event = .unset,
+        sent_tail: std.atomic.Value(bool) = .init(false),
+        count: usize = 0,
+        held: ?media.live_mp4.Segment = null,
+        fn serve(self: *@This(), listener: *http.TcpListener) !void {
+            const accepted = try listener.accept();
+            var socket = accepted.socket;
+            defer socket.close();
+            try socket.setRecvTimeout(2000);
+            try socket.setSendTimeout(2000);
+            var request: [4096]u8 = undefined;
+            var used: usize = 0;
+            while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                if (used == request.len) return error.TestUnexpectedResult;
+                const n = try socket.recv(request[used..]);
+                if (n == 0) return error.UnexpectedEof;
+                used += n;
+            }
+            try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+            try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+            try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            const boundary = 11206 + 8; // Next moof header frames the first fragment.
+            try chunk(&socket, bytes[797..boundary]);
+            // The rest of the response cannot exist until a fragment callback
+            // has run. A whole-response buffering regression times out.
+            try self.release.wait(std.testing.io);
+            self.sent_tail.store(true, .release);
+            try chunk(&socket, bytes[boundary..]);
+            try socket.sendAll("0\r\n\r\n");
+        }
+        fn chunk(socket: *http.Socket, body: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{body.len}));
+            try socket.sendAll(body);
+            try socket.sendAll("\r\n");
+        }
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count == 0) {
+                try std.testing.expect(!self.sent_tail.load(.acquire));
+                self.held = try delivery.take();
+                self.release.set(std.testing.io);
+            }
+            self.count += 1;
+        }
+    };
+    var state = State{};
+    defer if (state.held) |*segment| segment.deinit();
+    var listener = try http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/media.m4s", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .limits = .{ .timeout_ms = 2000 } };
+    var ingest = try media.live_mp4.Ingest.init(a, "authenticated-stream", bytes[0..797], .{});
+    var live_ingest = true;
+    defer if (live_ingest) ingest.deinit();
+    var serving = try std.testing.io.concurrent(State.serve, .{ &state, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    const stats = try transport.streamFmp4(url, "media.m4s", null, bytes.len, &ingest, &state, State.accept);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 6), stats.fragments);
+    try std.testing.expectEqual(stats.fragments, state.count);
+    try std.testing.expect(stats.largest_pending_capacity < stats.bytes);
+    ingest.deinit();
+    live_ingest = false;
+    var lease = try state.held.?.reader.readPacket(0);
+    defer lease.deinit();
+    try std.testing.expect(lease.bytes.len != 0);
+}
 test "production HTTP media client authenticates exact ranges and refuses redirects" {
     var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
         .{ .path = "/data", .assert_request = Verify.range, .respond = .{ .status = 206, .headers = &.{.{ .name = "Content-Range", .value = "bytes 2-5/16" }}, .body = "cdef" } },

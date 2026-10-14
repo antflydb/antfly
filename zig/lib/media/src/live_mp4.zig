@@ -168,8 +168,17 @@ pub const Ingest = struct {
         if (size > self.options.stream.max_bytes -| self.initialization.bytes.len) return error.ResourceLimitExceeded;
         if (size > self.pending.capacity) {
             const previous = self.pending_reservation.resources;
-            try self.pending_reservation.resize(.{ .host_bytes = try std.math.add(usize, size, self.pending.capacity) });
-            const grown = self.allocator.alloc(u8, size) catch |err| {
+            // Arbitrarily small HTTP pieces must not force quadratic copying.
+            // Charge actual capacity and the simultaneous old/new allocation.
+            // A tight shared budget can still choose the exact required size.
+            const ceiling = self.options.stream.max_bytes -| self.initialization.bytes.len;
+            var capacity = @max(size, @min(ceiling, self.pending.capacity *| 2));
+            self.pending_reservation.resize(.{ .host_bytes = try std.math.add(usize, capacity, self.pending.capacity) }) catch |err| {
+                if (capacity == size or err != error.SharedAdmissionExceeded) return err;
+                capacity = size;
+                try self.pending_reservation.resize(.{ .host_bytes = try std.math.add(usize, capacity, self.pending.capacity) });
+            };
+            const grown = self.allocator.alloc(u8, capacity) catch |err| {
                 try self.pending_reservation.resize(previous);
                 return err;
             };
@@ -179,7 +188,7 @@ pub const Ingest = struct {
             self.pending = .empty;
             self.pending.items = grown[0..used];
             self.pending.capacity = grown.len;
-            try self.pending_reservation.resize(.{ .host_bytes = size });
+            try self.pending_reservation.resize(.{ .host_bytes = capacity });
         }
         self.pending.appendSliceAssumeCapacity(bytes);
         self.ingested_bytes += bytes.len;

@@ -46,6 +46,7 @@ test {
     _ = dash;
     _ = dash_live;
     _ = http_stream;
+    _ = @import("http_fragment_test.zig");
     _ = hls_live;
     _ = admission;
     _ = remote;

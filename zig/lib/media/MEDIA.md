@@ -1947,3 +1947,27 @@ remain explicit unsupported policies. This is complete-segment request timing;
 incremental partial-DASH delivery and broader live-origin qualification remain
 in the active non-CUDA scope. See [source-bound qualification](testdata/dash-availability/README.md)
 for exact-boundary, inheritance, live reload, cleanup and platform evidence.
+
+### Incremental authenticated HTTP fragment delivery
+
+The native HTTP adapter can now feed response body pieces directly into automatic
+fMP4 framing and deliver complete fragments before the response finishes. Header
+validation precedes publication. Callback backpressure bounds the producer;
+FragmentDelivery.take transfers an independent immutable snapshot, while untaken
+deliveries are released on callback return. Entered failures terminalize ingest
+without implicit replay, preserving already taken snapshots. Pre-entry admission
+denial does not enter transport. Exact ranges, cancellation and work ceilings
+remain enforced. The retained framer capacity is reported independently of full
+process memory and conservative transport admission.
+
+Pending input grows geometrically within the existing byte ceiling, charging
+actual old/new capacity overlap. Tight shared budgets can fall back to exact
+required growth; allocation failures remain visible. One-byte input for a real
+10,409-byte fragment uses fifteen allocations and 32,767 allocated bytes while
+retaining identical coded bytes. A production authenticated chunked server
+withholds its tail until the first fragment callback, making whole-response
+buffering fail the gate. See [source-bound qualification](testdata/http-fragments/README.md)
+for packet parity, ownership, range/failure/cancellation, growth and platform checks.
+This transport foundation does not yet enable availabilityTimeComplete=false,
+resumable partial-resource cursors or direct model coordinator delivery. Those
+and the complete non-CUDA objective remain active.

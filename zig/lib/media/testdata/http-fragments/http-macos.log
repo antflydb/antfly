@@ -1,0 +1,7 @@
+info(verbose): /Users/ajroetker/bin/zig-0.17.0/zig test -Osafe --dep httpx --dep antfly_media -Mroot=http_live_test_root.zig --dep antfly-json -Mhttpx=../httpx/src/httpx.zig -Osafe -Mantfly_media=src/mod.zig -Odebug -Mantfly-json=../json/src/mod.zig --cache-dir /tmp/zig-local-cache --global-cache-dir /private/tmp/antfly-av1-model-qualification-global --build-root . --name test --zig-lib-dir /Users/ajroetker/bin/zig-0.17.0/lib/ --listen=-
+info(verbose): /tmp/zig-local-cache/o/fdcbe27507a6cde014ae6b95fd3528e8/test --cache-dir=/tmp/zig-local-cache --seed=0x72ba5422 --listen=-
+Build Summary: 3/3 steps succeeded; 12/12 tests passed
+test-media-http success
++- run test 12 pass (12 total) 152ms MaxRSS:5M
+   +- compile test safe native success 41s MaxRSS:856M
+
