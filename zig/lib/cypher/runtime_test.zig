@@ -463,3 +463,25 @@ test "Unicode casing and trimming preserve Cypher scalar semantics" {
     try check("RETURN toLower(null),toUpper(null),trim(null),ltrim(null),rtrim(null)", "[[null,null,null,null,null]]");
     try check("UNWIND ['ÉCOLE','école','Else'] AS title WITH title WHERE toLower(title)='école' RETURN count(*)", "[[2]]");
 }
+
+test "scalar property access rejects non-containers and preserves missing values" {
+    try check("RETURN null.foo,{}.foo,{foo:42}.foo", "[[null,null,42]]");
+    for ([_][]const u8{ "WITH 42 AS x RETURN x.foo", "WITH true AS x RETURN x.foo", "WITH 'text' AS x RETURN x.foo", "WITH [1] AS x RETURN x.foo" }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "numeric scalars and aggregation preserve Cypher precision and spelling" {
+    try check("RETURN toInteger('9007199254740993.0'),toInteger('9223372036854775807.0'),toInteger('-9223372036854775808.0')", "[[9007199254740993,9223372036854775807,-9223372036854775808]]");
+    try check("UNWIND [1,1.0] AS x RETURN collect(DISTINCT toString(x))", "[[[\"1\",\"1.0\"]]]");
+    try check("RETURN toString(1e20),toString(0.001),toString(-0.0),toString(1e-323)", "[[\"1.0E20\",\"0.001\",\"-0.0\",\"9.9E-324\"]]");
+    try check("UNWIND [9223372036854775807,9223372036854775807] AS x RETURN avg(x)=toFloat(9223372036854775807)", "[[true]]");
+    try check("UNWIND [1e308,1e308] AS x RETURN avg(x)=1e308", "[[true]]");
+    try check("UNWIND [1e308,-1e308] AS x RETURN avg(x)=0.0", "[[true]]");
+    try check("UNWIND [null,1,2.0] AS x RETURN avg(x)", "[[1.5]]");
+    try check("UNWIND [] AS x RETURN avg(x)", "[[null]]");
+}

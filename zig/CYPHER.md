@@ -184,6 +184,14 @@ The tables are reproduced with `lib/cypher/tools/generate_unicode_case.py` from
 hash-checked official Unicode inputs; their Unicode license is embedded in the
 generated source.
 
+Scalar property access rejects values other than nodes, relationships, maps,
+and null, so invalid reads abort a write statement. `toInteger(string)` parses
+and bounds-checks decimals exactly before truncating toward zero; valid decimal
+values outside signed 64-bit range raise `CypherNumericOverflow`. `avg()` uses a
+running floating-point mean to avoid intermediate integer or float sum overflow.
+`toString(float)` retains fractional digits and Java 21/Cypher notation thresholds,
+including negative zero and subnormal values.
+
 ## Product direction
 
 Build **Antfly Graph**, a Cypher-compatible graph language with Antfly search

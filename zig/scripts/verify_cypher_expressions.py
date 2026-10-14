@@ -187,6 +187,82 @@ def main():
         )
         assert sql["rows"] == [["ÉCOLE"]], sql
         checks += 1
+        for value in (42, True, "text", [1]):
+            invalid = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": "CREATE (:Document {id:'rollback'}) WITH $value AS x RETURN x.foo",
+                    "parameters": {"value": value},
+                },
+                status=400,
+            )
+            assert invalid["code"] == "CypherTypeMismatch", invalid
+            checks += 1
+        for text in (
+            "9223372036854775808",
+            "-9223372036854775809",
+            "9223372036854775807.1",
+            "-9223372036854775808.1",
+        ):
+            invalid = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": "CREATE (:Document {id:'rollback'}) RETURN toInteger($value)",
+                    "parameters": {"value": text},
+                },
+                status=400,
+            )
+            assert invalid["code"] == "CypherNumericOverflow", invalid
+            checks += 1
+        assert strings(query("MATCH (n:Document {id:'rollback'}) RETURN count(n)")) == [
+            ["0"]
+        ]
+        checks += 1
+        assert strings(
+            query(
+                "RETURN toInteger('9007199254740993.0'),toInteger('9223372036854775807.0'),toInteger('-9223372036854775808.0'),toString(1.0),toString(1e20)"
+            )
+        ) == [
+            [
+                "9007199254740993",
+                "9223372036854775807",
+                "-9223372036854775808",
+                "1.0",
+                "1.0E20",
+            ]
+        ]
+        checks += 1
+        for values, expected in (
+            (
+                "[9223372036854775807,9223372036854775807]",
+                "toFloat(9223372036854775807)",
+            ),
+            ("[1e308,1e308]", "1e308"),
+            ("[1e308,-1e308]", "0.0"),
+        ):
+            assert strings(query(f"UNWIND {values} AS x RETURN avg(x)={expected}")) == [
+                [True]
+            ]
+            checks += 1
+        distinct = query("UNWIND [1,1.0] AS x RETURN collect(DISTINCT toString(x))")[
+            "rows"
+        ][0][0]
+        assert distinct == {
+            "type": "list",
+            "value": [
+                {"type": "string", "value": "1"},
+                {"type": "string", "value": "1.0"},
+            ],
+        }, distinct
+        checks += 1
+        sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT g.value,g.text FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS(toInteger('9007199254740993.0') AS value,toString(1.0) AS text)) g"
+            },
+        )
+        assert sql["rows"] == [["9007199254740993", "1.0"]], sql
+        checks += 1
         print(f"{checks} native Cypher/SQL expression checks passed")
     finally:
         if created_graph:

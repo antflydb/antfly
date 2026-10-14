@@ -19,6 +19,7 @@ const compiler = @import("compiler.zig");
 const catalog = @import("catalog.zig");
 const v = @import("value.zig");
 const backend_mod = @import("backend.zig");
+const numbers = @import("numbers.zig");
 const unicode_string = @import("unicode_string.zig");
 const Budget = @import("budget.zig");
 const A = std.mem.Allocator;
@@ -724,6 +725,7 @@ const Engine = struct {
             .property => |p| blk: {
                 const value = try self.eval(p.base, row, group);
                 try self.requireLiveContents(value);
+                if (value != .null and value != .node and value != .relationship and value != .map) return error.CypherTypeMismatch;
                 break :blk value.property(p.name);
             },
             .index => |i| blk: {
@@ -1061,7 +1063,7 @@ const Engine = struct {
             .string => value,
             .boolean => .{ .string = if (value.boolean) "true" else "false" },
             .integer => .{ .string = try std.fmt.allocPrint(self.a, "{d}", .{value.integer}) },
-            .number => .{ .string = try std.fmt.allocPrint(self.a, "{d}", .{value.number}) },
+            .number => .{ .string = try numbers.floatString(self.a, value.number) },
             else => error.CypherTypeMismatch,
         };
         if (std.ascii.eqlIgnoreCase(name, "toBoolean")) return switch (value) {
@@ -1074,9 +1076,7 @@ const Engine = struct {
             if (integer and value == .integer) return value;
             if (integer and value == .boolean) return .{ .integer = @intFromBool(value.boolean) };
             if (value != .integer and value != .number and value != .string) return error.CypherTypeMismatch;
-            if (integer and value == .string) if (std.fmt.parseInt(i64, value.string, 10)) |parsed| {
-                return .{ .integer = parsed };
-            } else |_| {};
+            if (integer and value == .string) return if (try numbers.decimalInteger(value.string)) |parsed| .{ .integer = parsed } else .null;
             const number = if (value == .string) std.fmt.parseFloat(f64, value.string) catch return .null else try value.numeric();
             if (!std.math.isFinite(number)) return .null;
             if (!integer) return .{ .number = number };
@@ -1171,12 +1171,19 @@ const Engine = struct {
             }
             return best;
         }
+        if (std.ascii.eqlIgnoreCase(call_value.name, "avg")) {
+            var mean: f64 = 0;
+            for (items.items, 1..) |item, item_count| {
+                mean = numbers.nextAverage(mean, try item.numeric(), item_count);
+                if (!std.math.isFinite(mean)) return error.CypherNumericOverflow;
+            }
+            return .{ .number = mean };
+        }
         var sum: v.Value = .{ .integer = 0 };
         for (items.items) |item| {
             if (item != .integer and item != .number) return error.CypherTypeMismatch;
             sum = try self.binary(.add, sum, item);
         }
-        if (std.ascii.eqlIgnoreCase(call_value.name, "avg")) return .{ .number = (try sum.numeric()) / @as(f64, @floatFromInt(items.items.len)) };
         return sum;
     }
 

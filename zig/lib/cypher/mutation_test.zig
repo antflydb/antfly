@@ -508,3 +508,13 @@ test "reading missing postimages does not delete restored relationship identitie
         try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
     }
 }
+
+test "invalid property access and decimal overflow abort all writes" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    try std.testing.expectError(error.CypherTypeMismatch, fixture.run("CREATE (:Person {name:'rollback'}) WITH 42 AS x RETURN x.foo"));
+    try std.testing.expectError(error.CypherNumericOverflow, fixture.run("CREATE (:Person {name:'rollback'}) RETURN toInteger('-9223372036854775809')"));
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 2), fixture.rollbacks);
+}

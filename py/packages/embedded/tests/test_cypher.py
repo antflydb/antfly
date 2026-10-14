@@ -358,3 +358,66 @@ def test_unicode_strings_filter_write_and_graph_table_survive_reopen(require_nat
         assert database.sql(
             "SELECT g.name FROM GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE lower(n.name)='école' COLUMNS (upper(n.name) AS name)) g"
         )["rows"] == [["ÉCOLE"]]
+
+
+def test_scalar_errors_roll_back_and_numbers_preserve_cypher_semantics(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "knowledge", "definition": {"labels": [{"name": "Document", "table": "docs"}]}}
+        )
+        for value in (42, True, "text", [1]):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json(
+                    "knowledge",
+                    {
+                        "query": "CREATE (:Document {name:'rollback'}) WITH $value AS x RETURN x.foo",
+                        "parameters": {"value": value},
+                    },
+                )
+            assert invalid.value.graph_code == "CypherTypeMismatch"
+        for text in ("9223372036854775808", "-9223372036854775809", "9223372036854775807.1", "-9223372036854775808.1"):
+            with pytest.raises(af.GraphError) as overflow:
+                database.cypher_json(
+                    "knowledge",
+                    {
+                        "query": "CREATE (:Document {name:'rollback'}) RETURN toInteger($value)",
+                        "parameters": {"value": text},
+                    },
+                )
+            assert overflow.value.graph_code == "CypherNumericOverflow"
+        assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]
+        row = database.cypher_json(
+            "knowledge",
+            {
+                "query": "RETURN toInteger('9007199254740993.0'),toInteger('9223372036854775807.0'),toInteger('-9223372036854775808.0'),toString(1.0),toString(1e20)"
+            },
+        )["rows"][0]
+        assert [cell["value"] for cell in row] == [
+            "9007199254740993",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "1.0",
+            "1.0E20",
+        ]
+        distinct = database.cypher_json(
+            "knowledge", {"query": "UNWIND [1,1.0] AS x RETURN collect(DISTINCT toString(x))"}
+        )["rows"][0][0]
+        assert distinct == {
+            "type": "list",
+            "value": [{"type": "string", "value": "1"}, {"type": "string", "value": "1.0"}],
+        }
+        for values, expected in (
+            ("[9223372036854775807,9223372036854775807]", "toFloat(9223372036854775807)"),
+            ("[1e308,1e308]", "1e308"),
+            ("[1e308,-1e308]", "0.0"),
+        ):
+            assert database.cypher_json("knowledge", {"query": f"UNWIND {values} AS x RETURN avg(x)={expected}"})[
+                "rows"
+            ] == [[{"type": "boolean", "value": True}]]
+        database.cypher_json("knowledge", {"query": "CREATE (:Document {name:toString(1.0)})"})
+        assert database.sql(
+            "SELECT g.value,g.text FROM GRAPH_TABLE(knowledge MATCH (n IS Document) COLUMNS (toInteger('9007199254740993.0') AS value,toString(1.0) AS text)) g"
+        )["rows"] == [["9007199254740993", "1.0"]]
+    with af.open_hosted(aflite_path) as database:
+        assert database.sql("SELECT name FROM docs")["rows"] == [["1.0"]]
