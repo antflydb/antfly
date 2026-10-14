@@ -1390,3 +1390,40 @@ this does not establish broad production throughput parity.
 
 Reviewed release artifact and link-map qualification is in progress. Raw logs,
 JSON, command provenance and maps remain outside the repository.
+
+Main `0cba59bceb` was merged into `f2882c6a6e`. Conflict resolution preserves
+main's DB-backed extraction budget, repeated identical index admissions and
+catalog checks, while retaining pointer-based prepared-owner borrows and the
+compact generated error-name catalog. The merged default Debug composition
+passes 103/103 steps, including API compilation, both native owner profiles,
+73 implementation C API tests (2 skips), 48 production C API tests, 44 runtime
+tests and 13 restore tests, with no failures, leaks or unexpected errors.
+The merged source audit covers 882 production files and all 20 checker tests
+pass. Main's compute-owner cache regression passes: storage-only ABI edits or
+removal do not rebuild or block the shared enrichment archive. A standard cache
+was removed during an initial run; qualification now uses an isolated cache
+inside the worktree. The duplicate local release was stopped after Wolfspider
+became available; its isolated cache was removed and raw logs were preserved.
+The merge hook could not run the pinned Node formatter for unchanged generated
+Model Explorer files inherited from main; only the merge commit bypassed it.
+The generated JSON is identical to origin/main.
+
+
+Concurrent review after the main merge found and fixed three regressions at
+`4fc2d298f5`: returned identity/captured search requests now restore the original
+caller-owned predicate instead of retaining a stack receiver; resolution and
+promotion callback carriers transport errors by name, including reverse
+candidate-consumer callbacks and retained batch sources; independent embedded
+packaging applies the same graph-wide strip/error-tracing profile to producers
+and consumers. The private storage descriptor/getters are now v21; the public
+C ABI is unchanged. Regression coverage checks post-return predicate identity,
+source callback errors, reverse consumer errors and batch release ownership.
+Formatting, AST and diff checks pass; compilation/execution of these final
+review corrections is pending on Wolfspider (SDK 26.4). Earlier qualification
+above remains attributed to its original source revision.
+
+Wolfspider's earlier pre-review release and the contended local release were
+stopped before completion to qualify the reviewed revision instead. Their
+elapsed times are not completed build measurements. GitHub's Apache boundary
+check passed for the merged revision; the draft PR CI gate deliberately keeps
+test runners idle, so its action-required status is not a test failure.
