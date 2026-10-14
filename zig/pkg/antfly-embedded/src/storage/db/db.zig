@@ -13211,6 +13211,21 @@ pub const DB = struct {
         index_name: []const u8,
     ) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        // Index reconciliation calls this for every managed index on each pass,
+        // but a pending admission marker is rare. Probe under the shared apply
+        // lock first so the common no-op neither drains text merges nor blocks
+        // readers behind a structural mutation. Any probe failure falls back to
+        // the authoritative check below.
+        if (self.lockApplySharedForPortableRuntime()) |_| {
+            defer self.core.unlockApplyShared();
+            const probe: ?[]u8 = self.core.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => null,
+            };
+            if (probe) |bytes| alloc.free(bytes);
+        } else |_| {}
         var structural_guard = self.beginIndexStructuralMutation("managed index admission materialization", index_name);
         defer structural_guard.deinit();
         // Catalog entries are owned by the apply lifecycle. Hold its exclusive
@@ -13218,8 +13233,6 @@ pub const DB = struct {
         // replacement cannot free the config or commit absence in between.
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
-        defer alloc.free(key);
         const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,

@@ -2823,7 +2823,7 @@ pub const DocStore = struct {
         // Replay lanes are append-only. Capturing each lane independently is
         // sufficient below an acknowledged retirement watermark, and avoids
         // cloning/sorting unrelated document and artifact keys after every
-        // enrichment completion. The existing atomic deletion batch remains.
+        // enrichment completion.
         for (0..replay_hints.len + 1) |lane| {
             const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
             var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
@@ -2842,18 +2842,28 @@ pub const DocStore = struct {
             }
         }
 
-        if (deletes.items.len == 0) return;
-
-        var batch = try self.beginWriteBatch();
-        errdefer batch.abort();
-        for (deletes.items) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+        // Commit in bounded chunks. Entries at or below an acknowledged
+        // retirement watermark are never read again, so deleting them is
+        // idempotent and partial progress is safe. A single batch for a large
+        // retained backlog exceeds the LSM's per-commit admission limit
+        // (ResourceBudgetExceeded), which failed every reopen of a large table.
+        var start: usize = 0;
+        while (start < deletes.items.len) {
+            const end = @min(start + replay_truncate_batch_keys, deletes.items.len);
+            var batch = try self.beginWriteBatch();
+            errdefer batch.abort();
+            for (deletes.items[start..end]) |key| {
+                batch.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+            try batch.commit();
+            start = end;
         }
-        try batch.commit();
     }
+
+    const replay_truncate_batch_keys: usize = 64 * 1024;
 
     /// Scan all keys with the given prefix. Caller owns returned slices.
     pub fn scanPrefix(self: *DocStore, alloc: Allocator, prefix: []const u8) ![]OwnedKVPair {
