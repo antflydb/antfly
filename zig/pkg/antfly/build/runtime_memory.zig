@@ -38,11 +38,34 @@ pub const CompileMemoryProfile = struct {
     strip: bool,
     cpu_inference: bool,
     sanitize_thread: bool = false,
+    // Opt-in only after the builder verifies SDK and all backend settings.
+    macos_metal_blas_release: bool = false,
 };
 
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
     const target = profile.target;
     const baseline_cpu = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+    if (profile.macos_metal_blas_release and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .macos and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .fast and profile.strip and !profile.sanitize_thread)
+    {
+        // Wolfspider native SDK 26.4, stripped Metal/Accelerate ReleaseFast.
+        // Claims include >=25% above each rounded MaxRSS upper bound. The
+        // paired cold build and overlap qualification live in COMPILATION.md.
+        const gib: usize = switch (unit) {
+            .api_kernel => 14,
+            .distributed => 10,
+            .storage_kernel => 18,
+            .enrichment_compute => 3,
+            .serverless => 7,
+            .inference => 12,
+            .cli => 3,
+        };
+        return gib * 1024 * 1024 * 1024;
+    }
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
@@ -204,4 +227,30 @@ test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, sanitized));
     }
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= 22 * gib);
+}
+
+test "opt-in Darwin claims retain margins and reject unmeasured profiles" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos, .cpu_model = .baseline });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = true, .cpu_inference = false, .macos_metal_blas_release = true };
+    const gib = 1024 * 1024 * 1024;
+    const units = [_]RuntimeLibraryUnit{ .api_kernel, .distributed, .storage_kernel, .enrichment_compute, .serverless, .inference, .cli };
+    const rounded_peak_upper_bounds = [_]usize{ 11, 8, 14, 2, 5, 9, 2 };
+    for (units, rounded_peak_upper_bounds) |unit, peak| {
+        try std.testing.expect(runtimeCompileMaxRss(unit, profile) >= peak * gib + peak * gib / 4);
+        var fallback = profile;
+        fallback.macos_metal_blas_release = false;
+        try std.testing.expect(runtimeCompileMaxRss(unit, profile) < runtimeCompileMaxRss(unit, fallback));
+        var unstripped = profile;
+        unstripped.strip = false;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, unstripped));
+        var sanitized = profile;
+        sanitized.sanitize_thread = true;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, sanitized));
+        inline for (.{ .debug, .safe, .small }) |mode| {
+            var unmeasured = profile;
+            unmeasured.optimize = mode;
+            try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, unmeasured));
+        }
+    }
+    try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, profile) + runtimeCompileMaxRss(.distributed, profile) <= 28 * gib);
 }

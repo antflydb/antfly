@@ -106,6 +106,8 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
+    native_enrichment: *std.Build.Step.Compile,
+    native_inference: *std.Build.Step.Compile,
 };
 pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
@@ -221,22 +223,31 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
         }
 
-        const role_artifact = b.addLibrary(.{
-            .name = if (unit == .storage_kernel)
-                "antfly-storage-kernel"
-            else
-                b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
-            .root_module = role_mod,
-            .linkage = .static,
-            .max_rss = runtimeCompileMaxRss(unit, .{
-                .host = b.graph.host.result,
-                .target = target.result,
-                .optimize = optimize,
-                .strip = strip,
-                .cpu_inference = options.cpu_inference,
-                .sanitize_thread = sanitize_thread,
-            }),
-        });
+        // Both products consume the same three coarse compute exports. The
+        // Apache owner is already PIC and storage-free. Sanitized server
+        // profiles retain their separately instrumented owner.
+        const role_artifact = if (unit == .enrichment_compute and !sanitize_thread)
+            options.native_enrichment
+        else
+            b.addLibrary(.{
+                .name = if (unit == .storage_kernel)
+                    "antfly-storage-kernel"
+                else
+                    b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+                .root_module = role_mod,
+                .linkage = .static,
+                .max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
+                    .host = b.graph.host.result,
+                    .target = target.result,
+                    .optimize = optimize,
+                    .strip = strip,
+                    .cpu_inference = options.cpu_inference,
+                    .sanitize_thread = sanitize_thread,
+                    .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
+                }),
+            });
+        if (unit == .inference and production_antfly_imports.shared_inference_core)
+            role_artifact.root_module.linkLibrary(options.native_inference);
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
