@@ -38,6 +38,8 @@ const ml = @import("ml");
 pub const CT = backend_contracts.CT;
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
+pub const rope_table = @import("rope_table.zig");
+pub const geglu = @import("geglu.zig");
 pub const record_loss_math = @import("record_loss_math.zig");
 pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
 pub const consistency_loss_math = @import("consistency_loss_math.zig");
@@ -2222,6 +2224,11 @@ pub const ComputeBackend = struct {
         /// = d_gamma, row `rows+1` = d_beta. Optional; backends without it fall
         /// back to the lowered (decomposed) backward.
         layerNormBackward: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT = null,
+        /// `fused_rope_table`: x [rows, width] rotated by [rows*heads, head_dim/2] tables.
+        ropeTable: ?*const fn (ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT = null,
+        /// `fused_geglu` [rows, 2*width] -> [rows, width] and its backward.
+        geglu: ?*const fn (ctx: *anyopaque, input: CT, width: usize) anyerror!CT = null,
+        gegluBackward: ?*const fn (ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT = null,
 
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
@@ -3856,6 +3863,21 @@ pub const ComputeBackend = struct {
     pub fn layerNormConsumeInput(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.layerNormConsumeInput) |f| return f(self.ptr, input, gamma, beta, dim, eps);
         return null;
+    }
+
+    pub fn ropeTable(self: *const ComputeBackend, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !CT {
+        const op = self.vtable.ropeTable orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, cos, sin, width, head_dim, inverse);
+    }
+
+    pub fn geglu(self: *const ComputeBackend, input: CT, width: usize) !CT {
+        const op = self.vtable.geglu orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, width);
+    }
+
+    pub fn gegluBackward(self: *const ComputeBackend, input: CT, dout: CT, width: usize) !CT {
+        const op = self.vtable.gegluBackward orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, dout, width);
     }
 
     pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {

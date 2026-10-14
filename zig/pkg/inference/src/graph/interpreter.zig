@@ -2629,6 +2629,14 @@ pub fn executeNode(
             return cb.layerNorm(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs.dim, attrs.eps);
         },
 
+        .fused_rope_table => |attrs| {
+            const width: usize = @intCast(graph.node(node_id).output_shape.dim(1));
+            return cb.ropeTable(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), width, attrs.head_dim, attrs.inverse);
+        },
+
+        .fused_geglu => |attrs| return cb.geglu(V.get(ins[0]), attrs.width),
+        .fused_geglu_backward => |attrs| return cb.gegluBackward(V.get(ins[0]), V.get(ins[1]), attrs.width),
+
         .fused_layer_norm_backward => |attrs| {
             return (try cb.layerNormBackward(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs.dim, attrs.eps)) orelse error.UnsupportedPrimitiveOp;
         },

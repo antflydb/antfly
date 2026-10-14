@@ -15600,6 +15600,120 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, shape_i32);
     }
 
+    /// Runs one boundary kernel on device-resident f32 operands into a new
+    /// `shape` tensor. Null when an operand is not device-resident f32.
+    fn boundaryKernelDevice(self: *MetalCompute, request: ops.gliner_boundary_device.Kernel, inputs: []const CT, shape: []const i32) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const layout = request.layout() catch return null;
+        var tensors: [ops.gliner_boundary_device.max_inputs]MetalTensor = undefined;
+        var held: usize = 0;
+        defer for (tensors[0..held]) |*tensor| tensor.deinit();
+        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        for (inputs, 0..) |input, i| {
+            tensors[i] = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+            held += 1;
+            const tensor = tensors[i];
+            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != layout.input_elements[i] or
+                tensor.deviceByteLen() != tensor.elemCount() * 4) return null;
+            sources[i] = tensor;
+        }
+        var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * @sizeOf(f32), .private, shape);
+        errdefer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (2 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (2 * width);
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .laya_geglu };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        if (try self.boundaryKernelDevice(request, &.{input}, &shape)) |tensor| return tensor;
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const output = try self.allocator.alloc(f32, x.len / 2);
+        errdefer self.allocator.free(output);
+        try ops.geglu.forward(output, x, width);
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (2 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (2 * width);
+        const shape = [_]i32{ @intCast(rows), @intCast(2 * width) };
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .geglu_backward };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        if (try self.boundaryKernelDevice(request, &.{ input, dout }, &shape)) |tensor| return tensor;
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const g = try toFloat32Op(ctx, dout, self.allocator);
+        defer self.allocator.free(g);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.geglu.backward(output, x, g, width);
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.ropeTableDevice(input, cos, sin, width, head_dim, inverse)) |tensor| return tensor;
+        // Host fallback for operands that are not device-resident f32.
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const c = try toFloat32Op(ctx, cos, self.allocator);
+        defer self.allocator.free(c);
+        const s = try toFloat32Op(ctx, sin, self.allocator);
+        defer self.allocator.free(s);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.rope_table.apply(output, x, c, s, width, head_dim, inverse);
+        const shape = [_]i32{ @intCast(x.len / width), @intCast(width) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn ropeTableDevice(self: *MetalCompute, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        var x_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        defer x_mt.deinit();
+        var cos_mt = self.ownedDeviceMetalTensorFromCt(cos) catch return null;
+        defer cos_mt.deinit();
+        var sin_mt = self.ownedDeviceMetalTensorFromCt(sin) catch return null;
+        defer sin_mt.deinit();
+        for ([_]MetalTensor{ x_mt, cos_mt, sin_mt }) |tensor|
+            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.deviceByteLen() != tensor.elemCount() * 4) return null;
+        const rows = ops.rope_table.validate(x_mt.elemCount(), cos_mt.elemCount(), width, head_dim) catch return null;
+        if (sin_mt.elemCount() != cos_mt.elemCount() or rows > std.math.maxInt(u32) or width > std.math.maxInt(u32)) return null;
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        var output = try MetalTensor.deviceAllocate(runtime, x_mt.elemCount() * @sizeOf(f32), .private, &shape);
+        errdefer output.deinit();
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .rope_table };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        request.dims[2] = @intCast(head_dim);
+        request.dims[3] = @intFromBool(inverse);
+        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        sources[0] = x_mt;
+        sources[1] = cos_mt;
+        sources[2] = sin_mt;
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
     /// LayerNorm over rows of `dim`, reading gamma and beta from their own
     /// buffers rather than a prepared slot. Null when the operands are not
     /// device-resident f32 or the shape is outside the kernel's range.
@@ -32639,7 +32753,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
         vt.layerNorm = layerNormOp;
+        // The inherited NativeCompute op would read a MetalCompute tensor as
+        // its own; the interpreter falls back to layerNorm without it.
+        vt.layerNormConsumeInput = null;
         vt.layerNormBackward = layerNormBackwardOp;
+        vt.ropeTable = ropeTableOp;
+        vt.geglu = gegluOp;
+        vt.gegluBackward = gegluBackwardOp;
         vt.addLayerNorm = addLayerNormOp;
         vt.addLayerNormSum = addLayerNormSumOp;
         vt.ensureDeviceResident = ensureDeviceResidentOp;

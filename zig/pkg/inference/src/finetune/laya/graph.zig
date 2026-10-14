@@ -157,8 +157,15 @@ fn norm(b: *B, x: Id, prefix: []const u8, dim: u32, eps: f32, bias: bool) !Id {
         @memset(zeros, 0);
         break :blk try b.tensorConst(zeros, Shape.init(.f32, &.{dim}));
     };
-    const fused = try b.layerNorm(x, w, z, dim, eps);
-    return b.graph.node(fused).vjp_alternate;
+    return trainingLayerNorm(b, x, w, z, dim, eps);
+}
+/// With `fuse_layer_norm_backward` the fused node has no decomposition and
+/// autodiff differentiates it with one fused backward node; otherwise use the
+/// primitive decomposition.
+fn trainingLayerNorm(b: *B, x: Id, gamma: Id, beta: Id, dim: u32, eps: f32) !Id {
+    const fused = try b.layerNorm(x, gamma, beta, dim, eps);
+    const alternate = b.graph.node(fused).vjp_alternate;
+    return if (alternate == ml.null_node) fused else alternate;
 }
 fn drop(b: *B, built: *Built, x: Id, probability: f32) !Id {
     if (probability == 0) return x;
@@ -227,6 +234,11 @@ pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, 
 // layout and an exact VJP without depending on inference-only fused kernels.
 // Tables are runtime inputs because tree-packed rows restart positions.
 fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
+    // One fused rotation forward and one inverse rotation backward, instead
+    // of the slice/multiply/concat primitives below and their VJPs.
+    // ANTFLY_LAYA_DECOMPOSED_ROPE keeps the primitives, for bisecting.
+    if (!@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_DECOMPOSED_ROPE"))
+        return b.ropeTable(x, tables[0], tables[1], d);
     const n = l.batch * l.sequence * h;
     const c = tables[0];
     const s = tables[1];
@@ -333,8 +345,16 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         x = try b.add(x, try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false, encoder_lora));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, &result, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false, encoder_lora);
-        const gate = try b.geluExact(try b.sliceLastDim(up, 0, cfg.intermediate_size));
-        const product = try b.mul(gate, try b.sliceLastDim(up, cfg.intermediate_size, cfg.intermediate_size * 2));
+        // One fused GeGLU node forward and backward instead of two slices, a
+        // GELU and a multiply (whose VJPs pad back to the full width).
+        // ANTFLY_LAYA_DECOMPOSED_GEGLU keeps the primitives, for bisecting.
+        const product = if (!@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_DECOMPOSED_GEGLU"))
+            try b.geglu(up, cfg.intermediate_size)
+        else
+            try b.mul(
+                try b.geluExact(try b.sliceLastDim(up, 0, cfg.intermediate_size)),
+                try b.sliceLastDim(up, cfg.intermediate_size, cfg.intermediate_size * 2),
+            );
         x = try b.add(x, try linear(b, &result, product, try std.fmt.bufPrint(&names, "{s}.mlp.Wo", .{prefix}), n, cfg.intermediate_size, h, false, encoder_lora));
         try result.trace(b.graph.allocator, prefix, x);
     }
@@ -382,8 +402,8 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         const norm_w = try param(b, "pointer.norm", "weight", &.{h});
         const norm_b = try param(b, "pointer.norm", "bias", &.{h});
         const anchor_rows = try b.gather(x, result.inputs.anchors, Shape.init(.f32, &.{ l.questions * l.options, h }));
-        const anchor = b.graph.node(try b.layerNorm(anchor_rows, norm_w, norm_b, h, 1e-5)).vjp_alternate;
-        const options = b.graph.node(try b.layerNorm(m, norm_w, norm_b, h, 1e-5)).vjp_alternate;
+        const anchor = try trainingLayerNorm(b, anchor_rows, norm_w, norm_b, h, 1e-5);
+        const options = try trainingLayerNorm(b, m, norm_w, norm_b, h, 1e-5);
         const q = try linear(b, &result, anchor, "pointer.q", l.questions * l.options, h, p, true, null);
         const k = try linear(b, &result, options, "pointer.k", l.questions * l.options, h, p, true, null);
         const product = try b.mul(q, k);

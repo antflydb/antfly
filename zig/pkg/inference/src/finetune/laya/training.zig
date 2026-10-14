@@ -420,6 +420,10 @@ pub const Program = struct {
         var graph = ml.Graph.init(a);
         errdefer graph.deinit();
         var builder = ml.Builder.init(&graph);
+        // One fused LayerNorm node forward and one backward, instead of the
+        // decomposed mean/variance/rsqrt primitives and their VJPs.
+        // ANTFLY_LAYA_DECOMPOSED_NORM keeps the primitives, for bisecting.
+        builder.fuse_layer_norm_backward = !@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_DECOMPOSED_NORM");
         var built = try architecture.buildWithAttention(&builder, cfg, l, dropout, lora, use_fused_attention);
         errdefer built.deinit(a);
         try graph.markOutput(built.logits);
