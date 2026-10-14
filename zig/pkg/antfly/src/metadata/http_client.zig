@@ -750,17 +750,27 @@ pub const MetadataHttpClient = struct {
     /// apply the subsequent registration. Absent/upgrade-required routes are
     /// a safe legacy registration verdict; all other failures remain errors.
     pub fn storeRootReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
     }
 
     /// Separate authenticated v18 admission. Old leaders do not expose this
     /// route, so callers omit the public key rather than appending a command
     /// their followers cannot decode.
     pub fn storeRootSigningReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
     }
 
-    fn storeRootCapabilityReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
+    /// Absence is a safe rolling-upgrade verdict; transient/ambiguous failures
+    /// are not permission to discard a capability already enrolled.
+    pub fn schemaReaderReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
+        return self.storeDecoderReadiness(base_uri, routes.Routes.internal_schema_reader_readiness, topology_protocol.schema_reader_capability_version) catch |err| switch (err) {
+            error.InvalidStoreRootReadinessResponse => error.InvalidSchemaReaderReadinessResponse,
+            error.StoreRootReadinessUnavailable => error.SchemaReaderReadinessUnavailable,
+            else => err,
+        };
+    }
+
+    fn storeDecoderReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
         const uri = try join(self.alloc, base_uri, route);
         defer self.alloc.free(uri);
         var response = try self.executeWithRetry(.{
@@ -2614,6 +2624,38 @@ fn consumerTests() type {
                 } else {
                     try std.testing.expectEqual(case.result.?, try client.storeRootSigningReadiness("http://127.0.0.1:9000"));
                 }
+            }
+        }
+
+        test "system catalog schema reader readiness client rejects incomplete and ambiguous replies" {
+            const Executor = struct {
+                status: u16,
+                body: []const u8,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.internal_schema_reader_readiness));
+                    try std.testing.expectEqualStrings("", request.body);
+                    return .{ .status = self.status, .content_type = try a.dupe(u8, "application/json"), .body = try a.dupe(u8, self.body) };
+                }
+            };
+            const cases = [_]struct { status: u16, body: []const u8, result: ?bool = null, err: ?anyerror = null }{
+                .{ .status = 200, .body = "{\"activated_version\":37}", .result = true },
+                .{ .status = 200, .body = "{\"activated_version\":38}", .result = true },
+                .{ .status = 404, .body = "", .result = false },
+                .{ .status = 405, .body = "", .result = false },
+                .{ .status = 426, .body = "", .result = false },
+                .{ .status = 503, .body = "", .err = error.SchemaReaderReadinessUnavailable },
+                .{ .status = 200, .body = "{\"activated_version\":36}", .err = error.InvalidSchemaReaderReadinessResponse },
+                .{ .status = 200, .body = "not json", .err = error.InvalidSchemaReaderReadinessResponse },
+                .{ .status = 200, .body = z17RepeatString("x", 1025), .err = error.InvalidSchemaReaderReadinessResponse },
+            };
+            for (cases) |case| {
+                var executor: Executor = .{ .status = case.status, .body = case.body };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+                if (case.err) |expected| {
+                    try std.testing.expectError(expected, client.schemaReaderReadiness("http://127.0.0.1:9000"));
+                } else try std.testing.expectEqual(case.result.?, try client.schemaReaderReadiness("http://127.0.0.1:9000"));
             }
         }
 

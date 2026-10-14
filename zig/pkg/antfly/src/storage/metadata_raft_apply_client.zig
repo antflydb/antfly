@@ -314,6 +314,9 @@ pub const RaftApplyStore = struct {
     pub fn getRelationalTopologyProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
         return self.projection(u16, .{ .kind = .relational_topology_protocol_activation_version, .group_id = group_id });
     }
+    pub fn getSchemaReaderFloor(self: *RaftApplyStore, group_id: u64) !metadata_table_manager.SchemaReaderFloor {
+        return self.catalogProjection(metadata_table_manager.SchemaReaderFloor, self.alloc, group_id, .schema_reader_floor);
+    }
     pub fn resolveTableCreateIdentity(self: *RaftApplyStore, group_id: u64, initial: u64) !u64 {
         return self.projection(u64, .{ .kind = .resolve_table_create_identity, .group_id = group_id, .arg0 = initial });
     }
@@ -330,6 +333,10 @@ pub const RaftApplyStore = struct {
     }
     pub fn standaloneRevision(self: *RaftApplyStore) !u64 {
         return self.projection(u64, .{ .kind = .standalone_revision });
+    }
+    pub const StandaloneRevisionState = contract.StandaloneRevisionState;
+    pub fn standaloneRevisionState(self: *RaftApplyStore) !StandaloneRevisionState {
+        return self.catalogProjection(StandaloneRevisionState, self.alloc, 0, .standalone_revision_state);
     }
     pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
         return self.updateStandaloneCatalog(group_id, expected_revision, .{ .replace = true, .tables = tables, .ranges = ranges, .auxiliary_json = auxiliary_json });
@@ -548,6 +555,16 @@ pub const RaftApplyStore = struct {
     pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_decision = request });
     }
+    pub fn relationalIndexOwnerAckStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_ack_status = request });
+    }
+    pub fn validateRelationalIndexOwnerAck(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const publication = @import("../metadata/relational_index_publication.zig");
+        if (bytes.len == 0 or bytes.len > publication.max_ack_bytes) return error.InvalidGenerationPublication;
+        const valid = try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_owner_ack_preflight = bytes });
+        if (!valid) return error.InvalidIndexOwnerReceipt;
+    }
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
     }
@@ -606,6 +623,10 @@ pub const RaftApplyStore = struct {
     }
     pub fn storeRootControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.Control) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .store_root_control = request });
+    }
+    pub fn validateStoreRootEnrollmentProtocol(self: *RaftApplyStore, group_id: u64) !void {
+        const valid = try self.catalogProjection(bool, self.alloc, group_id, .validate_store_root_enrollment_protocol);
+        if (!valid) return error.TableTopologyProtocolUpgradeRequired;
     }
     pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });

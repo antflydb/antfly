@@ -2830,6 +2830,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_data_runtime_tests = data_tests_addTests_result.run_lib_data_runtime_tests;
     const run_lib_data_storage_tests = data_tests_addTests_result.run_lib_data_storage_tests;
+    const reader_admission_step = b.step("antfly-store-reader-admission-test", "Verify durable decoder readiness and incarnation-bound schema reader advertisement");
+    for ([_]struct { module: *std.Build.Module, filters: []const []const u8 }{
+        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog schema reader readiness"} },
+        .{ .module = data_consumer_module, .filters = &.{"data runtime schema reader"} },
+    }) |fixture| {
+        const tests = b.addTest(.{
+            .root_module = fixture.module,
+            .filters = fixture.filters,
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        reader_admission_step.dependOn(&addFilteredTestRunArtifact(b, tests).step);
+    }
 
     const db_tests_addTests_result = db_tests.addTests(b, .{
         .antfly_test_mod = antfly_test_mod,

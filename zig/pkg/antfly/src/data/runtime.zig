@@ -4887,6 +4887,7 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // deliberately absent here and remains a permanent safety failure.
         error.StoreRootSigningIdentityUnconfirmed,
         error.StoreRootReadinessUnavailable,
+        error.SchemaReaderReadinessUnavailable,
         error.TableTopologyProtocolUpgradeRequired,
         // A concurrent metadata mutation can invalidate the local snapshot
         // cache after bootstrap reads its head but before that head is
@@ -18005,6 +18006,8 @@ pub const DataServer = struct {
         const previous_store = for (protocol_snapshot.stores) |store| {
             if (store.store_id == registration.store_id) break store;
         } else null;
+        const reader_enrolled = if (previous_store) |store| store.schema_reader.known() else false;
+        const schema_reader = try schemaReaderCapabilityForReadiness(try remote_metadata.schemaReaderReadiness(), previous_store);
         const previously_enrolled = if (previous_store) |store|
             !std.mem.eql(u8, &store.replica_root_public_key, &zero_key)
         else
@@ -18048,6 +18051,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
+            .schema_reader = schema_reader,
             .dense_native_storage_protocol_version = dense_native_capability,
             .api_url = api_url,
             .raft_url = raft_url,
@@ -18060,7 +18064,8 @@ pub const DataServer = struct {
             remote_metadata.registerNode(record) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => {
                     // Only a definite pre-proposal decoder verdict permits
-                    // fallback. Once enrolled, never strip the key.
+                    // fallback. An enrolled reader or signing claim must survive it.
+                    if (try schemaReaderRegistrationFallback(&record, reader_enrolled)) continue;
                     if (!std.mem.eql(u8, &record.replica_root_public_key, &zero_key)) {
                         if (previously_enrolled) return err;
                         record.replica_root_public_key = zero_key;
@@ -18945,6 +18950,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = dense_native_capability,
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
+            .schema_reader = registeredSchemaReaderCapability(snapshot.stores, registration.store_id, reporter_incarnation),
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -28380,6 +28386,17 @@ const RemoteMetadataSource = struct {
         }.call, {});
     }
 
+    fn schemaReaderReadiness(self: *RemoteMetadataSource) !bool {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
+        return self.withMetadataApiClient(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void) !bool {
+                return client.schemaReaderReadiness(base_uri);
+            }
+        }.call, {});
+    }
+
     fn reportNodeStatus(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
         return self.reportNodeStatusWithBudget(report, null);
     }
@@ -29267,6 +29284,32 @@ fn hasSingleRoleStore(
         if (matching_store_id.? != store.store_id) return false;
     }
     return matching_store_id != null and matching_store_id.? == store_id;
+}
+
+fn schemaReaderCapabilityForReadiness(ready: bool, previous: ?antfly.metadata.table_manager.StoreRecord) !antfly.metadata.table_manager.SchemaReaderCapabilities {
+    if (!ready) {
+        if (previous) |record| if (record.schema_reader.known()) return error.SchemaReaderReadinessUnavailable;
+        return .{};
+    }
+    return antfly.metadata.table_manager.SchemaReaderCapabilities.current;
+}
+
+/// Only a definite pre-proposal decoder verdict permits this fallback.
+/// An enrolled reader claim is never erased to fit an older metadata cohort.
+fn schemaReaderRegistrationFallback(record: *antfly.metadata.table_manager.StoreRecord, previously_enrolled: bool) !bool {
+    if (!record.schema_reader.known()) return false;
+    if (previously_enrolled) return error.TableTopologyProtocolUpgradeRequired;
+    record.schema_reader = .{};
+    return true;
+}
+
+/// Report the exact admitted claim, bound to this reporter incarnation.
+/// Neither a leader's version nor the presence of data Raft is reader proof.
+fn registeredSchemaReaderCapability(stores: []const antfly.metadata.table_manager.StoreRecord, store_id: u64, reporter_incarnation: u64) antfly.metadata.table_manager.SchemaReaderCapabilities {
+    if (reporter_incarnation == 0) return .{};
+    const record = findSnapshotStore(stores, store_id) orelse return .{};
+    if (record.reporter_incarnation != reporter_incarnation or !record.schema_reader.validForReporter(reporter_incarnation)) return .{};
+    return record.schema_reader;
 }
 
 fn storeRegistrationVisible(
@@ -36504,6 +36547,39 @@ fn consumerTests() type {
             try std.testing.expect(localPlacementEligible(hidden, registration, cached_root));
             hidden.store_id = 20;
             try std.testing.expect(!localPlacementEligible(hidden, registration, cached_root));
+        }
+
+        test "data runtime schema reader enrollment requires readiness and cannot discard an enrolled claim" {
+            try std.testing.expect(isRetryableMetadataBootstrapError(error.SchemaReaderReadinessUnavailable));
+            try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidSchemaReaderReadinessResponse));
+            const caps = antfly.metadata.table_manager.SchemaReaderCapabilities.current;
+            const unknown = try schemaReaderCapabilityForReadiness(false, null);
+            try std.testing.expect(!unknown.known());
+            var record: antfly.metadata.table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .replica_root_incarnation = 9, .replica_root_public_key = @splat(3), .schema_reader = caps };
+            try std.testing.expectEqualDeep(caps, try schemaReaderCapabilityForReadiness(true, record));
+            try std.testing.expectError(error.SchemaReaderReadinessUnavailable, schemaReaderCapabilityForReadiness(false, record));
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderRegistrationFallback(&record, true));
+            try std.testing.expectEqualDeep(caps, record.schema_reader);
+            try std.testing.expect(try schemaReaderRegistrationFallback(&record, false));
+            try std.testing.expect(!record.schema_reader.known());
+            try std.testing.expectEqual(@as(u128, 9), record.replica_root_incarnation);
+            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(3)), &record.replica_root_public_key);
+            try std.testing.expect(!try schemaReaderRegistrationFallback(&record, false));
+        }
+
+        test "data runtime schema reader advertisement uses the exact enrolled reporter not data raft capability" {
+            var record: antfly.metadata.table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .role = "serving", .schema_reader = .{ .semantic_ceiling = 30, .encoding_ceiling = 31 } };
+            try std.testing.expectEqual(@as(u16, 0), record.relational_topology_protocol_version);
+            try std.testing.expectEqualDeep(record.schema_reader, registeredSchemaReaderCapability(&.{record}, 1, 7));
+            try std.testing.expect(!registeredSchemaReaderCapability(&.{record}, 1, 6).known());
+            try std.testing.expect(!registeredSchemaReaderCapability(&.{record}, 1, 0).known());
+            try std.testing.expect(!registeredSchemaReaderCapability(&.{record}, 2, 7).known());
+            const expected = record;
+            record.schema_reader = .{};
+            try std.testing.expect(!storeRegistrationVisible(&.{record}, expected));
+            try std.testing.expect(!registeredSchemaReaderCapability(&.{record}, 1, 7).known());
+            record.schema_reader = .{ .semantic_ceiling = 30 };
+            try std.testing.expect(!registeredSchemaReaderCapability(&.{record}, 1, 7).known());
         }
 
         test "data store registration waits for native generation capability acknowledgment" {

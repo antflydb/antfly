@@ -38,6 +38,7 @@ pub const Routes = struct {
     pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const internal_store_root_readiness = "/internal/v1/catalog/store-root-readiness";
     pub const internal_store_root_signing_readiness = "/internal/v1/catalog/store-root-signing-readiness";
+    pub const internal_schema_reader_readiness = "/internal/v1/catalog/schema-reader-readiness";
     pub const internal_linearizable_snapshot = "/internal/v1/catalog/linearizable-snapshot";
     pub const internal_provisioning_snapshot = "/internal/v1/catalog/provisioning";
     pub const internal_restore_staging_authority = "/internal/v1/catalog/restore-staging-authority";

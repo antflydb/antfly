@@ -1791,6 +1791,14 @@ pub fn metadataApplyStoreProjection(
             const input_request = std.json.parseFromSliceLeaky(contract.CatalogProjectionRequest, a, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             const group_id = request.group_id;
             switch (input_request) {
+                .schema_reader_floor => {
+                    const value = handle.store.getSchemaReaderFloor(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .standalone_revision_state => {
+                    const value = handle.store.standaloneRevisionState() catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .read_store => |input| {
                     const value = handle.store.readStore(a, group_id, input.store_id, input.reports) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -1941,6 +1949,14 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.relationalIndexOwnerDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .relational_index_owner_ack_status => |input| {
+                    const value = handle.store.relationalIndexOwnerAckStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relational_index_owner_ack_preflight => |input| {
+                    handle.store.validateRelationalIndexOwnerAck(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
                 .fk_initial_create_prepare => |input| {
                     const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -1984,6 +2000,10 @@ pub fn metadataApplyStoreProjection(
                 .store_root_control => |input| {
                     const value = handle.store.storeRootControlJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_store_root_enrollment_protocol => {
+                    handle.store.validateStoreRootEnrollmentProtocol(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
                 },
                 .fk_initial_parent_decision => |input| {
                     const value = handle.store.fkInitialParentDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);

@@ -13008,11 +13008,7 @@ pub const RaftApplyStore = struct {
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
-    pub const StandaloneRevisionState = struct {
-        revision: u64,
-        /// Last commit that might change the visible catalog projection.
-        projection_revision: u64,
-    };
+    pub const StandaloneRevisionState = apply_contract.StandaloneRevisionState;
 
     pub fn standaloneRevisionState(self: *RaftApplyStore) !StandaloneRevisionState {
         var txn = try self.store.beginReadTxn();

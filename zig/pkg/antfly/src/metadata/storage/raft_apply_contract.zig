@@ -276,6 +276,12 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+pub const StandaloneRevisionState = struct {
+    revision: u64,
+    /// Last commit that might change the visible catalog projection.
+    projection_revision: u64,
+};
+
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
@@ -325,4 +331,10 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    // Additive owned JSON projections; no storage handles cross this boundary.
+    schema_reader_floor: void,
+    standalone_revision_state: void,
+    relational_index_owner_ack_status: @import("../relational_index_publication.zig").Ack,
+    relational_index_owner_ack_preflight: []const u8,
+    validate_store_root_enrollment_protocol: void,
 };

@@ -118,12 +118,22 @@ fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anye
 }
 
 fn storeRootReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
-    return storeRootCapabilityReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
+    return storeDecoderReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
 }
 
-fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
+fn schemaReaderReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness {
     return struct {
-        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
+        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            try svc.ensureSchemaReaderDecoderReadyWithContext(request);
+            return storeDecoderReadinessCall(Service, @import("topology_protocol.zig").schema_reader_capability_version)(ptr, request);
+        }
+    }.call;
+}
+
+fn storeDecoderReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness {
+    return struct {
+        fn call(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
             const svc: *Service = @ptrCast(@alignCast(ptr));
             const proof = try svc.ensureTableTopologyProtocolReadyWithContext(request, required_version);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -192,7 +202,7 @@ test "store-root readiness returns only an exact durable v17 activation" {
     var signing_proof = proof;
     signing_proof.required_version = protocol.store_root_signing_decoder_version;
     var signing_fake: Fake = .{ .store = .{ .activation = activation }, .proof = signing_proof };
-    const signing_call = comptime storeRootCapabilityReadinessCall(Fake, protocol.store_root_signing_decoder_version);
+    const signing_call = comptime storeDecoderReadinessCall(Fake, protocol.store_root_signing_decoder_version);
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
     signing_fake.store.activation.?.version = protocol.store_root_signing_decoder_version;
     try std.testing.expectEqual(protocol.store_root_signing_decoder_version, (try signing_call(&signing_fake, .{})).activated_version);
@@ -200,6 +210,60 @@ test "store-root readiness returns only an exact durable v17 activation" {
     signing_fake.store.activation.?.member_count += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
     try std.testing.expect(!signing_fake.validated);
+}
+
+test "system catalog schema reader readiness binds exact durable membership after activation" {
+    const protocol = @import("topology_protocol.zig");
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        prepared: bool = false,
+        validated: bool = false,
+        fail_validation: bool = false,
+        activation: ?protocol.Activation = null,
+        proof: service.TableTopologyProtocolReadiness,
+        pub fn ensureSchemaReaderDecoderReadyWithContext(self: *@This(), _: operation.RequestContext) !void {
+            self.prepared = true;
+        }
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, required: u16) !service.TableTopologyProtocolReadiness {
+            try std.testing.expect(self.prepared);
+            try std.testing.expectEqual(protocol.schema_reader_capability_version, required);
+            return self.proof;
+        }
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn topologyActivation(self: *@This(), _: u64) !?protocol.Activation {
+            return self.activation;
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: service.TableTopologyProtocolReadiness) !void {
+            if (self.fail_validation) return error.TableTopologyProtocolUpgradeRequired;
+            self.validated = true;
+        }
+    };
+    const proof: service.TableTopologyProtocolReadiness = .{
+        .term = 7,
+        .required_version = protocol.schema_reader_capability_version,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .protected_member_count = 2,
+        .protected_membership_fingerprint = @splat(3),
+    };
+    var fake: Fake = .{ .proof = proof };
+    const call = comptime schemaReaderReadinessCall(Fake);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
+    fake.activation = .{ .version = protocol.schema_reader_capability_version, .incarnation = proof.metadata_incarnation.?, .member_count = 2, .membership_fingerprint = @splat(3) };
+    try std.testing.expectEqual(protocol.schema_reader_capability_version, (try call(&fake, .{})).activated_version);
+    fake.validated = false;
+    fake.activation.?.membership_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
+    fake.activation.?.membership_fingerprint = @splat(3);
+    fake.activation.?.version -= 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    fake.activation.?.version = protocol.schema_reader_capability_version;
+    fake.fail_validation = true;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, call(&fake, .{}));
+    try std.testing.expect(!fake.validated);
 }
 
 pub const AdminSource = struct {
@@ -214,6 +278,7 @@ pub const AdminSource = struct {
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         ensure_store_root_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
         ensure_store_root_signing_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
+        ensure_schema_reader_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreDecoderReadiness = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         provisioning_snapshot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) anyerror!@import("restore_staging.zig").ProvisioningSnapshot = null,
         restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
@@ -320,6 +385,11 @@ pub const AdminSource = struct {
 
     pub fn ensureStoreRootSigningReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreRootReadiness {
         const fn_ptr = self.vtable.ensure_store_root_signing_readiness orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn ensureSchemaReaderReadiness(self: AdminSource, request: operation.RequestContext) !metadata_api.StoreDecoderReadiness {
+        const fn_ptr = self.vtable.ensure_schema_reader_readiness orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, request);
     }
 
@@ -645,7 +715,8 @@ pub const AdminSource = struct {
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeDecoderReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_schema_reader_readiness = comptime schemaReaderReadinessCall(service.MetadataService),
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
@@ -714,7 +785,8 @@ pub const AdminSource = struct {
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataHttpService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeDecoderReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_schema_reader_readiness = comptime schemaReaderReadinessCall(service.MetadataHttpService),
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
@@ -1970,6 +2042,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_store_root_readiness, httpx.Handler.bind(self, metadataStoreRootReadiness));
         try server.post(routes.Routes.internal_store_root_signing_readiness, httpx.Handler.bind(self, metadataStoreRootSigningReadiness));
+        try server.post(routes.Routes.internal_schema_reader_readiness, httpx.Handler.bind(self, metadataSchemaReaderReadiness));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_provisioning_snapshot, httpx.Handler.bind(self, metadataProvisioningSnapshot));
         try server.post(routes.Routes.internal_restore_staging_authority, httpx.Handler.bind(self, metadataRestoreStagingAuthority));
@@ -2440,6 +2513,15 @@ pub const MetadataHttpServer = struct {
             return ctx.status(403).text("authenticated service required");
         const request = requestContext(ctx);
         const result = self.source.ensureStoreRootSigningReadiness(request) catch |err| return metadataMutationError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataSchemaReaderReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        const request = requestContext(ctx);
+        const result = self.source.ensureSchemaReaderReadiness(request) catch |err| return metadataMutationError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }

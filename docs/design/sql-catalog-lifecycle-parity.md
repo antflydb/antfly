@@ -5303,6 +5303,63 @@ wrapper was stopped. The wrapper itself is not recorded as a completed check.
 Original dispositions remain 479 implemented / 136 rejected / 73 superseded /
 898 unresolved. The floor/transport tests earn no original-case credit.
 
+### Automatic, qualified schema-reader advertisement
+
+The authenticated internal schema-reader-readiness RPC now reuses the existing
+durable decoder activation machinery. Both metadata service implementations
+establish the activation receipt before returning readiness, then verify the
+same incarnation and complete protected membership and revalidate leadership.
+The shared result is StoreDecoderReadiness; existing store-root readiness keeps
+its wire representation and uses the same verifier. This is an internal
+control-plane RPC, not a new public SQL/OpenAPI schema or index route.
+
+Data registration advertises the current semantic/ASCH ceilings only after that
+readiness proof. Missing/unsupported legacy routes permit an unknown initial
+claim; malformed replies and ambiguous failures do not. Once a reader claim is
+enrolled, unavailable readiness cannot erase it. Only an explicit pre-proposal
+decoder rejection allows an un-enrolled claim to fall back, without stripping
+the physical-root/signing identity. Transient readiness unavailability follows
+the existing bounded bootstrap backoff; malformed proof remains a safety error.
+
+Status collection copies the exact admitted descriptor from its linearizable
+metadata snapshot for the same nonzero reporter incarnation. It neither infers
+support from the leader's version nor requires data Raft. The heartbeat cache,
+sparse/full report comparison and reference fences retain that descriptor.
+These implementation capabilities remain separate from actual schema/root
+installation acknowledgements.
+
+Production Debug compilation exposed missing facade methods that physical
+metadata unit tests could not exercise. Reader-floor lookup, the atomic
+standalone revision/projection-revision pair, planless index-owner ACK
+status/preflight and root-enrollment protocol validation now cross the existing
+owned JSON kernel projection protocol. No physical storage handle escapes the
+owner. StandaloneRevisionState is a storage-free shared contract. The new
+compiled-owner regression verifies real registration/capability projection,
+revision-pair semantics and preserved admission errors; advertising alone leaves
+the schema floor inactive. The actual serverless archive also needed the pure
+resolver fingerprint dependency already present in native object runtimes;
+the shared object-runtime import profile now supplies it to both.
+
+The dedicated reader-admission gate audits the metadata and data source owners
+with separate nonempty filters. Its first selection incorrectly combined
+unrelated owner filters and failed the audit; the filters were corrected rather
+than weakening the audit. The data contracts are also selected by the normal
+data-runtime gate, and the opaque projection regression by the existing
+compiled storage-owner gate.
+
+Qualification for this advertisement increment used Debug throughout. The
+actual server and final reader-admission/data-runtime gate passed 128/128 build
+steps. The broader metadata/catalog/coordinator and data-runtime gate passed
+125/125 steps, and the compiled storage-owner regression plus actual server
+passed 67/67 steps. Formatting, license/Apache boundaries, control-catalog
+freshness and original-inventory checks passed; original dispositions remain
+479 implemented, 136 rejected, 73 superseded and 898 unresolved.
+
+Server-derived publication/manifest requirements, atomic binding to every
+catalog/schema mutation and exact same-root/group/schema owner ACKs remain
+unfinished. Native/metadata transport and advertisement proofs do not complete
+the unchanged original sql-0671 CREATE or any other original SQL case.
+
 The unchanged sql-0671 declaration now also has an independently captured
 PostgreSQL fixture and native/mounted contracts. The complete declaration binds
 its UUID PRIMARY KEY, text replacement/lower, exact NUMERIC rounding and JSONB

@@ -3646,7 +3646,7 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 
 /// Capability observation alone does not install the apply-side barrier. Own
 /// and observe its durable receipt before admitting the user's guarded write.
-fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext, required_version: u16) !void {
+fn ensureDurableDecoderActivation(service: anytype, context: api_operation.RequestContext, required_version: u16) !void {
     const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     const activation: metadata_topology_protocol.Activation = .{
         .version = readiness.required_version,
@@ -6872,6 +6872,10 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
+    pub fn ensureSchemaReaderDecoderReadyWithContext(self: *MetadataService, context: api_operation.RequestContext) !void {
+        try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.schema_reader_capability_version);
+    }
+
     pub fn reportStoreStatus(self: *MetadataService, report: metadata_table_manager.StoreStatusReport) !void {
         if (report.runtime_reference) return reportReferencedStoreStatus(self, report);
         _ = try self.reportStoreStatuses(&.{report});
@@ -6953,7 +6957,7 @@ pub const MetadataService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
+        try ensureDurableDecoderActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -9681,6 +9685,10 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
+    pub fn ensureSchemaReaderDecoderReadyWithContext(self: *MetadataHttpService, context: api_operation.RequestContext) !void {
+        try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.schema_reader_capability_version);
+    }
+
     /// A response acknowledges the exact applied cursor. Lost responses can
     /// retry the same command; stale bases never turn into partial overwrites.
     pub fn reportStoreBaseline(self: *MetadataHttpService, alloc: std.mem.Allocator, context: api_operation.RequestContext, bytes: []const u8) !store_report_baseline.Progress {
@@ -10002,7 +10010,7 @@ pub const MetadataHttpService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
+        try ensureDurableDecoderActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 

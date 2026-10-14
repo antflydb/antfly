@@ -38,6 +38,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime ordered artifact upload handoff",
+        "data runtime schema reader",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
