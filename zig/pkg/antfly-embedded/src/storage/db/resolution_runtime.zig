@@ -589,6 +589,14 @@ fn sameResolutionDecisions(gpa: Allocator, left: []const u8, right: []const u8) 
     var b = try std.json.parseFromSlice(std.json.Value, gpa, right, .{});
     defer b.deinit();
     if (a.value != .object or b.value != .object) return false;
+    // The previous generation's queued promotion can be fenced by catalog
+    // DDL before it reaches the sink. Its journal handoff does not prove sink
+    // completion, so a new generation must carry a promotion hint even when
+    // the decisions match. The promotion receipt still suppresses sink writes
+    // when those documents were already published.
+    const ag = a.value.object.get("config_generation") orelse return false;
+    const bg = b.value.object.get("config_generation") orelse return false;
+    if (ag != .integer or ag.integer < 0 or bg != .integer or ag.integer != bg.integer) return false;
     const aw = a.value.object.get("_resolution_work") orelse return false;
     const bw = b.value.object.get("_resolution_work") orelse return false;
     if (aw != .object or bw != .object) return false;
@@ -4738,7 +4746,7 @@ test "resolver backfill skips stale empty resolutions without routed mentions" {
     try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
 }
 
-test "incremental resolution replay commits refreshes atomically without unchanged promotion" {
+test "incremental resolution replay atomically hands off new generations and suppresses same-generation promotion" {
     const a = std.testing.allocator;
     var memory: MapStore = .{ .alloc = a };
     defer memory.deinit();
@@ -4759,19 +4767,25 @@ test "incremental resolution replay commits refreshes atomically without unchang
     defer a.free(old);
     try std.testing.expect(std.mem.indexOf(u8, old, "\"config_generation\":1") != null);
     _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
-    try std.testing.expectEqual(@as(u64, 1), writer.inferred_calls);
-    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 0), writer.graph_only_calls);
     const current = (try memory.store().get(a, resolved)).?;
     defer a.free(current);
     try std.testing.expect(std.mem.indexOf(u8, current, "\"config_generation\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, current, "_resolution_work") != null);
     try std.testing.expect(try resolution_handoff.matches(a, memory.store(), resolved, current));
+    // At the same generation, a retention-only refresh keeps the decisions
+    // and their existing promotion work, without another promotion hint.
+    configs[0].retain_work = .embeddings;
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
     // A superseding template change uses current extraction and replaces real
     // decisions via the full promotion/graph handoff, never old pending work.
     configs[0].config_generation = 3;
     configs[0].key_template = "person/{{ uslug _entity.text }}";
     _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
-    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 3), writer.inferred_calls);
     const changed = (try memory.store().get(a, resolved)).?;
     defer a.free(changed);
     var decoded = try resolver_lib.parseResolution(a, changed);
