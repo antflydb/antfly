@@ -235,6 +235,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .cpu_inference = options.cpu_inference,
             .sanitize_thread = sanitize_thread,
             .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
+            .macos_shared_storage_sdk27 = production_antfly_imports.darwin_shared_storage_sdk27,
         });
         const role_artifact = if (unit == .enrichment_compute and !sanitize_thread) blk: {
             // Reuse the implementation without replacing the runtime's

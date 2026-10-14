@@ -1088,6 +1088,12 @@ compiler-local numeric error codes. Both products access one handle registry
 and one C API TLS error state. Public lookup/raw/schema output buffers use the
 C allocator even when an internal handle has a custom allocator.
 
+Each operation has a hidden accessor, rather than one global pointer table, so
+final links can discard unused operations. Lookup, scan, statistics and relational
+constraint/index maintenance also route to the owner. Stateful relational readers
+retain their existing implementation until their full reader lifetime and callback
+contract can be moved together.
+
 Static server adapters compile without waiting for the shared engine. Provider
 archives are attached to final consumers; `runtime-unit-storage-adapter` compiles
 the adapter alone for memory/time qualification. Reservations remain conservative
@@ -1098,7 +1104,12 @@ Both embedded and production-profile executable probes pass real cross-archive
 lifecycle, batch/query, named-error, incompatible-layout, registry and TLS checks.
 A handle registered by the client is looked up and closed through the public
 C API. Combined conformance, smoke, probe, row-preparation, replay and SQL
-transform validation passed all 109 build steps. The PDF suite passed 489 tests
+transform validation passed all 109 build steps. Expanded runtime/LSM/relational
+index qualification passed 104/104 steps, including 606 LSM tests (23 skips),
+196 relational index tests and 44 runtime contracts. The final native storage
+and production-linked inference ABI probes pass. The Linux x86_64 GNU Debug
+ELF facade cross-link passed 52/52 steps and its exact 118-symbol public export
+audit; Linux execution is still a separate qualification gate. The PDF suite passed 489 tests
 after consolidating the two Roboto fonts into one PIC asset archive. This removes
 repeated data emission without changing font bytes or rendering behavior.
 
@@ -1117,7 +1128,43 @@ python3 zig/tools/benchmark_storage_owner.py \
   --output /path/outside/repository/storage-throughput.json
 ```
 
-Fresh release measurements of this expanded revision remain pending. SDK 27.0
-local results must be recorded separately from wolfspider's SDK 26.4 results;
-the 26.4 measured-admission policy does not apply to SDK 27.0. Earlier measured
-build/size figures above describe their frozen snapshots, not this revision.
+Initial cold SDK 27.0 measurements of `59a0711ade` against current main
+`2c8240e703` used Zig 0.17.0, native aarch64 baseline CPU, stripped ReleaseFast,
+Metal/Accelerate enabled, CUDA/PJRT disabled, and fresh local/global caches.
+Both enabled shared inference and the measured-memory option; only the candidate
+enabled shared storage. The baseline also received the identical missing
+serverless resolver-import repair. Both builds succeeded on a 14-core, 36 GiB Mac.
+These initial measurements precede selective operation linking and the expanded
+read adapters; they are not final results for the PR.
+
+| Initial SDK 27.0 measurement | Current main | Shared engine `59a0711ade` |
+| --- | ---: | ---: |
+| Cold combined executable/C API build | 2,633.97 s | 2,475.22 s |
+| Stripped executable | 178,481,624 B | 198,763,416 B |
+| Stripped C library | 71,561,936 B | 68,358,688 B |
+
+The initial executable size regression prompted selective linking and additional
+shared read operations. Exact font bytes appear five times per font in the
+baseline executable and twice in its C library, versus once per artifact in the
+candidate. The native asset archive removes four executable copies and one
+library copy of each font.
+
+Rounded compiler MaxRSS on that candidate was 9G API, 9G storage adapter, 6G
+storage engine, 5G inference, 4G distributed and 3G serverless. The opt-in SDK 27.0
+admission profile requires **both** shared owners, the exact compiler/SDK/native
+CPU/optimization/strip/backend settings above, and no thread sanitizer. It claims
+14 GiB for the adapter and 10 GiB for the engine; these exceed the rounded bounds
+plus a whole GiB and 25% margin. Remaining runtime claims use the conservative
+SDK 26.4 envelopes, also above this run's peaks. API and adapter can fit together
+within 28 GiB; final cold overlap qualification remains pending.
+
+Four alternating isolated-process runs (1,200 x 64 rows, 64 warmup batches) of
+that initial revision measured medians 3.5341 -> 3.6658 s for document batches
+(+3.73%) and 13.3586 -> 13.5646 s for SQL inserts (+1.54%). A single-row follow-up
+had large timing swings in both variants, and another workspace compiler was
+observed on the host. These results **do not establish throughput equivalence**.
+Repeat on the final revision with a quiet host. Counts and read-backs passed.
+
+Final release and overlap measurements remain pending. SDK 27.0 results are
+separate from wolfspider's SDK 26.4 pair; earlier figures describe their frozen
+snapshots. Shared storage and measured memory remain opt-in.

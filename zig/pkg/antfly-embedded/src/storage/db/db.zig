@@ -3208,6 +3208,7 @@ pub const DB = struct {
     };
 
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.ConstraintNotFound;
@@ -3219,6 +3220,7 @@ pub const DB = struct {
     }
 
     pub fn validateConstraintsStep(self: *DB, budget: relational_constraint_jobs.Budget) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("validateConstraintsStep", .{ self, budget });
         return self.validateConstraintsStepLocal(budget, false);
     }
 
@@ -3248,6 +3250,7 @@ pub const DB = struct {
 
     /// Retry only an observed failed epoch, never reset a newer declaration.
     pub fn retryConstraintValidation(self: *DB, schema_version: u32) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("retryConstraintValidation", .{ self, schema_version });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3290,6 +3293,7 @@ pub const DB = struct {
     /// coverage are reconstructed independently on every replica; progress is
     /// never a hot-standby command and cannot make a different owner query-ready.
     pub fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("buildRelationalIndexStep", .{ self, name, budget });
         return self.buildRelationalIndexStepLocal(name, budget, false);
     }
 
@@ -3311,6 +3315,7 @@ pub const DB = struct {
     }
 
     pub fn collectRelationalIndexGarbageStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectRelationalIndexGarbageStep", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3331,6 +3336,7 @@ pub const DB = struct {
     /// Retry only the observed failed generation. Healthy/building retries
     /// are idempotent; an old admin request cannot reset a replacement index.
     pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("retryRelationalIndexBuild", .{ self, name, generation });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3458,6 +3464,7 @@ pub const DB = struct {
     }
 
     pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalIndexBuildStatus", .{ self, name });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
@@ -6516,6 +6523,7 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStep", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         return try self.runLsmMaintenanceStepWithReplicationMutationHeld();
@@ -9188,6 +9196,7 @@ pub const DB = struct {
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("get", .{ self, alloc, key });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -17662,6 +17671,7 @@ pub const DB = struct {
     }
 
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("getDocument", .{ self, alloc, key, opts });
         return try self.lookup(alloc, key, opts);
     }
 
@@ -18159,6 +18169,7 @@ pub const DB = struct {
     }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("lookup", .{ self, alloc, key, opts });
         try checkLookupOptionsActive(opts);
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and
             (key.len != 0 or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
@@ -23050,6 +23061,7 @@ pub const DB = struct {
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("getSchemaJson", .{ self, alloc });
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
@@ -29439,6 +29451,7 @@ pub const DB = struct {
     }
 
     pub fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("getEnrichment", .{ self, alloc, kind, name });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.getEnrichment(alloc, kind, name);
@@ -37324,6 +37337,7 @@ pub const DB = struct {
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("diagnosticStats", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -38186,7 +38200,7 @@ pub const DB = struct {
     }
 
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
-        _ = alloc;
+        if (comptime storage_engine.enabled) return storage_engine.call("primaryDocCount", .{ self, alloc });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.scanPrimaryDocCount(self.core.byteRange());
@@ -38371,6 +38385,7 @@ pub const DB = struct {
     }
 
     pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("scan", .{ self, alloc, from_key, to_key, opts });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var collector = result_collectors.Scan{ .alloc = alloc, .include_documents = opts.include_documents };
         defer collector.deinit();

@@ -61,6 +61,12 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8) !v
     const value = (try db.get(alloc, "shared-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);
     if (!std.mem.eql(u8, value, "{\"n\":1}")) return error.SharedStorageReadBackFailed;
+    var looked_up = (try db.lookup(alloc, "shared-row", .{})) orelse return error.SharedStorageLookupFailed;
+    defer looked_up.deinit(alloc);
+    if (!std.mem.eql(u8, looked_up.json, value)) return error.SharedStorageLookupFailed;
+    var scanned = try db.scan(alloc, "", "", .{ .include_documents = true });
+    defer scanned.deinit(alloc);
+    if (scanned.documents.len != 1 or try db.primaryDocCount(alloc) != 1) return error.SharedStorageScanFailed;
     var result = try db.search(alloc, .{});
     defer result.deinit();
     if (result.hits.len != 1) return error.SharedStorageQueryFailed;

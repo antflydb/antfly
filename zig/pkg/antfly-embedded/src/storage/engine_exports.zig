@@ -15,6 +15,7 @@
 
 const engine = @import("engine.zig");
 const std = @import("std");
+const Exports = @This();
 const db = @import("db/db.zig");
 const DB = db.DB;
 const Allocator = std.mem.Allocator;
@@ -137,7 +138,70 @@ fn errorDetail() callconv(.c) [*:0]const u8 {
 fn setError(code: capi.ErrorCode, ptr: [*]const u8, len: usize) callconv(.c) void {
     _ = capi.recordError(code, ptr[0..len]);
 }
-const table: engine.VTable = .{ .open = open, .openOwned = openOwned, .close = close, .closeOwned = closeOwned, .startResidentBackgroundWorkersIfNeeded = startResidentBackgroundWorkersIfNeeded, .batchInternal = batchInternal, .searchWithDenseProfile = searchWithDenseProfile, .searchWithCapturedRequestAndExecutionContext = searchWithCapturedRequestAndExecutionContext, .searchLease = searchLease, .sync = sync, .syncIndexes = syncIndexes, .snapshot = snapshot, .snapshotWithMaintenanceDeadline = snapshotWithMaintenanceDeadline, .snapshotNativeWithCancellation = snapshotNativeWithCancellation, .snapshotRelationalCohort = snapshotRelationalCohort, .setSchema = setSchema, .setSchemaJson = setSchemaJson, .addIndex = addIndex, .deleteIndex = deleteIndex, .runUntilIdle = runUntilIdle, .runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation = runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation, .runBackgroundMaintenanceWithCancellation = runBackgroundMaintenanceWithCancellation, .registry = registry };
+fn get(self: *DB, alloc: Allocator, key: []const u8) engine.Outcome(?[]u8) {
+    return .{ .value = self.get(alloc, key) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
+    return .{ .value = self.getDocument(alloc, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
+    return .{ .value = self.lookup(alloc, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
+    return .{ .value = self.scan(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn diagnosticStats(self: *DB, alloc: Allocator) engine.Outcome(types.DBStats) {
+    return .{ .value = self.diagnosticStats(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn getSchemaJson(self: *DB, alloc: Allocator) engine.Outcome(?[]u8) {
+    return .{ .value = self.getSchemaJson(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn primaryDocCount(self: *DB, alloc: Allocator) engine.Outcome(u64) {
+    return .{ .value = self.primaryDocCount(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) engine.Outcome(?types.EnrichmentConfig) {
+    return .{ .value = self.getEnrichment(alloc, kind, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runLsmMaintenanceStep(self: *DB) engine.Outcome(bool) {
+    return .{ .value = self.runLsmMaintenanceStep() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn constraintValidationStatus(self: *DB) engine.Outcome(DB.ConstraintValidationStatus) {
+    return .{ .value = self.constraintValidationStatus() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn validateConstraintsStep(self: *DB, budget: @import("db/relational_constraint_jobs.zig").Budget) engine.Outcome(bool) {
+    return .{ .value = self.validateConstraintsStep(budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn retryConstraintValidation(self: *DB, schema_version: u32) engine.Outcome(bool) {
+    return .{ .value = self.retryConstraintValidation(schema_version) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: DB.RelationalIndexBuildBudget) engine.Outcome(void) {
+    return .{ .value = self.buildRelationalIndexStep(name, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn collectRelationalIndexGarbageStep(self: *DB) engine.Outcome(bool) {
+    return .{ .value = self.collectRelationalIndexGarbageStep() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) engine.Outcome(bool) {
+    return .{ .value = self.retryRelationalIndexBuild(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalIndexBuildStatus(self: *DB, name: []const u8) engine.Outcome(DB.RelationalIndexBuildStatus) {
+    return .{ .value = self.relationalIndexBuildStatus(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 const descriptor: engine.Descriptor = .{
     .table_layout = engine.table_layout,
     .db_layout = engine.db_layout,
@@ -149,15 +213,22 @@ const descriptor: engine.Descriptor = .{
     .core_fields = engine.core_fields.ptr,
     .core_field_count = engine.core_fields.len,
     .dispatch = engine.Boundary.local_dispatch,
-    .table = &table,
 };
-fn getFunctionTable() callconv(.c) *const engine.Descriptor {
+fn getDescriptor() callconv(.c) *const engine.Descriptor {
     return &descriptor;
 }
 comptime {
+    for (@typeInfo(engine.VTable).@"struct".field_names) |name| {
+        const Accessor = struct {
+            fn get() callconv(.c) *const anyopaque {
+                return @ptrCast(&@field(Exports, name));
+            }
+        };
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v2", .visibility = .hidden });
+    }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
-    @export(&getFunctionTable, .{ .name = "antfly_storage_engine_get_function_table_v1", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v2", .visibility = .hidden });
 }

@@ -1112,16 +1112,19 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
     const shared_inference_core = b.option(bool, "shared-inference-core", "Reuse one Apache inference engine for the server and embedded library") orelse false;
     const shared_storage_core = b.option(bool, "shared-storage-core", "Reuse one Apache physical storage engine for the server and embedded library") orelse false;
-    const measured_darwin_memory = b.option(bool, "measured-darwin-compile-memory", "Use native SDK 26.4 stripped Metal/BLAS ReleaseFast compiler admission claims") orelse false;
+    const measured_darwin_memory = b.option(bool, "measured-darwin-compile-memory", "Use qualified native SDK stripped Metal/BLAS ReleaseFast compiler admission claims") orelse false;
     const baseline_cpu = std.Target.Cpu.baseline(target.result.cpu.arch, target.result.os);
-    const darwin_release_memory = measured_darwin_memory and optimize == .fast and strip and !sanitize_thread and
+    const darwin_release_profile = measured_darwin_memory and optimize == .fast and strip and !sanitize_thread and
         std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
         b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
         target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
         inference_enable_metal and inference_enable_system_blas and
-        !inference_enable_cuda and !inference_enable_pjrt and
-        @import("antfly_platform").macosSdkMatchesVersion(b, target, "26.4");
+        !inference_enable_cuda and !inference_enable_pjrt;
+    const darwin_shared_storage_sdk27 = darwin_release_profile and shared_storage_core and shared_inference_core and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "27.0");
+    const darwin_release_memory = darwin_release_profile and
+        (@import("antfly_platform").macosSdkMatchesVersion(b, target, "26.4") or darwin_shared_storage_sdk27);
     const engine_options = b.addOptions();
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
@@ -1183,6 +1186,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .inference_engine = inference_engine_mod,
         .shared_inference_core = shared_inference_core,
         .darwin_release_memory = darwin_release_memory,
+        .darwin_shared_storage_sdk27 = darwin_shared_storage_sdk27,
         .sanitize_thread = sanitize_thread,
         .build_info = build_info,
 

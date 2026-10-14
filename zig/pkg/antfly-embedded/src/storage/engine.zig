@@ -40,6 +40,22 @@ pub fn Outcome(comptime T: type) type {
     return struct { value: T = undefined, failure: Failure = .{} };
 }
 pub const VTable = struct {
+    get: *const fn (self: *DB, alloc: Allocator, key: []const u8) Outcome(?[]u8),
+    getDocument: *const fn (self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) Outcome(?types.LookupResult),
+    lookup: *const fn (self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) Outcome(?types.LookupResult),
+    scan: *const fn (self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(types.ScanResult),
+    diagnosticStats: *const fn (self: *DB, alloc: Allocator) Outcome(types.DBStats),
+    getSchemaJson: *const fn (self: *DB, alloc: Allocator) Outcome(?[]u8),
+    primaryDocCount: *const fn (self: *DB, alloc: Allocator) Outcome(u64),
+    getEnrichment: *const fn (self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) Outcome(?types.EnrichmentConfig),
+    runLsmMaintenanceStep: *const fn (self: *DB) Outcome(bool),
+    constraintValidationStatus: *const fn (self: *DB) Outcome(DB.ConstraintValidationStatus),
+    validateConstraintsStep: *const fn (self: *DB, budget: @import("db/relational_constraint_jobs.zig").Budget) Outcome(bool),
+    retryConstraintValidation: *const fn (self: *DB, schema_version: u32) Outcome(bool),
+    buildRelationalIndexStep: *const fn (self: *DB, name: []const u8, budget: DB.RelationalIndexBuildBudget) Outcome(void),
+    collectRelationalIndexGarbageStep: *const fn (self: *DB) Outcome(bool),
+    retryRelationalIndexBuild: *const fn (self: *DB, name: []const u8, generation: u64) Outcome(bool),
+    relationalIndexBuildStatus: *const fn (self: *DB, name: []const u8) Outcome(DB.RelationalIndexBuildStatus),
     open: *const fn (Allocator, []const u8, OpenOptions) Outcome(DB),
     openOwned: *const fn (Allocator, []const u8, OpenOptions) Outcome(*DB),
     close: *const fn (*DB) Outcome(void),
@@ -79,7 +95,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 1,
+    version: u32 = 2,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -90,7 +106,6 @@ pub const Descriptor = extern struct {
     core_fields: [*]const FieldLayout,
     core_field_count: usize,
     dispatch: callback.CallbackDispatch,
-    table: *const anyopaque,
 };
 pub const table_layout = blk: {
     @setEvalBranchQuota(100_000);
@@ -112,26 +127,29 @@ pub const registry_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("../capi/handles.zig").HandleRegistry);
 };
-extern fn antfly_storage_engine_get_function_table_v1() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v2() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_function_table_v1();
+    const descriptor = antfly_storage_engine_get_descriptor_v2();
     try validateDescriptor(descriptor);
-    const table: *const VTable = @ptrCast(@alignCast(descriptor.table));
-    const outcome = try Boundary.call(name, descriptor.dispatch, @field(table, name), args);
+    // Individual hidden accessors let final links discard unused operations.
+    // A global table would retain every physical operation in every consumer.
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v2" });
+    const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
+    const outcome = try Boundary.call(name, descriptor.dispatch, method, args);
     if (outcome.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..outcome.failure.len]);
     return outcome.value;
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_function_table_v1();
+    return antfly_storage_engine_get_descriptor_v2();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 1 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 2 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout))
         return error.UnsupportedVersion;
