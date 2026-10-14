@@ -189,7 +189,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
     statement_backend.parameter_invocation = binding.parameter_invocation;
-    if (binding.parameter_invocation) |invocation| try invocation.prepareJson(alloc, parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes });
+    if (binding.parameter_invocation) |invocation| try invocation.prepareJson(alloc, parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context });
     defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;

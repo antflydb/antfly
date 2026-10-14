@@ -652,8 +652,9 @@ impl<'c> Executor<'c> for &'c mut AntflyConnection {
          let opened=self.worker.run_resource(ResourceKind::Cursor, move|db|db.sql_cursor_open_json(cursor_request)).await;
          self.pending=false;
          match opened{
-          Ok(id)=>{let cursor=CursorGuard{worker:self.worker.clone(),id};loop{
-           let bytes=self.worker.run(move|db|db.sql_cursor_fetch_json(id,128)).await?;
+          Ok(id)=>{let cursor=CursorGuard{worker:self.worker.clone(),id};let cursor_statement:Arc<str>=Arc::from(statement.as_str());loop{
+           let cursor_statement=Arc::clone(&cursor_statement);
+           let bytes=self.worker.run(move|db|db.sql_cursor_fetch_json(id,128).map_err(|error|error.with_statement(&cursor_statement))).await?;
            #[derive(Deserialize)]struct Page{result:Output,exhausted:bool}
            let page:Page=serde_json::from_slice(&bytes).map_err(protocol)?;let (page_rows,result)=rows(page.result)?;
            for row in page_rows{yield Either::Right(row)}if page.exhausted{yield Either::Left(result);break}
