@@ -36,6 +36,7 @@ from pathlib import Path
 import resource
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -53,6 +54,18 @@ else:
 
 def failure_details(error):
     detail = {"type": type(error).__name__, "message": str(error)}
+    if isinstance(error, CapacityRetryFailure):
+        detail["attempts"] = error.attempts
+        detail["last_failure"] = error.attempts[-1] if error.attempts else None
+        if error.attempts:
+            detail.update(
+                {
+                    k: v
+                    for k, v in error.attempts[-1].items()
+                    if k not in ("type", "message")
+                }
+            )
+        return detail
     if isinstance(error, urllib.error.HTTPError):
         try:
             body = error.read(65537)
@@ -504,7 +517,113 @@ class ProcessMemory:
         )
 
 
+class CapacityRetryFailure(RuntimeError):
+    def __init__(self, message, attempts):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def post_capacity_retry(url, body, timeout=30, max_attempts=16):
+    """Retry only declared admission denials; keep every denial and one deadline."""
+    deadline = time.monotonic() + timeout
+    attempts = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CapacityRetryFailure("capacity retry deadline exceeded", attempts)
+        try:
+            response = compare.post(url + "/ai/v1", "/embed", body, timeout=remaining)
+            return response, attempts
+        except urllib.error.HTTPError as error:
+            detail = failure_details(error)
+            attempts.append(detail)
+            try:
+                policy = json.loads(detail["response_body"])
+            except (ValueError, TypeError):
+                policy = None
+            if (
+                detail["response_body_truncated"]
+                or error.code not in (429, 503)
+                or not isinstance(policy, dict)
+                or policy.get("retryable") is not True
+                or policy.get("reason")
+                not in ("inference_capacity", "inference_admission")
+            ):
+                raise CapacityRetryFailure(
+                    "request failure is not retryable capacity", attempts
+                ) from error
+            delay = policy.get("retry_after_ms")
+            if type(delay) is not int or delay <= 0:
+                raise CapacityRetryFailure(
+                    "invalid capacity retry delay", attempts
+                ) from error
+            delay /= 1000
+            attempts[-1]["retry_delay_seconds"] = delay
+            if delay >= deadline - time.monotonic():
+                raise CapacityRetryFailure(
+                    "capacity retry deadline exceeded", attempts
+                ) from error
+            if len(attempts) >= max_attempts:
+                raise CapacityRetryFailure(
+                    "capacity retry attempt limit exceeded", attempts
+                ) from error
+            time.sleep(delay)
+        except Exception as error:
+            raise CapacityRetryFailure(
+                "request failed during capacity retry",
+                [*attempts, failure_details(error)],
+            ) from error
+
+
+def embedding_metrics(url, timeout=5):
+    names = {
+        "active": "antfly_inference_embedding_groups_active",
+        "cancelled": "antfly_inference_embedding_groups_cancelled_total",
+        "completed": "antfly_inference_embedding_groups_completed_total",
+        "admitted": "antfly_admission_inference_in_flight_requests",
+    }
+    with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
+        data = response.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("metrics response exceeds qualification bound")
+    parsed = {}
+    for line in data.decode().splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] in names.values():
+            value = float(fields[1])
+            if not math.isfinite(value) or value < 0 or value != int(value):
+                raise ValueError("invalid embedding lifecycle metric")
+            parsed[fields[0]] = int(value)
+    if set(parsed) != set(names.values()):
+        raise ValueError("server does not expose required embedding cleanup metrics")
+    return {key: parsed[name] for key, name in names.items()}
+
+
+def wait_embedding_cleanup(url, before, outcome, timeout=30, expected_completions=0):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("embedding cleanup did not finish before deadline")
+        current = embedding_metrics(url, timeout=min(5, remaining))
+        if (
+            current[outcome] > before[outcome]
+            and current["active"] == 0
+            and current["admitted"] == 0
+        ):
+            return current
+        if (
+            outcome == "cancelled"
+            and current["completed"] > before["completed"] + expected_completions
+        ):
+            raise ValueError("disconnected embedding completed instead of cancelling")
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
 def disconnect_and_retry(url, body, expected):
+    before = embedding_metrics(url)
+    if before["active"] or before["admitted"]:
+        raise ValueError("disconnect qualification requires an idle owned server")
     endpoint = urllib.parse.urlsplit(url)
     connection = http.client.HTTPConnection(
         endpoint.hostname, endpoint.port, timeout=10
@@ -516,20 +635,72 @@ def disconnect_and_retry(url, body, expected):
             json.dumps(body),
             {"Content-Type": "application/json"},
         )
-        # Close during execution on the warmed model, rather than during parsing.
-        time.sleep(0.05)
-        connection.sock.shutdown(socket.SHUT_RDWR)
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError(
+                    "embedding did not enter the disconnect observation window"
+                )
+            current = embedding_metrics(url, timeout=min(5, remaining))
+            if current["active"] > before["active"]:
+                break
+            if (
+                current["completed"] > before["completed"]
+                or time.monotonic() >= deadline
+            ):
+                raise ValueError(
+                    "embedding did not enter the disconnect observation window"
+                )
+            time.sleep(0.01)
+        # Abortive close produces a hard disconnect; FIN/SHUT_WR is a legal
+        # request half-close and must not be mistaken for cancellation.
+        connection.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
     finally:
         connection.close()
     start = time.perf_counter()
-    retry = compare.post(url + "/ai/v1", "/embed", body)
+    retry, attempts = post_capacity_retry(url, body)
     compare.assert_agreement(retry["data"][0]["embedding"], expected)
+    after = wait_embedding_cleanup(url, before, "cancelled", expected_completions=1)
     return dict(
         peer_disconnect_requested=True,
+        disconnect="tcp_reset",
         retry="pass",
         retry_seconds=time.perf_counter() - start,
-        cancellation_completion="not observable through this HTTP response; do not infer from retry",
+        capacity_denials=attempts,
+        metrics_before=before,
+        metrics_after=after,
+        cancellation_completion="observed after grouped resource cleanup and request admission release",
     )
+
+
+def half_close_and_read(url, body, expected):
+    before = embedding_metrics(url)
+    endpoint = urllib.parse.urlsplit(url)
+    connection = http.client.HTTPConnection(
+        endpoint.hostname, endpoint.port, timeout=60
+    )
+    try:
+        connection.request(
+            "POST",
+            "/ai/v1/embed",
+            json.dumps(body),
+            {"Content-Type": "application/json"},
+        )
+        connection.sock.shutdown(socket.SHUT_WR)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError(f"half-closed request returned HTTP {response.status}")
+        vector = json.loads(response.read(16 * 1024 * 1024))["data"][0]["embedding"]
+        compare.assert_agreement(vector, expected)
+    finally:
+        connection.close()
+    after = wait_embedding_cleanup(url, before, "completed")
+    if after["cancelled"] != before["cancelled"]:
+        raise ValueError("legal request half-close was cancelled")
+    return dict(status="pass", metrics_before=before, metrics_after=after)
 
 
 @contextlib.contextmanager
@@ -664,6 +835,9 @@ def native(args, data, result):
         compare.publish(args.output, result)
         first = data["documents"][0]["id"]
         result["disconnect_retry"] = disconnect_and_retry(
+            url, bodies[first], result["cases"][first]["vector"]
+        )
+        result["half_close"] = half_close_and_read(
             url, bodies[first], result["cases"][first]["vector"]
         )
         jobs = [row["id"] for row in data["documents"]] * args.sustained_rounds

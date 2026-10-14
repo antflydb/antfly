@@ -334,11 +334,11 @@ def media_parts(suite, name):
     }[name]
 
 
-def post(url, endpoint, body):
+def post(url, endpoint, body, timeout=600):
     request = urllib.request.Request(
         url + endpoint, json.dumps(body).encode(), {"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(request, timeout=600) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read(16 * 1024 * 1024))
 
 

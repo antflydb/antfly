@@ -21,6 +21,7 @@ import tempfile
 import io
 import urllib.error
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 if __package__:
@@ -261,6 +262,195 @@ class FailureDetailsTests(unittest.TestCase):
             video.failure_details(ValueError("invalid corpus")),
             {"type": "ValueError", "message": "invalid corpus"},
         )
+
+
+class AdmissionRetryAndCleanupTests(unittest.TestCase):
+    @staticmethod
+    def denial(status=503, **fields):
+        body = dict(retryable=True, reason="inference_capacity", retry_after_ms=1000)
+        body.update(fields)
+        return urllib.error.HTTPError(
+            "http://127.0.0.1/embed",
+            status,
+            "Busy",
+            {},
+            io.BytesIO(json.dumps(body).encode()),
+        )
+
+    def clock(self):
+        now = [0.0]
+        return (
+            now,
+            mock.patch.object(video.time, "monotonic", side_effect=lambda: now[0]),
+            mock.patch.object(
+                video.time,
+                "sleep",
+                side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+        )
+
+    def test_declared_capacity_delay_and_remaining_request_timeout_are_honored(self):
+        denial = self.denial()
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(
+                video.compare, "post", side_effect=[denial, {"ok": True}]
+            ) as post,
+        ):
+            response, attempts = video.post_capacity_retry("http://127.0.0.1", {})
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(now[0], 1)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in post.call_args_list], [30, 29]
+        )
+        self.assertEqual(attempts[0]["retry_delay_seconds"], 1)
+        self.assertTrue(denial.closed)
+
+    def test_persistent_denials_expire_and_preserve_all_failure_bodies(self):
+        denials = [self.denial() for _ in range(3)]
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(video.compare, "post", side_effect=denials),
+        ):
+            with self.assertRaises(video.CapacityRetryFailure) as failure:
+                video.post_capacity_retry("http://127.0.0.1", {}, timeout=2.5)
+        self.assertEqual(now[0], 2)
+        details = video.failure_details(failure.exception)
+        self.assertEqual(len(details["attempts"]), 3)
+        self.assertEqual(details["http_status"], 503)
+        self.assertTrue(all(error.closed for error in denials))
+
+    def test_non_capacity_or_malformed_retry_contract_fails_immediately(self):
+        for policy in (
+            {"retryable": False},
+            {"reason": "model_publication"},
+            {"retry_after_ms": True},
+            {"retry_after_ms": 0},
+            {"retry_after_ms": 31000},
+        ):
+            with self.subTest(policy=policy):
+                denial = self.denial(**policy)
+                with (
+                    mock.patch.object(
+                        video.compare, "post", side_effect=denial
+                    ) as post,
+                    mock.patch.object(video.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(video.CapacityRetryFailure):
+                        video.post_capacity_retry("http://127.0.0.1", {})
+                self.assertEqual(post.call_count, 1)
+                sleep.assert_not_called()
+                self.assertTrue(denial.closed)
+        with mock.patch.object(
+            video.compare, "post", side_effect=self.denial(status=400)
+        ) as post:
+            with self.assertRaises(video.CapacityRetryFailure):
+                video.post_capacity_retry("http://127.0.0.1", {})
+            self.assertEqual(post.call_count, 1)
+
+    def test_transport_errors_are_not_hidden_by_capacity_retry(self):
+        with mock.patch.object(
+            video.compare, "post", side_effect=ConnectionResetError("reset")
+        ) as post:
+            with self.assertRaises(video.CapacityRetryFailure) as failure:
+                video.post_capacity_retry("http://127.0.0.1", {})
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(
+                video.failure_details(failure.exception)["last_failure"]["type"],
+                "ConnectionResetError",
+            )
+
+    def test_small_retry_delays_remain_bounded_by_attempt_count(self):
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(
+                video.compare,
+                "post",
+                side_effect=[self.denial(retry_after_ms=1) for _ in range(3)],
+            ) as post,
+        ):
+            with self.assertRaisesRegex(video.CapacityRetryFailure, "attempt limit"):
+                video.post_capacity_retry("http://127.0.0.1", {}, max_attempts=3)
+        self.assertEqual(post.call_count, 3)
+        self.assertLess(now[0], 0.01)
+
+    def test_cleanup_metrics_use_operational_route_and_close_response(self):
+        response = io.BytesIO(
+            b"antfly_inference_embedding_groups_active 1\n"
+            b"antfly_inference_embedding_groups_cancelled_total 2\n"
+            b"antfly_inference_embedding_groups_completed_total 10\n"
+            b"antfly_admission_inference_in_flight_requests 1\n"
+        )
+        with mock.patch.object(
+            video.urllib.request, "urlopen", return_value=response
+        ) as get:
+            self.assertEqual(
+                video.embedding_metrics("http://127.0.0.1"),
+                dict(active=1, cancelled=2, completed=10, admitted=1),
+            )
+        get.assert_called_once_with("http://127.0.0.1/ml/v1/metrics", timeout=5)
+        self.assertTrue(response.closed)
+
+    def test_cleanup_waits_for_admission_release_after_cancelled_outcome(self):
+        before = dict(active=0, admitted=0, cancelled=0, completed=0)
+        pending = dict(active=0, admitted=1, cancelled=1, completed=0)
+        done = dict(pending, admitted=0)
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(video, "embedding_metrics", side_effect=[pending, done]),
+        ):
+            self.assertEqual(
+                video.wait_embedding_cleanup("http://127.0.0.1", before, "cancelled"),
+                done,
+            )
+        self.assertGreater(now[0], 0)
+
+    def test_retry_completion_cannot_be_confused_with_original_completion(self):
+        before = dict(active=0, admitted=0, cancelled=0, completed=0)
+        pending = dict(active=1, admitted=1, cancelled=0, completed=1)
+        done = dict(active=0, admitted=0, cancelled=1, completed=1)
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(video, "embedding_metrics", side_effect=[pending, done]),
+        ):
+            self.assertEqual(
+                video.wait_embedding_cleanup(
+                    "http://127.0.0.1", before, "cancelled", expected_completions=1
+                ),
+                done,
+            )
+
+    def test_completed_request_is_not_reported_as_cancelled(self):
+        before = dict(active=0, admitted=0, cancelled=0, completed=0)
+        with mock.patch.object(
+            video, "embedding_metrics", return_value=dict(before, completed=1)
+        ):
+            with self.assertRaisesRegex(ValueError, "instead of cancelling"):
+                video.wait_embedding_cleanup("http://127.0.0.1", before, "cancelled")
+
+    def test_cleanup_deadline_remains_a_failure(self):
+        before = dict(active=0, admitted=0, cancelled=0, completed=0)
+        now, clock, sleep = self.clock()
+        with (
+            clock,
+            sleep,
+            mock.patch.object(video, "embedding_metrics", return_value=before),
+        ):
+            with self.assertRaises(TimeoutError):
+                video.wait_embedding_cleanup(
+                    "http://127.0.0.1", before, "cancelled", timeout=0.1
+                )
+        self.assertGreaterEqual(now[0], 0.1)
 
 
 if __name__ == "__main__":
