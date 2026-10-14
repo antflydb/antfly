@@ -34,6 +34,33 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+// Worker-process diagnostics: explicit logical copies, not bus traffic.
+// Independent atomic reads may straddle concurrent operations; never reset.
+enum { TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS,
+    TERMITE_METAL_DOWNLOAD_BYTES, TERMITE_METAL_DOWNLOAD_CALLS,
+    TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS,
+    TERMITE_METAL_COMMAND_COMPLETED, TERMITE_METAL_COMMAND_FAILED,
+    TERMITE_METAL_GPU_NANOS, TERMITE_METAL_GPU_TIMESTAMP_MISSING,
+    TERMITE_METAL_TELEMETRY_COUNT };
+static _Atomic uint64_t termite_metal_telemetry[TERMITE_METAL_TELEMETRY_COUNT];
+static void termite_metal_telemetry_add(size_t index, uint64_t amount) {
+    uint64_t old = atomic_load_explicit(&termite_metal_telemetry[index], memory_order_relaxed);
+    for (;;) {
+        const uint64_t next = UINT64_MAX - old < amount ? UINT64_MAX : old + amount;
+        if (atomic_compare_exchange_weak_explicit(&termite_metal_telemetry[index], &old,
+                next, memory_order_relaxed, memory_order_relaxed)) return;
+    }
+}
+void termite_metal_telemetry_snapshot(uint64_t *values) {
+    if (values == NULL) return;
+    for (size_t i = 0; i < TERMITE_METAL_TELEMETRY_COUNT; ++i)
+        values[i] = atomic_load_explicit(&termite_metal_telemetry[i], memory_order_relaxed);
+}
+static void termite_metal_telemetry_copy(size_t bytes_index, size_t calls_index, size_t length) {
+    termite_metal_telemetry_add(bytes_index, (uint64_t)length);
+    termite_metal_telemetry_add(calls_index, 1);
+}
+
 #define TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY 256
 #define TERMITE_METAL_RMS_NORM_SLOT_CAPACITY 512
 #define TERMITE_METAL_LINEAR_SLOT_CAPACITY 1024
@@ -16510,6 +16537,12 @@ static id<MTLCommandBuffer> termite_metal_new_command_buffer(id<MTLCommandQueue>
         if (command_buffer != nil) {
             const char *context = label_cstr;
             [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                if (cb.status == MTLCommandBufferStatusCompleted) {
+                    const uint64_t nanos = termite_metal_command_buffer_gpu_elapsed_nanos(cb);
+                    termite_metal_telemetry_add(TERMITE_METAL_COMMAND_COMPLETED, 1);
+                    termite_metal_telemetry_add(nanos == 0 ? TERMITE_METAL_GPU_TIMESTAMP_MISSING : TERMITE_METAL_GPU_NANOS,
+                        nanos == 0 ? 1 : nanos);
+                } else termite_metal_telemetry_add(TERMITE_METAL_COMMAND_FAILED, 1);
                 if (cb.status != MTLCommandBufferStatusCompleted) {
                     termite_metal_log_command_buffer_failure(cb, context);
                 }
@@ -16553,6 +16586,12 @@ static id<MTLCommandBuffer> termite_metal_new_fast_prepared_command_buffer(
         if (command_buffer != nil) {
             const char *context = label_cstr;
             [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                if (cb.status == MTLCommandBufferStatusCompleted) {
+                    const uint64_t nanos = termite_metal_command_buffer_gpu_elapsed_nanos(cb);
+                    termite_metal_telemetry_add(TERMITE_METAL_COMMAND_COMPLETED, 1);
+                    termite_metal_telemetry_add(nanos == 0 ? TERMITE_METAL_GPU_TIMESTAMP_MISSING : TERMITE_METAL_GPU_NANOS,
+                        nanos == 0 ? 1 : nanos);
+                } else termite_metal_telemetry_add(TERMITE_METAL_COMMAND_FAILED, 1);
                 if (cb.status != MTLCommandBufferStatusCompleted) {
                     termite_metal_log_command_buffer_failure(cb, context);
                 }
@@ -63805,6 +63844,7 @@ int termite_metal_buffer_upload(
         if (offset + length > dst.length) return -2;
         if (dst.storageMode == MTLStorageModeShared) {
             memcpy((uint8_t *)dst.contents + offset, src, length);
+            termite_metal_telemetry_copy(TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS, length);
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
@@ -63822,7 +63862,9 @@ int termite_metal_buffer_upload(
         }
         [blit copyFromBuffer:staging sourceOffset:0 toBuffer:dst destinationOffset:offset size:length];
         [blit endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -7);
+        const int status = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -7);
+        if (status == 0) termite_metal_telemetry_copy(TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS, length);
+        return status;
     }
 }
 
@@ -63843,6 +63885,7 @@ int termite_metal_buffer_download(
             }
             if (runtime != NULL && termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
             memcpy(dst, (const uint8_t *)src.contents + offset, length);
+            termite_metal_telemetry_copy(TERMITE_METAL_DOWNLOAD_BYTES, TERMITE_METAL_DOWNLOAD_CALLS, length);
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
@@ -63863,6 +63906,7 @@ int termite_metal_buffer_download(
         [blit endEncoding];
         if (termite_metal_commit_and_wait(command_buffer, __func__, -7) != 0) return -7;
         memcpy(dst, staging.contents, length);
+        termite_metal_telemetry_copy(TERMITE_METAL_DOWNLOAD_BYTES, TERMITE_METAL_DOWNLOAD_CALLS, length);
         return 0;
     }
 }
@@ -63882,6 +63926,7 @@ int termite_metal_buffer_copy(
         if (src_offset + length > src.length || dst_offset + length > dst.length) return -2;
         if (src.storageMode == MTLStorageModeShared && dst.storageMode == MTLStorageModeShared) {
             memcpy((uint8_t *)dst.contents + dst_offset, (const uint8_t *)src.contents + src_offset, length);
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length);
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
@@ -63899,7 +63944,9 @@ int termite_metal_buffer_copy(
         }
         [blit copyFromBuffer:src sourceOffset:src_offset toBuffer:dst destinationOffset:dst_offset size:length];
         [blit endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -6);
+        const int status = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -6);
+        if (status == 0) termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length);
+        return status;
     }
 }
 
@@ -63931,6 +63978,8 @@ int termite_metal_buffer_copy_pair(
             dst_b.storageMode == MTLStorageModeShared) {
             memcpy((uint8_t *)dst_a.contents + dst_a_offset, (const uint8_t *)src_a.contents + src_a_offset, length_a);
             memcpy((uint8_t *)dst_b.contents + dst_b_offset, (const uint8_t *)src_b.contents + src_b_offset, length_b);
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length_a);
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length_b);
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -5;
@@ -63949,7 +63998,12 @@ int termite_metal_buffer_copy_pair(
         [blit copyFromBuffer:src_a sourceOffset:src_a_offset toBuffer:dst_a destinationOffset:dst_a_offset size:length_a];
         [blit copyFromBuffer:src_b sourceOffset:src_b_offset toBuffer:dst_b destinationOffset:dst_b_offset size:length_b];
         [blit endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
+        const int status = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
+        if (status == 0) {
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length_a);
+            termite_metal_telemetry_copy(TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS, length_b);
+        }
+        return status;
     }
 }
 

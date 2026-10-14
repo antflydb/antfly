@@ -443,6 +443,23 @@ def decoded(path, processor, sampling=None):
     )
 
 
+def assert_reference_decode(actual, expected):
+    """Distinguish a reference input mismatch from model arithmetic drift."""
+    if expected is None or "rgb_sha256" not in expected:
+        return
+    for key in (
+        "rgb_sha256",
+        "frames",
+        "selected_frames",
+        "duration",
+        "retained_rgb_bytes",
+    ):
+        if key in expected and actual.get(key) != expected[key]:
+            raise ValueError(
+                f"reference decoded input differs: {key}; verify decoder version and presentation policy before comparing model vectors"
+            )
+
+
 def process_tree_rss(root, records):
     """Include supervised model workers; exclude unrelated processes."""
     if root not in records:
@@ -573,6 +590,63 @@ def post_capacity_retry(url, body, timeout=30, max_attempts=16):
                 "request failed during capacity retry",
                 [*attempts, failure_details(error)],
             ) from error
+
+
+METAL_TELEMETRY_NAMES = (
+    "buffer_upload_bytes",
+    "buffer_upload_calls",
+    "buffer_download_bytes",
+    "buffer_download_calls",
+    "buffer_copy_bytes",
+    "buffer_copy_calls",
+    "commands_completed",
+    "commands_failed",
+    "completed_gpu_nanoseconds",
+    "gpu_timestamps_missing",
+)
+
+
+def metal_telemetry_snapshot(url, timeout=5):
+    names = {
+        "antfly_inference_metal_" + name + "_total": name
+        for name in METAL_TELEMETRY_NAMES
+    }
+    with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
+        data = response.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("Metal telemetry response exceeds qualification bound")
+    parsed = {}
+    for line in data.decode().splitlines():
+        fields = line.split()
+        if fields and fields[0] in names:
+            if len(fields) != 2 or not fields[1].isascii() or not fields[1].isdigit():
+                raise ValueError("invalid unsigned Metal telemetry counter")
+            key = names[fields[0]]
+            value = int(fields[1])
+            if key in parsed or value > 2**64 - 1:
+                raise ValueError("duplicate or out-of-range Metal telemetry counter")
+            parsed[key] = value
+    if set(parsed) != set(METAL_TELEMETRY_NAMES):
+        raise ValueError("server does not expose required Metal telemetry counters")
+    return parsed
+
+
+def metal_telemetry_delta(before, after):
+    for values in (before, after):
+        if set(values) != set(METAL_TELEMETRY_NAMES) or any(
+            type(value) is not int or not 0 <= value <= 2**64 - 1
+            for value in values.values()
+        ):
+            raise ValueError("invalid Metal telemetry snapshot")
+    if any(after[key] < before[key] for key in before):
+        raise ValueError("Metal telemetry worker counters reset during measurement")
+    return {
+        "before": before,
+        "after": after,
+        "delta": {key: after[key] - before[key] for key in before},
+        "saturated": [key for key in after if after[key] == 2**64 - 1],
+        "scope": "worker-process interval; concurrent requests and setup may contribute; explicit logical buffer copies, not bus traffic; completed runtime-factory GPU command time, not wall time or preparation GPU time; independent atomic scrapes may straddle operations",
+    }
 
 
 def embedding_metrics(url, timeout=5, include_outcomes=False):
@@ -938,15 +1012,27 @@ def native(args, data, result):
             body["model"] = args.model_dir.name
             bodies[row["id"]] = body
             samples = []
+            telemetry_samples = []
             cold = None
             for i in range(args.warmups + args.iterations):
                 if identity:
                     body["model_identity"] = identity
+                before_transfer = (
+                    metal_telemetry_snapshot(url)
+                    if getattr(args, "collect_metal_telemetry", False)
+                    else None
+                )
                 start = time.perf_counter()
                 response = compare.post(
                     url + "/ai/v1", "/embed", body, timeout=args.request_timeout
                 )
                 elapsed = time.perf_counter() - start
+                if before_transfer is not None:
+                    telemetry_samples.append(
+                        metal_telemetry_delta(
+                            before_transfer, metal_telemetry_snapshot(url)
+                        )
+                    )
                 if identity and identity != response["model_identity"]:
                     raise ValueError("model identity changed")
                 identity = response["model_identity"]
@@ -961,12 +1047,19 @@ def native(args, data, result):
                 "cold_seconds": cold,
                 "completed_timing": compare.timing(samples),
             }
+            if telemetry_samples:
+                result["cases"][row["id"]]["metal_telemetry"] = telemetry_samples
             compare.publish(args.output, result)
             print(args.backend, row["id"], samples, flush=True)
         result["model_identity"] = identity
         collect_reference_evidence(args, data, result)
         compare.publish(args.output, result)
         first = data["documents"][0]["id"]
+        before_lifecycle_transfer = (
+            metal_telemetry_snapshot(url)
+            if getattr(args, "collect_metal_telemetry", False)
+            else None
+        )
         result["disconnect_retry"] = disconnect_and_retry(
             url,
             bodies[first],
@@ -979,6 +1072,15 @@ def native(args, data, result):
             result["cases"][first]["vector"],
             request_timeout=args.request_timeout,
         )
+        if before_lifecycle_transfer is not None:
+            result["lifecycle_metal_telemetry"] = metal_telemetry_delta(
+                before_lifecycle_transfer, metal_telemetry_snapshot(url)
+            )
+        before_transfer = (
+            metal_telemetry_snapshot(url)
+            if getattr(args, "collect_metal_telemetry", False)
+            else None
+        )
         result["sustained"] = sustained_requests(
             url,
             bodies,
@@ -988,6 +1090,10 @@ def native(args, data, result):
             args.concurrency,
             getattr(args, "sustained_request_timeout", 60),
         )
+        if before_transfer is not None:
+            result["sustained"]["metal_telemetry"] = metal_telemetry_delta(
+                before_transfer, metal_telemetry_snapshot(url)
+            )
         compare.publish(args.output, result)
         if result["sustained"]["status"] != "pass":
             raise ValueError(
@@ -1000,6 +1106,11 @@ def pytorch(args, data, result):
     from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
     reference.verify_reference(args.model_dir)
+    expected_decoding = (
+        json.loads(args.reference.read_text()).get("decoding", {})
+        if args.reference
+        else {}
+    )
     result["reference_provenance"] = {
         "transformers_revision": reference.TRANSFORMERS_REVISION,
         "source_hashes": reference.SOURCE_HASHES,
@@ -1040,6 +1151,10 @@ def pytorch(args, data, result):
                     pixels, metadata, policy = decoded(
                         row["path"], processor.video_processor, row.get("sampling")
                     )
+                    # Preserve the actual failed decode receipt even when the
+                    # independent RGB oracle rejects it before model execution.
+                    result.setdefault("decoding", {})[row["id"]] = policy
+                    assert_reference_decode(policy, expected_decoding.get(row["id"]))
                     inputs = processor(
                         text=["<|video|>"],
                         videos=[pixels],
@@ -1145,6 +1260,11 @@ def main():
         help="Explicit whole-process envelope for the owned native server; 0 uses automatic policy",
     )
     parser.add_argument("--url")
+    parser.add_argument(
+        "--collect-metal-telemetry",
+        action="store_true",
+        help="Require worker-process Metal bridge counters around completed requests; metrics reads excluded from HTTP timing",
+    )
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmups", type=int, default=1)
@@ -1173,6 +1293,8 @@ def main():
         parser.error("native/metal requires --binary or --url")
     if not 0 <= args.process_memory_budget_mb <= 65536:
         parser.error("process memory budget must be between 0 and 65536 MiB")
+    if args.collect_metal_telemetry and args.backend not in ("native", "metal"):
+        parser.error("Metal telemetry requires native/metal HTTP backend")
     data = corpus(args.corpus)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
@@ -1200,6 +1322,7 @@ def main():
                 "score_tolerance",
                 "top_k",
                 "process_memory_budget_mb",
+                "collect_metal_telemetry",
             )
         },
         "cold_scope": "new process/model; artifact file cache is warmed by receipt verification; later case first calls use the resident model",

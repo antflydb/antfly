@@ -1,0 +1,158 @@
+{
+  "purpose": "direct captured vector/score preservation against fresh Linux ARM64 PyTorch reference; no relevance labels",
+  "reference_sha256": "2f3e2d9a7fb34a46a463872ac0b289f050d2682a1502d80c057fbbf79e12f50e",
+  "results": {
+    "current_metal": {
+      "source_report_sha256": "b12e7abb358148afefdddbabfe8431df89ca6deb4423ba61db57f3105905abfa",
+      "binary_sha256": "63250e87db901e3e45b854d79813386092e200a5d57fdf847b1286e1f38460b4",
+      "vector_agreement": {
+        "q0": {
+          "cosine": 0.9999999999998055,
+          "max_abs": 1.0058283805847168e-07,
+          "actual_norm": 0.9999999809944006
+        },
+        "q1": {
+          "cosine": 0.9999999999998641,
+          "max_abs": 8.940696716308594e-08,
+          "actual_norm": 1.0000000670458111
+        },
+        "q2": {
+          "cosine": 0.9999999999997861,
+          "max_abs": 1.043081283569336e-07,
+          "actual_norm": 1.00000002963348
+        },
+        "q3": {
+          "cosine": 0.99999999999977,
+          "max_abs": 1.1920928955078125e-07,
+          "actual_norm": 1.0000000311699975
+        },
+        "sintel-52s": {
+          "cosine": 0.9999999999734845,
+          "max_abs": 8.512288331985474e-07,
+          "actual_norm": 0.9999999906224706
+        }
+      },
+      "retrieval_agreement": {
+        "queries": {
+          "q0": {
+            "max_score_error": 1.589167327731289e-07,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q1": {
+            "max_score_error": 2.49023578091645e-07,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q2": {
+            "max_score_error": 7.011666591782983e-08,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q3": {
+            "max_score_error": 7.227641152240949e-08,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          }
+        },
+        "pass": true
+      }
+    },
+    "published_native_linux": {
+      "source_report_sha256": "5ac8c0ec73ef91a7a1a42da93f7e49fccef64ff4d7d6aaa6cc1d10ab75fb32c6",
+      "binary_sha256": "9af9d6d590f7464ebbc34b03e415780244f123f2e8424493c9d8c3bf765176f8",
+      "vector_agreement": {
+        "q0": {
+          "cosine": 0.9999999999998219,
+          "max_abs": 2.086162567138672e-07,
+          "actual_norm": 1.000000243367262
+        },
+        "q1": {
+          "cosine": 0.9999999999998415,
+          "max_abs": 8.940696716308594e-08,
+          "actual_norm": 1.0000001547814894
+        },
+        "q2": {
+          "cosine": 0.9999999999997546,
+          "max_abs": 1.1920928955078125e-07,
+          "actual_norm": 0.9999996436392526
+        },
+        "q3": {
+          "cosine": 0.9999999999997797,
+          "max_abs": 8.940696716308594e-08,
+          "actual_norm": 0.9999998141293824
+        },
+        "sintel-52s": {
+          "cosine": 0.9999999998630955,
+          "max_abs": 2.250075340270996e-06,
+          "actual_norm": 1.0000000011066041
+        }
+      },
+      "retrieval_agreement": {
+        "queries": {
+          "q0": {
+            "max_score_error": 8.893093912387684e-07,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q1": {
+            "max_score_error": 1.38968929785932e-06,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q2": {
+            "max_score_error": 1.028162144312006e-06,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          },
+          "q3": {
+            "max_score_error": 1.3487256421695903e-06,
+            "exact_ranking": true,
+            "top_k_overlap": {
+              "1": 1.0,
+              "5": 1.0,
+              "10": 1.0
+            },
+            "non_tied_inversions": []
+          }
+        },
+        "pass": true
+      }
+    }
+  }
+}

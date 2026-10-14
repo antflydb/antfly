@@ -47331,3 +47331,46 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     };
     return &result;
 }
+
+test "embeddinggemma2 Metal video transfer telemetry counts real shared/private copies and completed commands" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const telemetry = @import("metal_telemetry.zig");
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input = [_]f32{ 0.5, -2, 3, 4 };
+    var output: [4]f32 = undefined;
+    const before = telemetry.snapshot(true);
+    inline for (.{ .shared, .private }) |storage| {
+        var a = try MetalTensor.deviceAllocate(runtime, @sizeOf(@TypeOf(input)), storage, &.{4});
+        defer a.deinit();
+        var b = try MetalTensor.deviceAllocate(runtime, @sizeOf(@TypeOf(input)), storage, &.{4});
+        defer b.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_upload(runtime, a.deviceHandle(), 0, &input, @sizeOf(@TypeOf(input))));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy(runtime, a.deviceHandle(), 0, b.deviceHandle(), 0, @sizeOf(@TypeOf(input))));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy_pair(runtime, a.deviceHandle(), 0, b.deviceHandle(), 0, @sizeOf(@TypeOf(input)), b.deviceHandle(), 0, a.deviceHandle(), 0, @sizeOf(@TypeOf(input))));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, b.deviceHandle(), 0, &output, @sizeOf(@TypeOf(output))));
+        try std.testing.expectEqualSlices(f32, &input, &output);
+        const valid = telemetry.snapshot(true);
+        try std.testing.expect(termite_metal_buffer_upload(runtime, null, 0, &input, @sizeOf(@TypeOf(input))) != 0);
+        try std.testing.expect(termite_metal_buffer_download(runtime, b.deviceHandle(), @sizeOf(@TypeOf(input)), &output, @sizeOf(@TypeOf(output))) != 0);
+        try std.testing.expect(termite_metal_buffer_copy(runtime, null, 0, b.deviceHandle(), 0, @sizeOf(@TypeOf(input))) != 0);
+        const invalid = telemetry.snapshot(true);
+        try std.testing.expectEqualSlices(u64, valid[0..6], invalid[0..6]);
+    }
+    // Completion handlers may publish after a fence wakes its waiter.
+    for (0..100) |_| {
+        if (telemetry.snapshot(true)[6] > before[6]) break;
+        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(5), .awake);
+    }
+    const after = telemetry.snapshot(true);
+    try std.testing.expectEqual(@as(u64, 32), after[0] - before[0]);
+    try std.testing.expectEqual(@as(u64, 2), after[1] - before[1]);
+    try std.testing.expectEqual(@as(u64, 32), after[2] - before[2]);
+    try std.testing.expectEqual(@as(u64, 2), after[3] - before[3]);
+    try std.testing.expectEqual(@as(u64, 96), after[4] - before[4]);
+    try std.testing.expectEqual(@as(u64, 6), after[5] - before[5]);
+    try std.testing.expect(after[6] > before[6]);
+    try std.testing.expectEqual(before[7], after[7]);
+    try std.testing.expect(after[8] > before[8]);
+}

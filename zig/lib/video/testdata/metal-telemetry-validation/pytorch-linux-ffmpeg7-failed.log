@@ -1,0 +1,14 @@
+Loading weights:   0%|          | 0/1376 [00:00<?, ?it/s]Loading weights:   5%|▍         | 65/1376 [00:00<00:05, 219.26it/s]Loading weights:   6%|▋         | 87/1376 [00:00<00:07, 166.38it/s]Loading weights:   8%|▊         | 105/1376 [00:00<00:07, 166.32it/s]Loading weights:   9%|▉         | 127/1376 [00:00<00:11, 110.64it/s]Loading weights:  10%|█         | 140/1376 [00:01<00:11, 107.56it/s]Loading weights:  11%|█         | 152/1376 [00:01<00:12, 95.25it/s] Loading weights:  12%|█▏        | 162/1376 [00:01<00:12, 94.53it/s]Loading weights:  14%|█▎        | 189/1376 [00:01<00:13, 85.69it/s]Loading weights:  14%|█▍        | 198/1376 [00:01<00:13, 85.44it/s]Loading weights:  18%|█▊        | 251/1376 [00:01<00:06, 164.63it/s]Loading weights:  22%|██▏       | 305/1376 [00:02<00:04, 219.78it/s]Loading weights:  24%|██▍       | 330/1376 [00:02<00:04, 222.48it/s]Loading weights:  28%|██▊       | 380/1376 [00:02<00:03, 261.65it/s]Loading weights:  32%|███▏      | 437/1376 [00:02<00:03, 261.78it/s]Loading weights:  36%|███▋      | 499/1376 [00:03<00:08, 104.05it/s]Loading weights:  40%|████      | 556/1376 [00:03<00:05, 141.67it/s]Loading weights:  43%|████▎     | 586/1376 [00:04<00:05, 137.36it/s]Loading weights:  45%|████▌     | 623/1376 [00:04<00:04, 153.52it/s]Loading weights:  48%|████▊     | 660/1376 [00:04<00:03, 182.51it/s]Loading weights:  50%|█████     | 688/1376 [00:04<00:06, 110.26it/s]Loading weights:  53%|█████▎    | 736/1376 [00:05<00:04, 151.93it/s]Loading weights:  56%|█████▌    | 765/1376 [00:07<00:17, 35.46it/s] Loading weights:  62%|██████▏   | 852/1376 [00:08<00:07, 68.24it/s]Loading weights:  68%|██████▊   | 939/1376 [00:08<00:03, 110.95it/s]Loading weights:  86%|████████▌ | 1179/1376 [00:08<00:00, 272.41it/s]Loading weights:  94%|█████████▎| 1287/1376 [00:09<00:00, 169.08it/s]Loading weights:  99%|█████████▉| 1365/1376 [00:10<00:00, 112.92it/s]Loading weights: 100%|██████████| 1376/1376 [00:12<00:00, 109.42it/s]
+cpu q0 [3.7010595020110486]
+cpu q1 [1.5506247089942917]
+cpu q2 [1.578619791995152]
+cpu q3 [1.3767200430011144]
+cpu sintel-52s [110.39752263500122]
+Traceback (most recent call last):
+  File "/workspace/tools/embeddinggemma2/video_compare.py", line 1340, in <module>
+    main()
+  File "/workspace/tools/embeddinggemma2/video_compare.py", line 1321, in main
+    compare.assert_agreement(
+  File "/workspace/tools/embeddinggemma2/compare.py", line 91, in assert_agreement
+    raise ValueError(f"F32 parity failed: {result}")
+ValueError: F32 parity failed: {'cosine': 0.9992633921579525, 'max_abs': 0.0047985706478357315, 'actual_norm': 1.0000000370202944}

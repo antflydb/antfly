@@ -1849,3 +1849,39 @@ See the [source-bound attention qualification receipt](../video/testdata/attenti
 expanded-format model checks, reproduction and limitations. Broader sustained
 load, hard-stop recovery, codec/display/fuzz coverage, transfer telemetry and
 the complete non-CUDA objective remain open.
+
+### Metal bridge telemetry for completed request qualification
+
+The inference metrics route now exposes worker-process saturating atomic
+counters for explicit buffer upload/download/copy bytes and calls, completed
+runtime command buffers, command failures, GPU nanoseconds and missing GPU
+timestamps. Shared memcpy and Private staging both contribute logical bytes;
+copy-pair calls contribute two copies. Commands contribute timing only in their
+completion handlers. Scraping adds no model lock, runtime ownership or GPU fence.
+Disabled-Metal builds expose zeros without platform linkage.
+
+The maintained video harness offers `--collect-metal-telemetry`: it requires
+complete unsigned counters, rejects duplicates/invalid values and interval
+regressions, records saturation, and retains before/after/delta for measured
+requests, lifecycle checks and concurrent workload. Scrapes are outside HTTP
+request timing. Existing parity, cleanup and completion-accounting gates remain
+mandatory. Counters are process intervals, not per-request attribution; separate
+preparation, direct kernel convenience allocations, mapped aliases and legacy
+direct command buffers remain outside this instrumentation. Logical byte counts
+are not measured bus traffic. Comprehensive GPU memory/transfer attribution and
+the complete non-CUDA scope remain open.
+
+See [source-bound receipts](../video/testdata/metal-telemetry-validation/README.md) for qualification and reproduction.
+
+The fresh actual Linux ARM64 PyTorch real-clip reference now also passes:
+FFmpeg 9.0.2 reproduces the exact oracle RGB hash and selected IDs, and five
+pretrained vectors preserve the macOS oracle (maximum coordinate error 5.72e-7).
+The earlier FFmpeg 7.1.5 run failed video parity with differing decoded RGB and
+is retained. The reference harness now rejects recorded pixel/presentation
+mismatches before expensive model execution. The separate reference image/context
+recipe pins source/package identities and includes no model weights or credentials.
+Direct comparison with the fresh Linux oracle also preserves current Metal and
+previously captured native Linux vectors; the latter is explicitly historical
+binary evidence. Current native Linux execution passes the expanded-format suite.
+No numerical gates were relaxed. Broader Linux formats/x86_64, codec/display/fuzz,
+GPU memory/transfer attribution and the full non-CUDA scope remain open.

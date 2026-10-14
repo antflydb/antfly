@@ -552,5 +552,83 @@ class SustainedContracts(unittest.TestCase):
                 video.sustained_requests("http://127.0.0.1", {}, {}, "stable", ["x"], 1)
 
 
+class ReferenceDecodeContracts(unittest.TestCase):
+    def test_reference_input_hash_and_presentation_are_required_when_recorded(self):
+        expected = {
+            "rgb_sha256": "pinned",
+            "frames": 1253,
+            "selected_frames": [0, 24],
+            "duration": 52.208008,
+            "retained_rgb_bytes": 32,
+        }
+        video.assert_reference_decode(dict(expected, timestamp_evidence=None), expected)
+        for key in expected:
+            changed = dict(expected)
+            changed[key] = "different"
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                video.assert_reference_decode(changed, expected)
+        with self.assertRaisesRegex(ValueError, "rgb_sha256"):
+            video.assert_reference_decode({}, expected)
+
+    def test_oracle_without_decoded_pixels_keeps_vector_gate(self):
+        video.assert_reference_decode({}, None)
+        video.assert_reference_decode({}, {"policy": "legacy oracle"})
+
+
+class MetalTelemetryContracts(unittest.TestCase):
+    def metrics(self, text):
+        with mock.patch.object(video.urllib.request, "urlopen") as request:
+            request.return_value.__enter__.return_value.read.return_value = (
+                text.encode()
+            )
+            return video.metal_telemetry_snapshot("http://owned")
+
+    def text(self, values):
+        return "".join(
+            f"antfly_inference_metal_{key}_total {value}\n"
+            for key, value in values.items()
+        )
+
+    def test_integer_precision_and_zero_platform_metrics(self):
+        values = dict.fromkeys(video.METAL_TELEMETRY_NAMES, 0)
+        values["buffer_upload_bytes"] = 2**64 - 1
+        self.assertEqual(self.metrics(self.text(values)), values)
+        evidence = video.metal_telemetry_delta(values, values)
+        self.assertEqual(evidence["delta"], dict.fromkeys(values, 0))
+        self.assertEqual(evidence["saturated"], ["buffer_upload_bytes"])
+
+    def test_missing_duplicate_and_invalid_metrics_fail(self):
+        values = dict.fromkeys(video.METAL_TELEMETRY_NAMES, 0)
+        complete = self.text(values)
+        for text in (
+            "",
+            complete + complete,
+            complete.replace(" 0", " -1", 1),
+            complete.replace(" 0", " 1.0", 1),
+            complete.replace(" 0", " nan", 1),
+            complete.replace(" 0", " " + str(2**64), 1),
+        ):
+            with self.subTest(text=text[:60]), self.assertRaises(ValueError):
+                self.metrics(text)
+
+    def test_worker_reset_and_invalid_snapshots_fail(self):
+        before = dict.fromkeys(video.METAL_TELEMETRY_NAMES, 7)
+        after = dict(before, buffer_upload_bytes=6)
+        with self.assertRaisesRegex(ValueError, "reset"):
+            video.metal_telemetry_delta(before, after)
+        for values in (
+            {},
+            dict(before, buffer_upload_bytes=True),
+            dict(before, commands_failed=-1),
+        ):
+            with self.assertRaises(ValueError):
+                video.metal_telemetry_delta(before, values)
+        after = {key: value + 3 for key, value in before.items()}
+        self.assertEqual(
+            video.metal_telemetry_delta(before, after)["delta"],
+            dict.fromkeys(before, 3),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

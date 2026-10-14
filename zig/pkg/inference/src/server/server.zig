@@ -20658,6 +20658,8 @@ pub const Node = struct {
             try appendPromptCacheMetrics(&writer.writer, self.model_manager.loaded);
         }
         try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
+        const metal_telemetry = @import("../backends/metal_telemetry.zig");
+        try metal_telemetry.render(&writer.writer, metal_telemetry.snapshot(build_options.enable_metal));
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());

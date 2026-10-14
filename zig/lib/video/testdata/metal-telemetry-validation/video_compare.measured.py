@@ -1,0 +1,1340 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Matched real-video retrieval and completed CPU/MPS/native/Metal measurements.
+
+The corpus supplies clips and queries, never relevance judgments. This evaluates
+preservation of reference vectors and retrieval scores, not model usefulness.
+"""
+
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+from bisect import bisect_left
+from fractions import Fraction
+import hashlib
+import http.client
+import json
+import math
+import os
+import platform
+from pathlib import Path
+import resource
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import urllib.parse
+
+if __package__:
+    from . import compare, reference
+else:
+    import compare
+    import reference
+
+
+def failure_details(error):
+    detail = {"type": type(error).__name__, "message": str(error)}
+    if isinstance(error, CapacityRetryFailure):
+        detail["attempts"] = error.attempts
+        detail["last_failure"] = error.attempts[-1] if error.attempts else None
+        if error.attempts:
+            detail.update(
+                {
+                    k: v
+                    for k, v in error.attempts[-1].items()
+                    if k not in ("type", "message")
+                }
+            )
+        return detail
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            body = error.read(65537)
+        finally:
+            error.close()
+        detail.update(
+            http_status=error.code,
+            response_body=body[:65536].decode("utf-8", errors="replace"),
+            response_body_truncated=len(body) > 65536,
+        )
+    return detail
+
+
+def conditions():
+    result = {
+        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count(),
+        "threads": {
+            k: os.environ.get(k) for k in ("VECLIB_MAXIMUM_THREADS", "OMP_NUM_THREADS")
+        },
+    }
+    if sys.platform == "darwin":
+        for name, command in (
+            ("hardware", ["sysctl", "hw.model", "hw.memsize", "hw.ncpu"]),
+            ("swap", ["sysctl", "vm.swapusage"]),
+            ("vm_stat", ["vm_stat"]),
+        ):
+            p = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            result[name] = {"exit_code": p.returncode, "output": p.stdout}
+    elif sys.platform.startswith("linux"):
+        for name in ("meminfo", "vmstat"):
+            result[name] = Path("/proc", name).read_text()
+    return result
+
+
+def corpus(path):
+    data = json.loads(path.read_text())
+    names = []
+    for kind in ("documents", "queries"):
+        if not data.get(kind):
+            raise ValueError(f"empty {kind}")
+        for row in data[kind]:
+            names.append(row["id"])
+            if not isinstance(row["id"], str) or not row["id"]:
+                raise ValueError("nonempty case IDs required")
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate case IDs")
+    for row in data["documents"]:
+        source = Path(row["path"])
+        if not source.is_absolute():
+            source = path.parent / source
+        source = source.resolve()
+        if source.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError("clip exceeds model byte limit")
+        if reference.sha256(source) != row["sha256"]:
+            raise ValueError("clip changed")
+        if not row.get("provenance"):
+            raise ValueError("clip provenance required")
+        row["path"] = str(source)
+    if any(not isinstance(q["text"], str) or not q["text"] for q in data["queries"]):
+        raise ValueError("nonempty text queries required")
+    return data
+
+
+def retrieval(data, vectors):
+    return compare.retrieval_result(
+        {
+            "retrieval": {
+                "queries": [q["id"] for q in data["queries"]],
+                "documents": [d["id"] for d in data["documents"]],
+                "purpose": "reference preservation; no relevance labels",
+            }
+        },
+        {name: {"vector": value} for name, value in vectors.items()},
+    )
+
+
+def rank_agreement(actual, expected, top_k, tolerance):
+    """Exact rankings are reported; inversions are gated by reference score gaps.
+
+    A swap within the predeclared score tolerance is a numerical tie, not an
+    application-quality failure. Report exact overlap as well as this tie gate.
+    """
+    if set(actual["scores"]) != set(expected["scores"]):
+        raise ValueError("query sets differ")
+    rows = {}
+    for query, scores in expected["scores"].items():
+        measured = actual["scores"][query]
+        if set(scores) != set(measured):
+            raise ValueError("document sets differ")
+        if any(not math.isfinite(v) for v in [*scores.values(), *measured.values()]):
+            raise ValueError("nonfinite retrieval score")
+        ranking = actual["rankings"][query]
+        if len(ranking) != len(scores) or set(ranking) != set(scores):
+            raise ValueError("invalid ranking permutation")
+        inversions = []
+        for i, first in enumerate(ranking):
+            for second in ranking[i + 1 :]:
+                gap = scores[second] - scores[first]
+                if gap > tolerance:
+                    inversions.append({"first": first, "second": second, "gap": gap})
+        rows[query] = {
+            "max_score_error": max(abs(measured[d] - s) for d, s in scores.items()),
+            "exact_ranking": ranking == expected["rankings"][query],
+            "top_k_overlap": {
+                str(k): len(
+                    set(ranking[: min(k, len(scores))])
+                    & set(expected["rankings"][query][: min(k, len(scores))])
+                )
+                / min(k, len(scores))
+                for k in top_k
+            },
+            "non_tied_inversions": inversions,
+        }
+    return {
+        "queries": rows,
+        "pass": all(
+            r["max_score_error"] <= tolerance and not r["non_tied_inversions"]
+            for r in rows.values()
+        ),
+    }
+
+
+def timestamp_selection(frames, time_base, sampling):
+    """Independent exact-time oracle over FFprobe presentation pictures.
+
+    Sort once and binary-search target timestamps; native code scans bounded
+    metadata. No indexes or timing values are obtained from native inference.
+    """
+    allowed = {"policy", "start_ns", "end_ns", "step_ns", "max_frames", "overflow"}
+    if not isinstance(sampling, dict) or set(sampling) - allowed:
+        raise ValueError("invalid timestamp sampling object")
+    if sampling.get("policy") != "timestamps":
+        raise ValueError("expected timestamp policy")
+    start = sampling.get("start_ns", 0)
+    end = sampling.get("end_ns")
+    step = sampling.get("step_ns", 1_000_000_000)
+    cap = sampling.get("max_frames", 32)
+    overflow = sampling.get("overflow", "uniform")
+    if (
+        any(type(value) is not int for value in (start, step, cap))
+        or (end is not None and type(end) is not int)
+        or any(value > 2**63 - 1 for value in (start, step, cap))
+        or (end is not None and end > 2**63 - 1)
+        or start < 0
+        or step <= 0
+        or not 1 <= cap <= 32
+        or (end is not None and end <= start)
+        or overflow not in ("uniform", "truncate")
+    ):
+        raise ValueError("invalid timestamp sampling bounds")
+    scale = Fraction(time_base) * 1_000_000_000
+    if scale <= 0 or not frames:
+        raise ValueError("empty or invalid presentation timeline")
+    ordered = sorted(
+        (int(frame["best_effort_timestamp"]), index)
+        for index, frame in enumerate(frames)
+    )
+    origin, latest = ordered[0][0], ordered[-1][0]
+    times = [(pts - origin) * scale for pts, _ in ordered]
+    if end is None:
+        ends = []
+        previous = next((pts for pts, _ in reversed(ordered) if pts < latest), None)
+        for pts, index in ordered:
+            duration = frames[index].get("duration", frames[index].get("pkt_duration"))
+            if duration in (None, "N/A"):
+                duration = (
+                    latest - previous if pts == latest and previous is not None else 0
+                )
+            ends.append((pts - origin + int(duration)) * scale)
+        tail = max(ends)
+        end = -(-tail.numerator // tail.denominator)
+    if end <= start:
+        raise ValueError("empty timestamp window")
+    candidates = (end - start + step - 1) // step
+    count = min(candidates, cap)
+    selected = []
+    for i in range(count):
+        ordinal = (
+            i * (candidates - 1) // (count - 1)
+            if overflow == "uniform" and candidates > count > 1
+            else i
+        )
+        position = bisect_left(times, start + ordinal * step)
+        if position < len(times) and times[position] < end:
+            index = ordered[position][1]
+            if not selected or selected[-1] != index:
+                selected.append(index)
+    if not selected:
+        raise ValueError("empty timestamp window")
+    return selected
+
+
+def decoded(path, processor, sampling=None):
+    """Stream independent RGB decoding and retain only upstream-selected frames.
+
+    Default selection uses pinned HF; explicit windows use independent timestamps.
+    FFmpeg/Pillow are qualification tools, never native runtime dependencies.
+    """
+    import numpy as np
+    from PIL import Image
+    import tempfile
+    from transformers.video_utils import VideoMetadata
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_frames",
+        "-show_streams",
+        "-of",
+        "json",
+        str(path),
+    ]
+    info = json.loads(subprocess.check_output(command, timeout=120))["streams"][0]
+    # Container nb_frames counts transport samples, including individual PAFF
+    # fields. The reference processor requires completed presentation pictures.
+    count = int(info["nb_read_frames"])
+    duration_value = info.get("duration")
+    if duration_value in (None, "N/A"):
+        # Matroska commonly declares duration on the Segment, not the track.
+        container = json.loads(
+            subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_format", "-of", "json", str(path)],
+                timeout=120,
+            )
+        )
+        duration_value = container["format"]["duration"]
+    duration = float(duration_value)
+    width, height = int(info["width"]), int(info["height"])
+    if not (
+        0 < count <= 20000
+        and 0 < width * height <= 16 * 1024 * 1024
+        and math.isfinite(duration)
+        and duration > 0
+    ):
+        raise ValueError("reference decode metadata exceeds bounds")
+    if any(side.get("rotation", 0) for side in info.get("side_data_list", [])):
+        raise ValueError("reference display orientation requires an explicit policy")
+    metadata = VideoMetadata(
+        total_num_frames=count,
+        fps=count / duration,
+        duration=duration,
+        width=width,
+        height=height,
+    )
+    timestamp_evidence = None
+    if sampling is None or sampling == {"policy": "reference"}:
+        selected = processor.sample_frames(
+            metadata,
+            fps=processor.fps,
+            max_frames=processor.max_frames,
+            overflow_strategy=processor.overflow_strategy,
+        ).tolist()
+    else:
+        frames = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=best_effort_timestamp,duration,pkt_duration",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                timeout=120,
+            )
+        )["frames"]
+        count = len(frames)
+        metadata.total_num_frames = count
+        metadata.fps = count / duration
+        selected = timestamp_selection(frames, info["time_base"], sampling)
+        timestamp_evidence = {
+            "sampling": sampling,
+            "time_base": info["time_base"],
+            "presentation_frames": frames,
+        }
+    if not selected or len(selected) * width * height * 3 > 128 * 1024 * 1024:
+        raise ValueError("reference selected RGB exceeds bounds")
+    pictures = {}
+    wanted = set(selected)
+    if info["codec_name"] == "mjpeg":
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    str(Path(temporary) / "%d.jpg"),
+                ],
+                check=True,
+                timeout=120,
+            )
+            for index in wanted:
+                with Image.open(Path(temporary) / f"{index + 1}.jpg") as image:
+                    pixels = np.array(image.convert("RGB"))
+                if pixels.shape != (height, width, 3):
+                    raise ValueError("reference JPEG geometry changed")
+                pictures[index] = pixels
+        policy = "FFmpeg packet demux + independent Pillow/libjpeg RGB; upstream-selected frames only"
+    else:
+        frame_bytes = width * height * 3
+        with tempfile.TemporaryFile() as log:
+            process = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v:0",
+                    "-fps_mode",
+                    "passthrough",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=log,
+            )
+            decode_deadline = threading.Timer(120, process.kill)
+            decode_deadline.start()
+            try:
+                for index in range(count):
+                    raw = process.stdout.read(frame_bytes)
+                    if len(raw) != frame_bytes:
+                        raise ValueError("reference decoded frame count differs")
+                    if index in wanted:
+                        pictures[index] = (
+                            np.frombuffer(raw, dtype=np.uint8)
+                            .reshape(height, width, 3)
+                            .copy()
+                        )
+                if process.stdout.read(1):
+                    raise ValueError("reference decoded extra frames")
+                if process.wait(timeout=120) != 0:
+                    raise ValueError("reference FFmpeg decode failed")
+            finally:
+                decode_deadline.cancel()
+                process.stdout.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+        policy = "FFmpeg default RGB, streamed; upstream-selected frames only"
+    pixels = np.stack([pictures[index] for index in selected])
+    return (
+        pixels,
+        metadata,
+        dict(
+            policy=policy,
+            rgb_sha256=hashlib.sha256(pixels.tobytes()).hexdigest(),
+            frames=count,
+            selected_frames=selected,
+            duration=duration,
+            retained_rgb_bytes=pixels.nbytes,
+            timestamp_evidence=timestamp_evidence,
+        ),
+    )
+
+
+def process_tree_rss(root, records):
+    """Include supervised model workers; exclude unrelated processes."""
+    if root not in records:
+        raise ValueError("owned root is absent from memory sample")
+    children = {}
+    for pid, (parent, _) in records.items():
+        children.setdefault(parent, []).append(pid)
+    pending, seen, total = [root], set(), 0
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += records[pid][1]
+        pending.extend(children.get(pid, []))
+    return total
+
+
+class ProcessMemory:
+    """Sample the owned server's RSS; GPU private memory needs backend telemetry."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.samples = []
+        self.errors = []
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+
+    def sample(self):
+        while not self.stop.is_set():
+            try:
+                records = {}
+                if sys.platform.startswith("linux"):
+                    for entry in Path("/proc").iterdir():
+                        if not entry.name.isdigit():
+                            continue
+                        try:
+                            status = dict(
+                                line.split(":", 1)
+                                for line in (entry / "status").read_text().splitlines()
+                            )
+                            records[int(entry.name)] = (
+                                int(status["PPid"]),
+                                int(status.get("VmRSS", "0 kB").split()[0]) * 1024,
+                            )
+                        except (OSError, ValueError, KeyError):
+                            continue  # A process can exit between directory/read.
+                else:
+                    output = subprocess.check_output(
+                        ["ps", "-axo", "pid=,ppid=,rss="], timeout=2
+                    )
+                    for line in output.splitlines():
+                        pid, parent, kib = map(int, line.split())
+                        records[pid] = (parent, kib * 1024)
+                rss = process_tree_rss(self.pid, records)
+                self.samples.append((time.perf_counter(), rss))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                if not self.errors:
+                    self.errors.append(type(error).__name__)
+            self.stop.wait(0.1)
+
+    def finish(self):
+        self.stop.set()
+        self.thread.join(timeout=3)
+        return dict(
+            scope="sum of owned server and descendant RSS, 100ms samples; shared mappings may be counted more than once; excludes unmapped GPU private memory",
+            samples=len(self.samples),
+            peak_bytes=max((rss for _, rss in self.samples), default=None),
+            first_bytes=self.samples[0][1] if self.samples else None,
+            last_bytes=self.samples[-1][1] if self.samples else None,
+            errors=self.errors,
+        )
+
+
+class CapacityRetryFailure(RuntimeError):
+    def __init__(self, message, attempts):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def post_capacity_retry(url, body, timeout=30, max_attempts=16):
+    """Retry only declared admission denials; keep every denial and one deadline."""
+    deadline = time.monotonic() + timeout
+    attempts = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CapacityRetryFailure("capacity retry deadline exceeded", attempts)
+        try:
+            response = compare.post(url + "/ai/v1", "/embed", body, timeout=remaining)
+            return response, attempts
+        except urllib.error.HTTPError as error:
+            detail = failure_details(error)
+            attempts.append(detail)
+            try:
+                policy = json.loads(detail["response_body"])
+            except (ValueError, TypeError):
+                policy = None
+            if (
+                detail["response_body_truncated"]
+                or error.code not in (429, 503)
+                or not isinstance(policy, dict)
+                or policy.get("retryable") is not True
+                or policy.get("reason")
+                not in ("inference_capacity", "inference_admission")
+            ):
+                raise CapacityRetryFailure(
+                    "request failure is not retryable capacity", attempts
+                ) from error
+            delay = policy.get("retry_after_ms")
+            if type(delay) is not int or delay <= 0:
+                raise CapacityRetryFailure(
+                    "invalid capacity retry delay", attempts
+                ) from error
+            delay /= 1000
+            attempts[-1]["retry_delay_seconds"] = delay
+            if delay >= deadline - time.monotonic():
+                raise CapacityRetryFailure(
+                    "capacity retry deadline exceeded", attempts
+                ) from error
+            if len(attempts) >= max_attempts:
+                raise CapacityRetryFailure(
+                    "capacity retry attempt limit exceeded", attempts
+                ) from error
+            time.sleep(delay)
+        except Exception as error:
+            raise CapacityRetryFailure(
+                "request failed during capacity retry",
+                [*attempts, failure_details(error)],
+            ) from error
+
+
+METAL_TELEMETRY_NAMES = (
+    "buffer_upload_bytes",
+    "buffer_upload_calls",
+    "buffer_download_bytes",
+    "buffer_download_calls",
+    "buffer_copy_bytes",
+    "buffer_copy_calls",
+    "commands_completed",
+    "commands_failed",
+    "completed_gpu_nanoseconds",
+    "gpu_timestamps_missing",
+)
+
+
+def metal_telemetry_snapshot(url, timeout=5):
+    names = {
+        "antfly_inference_metal_" + name + "_total": name
+        for name in METAL_TELEMETRY_NAMES
+    }
+    with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
+        data = response.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("Metal telemetry response exceeds qualification bound")
+    parsed = {}
+    for line in data.decode().splitlines():
+        fields = line.split()
+        if fields and fields[0] in names:
+            if len(fields) != 2 or not fields[1].isascii() or not fields[1].isdigit():
+                raise ValueError("invalid unsigned Metal telemetry counter")
+            key = names[fields[0]]
+            value = int(fields[1])
+            if key in parsed or value > 2**64 - 1:
+                raise ValueError("duplicate or out-of-range Metal telemetry counter")
+            parsed[key] = value
+    if set(parsed) != set(METAL_TELEMETRY_NAMES):
+        raise ValueError("server does not expose required Metal telemetry counters")
+    return parsed
+
+
+def metal_telemetry_delta(before, after):
+    for values in (before, after):
+        if set(values) != set(METAL_TELEMETRY_NAMES) or any(
+            type(value) is not int or not 0 <= value <= 2**64 - 1
+            for value in values.values()
+        ):
+            raise ValueError("invalid Metal telemetry snapshot")
+    if any(after[key] < before[key] for key in before):
+        raise ValueError("Metal telemetry worker counters reset during measurement")
+    return {
+        "before": before,
+        "after": after,
+        "delta": {key: after[key] - before[key] for key in before},
+        "saturated": [key for key in after if after[key] == 2**64 - 1],
+        "scope": "worker-process interval; concurrent requests and setup may contribute; explicit logical buffer copies, not bus traffic; completed runtime-factory GPU command time, not wall time or preparation GPU time; independent atomic scrapes may straddle operations",
+    }
+
+
+def embedding_metrics(url, timeout=5, include_outcomes=False):
+    names = {
+        "active": "antfly_inference_embedding_groups_active",
+        "cancelled": "antfly_inference_embedding_groups_cancelled_total",
+        "completed": "antfly_inference_embedding_groups_completed_total",
+        "admitted": "antfly_admission_inference_in_flight_requests",
+    }
+    if include_outcomes:
+        names.update(
+            timed_out="antfly_inference_embedding_groups_timed_out_total",
+            failed="antfly_inference_embedding_groups_failed_total",
+        )
+    with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
+        data = response.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("metrics response exceeds qualification bound")
+    parsed = {}
+    for line in data.decode().splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] in names.values():
+            value = float(fields[1])
+            if not math.isfinite(value) or value < 0 or value != int(value):
+                raise ValueError("invalid embedding lifecycle metric")
+            parsed[fields[0]] = int(value)
+    if set(parsed) != set(names.values()):
+        raise ValueError("server does not expose required embedding cleanup metrics")
+    return {key: parsed[name] for key, name in names.items()}
+
+
+def wait_embedding_cleanup(url, before, outcome, timeout=30, expected_completions=0):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("embedding cleanup did not finish before deadline")
+        current = embedding_metrics(url, timeout=min(5, remaining))
+        if (
+            current[outcome] > before[outcome]
+            and current["active"] == 0
+            and current["admitted"] == 0
+        ):
+            return current
+        if (
+            outcome == "cancelled"
+            and current["completed"] > before["completed"] + expected_completions
+        ):
+            raise ValueError("disconnected embedding completed instead of cancelling")
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def disconnect_and_retry(url, body, expected, request_timeout=30):
+    before = embedding_metrics(url)
+    if before["active"] or before["admitted"]:
+        raise ValueError("disconnect qualification requires an idle owned server")
+    endpoint = urllib.parse.urlsplit(url)
+    connection = http.client.HTTPConnection(
+        endpoint.hostname, endpoint.port, timeout=10
+    )
+    try:
+        connection.request(
+            "POST",
+            "/ai/v1/embed",
+            json.dumps(body),
+            {"Content-Type": "application/json"},
+        )
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError(
+                    "embedding did not enter the disconnect observation window"
+                )
+            current = embedding_metrics(url, timeout=min(5, remaining))
+            if current["active"] > before["active"]:
+                break
+            if (
+                current["completed"] > before["completed"]
+                or time.monotonic() >= deadline
+            ):
+                raise ValueError(
+                    "embedding did not enter the disconnect observation window"
+                )
+            time.sleep(0.01)
+        # Abortive close produces a hard disconnect; FIN/SHUT_WR is a legal
+        # request half-close and must not be mistaken for cancellation.
+        connection.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
+    finally:
+        connection.close()
+    start = time.perf_counter()
+    retry, attempts = post_capacity_retry(url, body, timeout=request_timeout)
+    compare.assert_agreement(retry["data"][0]["embedding"], expected)
+    after = wait_embedding_cleanup(url, before, "cancelled", expected_completions=1)
+    return dict(
+        peer_disconnect_requested=True,
+        disconnect="tcp_reset",
+        retry="pass",
+        retry_seconds=time.perf_counter() - start,
+        capacity_denials=attempts,
+        metrics_before=before,
+        metrics_after=after,
+        cancellation_completion="observed after grouped resource cleanup and request admission release",
+    )
+
+
+def half_close_and_read(url, body, expected, request_timeout=60):
+    before = embedding_metrics(url)
+    endpoint = urllib.parse.urlsplit(url)
+    connection = http.client.HTTPConnection(
+        endpoint.hostname, endpoint.port, timeout=request_timeout
+    )
+    try:
+        connection.request(
+            "POST",
+            "/ai/v1/embed",
+            json.dumps(body),
+            {"Content-Type": "application/json"},
+        )
+        connection.sock.shutdown(socket.SHUT_WR)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError(f"half-closed request returned HTTP {response.status}")
+        vector = json.loads(response.read(16 * 1024 * 1024))["data"][0]["embedding"]
+        compare.assert_agreement(vector, expected)
+    finally:
+        connection.close()
+    after = wait_embedding_cleanup(url, before, "completed")
+    if after["cancelled"] != before["cancelled"]:
+        raise ValueError("legal request half-close was cancelled")
+    return dict(status="pass", metrics_before=before, metrics_after=after)
+
+
+@contextlib.contextmanager
+def server(args):
+    if args.url:
+        yield args.url.rstrip("/")
+        return
+    with socket.socket() as endpoint:
+        endpoint.bind(("127.0.0.1", 0))
+        port = endpoint.getsockname()[1]
+    with args.output.with_suffix(".server.log").open("w") as log:
+        process = subprocess.Popen(
+            [
+                str(args.binary.resolve()),
+                "run",
+                "--models-dir",
+                str(args.model_dir.parent.resolve()),
+                "--port",
+                str(port),
+                *(
+                    ["--process-memory-budget-mb", str(args.process_memory_budget_mb)]
+                    if getattr(args, "process_memory_budget_mb", 0)
+                    else []
+                ),
+                "--host-budget-mb",
+                "6144",
+                "--backend-budget-mb",
+                "12288",
+                "--combined-budget-mb",
+                "18432",
+                "--scratch-budget-mb",
+                "8192",
+            ],
+            env=dict(
+                os.environ,
+                ANTFLY_INFERENCE_REQUIRED_BACKEND=args.backend,
+                **(
+                    {"ANTFLY_INFERENCE_TEST_FORCE_RUN_ADMISSION_DENIALS": "1"}
+                    if getattr(args, "verify_capacity_retry", False)
+                    else {}
+                ),
+            ),
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+        url = f"http://127.0.0.1:{port}"
+        memory = ProcessMemory(process.pid)
+        memory.thread.start()
+        try:
+            for _ in range(300):
+                if process.poll() is not None:
+                    raise RuntimeError("owned server exited before health")
+                try:
+                    with urllib.request.urlopen(url + "/healthz", timeout=1):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                raise RuntimeError("owned server health deadline exceeded")
+            yield url
+        finally:
+            args.server_memory = memory.finish()
+            os.killpg(process.pid, signal.SIGTERM) if process.poll() is None else None
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+
+
+def sustained_evidence(completed, before, after):
+    """Separate released admission from unacknowledged server completions."""
+    acknowledged = sum(
+        row.get("http_status") == 200 or row["status"] == "pass" for row in completed
+    )
+    server_completions = after["completed"] - before["completed"]
+    denials = 0
+    for row in completed:
+        attempts = row.get(
+            "capacity_denials", row.get("failure", {}).get("attempts", [])
+        )
+        denials += sum(
+            attempt.get("http_status") in (429, 503)
+            and "retry_delay_seconds" in attempt
+            for attempt in attempts
+        )
+    quiescent = after["active"] == 0 and after["admitted"] == 0
+    cancellation_stable = after["cancelled"] == before["cancelled"]
+    return {
+        "capacity_denials": denials,
+        "quiescent": quiescent,
+        "cancellation_stable": cancellation_stable,
+        "cleanup_pass": quiescent and cancellation_stable,
+        "acknowledged_responses": acknowledged,
+        "server_completions": server_completions,
+        "unacknowledged_server_completions": server_completions - acknowledged,
+        "completion_accounting_pass": server_completions == acknowledged,
+    }
+
+
+def sustained_requests(url, bodies, vectors, identity, jobs, concurrency, timeout=60):
+    """Require completed vectors, explicit bounded capacity retries and cleanup.
+
+    Executor queue delay is separate from the request/retry deadline. Retain
+    every request outcome even when one fails; a denial alone is not success.
+    """
+    if not jobs or not 1 <= concurrency <= 32 or not 0 < timeout <= 3600:
+        raise ValueError("invalid sustained workload bounds")
+    before = embedding_metrics(url)
+    if before["active"] or before["admitted"]:
+        raise ValueError("sustained qualification requires an idle owned server")
+    stop = threading.Event()
+    samples, sample_errors = [], []
+
+    def monitor():
+        while not stop.is_set():
+            try:
+                samples.append(embedding_metrics(url))
+            except Exception as error:
+                sample_errors.append(failure_details(error))
+            stop.wait(0.05)
+
+    def request(index, name, submitted):
+        started = time.perf_counter()
+        row = {"index": index, "case": name, "queue_seconds": started - submitted}
+        try:
+            response, denials = post_capacity_retry(url, bodies[name], timeout=timeout)
+            row["capacity_denials"] = denials
+            row["http_status"] = 200
+            if response["model_identity"] != identity:
+                raise ValueError("model identity changed under concurrent load")
+            row["agreement"] = compare.assert_agreement(
+                response["data"][0]["embedding"], vectors[name]
+            )
+            row["status"] = "pass"
+        except Exception as error:
+            row["status"] = "failed"
+            row["failure"] = failure_details(error)
+        row["request_seconds"] = time.perf_counter() - started
+        row["total_seconds"] = time.perf_counter() - submitted
+        return row
+
+    observer = threading.Thread(target=monitor, daemon=True)
+    observer.start()
+    started = time.perf_counter()
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [
+                pool.submit(request, index, name, time.perf_counter())
+                for index, name in enumerate(jobs)
+            ]
+            completed = [future.result() for future in futures]
+        elapsed = time.perf_counter() - started
+        after = embedding_metrics(url)
+    finally:
+        stop.set()
+        observer.join(timeout=6)
+    evidence = sustained_evidence(completed, before, after)
+    successful = [row for row in completed if row["status"] == "pass"]
+    return {
+        "status": "pass"
+        if len(successful) == len(jobs)
+        and evidence["cleanup_pass"]
+        and evidence["completion_accounting_pass"]
+        and not sample_errors
+        else "failed",
+        "concurrency": concurrency,
+        "request_timeout_seconds": timeout,
+        "requests": completed,
+        "wall_seconds": elapsed,
+        "completed_per_second": len(successful) / elapsed,
+        "request_timing": compare.timing([row["request_seconds"] for row in successful])
+        if successful
+        else None,
+        "total_timing": compare.timing([row["total_seconds"] for row in successful])
+        if successful
+        else None,
+        **evidence,
+        "metrics_before": before,
+        "metrics_after": after,
+        "observed_peak_active": max(
+            [before["active"], after["active"], *(row["active"] for row in samples)]
+        ),
+        "observed_peak_admitted": max(
+            [
+                before["admitted"],
+                after["admitted"],
+                *(row["admitted"] for row in samples),
+            ]
+        ),
+        "metrics_samples": len(samples),
+        "metrics_errors": sample_errors,
+        "scope": "HTTP completion including bounded retry; total timing includes executor queue; 50ms lifecycle sampling can miss short peaks",
+    }
+
+
+def native(args, data, result):
+    reference.verify_checkpoint(args.model_dir)
+    with server(args) as url:
+        bodies = {}
+        identity = None
+        for row in data["queries"] + data["documents"]:
+            if "text" in row:
+                body = {"input": [row["text"]], "task_type": "RETRIEVAL_QUERY"}
+            else:
+                body = {
+                    "input": [
+                        {
+                            "content": [
+                                {
+                                    "type": "media",
+                                    "mime_type": "video/quicktime"
+                                    if row["path"].endswith(".mov")
+                                    else "video/webm"
+                                    if row["path"].endswith(".webm")
+                                    else "video/mp2t"
+                                    if row["path"].endswith(".ts")
+                                    else "video/mp4",
+                                    "data": base64.b64encode(
+                                        Path(row["path"]).read_bytes()
+                                    ).decode(),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            if "sampling" in row:
+                body["input"][0]["content"][0]["sampling"] = row["sampling"]
+            body["model"] = args.model_dir.name
+            bodies[row["id"]] = body
+            samples = []
+            telemetry_samples = []
+            cold = None
+            for i in range(args.warmups + args.iterations):
+                if identity:
+                    body["model_identity"] = identity
+                before_transfer = (
+                    metal_telemetry_snapshot(url)
+                    if getattr(args, "collect_metal_telemetry", False)
+                    else None
+                )
+                start = time.perf_counter()
+                response = compare.post(
+                    url + "/ai/v1", "/embed", body, timeout=args.request_timeout
+                )
+                elapsed = time.perf_counter() - start
+                if before_transfer is not None:
+                    telemetry_samples.append(
+                        metal_telemetry_delta(
+                            before_transfer, metal_telemetry_snapshot(url)
+                        )
+                    )
+                if identity and identity != response["model_identity"]:
+                    raise ValueError("model identity changed")
+                identity = response["model_identity"]
+                vector = response["data"][0]["embedding"]
+                compare.assert_agreement(vector, vector)
+                cold = elapsed if cold is None else cold
+                if i >= args.warmups:
+                    samples.append(elapsed)
+            result["cases"][row["id"]] = {
+                "vector": vector,
+                "prompt_tokens": response["usage"]["prompt_tokens"],
+                "cold_seconds": cold,
+                "completed_timing": compare.timing(samples),
+            }
+            if telemetry_samples:
+                result["cases"][row["id"]]["metal_telemetry"] = telemetry_samples
+            compare.publish(args.output, result)
+            print(args.backend, row["id"], samples, flush=True)
+        result["model_identity"] = identity
+        collect_reference_evidence(args, data, result)
+        compare.publish(args.output, result)
+        first = data["documents"][0]["id"]
+        before_lifecycle_transfer = (
+            metal_telemetry_snapshot(url)
+            if getattr(args, "collect_metal_telemetry", False)
+            else None
+        )
+        result["disconnect_retry"] = disconnect_and_retry(
+            url,
+            bodies[first],
+            result["cases"][first]["vector"],
+            request_timeout=args.request_timeout,
+        )
+        result["half_close"] = half_close_and_read(
+            url,
+            bodies[first],
+            result["cases"][first]["vector"],
+            request_timeout=args.request_timeout,
+        )
+        if before_lifecycle_transfer is not None:
+            result["lifecycle_metal_telemetry"] = metal_telemetry_delta(
+                before_lifecycle_transfer, metal_telemetry_snapshot(url)
+            )
+        before_transfer = (
+            metal_telemetry_snapshot(url)
+            if getattr(args, "collect_metal_telemetry", False)
+            else None
+        )
+        result["sustained"] = sustained_requests(
+            url,
+            bodies,
+            {name: case["vector"] for name, case in result["cases"].items()},
+            identity,
+            [row["id"] for row in data["documents"]] * args.sustained_rounds,
+            args.concurrency,
+            getattr(args, "sustained_request_timeout", 60),
+        )
+        if before_transfer is not None:
+            result["sustained"]["metal_telemetry"] = metal_telemetry_delta(
+                before_transfer, metal_telemetry_snapshot(url)
+            )
+        compare.publish(args.output, result)
+        if result["sustained"]["status"] != "pass":
+            raise ValueError(
+                "sustained workload did not complete every request and cleanup"
+            )
+
+
+def pytorch(args, data, result):
+    import torch
+    from transformers import AutoModel, AutoProcessor, AutoTokenizer
+
+    reference.verify_reference(args.model_dir)
+    result["reference_provenance"] = {
+        "transformers_revision": reference.TRANSFORMERS_REVISION,
+        "source_hashes": reference.SOURCE_HASHES,
+        "ffmpeg": subprocess.check_output(
+            ["ffmpeg", "-version"], text=True
+        ).splitlines()[0],
+    }
+    torch.set_num_threads(args.threads)
+    if args.backend == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS unavailable")
+    sync = torch.mps.synchronize if args.backend == "mps" else lambda: None
+    start = time.perf_counter()
+    model = (
+        AutoModel.from_pretrained(
+            args.model_dir, dtype=torch.float32, local_files_only=True
+        )
+        .eval()
+        .to(args.backend)
+    )
+    sync()
+    result["model_load_seconds"] = time.perf_counter() - start
+    processor = AutoProcessor.from_pretrained(args.model_dir, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
+    with torch.inference_mode():
+        for row in data["queries"] + data["documents"]:
+            samples = []
+            encoder_samples = []
+            cold = None
+            for i in range(args.warmups + args.iterations):
+                sync()
+                start = time.perf_counter()
+                if "text" in row:
+                    inputs = tokenizer(
+                        "task: search result | query: " + row["text"],
+                        return_tensors="pt",
+                    )
+                else:
+                    pixels, metadata, policy = decoded(
+                        row["path"], processor.video_processor, row.get("sampling")
+                    )
+                    inputs = processor(
+                        text=["<|video|>"],
+                        videos=[pixels],
+                        video_metadata=[metadata],
+                        do_sample_frames=False,
+                        return_tensors="pt",
+                    )
+                    result.setdefault("decoding", {})[row["id"]] = policy
+                inputs = {k: v.to(args.backend) for k, v in inputs.items()}
+                sync()
+                encoder_start = time.perf_counter()
+                hidden = model(**inputs).last_hidden_state
+                mask = inputs["attention_mask"].unsqueeze(-1)
+                vector = (
+                    torch.nn.functional.normalize(
+                        (hidden * mask).sum(1) / mask.sum(1), dim=-1
+                    )[0]
+                    .cpu()
+                    .tolist()
+                )
+                sync()
+                encoder_elapsed = time.perf_counter() - encoder_start
+                elapsed = time.perf_counter() - start
+                cold = elapsed if cold is None else cold
+                if i >= args.warmups:
+                    samples.append(elapsed)
+                    encoder_samples.append(encoder_elapsed)
+            result["cases"][row["id"]] = {
+                "vector": vector,
+                # Text endpoint usage counts lexical tokens; video groups count
+                # the expanded encoder sequence, including modality spans.
+                "prompt_tokens": len(
+                    tokenizer(
+                        "task: search result | query: " + row["text"],
+                        add_special_tokens=False,
+                    )["input_ids"]
+                )
+                if "text" in row
+                else int(inputs["attention_mask"].sum().item()),
+                "encoder_tokens": int(inputs["attention_mask"].sum().item()),
+                "cold_seconds": cold,
+                "completed_timing": compare.timing(samples),
+                "encoder_and_readback_timing": compare.timing(encoder_samples),
+            }
+            compare.publish(args.output, result)
+            print(args.backend, row["id"], samples, flush=True)
+    result["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (
+        1 if sys.platform == "darwin" else 1024
+    )
+    if args.backend == "mps":
+        result["mps_live_bytes"] = torch.mps.current_allocated_memory()
+        result["mps_driver_bytes"] = torch.mps.driver_allocated_memory()
+    result["torch"] = torch.__version__
+
+
+def collect_reference_evidence(args, data, result):
+    """Retain complete vector/ranking evidence before independent stress checks."""
+    result["retrieval"] = retrieval(
+        data, {name: case["vector"] for name, case in result["cases"].items()}
+    )
+    if not args.reference:
+        return None
+    expected = json.loads(args.reference.read_text())
+    if (
+        any(
+            result[k] != expected[k]
+            for k in ("corpus_sha256", "checkpoint_receipt_sha256", "precision")
+        )
+        or expected["status"] != "pass"
+    ):
+        raise ValueError("incomplete or mismatched reference")
+    if set(result["cases"]) != set(expected["cases"]):
+        raise ValueError("reference cases differ")
+    result["vector_agreement"] = {
+        n: compare.agreement(c["vector"], expected["cases"][n]["vector"])
+        for n, c in result["cases"].items()
+    }
+    result["reference_sha256"] = reference.sha256(args.reference)
+    result["retrieval_agreement"] = rank_agreement(
+        result["retrieval"],
+        expected["retrieval"],
+        args.top_k,
+        args.score_tolerance,
+    )
+    result["reference_evidence_stage"] = (
+        "completed measured corpus vectors; stress outcomes remain separate"
+    )
+    return expected
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--backend", choices=("native", "metal", "cpu", "mps"), required=True
+    )
+    parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--binary", type=Path)
+    parser.add_argument(
+        "--process-memory-budget-mb",
+        type=int,
+        default=0,
+        help="Explicit whole-process envelope for the owned native server; 0 uses automatic policy",
+    )
+    parser.add_argument("--url")
+    parser.add_argument(
+        "--collect-metal-telemetry",
+        action="store_true",
+        help="Require worker-process Metal bridge counters around completed requests; metrics reads excluded from HTTP timing",
+    )
+    parser.add_argument("--reference", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--sustained-rounds", type=int, default=2)
+    parser.add_argument("--sustained-request-timeout", type=float, default=60)
+    parser.add_argument("--request-timeout", type=float, default=600)
+    parser.add_argument("--score-tolerance", type=float, default=1e-4)
+    parser.add_argument("--top-k", type=int, nargs="+", default=[1, 5, 10])
+    args = parser.parse_args()
+    if not (
+        0 <= args.warmups <= 100
+        and 1 <= args.iterations <= 100
+        and 1 <= args.concurrency <= 32
+        and 1 <= args.sustained_rounds <= 100
+        and 0 < args.sustained_request_timeout <= 3600
+        and 0 < args.request_timeout <= 3600
+        and 1 <= args.threads <= 64
+        and 0 < args.score_tolerance <= 0.01
+        and all(k > 0 for k in args.top_k)
+    ):
+        parser.error("invalid bounded measurement controls")
+    if args.backend in ("native", "metal") and not (args.binary or args.url):
+        parser.error("native/metal requires --binary or --url")
+    if not 0 <= args.process_memory_budget_mb <= 65536:
+        parser.error("process memory budget must be between 0 and 65536 MiB")
+    if args.collect_metal_telemetry and args.backend not in ("native", "metal"):
+        parser.error("Metal telemetry requires native/metal HTTP backend")
+    data = corpus(args.corpus)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    result = {
+        "version": 1,
+        "status": "running",
+        "backend": args.backend,
+        "precision": "float32",
+        "purpose": "reference preservation, not end-user relevance",
+        "corpus_sha256": reference.sha256(args.corpus),
+        "checkpoint_receipt_sha256": reference.sha256(
+            args.model_dir / "embeddinggemma2_receipt.json"
+        ),
+        "tool_sha256": reference.sha256(Path(__file__)),
+        "cases": {},
+        "controls": {
+            k: getattr(args, k)
+            for k in (
+                "warmups",
+                "iterations",
+                "threads",
+                "concurrency",
+                "sustained_rounds",
+                "sustained_request_timeout",
+                "request_timeout",
+                "score_tolerance",
+                "top_k",
+                "process_memory_budget_mb",
+                "collect_metal_telemetry",
+            )
+        },
+        "cold_scope": "new process/model; artifact file cache is warmed by receipt verification; later case first calls use the resident model",
+        "timing_scope": "HTTP including decode/preparation/inference/final response"
+        if args.backend in ("native", "metal")
+        else "decode/preparation/inference/synchronized final readback; excludes HTTP",
+        "conditions_before": conditions(),
+    }
+    if args.binary:
+        result["binary_sha256"] = reference.sha256(args.binary)
+    try:
+        (native if args.backend in ("native", "metal") else pytorch)(args, data, result)
+        expected = collect_reference_evidence(args, data, result)
+        if expected is not None:
+            for name, case in result["cases"].items():
+                reference_case = expected["cases"][name]
+                if (
+                    "prompt_tokens" in reference_case
+                    and case["prompt_tokens"] != reference_case["prompt_tokens"]
+                ):
+                    raise ValueError(f"prompt-token parity failed: {name}")
+                compare.assert_agreement(
+                    case["vector"], expected["cases"][name]["vector"]
+                )
+            if not result["retrieval_agreement"]["pass"]:
+                raise ValueError("retrieval parity gate failed; measurements retained")
+        result["status"] = "pass"
+    except Exception as error:
+        result["failure"] = failure_details(error)
+        raise
+    finally:
+        if result["status"] != "pass":
+            result["status"] = "failed"
+        if hasattr(args, "server_memory"):
+            result["server_memory"] = args.server_memory
+        result["conditions_after"] = conditions()
+        compare.publish(args.output, result)
+
+
+if __name__ == "__main__":
+    main()
