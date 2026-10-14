@@ -64,6 +64,8 @@ pub const FragmentLedger = struct {
 pub const Encryption = struct { key: *const [16]u8, iv: [16]u8 };
 pub const ResumeOptions = struct {
     encryption: ?Encryption = null,
+    /// Accepted HLS parts, independent of this parent's moof boundaries.
+    sample_prefix: ?live.SamplesDigest = null,
     ingest: live.Options = .{},
     epoch: usize = 0,
     max_attempts: usize = 8,
@@ -76,12 +78,21 @@ pub const ResumeStats = struct {
     resource_complete: bool = true,
     transport: StreamStats = .{},
     replayed: usize = 0,
+    prefix_samples_skipped: usize = 0,
+    prefix_fragments_skipped: usize = 0,
     acknowledged: usize = 0,
 };
-fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, resource_context: [32]u8, encryption: ?Encryption, control: source.Control) ![32]u8 {
+fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, resource_context: [32]u8, encryption: ?Encryption, sample_prefix: ?live.SamplesDigest, control: source.Control) ![32]u8 {
     var state = std.crypto.hash.sha2.Sha256.init(.{});
     defer std.crypto.secureZero(u8, std.mem.asBytes(&state));
-    state.update("antfly-fmp4-replay-v3");
+    state.update("antfly-fmp4-replay-v4");
+    state.update(&.{@intFromBool(sample_prefix != null)});
+    if (sample_prefix) |prefix| {
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, prefix.count, .big);
+        state.update(&count);
+        state.update(&prefix.bytes());
+    }
     state.update(&.{@intFromBool(encryption != null)});
     if (encryption) |cipher| {
         state.update(cipher.key);
@@ -390,7 +401,7 @@ pub fn Adapter(comptime http: type) type {
             if (initialization.len > options.ingest.stream.max_bytes or initialization.len > options.ingest.max_ingested_bytes) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
-            const binding = try resumeBinding(url, range, initialization, options.epoch, options.resource_context, options.encryption, self.control);
+            const binding = try resumeBinding(url, range, initialization, options.epoch, options.resource_context, options.encryption, options.sample_prefix, self.control);
             if (ledger.binding) |previous| if (!std.mem.eql(u8, &previous, &binding)) {
                 ledger.invalid = true;
                 return error.SourceVersionChanged;
@@ -409,6 +420,9 @@ pub fn Adapter(comptime http: type) type {
                 ledger: *FragmentLedger,
                 previous_count: usize,
                 previous_prefix: [32]u8,
+                sample_prefix: ?live.SamplesDigest,
+                observed_prefix: live.SamplesDigest = .{},
+                prefix_verified: bool,
                 state: std.crypto.hash.sha2.Sha256 = .init(.{}),
                 count: usize = 0,
                 stats: ResumeStats = .{},
@@ -423,6 +437,8 @@ pub fn Adapter(comptime http: type) type {
                     std.mem.writeInt(u64, boundary[8..16], segment.reader.packets.len, .big);
                     var candidate = replay.state;
                     candidate.update(&boundary);
+                    const skip: usize = if (replay.sample_prefix) |expected| @min(expected.count - replay.observed_prefix.count, segment.reader.packets.len) else 0;
+                    var observed = replay.observed_prefix;
                     // Payload leases remain transient; the ledger retains no
                     // decoded pictures, packets, or per-fragment hash array.
                     for (segment.reader.packets, 0..) |packet, index| {
@@ -436,17 +452,31 @@ pub fn Adapter(comptime http: type) type {
                         var payload = try segment.reader.readPacket(index);
                         defer payload.deinit();
                         candidate.update(&header);
+                        if (index < skip) observed.state.update(&header);
                         var offset: usize = 0;
                         while (offset < payload.bytes.len) {
                             try replay.adapter.control.check();
                             const end = @min(payload.bytes.len, offset + 8192);
                             candidate.update(payload.bytes[offset..end]);
+                            if (index < skip) observed.state.update(payload.bytes[offset..end]);
                             offset = end;
                         }
+                        if (index < skip) observed.count = try std.math.add(usize, observed.count, 1);
                     }
                     var hash_state = candidate;
                     var hash: [32]u8 = undefined;
                     hash_state.final(&hash);
+                    if (replay.sample_prefix) |expected| {
+                        replay.observed_prefix = observed;
+                        replay.stats.prefix_samples_skipped += skip;
+                        if (replay.observed_prefix.count == expected.count) {
+                            if (!std.mem.eql(u8, &expected.bytes(), &replay.observed_prefix.bytes())) {
+                                replay.ledger.invalid = true;
+                                return error.SourceVersionChanged;
+                            }
+                            replay.prefix_verified = true;
+                        }
+                    }
                     if (replay.count < replay.previous_count) {
                         replay.count += 1;
                         replay.state = candidate;
@@ -457,11 +487,32 @@ pub fn Adapter(comptime http: type) type {
                         }
                         return;
                     }
+                    if (skip == segment.reader.packets.len and skip != 0) {
+                        replay.count += 1;
+                        replay.state = candidate;
+                        replay.stats.prefix_fragments_skipped += 1;
+                        // Do not commit a merely observed prefix: a truncated
+                        // unverified version must not poison a healthy retry.
+                        if (replay.prefix_verified) replay.commitObserved(hash);
+                        return;
+                    }
+                    if (!replay.prefix_verified) return error.InvalidHlsReplay;
+                    // Verification may finish within this moof. Previously
+                    // suppressed fragments are now proven accepted parts;
+                    // this fragment's new suffix still needs consumer ACK.
+                    var previous_state = replay.state;
+                    replay.commitObserved(previous_state.finalResult());
+                    if (skip != 0) try segment.reader.discardPacketPrefix(skip);
                     replay.accept(replay.context, delivery) catch |err| {
                         if (delivery.acknowledged) replay.commit(candidate, hash);
                         return err;
                     };
                     replay.commit(candidate, hash);
+                }
+                fn commitObserved(replay: *@This(), hash: [32]u8) void {
+                    if (replay.count <= replay.ledger.acknowledged) return;
+                    replay.ledger.acknowledged = replay.count;
+                    replay.ledger.prefix = hash;
                 }
                 fn commit(replay: *@This(), candidate: std.crypto.hash.sha2.Sha256, hash: [32]u8) void {
                     replay.state = candidate;
@@ -471,7 +522,7 @@ pub fn Adapter(comptime http: type) type {
                     replay.stats.acknowledged += 1;
                 }
             };
-            var replay = Replay{ .adapter = self, .ledger = ledger, .previous_count = ledger.acknowledged, .previous_prefix = ledger.prefix, .context = context, .accept = accept };
+            var replay = Replay{ .adapter = self, .ledger = ledger, .previous_count = ledger.acknowledged, .previous_prefix = ledger.prefix, .sample_prefix = options.sample_prefix, .prefix_verified = options.sample_prefix == null or options.sample_prefix.?.count == 0, .context = context, .accept = accept };
             ledger.active = true;
             defer ledger.active = false;
             const previous_requests = self.requests;
@@ -480,7 +531,7 @@ pub fn Adapter(comptime http: type) type {
                 ledger.binding = binding;
             };
             replay.stats.transport = try self.streamFmp4WithEncryption(base, reference, range, resource_limit, &ingest, options.encryption, &replay, Replay.publish);
-            if (replay.count < replay.previous_count) {
+            if (replay.count < replay.previous_count or !replay.prefix_verified) {
                 ledger.invalid = true;
                 return error.SourceVersionChanged;
             }

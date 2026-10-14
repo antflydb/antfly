@@ -2124,3 +2124,47 @@ The final gate passes 204 media and 16 production HTTP checks on both platforms,
 plus 42 model unit checks with three optional checkpoint skips.
 See [encrypted-streaming qualification](testdata/aes-stream/README.md) for terminal
 results, source/binary/checkpoint hashes and platform scope.
+
+
+### Incremental LL-HLS parts and parent reconciliation
+
+`Reader.streamNext` now consumes advertised fMP4 parts and complete parent
+resources with the same prefix-verified plaintext/AES transport. Part metadata
+and independent hints reach each fragment callback. The part cursor advances
+only at successful object EOF; accepted sample progress is retained on transport,
+consumer, allocation or cancellation failure. No preload hint is fetched.
+
+A complete parent is verified against accepted parts by ordered native sample
+DTS/PTS, duration, size, sync and encoded bytes. Verification is independent of
+moof boundaries: an accepted part may end inside a repackaged parent fragment.
+Only the new packet-index suffix reaches decode/inference. Moving-index overlap
+is admitted, and retained index charges shrink after their old allocation is
+freed. Packet leases and backing bytes remain independently owned.
+
+The expected sample prefix is frozen for each parent resource across retries.
+Observed but unverified parent fragments do not enter the resource ledger; a
+corrupt truncated version therefore cannot poison a later healthy retry before
+its accepted-part prefix has been verified. A mismatching or shorter completed
+prefix rejects before any new callback. Resource replay and manifest sample-prefix
+skip counts are reported separately. Fully duplicate parents advance the cursor
+without emitting another unit. Global delivery ordinals count newly emitted units.
+
+An unfinished advertised resource remains pinned when reload offers more parts.
+If an unfinished part disappears and its compatible complete parent is advertised,
+reload can replace that resource while preserving accepted samples for mandatory
+parent verification. Initialization/discontinuity mutation still rejects. Native
+DTS continuity is checked before delivery, and epochs retain their existing drain
+and reconfiguration rules. Buffered parts can transition to streaming parents.
+
+Qualification includes re-fragmented parent parity, corrupt/truncated versions,
+frozen retry prefixes, pinned reloads, fully duplicate parents, unfinished-part
+fallback, mixed buffered/streaming APIs, independently encrypted objects and all
+allocation failures. The half-second part and two-second parent fragments have
+independent FFprobe packet/hash provenance. A real authenticated server withholds
+the parent tail until a verified new suffix is delivered. The checkpoint gate
+compares six windows with buffered complete-clip inference while injecting output
+failure and verifying exact retained-output retry before new HTTP. CPU, Metal
+and actual Linux ARM64 each preserve all six vectors exactly; 214 media and 17
+HTTP checks pass on both platforms, plus 42 model checks with four optional skips. See
+[LL-HLS streaming qualification](testdata/ll-stream/README.md) for terminal results
+and source/binary/checkpoint scope. Incremental normalized TS remains open.

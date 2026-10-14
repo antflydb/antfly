@@ -934,3 +934,126 @@ test "production HLS AES streaming authenticates keys decrypts exact ranges and 
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 6), transport.requests);
 }
+
+test "production LL HLS streamed parent verifies repackaged sample prefix before authenticated withheld tail" {
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+    const first_manifest = prefix ++ "#EXT-X-PART:DURATION=0.5,URI=\"p0.m4s\",INDEPENDENT=YES\n";
+    const parent_manifest = prefix ++ "#EXTINF:6,\nparent.m4s\n#EXT-X-ENDLIST\n";
+    const initial = @embedFile("testdata/fragmented.mp4")[0..797];
+    const part = @embedFile("testdata/hls/ll-part-half.m4s");
+    const parent = @embedFile("testdata/hls/ll-parent-2s.mp4");
+    const State = struct {
+        release: std.Io.Event = .unset,
+        sent_tail: std.atomic.Value(bool) = .init(false),
+        count: usize = 0,
+        samples: usize = 0,
+        held: [4]?media.live_mp4.Segment = @splat(null),
+        fn serve(self: *@This(), listener: *http.TcpListener) !void {
+            for (0..5) |index| {
+                const accepted = try listener.accept();
+                var socket = accepted.socket;
+                defer socket.close();
+                try socket.setRecvTimeout(5000);
+                try socket.setSendTimeout(5000);
+                var request: [4096]u8 = undefined;
+                var used: usize = 0;
+                while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                    if (used == request.len) return error.TestUnexpectedResult;
+                    const n = try socket.recv(request[used..]);
+                    if (n == 0) return error.UnexpectedEof;
+                    used += n;
+                }
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+                const path = switch (index) {
+                    0, 3 => "GET /live/list.m3u8 ",
+                    1 => "GET /live/init.mp4 ",
+                    2 => "GET /live/p0.m4s ",
+                    else => "GET /live/parent.m4s ",
+                };
+                try std.testing.expect(std.mem.startsWith(u8, request[0..used], path));
+                if (index < 4) {
+                    const body = switch (index) {
+                        0 => first_manifest,
+                        1 => initial,
+                        2 => part,
+                        else => parent_manifest,
+                    };
+                    var header: [128]u8 = undefined;
+                    try socket.sendAll(try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}));
+                    try socket.sendAll(body);
+                } else {
+                    try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                    const boundary = 20775 + 8;
+                    try chunk(&socket, parent[797..boundary]);
+                    try self.release.wait(std.testing.io);
+                    self.sent_tail.store(true, .release);
+                    try chunk(&socket, parent[boundary..]);
+                    try socket.sendAll("0\r\n\r\n");
+                }
+            }
+        }
+        fn chunk(socket: *http.Socket, bytes: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{bytes.len}));
+            try socket.sendAll(bytes);
+            try socket.sendAll("\r\n");
+        }
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+            if (self.count == 0) {
+                try std.testing.expectEqual(@as(usize, 5), delivery.segment.?.reader.packets.len);
+                try std.testing.expectEqual(@as(?u32, 0), delivery.segment.?.hls_timing.?.part_index);
+            } else if (self.count == 1) {
+                try std.testing.expect(!self.sent_tail.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 15), delivery.segment.?.reader.packets.len);
+                try std.testing.expectEqual(@as(i64, 5120), delivery.segment.?.reader.packets[0].media_dts);
+                self.release.set(std.testing.io);
+            }
+            self.samples += delivery.segment.?.reader.packets.len;
+            self.held[self.count] = try delivery.take();
+            self.count += 1;
+        }
+    };
+    var state = State{};
+    defer for (&state.held) |*entry| if (entry.*) |*unit| unit.deinit();
+    var listener = try http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/live/list.m3u8", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .limits = .{ .timeout_ms = 5000 } };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{});
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(State.serve, .{ &state, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    _ = try reader.streamNext(&state, State.accept);
+    try reader.reload();
+    const result = (try reader.streamNext(&state, State.accept)).?;
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 5), result.prefix_samples_skipped);
+    try std.testing.expectEqual(@as(usize, 3), result.acknowledged);
+    try std.testing.expectEqual(@as(usize, 60), state.samples);
+    try std.testing.expectEqual(@as(usize, 4), state.count);
+    try std.testing.expect(reader.ended());
+    var original_source = media.source.Source{ .allocator = a, .identity = "ll-http-native-parity", .storage = .{ .borrowed = @embedFile("testdata/fragmented.mp4") } };
+    var reference = try media.mp4.Reader.init(a, &original_source, .{});
+    defer reference.deinit();
+    var cursor: usize = 0;
+    for (state.held) |entry| {
+        var unit = entry.?;
+        for (unit.reader.packets, 0..) |packet, local| {
+            try std.testing.expectEqual(reference.packets[cursor].media_dts, packet.media_dts);
+            try std.testing.expectEqual(reference.packets[cursor].media_pts, packet.media_pts);
+            var left = try reference.readPacket(cursor);
+            defer left.deinit();
+            var right = try unit.reader.readPacket(local);
+            defer right.deinit();
+            try std.testing.expectEqualSlices(u8, left.bytes, right.bytes);
+            cursor += 1;
+        }
+    }
+}

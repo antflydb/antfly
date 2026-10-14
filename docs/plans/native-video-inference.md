@@ -2274,3 +2274,16 @@ Encrypted-streaming qualification passes 204 media and 16 production HTTP tests
 on macOS and actual Linux ARM64, plus 42 model unit checks (three optional skips).
 Configured CPU, Metal and Linux checkpoint gates each preserve all six buffered
 plaintext HLS vectors exactly through first-output failure and before-EOF retry.
+
+
+LL-HLS advertised fMP4 parts and complete parents now stream through native
+plaintext/AES transport. Accepted-sample commitments reconcile repackaged moofs
+and freeze across resource retries; no new suffix reaches inference until the
+accepted prefix matches. Compatible part-to-parent fallback preserves progress,
+while overlapping descriptor/configuration mutation still rejects. Incremental
+normalized TS remains open. Qualification: `zig/lib/media/testdata/ll-stream/README.md`.
+
+LL-HLS streaming qualification passes 214 media and 17 authenticated HTTP tests
+on macOS and actual Linux ARM64, plus 42 model unit checks (four optional skips).
+Configured CPU, Metal and Linux checkpoint gates preserve all six buffered
+full-clip vectors exactly across parent repackaging and retained-output retry.

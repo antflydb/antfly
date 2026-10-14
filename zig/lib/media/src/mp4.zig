@@ -175,6 +175,24 @@ pub const Reader = struct {
         self.index_reservation.deinit();
         self.* = undefined;
     }
+    /// Atomically replace an owned packet index with its suffix. Snapshot bytes
+    /// and leases remain unchanged; admission covers old/new moving overlap.
+    pub fn discardPacketPrefix(self: *Reader, count: usize) !void {
+        if (count > self.packets.len) return error.InvalidPacketIndex;
+        if (count == 0) return;
+        try self.input.control.check();
+        const retained_bytes = try std.math.mul(usize, self.packets.len - count, @sizeOf(Packet));
+        var overlap = if (self.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = retained_bytes }) else @import("admission.zig").Token{};
+        defer overlap.deinit();
+        const tail = try self.allocator.dupe(Packet, self.packets[count..]);
+        errdefer self.allocator.free(tail);
+        try self.input.control.check();
+        self.allocator.free(self.packets);
+        self.packets = tail;
+        // Release bytes only after freeing their owner. Shrinking a valid
+        // token cannot fail; all fallible work preceded the index mutation.
+        self.index_reservation.resize(.{ .host_bytes = retained_bytes }) catch unreachable;
+    }
     pub fn readPacket(self: *Reader, index: usize) !source.Lease {
         if (index >= self.packets.len) return error.InvalidPacketIndex;
         const packet = self.packets[index];

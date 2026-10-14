@@ -55,3 +55,12 @@ encryption of `live-fragmented.mp4[797:]` with public fixture key bytes 00..0f
 and sequence IV 10. The media fixture manifest records its tool, command and
 source/plaintext/ciphertext hashes. Runtime uses native Zig decryption; the
 checkpoint streaming gate compares against buffered plaintext HLS windows.
+
+
+`ll-part-half.m4s` and `ll-parent-2s.mp4` copy the media qualification fixtures
+in `zig/lib/media/testdata/hls/`. FFmpeg packet-copy remuxing creates a half-second
+part and two-second parent moofs from `live-fragmented.mp4`; native DTS/PTS,
+duration, size, sync and encoded SHA-256 agree with all 60 source packets.
+`ll-parent-2s.json` records commands, tool, source/fixture hashes and packet
+provenance. The checkpoint gate consumes the part before a complete parent,
+then compares six streamed window vectors with buffered full-clip HLS inference.

@@ -33,8 +33,11 @@ pub const Options = struct {
 pub const SamplesDigest = struct {
     count: usize = 0,
     state: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    /// Cancellation/read failure leaves the prior commitment unchanged.
     pub fn extend(self: *SamplesDigest, reader: *mp4.Reader, begin: usize, end: usize) !void {
+        var candidate = self.*;
         for (reader.packets[begin..end], begin..) |packet, index| {
+            try reader.input.control.check();
             var header: [25]u8 = undefined;
             std.mem.writeInt(i64, header[0..8], packet.media_dts, .big);
             std.mem.writeInt(i64, header[8..16], packet.media_pts, .big);
@@ -43,10 +46,17 @@ pub const SamplesDigest = struct {
             header[24] = @intFromBool(packet.sync);
             var payload = try reader.readPacket(index);
             defer payload.deinit();
-            self.state.update(&header);
-            self.state.update(payload.bytes);
-            self.count = std.math.add(usize, self.count, 1) catch return error.ResourceLimitExceeded;
+            candidate.state.update(&header);
+            var offset: usize = 0;
+            while (offset < payload.bytes.len) {
+                try reader.input.control.check();
+                const stop = @min(payload.bytes.len, offset + 8192);
+                candidate.state.update(payload.bytes[offset..stop]);
+                offset = stop;
+            }
+            candidate.count = std.math.add(usize, candidate.count, 1) catch return error.ResourceLimitExceeded;
         }
+        self.* = candidate;
     }
     pub fn bytes(self: SamplesDigest) [32]u8 {
         var state = self.state;
@@ -296,13 +306,7 @@ pub const Ingest = struct {
         if (digest) |*value| try value.extend(&reader, skip, reader.packets.len);
         const last = reader.packets[reader.packets.len - 1];
         const next = try std.math.add(i64, last.media_dts, last.duration);
-        if (skip != 0) {
-            var trim_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = (reader.packets.len - skip) * @sizeOf(mp4.Packet) }) else admission.Token{};
-            defer trim_reservation.deinit();
-            const tail = try self.allocator.dupe(mp4.Packet, reader.packets[skip..]);
-            self.allocator.free(reader.packets);
-            reader.packets = tail;
-        }
+        if (skip != 0) try reader.discardPacketPrefix(skip);
         self.identity = identity;
         self.next_decode_time = next;
         const ordinal = self.segments;

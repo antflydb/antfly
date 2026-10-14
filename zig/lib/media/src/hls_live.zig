@@ -124,6 +124,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         stream_start_decode_time: ?i64 = null,
         stream_track_scale: u32 = 0,
         stream_was_partial: bool = false,
+        stream_sample_prefix: ?live.SamplesDigest = null,
         stream_call_active: bool = false,
         next_sequence: ?u64 = null,
         next_part: u32 = 0,
@@ -348,9 +349,16 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (@as(u128, expected_sequence) > @as(u128, last) + 1) return error.SourceVersionChanged;
                 } else if (self.playlist != null and self.playlist.?.segments.len != 0) return error.SourceVersionChanged;
             }
+            var replace_stream_resource = false;
             if (self.stream_key) |key| {
                 const item = (try self.selectedResource(parsed)) orelse return error.MediaStreamGap;
-                if (!std.meta.eql(key, try self.streamDescriptor(item))) return error.SourceVersionChanged;
+                if (!std.meta.eql(key, try self.streamDescriptor(item))) {
+                    const old = (try self.selectedResource(self.playlist.?)) orelse return error.MediaStreamGap;
+                    if (old.part == null or item.part != null or old.sequence != item.sequence or
+                        old.discontinuity_sequence != item.discontinuity_sequence or
+                        !sameInitialization(old.initialization, item.initialization)) return error.SourceVersionChanged;
+                    replace_stream_resource = true;
+                }
             }
             try self.transport.control.check();
             if (self.playlist) |*previous| previous.deinit();
@@ -360,6 +368,11 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             self.clearKey();
             self.playlist = parsed;
             self.manifest = body;
+            if (replace_stream_resource) {
+                self.stream_key = null;
+                self.stream_ledger = .{};
+                self.stream_sample_prefix = null;
+            }
             self.snapshot_requested_ns = requested_ns;
             if (selected_url) |url| {
                 self.media_url = url;
@@ -432,6 +445,12 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             }
         }
         fn selectedResource(self: *const Self, playlist: hls.Playlist) !?hls.Segment {
+            // Keep an unfinished advertised resource pinned even if a reload
+            // offers more parts or a completed parent alongside it.
+            if (self.stream_key) |key| for (playlist.segments) |item| {
+                if (self.next_sequence) |sequence| if (item.sequence != sequence) continue;
+                if (std.meta.eql(key, try self.streamDescriptor(item))) return item;
+            };
             if (self.dash_position) |position| return if (try position.select(playlist)) |index| playlist.segments[index] else null;
             return self.selectHls(playlist);
         }
@@ -465,7 +484,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         /// decode span covering the advertised resource duration. Retry/reload
         /// cannot silently drop or mutate
         /// the selected resource. next() cannot mix buffered consumption into an
-        /// unfinished streaming resource. TS/LL-HLS parts retain next().
+        /// unfinished streaming resource. Accepted LL-HLS parts bind parent
+        /// fallback by samples, independent of moof boundaries. TS retains next().
         pub fn streamNext(self: *Self, context: *anyopaque, accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void) !?network.ResumeStats {
             try self.transport.control.check();
             if (self.stream_call_active) return error.InvalidMediaStreamState;
@@ -473,7 +493,6 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             const item = (try self.selectedResource(playlist)) orelse return null;
             if (item.part) |part| if (part.gap) return error.MediaStreamGap;
             if (item.initialization.uri.len == 0) return error.UnsupportedStreamingResource;
-            if (item.part != null or self.next_part != 0) return error.UnsupportedHlsStreamingParts;
             if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) return error.PendingMediaSegment;
             const key = try self.streamDescriptor(item);
             if (self.stream_key) |previous| {
@@ -485,6 +504,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 self.stream_start_decode_time = null;
                 self.stream_track_scale = 0;
                 self.stream_was_partial = !item.availability_complete;
+                self.stream_sample_prefix = if (item.part == null and self.part_progress.count != 0) self.part_progress else null;
                 self.stream_ledger = .{};
             }
             const encryption: ?network.Encryption = if (item.encryption) |declaration| .{ .key = try self.loadKey(declaration), .iv = declaration.mediaIv(item.sequence) } else null;
@@ -501,8 +521,9 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (unit.reader.packets.len == 0) return error.EmptyMediaResource;
                     const first = unit.reader.packets[0];
                     if (ingest.next_decode_time) |expected_time| if (first.media_dts < expected_time) return error.NonMonotonicMediaSegment;
-                    if (sink.owner.stream_was_partial) {
-                        var expected_time = if (sink.owner.stream_start_decode_time != null) ingest.next_decode_time.? else first.media_dts;
+                    const hls_overlap = sink.item.part != null or sink.owner.stream_sample_prefix != null;
+                    if (sink.owner.stream_was_partial or hls_overlap) {
+                        var expected_time = if (hls_overlap) ingest.next_decode_time orelse first.media_dts else if (sink.owner.stream_start_decode_time != null) ingest.next_decode_time.? else first.media_dts;
                         for (unit.reader.packets) |packet| {
                             if (packet.media_dts != expected_time) return error.MediaStreamGap;
                             expected_time = try std.math.add(i64, packet.media_dts, packet.duration);
@@ -510,7 +531,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     }
                     const last = unit.reader.packets[unit.reader.packets.len - 1];
                     const decode_end = try std.math.add(i64, last.media_dts, last.duration);
-                    const ordinal = try std.math.add(usize, sink.owner.stream_base_ordinal, unit.ordinal);
+                    const ordinal = ingest.segments;
                     if (ordinal >= ingest.options.max_segments) return error.ResourceLimitExceeded;
                     unit.ordinal = ordinal;
                     if (sink.item.dash) |timing| {
@@ -520,7 +541,9 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                         mapped.resource_complete = delivery.body_complete and sink.owner.completeResource(sink.item, start, decode_end, unit.reader.track.timescale);
                         unit.dash_timing = mapped;
                     }
-                    if (comptime @hasDecl(manifest_parser, "master")) unit.hls_timing = .{ .sequence = sink.item.sequence, .discontinuity_sequence = sink.item.discontinuity_sequence };
+                    if (comptime @hasDecl(manifest_parser, "master")) unit.hls_timing = .{ .sequence = sink.item.sequence, .part_index = if (sink.item.part) |part| part.index else null, .independent_hint = if (sink.item.part) |part| part.independent else false, .discontinuity_sequence = sink.item.discontinuity_sequence };
+                    var progress = sink.owner.part_progress;
+                    if (sink.item.part != null) try progress.extend(&unit.reader, 0, unit.reader.packets.len);
                     const start_decode = sink.owner.stream_start_decode_time orelse first.media_dts;
                     const track_scale = unit.reader.track.timescale;
                     sink.accept(sink.context, delivery) catch |err| {
@@ -529,6 +552,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                             sink.owner.stream_track_scale = track_scale;
                             ingest.next_decode_time = decode_end;
                             ingest.segments = ordinal + 1;
+                            if (sink.item.part != null) sink.owner.part_progress = progress;
                         }
                         return err;
                     };
@@ -536,6 +560,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     sink.owner.stream_track_scale = track_scale;
                     ingest.next_decode_time = decode_end;
                     ingest.segments = ordinal + 1;
+                    if (sink.item.part != null) sink.owner.part_progress = progress;
                 }
             };
             var sink = Sink{ .owner = self, .item = item, .context = context, .accept = accept };
@@ -549,8 +574,8 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             defer self.ingest.?.ingested_bytes += self.transport.transferred_bytes - transferred_before;
             const remaining = self.ingest.?.options.max_ingested_bytes -| self.ingest.?.ingested_bytes;
             const resource_limit: usize = @intCast(@min(options.stream.max_bytes, remaining));
-            var result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .max_attempts = self.options.max_resource_attempts, .resource_context = key, .encryption = encryption }, &sink, Sink.publish);
-            result.resource_complete = if (self.stream_start_decode_time) |start| self.completeResource(item, start, self.ingest.?.next_decode_time.?, self.stream_track_scale) else false;
+            var result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .max_attempts = self.options.max_resource_attempts, .resource_context = key, .encryption = encryption, .sample_prefix = self.stream_sample_prefix }, &sink, Sink.publish);
+            result.resource_complete = if (self.stream_start_decode_time) |start| self.completeResource(item, start, self.ingest.?.next_decode_time.?, self.stream_track_scale) else self.stream_sample_prefix != null;
             if (!result.resource_complete) {
                 if (item.availability_complete) return error.IncompleteMediaSegment;
                 return result;
@@ -558,6 +583,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             self.commitCursor(item);
             self.stream_key = null;
             self.stream_ledger = .{};
+            self.stream_sample_prefix = null;
             return result;
         }
         pub fn next(self: *Self) !?live.Segment {
@@ -1299,8 +1325,12 @@ const PartialHttp = struct {
         manifest: []const u8 = ll_first,
         parent_bytes: ?[]const u8 = null,
         fail_media: bool = false,
+        fail_after_bytes: ?usize = null,
+        calls: usize = 0,
+        stream_complete: bool = false,
         requested_blocking_part: bool = false,
         pub fn get(self: *@This(), url: []const u8, options: anytype) !Response {
+            self.calls += 1;
             if (std.mem.indexOf(u8, url, "list.m3u8") != null) {
                 self.requested_blocking_part = std.mem.endsWith(u8, url, "_HLS_msn=10&_HLS_part=1");
                 return .{ .body = self.manifest };
@@ -1309,8 +1339,24 @@ const PartialHttp = struct {
                 if (self.fail_media) return error.ConnectionReset;
                 return .{ .body = self.parent_bytes orelse @embedFile("../testdata/fragmented.mp4")[797..20811] };
             }
+            if (std.mem.endsWith(u8, url, "seg-3.m4s")) return .{ .body = @embedFile("../testdata/fragmented.mp4")[20811..31468] };
             var original = FakeHttp.Client{ .manifest = self.manifest, .fail_media = self.fail_media };
             return original.get(url, options);
+        }
+        pub fn getToWriter(self: *@This(), url: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !Response {
+            self.stream_complete = false;
+            const response = try self.get(url, options);
+            try writer.startResponse(response);
+            const bytes = response.body.?;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                if (self.fail_after_bytes) |limit| if (offset >= limit) return error.ConnectionReset;
+                const stop = @min(bytes.len, offset + 128);
+                try writer.writeAll(bytes[offset..stop]);
+                offset = stop;
+            }
+            self.stream_complete = true;
+            return response;
         }
     };
 };
@@ -1462,6 +1508,18 @@ const EncryptedPartialHttp = struct {
             if (std.mem.endsWith(u8, url, "p0.m4s")) return .{ .body = self.part };
             if (std.mem.endsWith(u8, url, "parent.m4s")) return .{ .body = self.parent };
             return error.UnexpectedFixtureUri;
+        }
+        pub fn getToWriter(self: *@This(), url: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !Response {
+            const response = try self.get(url, options);
+            try writer.startResponse(response);
+            const bytes = response.body.?;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const stop = @min(bytes.len, offset + 128);
+                try writer.writeAll(bytes[offset..stop]);
+                offset = stop;
+            }
+            return response;
         }
     };
 };
@@ -2085,4 +2143,273 @@ fn encryptedReaderAllocations(a: std.mem.Allocator) !void {
 }
 test "live HLS encrypted streaming allocation failures drain keys initialization and independent packets" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, encryptedReaderAllocations, .{});
+}
+
+const ll_six_prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=1\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+const ll_six_part = ll_six_prefix ++ "#EXT-X-PART:DURATION=1,URI=\"seg-1.m4s\",INDEPENDENT=YES\n";
+const ll_six_parent = ll_six_prefix ++ "#EXTINF:6,\nparent.m4s\n#EXT-X-ENDLIST\n";
+const ll_remuxed = @embedFile("../testdata/hls/ll-parent-2s.mp4");
+const LlCapture = struct {
+    held: [8]?live.Segment = @splat(null),
+    count: usize = 0,
+    fail_at: ?usize = null,
+    fn deinit(self: *@This()) void {
+        for (&self.held) |*item| if (item.*) |*unit| unit.deinit();
+    }
+    fn accept(raw: *anyopaque, delivery: *network.FragmentDelivery) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+        if (self.fail_at == self.count) return error.ConsumerFailure;
+        self.held[self.count] = try delivery.take();
+        self.count += 1;
+    }
+    fn parity(self: *@This(), a: std.mem.Allocator) !void {
+        const source = @import("source.zig");
+        var input = source.Source{ .allocator = a, .identity = "ll-native-oracle", .storage = .{ .borrowed = @embedFile("../testdata/fragmented.mp4") } };
+        var oracle = try @import("mp4.zig").Reader.init(a, &input, .{});
+        defer oracle.deinit();
+        var cursor: usize = 0;
+        for (self.held[0..self.count]) |entry| {
+            var unit = entry.?;
+            for (unit.reader.packets, 0..) |packet, index| {
+                const expected = oracle.packets[cursor];
+                try std.testing.expectEqual(expected.media_dts, packet.media_dts);
+                try std.testing.expectEqual(expected.media_pts, packet.media_pts);
+                try std.testing.expectEqual(expected.duration, packet.duration);
+                var left = try oracle.readPacket(cursor);
+                defer left.deinit();
+                var right = try unit.reader.readPacket(index);
+                defer right.deinit();
+                try std.testing.expectEqualSlices(u8, left.bytes, right.bytes);
+                cursor += 1;
+            }
+        }
+        try std.testing.expectEqual(oracle.packets.len, cursor);
+    }
+};
+test "streamed LL HLS verifies parent prefix within a repackaged moof and emits each sample once" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = ll_remuxed[797..] };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    try std.testing.expectEqual(@as(u32, 1), reader.next_part);
+    try std.testing.expectEqual(@as(usize, 10), reader.part_progress.count);
+    try std.testing.expectEqual(@as(?u32, 0), capture.held[0].?.hls_timing.?.part_index);
+    try std.testing.expect(capture.held[0].?.hls_timing.?.independent_hint);
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    const result = (try reader.streamNext(&capture, LlCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 10), result.prefix_samples_skipped);
+    try std.testing.expectEqual(@as(usize, 3), result.acknowledged);
+    try std.testing.expectEqual(@as(usize, 4), capture.count);
+    try std.testing.expectEqual(@as(usize, 10), capture.held[1].?.reader.packets.len);
+    try std.testing.expectEqual(@as(usize, 10 * @sizeOf(@import("mp4.zig").Packet)), capture.held[1].?.reader.index_reservation.resources.host_bytes);
+    try std.testing.expect(reader.ended());
+    try capture.parity(a);
+}
+test "streamed LL HLS parent resource prefix stays frozen across accepted suffix and consumer retry" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = ll_remuxed[797..] };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    capture.fail_at = 2;
+    try std.testing.expectError(error.ConsumerFailure, reader.streamNext(&capture, LlCapture.accept));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(@as(usize, 10), reader.stream_sample_prefix.?.count);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+    capture.fail_at = null;
+    const result = (try reader.streamNext(&capture, LlCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.replayed);
+    try std.testing.expectEqual(@as(usize, 2), result.acknowledged);
+    try std.testing.expect(reader.ended());
+    try capture.parity(a);
+}
+test "streamed LL HLS fully duplicate parent advances cursor without callback or duplicate ordinals" {
+    var client = PartialHttp.Client{ .manifest = ll_second };
+    var transport = network.Adapter(PartialHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(std.testing.allocator, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    client.manifest = ll_parent;
+    try reader.reload();
+    const result = (try reader.streamNext(&capture, LlCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(@as(usize, 20), result.prefix_samples_skipped);
+    try std.testing.expectEqual(@as(usize, 2), result.prefix_fragments_skipped);
+    try std.testing.expectEqual(@as(usize, 0), result.acknowledged);
+    try std.testing.expect(reader.ended());
+}
+test "streamed LL HLS failed unfinished part can transition to its advertised complete parent" {
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=2\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+    var client = PartialHttp.Client{ .manifest = prefix ++ "#EXT-X-PART:DURATION=2,URI=\"parent.m4s\",INDEPENDENT=YES\n", .parent_bytes = @embedFile("../testdata/fragmented.mp4")[797..20811], .fail_after_bytes = 11206 - 797 + 8 };
+    var transport = network.Adapter(PartialHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(std.testing.allocator, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.ConnectionReset, reader.streamNext(&capture, LlCapture.accept));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u32, 0), reader.next_part);
+    client.manifest = prefix ++ "#EXTINF:6,\nparent.m4s\n#EXT-X-ENDLIST\n";
+    client.parent_bytes = ll_remuxed[797..];
+    client.fail_after_bytes = null;
+    try reader.reload();
+    try std.testing.expect(reader.stream_key == null);
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    try std.testing.expect(reader.ended());
+    try capture.parity(std.testing.allocator);
+}
+fn llStreamingAllocations(a: std.mem.Allocator) !void {
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = ll_remuxed[797..] };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+}
+test "streamed LL HLS all allocation failures release prefix verification trim and independent owners" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, llStreamingAllocations, .{});
+}
+
+test "streamed LL HLS truncated unverified parent prefix cannot commit corrupt samples or poison healthy retry" {
+    const a = std.testing.allocator;
+    const damaged = try a.dupe(u8, ll_remuxed[797..]);
+    defer a.free(damaged);
+    const payload = std.mem.indexOf(u8, damaged, "mdat").? + 4;
+    damaged[payload + 12] ^= 1;
+    var client = PartialHttp.Client{ .manifest = ll_six_part ++ "#EXT-X-PART:DURATION=1,URI=\"seg-2.m4s\",INDEPENDENT=YES\n#EXT-X-PART:DURATION=1,URI=\"seg-3.m4s\",INDEPENDENT=YES\n", .parent_bytes = damaged };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    for (0..3) |_| _ = try reader.streamNext(&capture, LlCapture.accept);
+    try std.testing.expectEqual(@as(usize, 30), reader.part_progress.count);
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    client.fail_after_bytes = 20775 - 797 + 8;
+    try std.testing.expectError(error.ConnectionReset, reader.streamNext(&capture, LlCapture.accept));
+    try std.testing.expectEqual(@as(usize, 0), reader.stream_ledger.acknowledged);
+    try std.testing.expect(!reader.stream_ledger.invalid);
+    try std.testing.expectEqual(@as(usize, 3), capture.count);
+    client.parent_bytes = ll_remuxed[797..];
+    client.fail_after_bytes = null;
+    const result = (try reader.streamNext(&capture, LlCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 30), result.prefix_samples_skipped);
+    try std.testing.expectEqual(@as(usize, 5), capture.count);
+    try std.testing.expect(reader.ended());
+    try capture.parity(a);
+}
+test "streamed LL HLS verified parent mismatch fails before any new consumer callback" {
+    const a = std.testing.allocator;
+    const damaged = try a.dupe(u8, ll_remuxed[797..]);
+    defer a.free(damaged);
+    const payload = std.mem.indexOf(u8, damaged, "mdat").? + 4;
+    damaged[payload + 12] ^= 1;
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = damaged };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    try std.testing.expectError(error.SourceVersionChanged, reader.streamNext(&capture, LlCapture.accept));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expect(reader.stream_ledger.invalid);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+}
+
+test "streamed LL HLS parent remains pinned when a live reload advertises additional parts" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = ll_remuxed[797..] };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    const live_parent = ll_six_prefix ++ "#EXTINF:6,\nparent.m4s\n";
+    client.manifest = live_parent;
+    try reader.reload();
+    capture.fail_at = 2;
+    try std.testing.expectError(error.ConsumerFailure, reader.streamNext(&capture, LlCapture.accept));
+    const key = reader.stream_key;
+    client.manifest = ll_six_part ++ "#EXT-X-PART:DURATION=1,URI=\"seg-2.m4s\",INDEPENDENT=YES\n#EXTINF:6,\nparent.m4s\n";
+    try reader.reload();
+    try std.testing.expectEqual(key, reader.stream_key);
+    capture.fail_at = null;
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    try capture.parity(a);
+}
+test "streamed LL HLS parent can follow a buffered part without reemitting its samples" {
+    const a = std.testing.allocator;
+    var client = PartialHttp.Client{ .manifest = ll_six_part, .parent_bytes = ll_remuxed[797..] };
+    var transport = network.Adapter(PartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(PartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    capture.held[0] = (try reader.next()).?;
+    capture.count = 1;
+    client.manifest = ll_six_parent;
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    try std.testing.expect(reader.ended());
+    try capture.parity(a);
+}
+test "streamed LL HLS independently encrypted parts and repackaged parent preserve native packet parity" {
+    const a = std.testing.allocator;
+    const original = @embedFile("../testdata/fragmented.mp4");
+    var iv: [16]u8 = @splat(0);
+    iv[15] = 1;
+    const init = try encryptPartialFixture(a, original[0..797], iv);
+    defer a.free(init);
+    iv[15] = 10;
+    const part = try encryptPartialFixture(a, @embedFile("../testdata/hls/ll-part-half.m4s"), iv);
+    defer a.free(part);
+    const parent = try encryptPartialFixture(a, ll_remuxed[797..], iv);
+    defer a.free(parent);
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PART-INF:PART-TARGET=0.5\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\",IV=0x1\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n";
+    var client = EncryptedPartialHttp.Client{ .manifest = prefix ++ "#EXT-X-PART:DURATION=0.5,URI=\"p0.m4s\",INDEPENDENT=YES\n", .initialization = init, .part = part, .parent = parent };
+    var transport = network.Adapter(EncryptedPartialHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/list.m3u8" };
+    var reader = try Reader(EncryptedPartialHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = LlCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, LlCapture.accept);
+    client.manifest = prefix ++ "#EXTINF:6,\nparent.m4s\n#EXT-X-ENDLIST\n";
+    try reader.reload();
+    const result = (try reader.streamNext(&capture, LlCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 5), result.prefix_samples_skipped);
+    try std.testing.expect(reader.ended());
+    try capture.parity(a);
 }
