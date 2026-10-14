@@ -1,7 +1,7 @@
 # Real-picture sequence seeds
 
-These two IVF files contain twelve stream-copied packets from the textured
-portion near second eight of the maintained 854×480 Sintel VP9 and AV1 corpus.
+These three IVF files contain twelve stream-copied packets from the textured
+portion near second eight of the maintained 854×480 Sintel VP8, VP9 and AV1 corpus.
 They preserve interframe references and avoid a corpus made only of opening
 black pictures. The packet-tape fuzz harness removes only the IVF file header;
 it preserves packet lengths and timestamps for mutation.
@@ -16,3 +16,7 @@ stream, generated with FFmpeg 9.0.2's native VP9 and libdav1d AV1 decoders.
 `provenance.json` records the complete oracle commands and concatenated raw
 picture hashes. Ordinary video CI compares each native decoded picture against
 these independent hashes without an FFmpeg runtime dependency.
+
+`vp8-golden.json` independently records the native FFmpeg VP8 decoder's
+twelve picture hashes. The VP8 sequence harness checks visible rows against
+that oracle and includes padded output bytes in retained-picture lifetime checks.

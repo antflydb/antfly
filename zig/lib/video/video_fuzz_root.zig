@@ -16,6 +16,7 @@
 test {
     _ = @import("src/h264_fuzz_test.zig");
     _ = @import("src/codecs/fuzz_test.zig");
+    _ = @import("src/vp8_sequence_test.zig");
     _ = @import("src/codecs/av1_headers.zig");
     _ = @import("src/webm_pictures.zig");
 }

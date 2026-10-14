@@ -17,4 +17,5 @@ test {
     _ = @import("src/mod.zig");
     // Ordinary CI replays the accepted codec seeds without fuzz instrumentation.
     _ = @import("src/codecs/fuzz_test.zig");
+    _ = @import("src/vp8_sequence_test.zig");
 }

@@ -96,5 +96,54 @@
       "pipe:1"
     ],
     "oracle_raw_sha256": "31db7818972bc850efffc2f34421c57f17e187c4a237a6ca4751c655353b3789"
+  },
+  "sintel-vp8-detail.ivf": {
+    "source": "zig/lib/video/testdata/benchmarks/webm/corpus/sintel-vp8-480p.webm",
+    "source_sha256": "696d5305cb89b7b7a0d23873ad13b39bba71fecf168c79316dc7eed9c661ce97",
+    "sha256": "3af4fe2c1f4748ebec4ec364e912b31de36a6f1962fe0f361052d7dce0387356",
+    "command": [
+      "ffmpeg",
+      "-v",
+      "error",
+      "-y",
+      "-ss",
+      "8",
+      "-i",
+      "zig/lib/video/testdata/benchmarks/webm/corpus/sintel-vp8-480p.webm",
+      "-map",
+      "0:v:0",
+      "-frames:v",
+      "12",
+      "-c:v",
+      "copy",
+      "-avoid_negative_ts",
+      "make_zero",
+      "-f",
+      "ivf",
+      "zig/lib/video/testdata/sequence-fuzz/sintel-vp8-detail.ivf"
+    ],
+    "oracle_command": [
+      "ffmpeg",
+      "-v",
+      "error",
+      "-threads",
+      "1",
+      "-c:v",
+      "vp8",
+      "-i",
+      "zig/lib/video/testdata/sequence-fuzz/sintel-vp8-detail.ivf",
+      "-map",
+      "0:v:0",
+      "-frames:v",
+      "12",
+      "-pix_fmt",
+      "yuv420p",
+      "-f",
+      "rawvideo",
+      "pipe:1"
+    ],
+    "oracle_raw_sha256": "ea20dbebeb6fb2e9bc313bc6e85e2c1b015bd3c316a1bb6350d2d55ad2f13b7e",
+    "license": "CC BY 3.0",
+    "attribution": "Sintel, Blender Foundation / durian.blender.org"
   }
 }

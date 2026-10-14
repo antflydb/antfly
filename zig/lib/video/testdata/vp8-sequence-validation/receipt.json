@@ -1,0 +1,45 @@
+{
+  "base_commit": "fe0e1cc145cebb17f110da4554f5fc61cb4008ab",
+  "source_sha256": {
+    "zig/lib/video/src/vp8_sequence_test.zig": "1fb4ff31b47b353b5ef897027b58ec74d17e9794bec6e94313566b16ee42382d",
+    "zig/lib/video/src/decode_budget.zig": "e48de4eb212aef6a9bb97896855b7a8bc6d46e2c77e64c2ddea4cae558924957",
+    "zig/lib/image/src/webp.zig": "adcdce514c39819f93b800415191b465e9ca90a9614a980ba0481ccd416f44c0",
+    "zig/lib/image/src/work_control.zig": "f6bf63e80fc57d5eea05563db25c8e62350319fd60f48c507d7ba92710c6cf06",
+    "zig/lib/video/video_test_root.zig": "f4f8109e581424985cdfcef8c07e1d22affdfa90585a5cb12981ceda91b7f708",
+    "zig/lib/video/video_fuzz_root.zig": "a7a76e7e59731c6a1959fdc06bfa818639fda1aa575fbd3b1f03d2657dac3b19",
+    "zig/lib/video/scripts/qualify_sequence_fuzz.py": "2311e7601388094682f70b3cc7cdacaa5bcd3b1b84ff14ce24e5796a94bb8b26",
+    "zig/lib/video/testdata/sequence-fuzz/sintel-vp8-detail.ivf": "3af4fe2c1f4748ebec4ec364e912b31de36a6f1962fe0f361052d7dce0387356",
+    "zig/lib/video/testdata/sequence-fuzz/vp8-golden.json": "7295fe2ff4c0ca9e2623a120b39d59c13ebf474398a50b493e4babe4645eef6f"
+  },
+  "macos_sequence_tests_pass": 13,
+  "linux_arm64_status": "passed",
+  "linux_x86_status": "passed under Docker architecture emulation on ARM64 host",
+  "fuzz_status": "running",
+  "oracle": {
+    "pictures": 12,
+    "reference": "FFmpeg 9.0.2 native VP8",
+    "pixel_format": "yuv420p",
+    "hash_order": "cropped visible Y, U, V rows"
+  },
+  "limits": {
+    "packets": 32,
+    "packet_tape_bytes": 131072,
+    "pixels": 1048576,
+    "all_live_decode_and_retained_bytes": 33554432,
+    "retained_outputs": 4,
+    "control_checks": 2000000
+  },
+  "linux_arm64_sequence_tests_pass": 13,
+  "linux_arm64_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "linux_arm64_binary_sha256": "a9499ef1f4ba0cece6694aa7b1b3427d97dca1d8e2ed8ff1493b5dd4a5cc7e00",
+  "linux_x86_binary_sha256": "60aa74cf94bf9243134c370a58b524130bbf7d9c34daf13522858ee418e9f827",
+  "linux_x86_sequence_tests_pass": 13,
+  "linux_x86_emulated": true,
+  "linux_x86_optimization": "ReleaseSafe",
+  "linux_arm64_optimization": "Debug",
+  "linux_x86_image": {
+    "id": "sha256:670c3d3188b78761e0d40e50fdeba8663e455110d689cb776cd25f36265fef7b",
+    "architecture": "amd64",
+    "os": "linux"
+  }
+}

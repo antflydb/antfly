@@ -1,0 +1,28 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile:
+#1 transferring dockerfile: 112B 0.0s done
+#1 DONE 0.1s
+
+#2 [internal] load .dockerignore
+#2 transferring context:
+#2 transferring context: 2B done
+#2 DONE 0.1s
+
+#3 [internal] load build context
+#3 transferring context: 14.12MB 1.6s done
+#3 DONE 1.6s
+
+#4 [1/1] COPY bin/video-tests /video-tests
+#4 DONE 0.2s
+
+#5 exporting to image
+#5 exporting layers
+#5 exporting layers 1.4s done
+#5 exporting manifest sha256:f9bfd14b51a5c06c26cfa5d2b13a42eb704628c24639db230c52c71c6a93eace 0.0s done
+#5 exporting config sha256:37d98a99f1a985d9f86e4dfef31f2ca2da39b37b84b6385b829a0940359d9d33 0.0s done
+#5 exporting attestation manifest sha256:874da98ad48b0c0f1c6698be1b206bf17924a0f8df19a82990805e5f0792493b 0.0s done
+#5 exporting manifest list sha256:670c3d3188b78761e0d40e50fdeba8663e455110d689cb776cd25f36265fef7b 0.0s done
+#5 naming to docker.io/library/antfly-video-sequence-x86:qualification done
+#5 DONE 1.5s

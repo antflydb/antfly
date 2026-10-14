@@ -2721,3 +2721,24 @@ sustained production fuzz coverage remain open. See the
 [source-bound sequence receipts](testdata/sequence-fuzz-validation/README.md) for platform results,
 independent picture oracles, seed attribution and reproduction. The complete
 non-CUDA objective remains active.
+
+### Include VP8 in stateful sequence qualification
+
+Ordinary CI and instrumented fuzzing now include a VP8 packet-sequence target,
+using the maintained pure Zig decoder and a textured twelve-packet 480p Sintel
+seed. Twelve independent FFmpeg native VP8 picture hashes match exactly; skipped
+outputs still update all interframe references and entropy, preserving every
+later oracle picture. Cancellation of the second packet preserves the first
+independently retained picture. Four retained outputs are checked across later
+decoding, failure and decoder destruction, including padded rows. Live decoder
+and retained-output allocations share a 32 MiB test budget, with bounded packet,
+pixel and control work. Failed cores are not reentered. The full sequence suite
+passes 13/13 on macOS ARM64 and in the pinned Linux ARM64 container.
+
+The maintained qualification driver runs VP8, VP9, AV1 and Annex B separately,
+and also fingerprints video/image Zig sources used by the VP8 path. A scratch
+image packages the static x86_64 Linux executable for a separate architecture
+emulation check; this is not native x86 hardware performance evidence. Actual
+fuzz and architecture results are retained in the [source-bound receipt](testdata/vp8-sequence-validation/README.md).
+Broader independent streams, sustained campaigns and the complete non-CUDA
+objective remain active.

@@ -9,7 +9,12 @@ import re
 import subprocess
 import sys
 
-TARGETS = {"vp9": "sequence VP9", "av1": "sequence AV1", "annex-b": "sequence Annex B"}
+TARGETS = {
+    "vp8": "sequence VP8",
+    "vp9": "sequence VP9",
+    "av1": "sequence AV1",
+    "annex-b": "sequence Annex B",
+}
 
 
 def parse_report(log: str, target: str) -> dict:
@@ -67,7 +72,8 @@ def main() -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     zig_root = Path(__file__).resolve().parents[3]
-    sources = sorted((zig_root / "lib/video/src/codecs").rglob("*.zig"))
+    sources = sorted((zig_root / "lib/video/src").rglob("*.zig"))
+    sources += sorted((zig_root / "lib/image/src").rglob("*.zig"))
     sources += [
         zig_root / "lib/video/video_fuzz_root.zig",
         zig_root / "lib/video/build_support.zig",
