@@ -1162,7 +1162,7 @@ Rounded compiler MaxRSS on that candidate was 9G API, 9G storage adapter, 6G
 storage engine, 5G inference, 4G distributed and 3G serverless. The opt-in SDK 27.0
 admission profile requires **both** shared owners, the exact compiler/SDK/native
 CPU/optimization/strip/backend settings above, and no thread sanitizer. It claims
-14 GiB for the adapter and 10 GiB for the engine; these exceed the rounded bounds
+14 GiB for the adapter, 10 GiB for the engine and 4 GiB for the CLI; these exceed the rounded bounds
 plus a whole GiB and 25% margin. Remaining runtime claims use the conservative
 SDK 26.4 envelopes, also above this run's peaks. API and adapter can fit together
 within 28 GiB; a subsequent cold overlap qualification at `044fc332fd` succeeded in 1,402.07 s
