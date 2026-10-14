@@ -1,7 +1,7 @@
 # Antfly Examples
 
 This directory contains complete examples demonstrating key Antfly features.
-Each example is its own Go module; build and run it from inside its directory
+Each Go example is its own module; build and run it from inside its directory
 with `GOWORK=off`.
 
 ## Ingestion Examples
@@ -74,6 +74,21 @@ Document corpus ingestion with entity extraction and a graph visualization.
 ### [Screenshots](screenshots-shots-shots/)
 
 Index screenshots and search them semantically.
+
+## Inference Examples
+
+### [Text to graph](text-to-graph/)
+
+Type or paste sentences, one per line, and watch a knowledge graph assemble as
+you type. Each line goes to `POST /ai/v1/extract` with GLiNER2.5, and the
+entity and relation types are editable in the page.
+
+**Quick start:**
+```bash
+./antfly inference pull "fastino/gliner2.5-base-v1:safetensors@72ac19b486cd4557424c8d61114e7530c243e9b0"
+./antfly standalone   # see the example README for memory budget flags
+cd examples/text-to-graph && pnpm install && pnpm dev
+```
 
 ## Embedded and Memory Examples
 
