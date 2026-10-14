@@ -988,10 +988,9 @@ concrete worker. Broader storage reuse and size reduction remain open.
 
 The measured release passed twelve inference CLI help paths, model-free HTTP
 health/readiness/model inventory, and graceful worker shutdown. No downloaded
-model or throughput comparison was performed. Commands, sampled peaks, compiler
-lifetimes and sizes are recorded in
-[wolfspider-20261013.json](build_support/antfly/wolfspider-20261013.json).
-Use separate fresh local/global caches and install prefixes for each run:
+model or throughput comparison was performed. Raw measurement files are retained
+outside the repository. Use separate fresh local/global caches and install
+prefixes for each run:
 
 ```sh
 export ZIG_GLOBAL_CACHE_DIR=/absolute/path/to/fresh-global-cache
