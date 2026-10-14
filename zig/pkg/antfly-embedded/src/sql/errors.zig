@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transport-independent, allocation-free diagnostics. Only static text crosses
-//! this boundary: errors must not disclose row values, SQL text, credentials,
-//! physical catalog names, or internal Zig implementation identifiers. Public
-//! column identifiers are copied into a request-owned bounded context.
+//! Transport-independent, allocation-free diagnostics. Static descriptions and
+//! bounded request-owned identifiers cross this boundary; errors must not
+//! disclose row values, SQL text, credentials, physical catalog names, or
+//! internal Zig implementation identifiers.
 const std = @import("std");
 
 pub const Diagnostic = struct {
@@ -24,6 +24,7 @@ pub const Diagnostic = struct {
     message: []const u8,
     hint: ?[]const u8 = null,
     column_name: ?[]const u8 = null,
+    parameter_index: ?usize = null,
     retryable: ?bool = null,
 
     pub fn httpStatus(self: Diagnostic) u16 {
@@ -42,6 +43,15 @@ pub const Diagnostic = struct {
 pub const Context = struct {
     column: [1024]u8 = undefined,
     column_len: ?usize = null,
+    parameter_index: ?usize = null,
+    message: [256]u8 = undefined,
+    message_len: usize = 0,
+
+    pub fn untranslatableParameter(self: *Context, index: usize) void {
+        self.parameter_index = index;
+        const formatted = std.fmt.bufPrint(&self.message, "parameter ${d}: SQL TEXT and JSONB strings and object keys cannot contain NUL (U+0000).", .{index}) catch unreachable;
+        self.message_len = formatted.len;
+    }
 
     pub fn notNull(self: *Context, name: []const u8) anyerror {
         if (name.len <= self.column.len) {
@@ -53,6 +63,10 @@ pub const Context = struct {
 
     pub fn diagnostic(self: *const Context, err: anyerror) Diagnostic {
         var result = describe(err);
+        if (err == error.SqlUntranslatableCharacter) {
+            result.parameter_index = self.parameter_index;
+            if (self.message_len != 0) result.message = self.message[0..self.message_len];
+        }
         if (err == error.SqlNotNullViolation) if (self.column_len) |length| {
             result.column_name = self.column[0..length];
         };
@@ -192,6 +206,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.Forbidden, error.Unauthorized, error.AccessDenied => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
         error.InvalidSqlBinaryRepresentation => .{ .code = "22P03", .message = "A binary SQL value has invalid framing or payload.", .hint = "Use the declared PostgreSQL type and a complete binary value." },
         error.SqlBinaryTypeMismatch => .{ .code = "42804", .message = "The binary value's element type differs from the declared SQL type.", .hint = "Encode the parameter using its declared element type." },
+        error.SqlUntranslatableCharacter => .{ .code = "22P05", .message = "SQL TEXT and JSONB strings and object keys cannot contain NUL (U+0000).", .hint = "Remove NUL characters or replace them with U+FFFD before binding.", .retryable = false },
         error.SqlInvalidTextEncoding => .{ .code = "22021", .message = "The SQL text value contains invalid UTF-8 or a zero byte.", .hint = "Use valid UTF-8 text without embedded zero bytes." },
         error.SqlInvalidRegularExpression => .{ .code = "2201B", .message = "The regular expression is invalid.", .hint = "Use PostgreSQL-compatible regular expression syntax." },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
