@@ -114,6 +114,14 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *const root.transaction.O
             if (created) continue;
             try entry.removed_edges.append(a, edge);
         } else {
+            // Never encode an active edge whose endpoint was removed in this
+            // statement, even if a delete already supplies the source intent.
+            for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
+                const present = for (overlay.nodes.items) |node| {
+                    if (!node.deleted and node.value.identity.eql(identity)) break true;
+                } else false;
+                if (!present) return error.CypherDeletedEntity;
+            }
             try data(.{ .map = relationship.properties });
             edge.metadata_json = try std.json.Stringify.valueAlloc(a, .{ .source_table = relationship.source.table, .target_table = relationship.target.table, .antfly_cypher = .{ .version = @as(u8, 1), .properties = root.wire.Value{ .value = .{ .map = relationship.properties } } } }, .{});
             try entry.edges.append(a, edge);

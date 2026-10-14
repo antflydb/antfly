@@ -737,6 +737,13 @@ misrepresent the original query result.
   cuts are reclaimed after their final reader closes, including setup and
   execution failures, so completed queries do not consume retained-cut capacity.
   Published continuation cuts retain their existing expiry lifecycle.
+  Deleted entities retain identity for counts and identity functions, but
+  property access, properties(), keys(), and labels() raise CypherDeletedEntity.
+  Entity results after deletion contain no cached properties. Deletion is
+  shared across subqueries and DETACH DELETE aliases. Retained aliases resolve
+  active document-derived replacements; a removed contribution has no readable
+  cached properties. CREATE/MERGE reject deleted endpoints, and overlays and
+  commit plans also validate live endpoints.
   MERGE rejects null node and relationship keys during pattern evaluation and
   rolls back earlier writes in the same statement. Keys referencing nodes in
   the same pattern are checked once those nodes are bound. Relationship aliases resolve

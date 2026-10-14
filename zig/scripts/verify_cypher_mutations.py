@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify current relationship values, null properties, and MERGE rollback."""
+"""Qualify relationship postimages, nulls, MERGE rollback, and deleted entities."""
 
 import argparse
 import base64
@@ -117,7 +117,34 @@ def main():
         assert query("MATCH ()-[r:LINK]->() RETURN count(r)") == [
             [{"type": "integer", "value": "0"}]
         ]
-        print("6 authenticated Cypher mutation semantics checks passed")
+        for statement in (
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) DELETE b CREATE (a)-[:LINK]->(b) RETURN a",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) DELETE a MERGE (a)-[:LINK]->(b) RETURN b",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CALL { WITH b DELETE b } CREATE (a)-[:LINK]->(b) RETURN a",
+            "MATCH (a:Document {id:'a'}) DELETE a RETURN a.x",
+            "MATCH (a:Document {id:'a'}) DELETE a RETURN a{.*}",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:LINK {x:42}]->(b) DELETE r SET a.x=r.x RETURN a.x",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE p=(a)-[r:LINK {x:42}]->(b) DETACH DELETE a RETURN relationships(p)[0].x",
+        ):
+            failure = call(f"/graphs/{graph}/query", {"query": statement}, status=400)
+            assert failure["code"] == "CypherDeletedEntity", failure
+            assert query("MATCH (n:Document) RETURN n.id ORDER BY n.id") == [
+                [{"type": "string", "value": "a"}],
+                [{"type": "string", "value": "b"}],
+            ]
+            assert query("MATCH ()-[r:LINK]->() RETURN count(r)") == [
+                [{"type": "integer", "value": "0"}]
+            ]
+        row = query(
+            "CREATE p=(n:Document {x:1})-[r:LINK {x:2}]->(:Document) DETACH DELETE n RETURN count(n),count(r),elementId(n),elementId(r),n,r,relationships(p)[0]"
+        )[0]
+        assert row[:2] == [{"type": "integer", "value": "1"}] * 2
+        assert row[2]["type"] == row[3]["type"] == "string"
+        assert row[4]["value"]["properties"]["value"] == {}
+        assert row[4]["value"]["labels"] == []
+        assert row[5]["value"]["properties"]["value"] == {}
+        assert row[6]["value"]["properties"]["value"] == {}
+        print("14 authenticated Cypher mutation semantics checks passed")
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")

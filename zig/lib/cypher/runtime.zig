@@ -180,6 +180,7 @@ const Engine = struct {
     columns: []const []const u8 = &.{},
     stages: std.ArrayList(Stage) = .empty,
     recursion: usize = 0,
+    deleted: std.ArrayList(v.EntityIdentity) = .empty,
     fn checkpoint(self: *Engine) !void {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
@@ -306,6 +307,7 @@ const Engine = struct {
     }
 
     fn nodeMatches(self: *Engine, raw: *const v.Node, pattern: ast.Node, row: Row) !bool {
+        if (self.isDeleted(.{ .node = raw })) return false;
         const node = if (self.backend.vtable.project_node) |project_node| (try project_node(self.backend.ptr, self.a, raw)) orelse return false else raw;
         const member = for (self.graph.labels) |label| {
             if (self.graph.admits(node, label.name)) break true;
@@ -610,14 +612,50 @@ const Engine = struct {
         }
     }
 
+    // Deletion keeps the binding's identity available for counting/equality,
+    // but never permits reading its former contents or reusing its endpoints.
+    fn isDeleted(self: *Engine, value: v.Value) bool {
+        if (value != .node and value != .relationship) return false;
+        const identity = v.EntityIdentity.fromValue(value) catch unreachable;
+        for (self.deleted.items) |deleted| {
+            if (identity.eql(deleted)) return true;
+            if (value == .relationship and deleted == .node and
+                (value.relationship.source.eql(deleted.node) or value.relationship.target.eql(deleted.node))) return true;
+        }
+        return false;
+    }
+    fn recordDeletion(self: *Engine, identity: v.EntityIdentity) !void {
+        for (self.deleted.items) |prior| if (prior.eql(identity)) return;
+        try self.deleted.append(self.a, identity);
+    }
+    fn requireLiveContents(self: *Engine, value: v.Value) !void {
+        if (self.isDeleted(value)) return error.CypherDeletedEntity;
+    }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
         const project_node = self.backend.vtable.project_node;
-        if (project_node == null and self.backend.vtable.get_relationship == null) return value;
+        if (self.isDeleted(value)) return switch (value) {
+            .node => |retained| blk: {
+                const node = try self.a.create(v.Node);
+                node.* = .{ .identity = retained.identity };
+                break :blk .{ .node = node };
+            },
+            .relationship => |retained| blk: {
+                const relationship = try self.a.create(v.Relationship);
+                relationship.* = retained.*;
+                relationship.properties = &.{};
+                break :blk .{ .relationship = relationship };
+            },
+            else => unreachable,
+        };
+        if (project_node == null and self.backend.vtable.get_relationship == null and self.deleted.items.len == 0) return value;
         return switch (value) {
             .node => |node| if (project_node) |project_read| if (try project_read(self.backend.ptr, self.a, node)) |visible| .{ .node = visible } else .null else value,
             .relationship => |retained| blk: {
                 const relationship = if (self.backend.vtable.get_relationship) |get_relationship|
-                    (try get_relationship(self.backend.ptr, self.a, .{ .identity = retained.identity, .index = retained.index })) orelse retained
+                    (try get_relationship(self.backend.ptr, self.a, .{ .identity = retained.identity, .index = retained.index })) orelse {
+                        try self.recordDeletion(.{ .relationship = .{ .identity = retained.identity, .index = retained.index } });
+                        return self.readValue(value);
+                    }
                 else
                     retained;
                 if (project_node) |project_read| for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
@@ -674,12 +712,19 @@ const Engine = struct {
             },
             .variable => |name| try self.readValue(lookup(row, name) orelse return error.UnboundCypherVariable),
             .parameter => |name| lookup(self.parameters, name) orelse error.MissingCypherParameter,
-            .property => |p| (try self.eval(p.base, row, group)).property(p.name),
+            .property => |p| blk: {
+                const value = try self.eval(p.base, row, group);
+                try self.requireLiveContents(value);
+                break :blk value.property(p.name);
+            },
             .index => |i| blk: {
                 const value = try self.eval(i.base, row, group);
                 const index = try self.eval(i.index, row, group);
                 if (value == .null or index == .null) break :blk .null;
-                if ((value == .map or value == .node or value == .relationship) and index == .string) break :blk value.property(index.string);
+                if ((value == .map or value == .node or value == .relationship) and index == .string) {
+                    try self.requireLiveContents(value);
+                    break :blk value.property(index.string);
+                }
                 if (value != .list or index != .integer) return error.CypherTypeMismatch;
                 const position = if (index.integer < 0) @as(i64, @intCast(value.list.len)) + index.integer else index.integer;
                 break :blk if (position < 0 or position >= value.list.len) .null else value.list[@intCast(position)];
@@ -797,6 +842,7 @@ const Engine = struct {
             .map_projection => |p| blk: {
                 const base = try self.eval(p.base, row, group);
                 if (base == .null) break :blk .null;
+                try self.requireLiveContents(base);
                 const properties = switch (base) {
                     .map => |map| map,
                     .node => |node| node.properties,
@@ -970,6 +1016,7 @@ const Engine = struct {
         if (args.len != 1) return error.CypherFunctionArity;
         const value = try self.eval(args[0], row, group);
         if (value == .null) return .null;
+        if (std.ascii.eqlIgnoreCase(name, "keys") or std.ascii.eqlIgnoreCase(name, "properties") or std.ascii.eqlIgnoreCase(name, "labels")) try self.requireLiveContents(value);
         if (std.ascii.eqlIgnoreCase(name, "keys")) {
             const properties = switch (value) {
                 .map => value.map,
@@ -1318,6 +1365,12 @@ const Engine = struct {
         try self.checkpoint();
         const mutate_fn = self.backend.vtable.mutate orelse return error.CypherMutationsUnavailable;
         try mutate_fn(self.backend.ptr, self.a, mutation);
+        const deletion: ?v.EntityIdentity = switch (mutation) {
+            .delete_node => |node| .{ .node = node.identity },
+            .delete_relationship => |relationship| .{ .relationship = relationship },
+            else => null,
+        };
+        if (deletion) |identity| try self.recordDeletion(identity);
         self.stats.mutations += 1;
     }
     fn creationProperties(self: *Engine, items: []const ast.Entry, row: Row, merge: bool) ![]const v.Entry {
@@ -1338,7 +1391,8 @@ const Engine = struct {
                     if (pattern.alias) |alias| if (lookup(row, alias)) |bound| {
                         if (bound != .node) return error.CypherTypeMismatch;
                         if (merge) _ = try self.creationProperties(pattern.properties, row, true);
-                        node.* = bound.node;
+                        try self.requireLiveContents(bound);
+                        node.* = (try self.backend.vtable.get(self.backend.ptr, self.a, bound.node.identity)) orelse return error.CypherDeletedEntity;
                         continue;
                     };
                     if (pattern.labels.len == 0) return error.CypherCreateRequiresLabel;
@@ -1446,6 +1500,7 @@ const Engine = struct {
             const base = try self.mutationEntity(base_expression, row.*);
             if (base == .null) continue;
             if (base != .node and base != .relationship) return error.CypherTypeMismatch;
+            try self.requireLiveContents(base);
             if (base == .relationship and base.relationship.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
             const value = try self.eval(assignment.value, row.*, null);
             const properties: []const v.Entry = if (assignment.target.value == .property) try self.a.dupe(v.Entry, &.{.{ .name = assignment.target.value.property.name, .value = value }}) else if (value == .map) value.map else return error.CypherTypeMismatch;
@@ -1465,6 +1520,7 @@ const Engine = struct {
             const base = try self.mutationEntity(property.base, row.*);
             if (base == .null) continue;
             if (base != .node and base != .relationship) return error.CypherTypeMismatch;
+            try self.requireLiveContents(base);
             if (base == .relationship and base.relationship.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
             const target = try v.EntityIdentity.fromValue(base);
             try self.mutate(.{ .remove_properties = .{ .target = target, .names = &.{property.name} } });

@@ -191,3 +191,102 @@ def test_relationship_postimages_nulls_and_merge_rollback(require_native, aflite
         assert [cell["value"] for cell in row[:2]] == ["2", "2"]
         assert {cell["value"] for cell in row[2]["value"]} == {"x", "y", "data"}
         assert row[3] == {"type": "map", "value": {"nested": {"type": "null", "value": None}}}
+
+
+def test_deleted_entities_reject_reads_and_endpoints_with_durable_rollback(require_native, aflite_path):
+    definition = {
+        "labels": [{"name": "Document", "table": "docs"}],
+        "relationships": [
+            {
+                "name": "LINK",
+                "index": "links",
+                "source_label": "Document",
+                "target_label": "Document",
+                "stored_type": "link",
+            }
+        ],
+    }
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT, x BIGINT)")
+        database.sql("INSERT INTO docs (_id,id,x) VALUES ('a','a',0),('b','b',0)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        database.graph_catalog_json({"action": "put", "name": "knowledge", "definition": definition})
+        for statement in (
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) DELETE b CREATE (a)-[:LINK]->(b) RETURN a",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) DELETE a CREATE (a)-[:LINK]->(b) RETURN b",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) DELETE b MERGE (a)-[:LINK]->(b) RETURN a",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CALL { WITH b DELETE b } CREATE (a)-[:LINK]->(b) RETURN a",
+            "MATCH (n:Document {id:'a'}) DELETE n RETURN n.x",
+            "MATCH (n:Document {id:'a'}) DELETE n RETURN n['x']",
+            "MATCH (n:Document {id:'a'}) DELETE n RETURN properties(n)",
+            "MATCH (n:Document {id:'a'}) DELETE n RETURN n{.*}",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:LINK {x:42}]->(b) DELETE r SET a.x=r.x RETURN a.x",
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE p=(a)-[r:LINK {x:42}]->(b) DETACH DELETE a RETURN relationships(p)[0].x",
+        ):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json("knowledge", {"query": statement})
+            assert invalid.value.graph_code == "CypherDeletedEntity"
+            assert database.sql("SELECT id,x FROM docs ORDER BY id")["rows"] == [["a", "0"], ["b", "0"]]
+            with database.open_table("docs") as table:
+                assert table.edges("links", "a", "link", 0) == []
+        row = database.cypher_json(
+            "knowledge",
+            {
+                "query": "CREATE p=(n:Document {x:1})-[r:LINK {x:2}]->(:Document) DETACH DELETE n RETURN count(n),count(r),elementId(n),elementId(r),n,r,relationships(p)[0]"
+            },
+        )["rows"][0]
+        assert [cell["value"] for cell in row[:2]] == ["1", "1"]
+        assert row[2]["type"] == row[3]["type"] == "string"
+        assert row[4]["value"]["properties"]["value"] == {}
+        assert row[4]["value"]["labels"] == []
+        assert row[5]["value"]["properties"]["value"] == {}
+        assert row[6]["value"]["properties"]["value"] == {}
+    with af.open_hosted(aflite_path) as database:
+        assert database.sql("SELECT id,x FROM docs WHERE id IS NOT NULL ORDER BY id")["rows"] == [
+            ["a", "0"],
+            ["b", "0"],
+        ]
+        with database.open_table("docs") as table:
+            assert table.edges("links", "a", "link", 0) == []
+            assert table.lookup("b")["id"] == "b"
+
+
+def test_document_derived_aliases_resolve_replacements_and_deleted_contents(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT, ref TEXT, x BIGINT)")
+        with database.open_table("docs") as table:
+            table.add_index(
+                {"name": "links", "kind": "graph", "config_json": '{"edge_types":[{"name":"link","field":"ref"}]}'}
+            )
+        database.sql("INSERT INTO docs (_id,id,ref,x) VALUES ('a','a','b',0),('b','b',null,0)")
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "knowledge",
+                "definition": {
+                    "labels": [{"name": "Document", "table": "docs"}],
+                    "relationships": [
+                        {
+                            "name": "LINK",
+                            "index": "links",
+                            "source_label": "Document",
+                            "target_label": "Document",
+                            "stored_type": "link",
+                        }
+                    ],
+                },
+            }
+        )
+        row = database.cypher_json(
+            "knowledge", {"query": "MATCH (a:Document {id:'a'})-[r:LINK]->(b) SET a.x=2 RETURN r.weight"}
+        )["rows"][0]
+        assert row == [{"type": "number", "value": 1}]
+        for expression in ("r.weight", "r{.*}", "properties(r)"):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json(
+                    "knowledge",
+                    {"query": f"MATCH (a:Document {{id:'a'}})-[r:LINK]->(b) SET a.ref=null RETURN {expression}"},
+                )
+            assert invalid.value.graph_code == "CypherDeletedEntity"
+            assert database.sql("SELECT ref,x FROM docs WHERE _id='a'")["rows"] == [["b", "2"]]

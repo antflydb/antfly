@@ -160,8 +160,12 @@ pub const Overlay = struct {
     fn getRelationship(ptr: *anyopaque, _: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
         const self = cast(ptr);
         try checkpoint(ptr);
-        const relationship = self.findRelationship(identity) orelse return null;
-        return if (relationship.deleted) null else relationship.value;
+        // Document postimages replace contributions with the same identity.
+        // Skip retired copies so a retained alias sees the active replacement.
+        for (self.relationships.items) |relationship| {
+            if (!relationship.deleted and relationship.value.identity.eql(identity.identity) and std.mem.eql(u8, relationship.value.index, identity.index)) return relationship.value;
+        }
+        return null;
     }
     fn projectNode(ptr: *anyopaque, a: A, value: *const v.Node) !?*const v.Node {
         const self = cast(ptr);
@@ -268,6 +272,10 @@ pub const Overlay = struct {
                 try self.refreshDocumentRelationships(a, copy);
             },
             .create_relationship => |relationship| {
+                for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
+                    const endpoint = self.findNode(identity) orelse return error.CypherDeletedEntity;
+                    if (endpoint.deleted) return error.CypherDeletedEntity;
+                }
                 if (self.findRelationship(.{ .identity = relationship.identity, .index = relationship.index }) != null) return error.CypherDuplicateIdentity;
                 try self.capacity();
                 const copy = try a.create(v.Relationship);

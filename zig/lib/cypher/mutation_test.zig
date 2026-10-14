@@ -346,3 +346,123 @@ test "CREATE and MERGE reject redeclaration of bound node labels and properties"
     try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.relationships.len);
 }
+
+test "deleted endpoints cannot be reused by CREATE or MERGE across subqueries" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seeded = try fixture.run("CREATE (a:Person {name:'Ada'}),(b:Person {name:'Bob'}) RETURN a,b");
+    seeded.deinit();
+    for ([_][]const u8{
+        "MATCH (a:Person {name:'Ada'}),(b:Person {name:'Bob'}) DELETE b CREATE (a)-[:KNOWS]->(b) RETURN a",
+        "MATCH (a:Person {name:'Ada'}),(b:Person {name:'Bob'}) DELETE a CREATE (a)-[:KNOWS]->(b) RETURN b",
+        "MATCH (a:Person {name:'Ada'}),(b:Person {name:'Bob'}) DELETE b MERGE (a)-[:KNOWS]->(b) RETURN a",
+        "MATCH (a:Person {name:'Ada'}),(b:Person {name:'Bob'}) CALL { WITH b DELETE b } CREATE (a)-[:KNOWS]->(b) RETURN a",
+        "MATCH (a:Person {name:'Ada'}) DELETE a CREATE (a)-[:KNOWS]->(b:Person {name:'New'}) RETURN b",
+    }) |query| {
+        try std.testing.expectError(error.CypherDeletedEntity, fixture.run(query));
+        try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+    }
+}
+
+test "deleted contents reject reads through properties functions paths and containers" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "CREATE (a:Person {x:1}) DELETE a RETURN a.x",
+        "CREATE (a:Person {x:1}) DELETE a RETURN a['x']",
+        "CREATE (a:Person {x:1}) DELETE a RETURN properties(a)",
+        "CREATE (a:Person {x:1}) DELETE a RETURN a{.x}",
+        "CREATE (a:Person {x:1}) DELETE a RETURN a{.*}",
+        "CREATE (a:Person {x:1}) DELETE a RETURN keys(a)",
+        "CREATE (a:Person {x:1}) DELETE a RETURN labels(a)",
+        "CREATE (a:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r SET a.x=r.x RETURN a.x",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r RETURN r['x']",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r RETURN properties(r)",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r RETURN keys(r)",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r RETURN r{.*}",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r SET r.x=1 RETURN r",
+        "CREATE (:Person)-[r:KNOWS {x:42}]->(:Person) DELETE r REMOVE r.x RETURN r",
+        "CREATE p=(a:Person)-[r:KNOWS {x:42}]->(:Person) DETACH DELETE a RETURN relationships(p)[0].x",
+        "CREATE (a:Person {x:1}) WITH a,[a] AS list,{n:a} AS map CALL { WITH a DELETE a } RETURN list[0].x",
+        "CREATE (a:Person {x:1}) WITH a,{n:a} AS map CALL { WITH a DELETE a } RETURN map.n.x",
+    }) |query| {
+        try std.testing.expectError(error.CypherDeletedEntity, fixture.run(query));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+}
+
+test "deleted bindings preserve identity and counts but serialize no cached contents" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE p=(a:Person {x:1})-[r:KNOWS {x:2}]->(:Person) DETACH DELETE a RETURN count(a),count(r),elementId(a),elementId(r),a,r,relationships(p)[0],nodes(p)[0],[a,r],{node:a,edge:r}");
+    defer result.deinit();
+    const row = result.rows[0];
+    try std.testing.expectEqual(@as(i64, 1), row[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), row[1].integer);
+    try std.testing.expect(row[2] == .string and row[3] == .string);
+    try std.testing.expectEqual(@as(usize, 0), row[4].node.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), row[4].node.labels.len);
+    try std.testing.expectEqual(@as(usize, 0), row[5].relationship.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), row[6].relationship.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), row[7].node.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), row[8].list[0].node.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), row[9].map[1].value.relationship.properties.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+}
+
+test "overlay admission and durable plans independently reject deleted endpoints" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+        fn existed(_: *anyopaque, _: []const u8, _: []const u8) bool {
+            return true;
+        }
+    };
+    for ([_]usize{ 0, 1 }) |deleted_index| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var seeded = try fixture.run("CREATE (a:Person),(b:Person) RETURN a,b");
+        seeded.deinit();
+        const a = fixture.arena.allocator();
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit } };
+        const backend = overlay.backend();
+        try backend.vtable.bind(backend.ptr, a, graph);
+        try backend.vtable.begin.?(backend.ptr);
+        defer backend.vtable.rollback.?(backend.ptr);
+        const source = overlay.nodes.items[0].value.identity;
+        const target = overlay.nodes.items[1].value.identity;
+        try backend.vtable.mutate.?(backend.ptr, a, .{ .delete_node = .{ .identity = overlay.nodes.items[deleted_index].value.identity, .detach = false } });
+        const relationship = try a.create(v.Relationship);
+        relationship.* = .{ .identity = .{ .table = "people", .key = "cypher:test" }, .index = "links", .type = "KNOWS", .source = source, .target = target };
+        try std.testing.expectError(error.CypherDeletedEntity, backend.vtable.mutate.?(backend.ptr, a, .{ .create_relationship = relationship }));
+        // Simulate a malformed adapter that bypasses overlay admission. The
+        // durable postimage planner must still reject the orphan edge.
+        try overlay.relationships.append(a, .{ .value = relationship });
+        try overlay.mutations.append(a, .{ .create_relationship = relationship });
+        try std.testing.expectError(error.CypherDeletedEntity, root.mutations.build(a, graph, &overlay, overlay.mutations.items, .{ .ptr = &fixture, .existed = Host.existed }));
+    }
+}
+
+test "properties captured before deletion remain ordinary data" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (a:Person {x:1})-[r:KNOWS {x:42}]->(:Person) WITH a,r,properties(r) AS before DELETE r SET a.x=before.x RETURN a.x,count(r)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 42), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][1].integer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+}
+
+test "MATCH does not resurrect a deleted bound node" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (n:Person {x:1}) DELETE n WITH n MATCH (n) RETURN count(n)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+}
