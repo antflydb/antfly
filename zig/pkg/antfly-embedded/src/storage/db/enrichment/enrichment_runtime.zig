@@ -4346,7 +4346,9 @@ fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentS
     runtime.chunk_artifact_bytes_written = @max(runtime.chunk_artifact_bytes_written, previous.chunk_artifact_bytes_written);
 }
 
-pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) UnsupportedEnrichmentRuntime else PlatformEnrichmentRuntime;
+const UnsupportedEnrichmentRuntime = struct {
     alloc: Allocator,
     status_hook: ?StatusHook = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
@@ -4835,7 +4837,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn indexSourceHasIsolatedFailure(self: *@This(), index_name: []const u8, artifact_name: []const u8) bool {
         return indexSourceHasIsolatedFailureLocked(self, index_name, artifact_name);
     }
-} else struct {
+};
+const PlatformEnrichmentRuntime = struct {
     const IoBackend = struct {
         borrowed: Io,
 

@@ -1111,7 +1111,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
     const shared_inference_core = b.option(bool, "shared-inference-core", "Reuse one Apache inference engine for the server and embedded library") orelse false;
-    const shared_storage_core = b.option(bool, "shared-storage-core", "Share an Apache archive for bulk storage ordinal operations") orelse false;
+    const shared_storage_core = b.option(bool, "shared-storage-core", "Reuse one Apache physical storage engine for the server and embedded library") orelse false;
     const measured_darwin_memory = b.option(bool, "measured-darwin-compile-memory", "Use native SDK 26.4 stripped Metal/BLAS ReleaseFast compiler admission claims") orelse false;
     const baseline_cpu = std.Target.Cpu.baseline(target.result.cpu.arch, target.result.os);
     const darwin_release_memory = measured_darwin_memory and optimize == .fast and strip and !sanitize_thread and
@@ -1126,7 +1126,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
     inference_engine_mod.addOptions("engine_options", engine_options);
-    inference_engine_mod.addImport("engine_errors", b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize }));
+    const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
+    inference_engine_mod.addImport("engine_errors", engine_error_names);
     inference_engine_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_engine_mod.addImport("inference_server", inference_server_mod);
     inference_engine_mod.addImport("httpx", httpx_mod);
@@ -1149,7 +1150,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
-        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .shared_core = shared_storage_core, .sanitize_thread = sanitize_thread }),
+        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .shared_core = shared_storage_core, .sanitize_thread = sanitize_thread, .error_names = engine_error_names }),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,

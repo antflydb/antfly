@@ -64,12 +64,20 @@ pub const Library = struct {
 };
 
 pub fn add(b: *std.Build, module: *std.Build.Module, providers: []const *std.Build.Step.Compile) Library {
+    return addWithStorageOwner(b, module, providers, null);
+}
+
+pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: []const *std.Build.Step.Compile, storage_owner: ?*std.Build.Step.Compile) Library {
     const target = module.resolved_target.?.result;
     const macho = target.os.tag == .macos;
     const elf = target.ofmt == .elf;
     // Mach-O archives compile without provider inputs. Only the final link
     // needs their emitted code, so LLVM owners can run independently.
-    if (!macho) for (providers) |provider| module.linkLibrary(provider);
+    const link_module = if (storage_owner != null and !macho) b.createModule(.{ .target = module.resolved_target, .optimize = module.optimize, .pic = true, .link_libc = module.link_libc }) else module;
+    if (!macho) {
+        if (storage_owner) |owner| link_module.linkLibrary(owner);
+        for (providers) |provider| link_module.linkLibrary(provider);
+    }
     const header = b.path("pkg/antfly-embedded/include/antfly.h");
     var exports: ?std.Build.LazyPath = null;
     if (macho or elf) {
@@ -79,10 +87,10 @@ pub fn add(b: *std.Build, module: *std.Build.Module, providers: []const *std.Bui
         generate.addArg("--output");
         exports = generate.addOutputFileArg(if (macho) "antfly.exports" else "antfly.map");
     }
-    const compile = b.addLibrary(.{
+    const compile = if (macho and storage_owner != null) storage_owner.? else b.addLibrary(.{
         .linkage = if (macho) .static else .dynamic,
         .name = if (macho) "antfly-capi-objects" else "antfly",
-        .root_module = module,
+        .root_module = link_module,
         // ELF version scripts must also hide compiler-provided Debug UBSan
         // symbols. Use the linker that applies the final export boundary to
         // every linked object, including those runtime objects.
@@ -131,6 +139,7 @@ pub fn add(b: *std.Build, module: *std.Build.Module, providers: []const *std.Bui
         break :blk output;
     } else blk: {
         compile.link_gc_sections = true;
+        if (storage_owner != null) forcePublicSymbols(b, compile);
         if (exports) |map| compile.setVersionScript(map);
         break :blk compile.getEmittedBin();
     };
@@ -202,4 +211,33 @@ fn addLinks(b: *std.Build, run: *std.Build.Step.Run, module: *std.Build.Module, 
         else => {}, // C/ObjC sources are compiled into their owning archive.
     };
     for (module.import_table.values()) |import| addLinks(b, run, import, visited, libraries);
+}
+
+// A source-less ELF facade must root the public header symbols in its provider
+// archive. Version-script entries alone do not cause archive extraction.
+fn forcePublicSymbols(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    const path = b.root.join(b.allocator, "pkg/antfly-embedded/include/antfly.h") catch @panic("OOM");
+    b.dependOnFileContents(b.path("pkg/antfly-embedded/include/antfly.h"));
+    const source = path.root_dir.handle.readFileAlloc(b.graph.io, path.sub_path, b.allocator, .limited(256 * 1024)) catch @panic("unable to read antfly.h");
+    var index: usize = 0;
+    while (index < source.len) {
+        if (std.mem.startsWith(u8, source[index..], "/*")) {
+            index += 2;
+            while (index + 1 < source.len and !std.mem.startsWith(u8, source[index..], "*/")) : (index += 1) {}
+            index = @min(index + 2, source.len);
+            continue;
+        }
+        if (std.mem.startsWith(u8, source[index..], "//")) {
+            while (index < source.len and source[index] != '\n') : (index += 1) {}
+            continue;
+        }
+        if (std.ascii.isAlphabetic(source[index]) or source[index] == '_') {
+            const start = index;
+            while (index < source.len and (std.ascii.isAlphanumeric(source[index]) or source[index] == '_')) : (index += 1) {}
+            const name = source[start..index];
+            var after = index;
+            while (after < source.len and std.ascii.isWhitespace(source[after])) : (after += 1) {}
+            if (std.mem.startsWith(u8, name, "antfly_") and after < source.len and source[after] == '(') artifact.forceUndefinedSymbol(name);
+        } else index += 1;
+    }
 }

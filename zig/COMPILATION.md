@@ -1068,3 +1068,56 @@ An initial alternating release-library batch probe (three runs per variant,
 insert time 179.55 → 181.95 ms. These short, model-free runs do not establish
 throughput parity; the apparent regressions (8.47% and 1.34%) require longer
 workloads and attribution before promotion.
+
+### Shared physical engine follow-up (qualification in progress)
+
+`-Dshared-storage-core=true` now selects a complete Apache native storage owner,
+not only ordinal workers. `antfly-storage-engine` compiles the public C API once
+and owns coarse DB lifecycle, batch, query (including leased reads), snapshot,
+schema/index and maintenance operations. The executable's ELv2 storage archive
+retains server/Raft adapters and calls this same compiled owner. The installed
+C library links the owner archive; it does not compile another public C API object.
+Per-record loops remain within operations.
+
+The private native descriptor checks compiler identity, method signatures, and
+DB/Core/handle/registry sizes, alignment and field layouts before interpreting
+borrowed native state. Conditional runtime implementations have authored names
+so independent compilation units calculate identical type identities. The
+existing error-domain dispatcher transports named failures without copying
+compiler-local numeric error codes. Both products access one handle registry
+and one C API TLS error state. Public lookup/raw/schema output buffers use the
+C allocator even when an internal handle has a custom allocator.
+
+Static server adapters compile without waiting for the shared engine. Provider
+archives are attached to final consumers; `runtime-unit-storage-adapter` compiles
+the adapter alone for memory/time qualification. Reservations remain conservative
+until the new unit is measured. Unsupported and thread-sanitized profiles keep
+the existing independent implementations. The option remains disabled by default.
+
+Both embedded and production-profile executable probes pass real cross-archive
+lifecycle, batch/query, named-error, incompatible-layout, registry and TLS checks.
+A handle registered by the client is looked up and closed through the public
+C API. Combined conformance, smoke, probe, row-preparation, replay and SQL
+transform validation passed all 109 build steps. The PDF suite passed 489 tests
+after consolidating the two Roboto fonts into one PIC asset archive. This removes
+repeated data emission without changing font bytes or rendering behavior.
+
+A longer alternating probe of the earlier draft (four runs per variant, 1,200
+batches of 64 rows, read-back verified) measured document-write medians
+3.3390 → 3.2963 s (-1.28%) and SQL insert medians 13.7517 → 13.7660 s (+0.10%).
+It does not reproduce the short probe's slowdown, and does not qualify this
+expanded engine revision. The new reproducible benchmark warms each database,
+checks insert counts and reads, and loads each library in an isolated process:
+
+```sh
+python3 zig/tools/benchmark_storage_owner.py \
+  --baseline /path/to/baseline/libantfly.dylib \
+  --candidate /path/to/candidate/libantfly.dylib \
+  --rounds 4 --batches 1200 --batch-size 64 --warmup-batches 64 \
+  --output /path/outside/repository/storage-throughput.json
+```
+
+Fresh release measurements of this expanded revision remain pending. SDK 27.0
+local results must be recorded separately from wolfspider's SDK 26.4 results;
+the 26.4 measured-admission policy does not apply to SDK 27.0. Earlier measured
+build/size figures above describe their frozen snapshots, not this revision.

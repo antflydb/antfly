@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const storage_engine = @import("../engine.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
@@ -20,7 +21,7 @@ const read_projection = @import("read_projection.zig");
 // binding retains only open configuration, existing local codec/collector
 // entry points, and pointers to live cache and fault-injection state.
 const DBModule = @This();
-const local_mutation = @import("local_mutation.zig").ImplementationFor(struct {
+const MutationDependencies = struct {
     pub const OpenOptions = DBModule.OpenOptions;
     pub const appendDocumentChildRangeOutboxWrites = DBModule.appendDocumentChildRangeOutboxWrites;
     pub const appendJsonString = DBModule.appendJsonString;
@@ -83,7 +84,8 @@ const local_mutation = @import("local_mutation.zig").ImplementationFor(struct {
     pub const test_before_graph_replay_apply = &DBModule.test_before_graph_replay_apply;
     pub const test_fail_restore_projection_apply = &DBModule.test_fail_restore_projection_apply;
     pub const test_portable_runtime_batch_prelock_hook = &DBModule.test_portable_runtime_batch_prelock_hook;
-});
+};
+const local_mutation = @import("local_mutation.zig").ImplementationFor(MutationDependencies);
 const document_collectors = @import("document_collectors.zig");
 const materialized_sources = @import("materialized_sources.zig");
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
@@ -2958,6 +2960,8 @@ test "db optional row policy authority preserves scoped secret denial and outage
     try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
 }
 
+const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
+
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
@@ -2985,7 +2989,7 @@ pub const DB = struct {
     graph_replacement_mutex: std.Io.Mutex = .init,
     graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
     graph_replacement_catalog_generation: u64 = 0,
-    graph_replacement_progress: ?struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 } = null,
+    graph_replacement_progress: ?GraphReplacementProgress = null,
     index_backends: db_config.IndexBackendOptions,
     core: *db_core.DBCore,
     /// Immutable physical root identity, initialized before workers bind.
@@ -3592,6 +3596,7 @@ pub const DB = struct {
     /// containers must call `startQuarantineRetryWorkerIfNeeded` only after
     /// installing the value at its final address.
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
             if (opts.initial_child_bootstrap) |bootstrap| {
@@ -4955,6 +4960,7 @@ pub const DB = struct {
     }
 
     pub fn close(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
         self.closed = true;
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
@@ -4967,6 +4973,7 @@ pub const DB = struct {
     /// should prefer this form whenever background workers are enabled: worker
     /// callbacks may retain the DB address until `closeOwned` joins them.
     pub fn openOwned(alloc: Allocator, path: []const u8, opts: OpenOptions) !*DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openOwned", .{ alloc, path, opts });
         const owned = try alloc.create(DB);
         errdefer alloc.destroy(owned);
         owned.* = try open(alloc, path, opts);
@@ -4980,6 +4987,7 @@ pub const DB = struct {
     /// point so newly added maintenance cannot accidentally retain a movable
     /// stack value.
     pub fn startResidentBackgroundWorkersIfNeeded(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("startResidentBackgroundWorkersIfNeeded", .{self}) catch unreachable;
         self.stable_address = true;
         // TTL callbacks retain only stable context, never this movable wrapper.
         // The resident probe observes their atomic outbox notification.
@@ -4991,6 +4999,7 @@ pub const DB = struct {
     }
 
     pub fn closeOwned(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("closeOwned", .{self}) catch unreachable;
         const owner_alloc = self.alloc;
         self.close();
         owner_alloc.destroy(self);
@@ -8101,7 +8110,8 @@ pub const DB = struct {
     /// apply lock instead of falling back to parse/extract/encode while holding
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
-    fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+    pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
         try types.validateGraphEndpointCleanupCommand(req);
         var lake_schema_view = self.core.acquireSchemaView();
         defer if (lake_schema_view) |*view| view.release();
@@ -19147,6 +19157,7 @@ pub const DB = struct {
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshot", .{ self, id });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, null, null, false, null);
@@ -19188,6 +19199,7 @@ pub const DB = struct {
     /// any follow-up work that raced with their capture barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn snapshotWithMaintenanceDeadline(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotWithMaintenanceDeadline", .{ self, id, maintenance_deadline_ns });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false, null);
@@ -19200,6 +19212,7 @@ pub const DB = struct {
     }
 
     pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotNativeWithCancellation", .{ self, id, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, true, cancellation, null, null, false, null);
@@ -19208,6 +19221,7 @@ pub const DB = struct {
     /// Cohort capture verifies the exact durable owner fence and drained
     /// participant set under the same apply lock that pins the native root.
     pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotRelationalCohort", .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         if (expected.role != .backup_snapshot) return error.InvalidIntegrityTopologyFence;
@@ -20006,6 +20020,7 @@ pub const DB = struct {
     }
 
     pub fn sync(self: *DB, full: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("sync", .{ self, full });
         if (full) if (self.local_execution.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
         lockApply(self);
         defer self.core.unlockApply();
@@ -20020,6 +20035,7 @@ pub const DB = struct {
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("syncIndexes", .{ self, force });
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
@@ -22147,6 +22163,7 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSchema", .{ self, table_schema });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -22417,6 +22434,7 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSchemaJson", .{ self, alloc, schema_json });
         return self.setSchemaJsonMode(alloc, schema_json, null, null);
     }
 
@@ -28090,6 +28108,7 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("addIndex", .{ self, cfg });
         _ = try self.addIndexWithAdmission(cfg, .ordinary);
     }
 
@@ -29729,6 +29748,7 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("deleteIndex", .{ self, name });
         if (self.core.index_manager.get(name) == null) return self.cancelReplacement(name);
         return self.deleteIndexForReconciliation(name, null);
     }
@@ -31899,6 +31919,7 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdle", .{self});
         const started_ns = platform_time.monotonicNs();
         const before = self.enrichmentThroughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
@@ -31977,6 +31998,7 @@ pub const DB = struct {
         self: *DB,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
     }
 
@@ -31984,6 +32006,7 @@ pub const DB = struct {
     /// relational debt after one page so its caller can release that lease
     /// before another turn; explicit runUntilIdle still proves full coverage.
     pub fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundMaintenanceWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
         return self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
@@ -39067,6 +39090,7 @@ pub const DB = struct {
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchWithDenseProfile", .{ self, alloc, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -39127,6 +39151,7 @@ pub const DB = struct {
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+            if (comptime storage_engine.enabled) return storage_engine.call("searchLease", .{ self, alloc, req });
             const db = self.db;
             const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
             if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
@@ -39172,12 +39197,13 @@ pub const DB = struct {
         return (try self.searchWithCapturedRequestAndExecutionContext(alloc, req, exec_ctx)).result;
     }
 
-    fn searchWithCapturedRequestAndExecutionContext(
+    pub fn searchWithCapturedRequestAndExecutionContext(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !SearchWithCapturedRequestResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchWithCapturedRequestAndExecutionContext", .{ self, alloc, req, exec_ctx });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();

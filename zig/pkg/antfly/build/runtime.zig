@@ -106,6 +106,7 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
+    native_storage: ?*std.Build.Step.Compile,
     native_enrichment: *std.Build.Step.Compile,
     native_inference: *std.Build.Step.Compile,
 };
@@ -256,6 +257,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
+        if (unit == .storage_kernel and options.native_storage != null)
+            b.step("runtime-unit-storage-adapter", "Compile only the server storage adapter without waiting for shared engine emission").dependOn(&role_artifact.step);
+        if (unit == .storage_kernel) {
+            if (options.native_storage) |owner| runtime_unit_step.dependOn(&owner.step);
+        }
         runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
@@ -273,6 +279,30 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
+    }
+
+    if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
+    if (options.native_storage) |owner| {
+        // Exercise the server's production build/source options against the
+        // independently compiled Apache owner, not just the embedded profile.
+        const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
+        production_antfly_imports.configureStorage(b, client, link_libc);
+        production_antfly_imports.storage_boundary.configureProfile(client, false, true, .all);
+        const capi_options = b.addOptions();
+        capi_options.addOption(bool, "linked_storage", true);
+        capi_options.addOption(bool, "inference_enabled", true);
+        client.addOptions("capi_build_options", capi_options);
+        client.addImport("antfly_storage_root", client);
+        const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
+        probe_mod.addImport("storage_client", client);
+        probe_mod.linkLibrary(owner);
+        probe_mod.linkLibrary(options.native_inference);
+        probe_mod.linkLibrary(options.native_enrichment);
+        const probe = b.addExecutable(.{ .name = "storage-server-owner-linkage-probe", .root_module = probe_mod, .max_rss = 4 * 1024 * 1024 * 1024 });
+        const run = b.addRunArtifact(probe);
+        _ = run.addOutputDirectoryArg("storage-server-owner-linkage");
+        run.has_side_effects = true;
+        b.top_level_steps.get("storage-owner-linkage-test").?.step.dependOn(&run.step);
     }
 
     // Exercise the real production archive boundary for encoded-image reads.

@@ -95,6 +95,7 @@ pub const AddEmbeddedOptions = struct {
     antfly_mod: *std.Build.Module,
 };
 pub const AddEmbeddedResult = struct {
+    native_storage: ?*std.Build.Step.Compile,
     native_inference: *std.Build.Step.Compile,
     native_enrichment: *std.Build.Step.Compile,
     embedded_mod: *std.Build.Module,
@@ -225,7 +226,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     }
 
     const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"),
+        .root_source_file = b.path(if (antfly_imports.storage_boundary.shared_core) "pkg/antfly-embedded/src/storage_engine_root.zig" else "pkg/antfly-embedded/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -289,6 +290,17 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
         @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
+    const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
+        const owner_options = b.addOptions();
+        owner_options.addOption(bool, "shared_storage_core", true);
+        owner_options.addOption(bool, "storage_engine_owner", true);
+        capi_mod.addOptions("storage_engine_options", owner_options);
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        owner.link_function_sections = true;
+        owner.link_data_sections = true;
+        @import("source_owner.zig").registerStorageProvider(owner);
+        break :blk owner;
+    } else null;
     const libantfly_link_mod = capi_mod;
     libantfly_link_mod.strip = strip;
     // Final native library consumers need release metadata even in the
@@ -296,8 +308,25 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // and before any consumer can cache this module's dependency graph.
     antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, libantfly_link_mod, target);
-    const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod, &.{ native_inference, native_enrichment });
+    const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
+    if (native_storage) |owner| {
+        const client_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
+        antfly_imports.configureEmbedded(b, client_mod, link_libc);
+        client_mod.addOptions("capi_build_options", capi_options);
+        client_mod.addImport("antfly_storage_root", client_mod);
+        const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
+        probe_mod.addImport("storage_client", client_mod);
+        probe_mod.linkLibrary(owner);
+        probe_mod.linkLibrary(native_inference);
+        probe_mod.linkLibrary(native_enrichment);
+        const probe = b.addExecutable(.{ .name = "storage-owner-linkage-probe", .root_module = probe_mod, .max_rss = 4 * 1024 * 1024 * 1024 });
+        const run = b.addRunArtifact(probe);
+        _ = run.addOutputDirectoryArg("storage-owner-linkage");
+        run.has_side_effects = true;
+        b.step("storage-owner-linkage-test", "Exercise actual shared storage calls, state ownership and incompatible ABI rejection").dependOn(&run.step);
+    }
+
     b.dependOnFileContents(b.path("pkg/antfly-embedded/libantfly.pc.in"));
     const pc_path = b.root.join(b.allocator, "pkg/antfly-embedded/libantfly.pc.in") catch @panic("OOM");
     const pc_template = pc_path.root_dir.handle.readFileAlloc(b.graph.io, pc_path.sub_path, b.allocator, .limited(16 * 1024)) catch @panic("unable to read libantfly.pc.in");
@@ -608,6 +637,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_test_step.dependOn(&run_resolution.step);
 
     return .{
+        .native_storage = native_storage,
         .native_inference = native_inference,
         .native_enrichment = native_enrichment,
         .embedded_mod = embedded_mod,
