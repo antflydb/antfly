@@ -327,13 +327,74 @@ fn detectArchitectureObject(obj: std.json.ObjectMap) !Architecture {
     return if (is_extractor) .span else .unknown;
 }
 
+// Config files are untrusted even before their artifact identity is checked.
+// JSON parsing uses a heap stack; bound this recursive comparison separately.
+const max_encoder_comparison_depth = 64;
+
+fn sameIntegerFloat(integer: i64, float: f64) bool {
+    if (!std.math.isFinite(float) or
+        float < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+        float >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return false;
+    // The round trip rejects fractions and integers rounded by f64, while
+    // accepting equivalent serialization such as pooler_dropout: 0 or 0.0.
+    return @as(i64, @intFromFloat(float)) == integer and @as(f64, @floatFromInt(integer)) == float;
+}
+
+fn sameJson(left: std.json.Value, right: std.json.Value, depth: usize) bool {
+    if (depth > max_encoder_comparison_depth) return false;
+    if (left == .integer and right == .float) return sameIntegerFloat(left.integer, right.float);
+    if (left == .float and right == .integer) return sameIntegerFloat(right.integer, left.float);
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |value| value == right.bool,
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .string, .number_string => |value| std.mem.eql(u8, value, if (left == .string) right.string else right.number_string),
+        .array => |items| blk: {
+            if (items.items.len != right.array.items.len) break :blk false;
+            for (items.items, right.array.items) |a, b| if (!sameJson(a, b, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .object => |obj| blk: {
+            if (obj.count() != right.object.count()) break :blk false;
+            var iterator = obj.iterator();
+            while (iterator.next()) |entry| {
+                const other = right.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!sameJson(entry.value_ptr.*, other, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
 pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_bytes: []const u8) !Config {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
     const obj = parsed.value.object;
     if (try detectArchitectureObject(obj) != .boundary) return error.UnsupportedGlinerArchitecture;
-    try requireString(obj, "model_type", "extractor");
+    const kind = obj.get("model_type") orelse return error.InvalidGlinerBoundaryConfig;
+    if (kind != .string) return error.InvalidGlinerBoundaryConfig;
+    const transformers_wrapper = std.mem.eql(u8, kind.string, "gliner2");
+    if (!transformers_wrapper and !std.mem.eql(u8, kind.string, "extractor"))
+        return error.UnsupportedGlinerBoundaryConfiguration;
+    if (transformers_wrapper) {
+        const architectures = obj.get("architectures") orelse return error.InvalidGlinerBoundaryConfig;
+        if (architectures != .array or architectures.array.items.len != 1 or
+            architectures.array.items[0] != .string or
+            !std.mem.eql(u8, architectures.array.items[0].string, "Gliner2ForSchemaExtraction"))
+            return error.UnsupportedGlinerBoundaryConfiguration;
+        if (!obj.contains("encoder_config")) return error.InvalidGlinerBoundaryConfig;
+    }
+    // Two declarations must describe the same encoder, including fields that
+    // this runtime does not consume. Object key order is immaterial.
+    if (obj.get("encoder_config")) |inline_encoder| {
+        if (inline_encoder != .object) return error.InvalidGlinerBoundaryConfig;
+        const sidecar = std.json.parseFromSlice(std.json.Value, allocator, encoder_bytes, .{}) catch |err| return configError(err);
+        defer sidecar.deinit();
+        if (!sameJson(inline_encoder, sidecar.value, 0)) return error.UnsupportedGlinerBoundaryEncoder;
+    }
     try requireString(obj, "token_pooling", "first");
     const version = try requiredU32(obj, "config_version", false);
     const arch_version = try requiredU32(obj, "architecture_version", false);
@@ -737,4 +798,71 @@ test "gliner boundary reads an Antenna neck only on a ModernBERT checkpoint" {
     defer a.free(necked_base);
     try std.testing.expect(!std.mem.eql(u8, necked_base, base_config));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryConfiguration, parseConfig(a, necked_base, base_encoder));
+}
+
+test "gliner boundary Transformers wrapper preserves the pinned executable contract" {
+    const a = std.testing.allocator;
+    const legacy = try loadFixture(a, .base, "config.json");
+    defer a.free(legacy);
+    const wrapper = try loadFixture(a, .base, "config_transformers.json");
+    defer a.free(wrapper);
+    const encoder = try loadFixture(a, .base, "encoder_config.json");
+    defer a.free(encoder);
+    try std.testing.expectEqualDeep(try parseConfig(a, legacy, encoder), try parseConfig(a, wrapper, encoder));
+    // Sidecar serialization and object insertion order do not change semantics.
+    var reordered = try std.json.parseFromSlice(std.json.Value, a, encoder, .{});
+    defer reordered.deinit();
+    const hidden_size = reordered.value.object.fetchSwapRemove("hidden_size").?;
+    try reordered.value.object.put(reordered.arena.allocator(), "hidden_size", hidden_size.value);
+    const reordered_bytes = try std.json.Stringify.valueAlloc(a, reordered.value, .{});
+    defer a.free(reordered_bytes);
+    try std.testing.expectEqualDeep(try parseConfig(a, wrapper, encoder), try parseConfig(a, wrapper, reordered_bytes));
+    const replacements = .{
+        .{ "\"hidden_size\": 768", "\"hidden_size\": 1024", error.UnsupportedGlinerBoundaryEncoder },
+        .{ "\"legacy\": true", "\"legacy\": false", error.UnsupportedGlinerBoundaryEncoder },
+        .{ "\"encoder_config\": {", "\"other_encoder_config\": {", error.InvalidGlinerBoundaryConfig },
+        .{ "Gliner2ForSchemaExtraction", "FutureExtractor", error.UnsupportedGlinerBoundaryConfiguration },
+        .{ "\"model_type\": \"gliner2\"", "\"model_type\": \"future\"", error.UnsupportedGlinerBoundaryConfiguration },
+    };
+    inline for (replacements) |replacement| {
+        const bytes = try std.mem.replaceOwned(u8, a, wrapper, replacement[0], replacement[1]);
+        defer a.free(bytes);
+        try std.testing.expectError(replacement[2], parseConfig(a, bytes, encoder));
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8, encoder_bytes: []const u8) !void {
+            _ = try parseConfig(allocator, bytes, encoder_bytes);
+        }
+    }.run, .{ wrapper, encoder });
+}
+
+test "gliner boundary Transformers wrapper rejects deeply nested encoder metadata" {
+    const a = std.testing.allocator;
+    const wrapper = try loadFixture(a, .base, "config_transformers.json");
+    defer a.free(wrapper);
+    const encoder = try loadFixture(a, .base, "encoder_config.json");
+    defer a.free(encoder);
+    // Both declarations are valid and identical, and fit well below the
+    // one-MiB sidecar limit. Their depth must not exhaust the process stack.
+    const depth = 20000;
+    const nested = try a.alloc(u8, 2 * depth + 1);
+    defer a.free(nested);
+    @memset(nested[0..depth], '[');
+    nested[depth] = '0';
+    @memset(nested[depth + 1 ..], ']');
+    const field = try std.fmt.allocPrint(a, "\"encoder_config\": {{\"extra\":{s},", .{nested});
+    defer a.free(field);
+    const with_inline = try std.mem.replaceOwned(u8, a, wrapper, "\"encoder_config\": {", field);
+    defer a.free(with_inline);
+    const with_sidecar = try std.fmt.allocPrint(a, "{{\"extra\":{s},{s}", .{ nested, encoder[1..] });
+    defer a.free(with_sidecar);
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryEncoder, parseConfig(a, with_inline, with_sidecar));
+}
+
+test "gliner boundary encoder comparison preserves numeric values across JSON serialization" {
+    try std.testing.expect(sameJson(.{ .integer = 0 }, .{ .float = 0.0 }, 0));
+    try std.testing.expect(sameJson(.{ .float = 0.0 }, .{ .integer = 0 }, 0));
+    try std.testing.expect(!sameJson(.{ .integer = 0 }, .{ .float = 0.5 }, 0));
+    try std.testing.expect(!sameJson(.{ .integer = 9007199254740993 }, .{ .float = 9007199254740992.0 }, 0));
+    try std.testing.expect(!sameJson(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9223372036854775808.0 }, 0));
 }
