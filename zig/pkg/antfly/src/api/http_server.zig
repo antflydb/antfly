@@ -12995,14 +12995,17 @@ pub const ApiHttpServer = struct {
             };
         };
         defer if (configured_root == null) self.alloc.free(root);
-        try self.lake_cache_start_mutex.lock(self.embedding_provider_runtime.io);
+        // Queries never queue behind optional cache startup. The background
+        // owner restores inventory and publishes the disk tier independently.
+        if (!self.lake_cache_start_mutex.tryLock()) return;
         defer self.lake_cache_start_mutex.unlock(self.embedding_provider_runtime.io);
         if (self.lake_cache_io == null) {
             const io_impl = self.owner_alloc.create(std.Io.Threaded) catch |err| {
                 self.lake_read_cache.recordDiskUnavailable(err);
                 return;
             };
-            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+            // One restoration task plus the persistent write worker it starts.
+            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
             self.lake_cache_io = io_impl;
         }
         const cache_io = self.lake_cache_io.?.io();
@@ -13013,7 +13016,7 @@ pub const ApiHttpServer = struct {
             .max_write_queue_entries = config.max_write_queue_entries,
             .protected_bytes = config.protected_bytes,
         };
-        try self.lake_read_cache.ensurePersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
+        try self.lake_read_cache.startPersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {
@@ -21781,6 +21784,9 @@ pub const ApiHttpServer = struct {
     ) !contextual_operations.OwnedResponse {
         const composed = @import("composed_query.zig");
         if (composed.hasSource(self.alloc, body) catch false) {
+            const composed_started = @import("antfly_platform").time.monotonicNs();
+            var composed_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
+            defer composed_profile.finish(&self.lake_query_metrics, composed_started);
             var source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always });
             defer source_root.deinit();
             var composed_body = body;
@@ -21788,6 +21794,8 @@ pub const ApiHttpServer = struct {
             defer if (expanded_body) |bytes| self.alloc.free(bytes);
             var source_value = source_root.value.object.get("source").?;
             if (source_value == .object) if (source_value.object.get("saved")) |saved| {
+                const definition_started = @import("antfly_platform").time.monotonicNs();
+                defer composed_profile.record(&self.lake_query_metrics, .composed_definition, definition_started);
                 if (source_value.object.count() != 1 or saved != .string) return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
                 if (!admittedTablePermissionAllowed(authenticated_identity, saved.string, .read)) return contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
                 const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = if (cancellation) |cancel| cancel.token() else .none };
@@ -21808,6 +21816,7 @@ pub const ApiHttpServer = struct {
             const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
             const Runner = struct {
                 server: *ApiHttpServer,
+                profile: *@import("lake_query_metrics.zig").ComposedProfile,
                 overlay: bool,
                 deadline: ?u64,
                 identity: ?AuthenticatedIdentity,
@@ -21819,6 +21828,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const leaf_started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_leaf, leaf_started);
                     if (!admittedTablePermissionAllowed(runner.identity, name, .read)) return contextual_operations.jsonErrorAlloc(a, 403, "forbidden");
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
@@ -21856,7 +21867,12 @@ pub const ApiHttpServer = struct {
                             native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});
                         }
                     }
-                    var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    var response = response: {
+                        const native_started = @import("antfly_platform").time.monotonicNs();
+                        defer if (bound.storage.engine != .object and external == null)
+                            runner.profile.record(&runner.server.lake_query_metrics, .composed_native_leaf, native_started);
+                        break :response try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    };
                     if (response.status != 200) return response;
                     errdefer response.deinit(runner.server.alloc);
                     var after = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
@@ -21882,6 +21898,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
@@ -21890,6 +21908,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
@@ -21900,7 +21920,7 @@ pub const ApiHttpServer = struct {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
                 }
             };
-            var runner: Runner = .{ .server = self, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
+            var runner: Runner = .{ .server = self, .profile = &composed_profile, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
             return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);

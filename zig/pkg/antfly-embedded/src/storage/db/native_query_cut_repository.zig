@@ -29,6 +29,8 @@ pub const CheckpointReference = struct {
     sequence: u64,
     files: []const remote_storage.File,
 };
+pub const ReuseProof = @import("native_query_reuse.zig").Proof;
+pub const WarmResult = struct { complete: bool, proof: ?ReuseProof = null };
 pub const VTable = struct {
     publish: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
     recover: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
@@ -36,6 +38,9 @@ pub const VTable = struct {
     warm: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation, u64) anyerror!bool = null,
     can_evict: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, u64, Cancellation) anyerror!bool = null,
     reference: ?*const fn (*anyopaque, std.Io, Request, Namespace, Storage, Cancellation) anyerror!bool = null,
+    publish_with_proof: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!?ReuseProof = null,
+    warm_with_proof: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation, u64) anyerror!WarmResult = null,
+    reuse: ?*const fn (*anyopaque, std.Io, Request, Request, Namespace, ReuseProof, Cancellation) anyerror!?ReuseProof = null,
 };
 const Boundary = @import("../../runtime_callback_abi.zig").Boundary(VTable);
 pub const Port = struct {
@@ -65,5 +70,18 @@ pub const Port = struct {
     pub fn reference(self: Port, io: std.Io, request: Request, namespace: Namespace, source: Storage, cancellation: Cancellation) !bool {
         const callback = self.vtable.reference orelse return false;
         return Boundary.call("reference", self.dispatch, callback, .{ self.ptr, io, request, namespace, source, cancellation });
+    }
+    pub fn publishReusable(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?ReuseProof {
+        if (self.vtable.publish_with_proof) |callback| return Boundary.call("publish_with_proof", self.dispatch, callback, .{ self.ptr, io, root, request, namespace, cancellation });
+        try self.publish(io, root, request, namespace, cancellation);
+        return null;
+    }
+    pub fn warmReusable(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !WarmResult {
+        if (self.vtable.warm_with_proof) |callback| return Boundary.call("warm_with_proof", self.dispatch, callback, .{ self.ptr, io, root, request, namespace, cancellation, max_bytes });
+        return .{ .complete = try self.warm(io, root, request, namespace, cancellation, max_bytes) };
+    }
+    pub fn reuse(self: Port, io: std.Io, previous: Request, request: Request, namespace: Namespace, proof: ReuseProof, cancellation: Cancellation) !?ReuseProof {
+        const callback = self.vtable.reuse orelse return null;
+        return Boundary.call("reuse", self.dispatch, callback, .{ self.ptr, io, previous, request, namespace, proof, cancellation });
     }
 };
