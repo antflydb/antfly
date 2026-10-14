@@ -440,6 +440,14 @@ func (db *DB) Backup() ([]byte, error) {
 	})
 }
 
+// BackupJSON exports a portable archive with an explicit optional table scope.
+// Default is always included. Full backups never silently omit unavailable tables.
+func (db *DB) BackupJSON(options []byte) ([]byte, error) {
+	return db.withInputOutput(options, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_backup_json((*C.antfly_db)(handle), input, out)
+	})
+}
+
 // ImportBackup imports a portable Antfly backup archive into this empty
 // database. OutcomeUnknown means the live handle adopted the imported
 // generation, but crash durability could not be confirmed; inspect the handle
@@ -725,7 +733,35 @@ func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
 	})
 }
 
+// ResolverIdentitiesJSON lists active and retired identities, including durable merges.
+func (db *DB) ResolverIdentitiesJSON() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_list_resolver_identities_json((*C.antfly_db)(handle), out)
+	})
+}
+
+// DropResolverIdentity deletes retired identity metadata; artifacts and canonical rows remain.
+// Retry on Busy. Delete source documents for artifact cleanup; explicitly delete unused canonical rows.
+func (db *DB) DropResolverIdentity(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+	var deleted C.bool
+	if err := check(C.antfly_db_drop_resolver_identity((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
 // SetResolverNamespaceJSON atomically resets or migrates resolver identities; drain afterward.
+// Retry the identical request on Busy.
 func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 	name, cleanup := makeCStringSlice([]byte(resolver))
 	defer cleanup()
@@ -734,7 +770,11 @@ func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
 	})
 }
 
-// AddIndexJSON adds an index from its JSON configuration.
+// AddIndexJSON adds or replaces an index. Retry the identical request on Busy.
+// A graph replaces command registers a resumable background shadow; the old
+// index serves until activation. It also works when the old index is absent.
+// Optional wait:{timeout_ms:N} waits for activation. Deadline Busy leaves the
+// accepted shadow running; PendingWorkStatsJSON reports progress and last error.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_db_add_index_json((*C.antfly_db)(handle), input)
@@ -742,6 +782,7 @@ func (db *DB) AddIndexJSON(config []byte) error {
 }
 
 // DeleteIndex deletes an index by name and reports whether it existed.
+// DeleteIndex retires an index; retry on Busy. Returns whether the index existed.
 func (db *DB) DeleteIndex(name string) (bool, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -756,6 +797,26 @@ func (db *DB) DeleteIndex(name string) (bool, error) {
 
 	var deleted C.bool
 	if err := check(C.antfly_db_delete_index((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
+// CancelReplacement cancels a running or failed shadow by its new name.
+func (db *DB) CancelReplacement(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+
+	var deleted C.bool
+	if err := check(C.antfly_db_cancel_replacement((*C.antfly_db)(handle), input, &deleted)); err != nil {
 		return false, err
 	}
 	return bool(deleted), nil

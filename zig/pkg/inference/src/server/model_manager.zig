@@ -2298,7 +2298,137 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| try paths.append(alloc, path);
+        }
+    }
+    if (manifest.safetensors_index_path) |path| {
+        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (index == .object) if (index.object.get("weight_map")) |weights| {
+            if (weights != .object) return error.InvalidModelLayout;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (weights.object.values()) |file| {
+                if (file != .string) return error.InvalidModelLayout;
+                const slot = try seen.getOrPut(alloc, file.string);
+                if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
+            }
+        };
+    }
+    var external: std.ArrayList([]const u8) = .empty;
+    for (paths.items) |path| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
+    }
+    try paths.appendSlice(alloc, external.items);
+    return componentDependencySignature(io, paths.items);
+}
+
+// Legacy managed receipts may lack a digest. Hash those files once per local
+// file generation, keeping the resulting identity content-based across copies.
+const LegacyArtifactDigestCache = struct {
+    const Entry = struct { signature: [32]u8, digest: [32]u8 };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var entries: [256]?Entry = @splat(null);
+    var next: usize = 0;
+    var forbid_hashing_for_test: bool = false;
+
+    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
+        const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
+        spinLock(&mutex);
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) {
+                mutex.unlock();
+                return entry.digest;
+            }
+        };
+        mutex.unlock();
+        const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
+        defer std.heap.page_allocator.free(memo_path);
+        const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
+        defer if (memo_bytes) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo_bytes) |bytes| {
+            if (std.json.parseFromSlice(Entry, std.heap.page_allocator, bytes, .{})) |memo| {
+                defer memo.deinit();
+                if (std.mem.eql(u8, &signature, &memo.value.signature)) {
+                    spinLock(&mutex);
+                    defer mutex.unlock();
+                    entries[next] = memo.value;
+                    next = (next + 1) % entries.len;
+                    return memo.value.digest;
+                }
+            } else |_| {}
+        }
+        if (builtin.is_test and forbid_hashing_for_test) return error.UnexpectedModelRehash;
+        var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+        defer file.close(io);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            hasher.update(buffer[0..count]);
+        }
+        var result: [32]u8 = undefined;
+        hasher.final(&result);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        const memo = std.json.Stringify.valueAlloc(std.heap.page_allocator, Entry{ .signature = signature, .digest = result }, .{}) catch null;
+        defer if (memo) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo) |bytes| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = memo_path, .data = bytes }) catch {};
+        spinLock(&mutex);
+        defer mutex.unlock();
+        entries[next] = .{ .signature = signature, .digest = result };
+        next = (next + 1) % entries.len;
+        return result;
+    }
+};
+
+/// Stable identity before loading weights. Managed receipts use relative paths
+/// and pinned content digests, so copying/restoring a model preserves reuse.
+pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
+    defer if (receipt) |*validated| validated.deinit();
+    if (receipt) |*validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (artifacts) |artifact| {
+            const decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
+            }
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
 pub const LoadedModel = struct {
+    resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
@@ -7330,6 +7460,10 @@ pub const ModelManager = struct {
         return self.waitForLoadFlight(flight_key, flight, control);
     }
 
+    pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+        return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
+    }
+
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
@@ -7378,6 +7512,8 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -7610,7 +7746,9 @@ pub const ModelManager = struct {
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
@@ -13469,4 +13607,51 @@ test "ONNX export tokenizer format takes precedence over root JSON" {
         defer a.free(ids);
         try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
     }
+}
+
+test "capi resolver model identity uses receipt digests before load and survives copying" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const body = "identical fake model weights";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .source = .{ .owner = "test", .name = "identity", .variant = "safetensors", .selected_format = "safetensors" }, .artifacts = &.{.{ .path = "model.safetensors", .size = body.len, .sha256 = &hex }} }, .{});
+    defer a.free(receipt);
+    for ([_]std.Io.Dir{ first.dir, second.dir }) |dir| {
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    const first_path = try first.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(second_path);
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    const original = try modelIdentity(a, io, first_path, manifest);
+    const copied = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &copied);
+    LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process
+    LegacyArtifactDigestCache.forbid_hashing_for_test = true;
+    defer LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    try std.testing.expectEqualSlices(u8, &original, &try modelIdentity(a, io, second_path, manifest));
+    LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    const legacy = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{.{ .path = "model.safetensors", .size = body.len }} }, .{});
+    defer a.free(legacy);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = legacy });
+    const legacy_identity = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &legacy_identity);
+    try std.testing.expectEqualSlices(u8, &legacy_identity, &try modelIdentity(a, io, second_path, manifest));
+    // Invalid weight bytes deliberately prove identity lookup does not load a model.
+    const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
+    defer a.free(changed);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+    // A stale pinned receipt must also reject in-place weight replacement.
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
 }

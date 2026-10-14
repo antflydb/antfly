@@ -39,6 +39,9 @@ __all__ = [
     "UNSUPPORTED",
     "STALLED",
     "CANCELLED",
+    "REPLACEMENT_FAILED",
+    "REPLACEMENT_PENDING",
+    "REPLACEMENT_CONFIGURATION_MISMATCH",
     "INTERNAL",
     "error_code_name",
     "error_code_description",
@@ -53,6 +56,9 @@ __all__ = [
     "UnsupportedError",
     "StalledError",
     "CancelledError",
+    "ReplacementFailedError",
+    "ReplacementPendingError",
+    "ReplacementConfigurationMismatchError",
     "InternalError",
     "raise_for_code",
     "error_class_for_code",
@@ -74,10 +80,12 @@ UNSUPPORTED = 8
 # A bounded drain (e.g. run_until_idle) detected a managed index making no
 # forward progress and gave up.
 STALLED = 9
-# The caller cancelled the call by returning false from its progress or
-# stream callback (Inference.pull()'s progress, generate_stream()'s
-# on_chunk).
+# The operation was cancelled, including a pending replacement or a
+# progress/stream callback returning false.
 CANCELLED = 10
+REPLACEMENT_FAILED = 11
+REPLACEMENT_PENDING = 12
+REPLACEMENT_CONFIGURATION_MISMATCH = 13
 INTERNAL = 255
 
 _NAMES: dict[int, str] = {
@@ -92,6 +100,9 @@ _NAMES: dict[int, str] = {
     UNSUPPORTED: "ANTFLY_UNSUPPORTED",
     STALLED: "ANTFLY_STALLED",
     CANCELLED: "ANTFLY_CANCELLED",
+    REPLACEMENT_FAILED: "ANTFLY_REPLACEMENT_FAILED",
+    REPLACEMENT_PENDING: "ANTFLY_REPLACEMENT_PENDING",
+    REPLACEMENT_CONFIGURATION_MISMATCH: "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
     INTERNAL: "ANTFLY_INTERNAL",
 }
 
@@ -110,6 +121,9 @@ _DESCRIPTIONS: dict[int, str] = {
     UNSUPPORTED: "the operation requires a capability that is not supported by this platform or filesystem",
     STALLED: "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
     CANCELLED: "the caller cancelled the operation",
+    REPLACEMENT_FAILED: "replacement failed after its retry budget; inspect diagnostics and cancel before retrying",
+    REPLACEMENT_PENDING: "index name is reserved by a pending replacement",
+    REPLACEMENT_CONFIGURATION_MISMATCH: "replacement configuration differs from the reserved request",
     INTERNAL: "an internal error occurred",
 }
 
@@ -188,6 +202,18 @@ class CancelledError(AntflyError):
     CODE = CANCELLED
 
 
+class ReplacementFailedError(AntflyError):
+    CODE = REPLACEMENT_FAILED
+
+
+class ReplacementPendingError(AntflyError):
+    CODE = REPLACEMENT_PENDING
+
+
+class ReplacementConfigurationMismatchError(AntflyError):
+    CODE = REPLACEMENT_CONFIGURATION_MISMATCH
+
+
 class InternalError(AntflyError):
     CODE = INTERNAL
 
@@ -203,6 +229,9 @@ _ERROR_CLASSES: dict[int, type[AntflyError]] = {
     UNSUPPORTED: UnsupportedError,
     STALLED: StalledError,
     CANCELLED: CancelledError,
+    REPLACEMENT_FAILED: ReplacementFailedError,
+    REPLACEMENT_PENDING: ReplacementPendingError,
+    REPLACEMENT_CONFIGURATION_MISMATCH: ReplacementConfigurationMismatchError,
     INTERNAL: InternalError,
 }
 

@@ -232,8 +232,8 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
     }
 }
 
-/// Undo buffer for the catalog mutations a native Lite AddIndex performs
-/// before (nested enrichments) and after (nested resolvers) `db.addIndex`.
+/// Undo buffer for the catalog mutations an embedded AddIndex performs
+/// before index admission (nested enrichments and resolvers).
 /// The C ABI admits one index per call with no transaction around the
 /// enrichment/resolver catalogs, so a rejected or partially failed AddIndex
 /// must restore the pre-call configuration itself: durably upserting an
@@ -260,7 +260,7 @@ pub const LiteCatalogRollback = struct {
         return .{
             .handle = handle,
             .prior = prior,
-            .prior_resolvers = try handle.database().*.listResolvers(handle.alloc),
+            .prior_resolvers = try handle.database().core.index_manager.listResolverIdentities(handle.alloc),
         };
     }
 
@@ -303,15 +303,9 @@ pub const LiteCatalogRollback = struct {
                 }
                 break :blk null;
             };
-            if (prior) |cfg| {
-                _ = self.handle.database().*.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }) catch |err| {
-                    std.log.warn("lite AddIndex rollback failed to restore resolver {s}: {s}", .{ name, @errorName(err) });
-                };
-            } else {
-                _ = self.handle.database().*.removeResolverWithoutDrain(name) catch |err| {
-                    std.log.warn("lite AddIndex rollback failed to remove resolver {s}: {s}", .{ name, @errorName(err) });
-                };
-            }
+            self.handle.database().*.restoreResolverIdentityWithoutDrain(name, prior) catch |err| {
+                std.log.warn("AddIndex rollback failed to restore resolver identity {s}: {s}", .{ name, @errorName(err) });
+            };
         }
         for (self.touched.items) |touch| {
             const prior = blk: {
@@ -338,9 +332,9 @@ pub const LiteCatalogRollback = struct {
 /// server registers resolvers from the whole table's indexes JSON
 /// (`metadata_table_provisioner.ensureResolversWithOptions`) after index
 /// provisioning; a native Lite handle admits one index at a time, so this
-/// harvests the graph config's `"resolvers"` array after the index itself is
-/// admitted. Add/update only — a single index's config never proves another
-/// index's resolvers are gone, so nothing is removed here. `upsertResolver`
+/// harvests the graph config's `"resolvers"` array before graph construction so
+/// retained canonical endpoints are available during index rebuild. Deletion reconciles ownership across all admitted graph indexes;
+/// the last owner's removal retires execution but retains durable identity. `upsertResolver`
 /// is idempotent for an unchanged config; backfill is deferred to the
 /// resolver workers (or the next `antfly_db_run_until_idle`).
 pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
@@ -364,11 +358,13 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
         cfg.value.merge_state_version = 0;
         cfg.value.resolution_generation = 0;
         cfg.value.namespace_generation = 0;
+        cfg.value.inline_managed = true;
+        cfg.value.retired = false;
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
         try rollback.willTouchResolver(cfg.value.name);
-        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false });
+        _ = try handle.database().*.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false, .wait_for_activity = true });
     }
 }
 
@@ -2305,7 +2301,11 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
-    handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    @import("tables.zig").loadCatalog(handle) catch |err| {
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
+    handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
 
@@ -2633,6 +2633,7 @@ pub fn openLiteHandleAllocWithRuntime(
     opts.start_resolver_workers = false;
     if (resolved.externally_locked) {
         // The connection worker drives maintenance while holding its path lease.
+        opts.start_independent_maintenance = false;
         opts.executor = .{ .backend = .manual };
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
@@ -2705,6 +2706,11 @@ pub fn openLiteHandleAllocWithRuntime(
         return err;
     };
     @import("entity_sink.zig").attach(handle, &handle.db);
+    @import("tables.zig").loadCatalog(handle) catch |err| {
+        stopLiteEmbeddedInference(handle);
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
@@ -2762,7 +2768,11 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = options,
     };
-    handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    @import("tables.zig").loadCatalog(handle) catch |err| {
+        alloc.free(handle.embedded_path.?);
+        return err;
+    };
+    handle.database().*.startResidentBackgroundWorkersIfNeeded();
     return handle;
 }
 
@@ -2887,6 +2897,14 @@ pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
     return out;
 }
 
+fn databaseMinimumReaderVersion(handle: *Handle) u32 {
+    const root = handle.parent_handle orelse handle;
+    var version = root.db.core.index_manager.minimum_reader_version.load(.acquire);
+    var it = root.embedded_tables.valueIterator();
+    while (it.next()) |table| version = @max(version, table.*.db.core.index_manager.minimum_reader_version.load(.acquire));
+    return version;
+}
+
 pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
@@ -2899,7 +2917,9 @@ pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*ca
     const handle = guard.handle;
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
-    out.* = stringifyJson(lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    var capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
+    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle);
+    out.* = stringifyJson(capabilities) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -2935,12 +2955,14 @@ pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buf
 
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
+    var capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
+    capabilities.minimum_reader_version = databaseMinimumReaderVersion(handle);
     const status = lite_backend.Status(JsonDBStats){
         .storage = storage,
         .stats = jsonDBStatsProjection(stats, indexes),
         .pending_work = handle.database().*.pendingWorkStats(),
         .inference = inference,
-        .capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference),
+        .capabilities = capabilities,
     };
 
     const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
@@ -2963,6 +2985,30 @@ pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(handle.alloc);
     @import("database_backup.zig").exportDatabase(handle, &out) catch |err| return capi.mapError(err);
+    const bytes = out.toOwnedSlice(handle.alloc) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    out = .empty;
+    out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub export fn antfly_db_backup_json(handle_ptr: ?*anyopaque, options: capi.Slice, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle = guard.handle;
+
+    @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(handle.alloc);
+    const Request = struct { tables: ?[]const []const u8 = null };
+    const request = std.json.parseFromSlice(Request, handle.alloc, options.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer request.deinit();
+    @import("database_backup.zig").exportTables(handle, &out, request.value.tables) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     out = .empty;
     out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
@@ -3202,6 +3248,7 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
     }
     defer guard.leave();
     const handle = guard.handle;
+    @import("entity_sink.zig").collectEmbeddingCache(handle.parent_handle orelse handle, true) catch |err| return capi.mapError(err);
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         return .ok;
@@ -4425,6 +4472,12 @@ pub export fn antfly_db_get_raw(
     const handle = guard.handle;
     const result = handle.database().*.get(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
     if (result == null) return capi.mapError(error.NotFound);
+    if (@import("../storage/internal_keys.zig").isResolutionArtifactKey(key.bytes())) {
+        defer handle.alloc.free(result.?);
+        const visible = @import("../storage/hierarchy_navigation.zig").publicArtifactPayloadAlloc(handle.alloc, result.?) catch |err| return capi.mapError(err);
+        out_buf.* = .{ .ptr = visible.ptr, .len = visible.len };
+        return .ok;
+    }
     out_buf.* = .{
         .ptr = result.?.ptr,
         .len = result.?.len,
@@ -4530,26 +4583,58 @@ pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
 
 /// A root Lite connection drains every namespace. Report that same scope,
 /// retaining per-table snapshots so callers can identify failed producers.
+fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Value {
+    const bytes = try std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{});
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const jobs = try database.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    var rows: std.ArrayList(std.json.Value) = .empty;
+    for (jobs.value) |job| {
+        const status = try std.json.Stringify.valueAlloc(a, .{
+            .name = job.name,
+            .replaces = job.old,
+            .phase = @tagName(job.phase),
+            .scanned_keys = job.scanned,
+            .applied_sequence = job.applied_sequence,
+            .target_sequence = database.core.nextDerivedSequence(),
+            .last_error = job.last_error,
+            .retry_count = job.retry_count,
+            .total_retry_count = job.total_retry_count,
+            .max_total_retries = db_mod.DB.replacement_total_retry_limit,
+            .retry_after_ns = job.retry_after_ns,
+            .activation_attempts = job.activation_attempts,
+        }, .{});
+        try rows.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, status, .{}));
+    }
+    try value.object.put(a, "replacements", .{ .array = .fromOwnedSlice(a, rows.items) });
+    return value;
+}
+
 pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
-    var stats = handle.database().pendingWorkStats();
-    if (handle.selected_table_name != null or handle.embedded_tables.count() == 0) return stringifyJson(stats);
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    var aggregate = handle.database().pendingWorkStats();
+    var output = try pendingNamespaceStatsValue(a, handle.database());
+    if (handle.selected_table_name != null) return stringifyJson(output);
     var snapshots: std.json.ObjectMap = .empty;
     var iterator = handle.embedded_tables.iterator();
     while (iterator.next()) |entry| {
-        const child = entry.value_ptr.*.db.pendingWorkStats();
-        const bytes = try std.json.Stringify.valueAlloc(a, child, .{});
-        try snapshots.put(a, entry.key_ptr.*, try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}));
-        stats.enrichment.enabled = stats.enrichment.enabled or child.enrichment.enabled;
-        stats.enrichment.error_count +|= child.enrichment.error_count;
-        stats.enrichment.retryable_error_count +|= child.enrichment.retryable_error_count;
-        stats.enrichment.fatal_error_count +|= child.enrichment.fatal_error_count;
-        if (child.enrichment.last_error_code.len > 0) stats.enrichment.last_error_code = child.enrichment.last_error_code;
+        const child = try pendingNamespaceStatsValue(a, &entry.value_ptr.*.db);
+        try snapshots.put(a, entry.key_ptr.*, child);
+        const child_stats = entry.value_ptr.*.db.pendingWorkStats();
+        aggregate.enrichment.enabled = aggregate.enrichment.enabled or child_stats.enrichment.enabled;
+        aggregate.enrichment.error_count +|= child_stats.enrichment.error_count;
+        aggregate.enrichment.retryable_error_count +|= child_stats.enrichment.retryable_error_count;
+        aggregate.enrichment.fatal_error_count +|= child_stats.enrichment.fatal_error_count;
+        if (child_stats.enrichment.last_error_code.len > 0) aggregate.enrichment.last_error_code = child_stats.enrichment.last_error_code;
     }
-    const bytes = try std.json.Stringify.valueAlloc(a, stats, .{});
-    var output = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const enrichment = try std.json.Stringify.valueAlloc(a, aggregate.enrichment, .{});
+    try output.object.put(a, "enrichment", try std.json.parseFromSliceLeaky(std.json.Value, a, enrichment, .{}));
+    var unavailable: std.json.ObjectMap = .empty;
+    var errors = handle.embedded_table_errors.iterator();
+    while (errors.next()) |entry| try unavailable.put(a, entry.key_ptr.*, .{ .string = entry.value_ptr.* });
+    try output.object.put(a, "unavailable_tables", .{ .object = unavailable });
     try output.object.put(a, "tables", .{ .object = snapshots });
     return stringifyJson(output);
 }
@@ -5434,7 +5519,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    try @import("tables.zig").load(handle);
+    try @import("tables.zig").loadAvailable(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
@@ -7085,10 +7170,43 @@ pub export fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolv
         next.merges = aliases.items;
         next.merge_state_version = 1;
         next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+pub export fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    const identities = handle.database().core.index_manager.listResolverIdentities(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (identities) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(identities);
+    }
+    // Identity management includes the durable redirects omitted from config JSON.
+    const Identity = struct { config: @import("../storage/db/catalog/resolver_catalog.zig").ResolverConfig, merges: []const @import("antfly_resolver").KeyAlias };
+    const result = handle.alloc.alloc(Identity, identities.len) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(result);
+    for (identities, result) |cfg, *identity| identity.* = .{ .config = cfg, .merges = cfg.merges };
+    out.* = stringifyJson(result) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+/// Explicit irreversible identity deletion is allowed only after retirement.
+pub export fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slice, out_deleted: ?*bool) capi.ErrorCode {
+    capi.clearLastError();
+    const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
+    out.* = false;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    out.* = guard.handle.database().dropRetiredResolverIdentity(name.bytes()) catch |err| return capi.mapErrorContext(err, "retire all declaring indexes before dropping resolver identity");
+    return .ok;
 }
 
 /// Explicitly reset redirects or map every stored alias endpoint into a new namespace.
@@ -7106,7 +7224,7 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
     const request = parsed.value;
     if (request.key_map != null and request.aliases != null) return capi.mapErrorContext(error.InvalidArgument, "explicit aliases require reset_merges:true");
     if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
-    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().core.index_manager.listResolverIdentities(handle.alloc) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(handle.alloc);
         handle.alloc.free(configs);
@@ -7149,15 +7267,54 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
         else
             0;
         next.merge_state_version = if (merges.items.len > 0) 1 else 0;
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
+        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
 }
 
-pub export fn antfly_db_add_index_json(
+var test_index_before_wait_quantum: ?*const fn (?*anyopaque) anyerror!void = null;
+
+/// Registration captures the admitted generation atomically. Optional waiting
+/// retains it while releasing API/path admission between maintenance quanta.
+pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice) capi.ErrorCode {
+    capi.clearLastError();
+    var request = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, config_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer request.deinit();
+    var generation: u64 = 0;
+    const result = addIndexJsonRegistered(handle_ptr, config_json, &generation);
+    if (result != .ok) return result;
+    if (request.value != .object) return .ok;
+    const wait = request.value.object.get("wait") orelse return .ok;
+    const timeout = wait.object.get("timeout_ms").?.integer;
+    const name = request.value.object.get("name").?.string;
+    const deadline = monotonicNowNs() +| @as(u64, @intCast(timeout)) *| std.time.ns_per_ms;
+    while (true) {
+        if (builtin.is_test) if (test_index_before_wait_quantum) |hook|
+            hook(handle_ptr) catch |err| return capi.mapError(err);
+        const pending = blk: {
+            const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
+            defer guard.leave();
+            if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+            const database = guard.handle.database();
+            const now = monotonicNowNs();
+            const quantum_ms = @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+            database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
+                error.Busy => break :blk true,
+                else => return capi.mapError(err),
+            };
+            break :blk false;
+        };
+        if (!pending) return .ok;
+        if (monotonicNowNs() >= deadline) return capi.mapError(error.Busy);
+        handleLockIo().sleep(.fromMilliseconds(1), .awake) catch |err| return capi.mapError(err);
+    }
+}
+
+fn addIndexJsonRegistered(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
+    generation: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
     const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -7176,12 +7333,22 @@ pub export fn antfly_db_add_index_json(
     if (name != .string or name.string.len == 0) return capi.mapError(error.InvalidIndexName);
     const discriminator = value.object.get("kind") orelse value.object.get("type") orelse return capi.mapError(error.MissingIndexType);
     if (discriminator != .string) return capi.mapError(error.InvalidIndexType);
-    const config_value = value.object.get("config_json");
+    const replacement = value.object.get("replaces");
+    const wait = value.object.get("wait");
+    if (wait) |request| {
+        if (request != .object) return capi.mapError(error.InvalidArgument);
+        const timeout = request.object.get("timeout_ms") orelse return capi.mapError(error.InvalidArgument);
+        if (timeout != .integer or timeout.integer < 0) return capi.mapError(error.InvalidArgument);
+    }
+    var index_value = value;
+    _ = index_value.object.swapRemove("wait");
+    _ = index_value.object.swapRemove("replaces");
+    const config_value = index_value.object.get("config_json");
     const normalized_config = if (config_value) |config| switch (config) {
         .string => config.string,
         .object => std.json.Stringify.valueAlloc(a, config, .{}) catch |err| return capi.mapError(err),
         else => return capi.mapError(error.InvalidIndexConfig),
-    } else std.json.Stringify.valueAlloc(a, value, .{}) catch |err| return capi.mapError(err);
+    } else std.json.Stringify.valueAlloc(a, index_value, .{}) catch |err| return capi.mapError(err);
     const kind: db_mod.types.IndexKind = if (std.mem.eql(u8, discriminator.string, "embeddings")) blk: {
         const config = std.json.parseFromSliceLeaky(std.json.Value, a, normalized_config, .{}) catch |err| return capi.mapError(err);
         if (config != .object) return capi.mapError(error.InvalidIndexConfig);
@@ -7191,6 +7358,15 @@ pub export fn antfly_db_add_index_json(
         }
         break :blk .dense_vector;
     } else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse return capi.mapError(error.InvalidIndexType);
+    // Validate command targets before registering any inline producers/resolvers.
+    if (replacement) |old| {
+        if (old != .string or old.string.len == 0 or std.mem.eql(u8, old.string, name.string))
+            return capi.mapErrorContext(error.InvalidArgument, "replaces must name a different graph index");
+        if (kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
+        if (handle.database().core.index_manager.get(old.string)) |previous| {
+            if (previous.kind != .graph) return capi.mapErrorContext(error.InvalidArgument, "atomic replacement requires graph indexes");
+        }
+    }
     const parsed = .{ .value = .{ .name = name.string, .config_json = normalized_config } };
     // A native Lite handle also accepts the server's nested "enrichments"
     // shape on this index's own config (see `registerLiteIndexEnrichments`),
@@ -7202,11 +7378,26 @@ pub export fn antfly_db_add_index_json(
     // enrichment/resolver registration restores the pre-call enrichment
     // catalog instead of leaving durably changed producers behind a caller
     // who was told the AddIndex failed.
+    {
+        const jobs = handle.database().graphReplacementStatusAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        defer jobs.deinit();
+        for (jobs.value) |job| {
+            if (!std.mem.eql(u8, job.name, parsed.value.name)) continue;
+            const cfg = job.config orelse return capi.mapError(error.InvalidIndexConfig);
+            const same = cfg.kind == kind and (@import("../storage/db/enrichment/config_validation.zig").producerJsonValuesEqual(handle.alloc, cfg.config_json, parsed.value.config_json) catch |err| return capi.mapError(err));
+            if (!same or (replacement != null and !std.mem.eql(u8, replacement.?.string, job.old)))
+                return capi.mapErrorContext(error.IndexReplacementConfigurationMismatch, "index name is reserved by a different pending replacement; cancel_replacement before changing it");
+            if (job.phase == .failed)
+                return capi.mapErrorContext(error.IndexReplacementFailed, "replacement failed; inspect pending_work_stats and cancel_replacement before retrying");
+            generation.* = job.generation;
+            return .ok;
+        }
+    }
     var rollback: ?LiteCatalogRollback = null;
     defer if (rollback) |*undo| undo.deinit();
-    if (handle.lite_profile == .native) {
+    {
         rollback = LiteCatalogRollback.init(handle) catch |err| return capi.mapError(err);
-        registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
+        if (handle.lite_profile == .native) registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
             rollback.?.restore();
             return capi.mapError(err);
         };
@@ -7223,10 +7414,10 @@ pub export fn antfly_db_add_index_json(
     else
         parsed.value.config_json;
     defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
-    // Native clients replay inline configs on every open. Admit an identical
+    // Embedded clients replay inline configs on every open. Admit an identical
     // existing index idempotently, while retaining duplicate-config conflicts.
     var existing_index = false;
-    if (handle.lite_profile == .native) {
+    {
         const installed = handle.database().listIndexes(handle.alloc) catch |err| {
             if (rollback) |*undo| undo.restore();
             return capi.mapError(err);
@@ -7243,34 +7434,68 @@ pub export fn antfly_db_add_index_json(
                 return capi.mapErrorContext(error.InvalidArgument, "index already exists with a different configuration");
             }
             existing_index = true;
+            generation.* = cfg.coverage_generation;
         }
     }
-    if (!existing_index) handle.database().*.addIndex(.{
-        .name = parsed.value.name,
-        .kind = kind,
-        .config_json = stored_config_json,
-    }) catch |err| {
-        if (rollback) |*undo| undo.restore();
-        return capi.mapError(err);
-    };
-    // A native handle also registers the entity resolvers a graph config
-    // declares inline, after the index (and its source artifact's enrichment)
-    // is admitted, the way the server's provisioner runs ensureResolvers
-    // after index reconciliation. A resolver registration failure unwinds
-    // the just-admitted index and the enrichment catalog so the call is
-    // all-or-nothing.
-    if (handle.lite_profile == .native and kind == .graph) {
+    // Reactivate inline identities before graph construction reads retained
+    // resolution artifacts. Otherwise a new generation can be built while its
+    // resolver is retired, then skip already-current resolutions on replay.
+    // The undo buffer restores both active and retired state on failed admission.
+    if (kind == .graph) {
         registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
-            if (!existing_index) _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
-                std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
-            };
-            if (rollback) |*undo| undo.restore();
+            rollback.?.restore();
             if (err == error.ResolverMergeNamespaceChange)
-                return capi.mapErrorContext(err, "changing a resolver table or key_template requires explicitly resetting or migrating its durable merges");
+                return capi.mapErrorContext(err, "changing a resolver table, key_template, or fenced inline aliases requires explicitly resetting or migrating its durable namespace");
             return capi.mapError(err);
         };
     }
+    const index_cfg: db_mod.types.IndexConfig = .{ .name = parsed.value.name, .kind = kind, .config_json = stored_config_json };
+    if (!existing_index) {
+        if (replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null) {
+            generation.* = handle.database().replaceGraphIndex(replacement.?.string, index_cfg) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            };
+        } else {
+            handle.database().addIndex(index_cfg) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            };
+            generation.* = handle.database().indexGeneration(index_cfg.name) orelse return capi.mapError(error.Cancelled);
+        }
+    }
+    if (existing_index and replacement != null) {
+        if (handle.database().core.index_manager.get(replacement.?.string) != null) {
+            _ = handle.database().deleteIndex(replacement.?.string) catch |err| {
+                // A pre-publication failure must undo inline config changes.
+                // After publication the index is gone and its new identity state
+                // must remain consistent with the committed catalog.
+                if (handle.database().core.index_manager.get(replacement.?.string) != null) rollback.?.restore();
+                return capi.mapError(err);
+            };
+        }
+    }
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
+    @import("tables.zig").noteReaderVersion(handle) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_cancel_replacement(
+    handle_ptr: ?*anyopaque,
+    name: capi.Slice,
+    out_deleted: ?*bool,
+) capi.ErrorCode {
+    capi.clearLastError();
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const out = out_deleted orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
+    out.* = false;
+    const handle = guard.handle;
+    out.* = handle.database().*.cancelReplacement(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -8002,5 +8227,70 @@ test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+    }
+}
+
+test "capi resolver replacement public waits retain admission generation across quanta" {
+    const a = std.testing.allocator;
+    for (0..4) |mode| {
+        var directory = try TestDirectory.init("replacement-public-wait-generation");
+        defer directory.cleanup();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+        defer a.free(path);
+        const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted }, true);
+        const id = try publishHandle(handle);
+        defer antfly_db_close(id);
+        const old = "{\"name\":\"old\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        const replacement = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        const wait_replace = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"wait\":{\"timeout_ms\":1000}}";
+        const wait_join = "{\"name\":\"new\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"wait\":{\"timeout_ms\":1000}}";
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(old)));
+        if (mode != 0) try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(replacement)));
+        const Reuse = struct {
+            var later_quantum = false;
+            var calls: usize = 0;
+            var original_generation: u64 = 0;
+            fn hook(handle_ptr: ?*anyopaque) anyerror!void {
+                calls += 1;
+                {
+                    const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+                    defer guard.leave();
+                    if (guard.entry_error != null) return error.TestUnexpectedResult;
+                    const database = guard.handle.database();
+                    const jobs = try database.graphReplacementStatusAlloc(guard.handle.alloc);
+                    defer jobs.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+                    original_generation = jobs.value[0].generation;
+                    if (later_quantum and calls == 1) {
+                        // Hold the first quantum in backoff, without relying
+                        // on corpus size, scheduler speed or thread timing.
+                        var job = jobs.value[0];
+                        job.retry_after_ns = @as(u64, @intCast(@max(0, std.Io.Timestamp.now(database.core.index_manager.checkpointIo(), .real).toNanoseconds()))) + 2 * std.time.ns_per_s;
+                        try database.core.index_manager.saveGraphReplacementBuild(database.core.store, job);
+                        return;
+                    }
+                }
+                test_index_before_wait_quantum = null;
+                var deleted = false;
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_cancel_replacement(handle_ptr, .fromSlice("new"), &deleted));
+                try std.testing.expect(deleted);
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
+                const different = "{\"name\":\"new\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"other_links\"}]}";
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle_ptr, .fromSlice(different)));
+            }
+        };
+        Reuse.calls = 0;
+        Reuse.original_generation = 0;
+        Reuse.later_quantum = mode == 3;
+        test_index_before_wait_quantum = Reuse.hook;
+        defer test_index_before_wait_quantum = null;
+        try std.testing.expectEqual(capi.ErrorCode.cancelled, antfly_db_add_index_json(id, .fromSlice(if (mode == 2) wait_join else wait_replace)));
+        try std.testing.expectEqual(@as(usize, if (mode == 3) 2 else 1), Reuse.calls);
+        const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const database = guard.handle.database();
+        try std.testing.expect(database.indexGeneration("old") != null);
+        try std.testing.expect(database.indexGeneration("new").? != Reuse.original_generation);
     }
 }

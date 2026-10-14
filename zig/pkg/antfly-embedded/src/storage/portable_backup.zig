@@ -1766,6 +1766,7 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
+        std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
         std.mem.eql(u8, key, resolver_catalog.merge_catalog_key);
 }
 
@@ -3440,6 +3441,7 @@ const PortableArchiveValidation = struct {
     saw_index_catalog: bool = false,
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
+    minimum_reader_version: ?u32 = null,
     saw_resolver_merges: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
@@ -3695,6 +3697,9 @@ const PortableArchiveValidation = struct {
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
+        if (self.minimum_reader_version) |version| {
+            if (version < try resolver_catalog.catalogReaderVersion(alloc, resolver_bytes)) return error.InvalidMetadataBatch;
+        }
         const configs = try resolver_catalog.deserializeCatalog(alloc, resolver_bytes);
         defer {
             for (configs) |*cfg| cfg.deinit(alloc);
@@ -4632,6 +4637,11 @@ fn validateMetadataEntries(
             };
             archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, resolver_catalog.minimum_reader_key)) {
+            if (archive.minimum_reader_version != null) return error.InvalidMetadataBatch;
+            const version = std.fmt.parseInt(u32, entry.value, 10) catch return error.InvalidMetadataBatch;
+            if (version == 0 or version > resolver_catalog.supported_reader_version) return error.InvalidMetadataBatch;
+            archive.minimum_reader_version = version;
         } else if (std.mem.eql(u8, entry.key, resolver_catalog.merge_catalog_key)) {
             if (archive.saw_resolver_merges) return error.InvalidMetadataBatch;
             resolver_catalog.validateSerializedMergeState(alloc, entry.value) catch |err| switch (err) {
