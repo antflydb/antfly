@@ -44272,7 +44272,14 @@ test "text merge publication keeps every chunk member sharing one parent ordinal
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    // This fixture tests chunk identities, not the production volume's safety
+    // reserve. Keep real scratch admission with a fixture-sized disk floor.
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(alloc);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -44685,7 +44692,14 @@ test "text merge native admission excludes streamed document coordinate and ordi
     defer a.free(path_z);
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 10 * 1024 * 1024, .hard_limit_bytes = 10 * 1024 * 1024 };
-    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    // Preserve the actual 10 MiB merge-memory ceiling without requiring a
+    // production-sized free-disk reserve on the compiler's shared volume.
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(a);
     var store = try docstore_mod.DocStore.open(a, path_z, .{});
     defer store.close();
     var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
