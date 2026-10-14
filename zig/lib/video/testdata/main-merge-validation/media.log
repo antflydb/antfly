@@ -1,0 +1,25 @@
+test-video
++- run test
+   +- compile test debug native 1 errors
+lib/image/src/webp.zig:6014:1: error: expected statement, found 'test'
+test "vp8l prefix lookup matches linear decoding for every sixteen-bit prefix" {
+^~~~
+error: 1 compilation errors
+failed command: /Users/ajroetker/bin/zig-0.17.0/zig test -cflags -fobjc-arc -Wall -Wextra -Werror -- lib/video/src/backends/apple_prepare.m -cflags -fobjc-arc -Wall -Wextra -Werror -- lib/video/src/backends/apple_video.m -cflags -fobjc-arc -- lib/video/src/backends/apple_video_test.m -Odebug -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -F /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks -I /tmp/zig-local-cache/o/34fd64c9643ddbe6ab826b53126b5211 -L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib --dep antfly_media --dep antfly_image -Mroot=lib/video/video_test_root.zig -Odebug -Mantfly_media=lib/media/src/mod.zig -Odebug -Mantfly_image=lib/image/src/mod.zig -framework Foundation -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Metal -lc --libc /tmp/zig-local-cache/o/3215515f51bda522802b7a9c822f21fb/macos-sdk-libc.txt --cache-dir /tmp/zig-local-cache --global-cache-dir /private/tmp/antfly-av1-model-qualification-global --build-root . --name test --zig-lib-dir /Users/ajroetker/bin/zig-0.17.0/lib/ --listen=-
+
+test-media
++- run test w
+one-byte fragment: 10409 bytes, 15 allocations, 32767 allocated bytes, 16384 retained capacity
+failed command: /tmp/zig-local-cache/o/f543983f692c68700c014515a8ce8425/test --cache-dir=/tmp/zig-local-cache --seed=0x78d401d0 --listen=-
+
+Build Summary: 5/8 steps succeeded (1 failed); 168/168 tests passed
+test-video transitive failure
++- run test transitive failure
+   +- compile test debug native 1 errors
+      +- WriteFile macos-sdk-libc.txt cached
+      +- WriteFile video_prepare_shader.h cached
+test-media success
++- run test 168 pass (168 total) 6s MaxRSS:35M
+   +- compile test debug native success 1m MaxRSS:484M
+      +- WriteFile macos-sdk-libc.txt (reused)
+

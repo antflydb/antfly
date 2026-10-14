@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "date": "2026-10-14",
+  "branch_parent": "fbaa9544f7644dbaeb399fd0d729e1c2bcdcbe04",
+  "merged_main": "4838edd96171b020eb865e62f16e027551d02a79",
+  "validated_source_tree_before_receipt": "c95db5b3ffb35a5799a330c378d9cc27d8fd81e3",
+  "host": "macOS ARM64",
+  "zig": "0.17.0",
+  "source_sha256": {
+    "zig/pkg/inference/build.zig": "789003ff6ade609457e66c2daf58ad4cbd0da121ef554fee8eb72f8a0aaf01b5",
+    "zig/pkg/inference/build/commands.zig": "df89fc69670a72d01d6fb5e7c9ea97853a595ded4c43a9200c30dd2be5df9088",
+    "zig/lib/image/src/webp.zig": "7db424e318f9e94b5491e08d53a4cf5f5caaac462ff4566eec0973eedac61216",
+    "zig/lib/objectstore/src/types.zig": "63748fa88c5759990677b70a6134f565da2b8cbf38925dc9fdb09792a6bca5f0",
+    "zig/pkg/inference/src/architectures/embedding_gemma2.zig": "2ace4f202e1cfe6061101cfe5b4c431100c8e5c979c0ea67a9043038728e5b8f",
+    "zig/pkg/inference/src/architectures/embedding_gemma2_config.zig": "84362be11966d339ed02a7340d141c1c24d86bb58af7416fd0d463704cba7c43",
+    "zig/pkg/inference/src/architectures/gemma4_projector.zig": "efb55ee97ba0145f2ffc1b89d95f63088862a28d1ad4d16e8c587e4c0ef63043",
+    "zig/pkg/inference/src/backends/metal_kernels.m": "7b3ff92d204a39aaa460525105f16f3a2fe8ac85cdbac2209caa5974f727d72c",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "1a5442353ce175d7191cf785271ca643d5495386fea8bc02bfcf238eb213bd4f",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "41344f1fce8eaa14af74eaf0b993a124ad419cb4464e4f07ac8c43dfa8c0e5b2",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "d85cfb0c5c65d359b0bd9bf3f559a4a58d085054e3c92c8b8ba4533d60ed41df",
+    "zig/pkg/inference/src/server/server.zig": "1a20f06496d4d78ee86df848b6c8ac04e0f6d0e988e3f66becbaa26a5967a1e6",
+    "zig/pkg/inference/src/models/embedding_gemma2_identity.zig": "3fc2f0fa50829747818081ec14bb278bd04aca206e9e4a5ce35215d90802a4d4"
+  },
+  "inference_binary_sha256": "4cea17d16f9f31b4bcf43cc17b4f00ba322d377138e0030136ae3ce788301792",
+  "video_binary_sha256": "f7e25936bba8d6cf069803b1b906f670b9d416adcad2801efab18c9b84c9c12a",
+  "oracle_sha256": "fd721cfb54d60b378afcabc8487d29f69526f119ef96b70a25e373ffd05cd2bd",
+  "checkpoint_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+  "results": {
+    "media": {
+      "passed": 168,
+      "note": "Combined initial build had a video syntax conflict; media completed successfully. The corrected video binary is qualified separately."
+    },
+    "inference_metal": {
+      "selected": 106,
+      "passed": 98,
+      "skipped": 8,
+      "failed": 0
+    },
+    "video_device": {
+      "passed": 265,
+      "skipped": 2,
+      "failed": 0
+    },
+    "pretrained_metal": {
+      "cases": 6,
+      "http": true,
+      "max_coordinate_error": 4.563e-05,
+      "min_cosine": 0.99999994,
+      "gate_max_coordinate_error": 0.001
+    },
+    "pretrained_cpu": {
+      "cases": 6,
+      "http": true,
+      "max_coordinate_error_logged": 2.68e-07,
+      "min_cosine_logged": 1.0,
+      "gate_max_coordinate_error": 0.0001
+    }
+  },
+  "log_sha256": {
+    "media.log": "7d048c7b5f4adfdcd3352cedd980d10ff32dbdb305f15c19f59cb043eccffc85",
+    "inference-metal.log": "9a219c08c135a0d1b975af36292c4a5e6421986f1607da9ede084bc6826466b4",
+    "video-device.log": "f5e5c840f5d1285cc65d385fea6115b92950bad9123380e3d14266ebb6425ac5",
+    "pretrained-metal.log": "ecb3e9ddaf29557ce083adc37d8eb754b1b72f2242899651928922162252c90b",
+    "pretrained-cpu.log": "37d853d308a8b07304d5425ce49f7dbd262775327b94dde0d1d50c753a6490f7"
+  },
+  "merge_commit": "2acae2b554bf0c4cba7b1279d766412267a0ef14",
+  "commit_hook": {
+    "license_check": "passed",
+    "resolved_zig_format_check": "passed",
+    "status": "bypassed_for_merge",
+    "reason": "TypeScript pnpm dependency verification required pnpm install; failing file was unchanged from origin/main."
+  },
+  "pre_push_tidy_check": "passed for all ten Go modules",
+  "status": "pass"
+}
