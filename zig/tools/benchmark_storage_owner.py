@@ -230,10 +230,18 @@ def main():
     for mode in ["document", "relational"]:
         old = statistics.median(x[mode]["elapsed_ns"] for x in samples["baseline"])
         new = statistics.median(x[mode]["elapsed_ns"] for x in samples["candidate"])
+        # Nearby pairs control host drift better than a ratio of independent
+        # medians; retain both summaries so variability stays visible.
+        paired = [
+            100 * (new_sample[mode]["elapsed_ns"] / old_sample[mode]["elapsed_ns"] - 1)
+            for old_sample, new_sample in zip(samples["baseline"], samples["candidate"])
+        ]
         summary[mode] = {
             "baseline_median_ns": old,
             "candidate_median_ns": new,
             "time_change_percent": 100 * (new / old - 1),
+            "paired_time_change_percent": paired,
+            "paired_median_time_change_percent": statistics.median(paired),
         }
     result = {
         "host": platform.platform(),
