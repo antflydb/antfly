@@ -3851,3 +3851,19 @@ coordinate maps. This cost is available from authenticated navigation alone;
 planning never fetches source-span pages. New serving roots maintain the aggregate
 cost incrementally. Older roots without that counter use bounded windows instead
 of the small-corpus shortcut until a fresh serving layout is published.
+
+Qualification for code head `99b054525a` (including `origin/main` at `7aa031f49d`):
+
+- Debug server and lake suites: 95/95 build steps; 437 integration and 36 focused
+  test executions passed, with no failures or leaks.
+- ReleaseFast focused suite: 51/51 build steps; 36 test executions passed, with
+  no failures or leaks.
+- Object-store suite: 92 passed; two live-provider tests skipped. Provider code is
+  unchanged from the separately qualified refinement commit `8f4e4ee042`.
+- Real Parquet/Iceberg E2Es: all 15 selected tests passed (31 deselected) in
+  310.93 seconds, including the 131-file paged-pack/bounded-window fixtures.
+- Apache dependency boundary verified 2,037 sources; license headers, formatting
+  of 69 changed Zig files, Python formatting/name checks and Git whitespace passed.
+
+These results qualify correctness and bounded execution. Provider retention
+policies and archive-scale throughput/latency/RSS remain separate qualification.
