@@ -19422,13 +19422,8 @@ pub const DB = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const State = struct { request: cut.Request, sequence: u64, complete: bool = false, next_ms: u64 = 0 };
-        var state: ?State = if (@import("native_backup.zig").readFileAlloc(a, io, state_path, 4096)) |bytes|
-            try std.json.parseFromSliceLeaky(State, a, bytes, .{})
-        else |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        const warming = @import("native_query_warming.zig");
+        var state = try warming.readState(a, io, state_path);
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
@@ -19449,7 +19444,7 @@ pub const DB = struct {
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
             try self.captureQueryCutInternal(state.?.request, cancellation, false);
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
         }
         const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
@@ -19457,7 +19452,7 @@ pub const DB = struct {
         if (completed) {
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
             try std.Io.Dir.cwd().deleteTree(io, root);
