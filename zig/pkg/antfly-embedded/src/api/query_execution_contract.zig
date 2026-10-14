@@ -4761,6 +4761,10 @@ fn expectScanner(scanner: *std.json.Scanner, token: std.json.TokenType) !void {
     _ = try scanner.next();
 }
 fn rawObjectSource(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]u8 {
+    const raw = (try rawObjectSourceRange(scratch, scanner, options)) orelse return null;
+    return try alloc.dupe(u8, raw);
+}
+fn rawObjectSourceRange(scratch: *std.heap.ArenaAllocator, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]const u8 {
     var start = scanner.*.cursor;
     while (start < scanner.*.input.len and (std.ascii.isWhitespace(scanner.*.input[start]) or scanner.*.input[start] == ':')) : (start += 1) {}
     if (try scanner.*.peekNextTokenType() == .null) {
@@ -4798,10 +4802,14 @@ fn rawObjectSource(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, 
             else => try scanner.*.skipValue(),
         }
     }
-    return try alloc.dupe(u8, scanner.*.input[start..scanner.*.cursor]);
+    return scanner.*.input[start..scanner.*.cursor];
 }
 
 const RemoteSearchParser = struct {
+    authority_group: ?u64 = null,
+    // Borrow ranges until capability metadata has been checked. Old providers
+    // may put arbitrary user documents in _source; never interpret them early.
+    pending_sources: std.ArrayListUnmanaged(?[]const u8) = .empty,
     alloc: std.mem.Allocator,
     scanner: std.json.Scanner,
     metadata: std.heap.ArenaAllocator,
@@ -4811,6 +4819,7 @@ const RemoteSearchParser = struct {
     rows_seen: bool = false,
     graph_results: ?[]db_mod.types.GraphSearchResult = null,
     fn deinit(self: *@This()) void {
+        self.pending_sources.deinit(self.alloc);
         if (self.graph_results) |results| {
             for (results) |*result| result.deinit(self.alloc);
             self.alloc.free(results);
@@ -4864,11 +4873,16 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
         var stored: ?[]u8 = null;
+        var pending: ?[]const u8 = null;
         errdefer if (stored) |value| self.alloc.free(value);
         var seen: u64 = 0;
         while (try self.key(a)) |name| {
             const i = try index(metadata_openapi.QueryHit, name, &seen);
-            if (std.mem.eql(u8, name, "_source")) stored = try self.source() else try self.member(metadata_openapi.QueryHit, &wire, i, a);
+            if (std.mem.eql(u8, name, "_source")) {
+                if (self.authority_group != null) {
+                    pending = try rawObjectSourceRange(&self.scratch, &self.scanner, self.options);
+                } else stored = try self.source();
+            } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
         }
         if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
         var hit: db_mod.types.SearchHit = .{ .id = try self.alloc.dupe(u8, wire._id) };
@@ -4883,6 +4897,7 @@ const RemoteSearchParser = struct {
         hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(self.alloc, wire.hierarchy);
         hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(self.alloc, wire.hierarchy);
         hit.highlights = try parseRemoteHighlightsAlloc(self.alloc, wire._highlights);
+        if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
         return hit;
@@ -4970,7 +4985,17 @@ pub fn parseRemoteSearchResultWithScratch(alloc: std.mem.Allocator, scratch: std
 }
 
 fn parseRemoteSearchResultInnerWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultOwned(alloc, scratch, body, null, null);
+}
+
+/// Private authenticated transport: decode the proof from wire and copy only
+/// the document range into its final owner, never an intermediate envelope.
+pub fn parseRemoteSearchResultWithAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, group: u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultOwned(alloc, scratch, body, group, document_allocator) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, authority_group: ?u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
     var parser: RemoteSearchParser = .{
+        .authority_group = authority_group,
         .alloc = alloc,
         .scanner = std.json.Scanner.initCompleteInput(scratch, body),
         .metadata = std.heap.ArenaAllocator.init(scratch),
@@ -4991,7 +5016,32 @@ fn parseRemoteSearchResultInnerWithScratch(alloc: std.mem.Allocator, scratch: st
     const relation = try query_contract.parseTotalHitsRelation(total.relation);
     const graphs = parser.graph_results;
     parser.graph_results = null;
-    return try finishRemoteSearchResult(alloc, response, hits, total_hits, relation, graphs);
+    var result = try finishRemoteSearchResult(alloc, response, hits, total_hits, relation, graphs);
+    // The outer errdefer owns the hit metadata until return.
+    errdefer {
+        result.hits = &.{};
+        result.deinit();
+    }
+    if (authority_group) |group| {
+        if (result.document_authority_version != 1) return result;
+        const body_allocator = document_allocator orelse alloc;
+        // Hit metadata remains covered by the outer errdefer; bodies can have
+        // a different owner and need their own rollback before it executes.
+        errdefer for (hits) |*hit| {
+            if (hit.stored_data) |bytes| body_allocator.free(bytes);
+            hit.stored_data = null;
+        };
+        for (hits, parser.pending_sources.items) |*hit, source| {
+            const authority_envelope = (try db_mod.types.document_authority.parse(scratch, source orelse return error.InvalidRemoteResponse)) orelse return error.InvalidRemoteResponse;
+            if (authority_envelope.authority.group != group) return error.InvalidRemoteResponse;
+            const proof = try alloc.create(db_mod.types.document_authority.Authority);
+            proof.* = authority_envelope.authority;
+            hit.document_authority = proof;
+            if (authority_envelope.document) |raw| hit.stored_data = try body_allocator.dupe(u8, raw);
+        }
+        result.stored_data_allocator = document_allocator;
+    }
+    return result;
 }
 
 fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi.QueryResult, hits: []db_mod.types.SearchHit, total_hits: u32, total_hits_relation: db_mod.types.TotalHitsRelation, streamed_graphs: ?[]db_mod.types.GraphSearchResult) !db_mod.types.SearchResult {
@@ -7247,4 +7297,32 @@ test "public graph metric borrowed wire scratch allocator reclaims nested arenas
     scratch.free(temporary);
     try std.testing.expectEqual(before + temporary.len, quota.freed_bytes);
     try std.testing.expectEqualStrings("retained", retained);
+}
+
+test "public graph metric borrowed wire authority decoder copies only final document and retires scratch" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const proof: db_mod.types.document_authority.Authority = .{ .group = 7, .version = 9, .digest = @splat(3) };
+            const envelope = try db_mod.types.document_authority.encode(a, proof, "{\"n\":1e2,\"text\":\"hello\"}");
+            defer a.free(envelope);
+            const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":1}}}}]}}", .{envelope});
+            defer a.free(wire);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            var live = true;
+            defer if (live) scratch.deinit();
+            var result = try parseRemoteSearchResultWithAuthority(scratch.allocator(), scratch.allocator(), wire, 7, a);
+            // Metadata is still in scratch; extract the final body, then retire
+            // every parser/result metadata allocation before using it.
+            const document = result.hits[0].stored_data.?;
+            defer a.free(document);
+            try std.testing.expect(result.hits[0].document_authority.?.eql(proof));
+            result.hits[0].stored_data = null;
+            result.deinit();
+            scratch.deinit();
+            live = false;
+            try std.testing.expectEqualStrings("{\"n\":1e2,\"text\":\"hello\"}", document);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

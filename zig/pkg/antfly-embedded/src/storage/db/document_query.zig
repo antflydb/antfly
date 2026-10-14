@@ -34,6 +34,17 @@ pub fn lookupJson(
     };
 }
 
+/// Projection containers use scratch; only serialized bytes use output.
+/// Strings and number lexemes borrow the parsed source until encoding ends.
+pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
+    if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var projected = try projectLookupView(alloc, parsed.value, opts);
+    defer deinitProjectionView(alloc, &projected);
+    return .{ .json = try std.json.Stringify.valueAlloc(output, projected, .{}) };
+}
+
 pub fn projectLookupJsonValue(
     alloc: Allocator,
     raw: []const u8,

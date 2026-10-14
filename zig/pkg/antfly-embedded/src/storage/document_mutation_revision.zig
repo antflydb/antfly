@@ -46,6 +46,63 @@ pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     if (value.kind != physical[physical.len - 1] or value.revision != try load(txn, key)) return null;
     return value;
 }
+/// Decode a bounded proof window from one sorted, deduplicated metadata read.
+/// Values are reduced to owned scalars before any primary read can retire them.
+pub fn loadWindow(txn: anytype, a: std.mem.Allocator, physical: []const []const u8, ids: []const []const u8, contents: []?Content, timestamps: []u64) !void {
+    if (physical.len != ids.len or contents.len != ids.len or timestamps.len != ids.len or ids.len > 64) return error.InvalidArgument;
+    const Entry = struct {
+        key: []const u8,
+        row: usize,
+        kind: enum { content, revision, timestamp },
+        value_index: usize = 0,
+        fn less(_: void, left: @This(), right: @This()) bool {
+            return std.mem.order(u8, left.key, right.key) == .lt;
+        }
+    };
+    const entries = try a.alloc(Entry, ids.len * 3);
+    defer a.free(entries);
+    var initialized: usize = 0;
+    defer for (entries[0..initialized]) |entry| a.free(entry.key);
+    for (physical, ids, 0..) |row, id, i| {
+        const revision = keyForPhysical(row) orelse return error.InvalidArgument;
+        entries[initialized] = .{ .key = try a.dupe(u8, &contentKey(revision)), .row = i, .kind = .content };
+        initialized += 1;
+        entries[initialized] = .{ .key = try a.dupe(u8, &revision), .row = i, .kind = .revision };
+        initialized += 1;
+        entries[initialized] = .{ .key = try keys.ttlKeyAlloc(a, id), .row = i, .kind = .timestamp };
+        initialized += 1;
+    }
+    std.mem.sort(Entry, entries, {}, Entry.less);
+    var sorted: [192][]const u8 = undefined;
+    var values: [192]?[]const u8 = undefined;
+    var count: usize = 0;
+    for (entries) |*entry| {
+        if (count == 0 or !std.mem.eql(u8, sorted[count - 1], entry.key)) {
+            sorted[count] = entry.key;
+            count += 1;
+        }
+        entry.value_index = count - 1;
+    }
+    try txn.getManySorted(sorted[0..count], values[0..count]);
+    @memset(contents, null);
+    @memset(timestamps, 0);
+    var revisions: [64]u64 = @splat(0);
+    for (entries) |entry| if (values[entry.value_index]) |raw| switch (entry.kind) {
+        .content => contents[entry.row] = try decodeContent(raw),
+        .revision => {
+            if (raw.len != 8) return error.InvalidDocumentMutationRevision;
+            revisions[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+        },
+        .timestamp => {
+            if (raw.len != 8) return error.InvalidTimestamp;
+            timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+        },
+    };
+    for (contents, physical, 0..) |*content, row, i| if (content.*) |cached| {
+        if (!keys.isStoredDocumentRowKey(row) or cached.kind != row[row.len - 1] or cached.revision != revisions[i]) content.* = null;
+    };
+}
+
 fn encodeContent(value: Content) [49]u8 {
     var raw: [49]u8 = undefined;
     std.mem.writeInt(u64, raw[0..8], value.revision, .little);
@@ -265,4 +322,48 @@ test "public graph metric borrowed wire cached content authority fences legacy w
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     std.debug.print("CONTENT_AUTHORITY cached_read_bytes=57 primary_reads=0 query_hash_bytes=0\n", .{});
+}
+
+test "public graph metric borrowed wire metadata window batches deduplicates and fences stale content" {
+    const Case = struct {
+        const Fake = struct {
+            calls: usize = 0,
+            count: usize = 0,
+            revision: [8]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            timestamp: [8]u8 = .{ 7, 0, 0, 0, 0, 0, 0, 0 },
+            content: [49]u8 = encodeContent(.{ .revision = 1, .bytes = 16384, .kind = 0, .digest = @splat(3) }),
+            pub fn getManySorted(self: *@This(), sorted: []const []const u8, values: []?[]const u8) !void {
+                self.calls += 1;
+                self.count = sorted.len;
+                for (sorted, values, 0..) |key, *value, i| {
+                    if (i > 0) try std.testing.expect(std.mem.order(u8, sorted[i - 1], key) == .lt);
+                    value.* = if (std.mem.startsWith(u8, key, content_prefix)) &self.content else if (std.mem.startsWith(u8, key, prefix)) &self.revision else &self.timestamp;
+                }
+            }
+        };
+        fn run(a: std.mem.Allocator) !void {
+            const physical = try keys.documentKeyAlloc(a, "doc");
+            defer a.free(physical);
+            var fake = Fake{};
+            // Use the real primary suffix rather than assuming its encoding.
+            fake.content[16] = physical[physical.len - 1];
+            const rows: [64][]const u8 = @splat(physical);
+            const ids: [64][]const u8 = @splat("doc");
+            var contents: [64]?Content = undefined;
+            var timestamps: [64]u64 = undefined;
+            try loadWindow(&fake, a, &rows, &ids, &contents, &timestamps);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expectEqual(@as(usize, 3), fake.count);
+            for (contents, timestamps) |content, timestamp| {
+                try std.testing.expectEqual(@as(u64, 16384), content.?.bytes);
+                try std.testing.expectEqual(@as(u64, 7), timestamp);
+            }
+            fake.revision[0] = 2;
+            try loadWindow(&fake, a, &rows, &ids, &contents, &timestamps);
+            for (contents) |content| try std.testing.expect(content == null);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    std.debug.print("AUTHORITY_WINDOW rows=64 point_calls_before=192 batch_calls_after=1 unique_keys=3\n", .{});
 }

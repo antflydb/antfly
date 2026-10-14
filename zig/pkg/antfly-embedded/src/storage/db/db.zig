@@ -18183,6 +18183,9 @@ pub const DB = struct {
     }
 
     fn lookupPrimarySnapshotWithSchema(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
+        return self.lookupPrimarySnapshotWithSchemaAndOutput(alloc, alloc, key, opts, probe, schema_view);
+    }
+    fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -18260,17 +18263,19 @@ pub const DB = struct {
                 fields,
             );
             defer projection.deinit();
-            break :blk try projection.project(alloc, row);
+            break :blk try projection.project(output, row);
         } else blk: {
-            const materialized = if (ordinal_row) |row|
-                try row.reconstructValueAlloc(alloc)
-            else
-                try alloc.dupe(u8, raw);
-            if (opts.fields.len == 0 and opts.include_all_fields) break :blk materialized;
-            defer alloc.free(materialized);
-            break :blk try projectLookupStoredBytes(self, alloc, key, materialized, opts);
+            if (opts.fields.len == 0 and opts.include_all_fields) break :blk if (ordinal_row) |row| try row.reconstructValueAlloc(output) else try output.dupe(u8, raw);
+            const materialized = if (ordinal_row) |row| try row.reconstructValueAlloc(alloc) else null;
+            defer if (materialized) |bytes| alloc.free(bytes);
+            break :blk try db_query_projection.projectLookupStoredBytesWithOutput(alloc, output, key, materialized orelse raw, opts, .{
+                .ctx = self,
+                .load_chunks = loadChunkFieldValueCallback,
+                .load_embeddings = loadEmbeddingFieldValueCallback,
+                .load_artifacts = loadArtifactFieldValueCallback,
+            });
         };
-        errdefer alloc.free(stored);
+        errdefer output.free(stored);
         try checkLookupOptionsActive(opts);
         var version: ?u64 = if (ordinal_row) |row| row.writeTimestampNs() else null;
         var digest: ?[32]u8 = null;
@@ -38565,12 +38570,23 @@ pub const DB = struct {
 
     fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult, pinned: ?*docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !void {
         if (req.document_authority_mode == .none) return;
+        if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
         var read: ?docstore_mod.DocStore.Txn = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
         defer if (read) |*owned| owned.abort();
-        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
-        defer scratch.deinit();
+        var metadata_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer metadata_scratch.deinit();
+        var projection_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer projection_scratch.deinit();
+        var physical: [64][]const u8 = undefined;
+        var ids: [64][]const u8 = undefined;
+        var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
+        var versions: [64]u64 = undefined;
+        const body_allocator = req.document_output_allocator orelse alloc;
+        if (req.document_output_allocator != null) result.stored_data_allocator = body_allocator;
         var eager_bytes: usize = 0;
         for (result.hits, 0..) |*hit, index| {
+            if (req.cancellation) |token| try token.check();
+            if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             // Apply-shared fences ordinary reads; captured dense reads fork
             // the original visibility cut. Retire page scratch every 64 hits.
             if (index != 0 and index % 64 == 0) {
@@ -38578,12 +38594,20 @@ pub const DB = struct {
                 read = null;
                 read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
             }
+            if (index % 64 == 0) {
+                if (!metadata_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = metadata_scratch.reset(.free_all);
+                const m = metadata_scratch.allocator();
+                const count = @min(@as(usize, 64), result.hits.len - index);
+                for (result.hits[index..][0..count], 0..) |candidate, row| {
+                    ids[row] = candidate.id;
+                    physical[row] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, m, candidate.id, schema_view);
+                }
+                try @import("../document_mutation_revision.zig").loadWindow(&read.?, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count]);
+            }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
-            if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
-            const a = scratch.allocator();
-            const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, a, hit.id, schema_view);
-            const cached = try @import("../document_mutation_revision.zig").loadContent(&read.?, store_key);
+            const store_key = physical[index % 64];
+            const cached = contents[index % 64];
             var digest: [32]u8 = undefined;
             const primary_bytes = if (cached) |content| cached: {
                 digest = content.digest;
@@ -38593,29 +38617,32 @@ pub const DB = struct {
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 break :legacy raw.len;
             };
-            const version = try lookupSnapshotTimestamp(a, hit.id, &read.?);
+            const version = versions[index % 64];
             const authority: types.document_authority.Authority = .{ .group = req.document_authority_group, .version = version, .digest = digest };
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
             const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
+            if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshotWithSchema(a, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view)
+                try self.lookupPrimarySnapshotWithSchemaAndOutput(projection_scratch.allocator(), body_allocator, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view)
             else
                 null;
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
                 // Charge actual projected JSON, including native rows whose
                 // compact storage bytes can expand during serialization.
                 if (document.json.len > 8 * 1024 or document.json.len > 64 * 1024 -| eager_bytes) {
-                    document.deinit(a);
+                    document.deinit(body_allocator);
                     projected = null;
                 } else eager_bytes += document.json.len;
             };
-            defer if (projected) |*document| document.deinit(a);
+            defer if (projected) |*document| document.deinit(body_allocator);
             if (req.document_authority_mode == .hydrate and projected == null) return error.StorageReadTemporarilyUnavailable;
             const owned_authority = try alloc.create(types.document_authority.Authority);
             owned_authority.* = authority;
             errdefer alloc.destroy(owned_authority);
-            const document_bytes = if (projected) |document| try alloc.dupe(u8, document.json) else null;
+            // Projection already has final body ownership. No arena copy.
+            const document_bytes = if (projected) |document| document.json else null;
+            projected = null;
             if (hit.stored_data) |bytes| alloc.free(bytes);
             if (hit.source_value) |*value| types.deinitJsonValue(alloc, value);
             if (hit.column_source) |source| source.deinit();

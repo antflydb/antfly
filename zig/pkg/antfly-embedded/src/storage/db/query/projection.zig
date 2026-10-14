@@ -87,6 +87,16 @@ pub fn projectLookupStoredBytes(
     return try projectLookupStoredBytesWithPlan(alloc, doc_key, raw, buildLookupFieldSelectionPlan(opts), loader);
 }
 
+pub fn projectLookupStoredBytesWithOutput(alloc: Allocator, output: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions, loader: SpecialFieldLoader) ![]u8 {
+    const special = parseSpecialFieldSelection(opts.fields);
+    const merged = if (special.all_artifacts or special.all_chunks or special.all_embeddings)
+        try mergeStoredDocumentWithSpecialFields(alloc, doc_key, raw, special, loader)
+    else
+        null;
+    defer if (merged) |bytes| alloc.free(bytes);
+    return (try document_query.lookupJsonWithOutput(alloc, output, merged orelse raw, opts)).json;
+}
+
 pub fn projectStoredBytesForSearch(
     alloc: Allocator,
     req: types.SearchRequest,

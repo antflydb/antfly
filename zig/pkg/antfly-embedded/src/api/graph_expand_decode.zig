@@ -26,6 +26,9 @@ pub const NodeBuilder = struct {
     nodes: std.ArrayListUnmanaged(query.GraphResultNode) = .empty,
     owner: ?*query.GraphMetricColumns = null,
     total_rows: usize,
+    permutation: [query.graph_metric_projection_limit]usize = undefined,
+    permutation_valid: bool = false,
+    permutation_builds: usize = 0,
     values: std.ArrayListUnmanaged(query.GraphMetricValue) = .empty,
     counts: std.ArrayListUnmanaged(usize) = .empty,
     names: std.ArrayListUnmanaged([]u8) = .empty,
@@ -83,6 +86,7 @@ pub const NodeBuilder = struct {
         for (self.nodes.items) |*node| node.metric_columns = null;
         owner.deinit(self.a);
         self.owner = null;
+        self.permutation_valid = false;
     }
     fn resizeColumns(self: *@This(), rows: usize) !void {
         const owner = self.owner orelse return;
@@ -108,6 +112,16 @@ pub const NodeBuilder = struct {
                 same = same and std.mem.eql(u8, name, source.metricAt(column).name);
             };
             if (!same and source.metricCount() == owner.names.len) remap: {
+                if (self.permutation_valid) {
+                    var matches = true;
+                    for (owner.names, 0..) |name, column| matches = matches and std.mem.eql(u8, name, source.metricAt(self.permutation[column]).name);
+                    if (matches) {
+                        source_columns = self.permutation;
+                        same = true;
+                        remapped = true;
+                        break :remap;
+                    }
+                }
                 var used: [query.graph_metric_projection_limit]bool = @splat(false);
                 for (owner.names, 0..) |name, column| {
                     const ordinal = for (0..source.metricCount()) |index| {
@@ -116,6 +130,9 @@ pub const NodeBuilder = struct {
                     used[ordinal] = true;
                     source_columns[column] = ordinal;
                 }
+                self.permutation = source_columns;
+                self.permutation_valid = true;
+                self.permutation_builds += 1;
                 same = true;
                 remapped = true;
             }
@@ -401,6 +418,12 @@ test "public graph metric borrowed wire reordered dictionary retains compact col
             defer builder.deinit();
             try builder.append(.{ .key = "a", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "rank", .score = 1 }, .{ .name = "degree", .score = 2 } }) });
             try builder.append(.{ .key = "b", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = null }, .{ .name = "rank", .score = 3 } }) });
+            for (0..63) |_| try builder.append(.{ .key = "c", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = 4 }, .{ .name = "rank", .score = 5 } }) });
+            try std.testing.expectEqual(@as(usize, 1), builder.permutation_builds);
+            // An ordered row does not invalidate the cached permutation.
+            try builder.append(.{ .key = "d", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "rank", .score = 6 }, .{ .name = "degree", .score = 7 } }) });
+            try builder.append(.{ .key = "e", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = 8 }, .{ .name = "rank", .score = 9 } }) });
+            try std.testing.expectEqual(@as(usize, 1), builder.permutation_builds);
             var owned = try builder.finish();
             defer owned.deinit(a);
             try std.testing.expect(owned.metrics.columns != null);
