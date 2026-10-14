@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_schema_reader_requirements, .err = error.InvalidSchemaReaderRequirements },
     .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
     .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },
     .{ .status = .invalid_index_publication_candidate, .err = error.InvalidIndexPublicationCandidate },

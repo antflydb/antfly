@@ -69,7 +69,8 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+    return std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+        @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
         lhs.object_storage_generation == rhs.object_storage_generation and
         std.mem.eql(u8, &lhs.object_storage_identity, &rhs.object_storage_identity) and
@@ -128,6 +129,13 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.schema_reader_requirements) |requirements| {
+        hashTableDefinitionPart(&hasher, "schema-reader-requirements-v1");
+        var versions: [8]u8 = undefined;
+        std.mem.writeInt(u32, versions[0..4], requirements.semantic_version, .little);
+        std.mem.writeInt(u32, versions[4..8], requirements.encoding_version, .little);
+        hasher.update(&versions);
+    }
     if (table.storage_migration) |migration| {
         hashTableDefinitionPart(&hasher, "vector-migration-v1");
         hashTableDefinitionPart(&hasher, migration.request.job_id);

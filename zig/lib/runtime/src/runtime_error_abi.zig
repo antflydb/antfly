@@ -759,7 +759,14 @@ pub const Detail = enum(c_int) {
     index_owner_receipt_changed,
     invalid_index_owner_receipt,
     sql_invalid_power_argument,
+    invalid_schema_reader_requirements,
 };
+
+test "schema reader requirement validation preserves exact callback error identity" {
+    const wire = statusFromError(error.InvalidSchemaReaderRequirements);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.InvalidSchemaReaderRequirements, errorFromStatus(wire));
+}
 
 test "native index claim failures preserve typed callback boundary identities" {
     const cases = .{
@@ -915,6 +922,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
         error.SqlInvalidPowerArgument => status(.invalid_argument, .sql_invalid_power_argument),
+        error.InvalidSchemaReaderRequirements => status(.invalid_argument, .invalid_schema_reader_requirements),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
         error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
@@ -1646,6 +1654,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
         .sql_invalid_power_argument => "SqlInvalidPowerArgument",
+        .invalid_schema_reader_requirements => "InvalidSchemaReaderRequirements",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
         .sql_index_already_exists => "SqlIndexAlreadyExists",

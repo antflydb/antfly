@@ -3422,6 +3422,22 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const has_reader_requirements = switch (command) {
+        .upsert_table => |table| table.schema_reader_requirements != null,
+        .compare_and_replace_table => |cas| cas.expected.schema_reader_requirements != null or cas.replacement.schema_reader_requirements != null,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.schema_reader_requirements != null,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.schema_reader_requirements != null) break :blk true;
+            break :blk false;
+        },
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| @import("schema_reader_wire.zig").requiresPublication(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresPublication(request.plan_json),
+        else => false,
+    };
+    if (has_reader_requirements) return metadata_topology_protocol.schema_reader_publication_version;
     switch (command) {
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| if (record.schema_reader.known())
             return metadata_topology_protocol.schema_reader_capability_version,
@@ -3524,6 +3540,52 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
 }
 
+test "system catalog schema reader publication rejects invalid facts before readiness or encoding" {
+    const Fake = struct {
+        calls: usize = 0,
+        pub fn cachedCoordinatedDecoderReadiness(self: *@This(), required: u16) !TableTopologyProtocolReadiness {
+            self.calls += 1;
+            try std.testing.expectEqual(metadata_topology_protocol.schema_reader_publication_version, required);
+            return error.NotLeader;
+        }
+    };
+    var fake: Fake = .{};
+    var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_reader_requirements = .{ .semantic_version = 30, .encoding_version = 0 } };
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, prepareCoordinatedDecoderAdmission(&fake, &.{.{ .upsert_table = table }}));
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .table = table }, .{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, prepareCoordinatedDecoderAdmission(&fake, &.{.{ .apply_system_catalog = bytes }}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    table.schema_reader_requirements.?.encoding_version = 31;
+    try std.testing.expectError(error.NotLeader, prepareCoordinatedDecoderAdmission(&fake, &.{.{ .upsert_table = table }}));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    table.schema_reader_requirements = null;
+    _ = try prepareCoordinatedDecoderAdmission(&fake, &.{.{ .upsert_table = table }});
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "system catalog schema reader publication requires the definition decoder across typed and nested proposals" {
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows" };
+    var marked = plain;
+    marked.schema_reader_requirements = .{ .semantic_version = 30, .encoding_version = 31 };
+    const commands = [_]metadata_storage.TransitionCommand{
+        .{ .upsert_table = marked },
+        .{ .compare_and_replace_table = .{ .expected = marked, .replacement = plain } },
+        .{ .compare_and_replace_table = .{ .expected = plain, .replacement = marked } },
+        .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{marked} } },
+        .{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"schema_reader_requirements\":{}}}}}" },
+        .{ .apply_fk_initial_create = "{\"plan\":{\"child\":{\"schema_reader_requirements\":{}}}}" },
+        .{ .apply_fk_generation_publication = "{\"plan\":{\"table\":{\"schema_reader_requirements\":{}}}}" },
+        .{ .apply_restore_staging = "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{}}}]}}" },
+        .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = "{\"table\":{\"schema_reader_requirements\":{}}}" } },
+        .{ .begin_relational_index_publication = "{\"plan\":{\"table\":{\"schema_reader_requirements\":{}}}}" },
+    };
+    for (commands) |command|
+        try std.testing.expectEqual(metadata_topology_protocol.schema_reader_publication_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = plain }));
+    try std.testing.expect(metadata_topology_protocol.schema_reader_publication_version > metadata_topology_protocol.schema_reader_floor_version);
+}
+
 test "catalog projection schema reader facts require their decoder profile at final append" {
     const protocol = metadata_topology_protocol;
     var record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .reporter_incarnation = 7 };
@@ -3602,6 +3664,7 @@ fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
     try request.ensureActive();
+    try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
     const required_version = @max(transitionRequiredCoordinatedDecoderVersion(command), try schemaReaderDecoderFloor(service), if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) try relationSourceDecoderFloor(service) else 0);
     if (required_version == 0) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
@@ -3682,6 +3745,9 @@ fn topologyActivationAdmission(service: anytype, bytes: []const u8, readiness: T
     return .{ .readiness = readiness, .source_mutation = false };
 }
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !CoordinatedDecoderAdmission {
+    // Reject malformed requirement facts before acquiring the runtime/apply
+    // lock. Keep payload scanning out of final append's cheap group-ID checks.
+    for (commands) |command| try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
     }

@@ -74,7 +74,11 @@ const std = @import("std");
 /// Version 38 decodes the durable independent semantic/ASCH reader floor and
 /// enforces it on store registration and report-root publication. A schema
 /// publication producer must separately bind this floor to its mutation.
-pub const current_version: u16 = 38;
+/// Version 39 decodes definition-bound semantic/ASCH requirements in table
+/// records (storage extension v3), including nested FK/restore/catalog plans.
+/// This does not itself activate a floor or acknowledge an installed schema.
+pub const current_version: u16 = 39;
+pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;
 pub const index_publication_admission_version: u16 = 36;

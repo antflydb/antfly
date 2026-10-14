@@ -3760,6 +3760,8 @@ test "opaque metadata reader projections preserve revision pairs capabilities an
     try std.testing.expect(revision.revision > 0);
     try std.testing.expectEqual(try store.standaloneRevision(), revision.revision);
     try std.testing.expectEqual(revision.revision, revision.projection_revision);
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, store.applyStandaloneCommand(group, .{ .apply_system_catalog = "{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":0}}}" }));
+    try std.testing.expectEqualDeep(revision, try store.standaloneRevisionState());
     try std.testing.expect(!(try store.getSchemaReaderFloor(group)).active()); // Advertisement alone never activates a schema floor.
 }
 

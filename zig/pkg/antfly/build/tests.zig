@@ -2845,7 +2845,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     reader_admission_step.dependOn(&reader_contract_run.step);
     unit_test_step.dependOn(&reader_contract_run.step);
     for ([_]struct { module: *std.Build.Module, filters: []const []const u8 }{
-        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog schema reader readiness"} },
+        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{ "system catalog schema reader readiness", "system catalog schema reader publication" } },
+        .{ .module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog schema reader table"} },
         .{ .module = data_consumer_module, .filters = &.{"data runtime schema reader"} },
     }) |fixture| {
         const tests = b.addTest(.{

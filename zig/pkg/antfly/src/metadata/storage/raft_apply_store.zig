@@ -7715,6 +7715,24 @@ pub const TransitionCommand = union(enum) {
     }
 };
 
+pub fn validateTransitionCommandSchemaReaderRequirements(command: TransitionCommand) !void {
+    switch (command) {
+        .upsert_table => |table| try table.validateSchemaReaderRequirements(),
+        .compare_and_replace_table => |cas| {
+            try cas.expected.validateSchemaReaderRequirements();
+            try cas.replacement.validateSchemaReaderRequirements();
+        },
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| try create.table.validateSchemaReaderRequirements(),
+            .drop => {},
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| try table.validateSchemaReaderRequirements(),
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| try @import("../schema_reader_wire.zig").validatePublication(@import("antfly_local_sources").common_schema_readers.ReaderRequirements, bytes),
+        .create_restore_job_with_staging => |request| try @import("../schema_reader_wire.zig").validatePublication(@import("antfly_local_sources").common_schema_readers.ReaderRequirements, request.plan_json),
+        else => {},
+    }
+}
+
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
         .apply_relation_reconciliation => |bytes| _ = try relation_control.Command.decode(bytes),
@@ -13047,6 +13065,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: TransitionCommand) !void {
+        try validateTransitionCommandSchemaReaderRequirements(command);
         if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
             try validateTransitionCommandDataGroupIds(command);
         var publication: ?RelationPublicationProof = null;
@@ -30737,9 +30756,10 @@ fn appendTableRecord(
     }
     if (record.requiresStorageMetadataExtension()) {
         try appendInt(alloc, out, u32, table_storage_metadata_magic);
-        try appendInt(alloc, out, u16, if (record.storage.engine == .object) 2 else table_storage_metadata_version);
+        try appendInt(alloc, out, u16, if (record.schema_reader_requirements != null) 3 else if (record.storage.engine == .object) 2 else table_storage_metadata_version);
+        if (record.schema_reader_requirements != null or record.storage.engine == .object)
+            try out.append(alloc, if (record.storage.engine == .object) 1 else 0);
         if (record.storage.engine == .object) {
-            try out.append(alloc, 1);
             try appendInt(alloc, out, u64, record.object_storage_generation);
             try out.appendSlice(alloc, &record.object_storage_identity);
         }
@@ -30760,6 +30780,11 @@ fn appendTableRecord(
             try appendInt(alloc, out, u32, migration.request.budget.batch_rows);
             try appendInt(alloc, out, u64, migration.request.budget.temporary_bytes);
             try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
+        }
+        if (record.schema_reader_requirements) |requirements| {
+            if (!requirements.valid()) return error.InvalidMetadataTransitionEncoding;
+            try appendInt(alloc, out, u32, requirements.semantic_version);
+            try appendInt(alloc, out, u32, requirements.encoding_version);
         }
     }
 }
@@ -31167,6 +31192,7 @@ fn readTableRecordWithReadSchema(
 }
 
 const BorrowedTableStorage = struct {
+    schema_reader_requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements = null,
     object_storage_generation: u64 = 0,
     object_storage_identity: [32]u8 = @splat(0),
     storage: @import("antfly_local_sources").common_table_storage.Settings = .{},
@@ -31190,10 +31216,13 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
     if (pos.* == encoded.len) return result;
     if (try readInt(encoded, pos, u32) != table_storage_metadata_magic) return error.InvalidMetadataTransitionEncoding;
     const version = try readInt(encoded, pos, u16);
-    if (version != table_storage_metadata_version and version != 2) return error.InvalidMetadataTransitionEncoding;
-    if (version == 2) {
-        if (try readInt(encoded, pos, u8) != 1) return error.InvalidMetadataTransitionEncoding;
-        result.storage.engine = .object;
+    if (version != table_storage_metadata_version and version != 2 and version != 3) return error.InvalidMetadataTransitionEncoding;
+    if (version >= 2) {
+        const engine = try readInt(encoded, pos, u8);
+        if (engine > 1 or (version == 2 and engine != 1)) return error.InvalidMetadataTransitionEncoding;
+        result.storage.engine = if (engine == 1) .object else .local;
+    }
+    if (result.storage.engine == .object) {
         result.object_storage_generation = try readInt(encoded, pos, u64);
         for (&result.object_storage_identity) |*byte| byte.* = try readInt(encoded, pos, u8);
     }
@@ -31224,7 +31253,15 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (version == 3) {
+        const requirements: @import("antfly_local_sources").common_schema_readers.ReaderRequirements = .{
+            .semantic_version = try readInt(encoded, pos, u32),
+            .encoding_version = try readInt(encoded, pos, u32),
+        };
+        if (!requirements.valid()) return error.InvalidMetadataTransitionEncoding;
+        result.schema_reader_requirements = requirements;
+    }
+    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null and result.schema_reader_requirements == null)) return error.InvalidMetadataTransitionEncoding;
     if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
@@ -31265,6 +31302,7 @@ fn readTableRecordWithRestoreIntent(
     var extension = try readTableStorageExtension(encoded, pos);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
+        .schema_reader_requirements = extension.schema_reader_requirements,
         .storage = extension.storage,
         .object_storage_generation = extension.object_storage_generation,
         .object_storage_identity = extension.object_storage_identity,
@@ -36354,6 +36392,84 @@ test "metadata raft apply store notifies committed key listeners for matched met
     try std.testing.expectEqual(@as(usize, 2), capture.matched);
     try std.testing.expect(capture.saw_table);
     try std.testing.expect(capture.saw_range);
+}
+
+test "system catalog schema reader table requirements preserve canonical frames projections and CAS identity" {
+    const a = std.testing.allocator;
+    const legacy: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    const legacy_bytes = try encodeTableRecord(a, legacy);
+    defer a.free(legacy_bytes);
+    const legacy_json = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    defer a.free(legacy_json);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_json, "schema_reader_requirements") == null);
+    inline for (.{ 0, 1, 2, 3 }) |storage_kind| inline for (.{ false, true }) |retirement| {
+        var table = legacy;
+        table.schema_reader_requirements = .{ .semantic_version = 30, .encoding_version = 31 };
+        if (storage_kind == 3) {
+            table.storage.engine = .object;
+            table.object_storage_generation = 17;
+            table.object_storage_identity = @splat(5);
+        } else if (storage_kind != 0) {
+            table.storage.dense_embeddings = .vector_store;
+            if (storage_kind == 2) table.storage_migration = .{ .request = .{ .job_id = "reader_migration", .mode = .online, .budget = .{ .batch_rows = 17, .batch_bytes = 8192, .temporary_bytes = 65536, .disk_reserve_bytes = 32768 } } };
+        }
+        if (retirement) table.relational_retirement_json = "retiring";
+        const encoded = try encodeTableRecord(a, table);
+        defer a.free(encoded);
+        const decoded = try decodeTableRecord(a, encoded);
+        defer metadata_table_manager.freeTable(a, decoded);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+        const clone = try metadata_table_manager.cloneTable(a, decoded);
+        defer metadata_table_manager.freeTable(a, clone);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, clone));
+        const canonical = try encodeTableRecord(a, clone);
+        defer a.free(canonical);
+        try std.testing.expectEqualSlices(u8, encoded, canonical);
+        const json = try std.json.Stringify.valueAlloc(a, .{ .table = table }, .{});
+        defer a.free(json);
+        try validateTransitionCommandSchemaReaderRequirements(.{ .apply_system_catalog = json });
+        const identity = try decodeTableIdentity(a, encoded);
+        defer identity.deinit(a);
+        try std.testing.expectEqual(table.table_id, identity.table_id);
+        const query = try decodeTableQueryProjection(a, encoded, true);
+        defer query.deinit(a);
+        try std.testing.expectEqual(table.storage.engine, query.query_definition.?.storage_engine);
+        var changed = table;
+        changed.schema_reader_requirements.?.semantic_version -= 1;
+        try std.testing.expect(!metadata_table_manager.tableDefinitionsEqual(table, changed));
+        try std.testing.expect(!std.mem.eql(u8, &metadata_table_manager.tableDefinitionFingerprint(table), &metadata_table_manager.tableDefinitionFingerprint(changed)));
+        changed.schema_reader_requirements = null;
+        try std.testing.expect(!metadata_table_manager.tableDefinitionsEqual(table, changed));
+        try std.testing.expect(!std.mem.eql(u8, &metadata_table_manager.tableDefinitionFingerprint(table), &metadata_table_manager.tableDefinitionFingerprint(changed)));
+        const extension = std.mem.indexOf(u8, encoded, "ATS1").?;
+        for (extension + 1..encoded.len) |len| {
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, encoded[0..len]));
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableIdentity(a, encoded[0..len]));
+        }
+        const corrupt = try a.dupe(u8, encoded);
+        defer a.free(corrupt);
+        std.mem.writeInt(u32, corrupt[corrupt.len - 8 ..][0..4], 32, .little);
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, corrupt));
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableIdentity(a, corrupt));
+        @memcpy(corrupt, encoded);
+        std.mem.writeInt(u32, corrupt[corrupt.len - 4 ..][0..4], 0, .little);
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, corrupt));
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableIdentity(a, corrupt));
+        var bad = table;
+        bad.schema_reader_requirements = .{ .semantic_version = 30, .encoding_version = 0 };
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, encodeTableRecord(a, bad));
+        try std.testing.expectError(error.InvalidSchemaReaderRequirements, bad.validateSchemaReaderRequirements());
+        try std.testing.expectError(error.InvalidSchemaReaderRequirements, validateTransitionCommandSchemaReaderRequirements(.{ .upsert_table = bad }));
+        const bad_json = try std.json.Stringify.valueAlloc(a, .{ .table = bad }, .{});
+        defer a.free(bad_json);
+        try std.testing.expectError(error.InvalidSchemaReaderRequirements, validateTransitionCommandSchemaReaderRequirements(.{ .apply_system_catalog = bad_json }));
+    };
+    const decoded_legacy = try decodeTableRecord(a, legacy_bytes);
+    defer metadata_table_manager.freeTable(a, decoded_legacy);
+    try std.testing.expect(decoded_legacy.schema_reader_requirements == null);
+    const canonical_legacy = try encodeTableRecord(a, decoded_legacy);
+    defer a.free(canonical_legacy);
+    try std.testing.expectEqualSlices(u8, legacy_bytes, canonical_legacy);
 }
 
 test "metadata.table storage extension preserves ownership migration and legacy bytes" {

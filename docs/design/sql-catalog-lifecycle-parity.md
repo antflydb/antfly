@@ -5420,3 +5420,77 @@ control-catalog generation/freshness, Zig formatting and original inventory
 checks passed. The broader integrated and native Debug runs remain in flight;
 their pending results are not counted as passes. Cache GC was previewed only
 (DRY_RUN=1); no caches were deleted.
+
+### Definition-bound requirement transport (not producer activation)
+
+TableRecord now carries optional internal schema_reader_requirements. Null is
+omitted from JSON and preserves released legacy binary records and definition
+fingerprints. A known pair survives clone/CAS and changes the definition hash;
+it uses strict table storage metadata extension v3 for local and object owners.
+Both full decode and borrowed point projections reject incomplete, zero,
+future or trailing requirement bytes. Existing v1/v2 storage extensions retain
+their interpretation. This field is not a public OpenAPI schema property.
+
+Metadata decoder profile 39 protects marked typed upserts/replacements,
+topology creates and extension deltas, plus nested catalog/FK/restore/private
+index envelopes. A bounded 4 KiB scanner traverses object/array structure,
+decodes escaped keys and skips schema/row strings without copying them. Null
+or absent markers retain predecessor admission; malformed/exhausted envelopes
+fail closed. The same classifier participates in single/batched final append.
+This proves current-member decoding, not durable future-member admission.
+
+Public producers do not populate the field yet. Before enabling them, derive
+requirements from the validated current/read/historical schema identities and
+physical manifests; never trust a caller's pair. Couple the pair, definition
+CAS, monotonic floor and publication/outbox in one successful transaction.
+Profile 39 must also be required by durable activation and subsequent global
+metadata/member admission once these records are published; the earlier
+profile-38 floor codec alone is insufficient. Finish exact same-root/group/
+schema installation ACKs and shared restore admission before claiming rollout
+safety or completing the original CREATE cases.
+
+All correctness qualification used Debug. The focused reader gate passed
+73/73 steps (pure, metadata wire/admission, table codec and data contracts).
+The stable-source actual server/catalog/coordinator gate passed 120/120 steps
+with 216 standard-runner tests plus its linked suites. Service/CHECK/lake
+qualification passed 73/73 steps with 13 standard tests and linked suites.
+The full metadata gate passed 70/70 steps: 226 and 316 control tests, 239
+storage tests, one linked test and 28 replication tests passed without leaks;
+two optional live PostgreSQL logical-CDC tests skipped their external-runtime
+prerequisites. No original case disposition changed (898 remain unresolved).
+
+The prior pure-contract/native qualification also finished: 268 native tests
+plus one linked test passed (51/51 steps). The full merged reader/data/server
+gate passed 165/165 steps. That gate reported a 16,100,278,272-byte macOS Debug
+implementation-compiler peak against an inherited 13 GiB consumer reservation.
+The implementation root now reserves 20 GiB (at least 25% headroom), scoped to
+macOS Debug only; Linux/release claims and test coverage remain unchanged. The
+rerun passed without the underestimated-bound diagnostic. This is compiler
+admission, not a runtime memory-limit increase. Formatting, control-catalog
+freshness, license/Apache boundary and inventory checks passed.
+
+Final qualification after preparation validation and error transport changes
+passed 169/169 Debug build steps and 218/218 standard-runner tests. This built
+the actual server and ran the reader-admission, system-catalog, metadata,
+service and compiled storage-owner gates. Linked suites passed 139 service,
+317 metadata/control, 226 metadata/runtime, 239 storage and 28 replication
+tests, plus the focused reader/codec/owner suites; two optional live PostgreSQL
+logical-CDC tests skipped their external-runtime prerequisites. These linked
+counts overlap other gate runs and must not be added as unique coverage.
+The separate runtime error ABI and kernel failure identity suites passed
+28 and five tests respectively. Invalid requirements retain their exact error
+identity through the compiled kernel and leave committed revisions unchanged.
+
+Requirement validation runs before coordinated admission takes its runtime
+lock and before standalone write transactions. JSON serialization remains
+format-only; malformed envelopes retain their existing domain-decoder errors.
+Recognized requirement objects use an explicit bounded token length. This
+preparation check validates the pair, not its derivation from the schema.
+Durable decoder admission must protect pending private plans as well as active
+native schemas: merely upgrading the active native reader floor from decoder
+38 to 39 would leave pending plans and future membership insufficiently guarded.
+
+Final formatting, control-catalog freshness, Apache boundary, license and
+original inventory checks passed. The inventory remains 479 implemented,
+136 rejected, 73 superseded and 898 unresolved; none of this transport work
+earns original-case completion credit.
