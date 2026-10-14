@@ -262,7 +262,7 @@ pub fn Snapshot(comptime DB: type) type {
                 const document = input.document orelse return error.CypherInvalidDocument;
                 if (document != .object) return error.CypherInvalidDocument;
                 const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
-                const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(scratch.allocator(), value.map) };
+                const node: cypher.value.Node = .{ .identity = identity, .properties = value.map };
                 const normalized = try self.db.normalizeCypherNode(scratch.allocator(), selected, &node, input.apply_defaults);
                 try checkpoint(ptr);
                 return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = normalized } }} }, .{});

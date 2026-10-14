@@ -113,3 +113,36 @@ def test_graph_table_joins_and_staged_sql_postimages(require_native, aflite_path
             "SELECT g.id FROM GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE n.id=$1 COLUMNS (n.id AS id)) g"
         )
         assert database.sql(parameterized, ["a"])["rows"] == [["a"]]
+
+
+def test_normalized_create_defaults_nulls_and_label_predicates(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql(
+            "CREATE TABLE docs (amount BIGINT DEFAULT 4, total BIGINT GENERATED ALWAYS AS (amount * 3) STORED)"
+        )
+        for name, predicate in (("all_docs", {}), ("filtered", {"total": 12})):
+            database.graph_catalog_json(
+                {
+                    "action": "put",
+                    "name": name,
+                    "definition": {"labels": [{"name": "Document", "table": "docs", "where": predicate}]},
+                }
+            )
+        result = database.cypher_json(
+            "all_docs", {"query": "CREATE (n:Document {amount:null}) RETURN n.amount,n.total"}
+        )
+        assert result["rows"] == [[{"type": "null", "value": None}] * 2]
+        assert database.sql("SELECT amount,total FROM docs")["rows"] == [[None, None]]
+        database.cypher_json("all_docs", {"query": "MATCH (n) DELETE n"})
+        database.cypher_json("all_docs", {"query": "CREATE (n:Document) DELETE n"})
+        assert database.sql("SELECT amount,total FROM docs")["rows"] == []
+        for verb in ("CREATE", "MERGE"):
+            result = database.cypher_json("filtered", {"query": f"{verb} (n:Document) RETURN n.amount,n.total"})
+            assert [cell["value"] for cell in result["rows"][0]] == ["4", "12"]
+            assert database.sql("SELECT amount,total FROM docs")["rows"] == [["4", "12"]]
+            database.cypher_json("all_docs", {"query": "MATCH (n) DELETE n"})
+        for value in ("null", "7"):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json("filtered", {"query": f"CREATE (n:Document {{amount:{value}}}) RETURN n"})
+            assert invalid.value.graph_code == "CypherLabelPredicateViolation"
+            assert database.sql("SELECT amount,total FROM docs")["rows"] == []

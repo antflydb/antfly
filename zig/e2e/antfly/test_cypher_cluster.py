@@ -137,6 +137,7 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
 
     for filename in [
         "verify_cypher_expressions.py",
+        "verify_cypher_normalization.py",
         "verify_cypher_postimage_policy.py",
     ]:
         qualification = subprocess.run(

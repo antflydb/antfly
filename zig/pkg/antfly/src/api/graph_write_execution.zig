@@ -60,12 +60,17 @@ pub const Provider = struct {
         for (plans) |*entry| if (std.mem.eql(u8, entry.table.name, table)) return entry;
         return error.CypherSearchTableOutsideGraph;
     }
-    const Preimage = struct { plans: []Plan };
+    const Preimage = struct { mutations: []const cypher.backend.Mutation };
     fn existed(ptr: *anyopaque, table: []const u8, key: []const u8) bool {
         const preimage: *Preimage = @ptrCast(@alignCast(ptr));
-        const entry = plan(preimage.plans, table) catch return false;
-        for (entry.predicates.items) |predicate| if (std.mem.eql(u8, predicate.key, key)) return true;
-        return false;
+        // The overlay captures every visible preimage before applying mutations.
+        // Only nodes created in this statement lack a durable preimage. Range
+        // proofs validate the complete retained cut, including deleted rows.
+        const identity: cypher.value.Identity = .{ .table = table, .key = key };
+        for (preimage.mutations) |mutation| {
+            if (mutation == .create_node and mutation.create_node.identity.eql(identity)) return false;
+        }
+        return true;
     }
     fn commit(ptr: *anyopaque, a: A, mutations: []const cypher.backend.Mutation) !void {
         const self = cast(ptr);
@@ -73,7 +78,7 @@ pub const Provider = struct {
         const overlay = self.overlay orelse return error.CypherTransactionRequired;
         const plans = try a.alloc(Plan, self.tables.len);
         for (self.tables, plans) |table, *entry| entry.* = .{ .table = table };
-        const body = try std.json.Stringify.valueAlloc(a, cypher.rpc.Request{ .operation = .observe, .graph_incarnation = self.graph.incarnation, .graph_revision = self.graph.revision }, .{});
+        const body = try std.json.Stringify.valueAlloc(a, cypher.rpc.Request{ .operation = .observe_ranges, .graph_incarnation = self.graph.incarnation, .graph_revision = self.graph.revision }, .{});
         const bytes = try self.channel.call(self.channel.ptr, a, body);
         const owners = try std.json.parseFromSliceLeaky([]const local.storage_db_cypher_write_observation.Owner, a, bytes, .{});
         for (owners) |owner| {
@@ -82,7 +87,7 @@ pub const Provider = struct {
             try entry.predicates.appendSlice(a, owner.predicates);
             try entry.guards.append(a, .{ .fence = owner.fence, .proofs = owner.proofs });
         }
-        var preimage: Preimage = .{ .plans = plans };
+        var preimage: Preimage = .{ .mutations = mutations };
         const postimages = try cypher.mutations.build(a, self.graph, overlay, mutations, .{ .ptr = &preimage, .existed = existed });
         for (postimages) |postimage| {
             const entry = try plan(plans, postimage.table);

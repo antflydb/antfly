@@ -5,6 +5,7 @@ import argparse
 import base64
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -20,9 +21,10 @@ def main():
     )
     table = "cypher_normalize_" + uuid.uuid4().hex
     graph = table + "_graph"
-    created_table = created_graph = False
+    filtered = graph + "_filtered"
+    created_table = created_graph = created_filtered = False
 
-    def call(path, body=None, method="POST"):
+    def call(path, body=None, method="POST", expected_status=None):
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -32,12 +34,25 @@ def main():
             },
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=40) as response:
-                status, content = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            status, content = error.code, error.read()
-        assert status in (200, 201, 202, 204), (path, status, content.decode())
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    status, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status, content = error.code, error.read()
+            if status == 503 and attempt < 39:
+                failure = json.loads(content)
+                # A proven rejection before execution is safe to retry while a
+                # newly provisioned replicated owner elects its leader.
+                if failure.get("write_outcome") == "not_started":
+                    time.sleep(0.25)
+                    continue
+            break
+        assert (
+            status in (200, 201, 202, 204)
+            if expected_status is None
+            else status == expected_status
+        ), (path, status, content.decode())
         return json.loads(content) if content else None
 
     def sql(statement):
@@ -75,6 +90,35 @@ def main():
             {"labels": [{"name": "Document", "table": table}], "relationships": []},
         )
         created_graph = True
+        verify(
+            "CREATE (n:Document {amount:null}) RETURN n.amount,n.total", [None, None]
+        )
+        query("MATCH (n:Document) DELETE n")
+        assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
+        # Creating and deleting a new identity must not stage a durable delete.
+        query("CREATE (n:Document) DELETE n")
+        assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
+        call(
+            f"/graphs/{filtered}",
+            {"labels": [{"name": "Document", "table": table, "where": {"total": 12}}]},
+        )
+        created_filtered = True
+        for statement in (
+            "CREATE (n:Document) RETURN n.amount,n.total",
+            "MERGE (n:Document) RETURN n.amount,n.total",
+        ):
+            result = call(f"/graphs/{filtered}/query", {"query": statement})
+            assert [cell["value"] for cell in result["rows"][0]] == ["4", "12"], result
+            assert sql(f"SELECT amount,total FROM {table}")["rows"] == [["4", "12"]]
+            query("MATCH (n:Document) DELETE n")
+        for value in ("null", "7"):
+            failure = call(
+                f"/graphs/{filtered}/query",
+                {"query": f"CREATE (n:Document {{amount:{value}}}) RETURN n"},
+                expected_status=400,
+            )
+            assert failure["code"] == "CypherLabelPredicateViolation", failure
+            assert sql(f"SELECT amount,total FROM {table}")["rows"] == []
         verify("CREATE (n:Document) RETURN n.amount,n.total", [4, 12])
         verify(
             "MATCH (n:Document) WITH n AS a,n AS b SET a.amount=7 RETURN b.amount,b.total",
@@ -89,9 +133,11 @@ def main():
         assert not names.intersection({"amount", "total"}), properties
         assert not {"amount", "total"}.intersection(properties[1]["value"]), properties
         print(
-            "Native Cypher normalized CREATE, generated SET, alias refresh, and REMOVE match durable SQL rows"
+            "Native Cypher normalization checks passed: defaults, explicit nulls, CREATE/MERGE predicate labels, deletes, generated SET, and REMOVE match durable SQL rows"
         )
     finally:
+        if created_filtered:
+            call(f"/graphs/{filtered}", method="DELETE")
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")
         if created_table:

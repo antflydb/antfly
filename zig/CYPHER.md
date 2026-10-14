@@ -727,6 +727,15 @@ misrepresent the original query result.
   All UNION branches participate in one transaction, including a read first
   branch followed by a write. Failures roll back every branch. Write admission
   checks the entire query before resolving permissions or opening owner cuts.
+  Retained overlays use the configured intermediate-state ceiling without a
+  separate 65,536-entity write limit. Owner range proofs validate the complete
+  cut at prepare; production writes do not materialize a predicate per row.
+  CREATE preserves explicit nulls through SQL default evaluation and validates
+  requested labels after defaults and generated columns have been normalized.
+  `scripts/verify_cypher_normalization.py` covers durable SQL parity, CREATE and
+  MERGE predicate labels, and deletion of existing versus transient nodes.
+  `scripts/verify_cypher_write_limits.py` qualifies production writes above
+  65,536 rows and rejection at the requested state ceiling.
 - Replicated policy installation remains fail-closed while old readers are
   active. The next signed committed mutation can finalize serving on a follower
   without a coordinator receipt probe; blocked apply defers until readers drain.

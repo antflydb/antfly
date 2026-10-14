@@ -55,11 +55,18 @@ def main():
             headers=headers,
             method=method,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=40) as response:
-                code, content = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            code, content = error.code, error.read()
+        for attempt in range(40):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    code, content = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                code, content = error.code, error.read()
+            if code == 503 and attempt < 39 and (status is None or 200 <= status < 300):
+                failure = json.loads(content)
+                if failure.get("write_outcome") == "not_started":
+                    time.sleep(0.25)
+                    continue
+            break
         assert (200 <= code < 300) if status is None else code == status, (
             method,
             path,
@@ -86,6 +93,18 @@ def main():
         assert isinstance(result["graph_incarnation"], str)
         assert isinstance(result["graph_revision"], str)
         return result
+
+    def durable_commit(result, credential=None):
+        commit = result["commit"]
+        if commit["status"] == "committed":
+            return True
+        if commit["status"] != "committed_pending":
+            return False
+        # Pending propagation is a durable commit, never a replay invitation.
+        receipt = call(
+            "GET", f"/transactions/{commit['transaction_id']}", credential=credential
+        )
+        return receipt["disposition"] == "committed" and receipt["durable"]
 
     def cell(value, kind, expected):
         assert value == {"type": kind, "value": expected}, value
@@ -448,7 +467,7 @@ def main():
                 credential=credential,
                 write_request_id=reader_write_id,
             )
-            assert admitted["commit"]["status"] == "committed", admitted
+            assert durable_commit(admitted, credential), admitted
             call(
                 "DELETE",
                 f"/auth/v1/users/{reader}/permissions?resource={table}&resourceType=table",
@@ -574,7 +593,7 @@ def main():
                 "CREATE (n:Document {id:'d',title:'Delta',rank:9223372036854775807}) RETURN elementId(n),n.rank",
                 write_request_id=write_id,
             )
-            assert created["commit"]["status"] == "committed", created
+            assert durable_commit(created), created
             cell(created["rows"][0][1], "integer", "9223372036854775807")
             status = call("GET", f"/transactions/{created['commit']['transaction_id']}")
             assert status["disposition"] == "committed", status
@@ -615,7 +634,7 @@ def main():
                     },
                     status=None,
                 )
-                assert result["commit"]["status"] == "committed", result
+                assert durable_commit(result), result
                 return result["rows"][0][0]
 
             # Conflicts are definite aborts; an unknown commit must never be retried.
@@ -648,10 +667,7 @@ def main():
                 "MERGE (n:Document {id:'concurrent'}) RETURN elementId(n)",
                 write_request_id=no_op_id,
             )
-            assert (
-                no_op["stats"]["mutations"] == 0
-                and no_op["commit"]["status"] == "committed"
-            ), no_op
+            assert no_op["stats"]["mutations"] == 0 and durable_commit(no_op), no_op
             no_op_receipt = call("GET", f"/transactions/{no_op_id}")
             assert no_op_receipt["disposition"] == "committed", no_op_receipt
             call(
@@ -737,9 +753,7 @@ def main():
             union = query(
                 "RETURN 'before' AS id UNION ALL CREATE (n:Document {id:'union_created'}) RETURN n.id AS id UNION ALL MATCH (n:Document {id:'union_created'}) RETURN n.id AS id"
             )
-            assert (
-                union["commit"]["status"] == "committed" and not union["read_only"]
-            ), union
+            assert durable_commit(union) and not union["read_only"], union
             assert union["rows"] == [
                 [{"type": "string", "value": value}]
                 for value in ["before", "union_created", "union_created"]

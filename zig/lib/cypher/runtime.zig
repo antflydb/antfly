@@ -1311,9 +1311,9 @@ const Engine = struct {
                     node.* = try self.a.create(v.Node);
                     const mutable: *v.Node = @constCast(node.*);
                     mutable.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, label.table, false), .labels = pattern.labels, .properties = try self.entries(pattern.properties, row) };
-                    for (pattern.labels) |name| if (!self.graph.admits(mutable, name)) return error.CypherLabelPredicateViolation;
                     try self.mutate(.{ .create_node = mutable });
                     node.* = (try self.backend.vtable.get(self.backend.ptr, self.a, mutable.identity)) orelse return error.CypherDeletedEntity;
+                    for (pattern.labels) |name| if (!self.graph.admits(node.*, name)) return error.CypherLabelPredicateViolation;
                     row = (try self.bind(row, pattern.alias, .{ .node = node.* })).?;
                 }
                 for (path.edges, relationships, 0..) |pattern, *relationship, i| {

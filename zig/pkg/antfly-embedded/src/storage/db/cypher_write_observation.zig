@@ -45,7 +45,6 @@ pub fn capture(comptime Snapshot: type, self: *Snapshot, a: std.mem.Allocator) !
         var page = try view.next(a, 256);
         defer page.deinit();
         for (page.rows) |row| {
-            if (predicates.items.len == 65536) return error.CypherAnchorBudgetExceeded;
             try predicates.append(a, .{ .key = try a.dupe(u8, row.id), .expected_version = row.version, .expected_content_digest = row.expected_content_digest });
         }
         if (page.after == null) break;

@@ -255,6 +255,9 @@ pub const Overlay = struct {
                 const copy = try a.create(v.Node);
                 copy.* = node.*;
                 if (self.base.vtable.normalize_node) |normalize| copy.* = (try normalize(self.base.ptr, a, copy, true)).*;
+                // Normalization may refresh labels. Validate the requested labels
+                // against defaults and generated values before staging the node.
+                for (node.labels) |name| if (!self.graph.?.admits(copy, name)) return error.CypherLabelPredicateViolation;
                 try self.nodes.append(a, .{ .value = copy, .dirty = true });
                 try self.refreshDocumentRelationships(a, copy);
             },
