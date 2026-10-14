@@ -28187,6 +28187,10 @@ components:
         - trunc
         - sign
         - sqrt
+        - jsonb_typeof
+        - jsonb_array_length
+        - jsonb_extract_path
+        - jsonb_extract_path_text
     RelationalExpressionType:
       type: string
       enum:
@@ -28198,6 +28202,7 @@ components:
         - number
         - numeric
         - sql_array
+        - json
     SQLBuiltinType:
       type: string
       description: >
@@ -28437,6 +28442,24 @@ components:
         candidate makes the result UNKNOWN. These operations require schema
 
         capability version 19.
+
+        JSON expressions require reader capability version 30. The json type
+
+        carries JSONB semantics, including exact numeric values and display
+
+        scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+
+        array length rejects a non-array value. jsonb_extract_path and
+
+        jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+
+        path components. Negative array ordinals count from the end; a missing
+
+        path returns SQL NULL. JSON extraction retains JSON null; text extraction
+
+        converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+
+        enclosing CASE/coalesce retain their short-circuit semantics.
       properties:
         op:
           $ref: '#/components/schemas/RelationalExpressionOp'
@@ -28454,6 +28477,11 @@ components:
         value:
           nullable: true
           description: Typed literal value, including null.
+        json_null:
+          type: boolean
+          description: For a literal of type json only. True denotes present JSON null and requires value
+            to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit
+            marker survives SDKs that omit optional null values. Requires reader capability version 30.
         column:
           type: string
           minLength: 1

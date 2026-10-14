@@ -27,6 +27,10 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   trunc: [1, 2],
   sign: [1, 1],
   sqrt: [1, 1],
+  jsonb_typeof: [1, 1],
+  jsonb_array_length: [1, 1],
+  jsonb_extract_path: [2, 32],
+  jsonb_extract_path_text: [2, 32],
   eq: [2, 2],
   ne: [2, 2],
   gt: [2, 2],
@@ -80,6 +84,7 @@ const types: Record<RelationalExpressionType, true> = {
   number: true,
   numeric: true,
   sql_array: true,
+  json: true,
 };
 const typeNames = new Set(Object.keys(types));
 const arrayTypes: Record<SQLBuiltinType, true> = {
@@ -141,6 +146,18 @@ function arrayLiteralBytes(input: unknown, location: string): number {
   if (count !== values.length) return fail();
   for (let i = 0; i < count; i++)
     if (typeof nulls[i] !== "boolean" || (nulls[i] && values[i] !== null)) return fail();
+  return boundedJsonLiteralBytes(input, location, 66, false);
+}
+
+function boundedJsonLiteralBytes(
+  input: unknown,
+  location: string,
+  maxDepth: number,
+  jsonbDomain: boolean
+): number {
+  const fail = (): never => {
+    throw new TypeError(`${location} requires a bounded JSON value`);
+  };
   let bytes = 0;
   const charge = (amount: number): void => {
     bytes += amount;
@@ -150,6 +167,7 @@ function arrayLiteralBytes(input: unknown, location: string): number {
     charge(2);
     for (let i = 0; i < value.length; i++) {
       const unit = value.charCodeAt(i);
+      if (jsonbDomain && unit === 0) fail();
       if (
         unit === 34 ||
         unit === 92 ||
@@ -174,7 +192,7 @@ function arrayLiteralBytes(input: unknown, location: string): number {
     }
   };
   const visit = (value: unknown, depth: number): void => {
-    if (depth > 66) fail();
+    if (depth > maxDepth) fail();
     if (value === null) {
       charge(4);
       return;
@@ -250,7 +268,7 @@ export function validateRelationalExpression(
     const op = node.op as RelationalExpressionOp;
     const allowed = new Set(
       op === "literal"
-        ? ["op", "type", "value", "sql_type"]
+        ? ["op", "type", "value", "sql_type", "json_null"]
         : op === "column"
           ? ["op", "column"]
           : op === "cast"
@@ -319,7 +337,17 @@ export function validateRelationalExpression(
       if (!isRelationalExpressionType(node.type))
         throw new TypeError(`${location}.type is required for a literal`);
       if (
+        hasOwn.call(node, "json_null") &&
+        (node.type !== "json" ||
+          typeof node.json_null !== "boolean" ||
+          (node.json_null && node.value != null))
+      )
+        throw new TypeError(
+          `${location}.json_null requires a JSON literal with absent or null value`
+        );
+      if (
         !arrayLiteral &&
+        node.type !== "json" &&
         node.value != null &&
         !["string", "number", "boolean"].includes(typeof node.value)
       )
@@ -333,8 +361,12 @@ export function validateRelationalExpression(
       )
         throw new TypeError(`${location}.value must be a safe integer or an exact decimal string`);
       let literalBytes =
-        arrayLiteral && node.value != null ? arrayLiteralBytes(node.value, `${location}.value`) : 8;
-      if (typeof node.value === "string") {
+        node.type === "json"
+          ? boundedJsonLiteralBytes(node.value ?? null, `${location}.value`, 64, true)
+          : arrayLiteral && node.value != null
+            ? arrayLiteralBytes(node.value, `${location}.value`)
+            : 8;
+      if (typeof node.value === "string" && node.type !== "json") {
         const maxBytes = 1024 * 1024;
         if (node.type === "blob") {
           // Match the native compiler's decoded-byte budget without allocating

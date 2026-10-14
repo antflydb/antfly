@@ -2492,7 +2492,7 @@ const Compiler = struct {
                 const marker = input.object.get("json_null");
                 if (marker) |present| {
                     if (node.kind != .json or present != .bool or !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType;
-                    if (present.bool and (!input.object.contains("value") or value != .null)) return error.InvalidRelationalExpression;
+                    if (present.bool and value != .null) return error.InvalidRelationalExpression;
                 }
                 const json_null = if (marker) |present| present.bool else false;
                 switch (node.kind) {
@@ -5181,6 +5181,11 @@ test "relational index system JSON literal ownership and display identity requir
     defer sql_null.deinit();
     var json_null = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}");
     defer json_null.deinit();
+    var omitted = try Compile.run(a, table, "{\"op\":\"literal\",\"type\":\"json\",\"json_null\":true}");
+    defer omitted.deinit();
+    try std.testing.expectEqualSlices(u8, &json_null.fingerprint, &omitted.fingerprint);
+    const omitted_value = try omitted.evaluate(.failing, &.{});
+    try std.testing.expect(omitted_value == .json and omitted_value.json.value == .null);
     try std.testing.expectEqual(Value.null, try sql_null.evaluate(.failing, &.{}));
     const present = try json_null.evaluate(.failing, &.{});
     try std.testing.expect(present == .json and present.json.value == .null);
@@ -5190,7 +5195,6 @@ test "relational index system JSON literal ownership and display identity requir
     try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, old, input));
     try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, old, "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}"));
     for ([_][]const u8{
-        "{\"op\":\"literal\",\"type\":\"json\",\"json_null\":true}",
         "{\"op\":\"literal\",\"type\":\"json\",\"value\":{},\"json_null\":true}",
     }) |invalid| try std.testing.expectError(error.InvalidRelationalExpression, Compile.run(a, table, invalid));
     for ([_][]const u8{

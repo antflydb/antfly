@@ -94,21 +94,38 @@ test "relational index system cold generated JSON verification preserves SQL nul
     }
 }
 
-test "relational index system public JSON expressions remain gated until grammar and lowering activate" {
+test "relational index system public JSON generated expressions retain typed values and null authority" {
     const a = std.testing.allocator;
     const api = @import("../../schema/mod.zig");
     for ([_][]const u8{
         "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"n\":1.20}}",
         "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":true}",
         "{\"op\":\"column\",\"column\":\"source\"}",
-    }) |expression| {
+    }, 0..) |expression, i| {
         const definition = try std.fmt.allocPrint(
             a,
             "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"generated_columns\":[{{\"column\":\"g\",\"expression\":{s}}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"g\":{{\"type\":\"json\",\"nullable\":true}},\"source\":{{\"type\":\"json\",\"nullable\":true}}}},\"additionalProperties\":false}}}}}}}}",
             .{expression},
         );
         defer a.free(definition);
-        try std.testing.expectError(error.InvalidSchemaUpdateRequest, api.CompiledTableValidator.init(a, definition));
+        var validator = try api.CompiledTableValidator.init(a, definition);
+        defer validator.deinit(a);
+        const runtime = try api.deriveRuntimeTableSchema(a, validator.schema);
+        defer @import("../schema.zig").freeSchema(a, runtime);
+        try std.testing.expect(runtime.requires_json_expressions);
+        var document = try std.json.parseFromSlice(std.json.Value, a, "{\"source\":{\"n\":1.20}}", .{ .parse_numbers = false });
+        defer document.deinit();
+        const prepared = try validator.prepareTypedValueWithNulls(document.arena.allocator(), a, &document.value, &.{}, false);
+        defer prepared.deinit(document.arena.allocator());
+        if (i == 1) {
+            try std.testing.expectEqual(std.json.Value.null, document.value.object.get("g").?);
+            try std.testing.expectEqual(@as(usize, 1), prepared.fields.len);
+            try std.testing.expectEqualStrings("g", prepared.fields[0]);
+        } else {
+            try std.testing.expectEqualStrings("1.20", document.value.object.get("g").?.object.get("n").?.number_string);
+            try std.testing.expectEqual(@as(usize, 0), prepared.fields.len);
+        }
+        try validator.prepareTypedValue(document.arena.allocator(), a, &document.value, prepared.fields, true);
     }
 }
 

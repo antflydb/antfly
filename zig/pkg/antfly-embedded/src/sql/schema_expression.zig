@@ -30,7 +30,10 @@ fn nullLiteral(instruction: scalar.Instruction) bool {
 }
 
 fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, target: scalar.Type) !Json {
-    if (value == .object and value.object.get("value") != null and value.object.get("value").? == .null and std.mem.eql(u8, value.object.get("op").?.string, "literal")) {
+    if (value == .object and value.object.get("value") != null and value.object.get("value").? == .null and
+        !std.meta.eql(value.object.get("json_null"), @as(?Json, .{ .bool = true })) and
+        std.mem.eql(u8, value.object.get("op").?.string, "literal"))
+    {
         // SQL NULL adopts the destination domain; it must not become a
         // runtime cast of the unknown literal's placeholder string type.
         const kind = target.kind orelse return error.UnsupportedSqlShape;
@@ -80,7 +83,12 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
         var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
         return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = try @import("numeric_value.zig").format(&context, number.*) });
     }
-    if (kind == .json and !value.sql_null) return error.UnsupportedSqlShape;
+    if (kind == .json) return json(alloc, .{
+        .op = "literal",
+        .type = "json",
+        .value = value.value,
+        .json_null = !value.sql_null and value.value == .null,
+    });
     if (value.value == .float and !std.math.isFinite(value.value.float)) return error.UnsupportedSqlShape;
     if (kind == .integer or kind == .number) return json(alloc, .{ .op = "literal", .type = nativeType(kind, identity), .sql_type = @tagName(identity.?), .value = value.value });
     return json(alloc, .{ .op = "literal", .type = nativeType(kind, identity), .value = value.value });
@@ -281,6 +289,7 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
                     .mod => "modulo",
                     .replace => "replace",
                     .md5 => "md5",
+                    inline .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => |tag| @tagName(tag),
                     inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @tagName(tag),
                     else => return error.UnsupportedSqlShape,
                 };
@@ -715,6 +724,67 @@ fn collectPredicates(alloc: std.mem.Allocator, expression: Json, negated: bool, 
         }
     }
     try appendPredicate(alloc, predicates, try json(alloc, .{ .column = column.string, .op = @tagName(op), .value = value }));
+}
+
+test "SQL durable JSON lowering executes independent PostgreSQL path contracts" {
+    const a = std.testing.allocator;
+    const native = @import("../schema/relational_expression.zig");
+    const Entry = struct { sql: []const u8, value: Json = .null, sql_null: ?bool = null, oid: ?u32 = null, @"error": ?[]const u8 = null };
+    var fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_json_path_reference.json"), .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer fixture.deinit();
+    var count: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.@"error" != null) continue;
+        errdefer std.debug.print("durable JSON lowering oracle: {s}\n", .{entry.sql});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var parsed = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer parsed.deinit();
+        const binding = try json(owned, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .unused = .{ .type = "keyword" } } } } } });
+        const lowered = try lowerTyped(owned, binding, parsed.expression, null);
+        const kind: native.Kind = switch (entry.oid.?) {
+            3802 => .json,
+            25 => .string,
+            23 => .integer,
+            else => return error.UnexpectedJsonFixture,
+        };
+        var plan = try native.Plan.init(a, .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true }, lowered.expression, kind);
+        defer plan.deinit();
+        const actual = try plan.evaluate(owned, &.{});
+        try std.testing.expectEqual(entry.sql_null orelse (entry.value == .null), actual == .null);
+        const result: Json = switch (actual) {
+            .null => .null,
+            .json => |root| root.value,
+            .string => |value| .{ .string = value },
+            .integer => |value| .{ .integer = value },
+            else => return error.UnexpectedJsonFixture,
+        };
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(owned, entry.value, .{}), try std.json.Stringify.valueAlloc(owned, result, .{}));
+        if (entry.oid == 23) try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int32), plan.result_sql_type);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 25), count);
+}
+
+test "SQL durable JSON lowering preserves JSON null through immutable COALESCE and CASE" {
+    const a = std.testing.allocator;
+    const native = @import("../schema/relational_expression.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const binding = try json(owned, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .unused = .{ .type = "keyword" } } } } } });
+    for ([_][]const u8{ "coalesce('null'::jsonb, '{}'::jsonb)", "CASE WHEN true THEN 'null'::jsonb ELSE '{}'::jsonb END", "coalesce(NULL::jsonb, 'null'::jsonb, '{}'::jsonb)" }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(owned, binding, parsed.expression, .{ .name = "g", .type = .json }, true);
+        try std.testing.expectEqualStrings("json", lowered.object.get("type").?.string);
+        try std.testing.expect(lowered.object.get("json_null").?.bool);
+        var plan = try native.Plan.init(a, .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true }, lowered, .json);
+        defer plan.deinit();
+        const actual = try plan.evaluate(owned, &.{});
+        try std.testing.expect(actual == .json and actual.json.value == .null);
+    }
 }
 
 test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {

@@ -5038,3 +5038,62 @@ pgwire tests, 257 native relational tests and 113 transaction tests (85/85 build
 steps). The full native rerun including this checkpoint is still in progress;
 the focused result is not a substitute for that gate. Cache GC was previewed
 only, with no deletions.
+
+### Public JSON expression grammar and SQL lowering
+
+OpenAPI now generates the JSON expression type, the four structural JSONB
+consumers and the explicit JSON-null literal marker across public SDKs. A true
+marker accepts an absent or null optional value; a conflicting nonnull value is
+still rejected. Absent-value and explicit-null JSON-null literals compile to
+the same immutable program identity and remain distinct from SQL NULL. Go,
+Python, TypeScript and Rust round-trip tests cover SDK omission behavior.
+
+SQL DDL lowering now retains typed JSON constants and lowers jsonb_typeof,
+jsonb_array_length, jsonb_extract_path and jsonb_extract_path_text to the native
+VM. JSON null survives immutable CASE/coalesce folding rather than adopting the
+SQL-null placeholder domain. The real lowering path executes all 25 admitted
+independent PostgreSQL JSON path fixtures; it no longer needs the native test's
+temporary AST bridge to prove that boundary.
+
+Full runtime schemas, reduced CHECK layouts, definition fingerprints and index
+admission share one expression-capability derivation. This fixes reduced-schema
+admission which previously dropped reader requirements when recompiling a CHECK
+or index expression. JSON dependencies are detected across defaults, generated
+columns, CHECKs, ordered index expressions and UNIQUE expressions. Plain JSON
+columns do not by themselves claim JSON-expression capability. Catalog checks
+reject a JSON-expression schema under reader capability 29 and accept it under
+30; this is a local durable capability fence, not a distributed readiness proof.
+
+A mounted SQL contract seeds real native storage from public DDL lowering,
+closes and reopens the database, and reads generated JSON consumers through the
+public SQL handler. Exact 1.20 display, JSON null, SQL NULL and their result flags
+survive restart. The public DDL validator also compiles JSON defaults, generated
+consumers, CHECKs and scalar expression indexes, rejects forged generated text
+on restore, and preserves JSON-null provenance through typed preparation.
+
+Production-source Debug qualification passed all 98 build steps: 1,045 SQL tests
+(three existing skips), 117 pgwire tests, 262 native relational tests and 113
+transaction tests, plus the mounted catalog/DDL suite. A final native rerun with
+the capability-29/30 assertion passed all 262 tests (50/50 steps), without leaks.
+The complete Go SDK suite, 303 Python SDK tests, 489 TypeScript SDK tests (one
+existing skip), TypeScript compilation and all 18 Rust SDK library tests passed.
+TypeScript's structural admission now includes the new operations/type and a
+bounded JSON literal walk, sharing its existing aggregate literal allowance
+without serializing a duplicate envelope. Tests cover UTF-8/Unicode, NUL,
+cycles, depth, exact arity, marker conflicts and one-unit-over admission.
+PostgreSQL independently reverified 138 existing text/JSON
+contracts without changing fixtures. Generation, formatting, inventory integrity,
+Apache boundary/license checks and control-catalog freshness passed.
+
+Distributed activation is still incomplete. Metadata proposal admission must
+bind the new schema-language/physical-reader requirements to a versioned decoder
+floor and current term/membership proof, and data-owner installation/restore
+must acknowledge the corresponding capabilities rather than only a schema
+epoch. The audit found that local table-catalog checks do not prove those remote
+requirements; the current ordinary CREATE floor must not be treated as evidence.
+Complete that rollout fence and its mixed-version/fault tests before declaring
+distributed activation ready. Generic raw-JSON codec cooperation, preparation
+ownership improvements and exact original-case campaigns also remain open.
+Original dispositions stay 479 implemented / 136 rejected / 73 superseded /
+898 unresolved. These public component/restart contracts are not a substitute
+for the unchanged original sql-0671 multi-column declaration and its full proof.

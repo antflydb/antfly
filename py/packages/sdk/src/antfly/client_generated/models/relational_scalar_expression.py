@@ -111,6 +111,15 @@ class RelationalScalarExpression:
     A matching candidate wins over NULL candidates; otherwise a NULL
     candidate makes the result UNKNOWN. These operations require schema
     capability version 19.
+    JSON expressions require reader capability version 30. The json type
+    carries JSONB semantics, including exact numeric values and display
+    scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+    array length rejects a non-array value. jsonb_extract_path and
+    jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+    path components. Negative array ordinals count from the end; a missing
+    path returns SQL NULL. JSON extraction retains JSON null; text extraction
+    converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+    enclosing CASE/coalesce retain their short-circuit semantics.
 
         Attributes:
             op (RelationalExpressionOp):
@@ -136,6 +145,9 @@ class RelationalScalarExpression:
             numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
                 describes every element, not dimensions. Absent means unconstrained NUMERIC.
             value (Any | Unset): Typed literal value, including null.
+            json_null (bool | Unset): For a literal of type json only. True denotes present JSON null and requires value to
+                be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives
+                SDKs that omit optional null values. Requires reader capability version 30.
             column (str | Unset):
             collation (str | Unset): Optional binary or ASCII case-insensitive collation for string comparisons and in_list;
                 aliases match ordered indexes.
@@ -147,6 +159,7 @@ class RelationalScalarExpression:
     sql_type: SQLBuiltinType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
+    json_null: bool | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
     args: list[RelationalScalarExpression] | Unset = UNSET
@@ -167,6 +180,8 @@ class RelationalScalarExpression:
             numeric_modifier = self.numeric_modifier.to_dict()
 
         value = self.value
+
+        json_null = self.json_null
 
         column = self.column
 
@@ -194,6 +209,8 @@ class RelationalScalarExpression:
             field_dict["numeric_modifier"] = numeric_modifier
         if value is not UNSET:
             field_dict["value"] = value
+        if json_null is not UNSET:
+            field_dict["json_null"] = json_null
         if column is not UNSET:
             field_dict["column"] = column
         if collation is not UNSET:
@@ -233,6 +250,8 @@ class RelationalScalarExpression:
 
         value = d.pop("value", UNSET)
 
+        json_null = d.pop("json_null", UNSET)
+
         column = d.pop("column", UNSET)
 
         collation = d.pop("collation", UNSET)
@@ -252,6 +271,7 @@ class RelationalScalarExpression:
             sql_type=sql_type,
             numeric_modifier=numeric_modifier,
             value=value,
+            json_null=json_null,
             column=column,
             collation=collation,
             args=args,

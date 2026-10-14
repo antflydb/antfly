@@ -109,6 +109,15 @@ class RelationalColumnExpression:
             A matching candidate wins over NULL candidates; otherwise a NULL
             candidate makes the result UNKNOWN. These operations require schema
             capability version 19.
+            JSON expressions require reader capability version 30. The json type
+            carries JSONB semantics, including exact numeric values and display
+            scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+            array length rejects a non-array value. jsonb_extract_path and
+            jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+            path components. Negative array ordinals count from the end; a missing
+            path returns SQL NULL. JSON extraction retains JSON null; text extraction
+            converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+            enclosing CASE/coalesce retain their short-circuit semantics.
     """
 
     column: str

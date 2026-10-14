@@ -212,6 +212,16 @@ def test_sql_bound_parameters_and_exact_integer_results():
     assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
 
 
+@pytest.mark.parametrize("with_value", [False, True])
+def test_public_json_null_expression_round_trip(with_value):
+    source = {"op": "literal", "type": "json", "json_null": True}
+    if with_value:
+        source["value"] = None
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.json_null is True
+    assert expression.to_dict() == source
+
+
 def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text():
     source = {"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.2500"}
     expression = RelationalScalarExpression.from_dict(source)

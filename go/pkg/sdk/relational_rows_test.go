@@ -96,6 +96,29 @@ func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRelationalJSONNullPublicExpressionContract(t *testing.T) {
+	for _, source := range []string{`{"op":"literal","type":"json","json_null":true}`, `{"op":"literal","type":"json","value":null,"json_null":true}`} {
+		var expression RelationalScalarExpression
+		if err := json.Unmarshal([]byte(source), &expression); err != nil {
+			t.Fatal(err)
+		}
+		if expression.Type != oapi.RelationalExpressionTypeJson || !expression.JsonNull {
+			t.Fatalf("lost JSON null identity: %+v", expression)
+		}
+		encoded, err := json.Marshal(expression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var restored map[string]any
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored["json_null"] != true || restored["type"] != "json" {
+			t.Fatalf("JSON null marker did not survive omitted optional value: %s", encoded)
+		}
+	}
+}
+
 func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
 	var expression RelationalScalarExpression
 	if err := json.Unmarshal([]byte(`{"op":"literal","type":"numeric","sql_type":"numeric","value":"9007199254740993.2500"}`), &expression); err != nil {

@@ -14040,9 +14040,9 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -14158,6 +14158,15 @@ export interface components {
          *     A matching candidate wins over NULL candidates; otherwise a NULL
          *     candidate makes the result UNKNOWN. These operations require schema
          *     capability version 19.
+         *     JSON expressions require reader capability version 30. The json type
+         *     carries JSONB semantics, including exact numeric values and display
+         *     scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+         *     array length rejects a non-array value. jsonb_extract_path and
+         *     jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+         *     path components. Negative array ordinals count from the end; a missing
+         *     path returns SQL NULL. JSON extraction retains JSON null; text extraction
+         *     converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+         *     enclosing CASE/coalesce retain their short-circuit semantics.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
@@ -14168,6 +14177,8 @@ export interface components {
             numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
+            /** @description For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30. */
+            json_null?: boolean;
             column?: string;
             /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
