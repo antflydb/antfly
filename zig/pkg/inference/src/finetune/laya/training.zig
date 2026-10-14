@@ -436,6 +436,9 @@ pub const Program = struct {
         errdefer gradients.deinit();
         gradients.graph.outputs.clearRetainingCapacity();
         for (gradients.param_grads) |id| try gradients.graph.markOutput(id);
+        // After the gradients: the forward logits, which `step` reads before
+        // the backward nodes run (see `interpreter.DeferredInput`).
+        try gradients.graph.markOutput(gradients.id_map[built.logits]);
         return .{ .graph = graph, .built = built, .seed = seed, .wrt = wrt, .gradients = gradients, .use_fused_attention = use_fused_attention };
     }
     pub fn deinit(self: *Program) void {
@@ -464,6 +467,38 @@ pub fn executeFramed(a: std.mem.Allocator, graph: *const ml.Graph, cb: *const op
     return result;
 }
 
+/// Runs the gradient graph once. Its forward nodes compute the logits; at the
+/// first backward node the frame is drained, the host loss produces the
+/// cotangent, and a new frame runs the backward nodes on the retained forward
+/// values (no second forward pass).
+const LossInput = struct {
+    a: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    cb: *const ops.ComputeBackend,
+    loss_cfg: objective.Config,
+    decision_rows: []const objective.Row,
+    layout: architecture.Layout,
+    prng: *std.Random.DefaultPrng,
+    framed: bool,
+    loss: ?objective.Result = null,
+
+    fn resolve(raw: *anyopaque, observed: ops.CT) anyerror!ops.CT {
+        const self: *LossInput = @ptrCast(@alignCast(raw));
+        if (self.framed) {
+            self.framed = false;
+            try self.cb.decoderRuntimeSubmitAndWaitFrame();
+        }
+        const logits = try self.cb.toFloat32(observed, self.scratch);
+        const noise = try self.scratch.alloc(f32, if (self.loss_cfg.rl_weight == 0) 0 else self.loss_cfg.group_size * logits.len);
+        for (noise) |*value| value.* = self.prng.random().floatNorm(f32);
+        self.loss = try objective.evaluate(self.a, self.loss_cfg, self.decision_rows, self.layout.options, logits, noise);
+        const cotangent = try floatInput(self.cb, self.loss.?.gradient, &.{ @intCast(self.layout.questions), @intCast(self.layout.options) });
+        self.framed = !@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_TRAIN_UNFRAMED") and self.cb.kind() == .metal and
+            (self.cb.decoderRuntimeBeginFrame() catch false);
+        return cotangent;
+    }
+};
+
 /// A whole forward/backward pair uses the same immutable weights and dropout
 /// masks. The trainer publishes an update only after the binding is released.
 pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Trainer, cfg: modern.Config, examples: []const Example, loss_cfg: objective.Config, seed_value: u64) !Report {
@@ -478,29 +513,45 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     var bound = true;
     defer if (bound) binding.deinit();
     const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, try bindFrozen(scratch, &program.graph, program.frozen), runtime });
-    var forward = try executeFramed(a, &program.graph, cb, combined);
-    defer forward.deinit(cb);
-    const logits = try cb.toFloat32(forward.outputs[0], scratch);
-    const l = try bucketedLayout(examples, cfg);
-    const decision_rows = try rows(scratch, examples);
-    const noise = try scratch.alloc(f32, if (loss_cfg.rl_weight == 0) 0 else loss_cfg.group_size * logits.len);
-    for (noise) |*value| value.* = prng.random().floatNorm(f32);
-    const loss = try objective.evaluate(a, loss_cfg, decision_rows, l.options, logits, noise);
-    defer loss.deinit(a);
-    const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
-    for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
-    const cotangent = try floatInput(cb, loss.gradient, &.{ @intCast(l.questions), @intCast(l.options) });
-    defer cb.free(cotangent);
-    backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = cotangent };
-    var backward = try executeFramed(a, &program.gradients.graph, cb, backward_inputs);
+    const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len);
+    for (combined, backward_inputs) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
+    var pending = LossInput{
+        .a = a,
+        .scratch = scratch,
+        .cb = cb,
+        .loss_cfg = loss_cfg,
+        .decision_rows = try rows(scratch, examples),
+        .layout = try bucketedLayout(examples, cfg),
+        .prng = &prng,
+        .framed = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and
+            !@import("antfly_platform").env.getenvBool("ANTFLY_LAYA_TRAIN_UNFRAMED") and try cb.decoderRuntimeBeginFrame(),
+    };
+    defer if (pending.loss) |loss| loss.deinit(a);
+    errdefer if (pending.framed) cb.decoderRuntimeCancelFrame() catch {};
+    var backward = try interpreter.execute(a, &program.gradients.graph, cb, .{
+        .runtime_inputs = backward_inputs,
+        .strict_integer_constants = true,
+        .deferred_input = .{
+            .node_id = program.gradients.id_map[program.seed],
+            .at = program.gradients.forward_node_count,
+            .observe = program.gradients.id_map[program.built.logits],
+            .context = &pending,
+            .resolve = LossInput.resolve,
+        },
+    });
     defer backward.deinit(cb);
+    if (pending.framed) {
+        pending.framed = false;
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+    }
+    const loss = pending.loss orelse return error.InvalidDeferredInput;
     // Results own their gradient tensors; freeing parameter/input bindings does
     // not invalidate these outputs. No optimizer mutation occurs with a tape live.
     binding.deinit();
     bound = false;
     const outcome = if (trainer.execution == .native) blk: {
         const gradients = try scratch.alloc(controller.Gradient, program.wrt.len);
-        for (program.wrt, backward.outputs, gradients) |id, output, *gradient| gradient.* = .{ .name = program.graph.parameterName(program.graph.node(id)), .values = try cb.toFloat32(output, scratch) };
+        for (program.wrt, backward.outputs[0..program.wrt.len], gradients) |id, output, *gradient| gradient.* = .{ .name = program.graph.parameterName(program.graph.node(id)), .values = try cb.toFloat32(output, scratch) };
         break :blk try trainer.submit(trainer.identity(), loss.loss, gradients, null);
     } else blk: {
         const gradients = try scratch.alloc(controller.ResidentGradient, program.wrt.len);
@@ -510,7 +561,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
         // device gradient is copied on the GPU; the materialized interpreter
         // can also return host-backed CTs for some VJPs, which are uploaded.
         // Either way the transfer is explicit; a foreign CT is never relabeled.
-        for (program.wrt, backward.outputs, gradients) |id, output, *gradient| {
+        for (program.wrt, backward.outputs[0..program.wrt.len], gradients) |id, output, *gradient| {
             const shape = program.graph.node(id).output_shape;
             var dims: [8]i32 = undefined;
             for (shape.dims[0..shape.rank()], 0..) |dim, i| dims[i] = @intCast(dim);
