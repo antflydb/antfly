@@ -1,0 +1,11 @@
+Decoder libdav1d [dav1d AV1 decoder by VideoLAN]:
+    General capabilities: delay threads 
+    Threading capabilities: other
+libdav1d decoder AVOptions:
+  -max_frame_delay   <int>        .D.V....... Max frame delay (from 0 to 256) (default 0)
+  -filmgrain         <boolean>    .D.V......P Apply Film Grain (default auto)
+  -oppoint           <int>        .D.V....... Select an operating point of the scalable bitstream (from -1 to 31) (default -1)
+  -alllayers         <boolean>    .D.V....... Output all spatial layers (default false)
+
+
+Exiting with exit code 0

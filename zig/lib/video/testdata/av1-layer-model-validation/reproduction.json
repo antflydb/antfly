@@ -1,0 +1,60 @@
+{
+  "command": [
+    "python3",
+    "tools/embeddinggemma2/generate_av1_model_corpus.py",
+    "--include-scalable",
+    "--output",
+    "/private/tmp/av1-layers-reproduced"
+  ],
+  "status": "pass",
+  "artifacts": {
+    "av1-c0-12.webm": {
+      "original_sha256": "a7353c1acaf114ae9d8cfec9c58cdac2b53e88cfefc8f070167dc36961f3f750",
+      "reproduced_sha256": "a7353c1acaf114ae9d8cfec9c58cdac2b53e88cfefc8f070167dc36961f3f750"
+    },
+    "av1-c0-8.webm": {
+      "original_sha256": "a9196cf53fdc71f8fbd573fa44bc95313f8faa62f896a8bc32a1cea9550458de",
+      "reproduced_sha256": "a9196cf53fdc71f8fbd573fa44bc95313f8faa62f896a8bc32a1cea9550458de"
+    },
+    "av1-c1-12.webm": {
+      "original_sha256": "58e553be16246f0f62fdacf5b1615792de1f5989d9e8011f4f15570e9608a7e6",
+      "reproduced_sha256": "58e553be16246f0f62fdacf5b1615792de1f5989d9e8011f4f15570e9608a7e6"
+    },
+    "av1-c2-10.webm": {
+      "original_sha256": "3c253a7ae6cb946ad30f6b4b42dee238c19b67f50c6e8ad3ec4e0f75b94ef209",
+      "reproduced_sha256": "3c253a7ae6cb946ad30f6b4b42dee238c19b67f50c6e8ad3ec4e0f75b94ef209"
+    },
+    "av1-c2-12.webm": {
+      "original_sha256": "3da76fcdf6e96c5c69ae8944891e519c1ddd1cde5275e6ed051c13290f7a125f",
+      "reproduced_sha256": "3da76fcdf6e96c5c69ae8944891e519c1ddd1cde5275e6ed051c13290f7a125f"
+    },
+    "av1-c2-8.webm": {
+      "original_sha256": "f09b08acee0b12892574d810fb7bf34c78033debb750a8b87fd809ec569ab27d",
+      "reproduced_sha256": "f09b08acee0b12892574d810fb7bf34c78033debb750a8b87fd809ec569ab27d"
+    },
+    "av1-c3-10.webm": {
+      "original_sha256": "2919444a2d4fea60aad0601301d78201f41a01eeb2a33c11e1865dfe607ee0d9",
+      "reproduced_sha256": "2919444a2d4fea60aad0601301d78201f41a01eeb2a33c11e1865dfe607ee0d9"
+    },
+    "av1-c3-12.webm": {
+      "original_sha256": "2f11f520cecb5443c8c25ead81883f9e5598bddfdaa50b7665aa809494919dac",
+      "reproduced_sha256": "2f11f520cecb5443c8c25ead81883f9e5598bddfdaa50b7665aa809494919dac"
+    },
+    "av1-c3-8.webm": {
+      "original_sha256": "4c436a1b74525e47da2d20496c23cd3de109b9d94ad449be9483d72074539770",
+      "reproduced_sha256": "4c436a1b74525e47da2d20496c23cd3de109b9d94ad449be9483d72074539770"
+    },
+    "av1-svc.webm": {
+      "original_sha256": "03366b84abcc0aec43311ed62a0735a5bdac27588f864413f01c200c0944d9e3",
+      "reproduced_sha256": "03366b84abcc0aec43311ed62a0735a5bdac27588f864413f01c200c0944d9e3"
+    },
+    "corpus.json": {
+      "original_sha256": "410e0015c99fb9cf6f7eec5f088544953415e32f0eee18b9e98764bd3562406b",
+      "reproduced_sha256": "410e0015c99fb9cf6f7eec5f088544953415e32f0eee18b9e98764bd3562406b"
+    },
+    "formats.json": {
+      "original_sha256": "623ffa740eda64d95ea659bf5cf5e94026e4926c753daf0c07b66071a07790e1",
+      "reproduced_sha256": "623ffa740eda64d95ea659bf5cf5e94026e4926c753daf0c07b66071a07790e1"
+    }
+  }
+}

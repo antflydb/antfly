@@ -102,9 +102,28 @@ def webm(encoded):
     return header + element(0x18538067, info + track + clusters)
 
 
-def generate(source, output, ffprobe, ffmpeg):
+def generate(source, output, ffprobe, ffmpeg, include_scalable=False):
     output.mkdir(parents=True, exist_ok=True)
     golden = json.loads((source / "golden.json").read_text())
+    if include_scalable:
+        layers = json.loads((source / "layers.json").read_text())
+        top = next(
+            row
+            for row in layers["cases"]
+            if row["operating_point"] == 0 and not row["all_layers"]
+        )
+        golden.append(
+            dict(
+                name="av1-svc",
+                framing="low_overhead",
+                packet_sha256=layers["packet_sha256"],
+                width=128,
+                height=96,
+                depth=8,
+                chroma=1,
+                frame_sha256=[frame["sha256"] for frame in top["frames"]],
+            )
+        )
     documents = []
     evidence = []
     for row in golden:
@@ -259,8 +278,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument(
+        "--include-scalable",
+        action="store_true",
+        help="Include pinned two-spatial/three-temporal-layer AV1 at operating point zero",
+    )
     args = parser.parse_args()
-    generate(args.source, args.output, args.ffprobe, args.ffmpeg)
+    generate(args.source, args.output, args.ffprobe, args.ffmpeg, args.include_scalable)
 
 
 if __name__ == "__main__":

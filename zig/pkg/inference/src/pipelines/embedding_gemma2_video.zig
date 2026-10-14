@@ -364,6 +364,13 @@ fn webmTrack(track: media.webm.Track) !media.mp4.Track {
     return .{ .codec = .avc, .id = 1, .timescale = 1_000_000_000, .width = std.math.cast(u16, track.width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u16, track.height) orelse return error.ResourceLimitExceeded, .avcc = &.{}, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
 }
 
+// Model presentation follows the pinned reference: operating point zero,
+// displaying its highest spatial layer while decoding lower-layer dependencies.
+// Library callers can still explicitly request every spatial output.
+fn webmDecodeOptions(control: media.source.Control, pool: ?*media.admission.Pool) video.webm_pictures.Options {
+    return .{ .decoder = .{ .control = control, .admission_pool = pool, .av1_operating_point = 0, .av1_all_layers = false } };
+}
+
 fn webmPolicy(track: media.webm.Track, width: u32, height: u32, signal: video.h264.Color) !video.preparation.Options {
     const layout = try video.display.webmLayout(track, width, height, .presentation);
     var common = try webmTrack(track);
@@ -387,8 +394,8 @@ fn webmHost(track: media.webm.Track, frame: *const video.codecs.Frame) !video.pr
     if (c.subsampling_v) |v| if (frame.chroma_format == 0 or v != vertical) return error.UnsupportedVideoColor;
     if (c.cb_subsampling_h) |v| if (v != 0) return error.UnsupportedVideoColor;
     if (c.cb_subsampling_v) |v| if (v != 0) return error.UnsupportedVideoColor;
-    // Current RGB conversion replicates coded chroma samples. Explicit siting
-    // requires a separate reconstruction filter rather than an ignored tag.
+    // Default SDR reconstruction follows the reference geometry. Explicit
+    // chroma siting requires a separately qualified filter policy.
     if (c.siting_h != 0 or c.siting_v != 0) return error.UnsupportedVideoColor;
     var host = frame.host();
     if (c.range == 3) return error.UnsupportedVideoColor;
@@ -471,7 +478,7 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     if (isWebm(bytes)) {
         var reader = try media.webm.Reader.init(a, &source, .{});
         defer reader.deinit();
-        var index = try video.webm_pictures.index(a, &reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } });
+        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
         const selected = try selectWebm(a, index, sampling, source.control);
         defer a.free(selected);
@@ -645,7 +652,7 @@ pub const Prefetch = struct {
             reader = packet_input.?.reader;
         }
         defer if (webm) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
-        var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
+        var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
         defer if (webm_index) |*index| index.deinit();
         const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectReader(a, &reader, sampling, source.control, self.reader_selection);
         self.selected = selected;
@@ -683,7 +690,7 @@ pub const Prefetch = struct {
         if (missing == 0) return;
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, misses[0..missing], &capture, Capture.publishWebm);
+            try video.webm_pictures.walkIndexed(a, &webm_reader, webmDecodeOptions(source.control, pool), webm_index.?, misses[0..missing], &capture, Capture.publishWebm);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -824,7 +831,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         reader = packet_input.?.reader;
     }
     defer if (webm) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
-    var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }) else null;
+    var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
     defer if (webm_index) |*index| index.deinit();
     const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectReader(a, &reader, sampling, source.control, selection);
     defer a.free(selected);
@@ -892,7 +899,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     }
     capture.decode_slots = miss_slots[0..missing];
     const decoded = if (missing == 0) {} else if (webm)
-        video.webm_pictures.walkIndexed(a, &webm_reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } }, webm_index.?, misses[0..missing], &capture, Capture.publishWebm)
+        video.webm_pictures.walkIndexed(a, &webm_reader, webmDecodeOptions(source.control, pool), webm_index.?, misses[0..missing], &capture, Capture.publishWebm)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -2199,4 +2206,56 @@ test "embeddinggemma2 video preflight includes native chroma reconstruction scra
     try std.testing.expect(plan.preparation_bytes >= required);
     try std.testing.expect(plan.preparation_bytes > old_charge);
     try std.testing.expect((try plan.deviceBytes()) >= required * plan.commands + 16 * 1024 * 1024);
+}
+
+test "embeddinggemma2 video scalable AV1 sampling uses highest spatial presentation layer" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/av1-svc.webm");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "model-scalable-presentation" };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var all = try video.webm_pictures.index(a, &reader, .{});
+    defer all.deinit();
+    var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(.{}, null));
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 24), all.pictures.len);
+    try std.testing.expectEqual(@as(usize, 12), index.pictures.len);
+    for (index.pictures) |picture| {
+        try std.testing.expectEqual(@as(u32, 128), picture.width);
+        try std.testing.expectEqual(@as(u32, 96), picture.height);
+    }
+    const selected = try selectWebm(a, index, .reference, .{});
+    defer a.free(selected);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 6 }, selected);
+    try std.testing.expectEqual(@as(u64, 2 * 128 * 96), try inspectPixels(bytes, .{ .io = std.testing.io }));
+    const CaptureLayer = struct {
+        count: usize = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const video.codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const hashes = [_][]const u8{
+                "70b3524de6d4a46f151043e5ce2b6b3425ad6db11a1de9aac5290c7b5fefe2a7",
+                "0f97efb9d3bbc6dc291b4a2b6a24b3fc3cc19ebda9ad2c0eda8c5e2189cef3a7",
+            };
+            try std.testing.expectEqual(([_]usize{ 0, 6 })[self.count], id);
+            // Independent AOM/FFmpeg hashes are planar Y/U/V; native
+            // storage interleaves U/V for preparation.
+            const host = frame.host();
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(host.planes[0].bytes);
+            const sample: usize = if (frame.bit_depth == 8) 1 else 2;
+            for (0..2) |plane| {
+                var at = plane * sample;
+                while (at < host.planes[1].bytes.len) : (at += 2 * sample)
+                    hash.update(host.planes[1].bytes[at..][0..sample]);
+            }
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            const actual = std.fmt.bytesToHex(digest, .lower);
+            try std.testing.expectEqualStrings(hashes[self.count], &actual);
+            self.count += 1;
+        }
+    };
+    var capture = CaptureLayer{};
+    try video.webm_pictures.walkIndexed(a, &reader, webmDecodeOptions(.{}, null), index, selected, &capture, CaptureLayer.accept);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
 }

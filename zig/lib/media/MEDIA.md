@@ -1623,3 +1623,34 @@ cancellation completion. Broader display/layer policies, mixed real-world stream
 full-pipeline load/performance and the remaining non-CUDA scope remain active.
 
 See the [current qualification receipts](../video/testdata/av1-chroma-model-validation/README.md).
+
+### Scalable AV1 model presentation qualification
+
+Model WebM planning and selected replay now share operating point zero with
+highest-spatial-layer presentation. Lower layers remain decoded as dependencies;
+they do not become extra model sampling pictures. Explicit all-layer output
+remains available to library callers. Admission preflight, cache producers and
+ordinary inference all use the same model policy.
+
+A packet-preserving WebM corpus adds the pinned two-spatial/three-temporal-layer
+AV1 clip to the nine depth/chroma controls. Independent FFmpeg output matches
+all 12 top-layer AOM picture hashes; repeated generation reproduces all 12 corpus
+artifacts byte-exactly. The regression compares the library's 24-picture timeline
+with the model's 12-picture timeline, selected IDs 0/6, admitted pixel count and
+independent planar hashes. The complete macOS model suite passes 51 tests.
+
+The old server fails the scalable embedding gate (maximum coordinate error
+0.03649, cosine 0.95742) and changes one query's ranking. The corrected server
+preserves all ten video vectors, both queries, exact rankings and top-1/5/10
+overlap 1.0 on native CPU, Metal and actual Linux ARM64 CPU. Gates are unchanged.
+Linux compares native execution with the pinned PyTorch CPU reference generated
+on macOS; it is not a fresh Linux PyTorch run. These generated fixtures establish
+reference preservation, not end-user relevance or arbitrary scalable conformance.
+
+Metal completes every vector/ranking comparison, then its retry is capacity-denied; its overall stress report remains failed.
+CPU/Linux disconnect/retry and ten serial sustained requests complete. Peer
+disconnect does not prove cancellation completion. Broader scalable streams,
+operating-point switching, display policies, real-stream/fuzz campaigns,
+full-pipeline load/performance and the remaining non-CUDA scope stay active.
+
+See the [qualification receipts](../video/testdata/av1-layer-model-validation/README.md).
