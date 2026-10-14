@@ -106,7 +106,7 @@ pub const View = struct {
             map: Hash.Iterator,
             compact: struct { entries: []Entry, offset: usize = 0 },
             const Result = struct { key_ptr: *const []const u8, value_ptr: *usize };
-            fn next(self: *@This()) ?Result {
+            pub fn next(self: *@This()) ?Result {
                 switch (self.*) {
                     .map => |*it| {
                         const e = it.next() orelse return null;
@@ -155,7 +155,7 @@ pub const View = struct {
             self.object_complete = complete;
         }
 
-        fn kind(self: Node) u8 {
+        pub fn kind(self: Node) u8 {
             const raw = std.mem.trim(u8, self.raw, " \r\n\t");
             return if (raw.len == 0) 0 else raw[0];
         }
@@ -166,7 +166,7 @@ pub const View = struct {
         return .{ .alloc = alloc, .root = .{ .raw = raw } };
     }
 
-    fn children(self: *View, node: *Node) ![]Child {
+    pub fn children(self: *View, node: *Node) ![]Child {
         const object = node.kind() == '{';
         if (node.children) |cached| if (!object or node.objectComplete()) return cached;
         if (!object and node.kind() != '[') return &.{};
@@ -206,7 +206,7 @@ pub const View = struct {
         return node.children.?;
     }
 
-    fn field(self: *View, node: *Node, name: []const u8) !?*Node {
+    pub fn field(self: *View, node: *Node, name: []const u8) !?*Node {
         if (node.kind() != '{') return null;
         if (node.object_index.get(name)) |i| {
             if (i == std.math.maxInt(usize)) return null;
@@ -220,7 +220,7 @@ pub const View = struct {
         return &entries[i].node;
     }
 
-    fn element(self: *View, node: *Node, index: usize) !?*Node {
+    pub fn element(self: *View, node: *Node, index: usize) !?*Node {
         if (node.children) |entries| return if (index < entries.len) &entries[index].node else null;
         // A cached null is a requested index proven absent by validation.
         // Unplanned indices retain the ordinary lazy scan behavior.
@@ -276,7 +276,7 @@ pub const View = struct {
             // A failed preparation cannot publish half-built caches to a
             // later predicate or projection using this same source view.
             view.root.children = null;
-            view.root.object_index.clearRetainingCapacity();
+            view.root.object_index = .empty;
             view.root.array_index.clearRetainingCapacity();
             view.root.markObjectComplete(false);
         }
@@ -299,6 +299,9 @@ pub const View = struct {
             ordinal: usize = 0,
             start: usize = 0,
             pending_node: ?*View.Node = null,
+            // Stable across work-stack growth; reused for siblings. Only the
+            // finished child is copied into the view's retained navigation.
+            pending_storage: *View.Node,
             pending_selector: ?*const Selector = null,
 
             fn wants(self: *@This(), name: []const u8) bool {
@@ -320,7 +323,7 @@ pub const View = struct {
                 var indices = selected.indices.iterator();
                 while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
             }
-            fn beginValue(self: *@This(), a: Allocator, start: usize, object_value: bool) !void {
+            fn beginValue(self: *@This(), start: usize, object_value: bool) !void {
                 self.start = start;
                 self.pending_node = null;
                 self.pending_selector = null;
@@ -331,13 +334,13 @@ pub const View = struct {
                     if (selected.fields.get(self.name)) |child| {
                         if (child.fields.count() != 0) {
                             self.pending_selector = child;
-                            self.pending_node = try a.create(View.Node);
+                            self.pending_node = self.pending_storage;
                         }
                     }
                 } else {
                     const item = selected.array_items.get(self.ordinal);
                     if (item == null and selected.fanout == null) return;
-                    self.pending_node = try a.create(View.Node);
+                    self.pending_node = self.pending_storage;
                     if (object_value) {
                         const child = item orelse selected.fanout.?;
                         if (child.fields.count() != 0) self.pending_selector = child;
@@ -362,7 +365,11 @@ pub const View = struct {
                         if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
                         try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
                     } else if (self.pending_node) |node| {
-                        if (self.selected.?.fanout != null) try self.children.append(a, .{ .node = node.* }) else try parent.array_index.put(a, self.ordinal, node);
+                        if (self.selected.?.fanout != null) try self.children.append(a, .{ .node = node.* }) else {
+                            const owned = try a.create(View.Node);
+                            owned.* = node.*;
+                            try parent.array_index.put(a, self.ordinal, owned);
+                        }
                     }
                 }
                 self.ordinal += 1;
@@ -388,7 +395,10 @@ pub const View = struct {
         };
         var frames: std.ArrayListUnmanaged(Frame) = .empty;
         defer {
-            for (frames.items) |*frame| frame.arena.deinit();
+            for (frames.items) |*frame| {
+                frame.arena.deinit();
+                scratch.destroy(frame.pending_storage);
+            }
             frames.deinit(scratch);
         }
         var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
@@ -426,18 +436,21 @@ pub const View = struct {
                     continue;
                 }
                 frame.key = true;
-                try frame.beginValue(alloc, scanner.cursor, token == .object_begin);
+                try frame.beginValue(scanner.cursor, token == .object_begin);
             }
             root_seen = true;
             if (token == .object_begin or token == .array_begin) {
                 const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].pending_selector != null) frames.items[depth - 1].pending_node else null;
                 const selected_plan = if (depth == 0) selector else frames.items[depth - 1].pending_selector;
                 _ = try scanner.next();
-                if (depth == frames.items.len) try frames.append(scratch, .{ .arena = .init(scratch) });
+                if (depth == frames.items.len) {
+                    try frames.ensureUnusedCapacity(scratch, 1);
+                    frames.appendAssumeCapacity(.{ .arena = .init(scratch), .pending_storage = try scratch.create(View.Node) });
+                }
                 const frame = &frames.items[depth];
                 var key_arena = frame.arena;
                 _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
-                frame.* = .{ .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
+                frame.* = .{ .pending_storage = frame.pending_storage, .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
                 try frame.plan(alloc);
                 depth += 1;
             } else {
@@ -805,4 +818,39 @@ test "public graph metric borrowed wire compact object projections retain unplan
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire streaming preparation recovers after every allocation failure" {
+    const a = std.testing.allocator;
+    const selector_paths = [_]plan_mod.Path{ .{ .parts = &.{"x"} }, .{ .parts = &.{"missing"} } };
+    var plan_arena = std.heap.ArenaAllocator.init(a);
+    defer plan_arena.deinit();
+    const selector = try plan_mod.compile(plan_arena.allocator(), &selector_paths);
+    var failed: usize = 0;
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var induced = false;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = index });
+        var view = View.init(failing.allocator(), "{\"x\":1,\"y\":2}");
+        view.prepareProjection(selector, .all, .object_only) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            failed += 1;
+            induced = true;
+            failing.fail_index = std.math.maxInt(usize);
+            var values: std.ArrayListUnmanaged(Value) = .empty;
+            try view.collect(&.{"x"}, false, &values);
+            try std.testing.expectEqual(@as(usize, 1), values.items.len);
+            try std.testing.expectEqual(@as(i64, 1), values.items[0].integer);
+            values.clearRetainingCapacity();
+            try view.collect(&.{"missing"}, false, &values);
+            try std.testing.expectEqual(@as(usize, 0), values.items.len);
+            try view.prepareProjection(selector, .all, .object_only);
+            try view.collect(&.{"x"}, false, &values);
+            try std.testing.expectEqual(@as(i64, 1), values.items[0].integer);
+        };
+        if (!induced) break;
+    }
+    try std.testing.expect(failed != 0);
 }

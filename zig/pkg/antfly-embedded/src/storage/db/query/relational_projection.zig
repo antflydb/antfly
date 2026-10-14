@@ -105,7 +105,8 @@ pub const Plan = struct {
     }
 
     pub fn projectSources(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources) ![]u8 {
-        var result = std.json.ObjectMap.empty;
+        const Projection = @import("projection_output.zig").Output;
+        var result: Projection.Object = .empty;
         if (self.paths.len == 0) {
             var output = std.Io.Writer.Allocating.init(scratch);
             defer output.deinit();
@@ -132,18 +133,14 @@ pub const Plan = struct {
             };
             for (self.paths) |parts| {
                 if (parts.len == 0) continue;
-                const value = source.get(parts[0]) orelse continue;
-                switch (value) {
-                    .json => |view| try view.include(scratch, &result, parts[0], parts[1..]),
-                    .logical => |logical| {
-                        var object = std.json.ObjectMap.empty;
-                        try object.put(scratch, parts[0], logical);
-                        try document_query.applyIncludePath(scratch, object, &result, parts);
-                    },
+                const value = source.getPtr(parts[0]) orelse continue;
+                switch (value.*) {
+                    .json => |view| try Projection.include(scratch, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..]),
+                    .logical => |*logical| try Projection.include(scratch, &result, parts[0], .{ .logical = logical }, parts[1..]),
                 }
             }
         }
-        return document_query.serializeWithOutput(scratch, alloc, std.json.Value{ .object = result });
+        return (Projection{ .object = result }).serialize(scratch, alloc);
     }
 };
 
@@ -242,4 +239,32 @@ test "public graph metric borrowed wire native JSON sparse selectors reuse immut
     const result = try lexical.projectSources(a, arena.allocator(), sources);
     defer a.free(result);
     try std.testing.expectEqualStrings("{\"payload\":{\"arr\":[1e2]}}", result);
+}
+
+test "public graph metric borrowed wire native JSON copy on write keeps output navigation in row scratch" {
+    const a = std.testing.allocator;
+    const columns = [_]schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table = schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{ "payload", "payload.a.x" });
+    defer plan.deinit();
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    var view = JsonView.init(source_arena.allocator(), "{\"a\":{\"x\":1,\"y\":2},\"other\":3}");
+    var sources = Plan.Sources.empty;
+    defer sources.deinit(a);
+    try sources.put(a, "payload", .{ .json = &view });
+    {
+        var row_arena = std.heap.ArenaAllocator.init(a);
+        defer row_arena.deinit();
+        const bytes = try plan.projectSources(a, row_arena.allocator(), sources);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("{\"payload\":{\"a\":{\"x\":1,\"y\":2},\"other\":3}}", bytes);
+        // The caller's page-owned view still contains only the selected field.
+        try std.testing.expectEqual(@as(usize, 1), view.root.children.?.len);
+    }
+    var values: std.ArrayListUnmanaged(std.json.Value) = .empty;
+    try view.collect(&.{ "a", "y" }, false, &values);
+    try std.testing.expectEqual(@as(i64, 2), values.items[0].integer);
 }

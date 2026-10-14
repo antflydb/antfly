@@ -120,11 +120,12 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     const overlays = try a.alloc(JsonView.RootSource, sources.len);
     for (sources, overlays) |source, *overlay| overlay.* = .{ .name = source.name, .value = source.value };
     view.root_sources = overlays;
-    var projected: std.json.ObjectMap = .empty;
+    const Projection = @import("query/projection_output.zig").Output;
+    var projected: Projection.Object = .empty;
     if (plan.include_all or plan.passthrough) {
-        try view.includePreparedRootExcept(a, &projected, plan.excluded);
-    } else for (plan.paths) |path| try view.includeRoot(a, &projected, path.parts);
-    return .{ .json = try serializeWithOutput(a, output, .{ .object = projected }) };
+        try Projection.includePreparedRootExcept(a, &projected, &view, plan.excluded);
+    } else for (plan.paths) |path| try Projection.includeRoot(a, &projected, &view, path.parts);
+    return .{ .json = try (Projection{ .object = projected }).serialize(a, output) };
 }
 
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
