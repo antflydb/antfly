@@ -6313,6 +6313,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer response.deinit();
         var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
         errdefer result.deinit();
+        try table_reads.restoreDocumentAuthority(alloc, alloc, group_id, req.document_authority_mode, &result);
         result.identity_read_generation = response.identityReadGeneration();
         if (req.identity_read_generation) |expected| {
             if (result.identity_read_generation != expected)

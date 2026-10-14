@@ -16964,13 +16964,23 @@ pub const ApiHttpServer = struct {
     /// Durable definitions and pending generations are the recovery source;
     /// the in-memory queue is only an idempotent wakeup. One table per pass
     /// also rechecks external coverage after source replacement or append.
+    /// Reserve a keyed wakeup before a catalog mutation so admission needs no
+    /// allocation after the durable commit. Deinit releases unused reservations.
+    pub fn prepareLakeCommit(self: *ApiHttpServer, table_name: []const u8) !?PreparedIndexInstallation {
+        return self.prepareIndexInstallationReconcile(table_name, "__lake_publication", null);
+    }
+
+    pub fn activateLakeCommit(self: *ApiHttpServer, prepared: *PreparedIndexInstallation) void {
+        _ = self.activatePreparedIndexInstallation(prepared, true);
+    }
+
     pub fn notifyLakeCommit(self: *ApiHttpServer, table_name: []const u8) !void {
         // Catalog state remains the durable recovery source. This wakeup only
         // lowers latency; a lost response or process restart is repaired by
         // the authoritative inventory sweep.
-        var prepared = (try self.prepareIndexInstallationReconcile(table_name, "__lake_publication", null)) orelse return;
+        var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
-        _ = self.activatePreparedIndexInstallation(&prepared, true);
+        self.activateLakeCommit(&prepared);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
