@@ -414,9 +414,10 @@ pub const Resolver = struct {
         return false;
     }
 
-    /// Candidate fields compared to the mention's generated name vector.
+    /// Caller owns the slice; field names borrow the resolver's scorer.
     pub fn candidateVectorFields(self: *const Resolver, a: std.mem.Allocator) ![]const []const u8 {
         var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer fields.deinit(a);
         if (self.scorer) |scorer| for (scorer.comparisons) |comparison| {
             if (!std.mem.eql(u8, comparison.left, "name_embedding")) continue;
             var duplicate = false;
@@ -426,7 +427,7 @@ pub const Resolver = struct {
             };
             if (!duplicate) try fields.append(a, comparison.right);
         };
-        return fields.items;
+        return try fields.toOwnedSlice(a);
     }
 
     /// In-place compaction of `entities` down to the mentions this resolver
@@ -1478,6 +1479,27 @@ pub fn fingerprint(alloc: std.mem.Allocator, value: anytype) ![32]u8 {
 
 fn sameDependency(left: ?[32]u8, right: ?[32]u8) bool {
     return left != null and right != null and std.mem.eql(u8, &left.?, &right.?);
+}
+
+test "candidate vector fields transfer exact slice ownership and unwind allocation failures" {
+    const Exercise = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var resolver = try Resolver.parse(alloc,
+                \\{"table":"entities","key_template":"entity/id","scorer":{"comparisons":[
+                \\{"name":"first","left":"name_embedding","right":"name_embedding","levels":[{"when":"cosine > 0.9","weight":1}]},
+                \\{"name":"duplicate","left":"name_embedding","right":"name_embedding","levels":[{"when":"cosine > 0.9","weight":1}]},
+                \\{"name":"second","left":"name_embedding","right":"alias_embedding","levels":[{"when":"cosine > 0.9","weight":1}]},
+                \\{"name":"text","left":"text","right":"canonical_name","levels":[{"when":"exact == 1","weight":1}]}]}}
+            );
+            defer resolver.deinit();
+            const fields = try resolver.candidateVectorFields(alloc);
+            defer alloc.free(fields);
+            try testing.expectEqual(@as(usize, 2), fields.len);
+            try testing.expectEqualStrings("name_embedding", fields[0]);
+            try testing.expectEqualStrings("alias_embedding", fields[1]);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Exercise.run, .{});
 }
 
 fn mentionRecord(entity: ExtractedEntity, fields: *[4]matcher.Field) matcher.Record {

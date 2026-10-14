@@ -318,6 +318,10 @@ pub var test_before_source_vector_checkpoint: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
 } = null;
+var test_before_dense_posting_coverage: ?struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+} = null;
 const sparse_backfill_batch_size: usize = 1024;
 const vector_backfill_page_items: usize = 1024;
 const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
@@ -16754,13 +16758,21 @@ pub const IndexManager = struct {
     }
 
     pub fn persistDensePostingSidecarByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
-        return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{});
+        return try self.ensureDensePostingCoverageByName(name, applied_sequence);
     }
 
     /// Idempotently ensures that the native posting authority covers a source
     /// boundary. This observer API never consumes a live source or maintenance
     /// capture; callers without its lease must retry after that owner commits.
     pub fn ensureDensePostingCoverageByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        // Generic checkpoint/status publishers run after the source callback
+        // releases its apply guard. Posting publication and its maintenance
+        // still mutate HBC state, so serialize them with source captures and
+        // physical projection metadata instead of racing their ownership.
+        var apply_guard = self.lockManagedIndexApply(.{ .name = name, .kind = .dense_vector }) catch |err| switch (err) {
+            error.IndexNotFound => return,
+        };
+        defer apply_guard.unlock();
         return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{});
     }
 
@@ -16785,6 +16797,9 @@ pub const IndexManager = struct {
         options: DensePostingPersistOptions,
     ) !void {
         const entry = self.denseIndex(name) orelse return;
+        if (builtin.is_test and !options.consume_owned_source_capture) {
+            if (test_before_dense_posting_coverage) |hook| try hook.call(hook.ctx);
+        }
         if (!self.densePostingSidecarEnabledForEntry(entry)) return;
         if (options.consume_owned_source_capture and
             entry.index.experimentalPostingMutationCaptureActive())
@@ -44272,7 +44287,14 @@ test "text merge publication keeps every chunk member sharing one parent ordinal
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    // This fixture tests chunk identities, not the production volume's safety
+    // reserve. Keep real scratch admission with a fixture-sized disk floor.
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(alloc);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -44685,7 +44707,14 @@ test "text merge native admission excludes streamed document coordinate and ordi
     defer a.free(path_z);
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 10 * 1024 * 1024, .hard_limit_bytes = 10 * 1024 * 1024 };
-    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    // Preserve the actual 10 MiB merge-memory ceiling without requiring a
+    // production-sized free-disk reserve on the compiler's shared volume.
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(a);
     var store = try docstore_mod.DocStore.open(a, path_z, .{});
     defer store.close();
     var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
@@ -46239,6 +46268,52 @@ test "dense hbc batch options preserve known-new ids outside offline bulk mode" 
     try std.testing.expect(!opts.centroid_only_routing);
     try std.testing.expect(!opts.defer_quantized_rebuild);
     try std.testing.expect(opts.skip_vector_store);
+}
+
+test "dense coverage publication excludes concurrent posting metadata and capture mutation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    }});
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    _ = try entry.index.publishExperimentalPostingCheckpoint(0);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    try entry.index.enableNativePostingMutationStore();
+    const Probe = struct {
+        mutex: *std.atomic.Mutex,
+        calls: usize = 0,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // This is the competing metadata/source writer's admission
+            // attempt at the coverage publisher's physical mutation boundary.
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return error.ConcurrentPostingMutationAdmitted;
+            }
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{ .mutex = entry.apply_mutex };
+    test_before_dense_posting_coverage = .{ .ctx = &probe, .call = Probe.run };
+    defer test_before_dense_posting_coverage = null;
+    try manager.persistDensePostingSidecarByName("dv_v1", 1);
+    try manager.ensureDensePostingCoverageByName("dv_v1", 2);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqual(@as(?u64, 2), entry.index.experimentalPostingDurableAppliedSequence());
+    try std.testing.expect(entry.apply_mutex.tryLock());
+    entry.apply_mutex.unlock();
 }
 
 test "authoritative posting capture starts inside an existing replay session" {

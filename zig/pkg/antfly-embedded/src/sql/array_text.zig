@@ -306,7 +306,8 @@ fn decodeElement(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays
 /// without array tokenization or SQL NULL inference from the string "NULL".
 pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays.Budget) !arrays.Element {
     try work.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlInvalidTextEncoding;
+    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
     return decodeElement(a, kind, text, work);
 }
 

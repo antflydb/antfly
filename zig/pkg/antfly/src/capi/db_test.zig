@@ -2982,6 +2982,7 @@ test "capi lite exposes hosted and status-only profiles" {
 
     var hosted_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_hosted(path, &hosted_handle));
+    defer if (hosted_handle != null) antfly_db_close(hosted_handle);
 
     var hosted_caps: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_capabilities_json(hosted_handle, &hosted_caps));
@@ -3003,10 +3004,28 @@ test "capi lite exposes hosted and status-only profiles" {
     const index_json =
         \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
     ;
-    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_add_index_json(hosted_handle, .{
+    // Reopening clients replay identical inline definitions. These admissions
+    // must succeed without duplicating the index; conflicting configs remain
+    // errors and must preserve the installed catalog.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
         .ptr = index_json,
         .len = index_json.len,
     }));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
+        .ptr = index_json,
+        .len = index_json.len,
+    }));
+    const conflicting_index_json =
+        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{\"field\":\"title\"}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(hosted_handle, .{
+        .ptr = conflicting_index_json,
+        .len = conflicting_index_json.len,
+    }));
+    var replayed_indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(hosted_handle, &replayed_indexes));
+    defer freeRawBuffer(replayed_indexes.ptr, replayed_indexes.len);
+    try std.testing.expectEqualStrings(initial_indexes.ptr.?[0..initial_indexes.len], replayed_indexes.ptr.?[0..replayed_indexes.len]);
 
     const writes = [_]capi.WriteIntent{.{
         .key = .{ .ptr = "doc:capi-lite-profile", .len = "doc:capi-lite-profile".len },

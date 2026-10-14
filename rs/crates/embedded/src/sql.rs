@@ -31,8 +31,44 @@ impl fmt::Display for SqlError {
         if let Some(code) = &self.sqlstate {
             write!(f, "{code}: {}", self.message)
         } else {
-            self.native.fmt(f)
+            f.write_str(&self.message)
         }
+    }
+}
+impl SqlError {
+    fn with_request(self, request: &[u8]) -> Self {
+        let statement = serde_json::from_slice::<serde_json::Value>(request)
+            .ok()
+            .and_then(|value| value["statement"].as_str().map(str::to_owned));
+        match statement {
+            Some(statement) => self.with_statement(&statement),
+            None => self,
+        }
+    }
+
+    /// Attach bounded SQL text, never parameter values, while preserving SQLSTATE.
+    pub(crate) fn with_statement(mut self, statement: &str) -> Self {
+        const LIMIT: usize = 512;
+        let mut end = statement.len().min(LIMIT);
+        while !statement.is_char_boundary(end) {
+            end -= 1;
+        }
+        let excerpt = format!(
+            "{}{}",
+            &statement[..end],
+            if end < statement.len() { "…" } else { "" }
+        );
+        self.message.push_str(&format!(" [statement: {excerpt}]"));
+        if let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&self.body) {
+            if let Some(error) = body
+                .get_mut("error")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                error.insert("statement".into(), excerpt.into());
+                self.body = serde_json::to_vec(&body).expect("SQL diagnostic JSON");
+            }
+        }
+        self
     }
 }
 impl std::error::Error for SqlError {}
@@ -55,17 +91,19 @@ fn output(code: i32, body: Vec<u8>) -> Result<Vec<u8>> {
     let diagnostic = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("error").cloned());
+    let native = Error::from_native(code);
+    let message = diagnostic
+        .as_ref()
+        .and_then(|value| value["message"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| native.to_string());
     Err(SqlError {
-        native: Error::from_native(code),
+        native,
         sqlstate: diagnostic
             .as_ref()
             .and_then(|v| v["code"].as_str())
             .map(str::to_owned),
-        message: diagnostic
-            .as_ref()
-            .and_then(|v| v["message"].as_str())
-            .unwrap_or("Native SQL operation failed")
-            .to_owned(),
+        message,
         body,
     })
 }
@@ -82,14 +120,16 @@ impl Database {
         output(code, body)
     }
     pub fn sql_json(&self, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
-        self.sql_call(|h, out| unsafe {
-            sys::antfly_db_sql_json(h, borrow_slice(request.as_ref()), out)
-        })
+        let request = request.as_ref();
+        self.sql_call(|h, out| unsafe { sys::antfly_db_sql_json(h, borrow_slice(request), out) })
+            .map_err(|error| error.with_request(request))
     }
     pub fn sql_describe_json(&self, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        let request = request.as_ref();
         self.sql_call(|h, out| unsafe {
-            sys::antfly_db_sql_describe_json(h, borrow_slice(request.as_ref()), out)
+            sys::antfly_db_sql_describe_json(h, borrow_slice(request), out)
         })
+        .map_err(|error| error.with_request(request))
     }
     pub fn sql_session_open(&self) -> crate::Result<u64> {
         self.with_handle(|h| {
@@ -102,10 +142,12 @@ impl Database {
         self.with_handle(|h| check(unsafe { sys::antfly_db_sql_session_close(h, id) }))
     }
     pub fn sql_cursor_open_json(&self, request: impl AsRef<[u8]>) -> Result<u64> {
+        let request = request.as_ref();
         let mut id = 0;
         self.sql_call(|h, out| unsafe {
-            sys::antfly_db_sql_open_cursor_json(h, borrow_slice(request.as_ref()), &mut id, out)
-        })?;
+            sys::antfly_db_sql_open_cursor_json(h, borrow_slice(request), &mut id, out)
+        })
+        .map_err(|error| error.with_request(request))?;
         Ok(id)
     }
     pub fn sql_cursor_fetch_json(&self, id: u64, rows: u32) -> Result<Vec<u8>> {
