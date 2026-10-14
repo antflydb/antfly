@@ -519,6 +519,24 @@ fn sqlx_errors_identify_statement_and_nul_parameter() {
             assert!(long_statement.starts_with(excerpt.trim_end_matches('…')));
             conn.close().await.unwrap();
         });
+        let database = antfly_embedded::Database::open_default(&path).unwrap();
+        let table = database.open_table("items").unwrap();
+        let error = table.sql_json(br#"{"statement":"SELECT 1"}"#).unwrap_err();
+        assert!(error.sqlstate.is_none());
+        assert!(error.body.is_empty());
+        assert!(
+            error
+                .message
+                .contains("SQL sessions require a root database handle")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("SQL sessions require a root database handle")
+        );
+        assert!(error.to_string().contains("[statement: SELECT 1]"));
+        drop(table);
+        drop(database);
         std::fs::remove_dir_all(directory).unwrap();
     });
 }

@@ -91,17 +91,19 @@ fn output(code: i32, body: Vec<u8>) -> Result<Vec<u8>> {
     let diagnostic = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("error").cloned());
+    let native = Error::from_native(code);
+    let message = diagnostic
+        .as_ref()
+        .and_then(|value| value["message"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| native.to_string());
     Err(SqlError {
-        native: Error::from_native(code),
+        native,
         sqlstate: diagnostic
             .as_ref()
             .and_then(|v| v["code"].as_str())
             .map(str::to_owned),
-        message: diagnostic
-            .as_ref()
-            .and_then(|v| v["message"].as_str())
-            .unwrap_or("Native SQL operation failed")
-            .to_owned(),
+        message,
         body,
     })
 }
