@@ -160,7 +160,7 @@ pub fn shallowLayoutId(comptime T: type) u64 {
         .error_union => |error_union| hashBytes(&hash, @typeName(error_union.payload)),
         .pointer => |pointer| {
             hashBytes(&hash, @tagName(pointer.size));
-            hashInteger(&hash, pointer.attrs.@"align" orelse @alignOf(pointer.child));
+            hashInteger(&hash, pointer.attrs.@"align" orelse if (pointer.child == anyopaque) 1 else @alignOf(pointer.child));
             hashInteger(&hash, @intFromBool(pointer.attrs.@"const"));
             hashInteger(&hash, @intFromBool(pointer.attrs.@"volatile"));
             hashBytes(&hash, @typeName(pointer.child));
@@ -224,6 +224,12 @@ test "native shallow layout fingerprints include field order" {
     const Left = extern struct { first: u32, second: u64 };
     const Right = extern struct { second: u64, first: u32 };
     try std.testing.expect(shallowLayoutId(Left) != shallowLayoutId(Right));
+}
+
+test "native opaque pointer contracts preserve explicit alignment" {
+    const plain = TypeContract.of(*anyopaque);
+    try std.testing.expect(plain.matches(TypeContract.of(*anyopaque)));
+    try std.testing.expect(!plain.matches(TypeContract.of(*align(16) anyopaque)));
 }
 
 test "native method identifiers are deterministic" {

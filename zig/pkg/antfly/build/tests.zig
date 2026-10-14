@@ -192,7 +192,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves", "graph replay" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -1956,7 +1956,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_public_limits_tests = b.addRunArtifact(public_limits_tests);
     b.step("public-limits-test", "Run shared public transport limits contract").dependOn(&run_public_limits_tests.step);
     api_http_runtime_test_step.dependOn(&run_public_limits_tests.step);
-    const runtime_contract_tests = b.addTest(.{ .root_module = antfly_imports.runtime_abi });
+    const runtime_contract_tests = b.addTest(.{
+        .root_module = antfly_imports.runtime_abi,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
     const run_runtime_contract_tests = b.addRunArtifact(runtime_contract_tests);
     b.step("runtime-contract-test", "Run shared runtime ABI and transport contracts").dependOn(&run_runtime_contract_tests.step);
     api_http_runtime_test_step.dependOn(&run_runtime_contract_tests.step);
@@ -5846,11 +5849,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_tests).step);
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_http_tests).step);
     const graph_metric_boundary_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/runtime_callback_abi.zig"),
+        .root_source_file = b.path("lib/runtime/src/runtime_callback_abi.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_metric_boundary_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     const graph_metric_boundary_tests = b.addTest(.{
         .root_module = graph_metric_boundary_mod,
         .filters = &.{"boundary dispatcher preserves graph metric readiness across runtime units"},
