@@ -1956,7 +1956,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_public_limits_tests = b.addRunArtifact(public_limits_tests);
     b.step("public-limits-test", "Run shared public transport limits contract").dependOn(&run_public_limits_tests.step);
     api_http_runtime_test_step.dependOn(&run_public_limits_tests.step);
-    const runtime_contract_tests = b.addTest(.{ .root_module = antfly_imports.runtime_abi });
+    const runtime_contract_tests = b.addTest(.{
+        .root_module = antfly_imports.runtime_abi,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
     const run_runtime_contract_tests = b.addRunArtifact(runtime_contract_tests);
     b.step("runtime-contract-test", "Run shared runtime ABI and transport contracts").dependOn(&run_runtime_contract_tests.step);
     api_http_runtime_test_step.dependOn(&run_runtime_contract_tests.step);

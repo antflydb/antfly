@@ -254,3 +254,14 @@ test "opt-in Darwin claims retain margins and reject unmeasured profiles" {
     }
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, profile) + runtimeCompileMaxRss(.distributed, profile) <= 28 * gib);
 }
+
+test "default Linux CPU enrichment fits a three GiB build budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    var profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
+    try std.testing.expectEqual(2 * gib, runtimeCompileMaxRss(.enrichment_compute, profile));
+    profile.optimize = .safe;
+    try std.testing.expectEqual(3 * gib, runtimeCompileMaxRss(.enrichment_compute, profile));
+    profile.sanitize_thread = true;
+    try std.testing.expect(runtimeCompileMaxRss(.enrichment_compute, profile) > 3 * gib);
+}

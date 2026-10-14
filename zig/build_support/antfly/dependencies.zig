@@ -1270,6 +1270,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
     inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
+    runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
