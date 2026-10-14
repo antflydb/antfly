@@ -19391,6 +19391,74 @@ pub const DB = struct {
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
+    /// Called under source/replay admission and apply fences. A sequence alone
+    /// misses catalog and generated-publication changes at the same watermark.
+    fn nativeQueryReuseDigestLocked(self: *DB, a: Allocator) !?[32]u8 {
+        // Local revision counters cannot be compared across owner lifetimes.
+        // Query-pin serialization owns this nonce and every hint using it.
+        if (!self.local_execution.native_query_reuse_epoch_ready) {
+            const io = self.backend_runtime.filesystemIo() orelse return null;
+            try io.randomSecure(&self.local_execution.native_query_reuse_epoch);
+            self.local_execution.native_query_reuse_epoch_ready = true;
+        }
+        const sequence = self.core.nextDerivedSequence();
+        if (self.currentMaintenanceTargetSequence() != sequence) return null;
+        const configs = try self.core.listIndexes(a);
+        defer types.freeIndexConfigs(a, configs);
+        const Entry = struct { name: []const u8, kind: []const u8, config_hash: u64, coverage_generation: u64, checkpoint: @import("derived/apply_state.zig").ProjectionCheckpoint };
+        const entries = try a.alloc(Entry, configs.len);
+        defer a.free(entries);
+        for (configs, entries) |cfg, *entry| {
+            const checkpoint = try self.core.loadProjectionCheckpoint(a, cfg.name);
+            if (checkpoint.status != .clean or checkpoint.config_hash != types.indexConfigHash(cfg) or checkpoint.applied_sequence != sequence) return null;
+            entry.* = .{ .name = cfg.name, .kind = @tagName(cfg.kind), .config_hash = types.indexConfigHash(cfg), .coverage_generation = cfg.coverage_generation, .checkpoint = checkpoint };
+        }
+        std.mem.sort(Entry, entries, {}, struct {
+            fn less(_: void, left: Entry, right: Entry) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.less);
+        if (self.loadIndexRepairState(a)) |value| {
+            var repair = value;
+            defer repair.deinit(a);
+            if (repair.entries.items.len != 0) return null;
+        } else |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
+            else => return err,
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u16, 1), .owner_epoch = self.local_execution.native_query_reuse_epoch, .namespace = self.core.identity_namespace, .range = self.core.byteRange(), .sequence = sequence, .primary_revision = self.core.store.query_generation_revision.load(.acquire), .catalog_epoch = self.core.index_manager.writePlanGeneration(), .projections = entries }, .{});
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+        return digest;
+    }
+    /// Query-pin guard is held. Validate unchanged state at a short read point,
+    /// release mutation fences before repository I/O, then rebind exact extents.
+    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
+        const repository = self.backend_runtime.query_cut_repository orelse return false;
+        if (repository.vtable.reuse == null) return false;
+        const basis = self.local_execution.native_query_reuse orelse return false;
+        if (std.mem.eql(u8, &basis.id, request.id)) return false;
+        const digest = checked: {
+            var capture = self.core.snapshot_admission.tryAcquireCapture() orelse return false;
+            defer capture.release();
+            var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return false;
+            defer replay.release();
+            if (!self.core.tryLockApplyExclusive()) return false;
+            defer self.core.unlockApply();
+            try cancellation.check();
+            try self.requireQueryCutStorage();
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            break :checked (try self.nativeQueryReuseDigestLocked(arena.allocator())) orelse return false;
+        };
+        if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
+        const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
+        // Rotate the logical authority, so expiry of the original manifest does
+        // not force capture while the authenticated extents still cover readers.
+        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        return true;
+    }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
@@ -19407,6 +19475,7 @@ pub const DB = struct {
         };
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
+        if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
@@ -19425,7 +19494,9 @@ pub const DB = struct {
         };
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
-            try repository.publish(io, root, request, self.core.identity_namespace, token);
+            if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
+                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+            }
         };
     }
     fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
@@ -19439,13 +19510,8 @@ pub const DB = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const State = struct { request: cut.Request, sequence: u64, complete: bool = false, next_ms: u64 = 0 };
-        var state: ?State = if (@import("native_backup.zig").readFileAlloc(a, io, state_path, 4096)) |bytes|
-            try std.json.parseFromSliceLeaky(State, a, bytes, .{})
-        else |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        const warming = @import("native_query_warming.zig");
+        var state = try warming.readState(a, io, state_path);
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
@@ -19466,17 +19532,19 @@ pub const DB = struct {
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
             try self.captureQueryCutInternal(state.?.request, cancellation, false);
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
         }
         const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
-        const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        const warmed = try repository.warmReusable(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        const completed = warmed.complete;
         if (completed) {
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
+            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
@@ -19824,6 +19892,7 @@ pub const DB = struct {
         // Pin the primary MVCC/read-snapshot while the selected revision is
         // fenced. Its corpus-sized serialization happens only after writers
         // resume and therefore does not extend write unavailability.
+        const query_reuse_digest = if (query_cut != null) try self.nativeQueryReuseDigestLocked(self.alloc) else null;
         var primary_snapshot = try self.core.pinNativeSnapshot();
         defer primary_snapshot.deinit();
         if (comptime builtin.os.tag == .freestanding) {
@@ -19948,7 +20017,9 @@ pub const DB = struct {
             try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
             try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
             if (query_cut) |request| {
-                try @import("native_query_cut.zig").finish(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, cancellation);
+                const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
+                const reuse_digest = if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
+                try @import("native_query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
             } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),

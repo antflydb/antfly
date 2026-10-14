@@ -65,6 +65,13 @@ test "external lake persistence owns its executor and reuses immutable bytes aft
         var server = server_mod.ApiHttpServer.init(a, cfg, status, null, null);
         defer server.deinit();
         {
+            // The first query must not queue behind another startup caller.
+            try server.lake_cache_start_mutex.lock(request_io.io());
+            defer server.lake_cache_start_mutex.unlock(request_io.io());
+            try server.prepareLakeCache();
+            try std.testing.expect(server.lake_cache_io == null);
+        }
+        {
             var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
             server.owner_alloc = failing.allocator();
             defer server.owner_alloc = a;
@@ -74,6 +81,7 @@ test "external lake persistence owns its executor and reuses immutable bytes aft
         }
         try server.prepareLakeCache();
         try server.prepareLakeCache();
+        try server.lake_read_cache.persistent_startup.await(server.lake_cache_io.?.io());
         try std.testing.expect(server.lake_read_cache.persistent != null);
         try std.testing.expect(server.lake_read_cache.persistentReady());
         {
@@ -82,7 +90,7 @@ test "external lake persistence owns its executor and reuses immutable bytes aft
             defer server.lake_cache_start_mutex.unlock(request_io.io());
             try server.prepareLakeCache();
         }
-        try std.testing.expectEqual(std.Io.Limit.limited(1), server.lake_cache_io.?.concurrent_limit);
+        try std.testing.expectEqual(std.Io.Limit.limited(2), server.lake_cache_io.?.concurrent_limit);
         var lease = try server.lake_read_cache.readImmutableBlockLease(a, @splat(9), "sidecar", bytes.len, digest, .{ .io = request_io.io() }, loader);
         defer lease.deinit();
         try std.testing.expectEqualStrings(bytes, lease.bytes());
@@ -93,6 +101,7 @@ test "external lake persistence owns its executor and reuses immutable bytes aft
         var server = server_mod.ApiHttpServer.init(a, cfg, status, null, null);
         defer server.deinit();
         try server.prepareLakeCache();
+        try server.lake_read_cache.persistent_startup.await(server.lake_cache_io.?.io());
         var lease = try server.lake_read_cache.readImmutableBlockLease(a, @splat(9), "sidecar", bytes.len, digest, .{ .io = request_io.io() }, loader);
         defer lease.deinit();
         try std.testing.expectEqualStrings(bytes, lease.bytes());

@@ -704,6 +704,11 @@ const Execution = struct {
             a.free(items);
         };
         if (self.use_stored_highlights) {
+            if (self.highlight_locations.count() != 0) {
+                try self.attachLocatedStoredHighlights(a, options, result.hits);
+                try self.context.ensureActive();
+                return;
+            }
             // Hidden source can dwarf the returned snippets. Reuse one input
             // region and retain only the owned highlight output between rows.
             var input = std.heap.ArenaAllocator.init(a);
@@ -728,7 +733,6 @@ const Execution = struct {
     fn loadStoredHighlights(self: *Execution, a: A, hits: []const types.SearchHit) ![]?[]u8 {
         const started = @import("antfly_platform").time.monotonicNs();
         defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
-        if (self.highlight_locations.count() != 0) return self.loadLocatedStoredHighlights(a, hits);
         if (self.highlight_pins.items.len == 0) {
             var pin = if (self.delivery_pin) |*ranked| try ranked.clone() else (try self.acquireForText(self.highlight_index, self.highlight_queries.?[0].query)) orelse return error.InvalidNativeLakeTextCorpus;
             errdefer pin.deinit();
@@ -766,36 +770,64 @@ const Execution = struct {
         }
         return result;
     }
-    /// Final winner locations retain no reader ownership. Reopen one immutable
-    /// segment at a time under the same publication lease, never a broad corpus.
-    fn loadLocatedStoredHighlights(self: *Execution, a: A, hits: []const types.SearchHit) ![]?[]u8 {
-        const result = try a.alloc(?[]u8, hits.len);
-        @memset(result, null);
-        errdefer {
-            for (result) |value| if (value) |bytes| a.free(bytes);
-            a.free(result);
+    /// Group only the final page's locations. One segment owner and one hidden
+    /// document input are live at a time; public hits keep their ranked order.
+    fn attachLocatedStoredHighlights(self: *Execution, a: A, options: types.HighlightRequest, hits: []types.SearchHit) !void {
+        const locations = try a.alloc(StoredHighlightLocation, hits.len);
+        defer a.free(locations);
+        const order = try a.alloc(usize, hits.len);
+        defer a.free(order);
+        for (hits, locations, order, 0..) |hit, *location, *index, position| {
+            location.* = self.highlight_locations.get(hit.id) orelse return error.InvalidNativeLakeTextCorpus;
+            index.* = position;
         }
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        for (hits, result) |hit, *out| {
+        std.mem.sort(usize, order, @as([]const StoredHighlightLocation, locations), struct {
+            fn less(rows: []const StoredHighlightLocation, l: usize, r: usize) bool {
+                const segment_order = std.mem.order(u8, &rows[l].segment, &rows[r].segment);
+                if (segment_order != .eq) return segment_order == .lt;
+                if (rows[l].document != rows[r].document) return rows[l].document < rows[r].document;
+                return l < r;
+            }
+        }.less);
+        var position: usize = 0;
+        while (position < order.len) {
             try self.context.ensureActive();
-            const location = self.highlight_locations.get(hit.id) orelse return error.InvalidNativeLakeTextCorpus;
-            _ = scratch.reset(.retain_capacity);
-            const sa = scratch.allocator();
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = sa, .result_allocator = sa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .forced_selection = &.{location.segment} };
+            const segment = locations[order[position]].segment;
+            var end = position + 1;
+            while (end < order.len and std.mem.eql(u8, &locations[order[end]].segment, &segment)) : (end += 1) {}
+            var segment_arena = std.heap.ArenaAllocator.init(a);
+            defer segment_arena.deinit();
+            const sa = segment_arena.allocator();
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = sa, .result_allocator = sa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .forced_selection = &.{segment} };
             defer child.deinit();
-            var pin = (try acquire(&child, self.highlight_index)) orelse return error.InvalidNativeLakeTextCorpus;
+            var pin = blk: {
+                const started = @import("antfly_platform").time.monotonicNs();
+                defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+                break :blk (try acquire(&child, self.highlight_index)) orelse return error.InvalidNativeLakeTextCorpus;
+            };
             defer pin.deinit();
             if (pin.snapshot.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            const doc = (try pin.snapshot.storedDocDecompressed(a, location.document)) orelse return error.InvalidNativeLakeTextCorpus;
-            errdefer a.free(doc.data);
-            const expected = try nativeKey(self, sa, hit.id);
-            if (!std.mem.eql(u8, doc.id, expected)) return error.InvalidNativeLakeTextCorpus;
-            const value = try std.json.parseFromSliceLeaky(std.json.Value, sa, doc.data, .{ .parse_numbers = false });
-            if (value != .object) return error.InvalidNativeLakeTextCorpus;
-            out.* = doc.data;
+            var input = std.heap.ArenaAllocator.init(a);
+            defer input.deinit();
+            for (order[position..end], position..) |index, ordered_position| {
+                try self.context.ensureActive();
+                _ = input.reset(.retain_capacity);
+                const ia = input.allocator();
+                const data = blk: {
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+                    for (order[ordered_position..@min(end, ordered_position + 4)]) |upcoming| try pin.snapshot.prefetchStoredDoc(locations[upcoming].document);
+                    const doc = (try pin.snapshot.storedDocDecompressed(ia, locations[index].document)) orelse return error.InvalidNativeLakeTextCorpus;
+                    const expected = try nativeKey(self, ia, hits[index].id);
+                    if (!std.mem.eql(u8, doc.id, expected)) return error.InvalidNativeLakeTextCorpus;
+                    const value = try std.json.parseFromSliceLeaky(std.json.Value, ia, doc.data, .{ .parse_numbers = false });
+                    if (value != .object) return error.InvalidNativeLakeTextCorpus;
+                    break :blk doc.data;
+                };
+                try search.attachHighlightsWithIndexQueries(a, options, self.highlight_queries.?, hits[index .. index + 1], &.{data});
+            }
+            position = end;
         }
-        return result;
     }
     fn hydrateDelivery(raw: *anyopaque, a: A, hits: []types.SearchHit) !void {
         const self: *Execution = @ptrCast(@alignCast(raw));
@@ -2013,10 +2045,9 @@ test "external lake stored highlights read authenticated native source without P
     defer writer.deinit();
     // Exercise hydration in isolation with its cache and instrumentation;
     // the source object is removed after publication construction.
-    var server: server_api.ApiHttpServer = undefined;
-    server.lake_query_metrics = .{};
-    server.lake_read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
-    defer server.lake_read_cache.deinit();
+    var status_token: u8 = 0;
+    var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &status_token, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
     var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{} }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
     defer owner.deinit();
     owner.declarations = &.{declaration};
@@ -2055,6 +2086,32 @@ test "external lake stored highlights read authenticated native source without P
     try owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &result);
     try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
     try std.testing.expectEqual(planning_reads, server.lake_read_cache.snapshot().provider_reads);
+    // Paged winners can arrive in reverse physical order. Both documents share
+    // one immutable segment; acquire it once and preserve public result order.
+    const second_id = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = 1 } });
+    try std.testing.expectEqual(@as(usize, 1), root.segments.len);
+    const segment = corpus.term_directory.identity(root.segments[0].artifact_id);
+    try owner.highlight_locations.put(ca, id, .{ .segment = segment, .document = 0 });
+    try owner.highlight_locations.put(ca, second_id, .{ .segment = segment, .document = 1 });
+    var grouped_hits = [_]types.SearchHit{ .{ .id = second_id, .score = 2 }, .{ .id = id, .score = 1 } };
+    defer for (grouped_hits) |hit| types.freeHighlights(a, hit.highlights);
+    var grouped: types.SearchResult = .{ .alloc = a, .hits = &grouped_hits, .total_hits = 2, .graph_results = &.{} };
+    const index_phase = @backingInt(@import("lake_query_metrics.zig").Phase.index);
+    const acquisitions = server.lake_query_metrics.snapshot().calls[index_phase];
+    try owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &grouped);
+    try std.testing.expectEqual(acquisitions + 1, server.lake_query_metrics.snapshot().calls[index_phase]);
+    try std.testing.expectEqualStrings(second_id, grouped_hits[0].id);
+    try std.testing.expectEqualStrings(id, grouped_hits[1].id);
+    try std.testing.expectEqualStrings("second needle", grouped_hits[0].highlights[0].fragments[0].text);
+    try std.testing.expectEqualStrings("a needle in the haystack", grouped_hits[1].highlights[0].fragments[0].text);
+    try owner.highlight_locations.put(ca, id, .{ .segment = segment, .document = 1 });
+    var invalid_hits = [_]types.SearchHit{.{ .id = id, .score = 1 }};
+    var invalid: types.SearchResult = .{ .alloc = a, .hits = &invalid_hits, .total_hits = 1, .graph_results = &.{} };
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
+    try std.testing.expectEqual(@as(usize, 0), invalid_hits[0].highlights.len);
+    owner.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &grouped));
+    owner.highlight_locations.clearRetainingCapacity();
     owner.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, owner.loadStoredHighlights(a, &hits));
 }

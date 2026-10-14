@@ -1062,6 +1062,10 @@ pub const ShadowState = struct {
 };
 
 pub const LocalExecutionState = struct {
+    /// Optional generation hint, accessed only under the physical query-pin guard.
+    native_query_reuse: ?@import("native_query_reuse.zig").State = null,
+    native_query_reuse_epoch: [16]u8 = @splat(0),
+    native_query_reuse_epoch_ready: bool = false,
     table_storage: table_storage_mod.Settings = .{},
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_offline_candidate: bool = false,
