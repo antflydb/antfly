@@ -2189,8 +2189,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset across a table range
-         * @description Runs a bounded operational repair pass for any asset producer type
+         * Reprocess a derived artifact across a table range
+         * @description Runs a bounded operational repair pass for any asset or embedding producer
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -2255,7 +2255,7 @@ export interface paths {
         /**
          * Create a derived document artifact reprocess job
          * @description Creates a durable user-facing repair job for a derived document
-         *     artifact. The job advances through the same bounded per-shard repair
+         *     asset or embedding artifact. The job advances through the same bounded per-shard repair
          *     primitive used by `/reprocess`, and stores returned continuation
          *     cursors so hosted controllers can resume large sharded table repairs
          *     without collapsing progress into a single global key cursor.
@@ -2395,11 +2395,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset
+         * Reprocess a derived artifact
          * @description Invalidates the current artifact state and requests the producer to
          *     rebuild the derived asset for the source document. Copy, generator,
          *     reader, transcriber, extractor, and document-extraction producers are
-         *     all supported.
+         *     all supported, as are dense and sparse embedding producers. Embedding
+         *     reprocessing regenerates vectors even when the source chunks are unchanged.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;

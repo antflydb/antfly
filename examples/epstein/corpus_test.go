@@ -335,6 +335,10 @@ func TestCorpusAppleIndexConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	analysis := indexes[corpusTextIndex].(map[string]any)["analysis_config"].(map[string]any)
+	if analysis["field_analyzers"].(map[string]any)["text"] != "simple" {
+		t.Fatalf("corpus name search must use lexical tokens: %#v", analysis)
+	}
 	raw, _ := json.Marshal(indexes)
 	var decoded map[string]any
 	if err = json.Unmarshal(raw, &decoded); err != nil {
@@ -496,6 +500,59 @@ func TestCorpusPDFWhitespaceHeader(t *testing.T) {
 				t.Fatalf("split PDF: %v", err)
 			}
 		}
+	}
+}
+
+func TestCorpusPreparedPageWindowsSurviveRestartAndValidateSource(t *testing.T) {
+	source := t.TempDir()
+	file := filepath.Join(source, "pages.pdf")
+	writeCorpusFixture(t, file, createMultiPagePDF(4))
+	info := mustStat(t, file)
+	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "test", Path: source}}}
+	store := newCorpusStore(cfg)
+	store.pageCache = t.TempDir()
+	loc := sourceLocator{Source: 0, Name: "pages.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano(), First: 1, Last: 2}
+	if err := store.preparePageWindow(loc); err != nil {
+		t.Fatal(err)
+	}
+	firstContext := store.pdfContext
+	next := loc
+	next.First, next.Last = 3, 4
+	if err := store.preparePageWindow(next); err != nil {
+		t.Fatal(err)
+	}
+	if store.pdfContext != firstContext {
+		t.Fatal("page windows reparsed the source PDF")
+	}
+	cache := store.pageCache
+	store.Close()
+	reopened := newCorpusStore(cfg)
+	reopened.pageCache = cache
+	defer reopened.Close()
+	var group sync.WaitGroup
+	for _, window := range []sourceLocator{loc, next, loc, next} {
+		group.Go(func() {
+			response := httptest.NewRecorder()
+			reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, window), nil))
+			if response.Code != http.StatusOK {
+				t.Errorf("cached window: %d %s", response.Code, response.Body.String())
+				return
+			}
+			doc, err := pdf.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+			if err != nil || doc.NumPage() != 2 {
+				t.Errorf("cached page count: %v", err)
+			}
+		})
+	}
+	group.Wait()
+	if reopened.pdfContext != nil {
+		t.Fatal("serving cached windows parsed the source")
+	}
+	writeCorpusFixture(t, file, createMultiPagePDF(3))
+	response := httptest.NewRecorder()
+	reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("changed source accepted stale cache: %d", response.Code)
 	}
 }
 

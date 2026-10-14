@@ -316,6 +316,8 @@ ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
 ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES=1
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS=50000000
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES=268435456
+ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES=134217728
+ANTFLY_ENRICHMENT_PDF_DECODE_STREAM_BYTES=67108864
 ```
 
 PDF rendering uses the resolved OCR item count as its window size. Render
@@ -326,6 +328,34 @@ while preserving the OCR batch-byte ceiling for separately tracked output and
 request allocations. The document-scoped PDF coordinator is reused across
 streaming OCR flushes, recomputes available worker bytes before each render
 window, and each page worker has its own hard allocator ceiling.
+
+The PDF decode ceilings are node-owned controls, separate from render pixels
+and OCR batch sizes. Large page trees may require a larger decode working set
+even when their source file is smaller than another PDF. For example, an
+operator can set `ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES=1073741824`
+and `ANTFLY_DOCUMENT_EXTRACTION_WORKING_SET_BYTES=2147483648`; the latter
+bounds the aggregate source, decoded state, and retained extraction output.
+Process admission still applies. Invalid or zero decode overrides keep the
+defaults, and producer JSON cannot raise these limits. Rejected precommit
+extractions publish a failed manifest with their exact error code. Hierarchy
+navigation returns non-retryable `document_artifact_publication_failed` for a
+failed publication, while an active publication remains retryable.
+
+Dense text embedding uses up to two concurrent provider calls within a bounded
+logical batch. `ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES` accepts 1 through 4;
+legacy providers without invocation-local context callbacks stay serial.
+All calls drain before a retry or replay checkpoint, and their outputs retain
+source order. The existing item and byte budgets bound the complete batch.
+Capacity rejection drains the concurrent wave and retries serially within the
+same deadline, so providers with one available execution slot can still progress.
+Query embedding retries transient inference capacity errors within its original
+deadline and observes cancellation during the wait.
+
+Embedding producers also accept the document artifact `reprocess` endpoint
+and paged table `reprocess`/`reprocess-jobs` endpoints. These routes accept the
+embedding artifact name (for example `document_dense_v1`). Repair issue filters
+use `kind: "embedding"`; unknown fields are rejected instead of silently
+discarding a misspelled filter.
 
 Readers must stay model-neutral at this layer. The artifact producer exposes a
 batch request hook, and document-extraction OCR/transcription workers flush

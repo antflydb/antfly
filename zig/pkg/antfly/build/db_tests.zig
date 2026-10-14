@@ -167,6 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
         "db generic artifact repair queue",
         "db shared repair completion",
@@ -401,6 +402,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment applied checkpoint stays degraded until runtime status clears",
         "storage.db.enrichment.enrichment_runtime.test.enrichment batch retry identity covers every work item",
         "storage.db.enrichment.enrichment_runtime.test.enrichment distinguishes transient capacity from permanent resource limits",
+        "PDF decode operator budgets",
+        "parallel dense inference preserves order",
         "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText with template error directive fails instead of returning text",
         "storage.db.enrichment.enrichment_runtime.test.enrichment foreground catch up reconciles retry state after checkpoint apply",
         "storage.db.enrichment.enrichment_runtime.test.enrichment generated preparation window bounds time to first publication",

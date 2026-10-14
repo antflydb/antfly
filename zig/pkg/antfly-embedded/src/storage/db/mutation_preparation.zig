@@ -1007,6 +1007,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
             consumer_indexes: []const []const u8,
             pending_lookup: *const PendingArtifactWriteIndex,
+            reuse_unchanged: bool,
         ) !void {
             if (sources.items.len == 0) return;
             defer clearChunkEmbeddingSourceList(alloc, sources);
@@ -1020,12 +1021,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
-                if (try storedOrPendingEmbeddingSourceHash(db, pending_lookup, artifact_key)) |existing_hash| {
+                if (reuse_unchanged) if (try storedOrPendingEmbeddingSourceHash(db, pending_lookup, artifact_key)) |existing_hash| {
                     if (existing_hash == source_hash) {
                         try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
                         continue;
                     }
-                }
+                };
                 try chunk_texts.append(alloc, source.text);
                 try source_indexes.append(alloc, i);
             }
@@ -1341,7 +1342,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try pending_deletes.extend(alloc, artifact_delete_keys.items);
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = dense_embeddings.items.len;
-                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes) catch |err| switch (err) {
+                            const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
+                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1360,7 +1362,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try pending_deletes.extend(alloc, artifact_delete_keys.items);
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
-                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes) catch |err| switch (err) {
+                            const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
+                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;

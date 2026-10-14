@@ -9621,7 +9621,12 @@ pub const DB = struct {
         artifact_name: []const u8,
         wait_for_completion: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+            return self.reprocessEmbeddingArtifactIssue(alloc, .{
+                .artifact_kind = .embedding,
+                .doc_key = doc_key,
+                .artifact_name = artifact_name,
+            }, wait_for_completion);
         defer cfg.deinit(alloc);
         // A missing producer definition means this artifact cannot currently be
         // regenerated. A missing source document is a distinct, actionable
@@ -17783,7 +17788,8 @@ pub const DB = struct {
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactRange", .{ self, alloc, artifact_name, req });
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+            (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
         var effective_req = req;
@@ -40217,6 +40223,7 @@ pub const DB = struct {
             const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse continue;
             defer alloc.free(manifest);
             const manifest_info = try documentUnitHierarchyManifestInfo(alloc, manifest);
+            if (manifest_info.failed) return error.DocumentArtifactPublicationFailed;
             const generation = manifest_info.published_generation orelse
                 return error.StorageReadTemporarilyUnavailable;
             const state_key = try assetStateKeyAlloc(alloc, navigation.parent_id, entry.name);
@@ -40486,6 +40493,7 @@ pub const DB = struct {
                 return error.StorageReadTemporarilyUnavailable;
             defer alloc.free(manifest);
             const info = try documentUnitHierarchyManifestInfo(alloc, manifest);
+            if (info.failed) return error.DocumentArtifactPublicationFailed;
             if (info.published_generation == null or info.published_generation.? != artifact.generation) {
                 return error.StorageReadTemporarilyUnavailable;
             }
@@ -48183,9 +48191,10 @@ fn hierarchyNavigationArtifactLessThan(_: void, left: HierarchyNavigationArtifac
 
 const DocumentUnitHierarchyManifestInfo = struct {
     generation: u64,
-    /// The last safely published hierarchy generation. An in-progress merge
-    /// has no readable generation; a failed merge retains its prior revision.
+    /// The safely published hierarchy generation. In-progress and failed
+    /// merges expose no generation because they may have replaced a prefix.
     published_generation: ?u64,
+    failed: bool = false,
 };
 
 fn documentUnitHierarchyManifestInfo(alloc: Allocator, manifest: []const u8) !DocumentUnitHierarchyManifestInfo {
@@ -48223,9 +48232,9 @@ fn documentUnitHierarchyManifestInfo(alloc: Allocator, manifest: []const u8) !Do
     if (std.mem.eql(u8, status.string, "failed")) {
         if (generation_u64 == 0 or to_generation_u64 != generation_u64) return error.InvalidDocumentExtractionManifest;
         // Streaming materialization may have flushed a prefix before failing.
-        // The retained prior summary therefore cannot prove that every old
-        // payload is intact; fail retryably until repair converges.
-        return .{ .generation = generation_u64, .published_generation = null };
+        // Do not expose mixed payloads, and distinguish a failed attempt from
+        // an active publication so clients do not retry a terminal failure.
+        return .{ .generation = generation_u64, .published_generation = null, .failed = true };
     }
     if (std.mem.eql(u8, status.string, "in_progress")) {
         if (from_generation_u64 != generation_u64) return error.InvalidDocumentExtractionManifest;
@@ -79347,7 +79356,7 @@ test "db document extraction asset materializes unit artifacts from data url" {
         "{\"artifact_type\":\"document_units\",\"generation\":2," ++
             "\"merge_plan\":{\"from_generation\":1,\"to_generation\":2,\"status\":\"failed\"}}",
     );
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.search(alloc, .{
+    try std.testing.expectError(error.DocumentArtifactPublicationFailed, db.search(alloc, .{
         .hierarchy_children = .{ .parent_id = "doc:a" },
         .return_mode = .unit,
         .order_by = &navigation_order,
@@ -81046,6 +81055,17 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
             });
             defer search_result.deinit();
             try std.testing.expect(search_result.total_hits > 0);
+            const calls_before_reprocess = counting.calls;
+            try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_chunk_dense_v1"));
+            try db.runUntilIdle();
+            try std.testing.expect(counting.calls > calls_before_reprocess);
+            const calls_before_range = counting.calls;
+            var range_result = try db.reprocessDocumentArtifactRange(alloc, "document_chunk_dense_v1", .{ .limit = 1 });
+            defer range_result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), range_result.reprocessed);
+            try std.testing.expectEqual(@as(u32, 0), range_result.failed);
+            try db.runUntilIdle();
+            try std.testing.expect(counting.calls > calls_before_range);
         }
     }
 } else struct {};
@@ -81668,6 +81688,40 @@ test "db retries remote document child range dispatch from durable outbox" {
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
+test "db public extraction budget rejection publishes a failure manifest" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const resources = @import("../resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 3072, .hard_limit_bytes = 4096 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .resource_manager = &manager,
+        .enrichment = .{ .resource_manager = &manager },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    const body = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(body);
+    @memset(body, 'x');
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(body.len));
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, body);
+    const document = try std.fmt.allocPrint(alloc, "{{\"url\":\"data:text/plain;base64,{s}\"}}", .{encoded});
+    defer alloc.free(document);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = document }}, .sync_level = .write });
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc", "units"));
+    var manifest = (try db.getDocumentArtifactManifest(alloc, "doc", "units")) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("failed", manifest.merge_status);
+    try std.testing.expectEqualStrings("DocumentExtractionWorkingSetTooLarge", manifest.last_error_code.?);
+    try std.testing.expectEqual(@as(usize, 0), manifest.unit_count);
+}
+
 test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -81721,7 +81775,7 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     // Permit only the requested embedding to succeed. The other document's
     // provider debt remains retrying, so a table-wide completion wait still fails.
     gated.allowed_successes.store(gated.successful_requests.load(.acquire) + 1, .release);
-    try std.testing.expect(try db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:embedding", "dense_v1"));
     try std.testing.expectEqual(gated.allowed_successes.load(.acquire), gated.successful_requests.load(.acquire));
     // A failure in the requested provider itself remains a real request error.
     try std.testing.expectError(error.EmbedRateLimited, db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
@@ -85246,7 +85300,7 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
         try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
     } else {
         const no_deletes = std.StringHashMapUnmanaged(void).empty;
-        try compute(alloc, &db, "{}", request, &artifact_writes, &no_deletes, &embeddings, &chunk_cache, null, null);
+        try compute(alloc, &db, "{}", request, &artifact_writes, &no_deletes, &embeddings, &chunk_cache, null, null, true);
     }
 
     // Guard the test's relocation precondition, not just the successful no-growth path.

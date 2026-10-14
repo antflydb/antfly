@@ -993,7 +993,7 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived asset across a table range
+/// Reprocess a derived artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -1166,7 +1166,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived asset
+/// Reprocess a derived artifact
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,

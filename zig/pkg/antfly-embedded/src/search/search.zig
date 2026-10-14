@@ -135,6 +135,7 @@ pub const NamedGraphResult = struct {
 };
 
 pub const SearchRequest = struct {
+    control: query_mod.ExecutionControl = .{},
     query: SearchQuery,
     k: u32 = 10,
     offset: u32 = 0,
@@ -590,10 +591,14 @@ pub fn execute(
 /// Exact snapshot count with at most one segment's filter bitmap in memory.
 /// Callers must separately prove that no primary visibility/residual check is owed.
 pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    return countMatchesWithControl(alloc, snap, query, .{});
+}
+
+pub fn countMatchesWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl) !u32 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
+    return std.math.cast(u32, try snap.countFilter(alloc, filter.withControl(control))) orelse error.CountOverflow;
 }
 
 pub fn executeCountCandidates(
@@ -601,11 +606,20 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
+    return executeCountCandidatesWithControl(alloc, snap, query, .{});
+}
+
+pub fn executeCountCandidatesWithControl(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    query: SearchQuery,
+    control: query_mod.ExecutionControl,
+) !SearchResult {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    const doc_ids = try snap.executeFilter(alloc, filter.withControl(control));
     defer alloc.free(doc_ids);
 
     var hits = try alloc.alloc(ScoredHit, doc_ids.len);
@@ -905,11 +919,35 @@ fn executeFilterQuery(
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    if (request.sort == null and request.search_after == null and request.aggregations.len == 0) {
+        // Expansion queries have constant scores. Keep exact membership in a
+        // bitmap and retain only the requested page prefix, rather than one
+        // document-ID array plus one ScoredHit for every matching document.
+        var matches = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
+        defer matches.deinit();
+        var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
+        defer scored.deinit(alloc);
+        const keep = effectiveK(request, snap);
+        var total: u32 = 0;
+        var iterator = matches.iterator();
+        while (iterator.next()) |doc_id| {
+            if (total % 256 == 0) try request.control.check();
+            if (!requestAllowsDocNum(request, doc_id)) continue;
+            total = try std.math.add(u32, total, 1);
+            if (scored.items.len < keep) try scored.append(alloc, .{ .doc_id = doc_id, .score = boost });
+        }
+        var bounded = request;
+        bounded.filter_doc_bitmap = null;
+        bounded.exclude_doc_bitmap = null;
+        bounded.filter_doc_nums = &.{};
+        bounded.filter_doc_nums_positive = false;
+        bounded.exclude_doc_nums = &.{};
+        return buildResult(alloc, snap, scored.items, total, .exact, bounded);
+    }
+    const doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
     defer alloc.free(doc_ids);
 
     var all_scored = try alloc.alloc(scorer_mod.ScoredHit, doc_ids.len);
-    errdefer alloc.free(all_scored);
     defer alloc.free(all_scored);
     for (doc_ids, 0..) |doc_id, i| {
         all_scored[i] = .{
@@ -1364,7 +1402,7 @@ fn executeMatchAll(
 ) !SearchResult {
     // Use filter to get all doc IDs
     const filter = query_mod.Filter{ .match_all = {} };
-    const raw_doc_ids = try snap.executeFilter(alloc, filter);
+    const raw_doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
     defer alloc.free(raw_doc_ids);
 
     // Unlike every other query type, match_all never goes through the
@@ -4561,7 +4599,7 @@ fn executeBool(
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
-            var membership = try snap.executeFilterBitmap(alloc, filter);
+            var membership = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
             defer membership.deinit();
             constrained = request;
             constrained.query = bq.must[0];
@@ -5054,7 +5092,7 @@ fn executeSort(
     // Get matching doc IDs via filter
     const owned_filter = try queryToFilter(alloc, request.query);
     defer owned_filter.deinit(alloc);
-    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter);
+    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter.withControl(request.control));
     defer alloc.free(doc_ids);
 
     // Read sort field values and pair with doc IDs

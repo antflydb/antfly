@@ -722,6 +722,12 @@ fn generatedEmbedBatchItems() usize {
     return @max(@as(usize, 1), parsed);
 }
 
+fn generatedEmbedParallelBatches() usize {
+    const raw = getenv("ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES") orelse return 2;
+    const requested = std.fmt.parseUnsigned(usize, raw, 10) catch return 2;
+    return std.math.clamp(requested, 1, 4);
+}
+
 fn generatedEmbedBatchBytes() usize {
     if (comptime builtin.os.tag == .freestanding) return generated_embed_default_batch_bytes;
     const raw = getenv("ANTFLY_ENRICHMENT_EMBED_BATCH_BYTES") orelse return generated_embed_default_batch_bytes;
@@ -842,9 +848,30 @@ test "PDF render prefetch is capped at one window" {
 /// Producer JSON cannot raise these limits; both streaming enrichment and the
 /// synchronous precompute path call this before reserving PDF working memory.
 pub fn applyDocumentExtractionRuntimePolicy(config: *document_extraction_mod.Config) void {
+    config.pdf_decode_limits.max_working_set_bytes = pdfDecodeBudget(
+        getenv("ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES"),
+        config.pdf_decode_limits.max_working_set_bytes,
+    );
+    config.pdf_decode_limits.max_decoded_stream_bytes = @min(pdfDecodeBudget(
+        getenv("ANTFLY_ENRICHMENT_PDF_DECODE_STREAM_BYTES"),
+        config.pdf_decode_limits.max_decoded_stream_bytes,
+    ), config.pdf_decode_limits.max_working_set_bytes);
     config.pdf_render_max_parallel_pages = generatedOcrRenderParallelPages();
     config.pdf_render_max_inflight_pixels = @max(@as(u64, 1), generatedOcrRenderInflightPixels());
     config.pdf_render_max_inflight_bytes = @max(@as(usize, 1), generatedOcrRenderInflightBytes());
+}
+
+fn pdfDecodeBudget(raw: ?[]const u8, default: usize) usize {
+    const value = std.fmt.parseUnsigned(usize, raw orelse return default, 10) catch return default;
+    return if (value == 0) default else value;
+}
+
+test "PDF decode operator budgets accept large documents and reject invalid overrides" {
+    const default: usize = 128 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), pdfDecodeBudget("1073741824", default));
+    for ([_]?[]const u8{ null, "", "0", "-1", "invalid", "184467440737095516160" }) |raw| {
+        try std.testing.expectEqual(default, pdfDecodeBudget(raw, default));
+    }
 }
 
 fn requestEmbedBatchItems(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) usize {
@@ -3601,10 +3628,7 @@ fn embedDenseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vectors = (if (foregroundProviderRequestContext(runtime)) |context|
-            dense_embedder.embedDenseBatchWithContext(runtime.alloc, embedding_name, texts, dims, context)
-        else
-            dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims)) catch |err| {
+        const vectors = embedDenseBatchAttempt(dense_embedder, runtime, embedding_name, texts, dims) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
@@ -3627,6 +3651,139 @@ fn embedDenseBatchWithRetry(
         noteInferenceControlSuccess(runtime, recovery_key, texts.len);
         return vectors;
     }
+}
+
+fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    // Only invocation-local provider callbacks promise concurrent execution.
+    // Legacy callbacks retain their serial path and mutable provider context.
+    const parallelism = @min(generatedEmbedParallelBatches(), texts.len);
+    if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
+        return if (foregroundProviderRequestContext(runtime)) |context|
+            dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
+        else
+            dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
+    }
+    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), parallelism);
+}
+
+fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
+    return parallelDenseBatch(alloc, io, provider, name, texts, dims, context, parallelism) catch |err| switch (err) {
+        // All concurrent calls have drained. Providers with only one available
+        // execution slot must still progress instead of retrying an equally
+        // wide wave indefinitely. Retain the same cancellation and deadline.
+        error.EmbedTransientFailure, error.ResourceTemporarilyUnavailable => {
+            try context.check();
+            return provider.embedDenseBatchWithContext(alloc, name, texts, dims, context);
+        },
+        else => return err,
+    };
+}
+
+fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
+    std.debug.assert(parallelism >= 1 and parallelism <= 4 and parallelism <= texts.len);
+    const Task = struct {
+        provider: embedder_mod.DenseEmbedder,
+        alloc: Allocator,
+        name: []const u8,
+        texts: []const []const u8,
+        dims: u32,
+        context: inference_request_context.RequestContext,
+        fn run(self: *@This()) anyerror![]const []const f32 {
+            return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+        }
+    };
+    const vectors = try alloc.alloc([]const f32, texts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    var tasks: [4]Task = undefined;
+    var futures: [4]?std.Io.Future(anyerror![]const []const f32) = @splat(null);
+    var inline_results: [4]anyerror![]const []const f32 = undefined;
+    for (0..parallelism) |index| {
+        tasks[index] = .{ .provider = provider, .alloc = alloc, .name = name, .texts = texts[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism], .dims = dims, .context = context };
+        futures[index] = io.concurrent(Task.run, .{&tasks[index]}) catch null;
+        if (futures[index] == null) inline_results[index] = Task.run(&tasks[index]);
+    }
+    // Drain every submitted call before retry, cancellation, or publication.
+    // Replay cursors advance only after the complete logical batch commits.
+    var failure: ?anyerror = null;
+    for (0..parallelism) |index| {
+        const result = if (futures[index]) |*future| future.await(io) else inline_results[index];
+        const batch = result catch |err| {
+            if (failure == null) failure = err;
+            continue;
+        };
+        defer alloc.free(batch);
+        if (batch.len != tasks[index].texts.len) {
+            for (batch) |vector| alloc.free(vector);
+            if (failure == null) failure = error.InvalidEmbeddingResponse;
+            continue;
+        }
+        @memcpy(vectors[initialized..][0..batch.len], batch);
+        initialized += batch.len;
+    }
+    if (failure) |err| return err;
+    return vectors;
+}
+
+test "parallel dense inference preserves order drains failures and bounds provider concurrency" {
+    const Harness = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        busy_when_parallel: bool = false,
+        fn unused(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSerialCallback;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(active, .acq_rel);
+            defer {
+                _ = self.active.fetchSub(1, .acq_rel);
+                _ = self.completed.fetchAdd(1, .acq_rel);
+            }
+            try context.io.sleep(.fromMilliseconds(10), .awake);
+            if (self.busy_when_parallel and active > 1) return error.ResourceTemporarilyUnavailable;
+            if (self.fail and std.mem.eql(u8, texts[0], "4")) return error.EmbedRateLimited;
+            const out = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(out);
+            }
+            for (texts, out) |text, *vector| {
+                vector.* = try alloc.alloc(f32, 1);
+                initialized += 1;
+                @constCast(vector.*)[0] = @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10));
+            }
+            return out;
+        }
+    };
+    var harness = Harness{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.unused, .dense_embed_batch_with_context_fn = Harness.batch };
+    const texts = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7" };
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const context: inference_request_context.RequestContext = .{ .io = io, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+    const vectors = try parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (vectors, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 2), harness.peak.load(.acquire));
+    harness.fail = true;
+    try std.testing.expectError(error.EmbedRateLimited, parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2));
+    try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), harness.completed.load(.acquire));
+    harness.fail = false;
+    harness.busy_when_parallel = true;
+    const fallback = try parallelDenseBatchWithCapacityFallback(alloc, io, provider, "model", &texts, 1, context, 2);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, fallback);
+    for (fallback, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 7), harness.completed.load(.acquire));
 }
 
 fn embedDensePartsWithRetry(

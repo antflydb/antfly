@@ -6620,6 +6620,44 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    if (task_type != .retrieval_query) return embedBatchWithEntryForTaskOnce(alloc, entry, texts, dims, task_type);
+    // A foreground query shares inference capacity with backfill. Keep one
+    // deadline across retries, and yield the executor during bounded waits.
+    var attempt: usize = 0;
+    const deadline = embeddingOperationDeadline(entry);
+    var bounded = entry.requestOverlay();
+    bounded.deadline_ns = deadline;
+    bounded.owns_bedrock_credentials = false;
+    bounded.auth_header_cache = .{};
+    defer bounded.auth_header_cache.deinit(alloc);
+    while (true) : (attempt += 1) {
+        try ensureEntryDeadline(&bounded);
+        return embedBatchWithEntryForTaskOnce(alloc, &bounded, texts, dims, task_type) catch |err| {
+            if (err != error.EmbedTransientFailure or attempt >= 3) return err;
+            try waitQueryEmbeddingRetry(&bounded, deadline);
+            continue;
+        };
+    }
+}
+
+fn waitQueryEmbeddingRetry(entry: *const ManagedEmbeddingEntry, deadline: u64) !void {
+    const wake = @min(deadline, monotonicNowNs() +| std.time.ns_per_s);
+    while (monotonicNowNs() < wake) {
+        try ensureEntryDeadline(entry);
+        const remaining = wake -| monotonicNowNs();
+        embeddingIo(entry).sleep(.fromNanoseconds(@intCast(@min(remaining, 50 * std.time.ns_per_ms))), .awake) catch return error.Cancelled;
+    }
+    try ensureEntryDeadline(entry);
+    if (monotonicNowNs() >= deadline) return error.Timeout;
+}
+
+fn embedBatchWithEntryForTaskOnce(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
     const trace_batch = entry.provider == .antfly and entry.antfly_provider != null and
         getenv("ANTFLY_EMBED_TRACE_DIR") != null and traced_local_batches.fetchAdd(1, .monotonic) < 64;
     const trace_started = if (trace_batch) monotonicNowNs() else 0;
@@ -9024,6 +9062,46 @@ test "managed embedder surfaces rate-limited openai compatible responses as retr
     defer managed.deinit();
 
     try std.testing.expectError(error.EmbedRateLimited, managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept"));
+}
+
+test "managed embedder retries query model capacity and keeps cancellation and deadline bounded" {
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const first = self.calls.fetchAdd(1, .acq_rel) == 0;
+            return .{
+                .status = if (first) 503 else 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, if (first)
+                    "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"retry_after_ms\":1000}"
+                else
+                    "{\"data\":[{\"index\":0,\"embedding\":[0.125,0.25,0.5]}]}"),
+            };
+        }
+    };
+    var app = App{};
+    const alloc = std.testing.allocator;
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base = try listener.baseUri(alloc);
+    defer alloc.free(base);
+    const config = try std.fmt.allocPrint(alloc, "{{\"semantic\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"openai\",\"model\":\"model\",\"url\":\"{s}\"}}}}}}", .{base});
+    defer alloc.free(config);
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, config);
+    defer managed.deinit();
+    const vector = try managed.embedQuery(alloc, "semantic", "Maxwell");
+    defer alloc.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+    try std.testing.expectEqual(@as(usize, 2), app.calls.load(.acquire));
+    var entry = managed.entries[0].requestOverlay();
+    entry.deadline_ns = monotonicNowNs();
+    try std.testing.expectError(error.Timeout, waitQueryEmbeddingRetry(&entry, entry.deadline_ns.?));
+    var canceled = std.atomic.Value(bool).init(true);
+    entry.deadline_ns = null;
+    entry.cancellation = CancellationToken.fromAtomic(&canceled);
+    try std.testing.expectError(error.Cancelled, waitQueryEmbeddingRetry(&entry, monotonicNowNs() + std.time.ns_per_s));
 }
 
 test "managed embedder paces repeated openai compatible requests" {
