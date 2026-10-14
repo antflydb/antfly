@@ -836,3 +836,34 @@ original gap. Twenty-four more probes queried 0, 50, 200 or 1,000 ms after the c
 transition and returned in 95–264 ms, without reproducing the preparation gap.
 The evidence artifact records these results and keeps the original failed
 criterion intact.
+
+### Background cache restoration and bounded highlight delivery
+
+Persistent range-cache startup now runs in a server-owned background task.
+Request preparation uses nonblocking startup admission and copies the configured
+path before returning; it neither waits for inventory nor borrows request memory
+or cancellation. RAM/source reads remain available until restoration completes.
+Only a fully inventoried owner is published, preserving the existing file lock,
+disk/entry ceilings, protected-entry priority and validation of retained hits.
+The dedicated executor admits restoration plus its write worker. Server shutdown
+cancels and joins restoration before destroying the cache or executor. Inventory
+header reads propagate cancellation rather than treating it as missing priority.
+
+Mapping retirement now detaches the idle entry under the cache lock, then unmaps
+and releases its disk lease outside it. Admission rechecks identity and capacity
+after cleanup, with bounded retries and the existing uncached-mapping fallback.
+This removes filesystem work from a global spin-lock section without changing
+active-reader pins or disk-capacity accounting.
+
+Paged stored highlights group final winner locations by authenticated segment
+identity and document ordinal. Each segment opens once for the page, while one
+hidden document input is reused at a time. Highlight outputs remain attached to
+their original hit positions; ranked order, scores and cursor contents do not
+change. Each document still verifies its native row identity, and a four-document
+lookahead uses the existing bounded prefetch queue. This targets repeated segment
+opening during cursor hydration, rather than changing the ranking algorithm.
+
+These changes address demonstrated startup work and repeated hydration work.
+They do not establish the cause of the original already-ready-cache stall or
+eliminate host paging. Keep the retained failures and require controlled-host,
+full-archive and managed Cloud qualification before treating latency as passed.

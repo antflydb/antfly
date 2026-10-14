@@ -12977,14 +12977,17 @@ pub const ApiHttpServer = struct {
             };
         };
         defer if (configured_root == null) self.alloc.free(root);
-        try self.lake_cache_start_mutex.lock(self.embedding_provider_runtime.io);
+        // Queries never queue behind optional cache startup. The background
+        // owner restores inventory and publishes the disk tier independently.
+        if (!self.lake_cache_start_mutex.tryLock()) return;
         defer self.lake_cache_start_mutex.unlock(self.embedding_provider_runtime.io);
         if (self.lake_cache_io == null) {
             const io_impl = self.owner_alloc.create(std.Io.Threaded) catch |err| {
                 self.lake_read_cache.recordDiskUnavailable(err);
                 return;
             };
-            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+            // One restoration task plus the persistent write worker it starts.
+            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
             self.lake_cache_io = io_impl;
         }
         const cache_io = self.lake_cache_io.?.io();
@@ -12995,7 +12998,7 @@ pub const ApiHttpServer = struct {
             .max_write_queue_entries = config.max_write_queue_entries,
             .protected_bytes = config.protected_bytes,
         };
-        try self.lake_read_cache.ensurePersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
+        try self.lake_read_cache.startPersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {
