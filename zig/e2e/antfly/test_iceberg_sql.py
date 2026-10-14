@@ -1234,6 +1234,15 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     break
             assert time.monotonic() < deadline, index
             time.sleep(0.1)
+        if vector_kind:
+            # Keep the archive publication fixed while exercising incremental
+            # accepted cuts. The background writer otherwise drains the first
+            # batch before the second request, legitimately removing its rows
+            # from the recent overlay. Reads need the catalog head/records but
+            # only commits use the intent namespace.
+            intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
+            intents.rename(intents.with_name("held-intents"))
+            intents.write_bytes(b"hold catalog publication for accepted-cut reuse")
         vector_image = (
             {"dense_native": "[0,1]", "sparse_native": '{"2":2}'} if vector_kind else {}
         )
@@ -1331,9 +1340,11 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 if payload.startswith(b"AFOBJ001"):
                     payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
                 descriptor = json.loads(payload)
-                return {run["prefix"]: run for run in descriptor["recent_runs"]}
+                return descriptor["publication"]["generation"], {
+                    run["prefix"]: run for run in descriptor["recent_runs"]
+                }
 
-            old_runs = retained_runs(hybrid_first["remote_snapshot"])
+            old_generation, old_runs = retained_runs(hybrid_first["remote_snapshot"])
             assert set(old_runs) == {ord("7"), ord("d")}, old_runs
             newer = call(
                 "POST",
@@ -1378,7 +1389,8 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
-            new_runs = retained_runs(latest["remote_snapshot"])
+            new_generation, new_runs = retained_runs(latest["remote_snapshot"])
+            assert new_generation == old_generation, (old_generation, new_generation)
             assert old_runs[ord("d")] == new_runs[ord("d")], (old_runs, new_runs)
             assert old_runs[ord("7")]["digest"] != new_runs[ord("7")]["digest"]
             assert (
@@ -1470,3 +1482,8 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         failed = False
     finally:
         server.stop(test_failed=failed)
+        intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
+        held_intents = intents.with_name("held-intents")
+        if held_intents.exists():
+            intents.unlink()
+            held_intents.rename(intents)
