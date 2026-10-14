@@ -8271,6 +8271,49 @@ pub fn decoderRuntimeDotGeneral2DF32DeviceInto(
     return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, output_override, null);
 }
 
+pub const Gemm = struct {
+    batch: usize = 1,
+    m: usize,
+    n: usize,
+    k: usize,
+    /// lhs is stored k x m (rhs n x k) per matrix.
+    transpose_left: bool = false,
+    transpose_right: bool = false,
+    alpha: f32 = 1,
+    /// Nonzero accumulates into the existing output.
+    beta: f32 = 0,
+};
+
+/// output = alpha * op(lhs) * op(rhs) + beta * output through MPS, for
+/// `batch` contiguous row-major f32 matrices. False when the runtime is
+/// unavailable or rejects the shapes.
+pub fn decoderRuntimeGemmF32Device(self: anytype, lhs: MetalTensor, rhs: MetalTensor, output: MetalTensor, gemm: Gemm) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!lhs.isDevice() or !rhs.isDevice() or !output.isDevice()) return false;
+    const lhs_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.m, gemm.k) catch return false) catch return false;
+    const rhs_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.n, gemm.k) catch return false) catch return false;
+    const output_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.m, gemm.n) catch return false) catch return false;
+    if (lhs.elemCount() != lhs_elems or rhs.elemCount() != rhs_elems or output.elemCount() != output_elems) return false;
+    return termite_metal_decode_runtime_gemm_f32_device(
+        runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        gemm.batch,
+        gemm.m,
+        gemm.n,
+        gemm.k,
+        @intFromBool(gemm.transpose_left),
+        @intFromBool(gemm.transpose_right),
+        gemm.alpha,
+        gemm.beta,
+    ) == 0;
+}
+
 fn decoderRuntimeDotGeneral2DF32DeviceImpl(
     self: anytype,
     lhs: MetalTensor,
@@ -22516,6 +22559,23 @@ pub extern fn termite_metal_decode_runtime_training_adamw_many_f32(
     eps: f32,
     weight_decay: f32,
     grad_scale: f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemm_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs: ?*const anyopaque,
+    lhs_offset: usize,
+    rhs: ?*const anyopaque,
+    rhs_offset: usize,
+    output: ?*anyopaque,
+    output_offset: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    transpose_left: u32,
+    transpose_right: u32,
+    alpha: f32,
+    beta: f32,
 ) c_int;
 pub const TrainingRef = extern struct { handle: ?*const anyopaque = null, offset: usize = 0 };
 pub extern fn termite_metal_decode_runtime_training_accumulate_into_many_f32(

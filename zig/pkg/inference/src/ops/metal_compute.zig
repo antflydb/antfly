@@ -14378,8 +14378,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
         if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
         if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
-        if (lhs_contracting[0] != 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
+        if (lhs_contracting[0] > 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
         if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
+        // A contraction over the lhs rows (a weight gradient, dY^T X) runs as
+        // a transposed-left MPS GEMM instead of materializing the transpose.
+        if (lhs_contracting[0] == 0) return self.tryDeviceDotGeneral2DTransposedLeft(lhs, rhs, lhs_shape, rhs_shape, rhs_contracting[0]);
 
         const m_i64 = lhs_shape[0];
         const k_i64 = lhs_shape[1];
@@ -14426,6 +14429,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return try self.ctFromOwnedMetalTensor(owned_tensor);
         }
         return null;
+    }
+
+    fn tryDeviceDotGeneral2DTransposedLeft(self: *MetalCompute, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, rhs_contracting: u8) !?CT {
+        if (lhs_shape[0] <= 0 or lhs_shape[1] <= 0 or rhs_shape[0] <= 0 or rhs_shape[1] <= 0) return null;
+        const k: usize = @intCast(lhs_shape[0]);
+        const m: usize = @intCast(lhs_shape[1]);
+        if (rhs_shape[rhs_contracting] != lhs_shape[0]) return null;
+        const n: usize = @intCast(rhs_shape[1 - @as(usize, rhs_contracting)]);
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
+        defer lhs_mt.deinit();
+        var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
+        defer rhs_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice() or lhs_mt.dtype != .f32 or rhs_mt.dtype != .f32) return null;
+        const out_shape = [_]i32{ @intCast(m), @intCast(n) };
+        var output = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
+        errdefer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGemmF32Device(self.provider_impl, lhs_mt, rhs_mt, output, .{
+            .m = m,
+            .n = n,
+            .k = k,
+            .transpose_left = true,
+            .transpose_right = rhs_contracting == 1,
+        })) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     fn tryDeviceDotGeneralBatched(
@@ -15522,7 +15553,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bufHasAnyQuantizedStorage(gamma_buf) or
             bufHasAnyQuantizedStorage(beta_buf);
         const device_fast_path_enabled = !has_quantized and !disableRuntimeElementwise();
-        if (device_fast_path_enabled) {
+        // Training parameters change every step, and a freed buffer's address
+        // can be reused, so an identity-keyed slot could serve stale weights.
+        // Read them directly instead.
+        if (device_fast_path_enabled and (gamma_buf.mutable_state or beta_buf.mutable_state)) {
+            if (try self.layerNormDirect(input, gamma, beta, dim, eps)) |tensor| return tensor;
+        }
+        if (device_fast_path_enabled and !gamma_buf.mutable_state and !beta_buf.mutable_state) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
                     bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
@@ -15561,6 +15598,45 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
         return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    /// LayerNorm over rows of `dim`, reading gamma and beta from their own
+    /// buffers rather than a prepared slot. Null when the operands are not
+    /// device-resident f32 or the shape is outside the kernel's range.
+    fn layerNormDirect(self: *MetalCompute, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        if (dim == 0 or dim > 4096 or !(eps > 0)) return null;
+        var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        defer input_mt.deinit();
+        var gamma_mt = self.ownedDeviceMetalTensorFromCt(gamma) catch return null;
+        defer gamma_mt.deinit();
+        var beta_mt = self.ownedDeviceMetalTensorFromCt(beta) catch return null;
+        defer beta_mt.deinit();
+        if (!input_mt.isDevice() or !gamma_mt.isDevice() or !beta_mt.isDevice() or input_mt.dtype != .f32 or
+            gamma_mt.dtype != .f32 or beta_mt.dtype != .f32 or input_mt.elemCount() % dim != 0 or
+            gamma_mt.elemCount() != dim or beta_mt.elemCount() != dim or input_mt.deviceByteLen() != input_mt.elemCount() * 4)
+            return null;
+        const rows = input_mt.elemCount() / dim;
+        if (rows == 0 or rows > std.math.maxInt(u32)) return null;
+        const logical = toBuf(input).logical_shape orelse return null;
+        const shape = try self.i32ShapeFromI64(logical);
+        defer self.allocator.free(shape);
+        var output = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, shape);
+        errdefer output.deinit();
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .norm };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(dim);
+        request.scalars[0] = eps;
+        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        sources[0] = input_mt;
+        sources[1] = gamma_mt;
+        sources[2] = beta_mt;
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     fn addLayerNormOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
