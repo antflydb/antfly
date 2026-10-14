@@ -56,6 +56,18 @@ float3 rgb_combined(int y, int2 uv, constant Params &p) {
     rounded = select(rounded, int3(0), rounded >= 512);
     return float3(clamp(rounded, 0, 255));
 }
+float3 rgb_gbr(uint g, uint2 br, constant Params &p) {
+    uint maximum = (1u << p.depth) - 1u;
+    int gg = int(min(g, maximum)), bb = int(min(br.x, maximum)), rr = int(min(br.y, maximum));
+    if (p.depth == 8) return float3(rr, gg, bb);
+    if (p.rounding != 6) return float3((uint3(rr, gg, bb) * 255u + maximum / 2u) / maximum);
+    int shift = p.depth + 1, bias = 1 << p.depth;
+    int y = (8414 * rr + 16519 * gg + 3208 * bb + (16 << (p.depth + 7)) + bias) >> shift;
+    int u = ((-4865 * rr - 9528 * gg + 14392 * bb + (128 << (p.depth + 7)) + bias) >> shift) - 8192;
+    int v = ((14392 * rr - 12061 * gg - 2332 * bb + (128 << (p.depth + 7)) + bias) >> shift) - 8192;
+    int yy = (y - 1024) * 9539;
+    return float3(clamp((int3(yy + v * 13075, yy - u * 3209 - v * 6660, yy + u * 16525) + (1 << 18)) >> 19, 0, 255));
+}
 float3 rgb_q16(int y, int2 uv_delta, constant Params &p) {
     int4 c = p.bt709 == 1 ? (p.full ? int4(103206, -12275, -30678, 121608) : int4(100902, -12001, -29993, 118894))
            : p.bt709 == 2 ? (p.full ? int4(96638, -10783, -37443, 123299) : int4(94482, -10543, -36607, 120547))
@@ -185,6 +197,7 @@ kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *o
 
 float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf, device const short2 *chroma, device const ChromaTap *chroma_y) {
     uint2 xy = source_point(point, p);
+    if (p.bt709 == 3) return rgb_gbr(yplane.read(xy).r >> p.sample_shift, uvplane.read(xy).rg >> p.sample_shift, p);
     if (p.rounding == 5 && p.tone == 0) return rgb_reconstructed(yplane.read(xy).r >> p.sample_shift, xy, p, chroma, chroma_y);
     if (p.rounding == 3 && p.chroma == 0 && p.tone == 0) {
         uint shift = p.depth - 8;

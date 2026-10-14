@@ -245,7 +245,7 @@ pub const Session = struct {
                         self.output_stats.skipped_outputs +|= 1;
                         continue;
                     }
-                    var copy = try frame.copy(self.allocator, self.options.admission_pool, p.d_w, p.d_h, @intCast(p.bit_depth), if (p.x_chroma_shift == 0) 3 else if (p.y_chroma_shift == 0) 2 else 1, .{ .full_range = p.range != 0, .matrix = switch (p.cs) {
+                    var copy = try frame.copy(self.allocator, self.options.admission_pool, p.d_w, p.d_h, @intCast(p.bit_depth), if (p.x_chroma_shift == 0) 3 else if (p.y_chroma_shift == 0) 2 else 1, .{ .full_range = p.range != 0, .primaries = if (p.cs == 7) 1 else 2, .transfer = if (p.cs == 7) 13 else 2, .matrix = switch (p.cs) {
                         1, 3 => 6,
                         2 => 1,
                         4 => 7,

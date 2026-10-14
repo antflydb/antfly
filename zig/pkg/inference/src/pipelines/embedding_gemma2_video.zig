@@ -299,6 +299,7 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
         if (container_matrix != 2) declared_matrix = container_matrix;
     }
     const matrix: video.preparation.Matrix = switch (declared_matrix) {
+        0 => .gbr_identity,
         1 => .bt709,
         5, 6 => .bt601,
         9 => .bt2020_ncl,
@@ -310,6 +311,7 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
         18 => .hlg_reinhard_100,
         else => return error.UnsupportedVideoColor,
     };
+    if (matrix == .gbr_identity and (tone != .none or (primaries != 1 and primaries != 2))) return error.UnsupportedVideoColor;
     if (tone != .none) {
         // Require explicit consistent primaries; never guess an HDR gamut.
         if (track.codec != .avc or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
@@ -317,7 +319,7 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
     // Apply SAR through target aspect; a single separable resample avoids an
     // intermediate stretched raster and its additional RGB8 rounding.
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (width % 16 == 0) .q13_components else .q16_luma };
+    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
@@ -486,7 +488,7 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
         for (selected) |id| {
             const picture = index.pictures[id];
             var preparation = try webmPolicy(reader.track, picture.width, picture.height, .{});
-            if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth);
+            if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, preparation.matrix);
             try plan.picture(picture.width, picture.height, preparation);
         }
         return plan;
@@ -1271,7 +1273,7 @@ const Capture = struct {
             .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
         };
         var options = try webmPolicy(track, frame.width, frame.height, signal);
-        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth);
+        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth, options.matrix);
         options.admission_pool = self.pool;
         if (self.metal) |metal| {
             const prepared = try metal.submitHost(self.a, host, options, self.control);
@@ -2258,4 +2260,24 @@ test "embeddinggemma2 video scalable AV1 sampling uses highest spatial presentat
     var capture = CaptureLayer{};
     try video.webm_pictures.walkIndexed(a, &reader, webmDecodeOptions(.{}, null), index, selected, &capture, CaptureLayer.accept);
     try std.testing.expectEqual(@as(usize, 2), capture.count);
+}
+
+test "embeddinggemma2 video identity GBR declarations select native RGB compatibility" {
+    const a = std.testing.allocator;
+    inline for (.{ "av1-gbr-10-127", "vp9-gbr-12-128" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name ++ ".webm");
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = name };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        const options = try webmPolicy(reader.track, reader.track.width, reader.track.height, .{});
+        try std.testing.expectEqual(video.preparation.Matrix.gbr_identity, options.matrix);
+        try std.testing.expectEqual(video.preparation.RgbRounding.gbr_reference, options.rgb_rounding);
+        try std.testing.expectEqual(@as(u64, 2) * reader.track.width * reader.track.height, try inspectPixels(bytes, .{ .io = std.testing.io }));
+        var invalid = reader.track;
+        invalid.colour.primaries = 9;
+        try std.testing.expectError(error.UnsupportedVideoColor, webmPolicy(invalid, invalid.width, invalid.height, .{}));
+        invalid = reader.track;
+        invalid.colour.transfer = 16;
+        try std.testing.expectError(error.UnsupportedVideoColor, webmPolicy(invalid, invalid.width, invalid.height, .{}));
+    }
 }

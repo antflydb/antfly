@@ -62,12 +62,13 @@ const Context = struct {
         if (self.mode == .decode or id % self.step != 0) return;
         if (frame.color.transfer == 16 or frame.color.transfer == 18) return error.UnsupportedVideoColor;
         const matrix: video.preparation.Matrix = switch (frame.color.matrix) {
+            0 => .gbr_identity,
             1 => .bt709,
             2, 5, 6 => .bt601,
             9 => .bt2020_ncl,
             else => return error.UnsupportedVideoColor,
         };
-        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth), .admission_pool = self.pool };
+        const options = video.preparation.Options{ .width = self.size, .height = self.size, .matrix = matrix, .torchvision = true, .rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth, matrix), .admission_pool = self.pool };
         const start = now(self.io);
         if (self.metal) |owner| {
             var prepared = try owner.submitHost(self.a, frame.host(), options, .{});

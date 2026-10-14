@@ -39,12 +39,13 @@ extern fn av_preparer_tone_mask(*anyopaque) u32;
 extern fn av_prepared_destroy(*anyopaque) void;
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
-pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
+pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl, gbr_identity };
 pub const ToneMapping = @import("tone.zig").Policy;
-pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples, q13_combined, q13_reconstructed };
+pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples, q13_combined, q13_reconstructed, gbr_reference };
 /// Pinned SDR software-video processor profile, independent of CPU dispatch.
 /// HDR has a separate rendering policy and must not select this profile.
-pub fn softwareSdrRounding(coded_width: u32, chroma: u8, depth: u8) RgbRounding {
+pub fn softwareSdrRounding(coded_width: u32, chroma: u8, depth: u8, matrix: Matrix) RgbRounding {
+    if (matrix == .gbr_identity) return .gbr_reference;
     return switch (chroma) {
         0 => .gray_samples,
         3 => .q13_combined,
@@ -98,6 +99,7 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
     if (source_width > 16_384 or source_height_u32 > 16_384 or options.width > 16_384 or options.height > 16_384) return error.ResourceLimitExceeded;
+    if ((options.matrix == .gbr_identity and options.tone_mapping != .none) or (options.rgb_rounding == .gbr_reference and options.matrix != .gbr_identity)) return error.UnsupportedVideoColor;
     if (options.matrix == .bt2020_ncl and options.tone_mapping == .none) return error.UnsupportedVideoColor;
     if (options.width % 48 != 0 or options.height % 48 != 0) return error.InvalidVideoGeometry;
     const pixels = try std.math.mul(usize, options.width, options.height);
@@ -111,7 +113,7 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     const rgb_bytes = try std.math.mul(usize, source_pixels, 3);
     // One conservative bound covers both reference and device paths, including
     // CPU result/patch repacking. Coefficient storage is checked separately.
-    const reconstruction = if (options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none)
+    const reconstruction = if (options.matrix != .gbr_identity and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none)
         try std.math.add(usize, try std.math.mul(usize, source_pixels, 4), try std.math.mul(usize, @as(usize, source_width) + source_height_u32, 128))
     else
         0;
@@ -130,7 +132,37 @@ fn sourcePoint(x: usize, y: usize, width: usize, height: usize, rotation: Rotati
 fn hostSample(bytes: []const u8, offset: usize, bit_depth: u8) u16 {
     return if (bit_depth == 8) bytes[offset] else std.mem.readInt(u16, bytes[offset..][0..2], .little);
 }
+fn validateColorLayout(chroma: u8, full: bool, options: Options) !void {
+    if (options.matrix == .gbr_identity and (chroma != 3 or !full)) return error.UnsupportedVideoColor;
+}
+// Preserve the independent RGB24 processor's high-depth compatibility profile:
+// a Q15 RGB -> Q6 studio intermediate, then the existing Q13 RGB transform.
+// These arithmetic coefficients are native code, not a scaler-library call.
+fn rgbGbr(g: u16, b: u16, r: u16, depth: u8, rounding: RgbRounding) [3]u8 {
+    const maximum: u32 = (@as(u32, 1) << @as(u5, @intCast(depth))) - 1;
+    const gg: i32 = @intCast(@min(g, maximum));
+    const bb: i32 = @intCast(@min(b, maximum));
+    const rr: i32 = @intCast(@min(r, maximum));
+    if (depth == 8) return .{ @intCast(rr), @intCast(gg), @intCast(bb) };
+    if (rounding != .gbr_reference) {
+        var out: [3]u8 = undefined;
+        for ([_]i32{ rr, gg, bb }, &out) |sample, *value|
+            value.* = @intCast((@as(u32, @intCast(sample)) * 255 + maximum / 2) / maximum);
+        return out;
+    }
+    const shift: u5 = @intCast(depth + 1);
+    const bias = @as(i32, 1) << @as(u5, @intCast(depth));
+    const y = (8414 * rr + 16519 * gg + 3208 * bb + (@as(i32, 16) << @as(u5, @intCast(depth + 7))) + bias) >> shift;
+    const u = (-4865 * rr - 9528 * gg + 14392 * bb + (@as(i32, 128) << @as(u5, @intCast(depth + 7))) + bias) >> shift;
+    const v = (14392 * rr - 12061 * gg - 2332 * bb + (@as(i32, 128) << @as(u5, @intCast(depth + 7))) + bias) >> shift;
+    return rgbCombined(y, u - 8192, v - 8192, 14, false, .bt601);
+}
 fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8, rounding: RgbRounding, tone_mapping: ToneMapping) [3]u8 {
+    if (matrix == .gbr_identity) {
+        const bytes: usize = if (bit_depth == 8) 1 else 2;
+        const at = y * planes[1].stride + x * bytes * 2;
+        return rgbGbr(hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth) >> format.sampleShift(), hostSample(planes[1].bytes, at, bit_depth) >> format.sampleShift(), hostSample(planes[1].bytes, at + bytes, bit_depth) >> format.sampleShift(), bit_depth, rounding);
+    }
     if (tone_mapping != .none) return rgbHdr(planes, x, y, format, matrix, bit_depth, chroma_format, tone_mapping);
     if (rounding == .gray_samples and chroma_format == 0) {
         const sample = hostSample(planes[0].bytes, y * planes[0].stride + x * @as(usize, if (bit_depth == 8) 1 else 2), bit_depth) >> format.sampleShift();
@@ -192,6 +224,7 @@ fn rgbHdr(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matr
         v *= factor;
     }
     const values: [3]f64 = switch (matrix) {
+        .gbr_identity => unreachable,
         .bt2020_ncl => .{ luma + 1.4746 * v, luma - 0.164553 * u - 0.571353 * v, luma + 1.8814 * u },
         .bt709 => .{ luma + 1.5748 * v, luma - 0.187324 * u - 0.468124 * v, luma + 1.8556 * u },
         .bt601 => .{ luma + 1.402 * v, luma - 0.344136 * u - 0.714136 * v, luma + 1.772 * u },
@@ -203,6 +236,7 @@ fn rgbHdr(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matr
 // integer equations directly; no external conversion library or lookup cache.
 fn q16Coefficients(full: bool, matrix: Matrix) [4]i32 {
     return switch (matrix) {
+        .gbr_identity => unreachable,
         .bt601 => if (full) .{ 91881, -22552, -46800, 116129 } else .{ 89830, -22049, -45756, 113537 },
         .bt709 => if (full) .{ 103206, -12275, -30678, 121608 } else .{ 100902, -12001, -29993, 118894 },
         .bt2020_ncl => if (full) .{ 96638, -10783, -37443, 123299 } else .{ 94482, -10543, -36607, 120547 },
@@ -231,6 +265,7 @@ fn rgbQ16(y: i32, u_delta: i32, v_delta: i32, full: bool, matrix: Matrix) [3]u8 
 // each component independently. This is an explicit SDR preparation policy.
 fn combinedCoefficients(full: bool, matrix: Matrix) [4]i32 {
     return switch (matrix) {
+        .gbr_identity => unreachable,
         .bt601 => if (full) .{ 11485, -2819, -5850, 14516 } else .{ 13075, -3209, -6660, 16525 },
         .bt709 => if (full) .{ 12901, -1534, -3835, 15201 } else .{ 14686, -1747, -4366, 17305 },
         .bt2020_ncl => if (full) .{ 12080, -1348, -4680, 15412 } else .{ 13752, -1535, -5328, 17545 },
@@ -322,7 +357,8 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     const width = if (rotated) cropped[1] else cropped[0];
     const height = if (rotated) cropped[0] else cropped[1];
     try host.validate();
-    var chroma_plan: ?chroma_filter.Plan = if (options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none and host.chroma_format != 0) try chroma_filter.Plan.init(allocator, host.width, host.height, host.chroma_format, control) else null;
+    try validateColorLayout(host.chroma_format, host.format.fullRange(), options);
+    var chroma_plan: ?chroma_filter.Plan = if (options.matrix != .gbr_identity and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none and host.chroma_format != 0) try chroma_filter.Plan.init(allocator, host.width, host.height, host.chroma_format, control) else null;
     defer if (chroma_plan) |*plan| plan.deinit();
     const chroma_horizontal = if (chroma_plan) |*plan| try reconstructedHorizontal(allocator, host, plan, control, simd) else null;
     defer if (chroma_horizontal) |values| allocator.free(values);
@@ -331,7 +367,7 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     for (0..height) |y| {
         try control.check();
         var x: usize = 0;
-        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and (options.rgb_rounding == .q13_components or options.rgb_rounding == .q16_luma or options.rgb_rounding == .q13_combined)) {
+        if (simd and options.rotation == .none and (host.chroma_format == 0 or host.chroma_format == 3 or options.crop.left % 2 == 0) and host.bit_depth == 8 and options.tone_mapping == .none and (options.matrix == .gbr_identity or options.rgb_rounding == .q13_components or options.rgb_rounding == .q16_luma or options.rgb_rounding == .q13_combined)) {
             while (x + 8 <= width) : (x += 8) integerRgbRow8(bytes[(y * width + x) * 3 ..][0..24], host, x + options.crop.left, y + options.crop.top, options);
         }
         while (x < width) : (x += 1) {
@@ -439,7 +475,9 @@ fn integerRgbRow8(out: []u8, host: HostSurface, x: usize, y: usize, options: Opt
     }
     var values: [3]V = undefined;
     const full = host.format.fullRange();
-    if (options.rgb_rounding == .q13_combined) {
+    if (options.matrix == .gbr_identity) {
+        values = .{ v + @as(V, @splat(128)), luma, u + @as(V, @splat(128)) };
+    } else if (options.rgb_rounding == .q13_combined) {
         const c = combinedCoefficients(full, options.matrix);
         const yy = (luma - @as(V, @splat(if (full) 0 else 16))) * @as(V, @splat(if (full) 8192 else 9539));
         values = .{ yy + v * @as(V, @splat(c[0])), yy + u * @as(V, @splat(c[1])) + v * @as(V, @splat(c[2])), yy + u * @as(V, @splat(c[3])) };
@@ -650,7 +688,7 @@ pub const Metal = struct {
         return self.coefficient_bytes + color_upload;
     }
     fn ensureChroma(self: *Metal, a: std.mem.Allocator, width: u32, height: u32, chroma: u8, options: Options, control: media.source.Control) !usize {
-        if (options.rgb_rounding != .q13_reconstructed or options.tone_mapping != .none or chroma == 0) return 0;
+        if (options.matrix == .gbr_identity or options.rgb_rounding != .q13_reconstructed or options.tone_mapping != .none or chroma == 0) return 0;
         const key = [3]u32{ width, height, chroma };
         if (self.chroma_coefficients != null and std.mem.eql(u32, &key, &self.chroma_key)) return 0;
         var plan = try chroma_filter.Plan.init(a, width, height, chroma, control);
@@ -671,6 +709,7 @@ pub const Metal = struct {
         try control.check();
         var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
         defer scope.deinit();
+        try validateColorLayout(1, surface.format.fullRange(), options);
         const g = try geometry(surface.width, surface.height, options);
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
@@ -699,6 +738,7 @@ pub const Metal = struct {
         try control.check();
         if (surface.bit_depth < 8 or surface.bit_depth > 14 or surface.chroma_format > 3 or (surface.uv == null) != (surface.chroma_format == 0)) return error.UnsupportedSurfaceFormat;
         if (surface.sample_shift > 16 - surface.bit_depth or (surface.bit_depth == 8 and surface.sample_shift != 0)) return error.UnsupportedSurfaceFormat;
+        try validateColorLayout(surface.chroma_format, surface.full_range, options);
         const g = try geometry(surface.width, surface.height, options);
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
@@ -714,6 +754,7 @@ pub const Metal = struct {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
         try surface.validate();
+        try validateColorLayout(surface.chroma_format, surface.format.fullRange(), options);
         const g = try geometry(surface.width, surface.height, options);
         const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
@@ -1010,7 +1051,7 @@ test "video reconstructed subsampled RGB matches independent odd even depth rang
         }
         var plan = try chroma_filter.Plan.init(a, size[0], size[1], chroma, .{});
         defer plan.deinit();
-        const rounding = softwareSdrRounding(size[0], chroma, depth);
+        const rounding = softwareSdrRounding(size[0], chroma, depth, .bt601);
         for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]bool{ false, true }) |full| {
             const host = HostSurface{ .width = size[0], .height = size[1], .chroma_format = chroma, .bit_depth = depth, .format = if (full) .nv12_full else .nv12_video, .planes = .{
                 .{ .bytes = yp, .width = size[0], .height = size[1], .stride = size[0] * bytes }, .{ .bytes = uvp, .width = cw, .height = ch, .stride = cw * 2 * bytes },
@@ -1024,6 +1065,23 @@ test "video reconstructed subsampled RGB matches independent odd even depth rang
                 at += 3;
             };
         };
+    };
+    try std.testing.expectEqual(expected.len, at);
+}
+
+test "video identity GBR preserves independent all-code high-depth RGB24 oracle" {
+    const expected = @embedFile("../testdata/rgb-gbr-reference.bin");
+    var at: usize = 0;
+    for ([_][2]u32{ .{ 9, 7 }, .{ 26, 16 }, .{ 127, 95 }, .{ 129, 129 } }) |size| for ([_]u8{ 8, 10, 12, 14 }) |depth| {
+        const maximum = @as(u32, 1) << @as(u5, @intCast(depth));
+        for (0..@as(usize, size[0]) * size[1]) |i| {
+            const g: u16 = @intCast(i % maximum);
+            const b: u16 = @intCast((i * 37 + 91) % maximum);
+            const r: u16 = @intCast((i * 73 + 11) % maximum);
+            const actual = rgbGbr(g, b, r, depth, .gbr_reference);
+            try std.testing.expectEqualSlices(u8, expected[at..][0..3], &actual);
+            at += 3;
+        }
     };
     try std.testing.expectEqual(expected.len, at);
 }

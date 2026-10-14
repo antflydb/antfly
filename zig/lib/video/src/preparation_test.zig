@@ -94,8 +94,13 @@ test "video Metal quantized bicubic patch preparation matches CPU with rotation 
     defer batch.deinit();
     inline for (std.meta.tags(prep.Rotation)) |rotation| {
         inline for ([_]prep.Matrix{ .bt601, .bt709 }) |matrix| {
-            inline for (std.meta.tags(prep.RgbRounding)) |rounding| {
+            for (std.meta.tags(prep.RgbRounding)) |rounding| {
                 const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .rotation = rotation, .rgb_rounding = rounding };
+                if (rounding == .gbr_reference) {
+                    try std.testing.expectError(error.UnsupportedVideoColor, prep.reference(a, &batch.frames[0].surface, options, .{}));
+                    try std.testing.expectError(error.UnsupportedVideoColor, metal.submit(a, &batch.frames[0].surface, options, .{}));
+                    continue;
+                }
                 const expected = try prep.reference(a, &batch.frames[0].surface, options, .{});
                 defer a.free(expected);
                 var result = try metal.submit(a, &batch.frames[0].surface, options, .{});
@@ -481,4 +486,64 @@ fn reconstructedAllocations(allocator: std.mem.Allocator) !void {
 }
 test "video reconstructed chroma allocation failures release every intermediate" {
     try std.testing.checkAllAllocationFailures(a, reconstructedAllocations, .{});
+}
+
+test "video GBR scalar SIMD Metal preparation matches independent RGB raster through crop rotation and strides" {
+    const oracle = @embedFile("../testdata/rgb-gbr-reference.bin");
+    const device: ?*anyopaque = if (@import("builtin").os.tag == .macos) (av_test_device_create() orelse return error.MetalPreparationUnavailable) else null;
+    defer if (device) |handle| av_test_device_destroy(handle);
+    var metal: ?prep.Metal = if (device) |handle| try prep.Metal.init(handle) else null;
+    defer if (metal) |*owner| owner.deinit();
+    var offset: usize = 0;
+    for ([_][2]u32{ .{ 9, 7 }, .{ 26, 16 }, .{ 127, 95 }, .{ 129, 129 } }) |size| for ([_]u8{ 8, 10, 12, 14 }) |depth| {
+        const sample: usize = if (depth == 8) 1 else 2;
+        const ystride = size[0] * sample + 8;
+        const uvstride = size[0] * sample * 2 + 8;
+        const yp = try a.alloc(u8, ystride * size[1]);
+        defer a.free(yp);
+        const uv = try a.alloc(u8, uvstride * size[1]);
+        defer a.free(uv);
+        @memset(yp, 0xaa);
+        @memset(uv, 0xaa);
+        const rgba = try a.alloc(u8, @as(usize, size[0]) * size[1] * 4);
+        defer a.free(rgba);
+        const maximum = @as(usize, 1) << @as(u5, @intCast(depth));
+        for (0..size[1]) |y| for (0..size[0]) |x| {
+            const i = y * size[0] + x;
+            const values = [_]u16{ @intCast(i % maximum), @intCast((i * 37 + 91) % maximum), @intCast((i * 73 + 11) % maximum) };
+            if (depth == 8) {
+                yp[y * ystride + x] = @intCast(values[0]);
+                uv[y * uvstride + x * 2] = @intCast(values[1]);
+                uv[y * uvstride + x * 2 + 1] = @intCast(values[2]);
+            } else {
+                std.mem.writeInt(u16, yp[y * ystride + x * 2 ..][0..2], values[0], .little);
+                std.mem.writeInt(u16, uv[y * uvstride + x * 4 ..][0..2], values[1], .little);
+                std.mem.writeInt(u16, uv[y * uvstride + x * 4 + 2 ..][0..2], values[2], .little);
+            }
+            @memcpy(rgba[i * 4 ..][0..3], oracle[offset + i * 3 ..][0..3]);
+            rgba[i * 4 + 3] = 255;
+        };
+        const host = prep.HostSurface{ .width = size[0], .height = size[1], .bit_depth = depth, .chroma_format = 3, .format = .nv12_full, .planes = .{ .{ .bytes = yp, .stride = ystride, .width = size[0], .height = size[1] }, .{ .bytes = uv, .stride = uvstride, .width = size[0], .height = size[1] } } };
+        for ([_]prep.Rotation{ .none, .clockwise90 }) |rotation| {
+            const options = prep.Options{ .width = 48, .height = 48, .matrix = .gbr_identity, .rgb_rounding = .gbr_reference, .torchvision = true, .rotation = rotation, .crop = .{ .left = 1, .top = 1, .right = 1, .bottom = 1 } };
+            const expected = try prep.referenceRgba(a, rgba, size[0], size[1], options, .{});
+            defer a.free(expected);
+            const scalar = try prep.referenceHostScalar(a, host, options, .{});
+            defer a.free(scalar);
+            const simd = try prep.referenceHost(a, host, options, .{});
+            defer a.free(simd);
+            try std.testing.expectEqualSlices(f32, expected, scalar);
+            try std.testing.expectEqualSlices(f32, scalar, simd);
+            if (metal) |*owner| {
+                var prepared = try owner.submitHost(a, host, options, .{});
+                defer prepared.deinit();
+                try prepared.wait(std.testing.io, .{});
+                const actual = try prepared.readback(a);
+                defer a.free(actual);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+            }
+        }
+        offset += @as(usize, size[0]) * size[1] * 3;
+    };
+    try std.testing.expectEqual(oracle.len, offset);
 }

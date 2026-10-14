@@ -291,7 +291,7 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
                 };
                 const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = matrix, .centered = full, .rgb_rounding = rounding };
                 const host = video.preparation.HostSurface{ .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .format = if (full) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = y, .width = width, .height = height, .stride = ys }, .{ .bytes = uv, .width = cw, .height = ch, .stride = uvs } } };
-                if (matrix == .bt2020_ncl) {
+                if (matrix == .bt2020_ncl or (rounding == .gbr_reference and matrix != .gbr_identity) or (matrix == .gbr_identity and (chroma != 3 or !full))) {
                     try std.testing.expectError(error.UnsupportedVideoColor, video.preparation.referenceHost(a, host, options, .{}));
                     try std.testing.expectError(error.UnsupportedVideoColor, metal.submitHost(a, host, options, .{}));
                     continue;

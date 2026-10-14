@@ -775,3 +775,45 @@ test "AV1 shared Annex B preflight denial is retryable and does not mask later c
     }
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
 }
+
+test "identity-matrix AV1 VP9 WebM pictures preserve independent RGB planes and colour metadata" {
+    const a = std.testing.allocator;
+    const pics = @import("../webm_pictures.zig");
+    const G = struct { name: []const u8, codec: decoder.Codec, width: u32, height: u32, depth: u8, frame_sha256: []const []const u8 };
+    const parsed = try std.json.parseFromSlice([]G, a, @embedFile("../../testdata/gbr/golden.json"), .{});
+    defer parsed.deinit();
+    const Capture = struct {
+        golden: G,
+        count: usize = 0,
+        fn accept(raw: *anyopaque, id: usize, frame: *const decoder.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.count, id);
+            try std.testing.expectEqual(self.golden.width, frame.width);
+            try std.testing.expectEqual(self.golden.height, frame.height);
+            try std.testing.expectEqual(self.golden.depth, frame.bit_depth);
+            try std.testing.expectEqual(@as(u8, 3), frame.chroma_format);
+            try std.testing.expect(frame.color.full_range);
+            try std.testing.expectEqual(@as(u8, 0), frame.color.matrix);
+            try std.testing.expectEqual(@as(u8, 1), frame.color.primaries);
+            try std.testing.expectEqual(@as(u8, 13), frame.color.transfer);
+            var expected: [32]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&expected, self.golden.frame_sha256[id]);
+            try std.testing.expectEqualSlices(u8, &expected, &hashFrame(frame.*));
+            self.count += 1;
+        }
+    };
+    inline for (.{ "av1-gbr-8-127", "vp9-gbr-8-127", "av1-gbr-10-127", "vp9-gbr-10-127", "av1-gbr-12-127", "vp9-gbr-12-127", "av1-gbr-8-128", "vp9-gbr-8-128", "av1-gbr-10-128", "vp9-gbr-10-128", "av1-gbr-12-128", "vp9-gbr-12-128" }) |name| {
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/gbr/" ++ name ++ ".webm") }, .identity = name };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var g: ?G = null;
+        for (parsed.value) |row| if (std.mem.eql(u8, row.name, name)) {
+            g = row;
+        };
+        var capture = Capture{ .golden = g.? };
+        var ids: [12]usize = undefined;
+        for (&ids, 0..) |*id, i| id.* = i;
+        try pics.walk(a, &reader, .{}, &ids, &capture, Capture.accept);
+        try std.testing.expectEqual(@as(usize, 12), capture.count);
+    }
+}
